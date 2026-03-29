@@ -1,0 +1,119 @@
+services:
+
+  # --------------------------------------------------------------------------
+  # agent — Python ASGI app. Serves HTTP on port 8000.
+  # External access: whitelist-only egress via iptables (googleapis.com + news).
+  #   The agent is connected to BOTH networks:
+  #     - internal: to reach ollama
+  #     - egress:   for whitelisted external calls (googleapis.com, etc.)
+  #   iptables rules in entrypoint.sh enforce the whitelist on the egress interface.
+  # --------------------------------------------------------------------------
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: admino-agent:latest
+    container_name: admino-agent
+    restart: unless-stopped
+
+    # NET_ADMIN is required for the entrypoint.sh iptables egress whitelist.
+    # Without it the whitelist is skipped with a warning (acceptable for dev).
+    cap_add:
+      - NET_ADMIN
+
+    ports:
+      - "8000:8000"
+
+    env_file:
+      - .env
+
+    environment:
+      # Docker embedded DNS resolver — used by entrypoint.sh to resolve
+      # whitelisted hostnames before locking down egress.
+      DOCKER_DNS_IP: "127.0.0.11"
+      # The internal Docker bridge CIDR — allow all traffic within this range
+      # so the agent can reach Ollama without going through iptables whitelist.
+      INTERNAL_NETWORK: "172.16.0.0/12"
+
+    volumes:
+      # Granular data mounts as specified in the requirements (§2.4)
+      - ./data/db:/app/data/db
+      - ./data/logs:/app/data/logs
+      - ./data/images:/app/data/images
+      - ./data/tokens:/app/data/tokens
+      # Config is read-only — the agent reads but must never write config files
+      - ./config:/app/config:ro
+
+    networks:
+      # Internal bridge: communicates with ollama
+      - internal
+      # Egress bridge: external calls, locked down by iptables in entrypoint.sh
+      - egress
+
+    depends_on:
+      ollama:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  # --------------------------------------------------------------------------
+  # ollama — LLM inference server.
+  # ZERO external network access: attached to the internal bridge network only.
+  # No ports are published to the host.
+  # --------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: admino-ollama
+    restart: unless-stopped
+
+    # Internal network only — no external routing.
+    # Port 11434 is intentionally NOT published to the host.
+    networks:
+      - internal
+
+    volumes:
+      - ollama_data:/root/.ollama
+
+    # Ollama does not need any elevated capabilities
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 15s
+      start_period: 60s
+      retries: 5
+
+# --------------------------------------------------------------------------
+# Networks
+#
+# `internal` (internal: true): Docker blocks all external routing from this
+#   bridge. Ollama is attached ONLY here — guaranteed zero external access
+#   regardless of iptables state.
+#
+# `egress`: standard bridge with external routing. Only the agent is attached.
+#   iptables rules in entrypoint.sh enforce the whitelist so the agent can
+#   reach googleapis.com etc. but nothing else.
+# --------------------------------------------------------------------------
+networks:
+  internal:
+    name: admino-internal
+    driver: bridge
+    internal: true
+
+  egress:
+    name: admino-egress
+    driver: bridge
+
+# --------------------------------------------------------------------------
+# Volumes
+# --------------------------------------------------------------------------
+volumes:
+  ollama_data:
+    name: admino-ollama-data

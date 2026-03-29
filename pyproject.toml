@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "admino"
+version = "0.1.0"
+description = "Local-only, security-first personal AI agent"
+requires-python = ">=3.12"
+dependencies = [
+    "uvicorn[standard]==0.34.0",
+    "httpx==0.28.1",
+    "pydantic>=2.10.6,<3",
+    "cryptography==44.0.2",
+    "google-auth-oauthlib==1.2.1",
+    "google-api-python-client==2.166.0",
+    "pyyaml==6.0.2",
+    "pytesseract==0.3.13",
+    "Pillow==11.1.0",
+    "beautifulsoup4==4.13.3",
+    "lxml==5.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.5",
+    "pytest-cov==6.0.0",
+    "pytest-asyncio==0.25.3",
+    "ruff==0.11.2",
+    "mypy==1.15.0",
+    "types-PyYAML==6.0.12.20241230",
+    "types-beautifulsoup4==4.12.0.20250204",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/admino"]
+
+[tool.ruff]
+src = ["src"]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "S", "B", "A", "C4", "SIM", "TCH", "RUF"]
+ignore = [
+    # Allow assert in tests
+    "S101",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+disallow_untyped_calls = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_reexport = true
+strict_equality = true
+extra_checks = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=src/admino --cov-report=term-missing --cov-report=html"
