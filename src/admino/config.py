@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from admino.permissions import PermissionsConfig, validate_permissions_config
 
@@ -40,7 +40,8 @@ class ServerConfig(BaseModel):
     host: str = Field(
         default="0.0.0.0",  # noqa: S104
         max_length=255,
-        description="Bind address for the ASGI server.",
+        pattern=r"^(?:(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-fA-F:]+)|localhost)$",
+        description="Bind address for the ASGI server (IPv4, IPv6, or 'localhost').",
     )
     port: int = Field(
         default=8000,
@@ -102,7 +103,7 @@ class PathsConfig(BaseModel):
         default=Path("/app/data/images"),
         description="Directory for uploaded document images.",
     )
-    tokens: Path = Field(
+    tokens_dir: Path = Field(
         default=Path("/app/data/tokens"),
         description="Directory for encrypted OAuth refresh tokens.",
     )
@@ -158,10 +159,23 @@ class EgressConfig(BaseModel):
     @field_validator("allowed_hosts")
     @classmethod
     def validate_allowed_hosts(cls, v: list[str]) -> list[str]:
-        """Ensure all host entries are non-empty strings."""
+        """Ensure all host entries are non-empty, valid hostname patterns.
+
+        Only allows characters safe for shell use and iptables: alphanumeric,
+        dots, hyphens, and leading wildcards (e.g. *.googleapis.com).
+        """
+        import re
+
+        safe_host_re = re.compile(r"^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.\-]{0,251}[a-zA-Z0-9])?$")
         for host in v:
             if not host or len(host) > 253:
                 msg = f"Invalid host entry: '{host}'. Must be 1-253 characters."
+                raise ValueError(msg)
+            if not safe_host_re.match(host):
+                msg = (
+                    f"Invalid host entry: '{host}'. "
+                    "Only alphanumeric characters, dots, hyphens, and a leading '*.' are allowed."
+                )
                 raise ValueError(msg)
         return v
 
@@ -217,7 +231,7 @@ class AppConfig(BaseModel):
         self.paths.database = self.paths.database.resolve()
         self.paths.audit_log = self.paths.audit_log.resolve()
         self.paths.images = self.paths.images.resolve()
-        self.paths.tokens = self.paths.tokens.resolve()
+        self.paths.tokens_dir = self.paths.tokens_dir.resolve()
         self.ocr.binary = self.ocr.binary.resolve()
         return self
 
@@ -305,8 +319,9 @@ def load_app_config(config_path: Path) -> AppConfig:
 
     try:
         return AppConfig.model_validate(data)
-    except Exception as exc:
-        msg = f"Invalid application config: {exc}"
+    except ValidationError as exc:
+        field_errors = ", ".join(str(e["loc"]) for e in exc.errors())
+        msg = f"Invalid application config: validation failed on fields: {field_errors}"
         raise ValueError(msg) from exc
 
 

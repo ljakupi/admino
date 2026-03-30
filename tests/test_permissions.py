@@ -408,7 +408,7 @@ class TestHardcodedDenialsConstant:
 
     def test_count(self) -> None:
         """There should be exactly 5 hardcoded denial pairs."""
-        assert len(HARDCODED_DENIALS) == 5
+        assert len(HARDCODED_DENIALS) == 7
 
     def test_is_frozenset(self) -> None:
         """HARDCODED_DENIALS must be immutable (frozenset)."""

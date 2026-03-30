@@ -16,7 +16,6 @@ import pytest
 from pydantic import ValidationError
 
 from admino.config import (
-    AppConfig,
     AuthConfig,
     EgressConfig,
     LimitsConfig,
@@ -65,7 +64,7 @@ class TestValidConfigLoading:
               database: "/data/db.sqlite"
               audit_log: "/data/audit.jsonl"
               images: "/data/images"
-              tokens: "/data/tokens"
+              tokens_dir: "/data/tokens"
             limits:
               max_tool_calls_per_message: 5
               max_pending_confirmations: 2
@@ -156,9 +155,7 @@ class TestEnvVarOverrides:
         config = load_app_config(yaml_path)
         assert config.ollama.url == "http://env-value:11434"
 
-    def test_ollama_model_override(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_ollama_model_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """OLLAMA_MODEL env var overrides ollama.model from YAML."""
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
@@ -171,9 +168,7 @@ class TestEnvVarOverrides:
         config = load_app_config(yaml_path)
         assert config.ollama.model == "env-model"
 
-    def test_log_level_override(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_log_level_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """LOG_LEVEL env var overrides log_level from YAML."""
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
@@ -185,9 +180,7 @@ class TestEnvVarOverrides:
         config = load_app_config(yaml_path)
         assert config.log_level == "DEBUG"
 
-    def test_audit_log_path_override(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_audit_log_path_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """AUDIT_LOG_PATH env var overrides paths.audit_log from YAML."""
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
@@ -254,7 +247,11 @@ class TestInvalidFieldValues:
             ("ollama:\n  url: 'ftp://bad'", "bad URL scheme", "Invalid application config"),
             ("log_level: 'TRACE'", "invalid log level", "Invalid application config"),
             ("limits:\n  max_tool_calls_per_message: 0", "below min", "Invalid application config"),
-            ("limits:\n  confirmation_timeout_s: 5", "below min timeout", "Invalid application config"),
+            (
+                "limits:\n  confirmation_timeout_s: 5",
+                "below min timeout",
+                "Invalid application config",
+            ),
         ],
         ids=[
             "port_too_low",
@@ -291,7 +288,7 @@ class TestPathResolution:
               database: "relative/db.sqlite"
               audit_log: "relative/audit.jsonl"
               images: "relative/images"
-              tokens: "relative/tokens"
+              tokens_dir: "relative/tokens"
             ocr:
               binary: "relative/tesseract"
             """,
@@ -301,7 +298,7 @@ class TestPathResolution:
         assert config.paths.database.is_absolute()
         assert config.paths.audit_log.is_absolute()
         assert config.paths.images.is_absolute()
-        assert config.paths.tokens.is_absolute()
+        assert config.paths.tokens_dir.is_absolute()
         assert config.ocr.binary.is_absolute()
 
     def test_absolute_paths_stay_absolute(self, tmp_path: Path) -> None:
@@ -468,7 +465,7 @@ class TestInvalidPermissionStates:
                 fetch: {state if state else '""'}
             """,
         )
-        with pytest.raises(ValueError, match="Invalid permission state|must be"):
+        with pytest.raises(ValueError, match=r"Invalid permission state|must be"):
             load_permissions_config(yaml_path)
 
 
@@ -499,6 +496,16 @@ class TestEgressHostValidation:
         """A hostname at exactly 253 characters is accepted."""
         config = EgressConfig(allowed_hosts=["x" * 253])
         assert len(config.allowed_hosts) == 1
+
+    def test_unsafe_characters_rejected(self) -> None:
+        """Hostnames with shell-unsafe characters raise ValidationError."""
+        with pytest.raises(ValidationError, match="Only alphanumeric"):
+            EgressConfig(allowed_hosts=["valid.com", "; rm -rf /"])
+
+    def test_semicolon_in_host_rejected(self) -> None:
+        """A semicolon in a host entry is rejected to prevent shell injection."""
+        with pytest.raises(ValidationError, match="Only alphanumeric"):
+            EgressConfig(allowed_hosts=["evil.com;bad.com"])
 
 
 # ---------------------------------------------------------------------------

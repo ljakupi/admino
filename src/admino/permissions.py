@@ -38,6 +38,8 @@ HARDCODED_DENIALS: frozenset[tuple[str, str]] = frozenset(
         ("calendar", "delete"),
         ("calendar", "update"),
         ("documents", "delete"),
+        ("files", "delete"),
+        ("memory", "delete"),
     }
 )
 

@@ -60,17 +60,26 @@ apply_iptables() {
     # In the container this is populated via the EGRESS_ALLOWED_HOSTS env var.
     if [ -n "${EGRESS_ALLOWED_HOSTS:-}" ]; then
         for host in ${EGRESS_ALLOWED_HOSTS}; do
+            # Validate host entry against safe character set before any shell use.
+            # Allowed: alphanumeric, dots, hyphens, and a leading '*.' wildcard.
+            if ! echo "${host}" | grep -qE '^(\*\.)?[a-zA-Z0-9][a-zA-Z0-9.\-]*[a-zA-Z0-9]$'; then
+                echo "[entrypoint] ERROR: Unsafe host entry '${host}' in EGRESS_ALLOWED_HOSTS — aborting." >&2
+                exit 1
+            fi
             # Strip leading wildcard (e.g. *.googleapis.com -> googleapis.com)
             clean_host="${host#\*.}"
             echo "[entrypoint] Whitelisting egress to: ${clean_host} (port 443)"
-            # Resolve hostname to IP(s) and add rules for each
+            # Resolve hostname to IP(s) and add rules for each.
+            # Fail hard if a required host cannot be resolved — a silent skip
+            # would leave the container running without its intended egress rules.
             resolved=$(getent hosts "${clean_host}" 2>/dev/null | awk '{print $1}' || true)
             if [ -n "$resolved" ]; then
                 for ip in $resolved; do
                     iptables -A OUTPUT -d "${ip}" -p tcp --dport 443 -j ACCEPT
                 done
             else
-                echo "[entrypoint] WARNING: Could not resolve ${clean_host} — skipping." >&2
+                echo "[entrypoint] ERROR: Could not resolve '${clean_host}' — aborting to prevent misconfigured egress." >&2
+                exit 1
             fi
         done
     fi
