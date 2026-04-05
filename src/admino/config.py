@@ -17,13 +17,15 @@ Security notes:
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
 
 from admino.permissions import PermissionsConfig, validate_permissions_config
 
@@ -40,7 +42,6 @@ class ServerConfig(BaseModel):
     host: str = Field(
         default="0.0.0.0",  # noqa: S104
         max_length=255,
-        pattern=r"^(?:(?:\d{1,3}\.){3}\d{1,3}|(?:[0-9a-fA-F:]+)|localhost)$",
         description="Bind address for the ASGI server (IPv4, IPv6, or 'localhost').",
     )
     port: int = Field(
@@ -50,9 +51,27 @@ class ServerConfig(BaseModel):
         description="Listen port for the ASGI server.",
     )
 
+    @field_validator("host")
+    @classmethod
+    def validate_host_address(cls, v: str) -> str:
+        """Validate host is a proper IP address or 'localhost'."""
+        if v == "localhost":
+            return v
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            msg = f"ServerConfig.host {v[:64]!r} is not a valid IP address or 'localhost'."
+            raise ValueError(msg) from None
+        return v
+
 
 class OllamaConfig(BaseModel):
-    """Ollama LLM inference settings."""
+    """Ollama LLM inference settings.
+
+    Security note: use http:// only for local/Docker networking (ollama, localhost,
+    127.0.0.1). For remote Ollama instances, use https:// to prevent cleartext
+    transmission of conversation history.
+    """
 
     url: str = Field(
         default="http://ollama:11434",
@@ -60,6 +79,45 @@ class OllamaConfig(BaseModel):
         pattern=r"^https?://",
         description="Base URL for the Ollama API.",
     )
+
+    @field_validator("url")
+    @classmethod
+    def warn_on_insecure_remote_url(cls, v: str) -> str:
+        """Warn when http:// is used with a non-local host.
+
+        Uses ipaddress to detect loopback and link-local addresses so that
+        non-standard loopback IPs (e.g. 127.0.0.2) and IPv6 link-local
+        addresses (fe80::) are correctly treated as local.
+        """
+        # Reject control characters (CRLF injection, null bytes).
+        if any(c in v for c in "\r\n\x00"):
+            msg = "OllamaConfig.url must not contain control characters."
+            raise ValueError(msg)
+
+        if v.startswith("http://"):
+            host_match = re.match(r"^http://([^/:]+)", v)
+            host = host_match.group(1) if host_match else ""
+            if not host:
+                msg = "OllamaConfig.url must include a hostname."
+                raise ValueError(msg)
+            # Named local hosts and Docker service names
+            local_names = frozenset({"localhost", "ollama"})
+            is_local = host in local_names
+            if not is_local:
+                try:
+                    addr = ipaddress.ip_address(host)
+                    is_local = addr.is_loopback or addr.is_link_local
+                except ValueError:
+                    pass  # Not an IP address — treat as remote
+            if not is_local:
+                logger.warning(
+                    "OllamaConfig.url uses http:// with non-local host '%s'. "
+                    "Conversation history will be transmitted in cleartext. "
+                    "Use https:// for remote Ollama instances.",
+                    host,
+                )
+        return v
+
     model: str = Field(
         default="qwen2.5-coder:14b",
         max_length=200,
@@ -72,6 +130,15 @@ class OllamaConfig(BaseModel):
         description="Request timeout in seconds for Ollama API calls.",
     )
 
+    @field_validator("model")
+    @classmethod
+    def validate_model_name(cls, v: str) -> str:
+        """Reject model names containing shell metacharacters."""
+        if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$", v):
+            msg = "OllamaConfig.model contains invalid characters."
+            raise ValueError(msg)
+        return v
+
 
 class AuthConfig(BaseModel):
     """Authentication configuration.
@@ -82,6 +149,10 @@ class AuthConfig(BaseModel):
     mode: Literal["vpn", "token"] = Field(
         default="vpn",
         description="Auth mode: 'vpn' trusts all connections, 'token' requires Bearer token.",
+    )
+    token: SecretStr | None = Field(
+        default=None,
+        description="Bearer token for 'token' auth mode. Populated from AUTH_TOKEN env var.",
     )
 
 
@@ -149,11 +220,15 @@ class EgressConfig(BaseModel):
 
     allowed_hosts: list[str] = Field(
         default_factory=lambda: [
-            "*.googleapis.com",
             "oauth2.googleapis.com",
             "accounts.google.com",
+            "www.googleapis.com",
         ],
-        description="Hostnames/patterns allowed for outbound connections.",
+        description=(
+            "Hostnames allowed for outbound connections. "
+            "Wildcards (*.example.com) resolve only the apex domain, "
+            "NOT subdomains — list each subdomain explicitly."
+        ),
     )
 
     @field_validator("allowed_hosts")
@@ -164,20 +239,42 @@ class EgressConfig(BaseModel):
         Only allows characters safe for shell use and iptables: alphanumeric,
         dots, hyphens, and leading wildcards (e.g. *.googleapis.com).
         """
-        import re
-
-        safe_host_re = re.compile(r"^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.\-]{0,251}[a-zA-Z0-9])?$")
+        # Requires at least 2 characters (matching the shell regex in entrypoint.sh).
+        # Single-char hostnames are not valid DNS labels and are rejected by both validators.
+        safe_host_re = re.compile(r"(\*\.)?[a-zA-Z0-9][a-zA-Z0-9.\-]*[a-zA-Z0-9]")
         for host in v:
             if not host or len(host) > 253:
-                msg = f"Invalid host entry: '{host}'. Must be 1-253 characters."
+                msg = f"Invalid host entry: '{host}'. Must be 2-253 characters."
                 raise ValueError(msg)
-            if not safe_host_re.match(host):
+            if ".." in host:
+                msg = "Invalid host entry: consecutive dots are not allowed."
+                raise ValueError(msg)
+            if not safe_host_re.fullmatch(host):
                 msg = (
                     f"Invalid host entry: '{host}'. "
                     "Only alphanumeric characters, dots, hyphens, and a leading '*.' are allowed."
                 )
                 raise ValueError(msg)
+            # Reject raw IP addresses — require DNS hostnames.
+            bare_host = host.removeprefix("*.")
+            try:
+                ipaddress.ip_address(bare_host)
+            except ValueError:
+                pass  # Not an IP — this is the expected (good) case.
+            else:
+                msg = "Raw IP addresses are not allowed in egress whitelist; use DNS hostnames."
+                raise ValueError(msg)
         return v
+
+
+# SECURITY: Do not add entries without a security review. Each prefix expands
+# the set of directories from which the OCR binary may be loaded. An overly
+# broad prefix (e.g. "/tmp/") would allow binary substitution attacks.
+_SAFE_BINARY_PREFIXES: tuple[str, ...] = (
+    "/usr/bin/",
+    "/usr/local/bin/",
+    "/opt/homebrew/bin/",
+)
 
 
 class OcrConfig(BaseModel):
@@ -185,20 +282,60 @@ class OcrConfig(BaseModel):
 
     binary: Path = Field(
         default=Path("/usr/bin/tesseract"),
-        description="Path to the Tesseract binary.",
+        description="Path to the Tesseract binary. Must reside under a known-safe prefix.",
     )
     languages: list[str] = Field(
         default_factory=lambda: ["eng"],
         description="Language codes for Tesseract OCR.",
     )
 
+    @field_validator("binary")
+    @classmethod
+    def validate_binary_path(cls, v: Path) -> Path:
+        """Restrict the Tesseract binary to known-safe directory prefixes.
+
+        Prevents an operator-supplied config from redirecting the OCR binary
+        to an arbitrary executable (e.g. /tmp/evil-tesseract).
+
+        Both the unresolved and resolved paths must reside under a safe prefix
+        to prevent symlink laundering (e.g. /tmp/tess -> /usr/bin/tesseract).
+        """
+        # Check unresolved path is also under a safe prefix (prevents symlink laundering)
+        if not any(str(v).startswith(prefix) for prefix in _SAFE_BINARY_PREFIXES):
+            msg = "OcrConfig.binary must reside under a safe prefix before and after resolution."
+            raise ValueError(msg)
+        resolved = v.resolve()
+        if not any(str(resolved).startswith(prefix) for prefix in _SAFE_BINARY_PREFIXES):
+            msg = "OcrConfig.binary resolves outside safe prefixes."
+            raise ValueError(msg)
+        # Warn if the binary does not exist yet (may not be installed on every dev machine).
+        # In production, a missing binary is a hard error.
+        if not resolved.is_file():
+            if os.environ.get("ADMINO_ENV", "").lower() == "production":
+                msg = (
+                    "OCR binary does not exist at the resolved path and "
+                    "ADMINO_ENV=production. Tesseract must be installed."
+                )
+                raise ValueError(msg)
+            logger.warning(
+                "OCR binary does not exist at the resolved path. "
+                "Tesseract may not be installed on this machine."
+            )
+        return resolved
+
     @field_validator("languages")
     @classmethod
     def validate_languages(cls, v: list[str]) -> list[str]:
-        """Ensure language codes are reasonable."""
+        """Ensure language codes are reasonable and contain no shell metacharacters."""
         for lang in v:
             if not lang or len(lang) > 10:
                 msg = f"Invalid language code: '{lang}'. Must be 1-10 characters."
+                raise ValueError(msg)
+            if not re.match(r"^[a-zA-Z0-9_-]+$", lang):
+                msg = (
+                    "Invalid language code: must contain only"
+                    " letters, digits, underscores, and hyphens."
+                )
                 raise ValueError(msg)
         return v
 
@@ -232,13 +369,65 @@ class AppConfig(BaseModel):
         self.paths.audit_log = self.paths.audit_log.resolve()
         self.paths.images = self.paths.images.resolve()
         self.paths.tokens_dir = self.paths.tokens_dir.resolve()
-        self.ocr.binary = self.ocr.binary.resolve()
+        # ocr.binary is already resolved in OcrConfig.validate_binary_path
+        return self
+
+    @model_validator(mode="after")
+    def warn_vpn_mode_on_all_interfaces(self) -> AppConfig:
+        """Warn when binding to all interfaces with no application-layer auth.
+
+        If server.host is 0.0.0.0 (all interfaces) and auth.mode is 'vpn'
+        (trust-the-network), the API is unauthenticated on every interface.
+        This is dangerous on a VPS with a public IP.
+        """
+        if self.server.host == "0.0.0.0" and self.auth.mode == "vpn":  # noqa: S104
+            logger.warning(
+                "server.host is '0.0.0.0' with auth.mode='vpn' — the API is "
+                "unauthenticated on ALL network interfaces. Ensure VPN/firewall "
+                "controls are in place, or switch to auth.mode='token'."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_auth_token_present(self) -> AppConfig:
+        """Fail fast if token auth is configured but AUTH_TOKEN is unset or weak.
+
+        Prevents an empty-string AUTH_TOKEN from creating an authentication
+        bypass where any request without an Authorization header would match.
+        """
+        if self.auth.mode == "token":
+            token = os.environ.get("AUTH_TOKEN", "")
+            if len(token) < 48:
+                msg = (
+                    "auth.mode is 'token' but AUTH_TOKEN env var is missing or "
+                    "shorter than 48 characters. Set a strong AUTH_TOKEN or use "
+                    "auth.mode: vpn."
+                )
+                raise ValueError(msg)
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", token):
+                msg = (
+                    "AUTH_TOKEN contains invalid characters. "
+                    "Only base64-URL-safe characters [A-Za-z0-9_-] are allowed."
+                )
+                raise ValueError(msg)
+            # Floor check only — not a substitute for cryptographically random generation.
+            # Recommended: python -c "import secrets; print(secrets.token_urlsafe(48))"
+            if len(set(token)) < 20:
+                msg = (
+                    "AUTH_TOKEN has insufficient entropy (fewer than 20 unique "
+                    "characters). Generate with: "
+                    'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+                )
+                raise ValueError(msg)
+            self.auth.token = SecretStr(token)
         return self
 
 
 # ---------------------------------------------------------------------------
 # Config loading functions
 # ---------------------------------------------------------------------------
+
+_VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
 def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
@@ -261,22 +450,42 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
         ollama_section = data.setdefault("ollama", {})
         if isinstance(ollama_section, dict):
             ollama_section["url"] = ollama_url
+        else:
+            logger.warning(
+                "Cannot apply OLLAMA_BASE_URL override: 'ollama' config section is not a mapping."
+            )
 
     ollama_model = os.environ.get("OLLAMA_MODEL")
     if ollama_model:
         ollama_section = data.setdefault("ollama", {})
         if isinstance(ollama_section, dict):
             ollama_section["model"] = ollama_model
+        else:
+            logger.warning(
+                "Cannot apply OLLAMA_MODEL override: 'ollama' config section is not a mapping."
+            )
 
     log_level = os.environ.get("LOG_LEVEL")
     if log_level:
-        data["log_level"] = log_level.upper()
+        upper = log_level.upper()
+        if upper in _VALID_LOG_LEVELS:
+            data["log_level"] = upper
+        else:
+            logger.warning(
+                "Ignoring invalid LOG_LEVEL value %r. Valid: %s",
+                log_level,
+                ", ".join(sorted(_VALID_LOG_LEVELS)),
+            )
 
     audit_log_path = os.environ.get("AUDIT_LOG_PATH")
     if audit_log_path:
         paths_section = data.setdefault("paths", {})
         if isinstance(paths_section, dict):
             paths_section["audit_log"] = audit_log_path
+        else:
+            logger.warning(
+                "Cannot apply AUDIT_LOG_PATH override: 'paths' config section is not a mapping."
+            )
 
     return data
 
@@ -300,28 +509,50 @@ def load_app_config(config_path: Path) -> AppConfig:
     """
     data: dict[str, object] = {}
 
-    if config_path.exists():
+    _max_config_bytes = 1_048_577  # 1 MB + 1 byte to detect oversize
+    try:
         logger.info("Loading config from %s", config_path)
-        raw_text = config_path.read_text(encoding="utf-8")
-        parsed = yaml.safe_load(raw_text)
+        with open(config_path, encoding="utf-8") as f:
+            raw_text = f.read(_max_config_bytes)
+        if len(raw_text) >= _max_config_bytes:
+            msg = "Config file exceeds 1MB size limit."
+            raise ValueError(msg)
+    except FileNotFoundError:
+        logger.warning(
+            "Config file %s not found, using defaults with env overrides.",
+            config_path,
+        )
+        raw_text = None
+
+    if raw_text is not None:
+        try:
+            parsed = yaml.safe_load(raw_text)
+        except yaml.YAMLError as exc:
+            msg = "config.yaml contains invalid YAML syntax."
+            raise ValueError(msg) from exc
         if parsed is not None:
             if not isinstance(parsed, dict):
                 msg = f"config.yaml must contain a YAML mapping, got {type(parsed).__name__}"
                 raise ValueError(msg)
             data = parsed
-    else:
-        logger.warning(
-            "Config file %s not found, using defaults with env overrides.",
-            config_path,
-        )
 
     data = _apply_env_overrides(data)
 
     try:
         return AppConfig.model_validate(data)
     except ValidationError as exc:
-        field_errors = ", ".join(str(e["loc"]) for e in exc.errors())
-        msg = f"Invalid application config: validation failed on fields: {field_errors}"
+        error_count = exc.error_count()
+        # Log field paths for operator debugging but do not include in the
+        # exception message — adversarial YAML keys could leak through loc tuples.
+        for err in exc.errors(include_input=False):
+            # Sanitize loc elements — adversarial YAML keys could inject non-printable
+            # characters or overly long strings into the log.
+            safe_loc = tuple(repr(part)[:64] for part in err["loc"])
+            logger.error("Config validation error at %s: %s", safe_loc, err["msg"])
+        msg = (
+            f"Invalid application config: validation failed on "
+            f"{error_count} field(s) — check server logs for details"
+        )
         raise ValueError(msg) from exc
 
 
@@ -341,13 +572,18 @@ def load_permissions_config(permissions_path: Path) -> PermissionsConfig:
         ValueError: If the YAML is malformed or validation fails.
         FileNotFoundError: If the permissions file does not exist.
     """
-    if not permissions_path.exists():
+    try:
+        raw_text = permissions_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         msg = f"Permissions config not found: {permissions_path}"
-        raise FileNotFoundError(msg)
+        raise FileNotFoundError(msg) from None
 
     logger.info("Loading permissions config from %s", permissions_path)
-    raw_text = permissions_path.read_text(encoding="utf-8")
-    parsed = yaml.safe_load(raw_text)
+    try:
+        parsed = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        msg = "permissions.yaml contains invalid YAML syntax."
+        raise ValueError(msg) from exc
 
     if not isinstance(parsed, dict):
         msg = f"permissions.yaml must contain a YAML mapping, got {type(parsed).__name__}"
@@ -371,6 +607,12 @@ def load_permissions_config(permissions_path: Path) -> PermissionsConfig:
         if not isinstance(actions, dict):
             msg = f"Actions for tool '{tool_name}' must be a mapping, got {type(actions).__name__}"
             raise ValueError(msg)
+        for k, v in actions.items():
+            if not isinstance(v, str):
+                msg = (
+                    f"Action value for '{tool_name}.{k}' must be a string, got {type(v).__name__}."
+                )
+                raise ValueError(msg)
         tools_typed[tool_name] = {str(k): str(v) for k, v in actions.items()}
 
     return validate_permissions_config(tools_typed)

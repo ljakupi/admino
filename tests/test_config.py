@@ -9,6 +9,7 @@ and sub-model presence.
 from __future__ import annotations
 
 import logging
+import secrets
 import textwrap
 from pathlib import Path
 
@@ -16,6 +17,7 @@ import pytest
 from pydantic import ValidationError
 
 from admino.config import (
+    AppConfig,
     AuthConfig,
     EgressConfig,
     LimitsConfig,
@@ -26,6 +28,13 @@ from admino.config import (
     load_app_config,
     load_permissions_config,
 )
+
+
+@pytest.fixture()
+def auth_token() -> str:
+    """Generate a fresh high-entropy auth token for each test (min 48 chars, base64url)."""
+    return secrets.token_urlsafe(48)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,8 +55,12 @@ def _write_yaml(path: Path, content: str) -> Path:
 class TestValidConfigLoading:
     """A well-formed config.yaml is parsed into the correct AppConfig fields."""
 
-    def test_all_fields_parsed(self, tmp_path: Path) -> None:
+    def test_all_fields_parsed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_token: str
+    ) -> None:
         """All explicitly set fields in YAML should be reflected in AppConfig."""
+        # AUTH_TOKEN must be set when mode=token to pass the startup validator
+        monkeypatch.setenv("AUTH_TOKEN", auth_token)
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -90,8 +103,10 @@ class TestValidConfigLoading:
         assert config.ollama.model == "llama3"
         assert config.ollama.timeout_s == 60
         assert config.auth.mode == "token"
-        assert config.paths.database == Path("/data/db.sqlite")
-        assert config.paths.audit_log == Path("/data/audit.jsonl")
+        assert config.paths.database.is_absolute()
+        assert str(config.paths.database).endswith("db.sqlite")
+        assert config.paths.audit_log.is_absolute()
+        assert str(config.paths.audit_log).endswith("audit.jsonl")
         assert config.limits.max_tool_calls_per_message == 5
         assert config.limits.max_pending_confirmations == 2
         assert config.limits.confirmation_timeout_s == 120
@@ -100,6 +115,10 @@ class TestValidConfigLoading:
         assert config.egress.allowed_hosts == ["example.com"]
         assert config.ocr.languages == ["eng", "deu"]
         assert config.log_level == "DEBUG"
+        assert config.paths.images.is_absolute()
+        assert str(config.paths.images).endswith("images")
+        assert str(config.paths.tokens_dir).endswith("tokens")
+        assert config.ocr.binary.is_absolute()
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +146,13 @@ class TestDefaults:
     def test_defaults_with_empty_yaml(self, tmp_path: Path) -> None:
         """An empty YAML file (parses as None) uses defaults."""
         yaml_path = _write_yaml(tmp_path / "config.yaml", "")
+        config = load_app_config(yaml_path)
+        assert config.server.port == 8000
+        assert config.log_level == "INFO"
+
+    def test_defaults_with_comment_only_yaml(self, tmp_path: Path) -> None:
+        """A YAML file containing only comments (parses as None) uses defaults."""
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "# just a comment\n")
         config = load_app_config(yaml_path)
         assert config.server.port == 8000
         assert config.log_level == "INFO"
@@ -230,6 +256,12 @@ class TestInvalidYaml:
         with pytest.raises(ValueError, match="YAML mapping"):
             load_app_config(yaml_path)
 
+    def test_malformed_yaml_syntax_raises(self, tmp_path: Path) -> None:
+        """Genuinely malformed YAML (syntax error) raises ValueError."""
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "key: [unclosed\n")
+        with pytest.raises(ValueError, match="invalid YAML syntax"):
+            load_app_config(yaml_path)
+
 
 # ---------------------------------------------------------------------------
 # 5. Invalid field values
@@ -240,18 +272,14 @@ class TestInvalidFieldValues:
     """Out-of-range or wrong-type values trigger ValidationError (wrapped in ValueError)."""
 
     @pytest.mark.parametrize(
-        ("field_path", "value", "match"),
+        ("field_path", "value"),
         [
-            ("server:\n  port: 0", "port below minimum", "Invalid application config"),
-            ("server:\n  port: 70000", "port above maximum", "Invalid application config"),
-            ("ollama:\n  url: 'ftp://bad'", "bad URL scheme", "Invalid application config"),
-            ("log_level: 'TRACE'", "invalid log level", "Invalid application config"),
-            ("limits:\n  max_tool_calls_per_message: 0", "below min", "Invalid application config"),
-            (
-                "limits:\n  confirmation_timeout_s: 5",
-                "below min timeout",
-                "Invalid application config",
-            ),
+            ("server:\n  port: 0", "port below minimum"),
+            ("server:\n  port: 70000", "port above maximum"),
+            ("ollama:\n  url: 'ftp://bad'", "bad URL scheme"),
+            ("log_level: 'TRACE'", "invalid log level"),
+            ("limits:\n  max_tool_calls_per_message: 0", "below min"),
+            ("limits:\n  confirmation_timeout_s: 5", "below min timeout"),
         ],
         ids=[
             "port_too_low",
@@ -262,12 +290,10 @@ class TestInvalidFieldValues:
             "timeout_below_min",
         ],
     )
-    def test_invalid_value_raises(
-        self, tmp_path: Path, field_path: str, value: str, match: str
-    ) -> None:
+    def test_invalid_value_raises(self, tmp_path: Path, field_path: str, value: str) -> None:
         """Various invalid field values raise ValueError wrapping validation errors."""
         yaml_path = _write_yaml(tmp_path / "config.yaml", field_path + "\n")
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match=r"Invalid application config.*field\(s\)"):
             load_app_config(yaml_path)
 
 
@@ -289,8 +315,6 @@ class TestPathResolution:
               audit_log: "relative/audit.jsonl"
               images: "relative/images"
               tokens_dir: "relative/tokens"
-            ocr:
-              binary: "relative/tesseract"
             """,
         )
         config = load_app_config(yaml_path)
@@ -299,7 +323,16 @@ class TestPathResolution:
         assert config.paths.audit_log.is_absolute()
         assert config.paths.images.is_absolute()
         assert config.paths.tokens_dir.is_absolute()
+        # ocr.binary is validated separately — must be under a safe prefix
+
+    def test_ocr_binary_default_is_absolute(self, tmp_path: Path) -> None:
+        """Default OCR binary path is absolute and under a safe prefix."""
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
+        config = load_app_config(yaml_path)
         assert config.ocr.binary.is_absolute()
+        assert str(config.ocr.binary).startswith(
+            ("/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/")
+        )
 
     def test_absolute_paths_stay_absolute(self, tmp_path: Path) -> None:
         """Absolute paths remain unchanged after resolution."""
@@ -390,6 +423,8 @@ class TestHardcodedDenialOverride:
             ("calendar", "delete"),
             ("calendar", "update"),
             ("documents", "delete"),
+            ("files", "delete"),
+            ("memory", "delete"),
         ],
         ids=[
             "gmail.send",
@@ -397,6 +432,8 @@ class TestHardcodedDenialOverride:
             "calendar.delete",
             "calendar.update",
             "documents.delete",
+            "files.delete",
+            "memory.delete",
         ],
     )
     def test_hardcoded_denial_overridden_to_deny(
@@ -419,7 +456,7 @@ class TestHardcodedDenialOverride:
             config = load_permissions_config(yaml_path)
 
         assert config.tools[tool].actions[action] == "deny"
-        assert any("hardcoded denial" in r.message for r in caplog.records)
+        assert any("hardcoded denial" in r.message.lower() for r in caplog.records)
 
     def test_warning_mentions_tool_and_action(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -468,6 +505,24 @@ class TestInvalidPermissionStates:
         with pytest.raises(ValueError, match=r"Invalid permission state|must be"):
             load_permissions_config(yaml_path)
 
+    def test_null_action_value_raises(self, tmp_path: Path) -> None:
+        """A YAML null action value (no value after colon) raises ValueError."""
+        yaml_path = _write_yaml(
+            tmp_path / "permissions.yaml",
+            "tools:\n  news:\n    fetch:\n",
+        )
+        with pytest.raises(ValueError, match="must be a string"):
+            load_permissions_config(yaml_path)
+
+    def test_integer_action_value_raises(self, tmp_path: Path) -> None:
+        """An integer action value in permissions.yaml raises ValueError."""
+        yaml_path = _write_yaml(
+            tmp_path / "permissions.yaml",
+            "tools:\n  gmail:\n    read: 1\n",
+        )
+        with pytest.raises(ValueError, match="must be a string"):
+            load_permissions_config(yaml_path)
+
 
 # ---------------------------------------------------------------------------
 # 11. Egress host validation
@@ -493,8 +548,21 @@ class TestEgressHostValidation:
         assert len(config.allowed_hosts) == 2
 
     def test_max_length_host_accepted(self) -> None:
-        """A hostname at exactly 253 characters is accepted."""
+        """A hostname at exactly 253 characters is accepted.
+
+        Note: single-label hostnames (no dots) are technically accepted by
+        the regex but are unlikely to resolve. The validator focuses on
+        shell-safety, not DNS validity.
+        """
         config = EgressConfig(allowed_hosts=["x" * 253])
+        assert len(config.allowed_hosts) == 1
+
+    def test_valid_dns_boundary_hostname(self) -> None:
+        """A realistic multi-label hostname at exactly 253 chars is accepted."""
+        # "a." * 126 + "a" = 253 chars with dots separating labels
+        hostname = "a." * 126 + "a"
+        assert len(hostname) == 253
+        config = EgressConfig(allowed_hosts=[hostname])
         assert len(config.allowed_hosts) == 1
 
     def test_unsafe_characters_rejected(self) -> None:
@@ -506,6 +574,20 @@ class TestEgressHostValidation:
         """A semicolon in a host entry is rejected to prevent shell injection."""
         with pytest.raises(ValidationError, match="Only alphanumeric"):
             EgressConfig(allowed_hosts=["evil.com;bad.com"])
+
+    def test_invalid_egress_host_in_yaml_raises(self, tmp_path: Path) -> None:
+        """An invalid egress host in config.yaml raises ValueError end-to-end."""
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'egress:\n  allowed_hosts:\n    - "valid.com"\n    - ""',
+        )
+        with pytest.raises(ValueError, match=r"Invalid application config.*field\(s\)"):
+            load_app_config(yaml_path)
+
+    def test_consecutive_dots_rejected(self) -> None:
+        """Hostnames with consecutive dots are rejected."""
+        with pytest.raises(ValidationError, match="consecutive dots"):
+            EgressConfig(allowed_hosts=["a..b.com"])
 
 
 # ---------------------------------------------------------------------------
@@ -580,6 +662,12 @@ class TestPermissionsYamlEdgeCases:
         with pytest.raises(ValueError, match="mapping"):
             load_permissions_config(yaml_path)
 
+    def test_malformed_permissions_yaml_raises(self, tmp_path: Path) -> None:
+        """Malformed YAML in permissions file raises ValueError."""
+        yaml_path = _write_yaml(tmp_path / "permissions.yaml", "key: {unclosed\n")
+        with pytest.raises(ValueError, match="invalid YAML syntax"):
+            load_permissions_config(yaml_path)
+
 
 class TestOcrConfigValidation:
     """OcrConfig language validation edge cases."""
@@ -598,6 +686,18 @@ class TestOcrConfigValidation:
         """Valid language codes pass validation."""
         config = OcrConfig(languages=["eng", "deu", "fra"])
         assert config.languages == ["eng", "deu", "fra"]
+
+    def test_language_code_shell_chars_rejected(self) -> None:
+        """Language codes with shell metacharacters are rejected."""
+        with pytest.raises(ValidationError, match="letters, digits"):
+            OcrConfig(languages=["eng;rm"])
+
+    def test_ocr_symlink_outside_safe_prefix_rejected(self, tmp_path: Path) -> None:
+        """A symlink under a non-safe prefix is rejected even if it points to a safe target."""
+        link = tmp_path / "tesseract"
+        link.symlink_to("/tmp/evil")  # noqa: S108
+        with pytest.raises(ValidationError, match="safe prefix"):
+            OcrConfig(binary=link)
 
 
 class TestServerConfigValidation:
@@ -624,6 +724,167 @@ class TestServerConfigValidation:
             ServerConfig(port=65536)
 
 
+class TestServerHostValidation:
+    """ServerConfig.host validates IP addresses properly."""
+
+    def test_valid_ipv4(self) -> None:
+        config = ServerConfig(host="127.0.0.1")
+        assert config.host == "127.0.0.1"
+
+    def test_valid_ipv6(self) -> None:
+        config = ServerConfig(host="::1")
+        assert config.host == "::1"
+
+    def test_localhost_accepted(self) -> None:
+        config = ServerConfig(host="localhost")
+        assert config.host == "localhost"
+
+    def test_invalid_octet_rejected(self) -> None:
+        """IP with octets > 255 should be rejected."""
+        with pytest.raises(ValidationError):
+            ServerConfig(host="999.999.999.999")
+
+    def test_hostname_rejected(self) -> None:
+        """Non-IP hostnames should be rejected."""
+        with pytest.raises(ValidationError):
+            ServerConfig(host="myserver.example.com")
+
+
+class TestAuthConfigValidation:
+    """AuthConfig token-mode startup validation."""
+
+    def test_token_mode_requires_auth_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mode=token fails if AUTH_TOKEN is absent."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_token_mode_requires_min_48_chars(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mode=token fails if AUTH_TOKEN is shorter than 48 chars."""
+        monkeypatch.setenv("AUTH_TOKEN", "tooshort")
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_token_mode_accepts_strong_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_token: str
+    ) -> None:
+        """mode=token succeeds when AUTH_TOKEN is at least 48 chars with sufficient entropy."""
+        monkeypatch.setenv("AUTH_TOKEN", auth_token)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        config = load_app_config(yaml_path)
+        assert config.auth.mode == "token"
+
+    def test_token_mode_rejects_low_entropy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mode=token fails if AUTH_TOKEN has fewer than 20 unique chars.
+
+        Uses a 48+ char token to isolate the entropy check from the length check.
+        """
+        # 19 unique chars repeated to reach 57 chars — passes length but fails entropy
+        token = "abcdefghijklmnopqrs" * 3
+        assert len(token) >= 48
+        assert len(set(token)) == 19
+        monkeypatch.setenv("AUTH_TOKEN", token)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        with pytest.raises(ValueError, match="Invalid application config"):
+            load_app_config(yaml_path)
+
+    def test_token_with_exactly_19_unique_chars_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 48+ char token with only 19 unique characters should fail entropy check."""
+        # Build a token from exactly 19 distinct base64url chars, repeated to reach 48
+        chars_19 = "abcdefghijklmnopqrs"
+        assert len(set(chars_19)) == 19
+        token = (chars_19 * 3)[:48]  # 48 chars, 19 unique
+        assert len(token) >= 48
+        assert len(set(token)) == 19
+        monkeypatch.setenv("AUTH_TOKEN", token)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_token_with_exactly_20_unique_chars_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 48+ char token with exactly 20 unique characters should pass."""
+        chars_20 = "abcdefghijklmnopqrst"
+        assert len(set(chars_20)) == 20
+        token = (chars_20 * 3)[:48]  # 48 chars, 20 unique
+        assert len(token) >= 48
+        assert len(set(token)) == 20
+        monkeypatch.setenv("AUTH_TOKEN", token)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        config = load_app_config(yaml_path)
+        assert config.auth.mode == "token"
+
+    def test_token_length_47_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 47-char token with high entropy should fail due to length."""
+        # Use a high-entropy token but truncate to 47 chars
+        token = secrets.token_urlsafe(48)[:47]
+        monkeypatch.setenv("AUTH_TOKEN", token)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_token_with_non_base64url_chars_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A 48+ char token containing non-base64url characters should fail."""
+        # Start with a valid token and inject invalid chars
+        token = secrets.token_urlsafe(48)
+        bad_token = token[:46] + "!@"
+        assert len(bad_token) >= 48
+        monkeypatch.setenv("AUTH_TOKEN", bad_token)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_vpn_mode_does_not_require_auth_token(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """mode=vpn succeeds even when AUTH_TOKEN is absent."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "vpn"')
+        config = load_app_config(yaml_path)
+        assert config.auth.mode == "vpn"
+
+    def test_auth_token_not_leaked_in_exception(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The AUTH_TOKEN value must not appear in exception messages."""
+        token = secrets.token_urlsafe(48)
+        monkeypatch.setenv("AUTH_TOKEN", token)
+        # Use an invalid port to trigger a validation error
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            "server:\n  port: 0\nauth:\n  mode: token",
+        )
+        with pytest.raises(ValueError) as exc_info:
+            load_app_config(yaml_path)
+        assert token not in str(exc_info.value)
+        assert token not in str(exc_info.value.__cause__)
+
+    def test_model_construct_bypasses_auth_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Documents that model_construct bypasses security validators.
+
+        Production code must NEVER use model_construct for AppConfig.
+        """
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        # model_construct skips all validators, including validate_auth_token_present
+        config = AppConfig.model_construct(auth=AuthConfig(mode="token"))
+        assert config.auth.mode == "token"
+
+
 class TestOllamaConfigValidation:
     """OllamaConfig URL pattern and timeout validation."""
 
@@ -641,6 +902,16 @@ class TestOllamaConfigValidation:
         """Timeout above 600 raises ValidationError."""
         with pytest.raises(ValidationError):
             OllamaConfig(timeout_s=601)
+
+    def test_crlf_in_url_rejected(self) -> None:
+        """A URL containing CRLF is rejected."""
+        with pytest.raises(ValidationError, match="control characters"):
+            OllamaConfig(url="http://localhost:11434\r\nX-Injected: true")
+
+    def test_model_name_shell_chars_rejected(self) -> None:
+        """Model name with shell metacharacters is rejected."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            OllamaConfig(model="evil; rm -rf /")
 
 
 # ---------------------------------------------------------------------------
@@ -689,3 +960,82 @@ class TestNonStringToolName:
         )
         with pytest.raises(ValueError, match="Tool name must be a string, got float"):
             load_permissions_config(yaml_path)
+
+
+# ---------------------------------------------------------------------------
+# VPN mode + 0.0.0.0 warning
+# ---------------------------------------------------------------------------
+
+
+class TestVpnModeWarning:
+    """Warn when binding to all interfaces with vpn auth (no app-layer auth)."""
+
+    def test_vpn_on_all_interfaces_warns(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """vpn mode + 0.0.0.0 should produce a warning."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  host: "0.0.0.0"\nauth:\n  mode: vpn',
+        )
+        with caplog.at_level(logging.WARNING):
+            load_app_config(yaml_path)
+        assert "unauthenticated on ALL network interfaces" in caplog.text
+
+    def test_token_mode_no_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        auth_token: str,
+    ) -> None:
+        """token mode + 0.0.0.0 should NOT produce the vpn warning."""
+        monkeypatch.setenv("AUTH_TOKEN", auth_token)
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  host: "0.0.0.0"\nauth:\n  mode: token',
+        )
+        with caplog.at_level(logging.WARNING):
+            load_app_config(yaml_path)
+        assert "unauthenticated on ALL" not in caplog.text
+
+    def test_localhost_vpn_no_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """vpn mode + localhost should NOT produce the warning."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  host: "localhost"\nauth:\n  mode: vpn',
+        )
+        with caplog.at_level(logging.WARNING):
+            load_app_config(yaml_path)
+        assert "unauthenticated on ALL" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Environment variable injection attacks
+# ---------------------------------------------------------------------------
+
+
+class TestEnvVarInjection:
+    """Env var values containing injection payloads must be rejected."""
+
+    def test_ollama_url_env_crlf_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OLLAMA_BASE_URL with CRLF injection is rejected."""
+        monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost\r\nX-Injected: true")
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_ollama_model_env_shell_chars_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """OLLAMA_MODEL with shell metacharacters is rejected."""
+        monkeypatch.setenv("OLLAMA_MODEL", "evil;rm -rf /")
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)

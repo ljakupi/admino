@@ -15,6 +15,7 @@ import pytest
 from pydantic import ValidationError
 
 from admino.permissions import (
+    _CONFIRM_ONLY_ACTIONS,
     HARDCODED_DENIALS,
     PermissionResult,
     PermissionsConfig,
@@ -63,23 +64,11 @@ def _build_config_with_hardcoded_allow(tool: str, action: str) -> PermissionsCon
 
 @pytest.mark.parametrize(
     ("tool", "action"),
-    [
-        ("gmail", "send"),
-        ("gmail", "delete"),
-        ("calendar", "delete"),
-        ("calendar", "update"),
-        ("documents", "delete"),
-    ],
-    ids=[
-        "gmail.send",
-        "gmail.delete",
-        "calendar.delete",
-        "calendar.update",
-        "documents.delete",
-    ],
+    sorted(HARDCODED_DENIALS),
+    ids=[f"{t}.{a}" for t, a in sorted(HARDCODED_DENIALS)],
 )
 class TestHardcodedDenials:
-    """All five hardcoded denial pairs must return 'deny' no matter what."""
+    """All hardcoded denial pairs must return 'deny' no matter what."""
 
     def test_denied_with_empty_config(
         self, tool: str, action: str, empty_config: PermissionsConfig
@@ -214,13 +203,8 @@ class TestValidateWarnsOnOverride:
 
     @pytest.mark.parametrize(
         ("tool", "action"),
-        [
-            ("gmail", "send"),
-            ("gmail", "delete"),
-            ("calendar", "delete"),
-            ("calendar", "update"),
-            ("documents", "delete"),
-        ],
+        sorted(HARDCODED_DENIALS),
+        ids=[f"{t}-{a}" for t, a in sorted(HARDCODED_DENIALS)],
     )
     def test_warning_logged_when_override_attempted(
         self,
@@ -245,8 +229,7 @@ class TestValidateWarnsOnOverride:
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warning_messages) >= 1
-        assert "gmail" in warning_messages[0]
-        assert "send" in warning_messages[0]
+        assert any("gmail" in m and "send" in m for m in warning_messages)
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +279,18 @@ class TestNoForbiddenImports:
         source = source_path.read_text()
         tree = ast.parse(source)
 
-        forbidden = {"agent", "llm", "server", "admino.agent", "admino.llm", "admino.server"}
+        forbidden_exact = {
+            "agent",
+            "llm",
+            "server",
+            "admino.agent",
+            "admino.llm",
+            "admino.server",
+            "tools",
+            "admino.tools",
+            "importlib",
+        }
+        forbidden_prefixes = ("admino.tools.", "tools.")
         imported_modules: list[str] = []
 
         for node in ast.walk(tree):
@@ -306,7 +300,17 @@ class TestNoForbiddenImports:
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 imported_modules.append(node.module)
 
-        violations = [m for m in imported_modules if m in forbidden]
+        violations = [
+            m for m in imported_modules if m in forbidden_exact or m.startswith(forbidden_prefixes)
+        ]
+
+        # Also check for __import__() calls
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                func = node.func
+                if isinstance(func, ast.Name) and func.id == "__import__":
+                    violations.append("__import__() call")
+
         assert violations == [], f"Forbidden imports found: {violations}"
 
 
@@ -404,11 +408,22 @@ class TestValidateInvalidState:
 
 
 class TestHardcodedDenialsConstant:
-    """The HARDCODED_DENIALS constant is a frozenset with exactly 5 entries."""
+    """The HARDCODED_DENIALS constant contains the exact expected set."""
 
     def test_count(self) -> None:
-        """There should be exactly 5 hardcoded denial pairs."""
-        assert len(HARDCODED_DENIALS) == 7
+        """HARDCODED_DENIALS contains the exact expected set."""
+        expected = frozenset(
+            {
+                ("gmail", "send"),
+                ("gmail", "delete"),
+                ("calendar", "delete"),
+                ("calendar", "update"),
+                ("documents", "delete"),
+                ("files", "delete"),
+                ("memory", "delete"),
+            }
+        )
+        assert expected == HARDCODED_DENIALS
 
     def test_is_frozenset(self) -> None:
         """HARDCODED_DENIALS must be immutable (frozenset)."""
@@ -422,3 +437,209 @@ class TestToolPermissionsDefaults:
         """A ToolPermissions with no args has an empty actions dict."""
         tp = ToolPermissions()
         assert tp.actions == {}
+
+
+# ---------------------------------------------------------------------------
+# Confirm-only actions: write-mutating actions downgraded from allow to confirm
+# ---------------------------------------------------------------------------
+
+
+class TestConfirmOnlyActions:
+    """Write-mutating actions cannot be set to 'allow' via YAML config."""
+
+    @pytest.mark.parametrize(
+        "tool,action",
+        sorted(_CONFIRM_ONLY_ACTIONS - HARDCODED_DENIALS),
+        ids=[f"{t}.{a}" for t, a in sorted(_CONFIRM_ONLY_ACTIONS - HARDCODED_DENIALS)],
+    )
+    def test_allow_downgraded_to_confirm(
+        self, tool: str, action: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Setting a confirm-only action to 'allow' should be downgraded to 'confirm'."""
+        raw = {tool: {action: "allow"}}
+        with caplog.at_level(logging.WARNING):
+            config = validate_permissions_config(raw)
+        assert config.tools[tool].actions[action] == "confirm"
+        assert "downgrading to 'confirm'" in caplog.text
+
+    @pytest.mark.parametrize(
+        "tool,action",
+        sorted(_CONFIRM_ONLY_ACTIONS - HARDCODED_DENIALS),
+        ids=[f"{t}.{a}" for t, a in sorted(_CONFIRM_ONLY_ACTIONS - HARDCODED_DENIALS)],
+    )
+    def test_confirm_stays_confirm(self, tool: str, action: str) -> None:
+        """Setting a confirm-only action to 'confirm' is accepted as-is."""
+        raw = {tool: {action: "confirm"}}
+        config = validate_permissions_config(raw)
+        assert config.tools[tool].actions[action] == "confirm"
+
+    @pytest.mark.parametrize(
+        "tool,action",
+        sorted(_CONFIRM_ONLY_ACTIONS - HARDCODED_DENIALS),
+        ids=[f"{t}.{a}" for t, a in sorted(_CONFIRM_ONLY_ACTIONS - HARDCODED_DENIALS)],
+    )
+    def test_deny_stays_deny(self, tool: str, action: str) -> None:
+        """Setting a confirm-only action to 'deny' is accepted as-is."""
+        raw = {tool: {action: "deny"}}
+        config = validate_permissions_config(raw)
+        assert config.tools[tool].actions[action] == "deny"
+
+    def test_non_mutating_action_allows_allow(self) -> None:
+        """A non-mutating action like gmail.read can be set to 'allow'."""
+        raw = {"gmail": {"read": "allow"}}
+        config = validate_permissions_config(raw)
+        assert config.tools["gmail"].actions["read"] == "allow"
+
+    def test_confirm_only_is_frozenset(self) -> None:
+        """_CONFIRM_ONLY_ACTIONS is immutable."""
+        assert isinstance(_CONFIRM_ONLY_ACTIONS, frozenset)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial input tests
+# ---------------------------------------------------------------------------
+
+
+class TestAdversarialInputs:
+    """Verify check_permission denies all malformed tool/action identifiers."""
+
+    @pytest.mark.parametrize(
+        ("tool", "action"),
+        [
+            ("", "delete"),  # empty tool
+            ("gmail", ""),  # empty action
+            ("gmail ", "send"),  # trailing space
+            (" gmail", "send"),  # leading space
+            ("GMAIL", "send"),  # uppercase
+            ("gmail\x00", "send"),  # null byte
+            ("g" * 300, "send"),  # overlength
+            ("gmail\nsend", "read"),  # newline in tool
+            ("gmail", "send\r"),  # carriage return in action
+            ("1gmail", "send"),  # starts with digit
+            ("gmail.evil", "send"),  # dot in tool name
+        ],
+    )
+    def test_adversarial_inputs_denied(
+        self, tool: str, action: str, empty_config: PermissionsConfig
+    ) -> None:
+        """Malformed tool/action identifiers must be denied."""
+        result = check_permission(tool, action, empty_config)
+        assert result.allowed == "deny"
+        assert "invalid" in result.reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Hardcoded denials subset of confirm-only
+# ---------------------------------------------------------------------------
+
+
+class TestHardcodedDenialsSubsetOfConfirmOnly:
+    """Every hardcoded denial must also be a confirm-only action."""
+
+    def test_hardcoded_denials_subset_of_confirm_only(self) -> None:
+        """HARDCODED_DENIALS must be a subset of _CONFIRM_ONLY_ACTIONS."""
+        assert HARDCODED_DENIALS <= _CONFIRM_ONLY_ACTIONS
+
+
+# ---------------------------------------------------------------------------
+# End-to-end permission pipeline
+# ---------------------------------------------------------------------------
+
+
+class TestPermissionPipeline:
+    """End-to-end: validate_permissions_config -> check_permission."""
+
+    def test_hardcoded_denial_survives_pipeline(self) -> None:
+        """A hardcoded denial set to 'allow' in raw config is still denied."""
+        raw: dict[str, dict[str, str]] = {"gmail": {"send": "allow", "read": "allow"}}
+        config = validate_permissions_config(raw)
+        result = check_permission("gmail", "send", config)
+        assert result.allowed == "deny"
+
+    def test_allowed_action_survives_pipeline(self) -> None:
+        """A normal 'allow' action passes through the full pipeline."""
+        raw: dict[str, dict[str, str]] = {"gmail": {"read": "allow"}}
+        config = validate_permissions_config(raw)
+        result = check_permission("gmail", "read", config)
+        assert result.allowed == "allow"
+
+    def test_confirm_only_downgrade_in_pipeline(self) -> None:
+        """A confirm-only action set to 'allow' is downgraded to 'confirm'."""
+        raw: dict[str, dict[str, str]] = {"files": {"write": "allow"}}
+        config = validate_permissions_config(raw)
+        result = check_permission("files", "write", config)
+        assert result.allowed == "confirm"
+
+
+# ---------------------------------------------------------------------------
+# Non-string YAML values
+# ---------------------------------------------------------------------------
+
+
+class TestValidateNonStringValues:
+    """validate_permissions_config rejects non-string permission state values.
+
+    Note: config.py pre-validates types via Pydantic before calling
+    validate_permissions_config in production. These tests cover the
+    function's standalone defensive behavior when called directly with
+    raw dicts (e.g. from tests or non-YAML callers).
+    """
+
+    def test_boolean_state_raises(self) -> None:
+        """A boolean value for permission state raises ValueError."""
+        with pytest.raises((ValueError, ValidationError)):
+            validate_permissions_config({"gmail": {"read": True}})  # type: ignore[dict-item]
+
+    def test_integer_state_raises(self) -> None:
+        """An integer value for permission state raises ValueError."""
+        with pytest.raises((ValueError, ValidationError)):
+            validate_permissions_config({"gmail": {"read": 123}})  # type: ignore[dict-item]
+
+    def test_none_state_raises(self) -> None:
+        """A None value for permission state raises ValueError."""
+        with pytest.raises((ValueError, ValidationError)):
+            validate_permissions_config({"gmail": {"read": None}})  # type: ignore[dict-item]
+
+
+# ---------------------------------------------------------------------------
+# Empty actions dict warning
+# ---------------------------------------------------------------------------
+
+
+class TestEmptyActionsWarning:
+    """validate_permissions_config warns when a tool has an empty actions dict."""
+
+    def test_empty_actions_logs_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A tool with no actions should log a warning."""
+        with caplog.at_level(logging.WARNING):
+            validate_permissions_config({"gmail": {}})
+        assert any("no actions" in r.message.lower() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Invalid identifier rejection
+# ---------------------------------------------------------------------------
+
+
+class TestValidateRejectsInvalidIdentifiers:
+    """validate_permissions_config rejects invalid tool/action names early."""
+
+    def test_invalid_tool_name_rejected(self) -> None:
+        """Uppercase tool name should be rejected."""
+        with pytest.raises(ValueError, match="Invalid tool name"):
+            validate_permissions_config({"GMAIL": {"read": "allow"}})
+
+    def test_invalid_action_name_rejected(self) -> None:
+        """Uppercase action name should be rejected."""
+        with pytest.raises(ValueError, match="Invalid action name"):
+            validate_permissions_config({"gmail": {"READ": "allow"}})
+
+    def test_empty_tool_name_rejected(self) -> None:
+        """Empty string tool name should be rejected."""
+        with pytest.raises(ValueError, match="Invalid tool name"):
+            validate_permissions_config({"": {"read": "allow"}})
+
+    def test_tool_name_with_newline_rejected(self) -> None:
+        """Tool name containing a newline should be rejected."""
+        with pytest.raises(ValueError, match="Invalid tool name"):
+            validate_permissions_config({"gmail\nfake": {"read": "allow"}})

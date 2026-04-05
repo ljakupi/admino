@@ -8,14 +8,16 @@ version = "0.1.0"
 description = "Local-only, security-first personal AI agent"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.115.0,<1",
     "uvicorn[standard]==0.34.0",
     "httpx==0.28.1",
     "pydantic>=2.10.6,<3",
+    "pydantic-settings>=2.7.0,<3",
     "cryptography==44.0.2",
     "google-auth-oauthlib==1.2.1",
     "google-api-python-client==2.166.0",
     "pyyaml==6.0.2",
-    "pytesseract==0.3.13",
+    "aiosqlite>=0.20.0,<1",
     "Pillow==11.1.0",
     "beautifulsoup4==4.13.3",
     "lxml==5.3.1",
@@ -42,10 +44,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "S", "B", "A", "C4", "SIM", "TCH", "RUF"]
-ignore = [
-    # Allow assert in tests
-    "S101",
-]
+ignore = []
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101", "S105", "S106"]

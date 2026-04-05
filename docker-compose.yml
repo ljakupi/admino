@@ -21,8 +21,10 @@ services:
     cap_add:
       - NET_ADMIN
 
+    # Bind to localhost only. For LAN/VPN access, change to "0.0.0.0:8000:8000"
+    # or use a reverse proxy. Never expose directly on a public interface.
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
 
     env_file:
       - .env
@@ -34,6 +36,9 @@ services:
       # The internal Docker bridge CIDR — allow all traffic within this range
       # so the agent can reach Ollama without going through iptables whitelist.
       INTERNAL_NETWORK: "172.16.0.0/12"
+      # Hard-fail if NET_ADMIN is absent and iptables whitelist cannot be applied.
+      # Set to "false" only for local development without Docker privileges.
+      REQUIRE_EGRESS_WHITELIST: "true"
 
     volumes:
       # Granular data mounts as specified in the requirements (§2.4)

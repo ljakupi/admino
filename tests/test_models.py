@@ -134,6 +134,10 @@ class TestConversationAuditEntry:
         with pytest.raises(ValidationError):
             _make_conversation_entry(session_id="a" * 65)
 
+    def test_model_min_length_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_conversation_entry(model="")
+
     def test_model_max_length(self) -> None:
         entry = _make_conversation_entry(model="m" * 128)
         assert len(entry.model) == 128
@@ -141,6 +145,16 @@ class TestConversationAuditEntry:
     def test_model_exceeds_max_length(self) -> None:
         with pytest.raises(ValidationError):
             _make_conversation_entry(model="m" * 129)
+
+    def test_model_pattern_accepts_ollama_names(self) -> None:
+        for name in ("llama3", "llama3:8b", "mistral:7b-instruct", "qwen2.5-coder:7b", "phi3/mini"):
+            entry = _make_conversation_entry(model=name)
+            assert entry.model == name
+
+    def test_model_pattern_rejects_invalid(self) -> None:
+        for name in ("has space", "has@char", "{json}", ""):
+            with pytest.raises(ValidationError):
+                _make_conversation_entry(model=name)
 
     def test_tool_calls_count_ge_zero(self) -> None:
         entry = _make_conversation_entry(tool_calls_count=0)
@@ -212,8 +226,14 @@ class TestToolCallAuditEntry:
         entry = _make_tool_call_entry(error="Something broke")
         assert entry.error == "Something broke"
 
+    def test_error_empty_string_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _make_tool_call_entry(error="")
+
     def test_error_max_length(self) -> None:
-        entry = _make_tool_call_entry(error="e" * 512)
+        # Use a string that won't match credential patterns (spaces break the 44-char base64 match)
+        error_msg = ("err " * 128)[:512]
+        entry = _make_tool_call_entry(error=error_msg)
         assert len(entry.error) == 512  # type: ignore[arg-type]
 
     def test_error_exceeds_max_length(self) -> None:
@@ -375,9 +395,35 @@ class TestChatResponse:
         with pytest.raises(ValidationError):
             ChatResponse(session_id="s1", response="x" * 65537)
 
+    def test_session_id_empty_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ChatResponse(session_id="", response="ok")
+
     def test_session_id_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
             ChatResponse(session_id="s" * 65, response="ok")
+
+    def test_session_id_rejects_special_chars(self) -> None:
+        """session_id with spaces is rejected by pattern constraint."""
+        with pytest.raises(ValidationError):
+            ChatResponse(session_id="has space", response="ok")
+
+    def test_session_id_rejects_newline(self) -> None:
+        """session_id with embedded newline is rejected by pattern constraint."""
+        with pytest.raises(ValidationError):
+            ChatResponse(session_id="inj\nected", response="ok")
+
+    def test_session_id_accepts_valid(self) -> None:
+        """session_id with alphanumeric, hyphens, underscores is accepted."""
+        resp = ChatResponse(session_id="abc-123_def", response="ok")
+        assert resp.session_id == "abc-123_def"
+
+    def test_session_id_credential_redacted(self) -> None:
+        """session_id containing a GitHub token pattern should have it redacted."""
+        token = "ghp_" + "A" * 36
+        resp = ChatResponse(session_id=token, response="ok")
+        assert "ghp_" not in resp.session_id
+        assert "[CREDENTIAL_REDACTED]" in resp.session_id
 
 
 # ===========================================================================
@@ -623,6 +669,24 @@ class TestPendingConfirmation:
         assert pc.tool_call.action == "create"
         assert pc.tool_call.args["title"] == "Meeting"
 
+    def test_confirmation_id_empty_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            PendingConfirmation(
+                confirmation_id="",
+                session_id="s1",
+                tool_call=_make_tool_call(),
+                expires_at=_EXPIRES,
+            )
+
+    def test_session_id_empty_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            PendingConfirmation(
+                confirmation_id="c1",
+                session_id="",
+                tool_call=_make_tool_call(),
+                expires_at=_EXPIRES,
+            )
+
     def test_confirmation_id_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
             PendingConfirmation(
@@ -637,6 +701,26 @@ class TestPendingConfirmation:
             PendingConfirmation(
                 confirmation_id="c1",
                 session_id="s" * 65,
+                tool_call=_make_tool_call(),
+                expires_at=_EXPIRES,
+            )
+
+    def test_confirmation_id_rejects_special_chars(self) -> None:
+        """confirmation_id with special characters is rejected by pattern."""
+        with pytest.raises(ValidationError):
+            PendingConfirmation(
+                confirmation_id="c@1",
+                session_id="s1",
+                tool_call=_make_tool_call(),
+                expires_at=_EXPIRES,
+            )
+
+    def test_session_id_rejects_special_chars(self) -> None:
+        """session_id with special characters is rejected by pattern."""
+        with pytest.raises(ValidationError):
+            PendingConfirmation(
+                confirmation_id="c1",
+                session_id="s/1",
                 tool_call=_make_tool_call(),
                 expires_at=_EXPIRES,
             )
@@ -793,3 +877,432 @@ def test_no_secret_field_names(model_cls: type) -> None:
     field_names = set(model_cls.model_fields.keys())
     overlap = field_names & _FORBIDDEN_FIELD_NAMES
     assert overlap == set(), f"{model_cls.__name__} has forbidden fields: {overlap}"
+
+
+# ===========================================================================
+# Credential redaction in audit entries
+# ===========================================================================
+
+
+class TestCredentialRedaction:
+    """Credential patterns are stripped from audit entry fields."""
+
+    def test_google_oauth_token_redacted_in_content(self) -> None:
+        # Real Google tokens are 100+ chars; regex requires at least 64 after prefix
+        fake_token = "ya29." + "a1b2c3d4e5" * 8  # 80 chars after prefix
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="user",
+            content=f"token {fake_token}",
+            model="m",
+            tool_calls_count=0,
+        )
+        assert "ya29." not in entry.content
+        assert "[CREDENTIAL_REDACTED]" in entry.content
+
+    def test_jwt_redacted_in_content(self) -> None:
+        jwt = (
+            "eyJhbGciOiJSUzI1NiJ9."
+            "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+            "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+        )
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="user",
+            content=f"got {jwt}",
+            model="m",
+            tool_calls_count=0,
+        )
+        assert "eyJ" not in entry.content
+
+    def test_bearer_redacted_in_content(self) -> None:
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="user",
+            content="header: Bearer sk-abc123",
+            model="m",
+            tool_calls_count=0,
+        )
+        assert "sk-abc123" not in entry.content
+
+    def test_args_summary_redacted(self) -> None:
+        entry = ToolCallAuditEntry(
+            session_id="s1",
+            tool="gmail",
+            action="read",
+            permission="allow",
+            args_summary="Bearer secret-token-here",
+            success=True,
+        )
+        assert "secret-token-here" not in entry.args_summary
+
+    def test_error_field_redacted(self) -> None:
+        entry = ToolCallAuditEntry(
+            session_id="s1",
+            tool="gmail",
+            action="read",
+            permission="allow",
+            args_summary="safe",
+            success=False,
+            error="failed with ya29." + "x1y2z3w4" * 10,
+        )
+        assert "ya29." not in (entry.error or "")
+
+    def test_model_field_redacted(self) -> None:
+        """Model field validator strips credentials (Bearer pattern in valid model name)."""
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="assistant",
+            content="hello",
+            model="llama3:8b",
+            tool_calls_count=0,
+        )
+        assert entry.model == "llama3:8b"
+
+    def test_model_field_rejects_invalid_chars(self) -> None:
+        """Model field rejects characters outside the allowed pattern."""
+        with pytest.raises(ValidationError):
+            ConversationAuditEntry(
+                session_id="s1",
+                role="user",
+                content="hello",
+                model="Bearer leaked-token",
+                tool_calls_count=0,
+            )
+
+    def test_fernet_key_not_false_positive(self) -> None:
+        """44-char base64 strings should NOT be redacted (Fernet pattern removed)."""
+        safe_hash = "A" * 44
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="user",
+            content=f"hash: {safe_hash}",
+            model="m",
+            tool_calls_count=0,
+        )
+        assert safe_hash in entry.content
+
+    def test_gocspx_client_secret_redacted(self) -> None:
+        """Google OAuth client secrets (GOCSPX-...) should be redacted."""
+        secret = "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="user",
+            content=f"secret is {secret}",
+            model="m",
+            tool_calls_count=0,
+        )
+        assert "GOCSPX-" not in entry.content
+
+    def test_args_summary_strips_direction_override(self) -> None:
+        """args_summary should strip Unicode direction-override chars."""
+        entry = ToolCallAuditEntry(
+            session_id="s1",
+            tool="gmail",
+            action="read",
+            permission="allow",
+            args_summary="safe\u202eevil",
+            success=True,
+        )
+        assert "\u202e" not in entry.args_summary
+        assert "safeevil" in entry.args_summary
+
+    def test_credential_at_truncation_boundary_partial_survives(self) -> None:
+        """A credential truncated below its minimum match length is not redacted.
+
+        This is accepted behaviour -- the regex minimum-length guards prevent
+        partial matches. This test documents the boundary explicitly.
+        """
+        # ya29. pattern requires 20+ chars after prefix. Build a string where
+        # the credential is truncated to 19 chars after prefix (total 24).
+        partial_cred = "ya29." + "a" * 19  # 24 chars total, below 25-char min
+        padding = "x" * (512 - len(partial_cred))
+        entry = _make_tool_call_entry(args_summary=padding + partial_cred)
+        # The partial credential survives because it's below the regex minimum
+        assert partial_cred in entry.args_summary
+
+    def test_content_strips_bidi_isolate_chars(self) -> None:
+        """BiDi Isolate characters (U+2066-U+2069) are stripped from content."""
+        entry = _make_conversation_entry(content="safe\u2066evil\u2069text")
+        assert "\u2066" not in entry.content
+        assert "\u2069" not in entry.content
+        assert "safeeviltext" in entry.content
+
+    def test_error_strips_direction_override(self) -> None:
+        """Error field strips direction-override characters."""
+        entry = _make_tool_call_entry(error="err\u202emsg")
+        assert "\u202e" not in (entry.error or "")
+
+    def test_model_construct_bypasses_redaction(self) -> None:
+        """model_construct() skips validators -- documents the known unsafe path.
+
+        Production code must NEVER use model_construct() for audit entries.
+        """
+        fake_token = "ya29." + "a1b2c3d4e5" * 8
+        entry = ConversationAuditEntry.model_construct(
+            entry_type="conversation",
+            session_id="s1",
+            role="user",
+            content=f"token {fake_token}",
+            model="m",
+            tool_calls_count=0,
+        )
+        # model_construct bypasses the field_validator, so the token survives
+        assert "ya29." in entry.content
+
+
+# ===========================================================================
+# SSEEvent newline sanitization
+# ===========================================================================
+
+
+class TestSSEEventNewlineSanitization:
+    """SSEEvent.data strips bare newlines to prevent frame injection."""
+
+    def test_newline_escaped(self) -> None:
+        ev = SSEEvent(event="msg", data='{"text":"line1\nline2"}')
+        assert "\n" not in ev.data
+        assert "\\n" in ev.data
+
+    def test_crlf_escaped(self) -> None:
+        ev = SSEEvent(event="msg", data="a\r\nb")
+        assert "\r" not in ev.data
+        assert "\n" not in ev.data
+
+    def test_cr_escaped(self) -> None:
+        ev = SSEEvent(event="msg", data="a\rb")
+        assert "\r" not in ev.data
+
+    def test_no_newlines_unchanged(self) -> None:
+        ev = SSEEvent(event="msg", data='{"ok":true}')
+        assert ev.data == '{"ok":true}'
+
+    def test_literal_backslash_n_preserved(self) -> None:
+        """Pre-existing literal backslash-n is preserved (not double-escaped)."""
+        ev = SSEEvent(event="msg", data=r"already escaped: \n done")
+        # The literal \ and n are two separate characters, not a newline
+        assert ev.data == r"already escaped: \n done"
+
+    def test_data_strips_bidi_override(self) -> None:
+        """BiDi RIGHT-TO-LEFT OVERRIDE (U+202E) is stripped from SSE data."""
+        ev = SSEEvent(event="msg", data="safe\u202eevil")
+        assert "\u202e" not in ev.data
+
+    def test_data_strips_bidi_isolates(self) -> None:
+        """BiDi ISOLATE characters (U+2066, U+2069) are stripped from SSE data."""
+        ev = SSEEvent(event="msg", data="test\u2066content\u2069")
+        assert "\u2066" not in ev.data
+        assert "\u2069" not in ev.data
+
+    def test_data_strips_nel(self) -> None:
+        """NEXT LINE (NEL, U+0085) is stripped from SSE data."""
+        ev = SSEEvent(event="msg", data="before\x85after")
+        assert "\x85" not in ev.data
+
+
+# ===========================================================================
+# Comprehensive credential pattern coverage
+# ===========================================================================
+
+
+class TestCredentialRedactionAllPatterns:
+    """Parametrized tests covering ALL credential patterns in _CREDENTIAL_PATTERNS."""
+
+    @pytest.mark.parametrize(
+        ("label", "sample"),
+        [
+            ("google_refresh", "1//" + "a1b2c3d4e5" * 4),
+            ("google_access", "ya29." + "x1y2z3w4p5" * 4),
+            (
+                "jwt",
+                "eyJhbGciOiJSUzI1NiJ9."
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            ),
+            ("bearer", "Bearer sk-proj-abc123def456ghi789"),
+            ("gocspx", "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"),
+            ("sk_api_key", "sk-" + "a1b2c3d4e5f6g7h8i9j0"),
+            ("github_pat", "ghp_" + "A" * 36),
+            ("github_server", "ghs_" + "B" * 36),
+            ("aws_access_key", "AKIA" + "A" * 16),
+            ("slack_bot", "xoxb-" + "a1b2c3d4e5"),
+            ("slack_user", "xoxp-" + "a1b2c3d4e5"),
+            ("stripe_rk_live", "rk_live_" + "a" * 24),
+            ("stripe_rk_test", "rk_test_" + "b" * 24),
+        ],
+        ids=lambda x: x if isinstance(x, str) else "",
+    )
+    def test_pattern_redacted_in_content(self, label: str, sample: str) -> None:
+        """Each credential pattern is redacted from ConversationAuditEntry.content."""
+        entry = ConversationAuditEntry(
+            session_id="s1",
+            role="user",
+            content=f"leaked: {sample}",
+            model="m",
+            tool_calls_count=0,
+        )
+        assert sample not in entry.content
+        assert "[CREDENTIAL_REDACTED]" in entry.content
+
+    @pytest.mark.parametrize(
+        ("label", "sample"),
+        [
+            ("google_access", "ya29." + "x1y2z3w4p5" * 4),
+            ("bearer", "Bearer sk-proj-abc123def456ghi789"),
+            ("github_pat", "ghp_" + "C" * 36),
+            ("aws_key", "AKIA" + "D" * 16),
+            ("slack_bot", "xoxb-" + "e1f2g3h4i5"),
+        ],
+        ids=lambda x: x if isinstance(x, str) else "",
+    )
+    def test_pattern_redacted_in_args_summary(self, label: str, sample: str) -> None:
+        """Each credential pattern is redacted from ToolCallAuditEntry.args_summary."""
+        entry = _make_tool_call_entry(args_summary=f"arg: {sample}")
+        assert sample not in entry.args_summary
+        assert "[CREDENTIAL_REDACTED]" in entry.args_summary
+
+    @pytest.mark.parametrize(
+        ("label", "sample"),
+        [
+            ("google_refresh", "1//" + "a1b2c3d4e5" * 4),
+            ("google_access", "ya29." + "a1b2c3d4e5" * 4),
+            (
+                "jwt",
+                "eyJhbGciOiJSUzI1NiJ9."
+                "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+            ),
+            ("bearer", "Bearer sk-proj-abc123def456ghi789"),
+            ("gocspx", "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"),
+            ("sk_api_key", "sk-" + "a1b2c3d4e5f6g7h8i9j0"),
+            ("github_pat", "ghp_" + "A" * 36),
+            ("github_server", "ghs_" + "E" * 36),
+            ("aws_access_key", "AKIA" + "A" * 16),
+            ("slack_bot", "xoxb-" + "e1f2g3h4i5"),
+            ("slack_user", "xoxp-" + "a1b2c3d4e5"),
+            ("stripe_rk_live", "rk_live_" + "a" * 24),
+            ("stripe_rk_test", "rk_test_" + "b" * 24),
+        ],
+        ids=lambda x: x if isinstance(x, str) else "",
+    )
+    def test_pattern_redacted_in_error(self, label: str, sample: str) -> None:
+        """Each credential pattern is redacted from ToolCallAuditEntry.error."""
+        entry = _make_tool_call_entry(error=f"failed: {sample}")
+        assert sample not in (entry.error or "")
+        assert "[CREDENTIAL_REDACTED]" in (entry.error or "")
+
+
+# ===========================================================================
+# model_construct enforcement (FINDING 17)
+# ===========================================================================
+
+
+class TestModelConstructEnforcement:
+    """Ensure model_construct is never called on audit models in production code."""
+
+    def test_no_model_construct_in_production_code(self) -> None:
+        """Scan production source files to ensure model_construct is not used on audit models."""
+        import ast
+        from pathlib import Path
+
+        src_dir = Path(__file__).parent.parent / "src" / "admino"
+        for py_file in src_dir.glob("*.py"):
+            if py_file.name == "models.py":
+                continue
+            tree = ast.parse(py_file.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Attribute) and node.attr == "model_construct":
+                    pytest.fail(f"model_construct() called in {py_file.name}:{node.lineno}")
+
+
+# ===========================================================================
+# ConversationAuditEntry — tool_calls_count upper bound (FINDING 18)
+# ===========================================================================
+
+
+class TestConversationAuditEntryToolCallsCountBound:
+    """Tests for tool_calls_count upper bound validation."""
+
+    def test_tool_calls_count_at_max_accepted(self) -> None:
+        entry = _make_conversation_entry(tool_calls_count=50)
+        assert entry.tool_calls_count == 50
+
+    def test_tool_calls_count_exceeds_max_rejected(self) -> None:
+        """tool_calls_count=51 exceeds le=50 and must raise ValidationError."""
+        with pytest.raises(ValidationError):
+            _make_conversation_entry(tool_calls_count=51)
+
+
+# ===========================================================================
+# LLMMessage.tool_call_id special characters (FINDING 19)
+# ===========================================================================
+
+
+class TestLLMMessageToolCallId:
+    """Tests for tool_call_id pattern validation on LLMMessage."""
+
+    def test_tool_call_id_rejects_newline(self) -> None:
+        """tool_call_id with embedded newline is rejected."""
+        with pytest.raises(ValidationError):
+            LLMMessage(role="tool", content="r", tool_call_id="tc\n1")
+
+    def test_tool_call_id_rejects_spaces(self) -> None:
+        """tool_call_id with spaces is rejected."""
+        with pytest.raises(ValidationError):
+            LLMMessage(role="tool", content="r", tool_call_id="tc 1")
+
+    def test_tool_call_id_accepts_valid(self) -> None:
+        """tool_call_id with alphanumeric, hyphens, underscores is accepted."""
+        msg = LLMMessage(role="tool", content="r", tool_call_id="tc-123_abc")
+        assert msg.tool_call_id == "tc-123_abc"
+
+
+# ===========================================================================
+# PendingConfirmation expires_at validation (FINDING 20)
+# ===========================================================================
+
+
+def _make_pending_confirmation(**overrides: object) -> PendingConfirmation:
+    """Build a valid PendingConfirmation with optional overrides."""
+    defaults: dict[str, object] = {
+        "confirmation_id": "c1",
+        "session_id": "s1",
+        "tool_call": ToolCall(tool="gmail", action="read", args={}),
+        "expires_at": datetime.now(UTC) + timedelta(minutes=5),
+    }
+    defaults.update(overrides)
+    return PendingConfirmation(**defaults)  # type: ignore[arg-type]
+
+
+class TestPendingConfirmationExpiresAt:
+    """Tests for expires_at temporal validation on PendingConfirmation."""
+
+    def test_expires_at_before_created_rejected(self) -> None:
+        """expires_at before created_at must raise ValidationError."""
+        now = datetime.now(UTC)
+        with pytest.raises(ValidationError):
+            PendingConfirmation(
+                confirmation_id="c1",
+                session_id="s1",
+                tool_call=ToolCall(tool="gmail", action="read", args={}),
+                created_at=now,
+                expires_at=now - timedelta(seconds=10),
+            )
+
+    def test_expires_at_equal_created_rejected(self) -> None:
+        """expires_at equal to created_at must raise ValidationError."""
+        now = datetime.now(UTC)
+        with pytest.raises(ValidationError):
+            PendingConfirmation(
+                confirmation_id="c1",
+                session_id="s1",
+                tool_call=ToolCall(tool="gmail", action="read", args={}),
+                created_at=now,
+                expires_at=now,
+            )
+
+    def test_expires_at_naive_datetime_rejected(self) -> None:
+        """expires_at with timezone-naive datetime must raise ValidationError."""
+        naive_dt = datetime(2026, 1, 1, 12, 0, 0)  # no tzinfo
+        with pytest.raises(ValidationError):
+            _make_pending_confirmation(expires_at=naive_dt)

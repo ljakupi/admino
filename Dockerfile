@@ -59,4 +59,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["uvicorn", "admino.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+# NOTE: --host 0.0.0.0 is correct for Docker (bind to all container interfaces).
+# config.yaml's server.host applies to non-Docker deployments only.
+# Access logging is enabled so HTTP probes leave a trace for security observability.
+CMD ["uvicorn", "admino.main:app", "--host", "0.0.0.0", "--port", "8000"]
