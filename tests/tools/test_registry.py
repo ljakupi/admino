@@ -788,14 +788,29 @@ class TestDispatchArgValidationAdditional:
         assert result.success is False
         assert "validation failed" in result.result.lower()
 
-    async def test_dispatch_extra_fields_handled(
+    async def test_dispatch_extra_fields_rejected(
         self, registered_tool: None, allow_config: PermissionsConfig
     ) -> None:
-        """Extra unexpected fields are handled by Pydantic (default: ignored)."""
+        """Extra unexpected fields are rejected — no covert smuggling channel.
+
+        Pydantic's default ``extra='ignore'`` would silently drop unknown
+        keys. Dispatch enforces ``extra='forbid'`` semantics explicitly so
+        the LLM cannot sneak fields past the schema.
+        """
         tc = _make_tool_call(args={"query": "test", "extra_field": "sneaky"})
         result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
-        # By default Pydantic ignores extra fields, so this should succeed
-        assert result.success is True
+        assert result.success is False
+        assert "unexpected fields" in result.result.lower()
+
+    async def test_dispatch_extra_field_value_not_leaked(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """The rejection message does not echo the extra field's value."""
+        secret = "ghp_verysensitivetokenvalue1234567890abcd"
+        tc = _make_tool_call(args={"query": "test", "sneaky_token": secret})
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        assert result.success is False
+        assert secret not in result.result
 
     async def test_dispatch_validation_error_does_not_leak_raw_value(
         self, allow_config: PermissionsConfig
@@ -1240,3 +1255,442 @@ class TestResourceExhaustionReRaise:
         tc = _make_tool_call()
         with pytest.raises(RecursionError):
             await dispatch_tool_call(tc, allow_config, session_id="s1")
+
+
+# ---------------------------------------------------------------------------
+# 27. Pending confirmation identity / expiry enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestPendingConfirmationEnforcement:
+    """Dispatch must verify pending_confirmation identity and expiry itself.
+
+    Callers are no longer the sole line of defence: a stale or mismatched
+    confirmation object must not unlock a different write action.
+    """
+
+    async def test_mismatched_tool_rejected(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """pending_confirmation for a different tool is rejected as deny."""
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        # Confirmation was issued for a DIFFERENT tool.action
+        other_tc = ToolCall(tool="files", action="write", args={"query": "test"})
+        pending = _make_pending_confirmation(other_tc)
+        # Now dispatch gmail.read with that stale/wrong confirmation
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+        )
+        assert result.success is False
+        assert result.permission.allowed == "deny"
+        assert "does not match" in result.result.lower()
+
+    async def test_mismatched_action_rejected(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """pending_confirmation for the same tool but different action is rejected."""
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        other_tc = ToolCall(tool="gmail", action="list", args={"query": "test"})
+        pending = _make_pending_confirmation(other_tc)
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+        )
+        assert result.success is False
+        assert result.permission.allowed == "deny"
+
+    async def test_mismatched_confirmation_handler_not_called(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """Handler must not execute when pending_confirmation identity mismatches."""
+        called = False
+
+        async def spy_handler(args: SampleArgs, *, session_id: str) -> str:
+            nonlocal called
+            called = True
+            return "run"
+
+        register_tool("gmail", "read", "Read", SampleArgs)(spy_handler)
+        other_tc = ToolCall(tool="files", action="write", args={"query": "test"})
+        pending = _make_pending_confirmation(other_tc)
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+        )
+        assert called is False
+
+    async def test_expired_pending_confirmation_rejected(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """A pending_confirmation past expires_at is rejected as deny."""
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        tc = _make_tool_call()
+        # Build an expired confirmation: created 10 minutes ago, expired 5 minutes ago
+        now = datetime.now(UTC)
+        pending = PendingConfirmation(
+            confirmation_id="confirm-expired",
+            session_id="sess-1",
+            tool_call=tc,
+            created_at=now - timedelta(minutes=10),
+            expires_at=now - timedelta(minutes=5),
+        )
+        result = await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+        )
+        assert result.success is False
+        assert result.permission.allowed == "deny"
+        assert "expired" in result.result.lower()
+
+    async def test_expired_confirmation_handler_not_called(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """Handler must not execute when pending_confirmation has expired."""
+        called = False
+
+        async def spy_handler(args: SampleArgs, *, session_id: str) -> str:
+            nonlocal called
+            called = True
+            return "run"
+
+        register_tool("gmail", "read", "Read", SampleArgs)(spy_handler)
+        tc = _make_tool_call()
+        now = datetime.now(UTC)
+        pending = PendingConfirmation(
+            confirmation_id="confirm-expired",
+            session_id="sess-1",
+            tool_call=tc,
+            created_at=now - timedelta(minutes=10),
+            expires_at=now - timedelta(minutes=5),
+        )
+        await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+        )
+        assert called is False
+
+
+# ---------------------------------------------------------------------------
+# 28. check_permission isolation spy
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPermissionIsolation:
+    """check_permission must be called with ONLY (tool, action, config).
+
+    The permission engine must never see LLM args, session state, or
+    conversation history. This spy test enforces the invariant.
+    """
+
+    async def test_check_permission_called_with_tool_action_config_only(
+        self,
+        allow_config: PermissionsConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Assert check_permission receives exactly (str, str, PermissionsConfig)."""
+        from admino.permissions import PermissionResult
+        from admino.permissions import check_permission as real_check
+        from admino.tools import registry as reg
+
+        captured: list[tuple[object, ...]] = []
+        captured_kwargs: list[dict[str, object]] = []
+
+        def spy(*args: object, **kwargs: object) -> PermissionResult:
+            captured.append(args)
+            captured_kwargs.append(kwargs)
+            return real_check(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(reg, "check_permission", spy)
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        tc = _make_tool_call(args={"query": "sensitive-value-should-not-reach-engine"})
+        await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+
+        assert len(captured) == 1
+        positional = captured[0]
+        # Exactly three positional args
+        assert len(positional) == 3
+        assert positional[0] == "gmail"
+        assert positional[1] == "read"
+        assert positional[2] is allow_config
+        # No kwargs snuck in
+        assert captured_kwargs[0] == {}
+        # Defence-in-depth: no arg value passed
+        for value in positional:
+            assert "sensitive-value-should-not-reach-engine" not in repr(value)
+
+
+# ---------------------------------------------------------------------------
+# 29. Handler exception logging must not pass exc_info
+# ---------------------------------------------------------------------------
+
+
+class TestHandlerExceptionLogHasNoExcInfo:
+    """logger.error for handler exceptions must NOT include exc_info.
+
+    An exception traceback could embed credentials or filesystem paths from
+    arbitrary tool handlers. Only the exception type name is safe to log.
+    """
+
+    async def test_logger_error_not_called_with_exc_info(
+        self,
+        allow_config: PermissionsConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Spy logger.error and assert no call used exc_info."""
+        from admino.tools import registry as reg
+
+        calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def spy(*args: object, **kwargs: object) -> None:
+            calls.append((args, kwargs))
+
+        monkeypatch.setattr(reg.logger, "error", spy)
+        register_tool("gmail", "read", "Read", SampleArgs)(failing_handler)
+        tc = _make_tool_call()
+        await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+
+        assert len(calls) >= 1
+        for _args, kwargs in calls:
+            # exc_info=True would embed the raw exception message in logs
+            assert kwargs.get("exc_info") in (None, False)
+
+
+# ---------------------------------------------------------------------------
+# 30. Registry freeze
+# ---------------------------------------------------------------------------
+
+
+class TestFreezeRegistry:
+    """freeze_registry() blocks further registrations."""
+
+    def test_freeze_blocks_new_registration(self) -> None:
+        """After freeze, register_tool raises RuntimeError."""
+        from admino.tools.registry import freeze_registry
+
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        freeze_registry()
+        with pytest.raises(RuntimeError, match="frozen"):
+            register_tool("news", "fetch", "Fetch", SampleArgs)(sample_handler)
+        # autouse clear_registry fixture resets the frozen flag after the test
+
+    def test_clear_registry_unfreezes(self) -> None:
+        """clear_registry() resets the frozen flag so tests can continue."""
+        from admino.tools.registry import freeze_registry
+
+        freeze_registry()
+        clear_registry()
+        # Should no longer raise
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        assert get_tool_entry("gmail", "read") is not None
+
+
+# ---------------------------------------------------------------------------
+# 31. Audit log entries from dispatch
+# ---------------------------------------------------------------------------
+
+
+class _SpyAuditLogger:
+    """In-memory audit logger spy for dispatch tests.
+
+    Structurally compatible with admino.audit.AuditLogger — exposes only
+    log_tool_call() since that is all dispatch uses. No disk I/O.
+    """
+
+    def __init__(self) -> None:
+        from admino.models import ToolCallAuditEntry
+
+        self.entries: list[ToolCallAuditEntry] = []
+
+    def log_tool_call(self, entry: object) -> None:
+        self.entries.append(entry)  # type: ignore[arg-type]
+
+
+class TestDispatchAuditLogging:
+    """Every dispatch path writes a ToolCallAuditEntry when audit_logger is set."""
+
+    async def test_audit_entry_on_success(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """Successful dispatch writes an audit entry with success=True."""
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        e = spy.entries[0]
+        assert e.tool == "gmail"
+        assert e.action == "read"
+        assert e.permission == "allow"
+        assert e.success is True
+        assert e.error is None
+
+    async def test_audit_entry_on_permission_deny(
+        self, registered_tool: None, deny_config: PermissionsConfig
+    ) -> None:
+        """Permission-denied dispatch writes an audit entry with success=False."""
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc, deny_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert spy.entries[0].permission == "deny"
+        assert spy.entries[0].success is False
+
+    async def test_audit_entry_on_confirm_required(
+        self, registered_tool: None, confirm_config: PermissionsConfig
+    ) -> None:
+        """Confirmation-required dispatch writes an audit entry."""
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert spy.entries[0].permission == "confirm"
+        assert spy.entries[0].success is False
+
+    async def test_audit_entry_on_unknown_tool(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Unknown tool dispatch writes an audit entry."""
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert spy.entries[0].success is False
+        assert spy.entries[0].error is not None
+        assert "unknown" in spy.entries[0].error.lower()
+
+    async def test_audit_entry_on_validation_failure(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """Arg-validation failure writes an audit entry."""
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call(args={"query": ""})  # violates min_length
+        await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert spy.entries[0].success is False
+
+    async def test_audit_entry_on_handler_exception(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Handler exception writes an audit entry (no raw exception details)."""
+        spy = _SpyAuditLogger()
+        register_tool("gmail", "read", "Read", SampleArgs)(failing_handler)
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        entry = spy.entries[0]
+        assert entry.success is False
+        assert entry.error is not None
+        assert "secrets.json" not in entry.error
+        assert "RuntimeError" in entry.error
+
+    async def test_audit_entry_on_malformed_identifier(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Malformed tool identifier writes an audit entry with placeholder values."""
+        spy = _SpyAuditLogger()
+        tc = ToolCall.model_construct(tool="GMAIL", action="read", args={})
+        await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        # Placeholder values because original identifier is not pattern-valid
+        assert spy.entries[0].tool == "invalid"
+        assert spy.entries[0].success is False
+
+    async def test_audit_entry_args_summary_contains_only_key_names(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """args_summary records key names only — never raw values."""
+        spy = _SpyAuditLogger()
+        secret_value = "ghp_1234567890abcdefghijklmnop"
+        tc = _make_tool_call(args={"query": secret_value})
+        await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert "query" in spy.entries[0].args_summary
+        assert secret_value not in spy.entries[0].args_summary
+
+    async def test_audit_entry_on_pending_confirmation_mismatch(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """Mismatched pending_confirmation writes a deny audit entry."""
+        spy = _SpyAuditLogger()
+        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
+        other_tc = ToolCall(tool="files", action="write", args={"query": "x"})
+        pending = _make_pending_confirmation(other_tc)
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc,
+            confirm_config,
+            session_id="sess-1",
+            pending_confirmation=pending,
+            audit_logger=spy,  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert spy.entries[0].permission == "deny"
+
+    async def test_no_audit_entry_when_logger_is_none(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """audit_logger=None is allowed in dev/tests and writes nothing."""
+        # Sanity check — this is the default behaviour that all other tests rely on.
+        result = await dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="sess-1", audit_logger=None
+        )
+        assert result.success is True
+
+
+# ---------------------------------------------------------------------------
+# 32. Production enforcement: audit_logger required when ADMINO_ENV=production
+# ---------------------------------------------------------------------------
+
+
+class TestProductionAuditEnforcement:
+    """In production mode, dispatch must reject audit_logger=None."""
+
+    async def test_production_requires_audit_logger(
+        self,
+        registered_tool: None,
+        allow_config: PermissionsConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """audit_logger=None in production raises ValueError.
+
+        ``_IS_PRODUCTION`` is cached at import time; monkey-patching the
+        module attribute simulates production without reloading.
+        """
+        from admino.tools import registry as reg
+
+        monkeypatch.setattr(reg, "_IS_PRODUCTION", True)
+        tc = _make_tool_call()
+        with pytest.raises(ValueError, match="audit_logger is required"):
+            await dispatch_tool_call(tc, allow_config, session_id="sess-1", audit_logger=None)
+
+    async def test_production_accepts_audit_logger(
+        self,
+        registered_tool: None,
+        allow_config: PermissionsConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """In production, dispatch proceeds normally when audit_logger is supplied."""
+        from admino.tools import registry as reg
+
+        monkeypatch.setattr(reg, "_IS_PRODUCTION", True)
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+        )
+        assert result.success is True
+        assert len(spy.entries) == 1

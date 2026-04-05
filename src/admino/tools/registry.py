@@ -26,9 +26,11 @@ Security notes:
 from __future__ import annotations
 
 import logging
+import os
 import re
 from collections.abc import Awaitable, Callable
-from typing import Final
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -36,10 +38,17 @@ from admino.models import (
     _CONTROL_CHAR_TABLE,
     PendingConfirmation,
     ToolCall,
+    ToolCallAuditEntry,
 )
 from admino.permissions import PermissionResult, PermissionsConfig, check_permission
 
+if TYPE_CHECKING:
+    from admino.audit import AuditLogger
+
 logger = logging.getLogger(__name__)
+
+# Cached at import time so it cannot be mutated between import and dispatch.
+_IS_PRODUCTION: Final[bool] = os.environ.get("ADMINO_ENV", "").lower() == "production"
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -153,6 +162,13 @@ class _ToolEntry(BaseModel):
 # After startup, treat as read-only — tool handlers must never mutate it.
 _REGISTRY: dict[tuple[str, str], _ToolEntry] = {}
 
+# Once frozen, ``register_tool`` refuses further registrations.  Production
+# entry points (main.py / server startup) should call ``freeze_registry()``
+# after all tool modules have been imported.  Direct mutation of ``_REGISTRY``
+# bypasses this flag — the underscore prefix and this comment are the only
+# line of defence for that path.
+_FROZEN: bool = False
+
 
 # ---------------------------------------------------------------------------
 # Registration decorator
@@ -179,6 +195,9 @@ def register_tool(
     Raises:
         ValueError: If tool/action identifiers are invalid or already registered.
     """
+    if _FROZEN:
+        msg = "Tool registry is frozen; register_tool() is not allowed after startup"
+        raise RuntimeError(msg)
     if not _VALID_IDENTIFIER.fullmatch(tool):
         msg = f"Invalid tool name: {tool!r:.64}"
         raise ValueError(msg)
@@ -211,12 +230,48 @@ def register_tool(
 # ---------------------------------------------------------------------------
 
 
+def _write_audit(
+    audit_logger: AuditLogger | None,
+    *,
+    session_id: str,
+    tool: str,
+    action: str,
+    permission: PermissionResult,
+    args_keys: list[str],
+    success: bool,
+    error: str | None,
+) -> None:
+    """Write a ToolCallAuditEntry for a dispatch outcome, if a logger is set.
+
+    The audit entry records only argument *key names*, never values, to
+    avoid credential leakage.  Malformed tool/action identifiers are
+    replaced with fixed placeholders so the Pydantic model validates.
+    """
+    if audit_logger is None:
+        return
+    safe_tool = tool if _VALID_IDENTIFIER.fullmatch(tool) else "invalid"
+    safe_action = action if _VALID_IDENTIFIER.fullmatch(action) else "rejected"
+    # Sort for determinism; truncate to the audit-entry field limit.
+    args_summary = ",".join(sorted(args_keys))[:512] if args_keys else "[no args]"
+    entry = ToolCallAuditEntry(
+        session_id=session_id,
+        tool=safe_tool,
+        action=safe_action,
+        permission=permission.allowed,
+        args_summary=args_summary,
+        success=success,
+        error=error,
+    )
+    audit_logger.log_tool_call(entry)
+
+
 async def dispatch_tool_call(
     tool_call: ToolCall,
     permissions_config: PermissionsConfig,
     *,
     session_id: str,
     pending_confirmation: PendingConfirmation | None = None,
+    audit_logger: AuditLogger | None = None,
 ) -> ToolCallResult:
     """Dispatch a tool call: check permissions, validate args, execute handler.
 
@@ -224,75 +279,222 @@ async def dispatch_tool_call(
     1. Check permission via the isolated permission engine.
     2. If denied, return immediately with the denial reason.
     3. If ``confirm`` and no pending_confirmation supplied, return a result
-       indicating that user confirmation is required.
+       indicating that user confirmation is required.  If pending_confirmation
+       IS supplied, verify its tool/action identity and expiry.
     4. Look up the tool in the registry (reject hallucinated tool names).
-    5. Validate arguments against the tool's Pydantic schema.
+    5. Reject unknown args keys, then validate against the Pydantic schema.
     6. Execute the async handler.
+
+    Every terminal path writes a ``ToolCallAuditEntry`` via ``audit_logger``
+    if one is supplied.  In production (``ADMINO_ENV=production``), an audit
+    logger is REQUIRED — passing ``None`` raises ``ValueError``.
 
     Args:
         tool_call: The LLM-requested tool call (tool, action, raw args).
         permissions_config: The validated permissions configuration.
         session_id: Current session identifier (passed to the handler).
         pending_confirmation: If present, the user has already confirmed this
-            call — skip the confirmation gate and proceed to execution.
-            **Caller contract:** the caller MUST verify that
-            ``pending_confirmation.tool_call.tool == tool_call.tool`` and
-            ``.action == tool_call.action`` before passing it. This function
-            trusts the caller to enforce that invariant.
+            call.  Dispatch verifies that ``pending_confirmation.tool_call.tool``
+            and ``.action`` match the incoming ``tool_call`` and that the
+            confirmation has not expired.  Mismatches and expiries are
+            rejected — the caller is no longer the sole line of defence.
+        audit_logger: Sink for ``ToolCallAuditEntry`` records.  Required in
+            production; optional in dev/tests for ergonomic reasons.
 
     Returns:
         A ``ToolCallResult`` with the outcome of the dispatch.
+
+    Raises:
+        ValueError: If ``audit_logger`` is None and ``ADMINO_ENV=production``.
     """
+    # Production enforcement: audit logger MUST be present.  This mirrors the
+    # pattern in audit.py (base_dir=None disallowed in production) and ensures
+    # the audit trail cannot be silently skipped.
+    if audit_logger is None and _IS_PRODUCTION:
+        msg = (
+            "audit_logger is required in production (ADMINO_ENV=production). "
+            "Pass a non-None AuditLogger to dispatch_tool_call."
+        )
+        raise ValueError(msg)
+
+    raw_tool = tool_call.tool
+    raw_action = tool_call.action
+    args_keys = list(tool_call.args.keys())
+
     # 0. Defensive identifier validation — reject malformed identifiers before
     #    any permission check or registry lookup.
-    if not _VALID_IDENTIFIER.fullmatch(tool_call.tool) or not _VALID_IDENTIFIER.fullmatch(
-        tool_call.action
-    ):
+    if not _VALID_IDENTIFIER.fullmatch(raw_tool) or not _VALID_IDENTIFIER.fullmatch(raw_action):
+        permission = PermissionResult(allowed="deny", reason="Malformed identifier.")
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error="Malformed identifier.",
+        )
         return ToolCallResult(
             success=False,
             result="Invalid tool or action identifier.",
-            permission=PermissionResult(allowed="deny", reason="Malformed identifier."),
+            permission=permission,
         )
 
     # 1. Permission check — ALWAYS first, before any arg parsing or execution.
-    permission = check_permission(tool_call.tool, tool_call.action, permissions_config)
+    #    SECURITY: check_permission receives ONLY (tool, action, config).
+    #    It must never see LLM-supplied args, session state, or conversation.
+    permission = check_permission(raw_tool, raw_action, permissions_config)
 
     # 2. Denied — return immediately.
     if permission.allowed == "deny":
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error=permission.reason,
+        )
         return ToolCallResult(
             success=False,
             result=permission.reason,
             permission=permission,
         )
 
-    # 3. Confirm required — and not yet confirmed by the user.
-    if permission.allowed == "confirm" and pending_confirmation is None:
-        return ToolCallResult(
-            success=False,
-            result=(
-                # defence-in-depth truncation on [:63] slices
-                f"Action {tool_call.tool[:63]}.{tool_call.action[:63]} requires user confirmation."
-            ),
-            permission=permission,
-        )
+    # 3. Confirm required.
+    if permission.allowed == "confirm":
+        # 3a. No confirmation supplied — ask the user.
+        if pending_confirmation is None:
+            _write_audit(
+                audit_logger,
+                session_id=session_id,
+                tool=raw_tool,
+                action=raw_action,
+                permission=permission,
+                args_keys=args_keys,
+                success=False,
+                error="Confirmation required.",
+            )
+            return ToolCallResult(
+                success=False,
+                result=(
+                    # defence-in-depth truncation on [:63] slices
+                    f"Action {raw_tool[:63]}.{raw_action[:63]} requires user confirmation."
+                ),
+                permission=permission,
+            )
+
+        # 3b. Confirmation supplied — enforce identity match.  The caller MUST
+        #     NOT be the sole line of defence: a stale or mismatched
+        #     confirmation must not unlock a different action.
+        if (
+            pending_confirmation.tool_call.tool != raw_tool
+            or pending_confirmation.tool_call.action != raw_action
+        ):
+            logger.warning(
+                "Rejected mismatched pending_confirmation for %s.%s",
+                raw_tool[:64],
+                raw_action[:64],
+            )
+            mismatched = PermissionResult(
+                allowed="deny",
+                reason="Pending confirmation does not match tool call.",
+            )
+            _write_audit(
+                audit_logger,
+                session_id=session_id,
+                tool=raw_tool,
+                action=raw_action,
+                permission=mismatched,
+                args_keys=args_keys,
+                success=False,
+                error="Pending confirmation mismatch.",
+            )
+            return ToolCallResult(
+                success=False,
+                result="Pending confirmation does not match this tool call.",
+                permission=mismatched,
+            )
+
+        # 3c. Confirmation supplied — enforce expiry.
+        if datetime.now(UTC) >= pending_confirmation.expires_at:
+            logger.warning(
+                "Rejected expired pending_confirmation for %s.%s",
+                raw_tool[:64],
+                raw_action[:64],
+            )
+            expired = PermissionResult(
+                allowed="deny",
+                reason="Pending confirmation has expired.",
+            )
+            _write_audit(
+                audit_logger,
+                session_id=session_id,
+                tool=raw_tool,
+                action=raw_action,
+                permission=expired,
+                args_keys=args_keys,
+                success=False,
+                error="Pending confirmation expired.",
+            )
+            return ToolCallResult(
+                success=False,
+                result="Pending confirmation has expired.",
+                permission=expired,
+            )
 
     # 4. Look up tool in the registry.
-    key = (tool_call.tool, tool_call.action)
+    key = (raw_tool, raw_action)
     entry = _REGISTRY.get(key)
     if entry is None:
         logger.warning(
             "Rejected unknown tool %s.%s (not in registry)",
-            tool_call.tool[:64],
-            tool_call.action[:64],
+            raw_tool[:64],
+            raw_action[:64],
+        )
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error="Unknown tool.",
         )
         return ToolCallResult(
             success=False,
             # defence-in-depth truncation on [:63] slices
-            result=f"Unknown tool: {tool_call.tool[:63]}.{tool_call.action[:63]}",
+            result=f"Unknown tool: {raw_tool[:63]}.{raw_action[:63]}",
             permission=permission,
         )
 
-    # 5. Validate arguments against the tool's Pydantic schema.
+    # 5a. Reject args containing fields not declared on the schema.  Pydantic's
+    #     default ``extra='ignore'`` would silently discard them, giving the
+    #     LLM a covert channel to smuggle data past argument validation.
+    schema_fields = set(entry.args_schema.model_fields.keys())
+    extra_keys = [k for k in tool_call.args if k not in schema_fields]
+    if extra_keys:
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error="Unexpected argument fields.",
+        )
+        return ToolCallResult(
+            success=False,
+            result="Argument validation failed: unexpected fields are not permitted.",
+            permission=permission,
+        )
+
+    # 5b. Validate arguments against the tool's Pydantic schema.
     try:
         validated_args = entry.args_schema.model_validate(tool_call.args)
     except ValidationError as exc:
@@ -300,6 +502,16 @@ async def dispatch_tool_call(
         error_details = exc.errors(include_input=False)
         error_summary = "; ".join(
             f"{'.'.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in error_details
+        )
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error="Argument validation failed.",
         )
         return ToolCallResult(
             success=False,
@@ -314,13 +526,25 @@ async def dispatch_tool_call(
         raise
     except Exception as exc:
         # Catch handler errors — never expose raw exception details that
-        # might contain user data or internal paths.
+        # might contain user data or internal paths.  exc_info is deliberately
+        # NOT passed: the exception message could include credentials or
+        # filesystem paths from arbitrary tool handlers.
         error_type = type(exc).__name__
         logger.error(
             "Tool %s.%s raised %s during execution",
-            tool_call.tool[:64],
-            tool_call.action[:64],
+            raw_tool[:64],
+            raw_action[:64],
             error_type,
+        )
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error=f"Handler raised {error_type}",
         )
         return ToolCallResult(
             success=False,
@@ -332,9 +556,19 @@ async def dispatch_tool_call(
     if not isinstance(result, str):
         logger.error(
             "Tool %s.%s returned non-string type %s",
-            tool_call.tool[:64],
-            tool_call.action[:64],
+            raw_tool[:64],
+            raw_action[:64],
             type(result).__name__,
+        )
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=permission,
+            args_keys=args_keys,
+            success=False,
+            error="Handler returned non-string.",
         )
         return ToolCallResult(
             success=False,
@@ -351,6 +585,16 @@ async def dispatch_tool_call(
     if len(sanitized_result) > _MAX_RESULT_LENGTH:
         sanitized_result = sanitized_result[:_MAX_RESULT_LENGTH]
 
+    _write_audit(
+        audit_logger,
+        session_id=session_id,
+        tool=raw_tool,
+        action=raw_action,
+        permission=permission,
+        args_keys=args_keys,
+        success=True,
+        error=None,
+    )
     return ToolCallResult(
         success=True,
         result=sanitized_result,
@@ -410,11 +654,34 @@ def get_tool_entry(tool: str, action: str) -> ToolDescription | None:
     )
 
 
+def freeze_registry() -> None:
+    """Mark the registry as frozen.
+
+    After freezing, any call to ``register_tool`` raises ``RuntimeError``.
+    Production entry points should call this once all tool modules have
+    been imported so that late/dynamic registration cannot silently alter
+    the enforcement surface.
+
+    Note: this flag does not protect against direct mutation of the
+    private ``_REGISTRY`` dict — that is deliberately left to the
+    underscore-prefix convention and CI scans.
+    """
+    global _FROZEN
+    _FROZEN = True
+
+
 def clear_registry() -> None:
-    """Remove all entries from the tool registry.
+    """Remove all entries from the tool registry and unfreeze.
 
     **Testing only** — this function exists solely for test fixture teardown.
-    Production code must never call this. A CI scan test (test_no_production_
-    clear_registry_calls) verifies that no non-test module references it.
+    In production (``ADMINO_ENV=production``) it raises ``RuntimeError`` at
+    call time, regardless of where it is called from.  A CI scan test
+    (``test_no_production_clear_registry_calls``) additionally verifies that
+    no non-test module references it.
     """
+    if _IS_PRODUCTION:
+        msg = "clear_registry() is forbidden in production (ADMINO_ENV=production)"
+        raise RuntimeError(msg)
+    global _FROZEN
     _REGISTRY.clear()
+    _FROZEN = False
