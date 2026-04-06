@@ -113,10 +113,15 @@ class TestConversationAuditEntry:
         entry = _make_conversation_entry(role=role)
         assert entry.role == role
 
-    @pytest.mark.parametrize("role", ["system", "tool", "admin", ""])
+    @pytest.mark.parametrize("role", ["system", "admin", ""])
     def test_role_rejects_invalid(self, role: str) -> None:
         with pytest.raises(ValidationError):
             _make_conversation_entry(role=role)
+
+    def test_role_accepts_tool(self) -> None:
+        """Tool-result turns are valid audit entries (H-3 fix)."""
+        entry = _make_conversation_entry(role="tool")
+        assert entry.role == "tool"
 
     def test_content_max_length(self) -> None:
         entry = _make_conversation_entry(content="x" * 32768)

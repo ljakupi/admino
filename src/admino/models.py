@@ -164,8 +164,11 @@ class ConversationAuditEntry(BaseModel):
         """
         return _strip_credentials(v)
 
-    role: Literal["user", "assistant"] = Field(
-        description="Whether this turn is from the user or the assistant.",
+    role: Literal["user", "assistant", "tool"] = Field(
+        description=(
+            "Role of this turn: 'user' (human input), 'assistant' (LLM output),"
+            " or 'tool' (tool-execution result fed back to the LLM)."
+        ),
     )
     content: str = Field(
         min_length=1,
@@ -597,3 +600,56 @@ class PendingConfirmation(BaseModel):
             msg = "expires_at must be after created_at"
             raise ValueError(msg)
         return self
+
+
+AgentStatus = Literal["final", "awaiting_confirmation", "limit_reached", "error"]
+"""Terminal status of an agent run.
+
+- ``final``: the LLM produced a plain text response; history contains it.
+- ``awaiting_confirmation``: a tool call requires user confirmation; the caller
+  must resume by calling ``Agent.run`` again with ``pending_confirmation`` set.
+- ``limit_reached``: the agent exhausted ``AgentConfig.max_tool_calls`` without
+  producing a final text response.
+- ``error``: an upstream error (e.g. LLM client failure) prevented completion;
+  ``response`` contains a safe human-readable message, never raw exception data.
+"""
+
+
+class AgentResult(BaseModel):
+    """Result of a single ``Agent.run`` invocation.
+
+    The caller owns conversation history: the agent returns the full updated
+    ``history`` (user turn + any assistant/tool turns added during the run) so
+    the caller can persist it. ``tool_calls`` is a summary for the HTTP
+    response layer; authoritative records live in the audit log.
+    """
+
+    status: AgentStatus = Field(
+        description="Terminal status of the agent run.",
+    )
+    response: str = Field(
+        default="",
+        max_length=65536,
+        description=(
+            "Assistant text to surface to the user. Empty when the agent"
+            " terminates without producing text (should not happen in"
+            " practice — always populated with a terminal message)."
+        ),
+    )
+    history: list[LLMMessage] = Field(
+        default_factory=list,
+        max_length=1000,
+        description="Updated conversation history including this turn's additions.",
+    )
+    tool_calls: list[ToolCallRecord] = Field(
+        default_factory=list,
+        max_length=50,
+        description="Summary of tool calls dispatched during this run.",
+    )
+    pending_confirmation: PendingConfirmation | None = Field(
+        default=None,
+        description=(
+            "Set when ``status == 'awaiting_confirmation'``. The caller must"
+            " persist this and pass it back on the resumption call."
+        ),
+    )

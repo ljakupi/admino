@@ -1,0 +1,657 @@
+"""Agent loop orchestrating LLM interaction, tool dispatch, and audit logging.
+
+This module defines the :class:`Agent` class — the single orchestrator that
+ties together the Ollama LLM client (``admino.llm``), the tool registry
+(``admino.tools.registry``), and the audit logger (``admino.audit``).
+
+Architecture & boundaries:
+- The agent is the ONLY component that closes the loop between LLM output,
+  tool dispatch, and conversation history. It MUST NOT be imported by
+  ``permissions.py`` (which remains isolated) and MUST NOT import from
+  ``server.py``.
+- Permission checks happen inside ``registry.dispatch_tool_call``. The agent
+  never calls ``check_permission`` directly — dispatch is the single
+  enforcement point, and passing ``audit_logger`` through ensures every
+  decision is recorded at that point.
+- Conversation history is owned by the *caller*. The agent receives a copy,
+  mutates a local list, and returns the updated list as part of
+  :class:`admino.models.AgentResult`. There is no module-level state.
+
+Security notes:
+- No ``eval``, ``exec``, ``compile``, ``importlib``, ``shell=True``, or
+  dynamic tool dispatch.
+- User message content, raw tool arguments, and assistant text are NEVER
+  logged at INFO/DEBUG. Only counts, tool/action names, and status strings
+  are emitted via the standard logger. Audit entries are the authoritative
+  record.
+- Exceptions from the LLM client are caught and converted into a safe
+  "error" AgentResult. ``MemoryError`` and ``RecursionError`` are
+  re-raised (mirroring the registry pattern).
+- Malformed LLM output (e.g. validation errors on LLM responses) is
+  converted to an assistant message with a generic note and returned —
+  never crashes the loop.
+- ``max_tool_calls`` is a hard cap enforced per-call inside the dispatch
+  batch — the loop breaks the moment it is reached, even mid-batch.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from datetime import UTC, datetime, timedelta
+from secrets import token_urlsafe
+from typing import TYPE_CHECKING
+
+from admino.audit import AuditWriteError
+from admino.models import (
+    AgentConfig,
+    AgentResult,
+    ConversationAuditEntry,
+    LLMMessage,
+    PendingConfirmation,
+    ToolCall,
+    ToolCallRecord,
+)
+from admino.tools.registry import dispatch_tool_call, get_registered_tools
+
+if TYPE_CHECKING:
+    from admino.audit import AuditLogger
+    from admino.llm import OllamaClient
+    from admino.permissions import PermissionsConfig
+    from admino.tools.registry import ToolCallResult, ToolDescription
+
+logger = logging.getLogger(__name__)
+
+_IDENTIFIER_RE: re.Pattern[str] = re.compile(r"[a-z][a-z0-9_]{0,62}")
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# Generic terminal messages. These are surfaced to users via the chat UI, so
+# they must be human-readable but must NOT contain any information derived
+# from LLM output, exception details, or tool arguments.
+_LIMIT_REACHED_MESSAGE: str = (
+    "I could not finish this request within the allowed number of tool calls."
+    " Please try breaking it into smaller steps."
+)
+_LLM_ERROR_MESSAGE: str = (
+    "I hit an error while talking to the local model. Please try again in a moment."
+)
+
+
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+
+class Agent:
+    """Orchestrates the LLM-tool loop for a single user message.
+
+    The agent is constructed once per process (or once per request — it is
+    cheap and stateless) with its dependencies injected. :meth:`run` is the
+    single public entry point and is fully async.
+
+    Dependencies are injected rather than imported at module level so that:
+    (a) tests can substitute fakes trivially, (b) there are no import-time
+    side effects, and (c) the security boundary with ``permissions.py`` is
+    preserved — the agent only ever passes ``PermissionsConfig`` through to
+    ``dispatch_tool_call``; it never imports ``check_permission`` itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        llm_client: OllamaClient,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+        model_name: str,
+    ) -> None:
+        """Initialise the agent with its collaborators.
+
+        Args:
+            llm_client: Async Ollama client used for ``/api/chat`` calls.
+            audit_logger: Append-only audit sink. Passed through to every
+                ``dispatch_tool_call`` invocation so tool-call audit entries
+                are written at the enforcement point.
+            permissions_config: Immutable permissions config, forwarded to
+                dispatch on every tool call. The agent itself never inspects
+                it.
+            agent_config: Runtime limits (``max_tool_calls``,
+                ``max_context_messages``).
+            model_name: Name of the LLM model used — recorded on every
+                conversation audit entry.
+        """
+        self._llm = llm_client
+        self._audit = audit_logger
+        self._permissions = permissions_config
+        self._config = agent_config
+        self._model_name = model_name
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def run(
+        self,
+        user_message: str,
+        session_id: str,
+        *,
+        history: list[LLMMessage],
+        pending_confirmation: PendingConfirmation | None = None,
+    ) -> AgentResult:
+        """Run the agent loop for a single user message.
+
+        The method appends the user message to ``history``, then enters the
+        LLM/tool loop until the LLM produces plain text, a tool call needs
+        confirmation, ``max_tool_calls`` is exhausted, or an error occurs.
+
+        Args:
+            user_message: The user's message text. Must already be validated
+                for length by the caller (server layer).
+            session_id: Session identifier — propagated to audit entries and
+                tool handlers. Must match the audit entry pattern.
+            history: Prior conversation history (caller-owned). The agent
+                copies this list; the original is not mutated.
+            pending_confirmation: If set, a previously-issued confirmation is
+                being resumed. The first tool call in this turn is dispatched
+                with this value so ``registry.dispatch_tool_call`` can verify
+                identity/expiry.
+
+        Returns:
+            :class:`AgentResult` with the terminal status, the updated
+            history, and a summary of tool calls made during the run.
+        """
+        # Work on a local copy so we never mutate the caller's list.
+        working_history: list[LLMMessage] = list(history)
+        working_history.append(LLMMessage(role="user", content=user_message))
+
+        # Audit the user turn before any LLM call so the trail is complete
+        # even if the model call fails — including session-mismatch rejections.
+        try:
+            self._audit_conversation(
+                session_id=session_id,
+                role="user",
+                content=user_message,
+                tool_calls_count=0,
+            )
+        except AuditWriteError:
+            # H-1: Audit failure is fatal for the run.  We cannot continue
+            # without a guaranteed audit trail.  Return a structured error
+            # rather than letting the raw exception propagate to the server.
+            logger.error("Audit write failed for user turn — aborting run")
+            return AgentResult(
+                status="error",
+                response="Internal error: audit unavailable.",
+                history=working_history,
+                tool_calls=[],
+            )
+
+        # H-2: Session-identity check — reject cross-session confirmation replay.
+        # Placed AFTER the user turn is audited so the attempt is recorded.
+        if pending_confirmation is not None and pending_confirmation.session_id != session_id:
+            logger.warning("Rejected cross-session pending_confirmation for session %s", session_id)
+            return self._terminal_error(
+                session_id=session_id,
+                history=working_history,
+                tool_records=[],
+                message="Pending confirmation session mismatch.",
+            )
+
+        tool_records: list[ToolCallRecord] = []
+        tool_calls_used: int = 0
+        tools_payload: list[dict[str, object]] = _tool_descriptions_to_payload(
+            get_registered_tools()
+        )
+        # Carry a one-shot pending_confirmation that is applied to the FIRST
+        # dispatch only, then cleared. This matches the server contract:
+        # a confirmation resumes exactly one tool call.
+        carry_confirmation: PendingConfirmation | None = pending_confirmation
+
+        # Bounded loop. Each iteration = one LLM round trip, possibly followed
+        # by a batch of tool dispatches.
+        for _iteration in range(self._config.max_tool_calls + 1):
+            # 1. Call the LLM with a trimmed context window.
+            trimmed = _trim_context(working_history, self._config.max_context_messages)
+            try:
+                response = await self._llm.chat(trimmed, tools=tools_payload)
+            except (MemoryError, RecursionError):
+                raise
+            except AuditWriteError:
+                # H-1: Propagated from a dispatch audit path inside the LLM
+                # layer is impossible (LLM does not audit), but guard for future.
+                logger.error("Audit write failed during LLM call — aborting run")
+                return self._terminal_error(
+                    session_id=session_id,
+                    history=working_history,
+                    tool_records=tool_records,
+                    message="Internal error: audit unavailable.",
+                )
+            except Exception as exc:
+                # Log only the exception type — never str(exc) which may
+                # embed HTTP response bodies or credentials. See llm.py
+                # OllamaError docstring.
+                logger.error("LLM chat call failed: %s", type(exc).__name__)
+                return self._terminal_error(
+                    session_id=session_id,
+                    history=working_history,
+                    tool_records=tool_records,
+                    message=_LLM_ERROR_MESSAGE,
+                )
+
+            # 2. Text-only response → we are done.
+            if not response.tool_calls:
+                assistant_text = response.content or ""
+                working_history.append(LLMMessage(role="assistant", content=assistant_text))
+                try:
+                    self._audit_conversation(
+                        session_id=session_id,
+                        role="assistant",
+                        content=assistant_text,
+                        tool_calls_count=0,
+                    )
+                except AuditWriteError:
+                    logger.error("Audit write failed for assistant turn — aborting run")
+                    return AgentResult(
+                        status="error",
+                        response="Internal error: audit unavailable.",
+                        history=working_history,
+                        tool_calls=tool_records,
+                    )
+                return AgentResult(
+                    status="final",
+                    response=assistant_text,
+                    history=working_history,
+                    tool_calls=tool_records,
+                )
+
+            # 3. LLM requested tool calls. Dispatch each one, honouring the
+            #    global max_tool_calls cap. If a call comes back pending
+            #    confirmation, short-circuit — the caller will resume us.
+            batch: list[ToolCall] = response.tool_calls
+            # Record the assistant's tool-call turn in history as an empty
+            # assistant message. The LLM needs its own prior turn present so
+            # the tool responses that follow are contextualised correctly.
+            working_history.append(LLMMessage(role="assistant", content=response.content or ""))
+            # L-4: Clamp batch count to le=50 limit on ConversationAuditEntry.
+            # tool_calls_count to avoid a ValidationError crash that would
+            # bypass audit.
+            try:
+                self._audit_conversation(
+                    session_id=session_id,
+                    role="assistant",
+                    content=response.content or "",
+                    tool_calls_count=min(len(batch), 50),
+                )
+            except AuditWriteError:
+                logger.error("Audit write failed for tool-call turn — aborting run")
+                return AgentResult(
+                    status="error",
+                    response="Internal error: audit unavailable.",
+                    history=working_history,
+                    tool_calls=tool_records,
+                )
+
+            for tool_call in batch:
+                if tool_calls_used >= self._config.max_tool_calls:
+                    # Hard cap reached mid-batch — stop immediately.
+                    return self._terminal_limit(
+                        session_id=session_id,
+                        history=working_history,
+                        tool_records=tool_records,
+                    )
+
+                try:
+                    result = await self._dispatch_one(
+                        tool_call=tool_call,
+                        session_id=session_id,
+                        pending_confirmation=carry_confirmation,
+                    )
+                except AuditWriteError:
+                    # H-1: Audit failure inside dispatch is fatal.
+                    logger.error("Audit write failed during tool dispatch — aborting run")
+                    return AgentResult(
+                        status="error",
+                        response="Internal error: audit unavailable.",
+                        history=working_history,
+                        tool_calls=tool_records,
+                    )
+                carry_confirmation = None  # consumed on the first dispatch
+                # M-4 design note: EVERY dispatch (including denied and
+                # validation-failed calls) counts against the cap.  This is
+                # intentional — it prevents the LLM from cheaply probing
+                # many denied tools to map the permission surface.  Trade-off:
+                # an adversarial LLM could exhaust the budget without executing
+                # any real tools.  The conservative choice is correct here.
+                tool_calls_used += 1
+
+                tool_records.append(
+                    ToolCallRecord(
+                        tool=_safe_identifier(tool_call.tool),
+                        action=_safe_identifier(tool_call.action),
+                        permission=result.permission.allowed,
+                        success=result.success,
+                    )
+                )
+
+                # Confirmation required and none carried → short-circuit.
+                # The dispatch layer has already written the audit entry
+                # for the pending-confirmation outcome.
+                if (
+                    result.permission.allowed == "confirm"
+                    and not result.success
+                    and result.pending_confirmation is None
+                ):
+                    # Build a PendingConfirmation object for the caller so
+                    # they can persist it and resume later. Registry does not
+                    # currently synthesise one on the "no confirmation
+                    # supplied" path; we construct it here from the tool call
+                    # plus the configured timeout.
+                    pending = _build_pending_confirmation(
+                        tool_call=tool_call,
+                        session_id=session_id,
+                        timeout_s=self._config.confirmation_timeout_s,
+                    )
+                    return AgentResult(
+                        status="awaiting_confirmation",
+                        response=result.result,
+                        history=working_history,
+                        tool_calls=tool_records,
+                        pending_confirmation=pending,
+                    )
+
+                # Feed the tool result back to the LLM as a tool-role message.
+                working_history.append(
+                    LLMMessage(
+                        role="tool",
+                        content=result.result,
+                    )
+                )
+                # H-3: Audit the tool-result turn so the audit log can
+                # fully reconstruct the LLM context window.
+                try:
+                    self._audit_conversation(
+                        session_id=session_id,
+                        role="tool",
+                        content=result.result,
+                        tool_calls_count=0,
+                    )
+                except AuditWriteError:
+                    logger.error("Audit write failed for tool-result turn — aborting run")
+                    return AgentResult(
+                        status="error",
+                        response="Internal error: audit unavailable.",
+                        history=working_history,
+                        tool_calls=tool_records,
+                    )
+
+            # After the batch, loop back for another LLM turn unless the cap
+            # has been reached.
+            if tool_calls_used >= self._config.max_tool_calls:
+                # Give the LLM one final chance to summarise, OR, if we have
+                # already done so once, terminate. The simplest safe choice
+                # is to terminate here — the LLM may otherwise issue more
+                # tool calls we cannot honour.
+                return self._terminal_limit(
+                    session_id=session_id,
+                    history=working_history,
+                    tool_records=tool_records,
+                )
+
+        # Defensive fallthrough: the for-range loop bound means we should
+        # never reach here, but if we do, treat as limit reached.
+        return self._terminal_limit(
+            session_id=session_id,
+            history=working_history,
+            tool_records=tool_records,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _dispatch_one(
+        self,
+        *,
+        tool_call: ToolCall,
+        session_id: str,
+        pending_confirmation: PendingConfirmation | None,
+    ) -> ToolCallResult:
+        """Dispatch a single tool call via the registry.
+
+        Thin wrapper that exists to (a) keep the main loop readable and
+        (b) centralise the audit-logger pass-through so it cannot be
+        forgotten at a call site.
+        """
+        return await dispatch_tool_call(
+            tool_call,
+            self._permissions,
+            session_id=session_id,
+            pending_confirmation=pending_confirmation,
+            audit_logger=self._audit,
+        )
+
+    def _audit_conversation(
+        self,
+        *,
+        session_id: str,
+        role: str,
+        content: str,
+        tool_calls_count: int,
+    ) -> None:
+        """Write a conversation audit entry.
+
+        Credential redaction, control-character stripping, and length
+        enforcement happen inside ``ConversationAuditEntry`` field
+        validators — we just construct the model.
+        """
+        # ConversationAuditEntry enforces content min_length=1; a genuinely
+        # empty assistant turn (tool-call-only) must still be auditable, so
+        # substitute a single-space placeholder. The redactor will promote
+        # it to "[SANITIZED]" if it collapses to empty.
+        safe_content = content if content else " "
+        # ConversationAuditEntry.content has max_length=32768. Tool results
+        # from the registry can be up to 65,536 chars.  Truncate to prevent
+        # a Pydantic ValidationError that would crash the run.
+        if len(safe_content) > 32768:
+            safe_content = safe_content[:32768]
+        # Map to the ConversationAuditEntry role literal.
+        audit_role: str = role if role in ("user", "assistant", "tool") else "assistant"
+        entry = ConversationAuditEntry(
+            session_id=session_id,
+            role=audit_role,  # type: ignore[arg-type]  # Literal validated by Pydantic
+            content=safe_content,
+            model=self._model_name,
+            tool_calls_count=tool_calls_count,
+        )
+        self._audit.log_conversation(entry)
+
+    def _terminal_limit(
+        self,
+        *,
+        session_id: str,
+        history: list[LLMMessage],
+        tool_records: list[ToolCallRecord],
+    ) -> AgentResult:
+        """Build and audit the terminal "limit reached" result."""
+        history.append(LLMMessage(role="assistant", content=_LIMIT_REACHED_MESSAGE))
+        try:
+            self._audit_conversation(
+                session_id=session_id,
+                role="assistant",
+                content=_LIMIT_REACHED_MESSAGE,
+                tool_calls_count=0,
+            )
+        except AuditWriteError:
+            logger.error("Audit write failed for limit-reached turn")
+        logger.info(
+            "Agent run terminated: max_tool_calls reached (%d tool calls)",
+            len(tool_records),
+        )
+        return AgentResult(
+            status="limit_reached",
+            response=_LIMIT_REACHED_MESSAGE,
+            history=history,
+            tool_calls=tool_records,
+        )
+
+    def _terminal_error(
+        self,
+        *,
+        session_id: str,
+        history: list[LLMMessage],
+        tool_records: list[ToolCallRecord],
+        message: str,
+    ) -> AgentResult:
+        """Build and audit a terminal error result with a safe message."""
+        history.append(LLMMessage(role="assistant", content=message))
+        try:
+            self._audit_conversation(
+                session_id=session_id,
+                role="assistant",
+                content=message,
+                tool_calls_count=0,
+            )
+        except AuditWriteError:
+            logger.error("Audit write failed for error turn")
+        # L-3: Log a "run terminated" message mirroring _terminal_limit.
+        logger.info("Agent run terminated: error (%d tool calls)", len(tool_records))
+        return AgentResult(
+            status="error",
+            response=message,
+            history=history,
+            tool_calls=tool_records,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (pure functions, unit-testable)
+# ---------------------------------------------------------------------------
+
+
+def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessage]:
+    """Return the tail of ``history`` bounded by ``max_messages``.
+
+    System messages at the head of history are preserved; only non-system
+    messages are trimmed from the middle/front. This keeps any persistent
+    system prompt in the context window regardless of conversation length.
+
+    M-1 defence: any ``system``-role message found AFTER the leading block
+    is dropped with a warning. Mid-conversation ``system`` messages could
+    originate from tainted caller-supplied history (e.g. prompt injection
+    persisted across turns) and must not ride through as trusted
+    instructions.
+    """
+    # Split off leading system messages — these are always preserved.
+    leading_system: list[LLMMessage] = []
+    idx = 0
+    for msg in history:
+        if msg.role == "system":
+            leading_system.append(msg)
+            idx += 1
+        else:
+            break
+    rest = history[idx:]
+    # M-1: drop mid-conversation system messages from rest.
+    rest = _filter_mid_system(rest)
+
+    if len(leading_system) + len(rest) <= max_messages:
+        return leading_system + rest
+    budget = max_messages - len(leading_system)
+    if budget <= 0:
+        # L-5: Pathological case — more system messages than the budget.
+        # Return just the system messages (trimmed) and warn.
+        logger.warning(
+            "Context budget (%d) exhausted by %d leading system messages",
+            max_messages,
+            len(leading_system),
+        )
+        return leading_system[:max_messages]
+    return leading_system + rest[-budget:]
+
+
+def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:
+    """Remove any ``system``-role messages from a non-leading position.
+
+    The agent only trusts system messages at the very start of history.
+    Any system-role message that appears mid-conversation (e.g. from a
+    tainted persisted history) is silently dropped with a warning.
+    """
+    filtered: list[LLMMessage] = []
+    for msg in messages:
+        if msg.role == "system":
+            logger.warning("Dropped mid-conversation system-role message from context")
+        else:
+            filtered.append(msg)
+    return filtered
+
+
+def _tool_descriptions_to_payload(
+    descriptions: list[ToolDescription],
+) -> list[dict[str, object]]:
+    """Convert registry tool descriptions to Ollama ``tools`` array format.
+
+    Ollama expects each tool as::
+
+        {
+            "type": "function",
+            "function": {
+                "name": "<tool>.<action>",
+                "description": "...",
+                "parameters": { ...json schema... }
+            }
+        }
+    """
+    payload: list[dict[str, object]] = []
+    for desc in descriptions:
+        payload.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"{desc.tool}.{desc.action}",
+                    "description": desc.description,
+                    "parameters": desc.parameters_schema,
+                },
+            }
+        )
+    return payload
+
+
+def _safe_identifier(value: str) -> str:
+    """Return ``value`` if it matches the identifier pattern, else a placeholder.
+
+    Used when populating :class:`ToolCallRecord`, whose ``tool``/``action``
+    fields enforce the same pattern as the permission engine. A malformed
+    identifier from the LLM would otherwise raise a ValidationError during
+    result construction.
+    """
+    if _IDENTIFIER_RE.fullmatch(value):
+        return value
+    return "invalid"
+
+
+def _build_pending_confirmation(
+    *,
+    tool_call: ToolCall,
+    session_id: str,
+    timeout_s: float,
+) -> PendingConfirmation:
+    """Construct a :class:`PendingConfirmation` for the caller to persist.
+
+    The confirmation_id is a cryptographically-random URL-safe token.
+    ``expires_at`` is derived from trusted ``AgentConfig.confirmation_timeout_s``,
+    never from LLM input.
+    """
+    now = datetime.now(UTC)
+    # Pattern enforces alphanumeric+_-; token_urlsafe produces URL-safe base64
+    # which includes '-' and '_' but no '+' or '/'.
+    confirmation_id = token_urlsafe(16)
+    return PendingConfirmation(
+        confirmation_id=confirmation_id,
+        session_id=session_id,
+        tool_call=tool_call,
+        created_at=now,
+        expires_at=now + timedelta(seconds=timeout_s),
+    )

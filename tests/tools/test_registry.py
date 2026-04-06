@@ -1269,9 +1269,7 @@ class TestPendingConfirmationEnforcement:
     confirmation object must not unlock a different write action.
     """
 
-    async def test_mismatched_tool_rejected(
-        self, confirm_config: PermissionsConfig
-    ) -> None:
+    async def test_mismatched_tool_rejected(self, confirm_config: PermissionsConfig) -> None:
         """pending_confirmation for a different tool is rejected as deny."""
         register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
         # Confirmation was issued for a DIFFERENT tool.action
@@ -1286,9 +1284,7 @@ class TestPendingConfirmationEnforcement:
         assert result.permission.allowed == "deny"
         assert "does not match" in result.result.lower()
 
-    async def test_mismatched_action_rejected(
-        self, confirm_config: PermissionsConfig
-    ) -> None:
+    async def test_mismatched_action_rejected(self, confirm_config: PermissionsConfig) -> None:
         """pending_confirmation for the same tool but different action is rejected."""
         register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
         other_tc = ToolCall(tool="gmail", action="list", args={"query": "test"})
@@ -1514,7 +1510,10 @@ class TestDispatchAuditLogging:
         spy = _SpyAuditLogger()
         tc = _make_tool_call()
         await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         e = spy.entries[0]
@@ -1531,7 +1530,10 @@ class TestDispatchAuditLogging:
         spy = _SpyAuditLogger()
         tc = _make_tool_call()
         await dispatch_tool_call(
-            tc, deny_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            deny_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         assert spy.entries[0].permission == "deny"
@@ -1544,20 +1546,24 @@ class TestDispatchAuditLogging:
         spy = _SpyAuditLogger()
         tc = _make_tool_call()
         await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            confirm_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         assert spy.entries[0].permission == "confirm"
         assert spy.entries[0].success is False
 
-    async def test_audit_entry_on_unknown_tool(
-        self, allow_config: PermissionsConfig
-    ) -> None:
+    async def test_audit_entry_on_unknown_tool(self, allow_config: PermissionsConfig) -> None:
         """Unknown tool dispatch writes an audit entry."""
         spy = _SpyAuditLogger()
         tc = _make_tool_call()
         await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         assert spy.entries[0].success is False
@@ -1571,20 +1577,24 @@ class TestDispatchAuditLogging:
         spy = _SpyAuditLogger()
         tc = _make_tool_call(args={"query": ""})  # violates min_length
         await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         assert spy.entries[0].success is False
 
-    async def test_audit_entry_on_handler_exception(
-        self, allow_config: PermissionsConfig
-    ) -> None:
+    async def test_audit_entry_on_handler_exception(self, allow_config: PermissionsConfig) -> None:
         """Handler exception writes an audit entry (no raw exception details)."""
         spy = _SpyAuditLogger()
         register_tool("gmail", "read", "Read", SampleArgs)(failing_handler)
         tc = _make_tool_call()
         await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         entry = spy.entries[0]
@@ -1600,7 +1610,10 @@ class TestDispatchAuditLogging:
         spy = _SpyAuditLogger()
         tc = ToolCall.model_construct(tool="GMAIL", action="read", args={})
         await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         # Placeholder values because original identifier is not pattern-valid
@@ -1615,7 +1628,10 @@ class TestDispatchAuditLogging:
         secret_value = "ghp_1234567890abcdefghijklmnop"
         tc = _make_tool_call(args={"query": secret_value})
         await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert len(spy.entries) == 1
         assert "query" in spy.entries[0].args_summary
@@ -1690,7 +1706,10 @@ class TestProductionAuditEnforcement:
         spy = _SpyAuditLogger()
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", audit_logger=spy  # type: ignore[arg-type]
+            tc,
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
         )
         assert result.success is True
         assert len(spy.entries) == 1
