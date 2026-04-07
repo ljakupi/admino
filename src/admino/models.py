@@ -46,17 +46,23 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # spoof displayed text in confirmation dialogs or log viewers.
 _CONTROL_CHAR_TABLE: MappingProxyType[int, None] = MappingProxyType(
     dict.fromkeys(
+        # C0 controls (0x00-0x1F) except tab (0x09), LF (0x0A), CR (0x0D).
         [i for i in range(32) if i not in (9, 10, 13)]
+        # C1 controls (0x80-0x9F). Includes U+009B (CSI — Control Sequence
+        # Introducer) which can trigger terminal escape sequences in log
+        # viewers, and U+0085 (NEL) which is a Unicode line break.
+        + list(range(0x80, 0xA0))
         + [
             0x200B,  # ZERO WIDTH SPACE
             0x200C,  # ZERO WIDTH NON-JOINER
             0x200D,  # ZERO WIDTH JOINER
+            0x200E,  # LEFT-TO-RIGHT MARK
+            0x200F,  # RIGHT-TO-LEFT MARK
             0x202A,  # LEFT-TO-RIGHT EMBEDDING
             0x202B,  # RIGHT-TO-LEFT EMBEDDING
             0x202C,  # POP DIRECTIONAL FORMATTING
             0x202D,  # LEFT-TO-RIGHT OVERRIDE
             0x202E,  # RIGHT-TO-LEFT OVERRIDE
-            0x0085,  # NEXT LINE (NEL) — C1 control, line break in Unicode
             0x2028,  # LINE SEPARATOR
             0x2029,  # PARAGRAPH SEPARATOR
             0x2066,  # LEFT-TO-RIGHT ISOLATE
@@ -394,6 +400,19 @@ class ChatResponse(BaseModel):
         max_length=65536,
         description="The assistant's text response.",
     )
+
+    @field_validator("response")
+    @classmethod
+    def sanitize_response(cls, v: str) -> str:
+        """Strip control characters and credentials from assistant response.
+
+        Prevents XSS via LLM output containing script tags or Unicode
+        direction-override characters. This is defence-in-depth — the PWA
+        must also use textContent (not innerHTML) when rendering responses.
+        """
+        v = v.translate(_CONTROL_CHAR_TABLE)
+        return _strip_credentials(v)
+
     tool_calls: list[ToolCallRecord] = Field(
         default_factory=list,
         max_length=50,

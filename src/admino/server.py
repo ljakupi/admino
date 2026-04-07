@@ -1,0 +1,832 @@
+"""FastAPI web server for admino — the HTTP/SSE boundary layer.
+
+Exposes the REST API and SSE streaming endpoint that clients interact with.
+All user input enters through this module and all responses leave through it.
+The server is a thin HTTP layer that delegates business logic to the agent.
+
+Routes:
+- POST /api/message       — Send a user message; returns ChatResponse.
+- GET  /api/events        — SSE stream for a session.
+- POST /api/confirm/{cid} — Approve or deny a pending confirmation.
+- GET  /health            — Health check (no auth required).
+- /                       — Static PWA files (no auth required).
+
+Security notes:
+- Bearer token auth via FastAPI dependency; constant-time comparison (hmac).
+- No raw user content, assistant text, or tool args logged at INFO or below.
+- Error responses use generic messages; never leak internal paths or config.
+- CORS restricted to localhost origins by default.
+- HSTS is not set (plain HTTP local deployment). When deploying behind a
+  TLS-terminating reverse proxy, configure HSTS at the proxy layer.
+- Does NOT import check_permission — permission decisions live in agent/registry.
+- Does NOT import from permissions.py except PermissionsConfig type (via TYPE_CHECKING).
+
+Deployment note:
+- This module uses module-level dicts (_sessions, _pending_confirmations) for
+  in-memory state. This requires a **single-worker** ASGI deployment. Running
+  multiple workers (e.g. uvicorn --workers 2) will silently split state across
+  processes. Use ``--workers 1`` (the default).
+
+Session ID note:
+- Session IDs are client-provided and validated by Pydantic (alphanumeric,
+  hyphens, underscores, max 64 chars). The server does not generate session IDs.
+  This is by design: the client is the only user (local-first, single-tenant).
+  Two clients sharing the same token AND same session_id will share history —
+  this is acceptable for the single-user threat model.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hmac
+import json
+import logging
+import time
+from collections import OrderedDict
+from datetime import UTC, datetime
+from pathlib import Path as PathLib
+from typing import TYPE_CHECKING
+
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import ValidationError
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from admino.models import (
+    AgentResult,
+    ChatRequest,
+    ChatResponse,
+    ConfirmRequest,
+    LLMMessage,
+    PendingConfirmation,
+    SSEEvent,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable
+
+    from starlette.responses import Response
+
+    from admino.agent import Agent
+    from admino.config import AppConfig
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Security headers middleware
+# ---------------------------------------------------------------------------
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Injects security response headers on every HTTP response.
+
+    Mitigates XSS (CSP), clickjacking (X-Frame-Options), MIME-sniffing
+    (X-Content-Type-Options), and information leakage (Referrer-Policy,
+    Permissions-Policy). Applied even for local-only deployments because
+    the PWA runs in a browser that respects these headers.
+
+    Note: ``Strict-Transport-Security`` (HSTS) is intentionally omitted.
+    This app serves over plain HTTP for local deployment. When deployed
+    behind a TLS-terminating reverse proxy (nginx, Caddy), HSTS must be
+    configured at the proxy layer — not here.
+    """
+
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        """Add security headers to every response."""
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; script-src 'self'; style-src 'self'; "
+            "connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+            "object-src 'none'; frame-ancestors 'none'; base-uri 'self'; "
+            "form-action 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=(), payment=()"
+        )
+        return response
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter
+# ---------------------------------------------------------------------------
+
+
+class _TokenBucket:
+    """Simple in-process token-bucket rate limiter.
+
+    Designed for single-user local deployment. Limits requests per second
+    to prevent resource exhaustion (Ollama inference, memory). Not shared
+    across workers — requires single-worker deployment (already required
+    by the in-memory session store).
+
+    Args:
+        rate: Tokens added per second.
+        capacity: Maximum burst capacity.
+    """
+
+    __slots__ = ("_capacity", "_last_refill", "_rate", "_tokens")
+
+    def __init__(self, rate: float, capacity: int) -> None:
+        self._rate = rate
+        self._capacity = capacity
+        self._tokens = float(capacity)
+        self._last_refill = time.monotonic()
+
+    def allow(self) -> bool:
+        """Consume one token. Returns True if the request is allowed."""
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+        self._last_refill = now
+        if self._tokens >= 1.0:
+            self._tokens -= 1.0
+            return True
+        return False
+
+
+# Per-path rate limiters. Configured for single-user local use:
+# - POST /api/message: 30 req/min (0.5/s) with burst of 5
+# - POST /api/confirm: 30 req/min (0.5/s) with burst of 5
+# - GET  /api/events:  10 req/min (~0.17/s) with burst of 3 (SSE connections)
+# A global fallback bucket catches any future routes that lack a specific limiter.
+_rate_limiters: dict[str, _TokenBucket] = {}
+_global_rate_limiter: _TokenBucket | None = None
+
+
+def _check_rate_limit(path: str) -> None:
+    """Check rate limit for a given path. Raises 429 if exceeded.
+
+    Uses the path-specific limiter if one exists, otherwise falls back
+    to the global limiter. This ensures new routes are rate-limited by
+    default even if no specific limiter is configured.
+
+    Args:
+        path: The request path to rate-limit.
+
+    Raises:
+        HTTPException: 429 if rate limit exceeded.
+    """
+    bucket = _rate_limiters.get(path, _global_rate_limiter)
+    if bucket is not None and not bucket.allow():
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+
+# ---------------------------------------------------------------------------
+# Module-level state — set during create_app()
+# ---------------------------------------------------------------------------
+
+# Maximum number of concurrent sessions before LRU eviction kicks in.
+# Sized for single-user local deployment with generous headroom.
+_MAX_SESSIONS: int = 256
+
+# In-memory session store: session_id -> conversation history.
+# No persistence across restarts (privacy-first design).
+# OrderedDict enables O(1) LRU eviction when _MAX_SESSIONS is exceeded.
+_sessions: OrderedDict[str, list[LLMMessage]] = OrderedDict()
+
+# Pending confirmations per session: session_id -> PendingConfirmation.
+# Keyed by session_id intentionally — only one pending confirmation per session.
+# A new confirmation for the same session overwrites the previous one. This
+# prevents confirmation queue buildup and simplifies the confirmation UX.
+_pending_confirmations: dict[str, PendingConfirmation] = {}
+
+# Per-session asyncio locks to serialise concurrent requests for the same
+# session. Prevents race conditions where two concurrent POST /api/message
+# requests read the same history snapshot, both run the agent, and the
+# second write silently overwrites the first's result. Also protects the
+# confirmation flow from interleaving with new messages.
+# Keyed by session_id; entries are lazily created and cleaned up on LRU
+# eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
+_session_locks: dict[str, asyncio.Lock] = {}
+
+# Injected at app creation time by create_app().
+_agent: Agent | None = None
+_config: AppConfig | None = None
+
+
+# ---------------------------------------------------------------------------
+# Session helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_session_lock(session_id: str) -> asyncio.Lock:
+    """Get or create a per-session asyncio lock.
+
+    Lazily creates locks on first access. Cleaned up when sessions are
+    LRU-evicted in ``_touch_session``, keeping the dict bounded by
+    ``_MAX_SESSIONS``.
+
+    Args:
+        session_id: The session identifier.
+
+    Returns:
+        The asyncio.Lock for the given session.
+    """
+    if session_id not in _session_locks:
+        _session_locks[session_id] = asyncio.Lock()
+    return _session_locks[session_id]
+
+
+def _touch_session(session_id: str, history: list[LLMMessage]) -> None:
+    """Insert or update a session, maintaining LRU order.
+
+    If the session store exceeds _MAX_SESSIONS, the least-recently-used
+    session is evicted. This bounds memory usage and prevents DoS via
+    unbounded session creation.
+
+    Args:
+        session_id: The session identifier.
+        history: The conversation history to store.
+    """
+    # Move to end if exists (mark as recently used), then update.
+    if session_id in _sessions:
+        _sessions.move_to_end(session_id)
+    _sessions[session_id] = history
+
+    # Evict oldest sessions if over capacity.
+    while len(_sessions) > _MAX_SESSIONS:
+        evicted_id, _ = _sessions.popitem(last=False)
+        # Also clean up any pending confirmation and lock for the evicted session.
+        _pending_confirmations.pop(evicted_id, None)
+        _session_locks.pop(evicted_id, None)
+        logger.info("Evicted session %s (session cap %d reached)", evicted_id, _MAX_SESSIONS)
+
+
+def _reap_expired_confirmations() -> None:
+    """Remove all expired pending confirmations.
+
+    Called unconditionally at the top of ``post_message`` and
+    ``post_confirm`` (before acquiring per-session locks) to prevent
+    stale confirmations from accumulating. This is the enforcement point
+    for confirmation_timeout_s configured in LimitsConfig.
+
+    IMPORTANT: This function must remain synchronous (no ``await`` calls).
+    Callers invoke it outside per-session locks, so it must complete
+    atomically within a single event-loop tick to avoid cross-session
+    race conditions on ``_pending_confirmations``.
+    """
+    now = datetime.now(UTC)
+    expired = [sid for sid, pc in _pending_confirmations.items() if now >= pc.expires_at]
+    for sid in expired:
+        logger.info("Reaped expired confirmation for session %s", sid)
+        del _pending_confirmations[sid]
+
+
+# ---------------------------------------------------------------------------
+# Auth dependency
+# ---------------------------------------------------------------------------
+
+
+def _get_bearer_token(request: Request) -> str | None:
+    """Extract Bearer token from the Authorization header.
+
+    Returns:
+        The token string, or None if the header is missing or malformed.
+    """
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None
+    return auth_header[7:]
+
+
+async def require_auth(request: Request) -> None:
+    """FastAPI dependency that enforces Bearer token authentication.
+
+    Skipped for health check and static file routes. Uses constant-time
+    comparison to prevent timing attacks on the token.
+
+    Raises:
+        HTTPException: 401 if the token is missing or invalid.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    # VPN mode: all connections trusted, no token required.
+    # Logged at WARNING so operators see it at default log level (INFO).
+    if _config.auth.mode == "vpn":
+        logger.warning(
+            "VPN mode: skipping auth for %s %s — all connections trusted",
+            request.method,
+            request.url.path,
+        )
+        return
+
+    # Token mode: require a valid Bearer token.
+    expected_token = _config.auth.token
+    if expected_token is None:
+        raise HTTPException(status_code=500, detail="Server misconfigured")
+
+    provided = _get_bearer_token(request)
+    if provided is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Constant-time comparison to prevent timing attacks.
+    if not hmac.compare_digest(provided, expected_token.get_secret_value()):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# ---------------------------------------------------------------------------
+# SSE helpers
+# ---------------------------------------------------------------------------
+
+
+def _format_sse(event: SSEEvent) -> str:
+    """Format an SSEEvent model into a wire-format SSE frame.
+
+    Args:
+        event: Validated SSE event with event type and JSON data.
+
+    Returns:
+        A string in SSE wire format: ``event: <type>\\ndata: <data>\\n\\n``.
+    """
+    return f"event: {event.event}\ndata: {event.data}\n\n"
+
+
+def _make_sse_event(event_type: str, payload: dict[str, object]) -> str:
+    """Create and format an SSE frame from an event type and payload dict.
+
+    Args:
+        event_type: The SSE event name (e.g. 'message', 'status', 'done').
+        payload: JSON-serializable dict for the data field.
+
+    Returns:
+        Wire-format SSE string.
+    """
+    sse = SSEEvent(event=event_type, data=json.dumps(payload, default=str))
+    return _format_sse(sse)
+
+
+async def _stream_agent_result(result: AgentResult) -> AsyncIterator[str]:
+    """Convert an AgentResult into a sequence of SSE frames.
+
+    Streams:
+    - status: processing
+    - tool_call: for each tool call in the result
+    - message: the final text response (or confirm/error as appropriate)
+    - done: stream end signal
+
+    Args:
+        result: The completed agent result to stream.
+
+    Yields:
+        SSE wire-format strings.
+    """
+    # 1. Status: processing
+    yield _make_sse_event("status", {"status": "processing"})
+
+    # 2. Tool call summaries
+    for tc in result.tool_calls:
+        yield _make_sse_event(
+            "tool_call",
+            {
+                "tool": tc.tool,
+                "action": tc.action,
+                "success": tc.success,
+            },
+        )
+
+    # 3. Main result based on status
+    if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
+        yield _make_sse_event(
+            "confirm",
+            {
+                "confirmation_id": result.pending_confirmation.confirmation_id,
+                "tool": result.pending_confirmation.tool_call.tool,
+                "action": result.pending_confirmation.tool_call.action,
+            },
+        )
+    elif result.status == "error":
+        yield _make_sse_event("error", {"message": result.response})
+    else:
+        yield _make_sse_event("message", {"content": result.response})
+
+    # 4. Done signal
+    yield _make_sse_event("done", {})
+
+
+# ---------------------------------------------------------------------------
+# Route handlers
+# ---------------------------------------------------------------------------
+
+
+async def health_check() -> dict[str, str]:
+    """Health check endpoint. No auth required.
+
+    Returns:
+        Simple status dict.
+    """
+    return {"status": "ok"}
+
+
+async def post_message(
+    body: ChatRequest,
+    _auth: None = Depends(require_auth),
+) -> ChatResponse:
+    """Handle POST /api/message — send a user message to the agent.
+
+    Validates the request, retrieves or creates a session, runs the agent,
+    updates session state, and returns the response.
+
+    Args:
+        body: Validated ChatRequest with message and session_id.
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        ChatResponse with the agent's reply and tool call summary.
+    """
+    if _agent is None or _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/message")
+    _reap_expired_confirmations()
+
+    # Enforce max_message_length from config (tighter than Pydantic's 32768).
+    max_len = _config.limits.max_message_length
+    if len(body.message) > max_len:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Message exceeds maximum length of {max_len} characters",
+        )
+
+    session_id = body.session_id
+
+    # Per-session lock serialises concurrent requests for the same session,
+    # preventing lost conversation turns from interleaved read-modify-write.
+    async with _get_session_lock(session_id):
+        history = _sessions.get(session_id, [])
+
+        logger.info("Processing message for session %s", session_id)
+
+        try:
+            result = await _agent.run(
+                user_message=body.message,
+                session_id=session_id,
+                history=history,
+            )
+        except (MemoryError, RecursionError):
+            raise
+        except Exception:
+            logger.error("Agent run failed for session %s", session_id)
+            raise HTTPException(status_code=500, detail="Internal error") from None
+
+        # Update session history from the agent's returned history (LRU-tracked).
+        _touch_session(session_id, result.history)
+
+        # Store pending confirmation if the agent is awaiting one.
+        if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
+            _pending_confirmations[session_id] = result.pending_confirmation
+
+        logger.info(
+            "Completed message for session %s: status=%s, tool_calls=%d",
+            session_id,
+            result.status,
+            len(result.tool_calls),
+        )
+
+        return ChatResponse(
+            session_id=session_id,
+            response=result.response,
+            tool_calls=result.tool_calls,
+        )
+
+
+async def get_events(
+    session_id: str = Query(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-zA-Z0-9_-]+$",
+        description="Session identifier. Alphanumeric, hyphens, underscores only.",
+    ),
+    _auth: None = Depends(require_auth),
+) -> StreamingResponse:
+    """Handle GET /api/events — SSE stream for a session.
+
+    For v1, this is a stub that returns session status. ``_stream_agent_result``
+    is implemented and tested but not yet wired into this endpoint — it will
+    be connected in v2 when full SSE streaming is completed.
+
+    Args:
+        session_id: Session identifier from query parameter (Pydantic-validated).
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        StreamingResponse with text/event-stream content type.
+    """
+    if _agent is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/events")
+
+    history = _sessions.get(session_id, [])
+    if not history:
+        # No messages in session yet — stream an empty done.
+        async def _empty_stream() -> AsyncIterator[str]:
+            yield _make_sse_event("done", {})
+
+        return StreamingResponse(
+            _empty_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # For v1, find the last user message and re-run if needed.
+    # The SSE endpoint primarily streams results of previous POST /api/message calls.
+    # Build a result from current session state.
+    async def _session_stream() -> AsyncIterator[str]:
+        yield _make_sse_event("status", {"status": "connected"})
+        yield _make_sse_event("done", {})
+
+    return StreamingResponse(
+        _session_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+async def post_confirm(
+    confirmation_id: str = Path(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-zA-Z0-9_-]+$",
+        description="Confirmation identifier. Alphanumeric, hyphens, underscores only.",
+    ),
+    body: ConfirmRequest = ...,  # type: ignore[assignment]
+    _auth: None = Depends(require_auth),
+) -> ChatResponse:
+    """Handle POST /api/confirm/{confirmation_id} — approve or deny a pending action.
+
+    Looks up the pending confirmation by session_id, verifies the confirmation_id
+    matches, checks expiry, and if approved, resumes the agent run.
+
+    Args:
+        confirmation_id: The confirmation ID from the URL path (Pydantic-validated).
+        body: Validated ConfirmRequest with session_id and approved flag.
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        ChatResponse with the result of the resumed agent run.
+
+    Raises:
+        HTTPException: 404 if confirmation not found, 400 if IDs mismatch,
+                       410 if confirmation has expired.
+    """
+    if _agent is None or _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/confirm")
+    _reap_expired_confirmations()
+
+    session_id = body.session_id
+
+    # Per-session lock serialises with concurrent POST /api/message requests.
+    async with _get_session_lock(session_id):
+        pending = _pending_confirmations.get(session_id)
+
+        if pending is None:
+            raise HTTPException(status_code=404, detail="No pending confirmation for this session")
+
+        if pending.confirmation_id != confirmation_id:
+            raise HTTPException(status_code=404, detail="Confirmation not found")
+
+        # Confirmation ID from body must also match (defence-in-depth).
+        if body.confirmation_id != confirmation_id:
+            raise HTTPException(status_code=400, detail="Confirmation ID mismatch")
+
+        # Check expiry at server layer — avoids a full agent round trip for
+        # expired confirmations that the registry would also reject.
+        if datetime.now(UTC) >= pending.expires_at:
+            del _pending_confirmations[session_id]
+            raise HTTPException(status_code=410, detail="Confirmation has expired")
+
+        # Remove the pending confirmation regardless of approval/denial.
+        del _pending_confirmations[session_id]
+
+        if not body.approved:
+            logger.info("Confirmation %s denied for session %s", confirmation_id, session_id)
+            # Safe f-string: tool and action are Pydantic-validated with
+            # pattern=r"^[a-z][a-z0-9_]{0,62}$", restricting to alphanumeric/
+            # underscore. ChatResponse.sanitize_response provides defence-in-depth.
+            return ChatResponse(
+                session_id=session_id,
+                response=f"Action {pending.tool_call.tool}.{pending.tool_call.action} was denied.",
+                tool_calls=[],
+            )
+
+        # Approved — resume the agent with the pending confirmation.
+        history = _sessions.get(session_id, [])
+
+        logger.info(
+            "Resuming agent for session %s after confirmation %s",
+            session_id,
+            confirmation_id,
+        )
+
+        try:
+            result = await _agent.run(
+                user_message="",
+                session_id=session_id,
+                history=history,
+                pending_confirmation=pending,
+            )
+        except (MemoryError, RecursionError):
+            raise
+        except Exception:
+            logger.error("Agent resume failed for session %s", session_id)
+            raise HTTPException(status_code=500, detail="Internal error") from None
+
+        _touch_session(session_id, result.history)
+
+        if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
+            _pending_confirmations[session_id] = result.pending_confirmation
+
+        return ChatResponse(
+            session_id=session_id,
+            response=result.response,
+            tool_calls=result.tool_calls,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Validation error handler
+# ---------------------------------------------------------------------------
+
+
+async def _validation_error_handler(
+    request: Request,
+    exc: ValidationError,
+) -> JSONResponse:
+    """Handle Pydantic validation errors without leaking input values.
+
+    Returns a generic 422 response. Raw input values are never included
+    in the response body.
+
+    Args:
+        request: The incoming request (unused but required by FastAPI).
+        exc: The Pydantic ValidationError.
+
+    Returns:
+        JSONResponse with safe error details.
+    """
+    safe_errors = []
+    for err in exc.errors(include_input=False):
+        safe_errors.append(
+            {
+                "loc": [str(loc) for loc in err["loc"]],
+                "msg": err["msg"],
+                "type": err["type"],
+            }
+        )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+
+async def _request_validation_error_handler(
+    request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    """Handle FastAPI request validation errors without leaking input values.
+
+    FastAPI raises RequestValidationError (not pydantic.ValidationError)
+    for request body/query/path validation failures. We extract only the
+    safe fields (loc, msg, type) and explicitly exclude 'input', 'ctx',
+    and 'url' to prevent raw user values from appearing in the response.
+
+    Args:
+        request: The incoming request (unused but required by FastAPI).
+        exc: The FastAPI RequestValidationError wrapping Pydantic errors.
+
+    Returns:
+        JSONResponse with safe error details (no raw input values).
+    """
+    safe_errors = []
+    for err in exc.errors():
+        safe_errors.append(
+            {
+                "loc": [str(loc) for loc in err.get("loc", [])],
+                "msg": err.get("msg", "Validation error"),
+                "type": err.get("type", "value_error"),
+            }
+        )
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+
+def create_app(
+    *,
+    agent: Agent,
+    config: AppConfig,
+) -> FastAPI:
+    """Create and configure the FastAPI application.
+
+    Wires up routes, middleware, error handlers, and module-level state.
+    The agent and config are injected to support testing with fakes.
+
+    Args:
+        agent: The Agent instance to handle user messages.
+        config: Application configuration (server, auth, CORS, etc.).
+
+    Returns:
+        A configured FastAPI application ready to serve.
+    """
+    global _agent, _config
+    _agent = agent
+    _config = config
+
+    # Clear session state on app creation (supports test isolation).
+    _sessions.clear()
+    _pending_confirmations.clear()
+    _session_locks.clear()
+
+    # Initialize rate limiters (reset on app creation for test isolation).
+    global _global_rate_limiter
+    _rate_limiters.clear()
+    _rate_limiters["/api/message"] = _TokenBucket(rate=0.5, capacity=5)
+    _rate_limiters["/api/confirm"] = _TokenBucket(rate=0.5, capacity=5)
+    _rate_limiters["/api/events"] = _TokenBucket(rate=0.17, capacity=3)
+    _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
+
+    # Log VPN mode warning at server startup.
+    if config.auth.mode == "vpn":
+        logger.warning(
+            "Server running in VPN mode — all requests are trusted without "
+            "authentication. Ensure network-level access controls are in place."
+        )
+
+    app = FastAPI(
+        title="admino",
+        description="Local-only, security-first personal AI agent",
+        version="0.1.0",
+        docs_url=None,  # Disable Swagger UI in production
+        redoc_url=None,  # Disable ReDoc in production
+    )
+
+    # --- Security headers middleware ---
+    # Starlette processes add_middleware calls in LIFO order: first added =
+    # outermost wrapper = last to touch the response. By adding
+    # SecurityHeadersMiddleware first, it wraps the entire stack and injects
+    # headers on every response (including CORS preflight 200s).
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    # --- CORS middleware ---
+    # Default to localhost-only origins for local-first security.
+    # allow_credentials=False: Bearer auth uses Authorization header, not
+    # cookies. Setting True would widen the attack surface for no benefit.
+    cors_origins = [
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=cors_origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    # --- Error handlers ---
+    # RequestValidationError: raised by FastAPI for request body/query/path validation.
+    app.add_exception_handler(RequestValidationError, _request_validation_error_handler)  # type: ignore[arg-type]
+    # ValidationError: raised by Pydantic inside route handlers (e.g. response model construction).
+    app.add_exception_handler(ValidationError, _validation_error_handler)  # type: ignore[arg-type]
+
+    # --- Routes ---
+    # Health check — no auth.
+    app.get("/health")(health_check)
+
+    # API routes — auth required.
+    app.post("/api/message", response_model=ChatResponse)(post_message)
+    app.get("/api/events")(get_events)
+    app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
+
+    # --- Static files (MUST be last so API routes take priority) ---
+    # Mount only if the static directory exists; skip in tests.
+    static_dir = PathLib(__file__).parent.parent.parent / "static"
+    if static_dir.is_dir():
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+
+    return app
