@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="description" content="admino — local-only, security-first personal AI agent" />
+  <meta name="theme-color" content="#0d1117" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="admino" />
+  <meta name="color-scheme" content="dark" />
+
+  <!-- CSP fallback: enforced by server header, but this protects when
+       static files are served outside FastAPI (e.g. dev server).
+       Note: frame-ancestors cannot be enforced via meta tag. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'" />
+
+  <title>admino</title>
+
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" href="/icons/icon-192.png" sizes="192x192" type="image/png" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+
+    <!-- Header -->
+    <header id="header" role="banner">
+      <span id="header-logo" aria-label="admino">admino</span>
+
+      <span
+        id="status-dot"
+        class="disconnected"
+        role="img"
+        aria-label="Disconnected from server"
+        title="Disconnected from server"
+      ></span>
+
+      <span
+        id="header-session"
+        aria-label="Current session ID"
+        title=""
+      ></span>
+
+      <nav id="header-actions" aria-label="Header actions">
+
+        <!-- New session -->
+        <button
+          id="new-session-btn"
+          class="icon-btn"
+          type="button"
+          aria-label="Start new session"
+          title="New session"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" />
+          </svg>
+        </button>
+
+        <!-- Install PWA (hidden until beforeinstallprompt fires) -->
+        <button
+          id="install-btn"
+          class="icon-btn"
+          type="button"
+          aria-label="Install admino as an app"
+          title="Install app"
+          hidden
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+            <polyline points="7 10 12 15 17 10" />
+            <line x1="12" y1="15" x2="12" y2="3" />
+          </svg>
+        </button>
+
+        <!-- Settings -->
+        <button
+          id="settings-btn"
+          class="icon-btn"
+          type="button"
+          aria-label="Open settings"
+          title="Settings"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+          </svg>
+        </button>
+
+      </nav>
+    </header>
+
+    <!-- Messages -->
+    <main
+      id="messages"
+      role="list"
+      aria-label="Conversation messages"
+      aria-live="polite"
+      aria-relevant="additions"
+    >
+      <!-- Typing indicator (stays at bottom via JS insertBefore) -->
+      <div
+        id="typing-indicator"
+        role="status"
+        aria-label="Agent is processing"
+        aria-live="polite"
+      >
+        <span class="typing-dot" aria-hidden="true"></span>
+        <span class="typing-dot" aria-hidden="true"></span>
+        <span class="typing-dot" aria-hidden="true"></span>
+      </div>
+    </main>
+
+    <!-- Input area -->
+    <footer id="input-area" role="contentinfo">
+
+      <!-- Image preview chip -->
+      <div
+        id="image-preview"
+        role="status"
+        aria-label="Image attached"
+      >
+        <img
+          id="image-preview-img"
+          src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw=="
+          alt="Attached image preview"
+        />
+        <span id="image-preview-name"></span>
+        <button
+          id="image-preview-remove"
+          type="button"
+          aria-label="Remove attached image"
+          title="Remove image"
+        >&times;</button>
+      </div>
+
+      <div id="input-row">
+
+        <!-- Image upload -->
+        <button
+          id="upload-btn"
+          class="upload-btn"
+          type="button"
+          aria-label="Attach image for document scanning"
+          title="Attach image"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="3" width="18" height="18" rx="2" ry="2" />
+            <circle cx="8.5" cy="8.5" r="1.5" />
+            <polyline points="21 15 16 10 5 21" />
+          </svg>
+        </button>
+        <input
+          id="file-input"
+          type="file"
+          accept="image/*"
+          aria-label="Select image file"
+          tabindex="-1"
+        />
+
+        <!-- Message input -->
+        <textarea
+          id="message-input"
+          placeholder="Message admino…"
+          rows="1"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="sentences"
+          spellcheck="true"
+          aria-label="Message input"
+          aria-multiline="true"
+        ></textarea>
+
+        <!-- Send -->
+        <button
+          id="send-btn"
+          class="send-btn"
+          type="button"
+          aria-label="Send message"
+          title="Send (Enter)"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <line x1="22" y1="2" x2="11" y2="13" />
+            <polygon points="22 2 15 22 11 13 2 9 22 2" />
+          </svg>
+        </button>
+
+      </div>
+    </footer>
+
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container" aria-live="assertive" aria-atomic="false"></div>
+
+  <!-- Settings modal -->
+  <div
+    id="settings-overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="settings-title"
+  >
+    <div id="settings-modal">
+      <h2 id="settings-title">Settings</h2>
+
+      <div class="field">
+        <label for="settings-token">Bearer token</label>
+        <input
+          id="settings-token"
+          type="password"
+          autocomplete="current-password"
+          placeholder="Leave blank for VPN mode (no auth)"
+          aria-describedby="settings-token-help"
+        />
+        <span id="settings-token-help" class="sr-only">
+          Enter the Bearer token configured on the admino server. Leave blank if running in VPN mode.
+        </span>
+      </div>
+
+      <div class="field">
+        <label for="settings-session">Session ID</label>
+        <input
+          id="settings-session"
+          type="text"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="Alphanumeric, hyphens, underscores — max 64 chars"
+          aria-describedby="settings-session-help"
+          maxlength="64"
+          pattern="^[a-zA-Z0-9_-]{1,64}$"
+        />
+        <span id="settings-session-help" class="sr-only">
+          The session ID links your conversation history. Change it to start a logically separate session.
+        </span>
+      </div>
+
+      <div class="modal-actions">
+        <button id="settings-cancel" class="btn btn-secondary" type="button">Cancel</button>
+        <button id="settings-save"   class="btn btn-primary"   type="button">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Token prompt overlay (first launch) -->
+  <div
+    id="token-prompt-overlay"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="token-prompt-title"
+  >
+    <div id="token-prompt-modal">
+      <h2 id="token-prompt-title">Welcome to admino</h2>
+      <p class="token-help">
+        Enter your Bearer token to authenticate with the server.
+        If you are connecting over a trusted VPN without token auth, skip this step.
+      </p>
+      <div class="field">
+        <label for="token-prompt-input">Bearer token</label>
+        <input
+          id="token-prompt-input"
+          type="password"
+          autocomplete="current-password"
+          placeholder="Paste your token here"
+        />
+      </div>
+      <div class="modal-actions">
+        <button id="token-prompt-skip"     class="btn btn-secondary" type="button">Skip (VPN mode)</button>
+        <button id="token-prompt-continue" class="btn btn-primary"   type="button">Continue</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

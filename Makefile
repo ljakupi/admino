@@ -1,23 +1,24 @@
 .PHONY: lint format typecheck test docker-build docker-up docker-down run clean
 
 # Source and package configuration
-SRC_DIR := src
-PACKAGE := admino
+SRC_DIR    := src
+TESTS_DIR  := tests
+PACKAGE    := admino
 
 # Detect OS for cross-platform compatibility
 UNAME := $(shell uname -s)
 
 lint:
-	ruff check $(SRC_DIR)/
+	python -m ruff check $(SRC_DIR)/ $(TESTS_DIR)/
 
 format:
-	ruff format $(SRC_DIR)/
+	python -m ruff format $(SRC_DIR)/ $(TESTS_DIR)/
 
 typecheck:
-	mypy $(SRC_DIR)/
+	python -m mypy $(SRC_DIR)/$(PACKAGE)/ --strict
 
 test:
-	pytest
+	python -m pytest $(TESTS_DIR)/ -v --tb=short --cov=$(SRC_DIR)/$(PACKAGE) --cov-report=term-missing
 
 docker-build:
 	docker compose build
@@ -29,14 +30,13 @@ docker-down:
 	docker compose down
 
 run:
-	uvicorn admino.main:app --reload --host 127.0.0.1 --port 8000
+	python -m $(PACKAGE).main
 
 clean:
 ifeq ($(UNAME), Darwin)
-	find $(SRC_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-	find tests -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find $(SRC_DIR) $(TESTS_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	rm -rf .mypy_cache .pytest_cache dist htmlcov .coverage
 else
-	find $(SRC_DIR) tests -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+	find $(SRC_DIR) $(TESTS_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	rm -rf .mypy_cache .pytest_cache dist htmlcov .coverage
 endif

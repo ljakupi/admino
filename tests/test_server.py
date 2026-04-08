@@ -1616,9 +1616,10 @@ class TestConfirmationPathInjection:
                 },
                 headers=_AUTH_HEADER,
             )
-        # Path traversal/special chars may result in 404 (route mismatch)
-        # or 422 (Pydantic validation). Either way, the request is rejected.
-        assert resp.status_code in (404, 422), f"Expected 404 or 422, got {resp.status_code}"
+        # Path traversal/special chars may result in 404 (route mismatch),
+        # 422 (Pydantic validation), or 405 (caught by static file mount).
+        # All are valid rejections of the malicious input.
+        assert resp.status_code in (404, 405, 422), f"Expected 404/405/422, got {resp.status_code}"
 
 
 # ---------------------------------------------------------------------------

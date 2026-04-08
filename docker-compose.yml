@@ -12,7 +12,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: admino-agent:latest
+    image: admino-agent:local
     container_name: admino-agent
     restart: unless-stopped
 
@@ -55,6 +55,14 @@ services:
       # Egress bridge: external calls, locked down by iptables in entrypoint.sh
       - egress
 
+    # Resource limits: prevent runaway tool calls or OCR jobs from
+    # exhausting host memory and triggering the OOM killer.
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
     depends_on:
       ollama:
         condition: service_healthy
@@ -72,7 +80,9 @@ services:
   # No ports are published to the host.
   # --------------------------------------------------------------------------
   ollama:
-    image: ollama/ollama:latest
+    # Pin to a specific version — never use :latest in production.
+    # Obtain digest with: docker inspect --format='{{index .RepoDigests 0}}' ollama/ollama:0.6.2
+    image: ollama/ollama:0.6.2
     container_name: admino-ollama
     restart: unless-stopped
 
@@ -84,12 +94,21 @@ services:
     volumes:
       - ollama_data:/root/.ollama
 
+    # Resource limits: size depends on the loaded model.
+    # 8g covers most 7B-parameter models. Increase for 14B+.
+    deploy:
+      resources:
+        limits:
+          memory: 8g
+          cpus: "4.0"
+
     # Ollama does not need any elevated capabilities
     cap_drop:
       - ALL
 
+    # Use shell-based health check — ollama images may not ship curl.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      test: ["CMD-SHELL", "printf 'GET /api/tags HTTP/1.0\\r\\n\\r\\n' | nc -w2 localhost 11434 | head -1 | grep -q 200"]
       interval: 30s
       timeout: 15s
       start_period: 60s

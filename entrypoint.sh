@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 # entrypoint.sh — Agent container entrypoint
 #
 # Responsibility: Apply iptables egress whitelist before starting the server.
@@ -25,13 +25,15 @@
 #          REQUIRE_EGRESS_WHITELIST  (default: true — set to "false" only for local dev without Docker)
 # Outputs: Runs "$@" (the CMD) after rules are applied.
 
-set -eu
+set -euo pipefail
 
 DOCKER_DNS_IP="${DOCKER_DNS_IP:-127.0.0.11}"
 # Default covers Docker's full IPAM pool (172.16.0.0/12). User-defined bridge
 # networks are assigned from this range (172.17.x, 172.18.x, etc.) so we must
 # cover the full range to reliably reach Ollama regardless of subnet assignment.
-# Override via INTERNAL_NETWORK if your Docker daemon uses a custom IPAM config.
+# Override via INTERNAL_NETWORK if your Docker daemon uses a custom IPAM config
+# (e.g. daemon.json "bip" or "default-address-pools"). Verify your Docker
+# bridge CIDR with: docker network inspect admino-internal --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
 INTERNAL_NETWORK="${INTERNAL_NETWORK:-172.16.0.0/12}"
 
 # Sanitize EGRESS_ALLOWED_HOSTS: collapse newlines to spaces to prevent
@@ -52,11 +54,12 @@ apply_iptables() {
 
     echo "[entrypoint] Applying egress whitelist via iptables..."
 
-    # Flush existing OUTPUT rules and immediately set default-deny policy.
-    # DROP is set before any ACCEPT rules to eliminate the window of unrestricted
-    # egress between the flush and the final policy set.
-    iptables -F OUTPUT
+    # Set default-deny policy BEFORE flushing rules to eliminate the race
+    # window. iptables -P persists across -F, so the chain is never open:
+    #   1. -P OUTPUT DROP  → policy becomes DROP (existing rules still apply)
+    #   2. -F OUTPUT       → rules removed, but DROP policy remains in effect
     iptables -P OUTPUT DROP
+    iptables -F OUTPUT
 
     # Allow loopback
     iptables -A OUTPUT -o lo -j ACCEPT

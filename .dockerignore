@@ -1,0 +1,56 @@
+# Prevent secrets and unnecessary files from leaking into the Docker build context.
+# Even without an explicit COPY, the entire context is sent to the Docker daemon.
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Data directories (user data, tokens, logs)
+data/
+
+# Test and development artifacts
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Build artifacts
+dist/
+*.egg-info/
+build/
+.eggs/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Version control
+.git/
+.gitignore
+
+# IDE and OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Documentation (not needed in image)
+*.md
+Makefile
+
+# Private keys
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Claude Code config (not needed in image)
+.claude/

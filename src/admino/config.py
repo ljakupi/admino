@@ -5,7 +5,7 @@ Reads and validates two YAML configuration files at startup:
 - permissions.yaml -- tool permission rules (delegated to permissions.py)
 
 Environment variable overrides are supported for deployment flexibility.
-Secrets (FERNET_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_TOKEN)
+Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_TOKEN)
 are NEVER read from YAML -- they come exclusively from environment variables.
 
 Security notes:

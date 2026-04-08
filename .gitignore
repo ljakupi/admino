@@ -3,6 +3,14 @@
 .env.*
 !.env.example
 
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+
 # Python
 __pycache__/
 *.py[cod]
@@ -30,6 +38,11 @@ htmlcov/
 .mypy_cache/
 .pyright/
 .ruff_cache/
+
+# SQLite databases (may contain user data)
+*.db
+*.sqlite
+*.sqlite3
 
 # macOS
 .DS_Store

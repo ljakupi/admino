@@ -1,5 +1,9 @@
 # Stage 1: builder — install Python dependencies into a prefix
-FROM python:3.12-slim AS builder
+# Pin to a specific patch release to prevent silent supply-chain changes.
+# For maximum reproducibility, pin to a digest:
+#   FROM python:3.12.8-slim@sha256:<digest> AS builder
+# Obtain the current digest with: docker inspect --format='{{index .RepoDigests 0}}' python:3.12.8-slim
+FROM python:3.12.8-slim AS builder
 
 WORKDIR /build
 
@@ -15,14 +19,16 @@ RUN pip install --no-cache-dir --prefix=/install .
 # -------------------------------------------------------------------
 # Stage 2: runtime — minimal image with Tesseract + non-root user
 # -------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.12.8-slim AS runtime
 
 # Install system runtime dependencies
-# tesseract-ocr: required by pytesseract for OCR on uploaded images
+# iptables: egress whitelist enforcement in entrypoint.sh (requires NET_ADMIN cap)
+# tesseract-ocr: called via subprocess.run for OCR on uploaded images (SEC-20 compliant)
 # tesseract-ocr-eng: English language data for Tesseract
 # curl: used by healthcheck only; not available to application code
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+        iptables \
         tesseract-ocr \
         tesseract-ocr-eng \
         curl \
@@ -59,7 +65,7 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["/entrypoint.sh"]
-# NOTE: --host 0.0.0.0 is correct for Docker (bind to all container interfaces).
+# NOTE: main.py calls uvicorn.run() internally after wiring all dependencies.
+# PYTHONPATH is not needed because the package is installed into /usr/local by the builder stage.
 # config.yaml's server.host applies to non-Docker deployments only.
-# Access logging is enabled so HTTP probes leave a trace for security observability.
-CMD ["uvicorn", "admino.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "-m", "admino.main"]
