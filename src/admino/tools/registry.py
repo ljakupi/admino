@@ -294,10 +294,11 @@ async def dispatch_tool_call(
         permissions_config: The validated permissions configuration.
         session_id: Current session identifier (passed to the handler).
         pending_confirmation: If present, the user has already confirmed this
-            call.  Dispatch verifies that ``pending_confirmation.tool_call.tool``
-            and ``.action`` match the incoming ``tool_call`` and that the
-            confirmation has not expired.  Mismatches and expiries are
-            rejected — the caller is no longer the sole line of defence.
+            call.  Dispatch verifies that ``pending_confirmation.tool_call.tool``,
+            ``.action``, AND ``.args`` match the incoming ``tool_call`` and that
+            the confirmation has not expired.  Mismatches (including args
+            differences) and expiries are rejected — the caller is no longer
+            the sole line of defence.
         audit_logger: Sink for ``ToolCallAuditEntry`` records.  Required in
             production; optional in dev/tests for ergonomic reasons.
 
@@ -390,9 +391,12 @@ async def dispatch_tool_call(
         # 3b. Confirmation supplied — enforce identity match.  The caller MUST
         #     NOT be the sole line of defence: a stale or mismatched
         #     confirmation must not unlock a different action.
+        #     M3 fix: also verify args deep equality to prevent a caller from
+        #     confirming a safe version then dispatching a destructive one.
         if (
             pending_confirmation.tool_call.tool != raw_tool
             or pending_confirmation.tool_call.action != raw_action
+            or pending_confirmation.tool_call.args != tool_call.args
         ):
             logger.warning(
                 "Rejected mismatched pending_confirmation for %s.%s",

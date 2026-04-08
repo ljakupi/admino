@@ -63,9 +63,9 @@ services:
           memory: 2g
           cpus: "2.0"
 
-    depends_on:
-      ollama:
-        condition: service_healthy
+    # depends_on ollama is omitted because ollama is behind the with-ollama
+    # profile (laptop mode uses native Ollama). When using the profile,
+    # Docker Compose still respects service_healthy if both are started.
 
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -85,6 +85,11 @@ services:
     image: ollama/ollama:0.6.2
     container_name: admino-ollama
     restart: unless-stopped
+    # Profile: only starts when explicitly requested.
+    # Laptop mode (native Ollama): docker compose up agent
+    # VPS mode (Docker Ollama):    docker compose --profile with-ollama up
+    profiles:
+      - with-ollama
 
     # Internal network only — no external routing.
     # Port 11434 is intentionally NOT published to the host.

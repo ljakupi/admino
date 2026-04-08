@@ -672,3 +672,109 @@ class AgentResult(BaseModel):
             " persist this and pass it back on the resumption call."
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Tool argument models (individual tools import these)
+# ---------------------------------------------------------------------------
+
+
+class MemoryStoreArgs(BaseModel):
+    """Arguments for the memory.store action (upsert a key-value note)."""
+
+    key: str = Field(
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_.\- ]+$",
+        description="Unique key for the memory entry. Alphanumeric, dots, hyphens, underscores.",
+    )
+    value: str = Field(
+        max_length=2000,
+        description="The value to store.",
+    )
+
+
+class MemoryRecallArgs(BaseModel):
+    """Arguments for the memory.recall action (retrieve a value by key)."""
+
+    key: str = Field(
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_.\- ]+$",
+        description="The key to look up. Alphanumeric, dots, hyphens, underscores.",
+    )
+
+
+class MemoryListArgs(BaseModel):
+    """Arguments for the memory.list action (list all stored keys)."""
+
+
+class FileReadArgs(BaseModel):
+    """Arguments for the files.read action."""
+
+    path: str = Field(
+        max_length=500,
+        description="Path to the file to read. Validated against allowed_paths at runtime.",
+    )
+
+
+class FileListArgs(BaseModel):
+    """Arguments for the files.list action."""
+
+    path: str = Field(
+        max_length=500,
+        description="Directory path to list. Validated against allowed_paths at runtime.",
+    )
+    max_depth: int = Field(
+        default=1,
+        ge=1,
+        le=3,
+        description="Maximum directory depth to recurse.",
+    )
+
+
+class FileSearchArgs(BaseModel):
+    """Arguments for the files.search action."""
+
+    path: str = Field(
+        max_length=500,
+        description="Root directory to search within. Validated against allowed_paths at runtime.",
+    )
+    pattern: str = Field(
+        max_length=200,
+        description="Filename glob pattern or text query.",
+    )
+    content_search: bool = Field(
+        default=False,
+        description="If True, search file contents instead of filenames.",
+    )
+    max_results: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of results to return.",
+    )
+
+
+class FileWriteArgs(BaseModel):
+    """Arguments for the files.write action."""
+
+    path: str = Field(
+        max_length=500,
+        description="Path to the file to write. Must be in a readwrite-allowed path.",
+    )
+    content: str = Field(
+        max_length=50000,
+        description="Content to write to the file.",
+    )
+
+
+class FileMoveArgs(BaseModel):
+    """Arguments for the files.move action."""
+
+    source: str = Field(
+        max_length=500,
+        description="Source file path. Must be in a readwrite-allowed path.",
+    )
+    destination: str = Field(
+        max_length=500,
+        description="Destination file path. Must be in a readwrite-allowed path.",
+    )

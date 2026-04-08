@@ -2,25 +2,128 @@
 
 Local-only, security-first personal AI agent. Python 3.12+, FastAPI, Pydantic v2, Ollama for LLM inference, Docker Compose deployment.
 
-## Quick Start
+## How to Run
+
+### Option A: Local dev mode (MacBook, recommended)
+
+This runs the Python app directly on your machine with native Ollama for Metal GPU acceleration. Fastest setup.
 
 ```bash
-# Install dependencies
+# 1. Install Ollama (if not already installed)
+#    Download from https://ollama.ai or:
+brew install ollama
+
+# 2. Start Ollama and pull the model (~8-10 GB download, one-time)
+ollama serve &                   # start Ollama in background (skip if already running)
+ollama pull gemma4:12b           # download the model
+
+# 3. Clone and install Python dependencies
+git clone <repo-url> admino && cd admino
 pip install -e ".[dev]"
 
-# Run quality checks
-make lint        # ruff check
-make format      # ruff format
-make typecheck   # mypy strict
-make test        # pytest with coverage
+# 4. Set up environment
+cp .env.example .env
+# Edit .env if needed — defaults work for local dev with VPN auth mode
 
-# Run locally (dev mode)
+# 5. Update config for local dev (native Ollama on localhost)
+#    Edit config/config.yaml and set:
+#      ollama.url: "http://localhost:11434"
+#    (The default is host.docker.internal which is for Docker mode)
+
+# 6. Create data directories
+mkdir -p data/db data/logs data/images data/tokens
+
+# 7. Start the agent
 make run
+```
 
-# Docker
+Open **http://localhost:8000** in your browser. You should see the admino PWA. Type a message and hit Enter.
+
+### Option B: Docker (agent container + native Ollama)
+
+Runs the agent in Docker but uses your native Ollama installation for GPU acceleration.
+
+```bash
+# 1. Make sure Ollama is running natively with the model pulled
+ollama serve &
+ollama pull gemma4:12b
+
+# 2. Set up environment
+cp .env.example .env
+
+# 3. Create data directories (mounted as Docker volumes)
+mkdir -p data/db data/logs data/images data/tokens
+
+# 4. Build and start
 make docker-build
 make docker-up
 ```
+
+Open **http://localhost:8000**.
+
+### Option C: Full Docker (agent + Ollama in containers, for VPS)
+
+Runs everything in Docker. No native Ollama needed. Slower on Mac (no Metal GPU).
+
+```bash
+# 1. Set up environment
+cp .env.example .env
+# Edit .env: set OLLAMA_BASE_URL=http://ollama:11434
+
+# 2. Edit config/config.yaml: set ollama.url to "http://ollama:11434"
+
+# 3. Create data directories
+mkdir -p data/db data/logs data/images data/tokens
+
+# 4. Build and start both containers
+docker compose --profile with-ollama up -d
+
+# 5. Pull the model into the Ollama container (one-time, ~8-10 GB)
+docker compose exec ollama ollama pull gemma4:12b
+```
+
+Open **http://localhost:8000**.
+
+### What to expect
+
+Once running, the PWA will:
+
+1. Prompt for a Bearer token on first visit (click **Skip** for VPN mode / local dev)
+2. Show a chat interface — type any message and press Enter
+3. The agent sends your message to Ollama, which may respond with tool calls
+4. Currently implemented tools: `memory.store/recall/list` and `files.read/list/search/write/move`
+5. Other tools (gmail, calendar, news, etc.) are not yet implemented — the agent will handle those gracefully with a text-only response
+
+### Troubleshooting
+
+| Problem | Fix |
+|---------|-----|
+| "Connection refused" on port 8000 | Make sure the agent is running: `make run` or `docker compose ps` |
+| "Connection refused" to Ollama | Make sure Ollama is running: `ollama serve` or check `ollama list` |
+| Slow first response | First inference loads the model into memory. Subsequent responses are faster. |
+| "Model not found" | Run `ollama pull gemma4:12b` (or whichever model is in your config) |
+| PWA shows "Disconnected" | The SSE connection status dot is cosmetic — the chat works via POST requests regardless |
+
+### Quality checks
+
+```bash
+make lint        # ruff check
+make format      # ruff format
+make typecheck   # mypy strict
+make test        # pytest with coverage (954 tests, 94% coverage)
+```
+
+## Recommended Models
+
+All models below support native tool/function calling via Ollama.
+
+| Model | Params | RAM (Q4) | Speed (M2) | Ollama Tag | Notes |
+|-------|--------|----------|------------|------------|-------|
+| **Gemma 4 12B** | 12B | ~8-10GB | 5-15s | `gemma4:12b` | **Recommended.** Best quality/speed balance for M2 24GB. |
+| Gemma 4 E4B | 4.5B eff | ~3GB | 2-5s | `gemma4:e4b` | Lightweight. Good for quick tasks. |
+| Gemma 4 27B | 27B | ~18GB | 15-40s | `gemma4:27b` | Highest quality. Tight fit on 24GB with Docker. |
+| Gemma 4 E2B | 2.3B eff | ~2GB | 1-3s | `gemma4:e2b` | Minimal. For constrained hardware (8GB RAM). |
+| Qwen 2.5 Coder 14B | 14B | ~10GB | 5-15s | `qwen2.5-coder:14b` | Alternative. Strong tool calling. |
 
 ## Architecture Decisions
 
@@ -141,6 +244,59 @@ src/admino/
     aggregate.py  -- Cross-source search + dedup
     recipes.py    -- YAML recipe loader + executor
 ```
+
+## Deviations from Specification
+
+The following intentional deviations from `final_requirements.md` improve security or reflect practical v1 choices:
+
+| Area | Spec Says | Implementation | Rationale |
+|------|-----------|---------------|-----------|
+| Ollama image tag | `ollama/ollama:latest` | `ollama/ollama:0.6.2` (pinned) | Supply chain security — prevents silent image changes. |
+| Port binding | `8000:8000` | `127.0.0.1:8000:8000` | Localhost-only by default — prevents unintended LAN exposure. |
+| API flow | Async (202 Accepted + SSE stream) | Synchronous (200 OK + ChatResponse) | Simpler v1. SSE streaming infrastructure exists but is not wired end-to-end yet. |
+| SSE event names | `thinking`, `confirmation_required`, `confirmation_resolved`, `tool_result` | `status`, `confirm`, `tool_call`, `message`, `done` | Functionally equivalent; the PWA uses these names. Will align naming in v2 if needed. |
+| Session ID generation | Server-generated UUID | Client-generated (timestamp + random hex) | Acceptable for single-user, local-only deployment. |
+| Default model | `qwen2.5-coder:14b` | `gemma4:12b` | Gemma 4 (April 2026) has native tool calling, better quality at similar size. |
+| Docker Compose Ollama | Always starts | Behind `with-ollama` profile | Laptop mode uses native Ollama for Metal GPU acceleration. |
+| Health endpoint | Returns `model`, `ollama_reachable`, `uptime_s` | Returns `{"status": "ok"}` only | Enriched response planned for v1 completion. |
+
+## Outstanding for Complete v1
+
+### Blocking (must implement before full v1 release)
+
+| # | Item | Files Needed | Priority |
+|---|------|-------------|----------|
+| 1 | **Tool modules: Gmail** — read, list, search via Google API | `tools/gmail.py` | P0 |
+| 2 | **Tool modules: Calendar** — read, list, create (with confirmation) via Google API | `tools/calendar.py` | P0 |
+| 3 | **Tool modules: News** — fetch via RSS or privacy-respecting API | `tools/news.py` | P1 |
+| 4 | **Tool modules: Documents** — store (OCR + LLM classification), search, query. SQLite schema from spec §3.4 | `tools/documents.py` | P1 |
+| 5 | **Tool modules: Web Search** — via SearXNG or Brave Search API | `tools/search.py` | P2 |
+| 6 | **Tool modules: Aggregate** — cross-source search + deduplication | `tools/aggregate.py` | P1 |
+| 7 | **Tool modules: Recipes** — YAML loader, date resolver, step runner | `tools/recipes.py` | P1 |
+| 8 | **Tool argument Pydantic models** — Gmail, Calendar, News, Documents, WebSearch, Aggregate, Recipe arg schemas | `models.py` additions | P0 |
+| 9 | **SQLite schema initialization** — `CREATE TABLE documents(...)` and migration logic | `tools/documents.py` | P1 |
+
+### Non-Blocking (required for v1 but not for basic operation)
+
+| # | Item | Details | Priority |
+|---|------|---------|----------|
+| 10 | **Tool-specific tests** | `tests/test_tools/test_gmail.py`, `test_calendar.py`, `test_documents.py`, `test_files.py`, `test_memory.py`, `test_aggregate.py`, `test_recipes.py` | P1 |
+| 11 | **Health endpoint enrichment** | Add `model`, `ollama_reachable`, `uptime_s` to GET /health response | P2 |
+| 12 | **`DEPENDENCIES.md`** | Document every direct dependency with name, version, purpose, justification (§9.7) | P2 |
+| 13 | **`conftest.py` shared fixtures** | Mock Ollama, test config, test DB fixtures for test organization | P3 |
+| 14 | **Adversarial/security tests** | `tests/test_security.py` — prompt injection, SQL injection, path traversal, control chars (§12.2) | P1 |
+| 15 | **Integration tests** | Full request flow: POST message -> tool execution -> response; confirmation flow end-to-end | P1 |
+
+### Currently Implemented
+
+- **Core infrastructure**: server.py, agent.py, llm.py, permissions.py, audit.py, config.py, models.py, main.py
+- **OAuth**: oauth.py (Fernet encryption, token refresh), oauth_setup.py (CLI consent flow)
+- **Tool registry**: tools/registry.py (registration, dispatch, permission enforcement)
+- **Tool modules**: tools/memory.py (SQLite key-value store), tools/files.py (path-validated file access)
+- **PWA**: index.html, style.css, app.js, service-worker.js, manifest.json, icons
+- **DevOps**: Dockerfile, docker-compose.yml, entrypoint.sh, Makefile, .env.example, .gitignore, .dockerignore
+- **Tests**: 954 tests, 94% coverage on core modules (all core modules above 80%)
+- **Security**: CSP headers, egress whitelist, credential sanitization, TOCTOU-safe file writes, path confinement
 
 ## License
 

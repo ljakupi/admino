@@ -404,7 +404,20 @@ class TestImportToolModules:
         assert "admino.tools.gmail" in imported
         assert "admino.tools.calendar" in imported
         assert "admino.tools.memory" in imported
-        assert len(imported) == 9  # All 9 tool modules
+        # All 9 top-level tool modules must be attempted; transitive imports
+        # (e.g. admino.tools.registry from within a tool) may add extras.
+        top_level_modules = {
+            "admino.tools.gmail",
+            "admino.tools.calendar",
+            "admino.tools.news",
+            "admino.tools.documents",
+            "admino.tools.search",
+            "admino.tools.files",
+            "admino.tools.memory",
+            "admino.tools.aggregate",
+            "admino.tools.recipes",
+        }
+        assert top_level_modules.issubset(set(imported))
 
     def test_import_tool_modules_continues_after_missing_module(self) -> None:
         """After a missing module, remaining modules are still imported."""
