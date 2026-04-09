@@ -4,105 +4,91 @@ Local-only, security-first personal AI agent. Python 3.12+, FastAPI, Pydantic v2
 
 ## How to Run
 
-### Option A: Local dev mode (MacBook, recommended)
+You're in your IDE terminal, the repo is cloned, and you want the app running. Here's what to do.
 
-This runs the Python app directly on your machine with native Ollama for Metal GPU acceleration. Fastest setup.
+### Prerequisites
+
+You need **Python 3.12+** and **Ollama** installed:
 
 ```bash
-# 1. Install Ollama (if not already installed)
-#    Download from https://ollama.ai or:
+# Install Ollama if you don't have it
 brew install ollama
+```
 
-# 2. Start Ollama and pull the model (~8-10 GB download, one-time)
-ollama serve &                   # start Ollama in background (skip if already running)
-ollama pull gemma4:12b           # download the model
+### Quick start (local dev, recommended)
 
-# 3. Clone and install Python dependencies
-git clone <repo-url> admino && cd admino
+Run these commands from the project root:
+
+```bash
+# 1. Install Python dependencies
 pip install -e ".[dev]"
 
-# 4. Set up environment
-cp .env.example .env
-# Edit .env if needed — defaults work for local dev with VPN auth mode
+# 2. Start Ollama and pull the model (one-time, ~8-10 GB download)
+ollama serve &               # skip if Ollama is already running
+ollama pull gemma4:12b
 
-# 5. Update config for local dev (native Ollama on localhost)
-#    Edit config/config.yaml and set:
-#      ollama.url: "http://localhost:11434"
-#    (The default is host.docker.internal which is for Docker mode)
+# 3. Create data directories
+mkdir -p data/db data/logs data/images data/tokens data/files/documents data/files/downloads data/files/notes
 
-# 6. Create data directories
-mkdir -p data/db data/logs data/images data/tokens
-
-# 7. Start the agent
+# 4. Start the agent
 make run
 ```
 
-Open **http://localhost:8000** in your browser. You should see the admino PWA. Type a message and hit Enter.
+Open **http://localhost:8000** in your browser. Done.
 
-### Option B: Docker (agent container + native Ollama)
+The config defaults (`config/config.yaml`) are set up for local dev out of the box — Ollama at `localhost:11434`, VPN auth mode (no token needed), relative data paths.
 
-Runs the agent in Docker but uses your native Ollama installation for GPU acceleration.
+### What happens at startup
+
+1. `main.py` loads `config/config.yaml` and `config/permissions.yaml`
+2. Opens the audit logger at `data/logs/audit.ndjson`
+3. Configures the memory tool (SQLite at `data/db/admino.db`) and files tool (allowed paths from config)
+4. Connects to Ollama, registers all tool handlers, freezes the registry
+5. Starts uvicorn on `0.0.0.0:8000` (single worker)
+
+### What to expect in the browser
+
+1. The PWA loads — click **Skip** on the token prompt (VPN auth mode needs no token)
+2. Type a message and press Enter
+3. The agent sends your message to Ollama, which may respond with tool calls
+4. Currently implemented tools: `memory.store/recall/list` and `files.read/list/search/write/move`
+5. Other tools (gmail, calendar, news, etc.) are not yet implemented — the agent handles those gracefully with a text-only response
+
+### Docker mode (optional)
+
+**Agent in Docker + native Ollama** (keeps Metal GPU acceleration):
 
 ```bash
-# 1. Make sure Ollama is running natively with the model pulled
 ollama serve &
 ollama pull gemma4:12b
-
-# 2. Set up environment
 cp .env.example .env
-
-# 3. Create data directories (mounted as Docker volumes)
 mkdir -p data/db data/logs data/images data/tokens
-
-# 4. Build and start
-make docker-build
-make docker-up
+make docker-build && make docker-up
 ```
 
-Open **http://localhost:8000**.
-
-### Option C: Full Docker (agent + Ollama in containers, for VPS)
-
-Runs everything in Docker. No native Ollama needed. Slower on Mac (no Metal GPU).
+**Full Docker** (agent + Ollama in containers, for VPS):
 
 ```bash
-# 1. Set up environment
 cp .env.example .env
 # Edit .env: set OLLAMA_BASE_URL=http://ollama:11434
-
-# 2. Edit config/config.yaml: set ollama.url to "http://ollama:11434"
-
-# 3. Create data directories
+# Edit config/config.yaml: set ollama.url to "http://ollama:11434"
 mkdir -p data/db data/logs data/images data/tokens
-
-# 4. Build and start both containers
 docker compose --profile with-ollama up -d
-
-# 5. Pull the model into the Ollama container (one-time, ~8-10 GB)
 docker compose exec ollama ollama pull gemma4:12b
 ```
 
-Open **http://localhost:8000**.
-
-### What to expect
-
-Once running, the PWA will:
-
-1. Prompt for a Bearer token on first visit (click **Skip** for VPN mode / local dev)
-2. Show a chat interface — type any message and press Enter
-3. The agent sends your message to Ollama, which may respond with tool calls
-4. Currently implemented tools: `memory.store/recall/list` and `files.read/list/search/write/move`
-5. Other tools (gmail, calendar, news, etc.) are not yet implemented — the agent will handle those gracefully with a text-only response
+Both options serve at **http://localhost:8000**.
 
 ### Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| "Connection refused" on port 8000 | Make sure the agent is running: `make run` or `docker compose ps` |
-| "Connection refused" to Ollama | Make sure Ollama is running: `ollama serve` or check `ollama list` |
-| Slow first response | First inference loads the model into memory. Subsequent responses are faster. |
-| "Model not found" | Run `ollama pull gemma4:12b` (or whichever model is in your config) |
-| PWA shows "Disconnected" | The SSE connection status dot is cosmetic — the chat works via POST requests regardless |
+| `Connection refused` on port 8000 | Is the agent running? `make run` or `docker compose ps` |
+| `Connection refused` to Ollama | Start it: `ollama serve` — verify with `ollama list` |
+| Slow first response | Normal — first inference loads the model into GPU memory |
+| `Model not found` | `ollama pull gemma4:12b` |
+| `Config file not found` | Run from the project root (where `config/` and `data/` live) |
+| PWA shows "Disconnected" | Cosmetic — chat works via POST regardless of SSE status |
 
 ### Quality checks
 
@@ -110,7 +96,7 @@ Once running, the PWA will:
 make lint        # ruff check
 make format      # ruff format
 make typecheck   # mypy strict
-make test        # pytest with coverage (954 tests, 94% coverage)
+make test        # pytest with coverage (1043 tests, 93% coverage)
 ```
 
 ## Recommended Models
@@ -280,7 +266,7 @@ The following intentional deviations from `final_requirements.md` improve securi
 
 | # | Item | Details | Priority |
 |---|------|---------|----------|
-| 10 | **Tool-specific tests** | `tests/test_tools/test_gmail.py`, `test_calendar.py`, `test_documents.py`, `test_files.py`, `test_memory.py`, `test_aggregate.py`, `test_recipes.py` | P1 |
+| 10 | **Tool-specific tests** | `test_gmail.py`, `test_calendar.py`, `test_documents.py`, `test_aggregate.py`, `test_recipes.py` (files + memory done) | P1 |
 | 11 | **Health endpoint enrichment** | Add `model`, `ollama_reachable`, `uptime_s` to GET /health response | P2 |
 | 12 | **`DEPENDENCIES.md`** | Document every direct dependency with name, version, purpose, justification (§9.7) | P2 |
 | 13 | **`conftest.py` shared fixtures** | Mock Ollama, test config, test DB fixtures for test organization | P3 |
@@ -295,7 +281,7 @@ The following intentional deviations from `final_requirements.md` improve securi
 - **Tool modules**: tools/memory.py (SQLite key-value store), tools/files.py (path-validated file access)
 - **PWA**: index.html, style.css, app.js, service-worker.js, manifest.json, icons
 - **DevOps**: Dockerfile, docker-compose.yml, entrypoint.sh, Makefile, .env.example, .gitignore, .dockerignore
-- **Tests**: 954 tests, 94% coverage on core modules (all core modules above 80%)
+- **Tests**: 1043 tests, 93% overall coverage (all core modules above 80%)
 - **Security**: CSP headers, egress whitelist, credential sanitization, TOCTOU-safe file writes, path confinement
 
 ## License

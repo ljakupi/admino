@@ -61,10 +61,11 @@ htmlcov/
 docker-compose.override.yml
 
 # Data directories (contain user data and secrets)
-data/db/
-data/logs/
-data/images/
-data/tokens/
+data
+# data/db/
+# data/logs/
+# data/images/
+# data/tokens/
 
 # Config (may contain tokens or local overrides — keep template only)
 config/config.yaml

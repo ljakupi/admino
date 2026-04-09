@@ -108,6 +108,7 @@ class Agent:
         permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
         model_name: str,
+        system_prompt: str = "",
     ) -> None:
         """Initialise the agent with its collaborators.
 
@@ -123,12 +124,16 @@ class Agent:
                 ``max_context_messages``).
             model_name: Name of the LLM model used — recorded on every
                 conversation audit entry.
+            system_prompt: Optional system message prepended to every run's
+                context window. Used to communicate available file paths,
+                operator constraints, and other static context to the LLM.
         """
         self._llm = llm_client
         self._audit = audit_logger
         self._permissions = permissions_config
         self._config = agent_config
         self._model_name = model_name
+        self._system_prompt = system_prompt
 
     # ------------------------------------------------------------------
     # Public API
@@ -165,7 +170,12 @@ class Agent:
             history, and a summary of tool calls made during the run.
         """
         # Work on a local copy so we never mutate the caller's list.
-        working_history: list[LLMMessage] = list(history)
+        # Prepend the system prompt if configured — it is always first so
+        # _trim_context preserves it as part of the leading system block.
+        working_history: list[LLMMessage] = []
+        if self._system_prompt:
+            working_history.append(LLMMessage(role="system", content=self._system_prompt))
+        working_history.extend(history)
         working_history.append(LLMMessage(role="user", content=user_message))
 
         # Audit the user turn before any LLM call so the trail is complete

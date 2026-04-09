@@ -27,6 +27,7 @@ Security notes:
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Final
@@ -38,9 +39,11 @@ from admino.models import AgentConfig
 
 logger = logging.getLogger(__name__)
 
-# Default config paths relative to CWD. Overridden by env in practice.
-_DEFAULT_CONFIG_PATH: Final[Path] = Path("config.yaml")
-_DEFAULT_PERMISSIONS_PATH: Final[Path] = Path("permissions.yaml")
+# Config directory: CONFIG_DIR env var (set in .env / docker-compose), or
+# fall back to ./config (local dev from project root).
+_CONFIG_DIR: Final[Path] = Path(os.environ.get("CONFIG_DIR", "config"))
+_DEFAULT_CONFIG_PATH: Final[Path] = _CONFIG_DIR / "config.yaml"
+_DEFAULT_PERMISSIONS_PATH: Final[Path] = _CONFIG_DIR / "permissions.yaml"
 
 # Valid Python log levels (explicit allowlist for _configure_logging).
 _VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset(
@@ -101,6 +104,46 @@ def _import_tool_modules() -> None:
         except Exception:
             logger.error("Failed to import tool module %s", module_name)
             raise
+
+
+def _build_system_prompt(config: object) -> str:
+    """Build a system prompt from the validated application config.
+
+    Tells the LLM which file paths it can access so it doesn't have to
+    guess and hit permission errors.
+
+    Args:
+        config: Validated AppConfig instance.
+
+    Returns:
+        A system prompt string, or empty string if nothing meaningful to say.
+    """
+    from admino.config import AppConfig
+
+    if not isinstance(config, AppConfig):
+        return ""
+
+    lines: list[str] = [
+        "You are admino, a local personal AI assistant.",
+        "You have access to the following tools: memory (store/recall/list key-value notes) "
+        "and files (read/list/search/write/move files).",
+        "",
+    ]
+
+    if config.files.allowed_paths:
+        lines.append("The following file paths are available to you:")
+        for entry in config.files.allowed_paths:
+            from pathlib import Path as _Path
+
+            resolved = _Path(entry.path).resolve()
+            access_desc = "read and write" if entry.access == "readwrite" else "read only"
+            lines.append(f"  - {entry.label}: {resolved}  ({access_desc})")
+        lines.append(
+            "When using file tools, always use the exact paths listed above "
+            "(or paths within those directories)."
+        )
+
+    return "\n".join(lines)
 
 
 def main(
@@ -169,9 +212,24 @@ def main(
     logger.debug("Ollama URL: %s", config.ollama.url)
 
     # ------------------------------------------------------------------
-    # 6. Import tool modules and freeze the registry
+    # 6. Configure and import tool modules, then freeze the registry
     # ------------------------------------------------------------------
+
+    # Configure tool modules with paths from the validated config BEFORE
+    # importing them (import triggers @register_tool decorators, not config).
+    from admino.tools import files as files_tool
+    from admino.tools import memory as memory_tool
     from admino.tools.registry import freeze_registry
+
+    memory_tool.configure(config.paths.database)
+    files_tool.configure(
+        allowed_paths=[
+            {"path": entry.path, "label": entry.label, "access": entry.access}
+            for entry in config.files.allowed_paths
+        ],
+        max_read_chars=config.files.max_read_chars,
+    )
+    logger.info("Tool modules configured (memory, files).")
 
     _import_tool_modules()
     freeze_registry()
@@ -187,9 +245,11 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 8. Instantiate the Agent
+    # 8. Build system prompt from config and instantiate the Agent
     # ------------------------------------------------------------------
     from admino.agent import Agent
+
+    system_prompt = _build_system_prompt(config)
 
     agent = Agent(
         llm_client=llm_client,
@@ -197,6 +257,7 @@ def main(
         permissions_config=permissions_config,
         agent_config=agent_config,
         model_name=config.ollama.model,
+        system_prompt=system_prompt,
     )
     logger.info("Agent initialized with model %s", config.ollama.model)
 
