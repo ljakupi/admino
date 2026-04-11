@@ -1,6 +1,6 @@
 # admino
 
-Local-only, security-first personal AI agent. Python 3.12+, FastAPI, Pydantic v2, Ollama for LLM inference, Docker Compose deployment.
+Local-only, security-first personal AI agent. Python 3.12+, FastAPI, Pydantic v2, Docker Compose deployment. LLM inference via **Ollama** (default, local), **vLLM** (local, GPU), **Anthropic Claude**, or **OpenAI** — provider is selected via `llm.provider` in `config.yaml`.
 
 ## How to Run
 
@@ -8,12 +8,12 @@ You're in your IDE terminal, the repo is cloned, and you want the app running. H
 
 ### Prerequisites
 
-You need **Python 3.12+** and **Ollama** installed:
+You need **Python 3.12+** and one LLM backend:
 
-```bash
-# Install Ollama if you don't have it
-brew install ollama
-```
+- **Ollama** (default, local, recommended for privacy) — `brew install ollama`
+- **vLLM** (local, GPU required) — runs as a Docker overlay
+- **Anthropic Claude** (opt-in, cloud) — `ANTHROPIC_API_KEY` env var
+- **OpenAI** (opt-in, cloud) — `OPENAI_API_KEY` env var
 
 ### Quick start (local dev, recommended)
 
@@ -27,8 +27,8 @@ pip install -e ".[dev]"
 ollama serve &               # skip if Ollama is already running
 ollama pull gemma4:12b
 
-# 3. Create data directories
-mkdir -p data/db data/logs data/images data/tokens data/files/documents data/files/downloads data/files/notes
+# 3. Create data directories + the single sandboxed documents dir
+mkdir -p data/db data/logs data/tokens ~/Downloads/admino
 
 # 4. Start the agent
 make run
@@ -36,25 +36,27 @@ make run
 
 Open **http://localhost:8000** in your browser. Done.
 
-The config defaults (`config/config.yaml`) are set up for local dev out of the box — Ollama at `localhost:11434`, VPN auth mode (no token needed), relative data paths.
+The config defaults in `config/config.yaml` currently target Anthropic (`llm.provider: "anthropic"`) since that's what's been exercised most recently in development. To switch to a local Ollama running on your laptop, change `llm.provider` to `"ollama"` and uncomment `ollama_url: "http://localhost:11434"`. VPN auth mode and relative data paths work out of the box either way.
 
 ### What happens at startup
 
 1. `main.py` loads `config/config.yaml` and `config/permissions.yaml`
 2. Opens the audit logger at `data/logs/audit.ndjson`
 3. Configures the memory tool (SQLite at `data/db/admino.db`) and files tool (allowed paths from config)
-4. Connects to Ollama, registers all tool handlers, freezes the registry
+4. Instantiates the LLM client for the configured `llm.provider` (Ollama / Anthropic / OpenAI), registers all tool handlers, freezes the registry
 5. Starts uvicorn on `0.0.0.0:8000` (single worker)
 
 ### What to expect in the browser
 
 1. The PWA loads — click **Skip** on the token prompt (VPN auth mode needs no token)
 2. Type a message and press Enter
-3. The agent sends your message to Ollama, which may respond with tool calls
+3. The agent sends your message to the configured LLM provider, which may respond with tool calls
 4. Currently implemented tools: `memory.store/recall/list` and `files.read/list/search/write/move`
 5. Other tools (gmail, calendar, news, etc.) are not yet implemented — the agent handles those gracefully with a text-only response
 
 ### Docker mode (optional)
+
+admino uses a base + overlay compose layout. The base `docker-compose.yml` defines the `agent` container only. Local LLM backends live in provider-specific overlay files (`docker-compose.ollama.yml`, `docker-compose.vllm.yml`) that are merged via `make docker-up BACKEND=<name>`.
 
 **Agent in Docker + native Ollama** (keeps Metal GPU acceleration):
 
@@ -62,31 +64,54 @@ The config defaults (`config/config.yaml`) are set up for local dev out of the b
 ollama serve &
 ollama pull gemma4:12b
 cp .env.example .env
-mkdir -p data/db data/logs data/images data/tokens
+# Edit config/config.yaml: llm.provider: "ollama", ollama_url: "http://host.docker.internal:11434"
+mkdir -p data/db data/logs data/tokens ~/Downloads/admino
 make docker-build && make docker-up
 ```
 
-**Full Docker** (agent + Ollama in containers, for VPS):
+**Full Docker with Ollama** (agent + Ollama in containers, for VPS):
 
 ```bash
 cp .env.example .env
-# Edit .env: set OLLAMA_BASE_URL=http://ollama:11434
-# Edit config/config.yaml: set ollama.url to "http://ollama:11434"
-mkdir -p data/db data/logs data/images data/tokens
-docker compose --profile with-ollama up -d
-docker compose exec ollama ollama pull gemma4:12b
+# Defaults already point at http://local-llm:11434 — no edits needed.
+mkdir -p data/db data/logs data/tokens ~/Downloads/admino
+make docker-build BACKEND=ollama
+make docker-up BACKEND=ollama
+docker compose exec local-llm ollama pull gemma4:12b
 ```
 
-Both options serve at **http://localhost:8000**.
+**Full Docker with vLLM** (agent + vLLM, GPU required):
+
+```bash
+cp .env.example .env
+# Edit config/config.yaml: set llm.provider: "openai" and openai_base_url: "http://local-llm:8000/v1"
+mkdir -p data/db data/logs data/tokens data/hf-cache ~/Downloads/admino
+make docker-build BACKEND=vllm
+make docker-up BACKEND=vllm
+```
+
+**Full Docker with a proprietary provider** (Anthropic / OpenAI — no local LLM container):
+
+```bash
+cp .env.example .env
+# Set ANTHROPIC_API_KEY (or OPENAI_API_KEY) in .env.
+# Set llm.provider in config/config.yaml to "anthropic" or "openai".
+mkdir -p data/db data/logs data/tokens ~/Downloads/admino
+make docker-build
+make docker-up
+```
+
+All four modes serve at **http://localhost:8000**. The agent inside the container always reaches the local LLM (when present) at the provider-agnostic hostname `http://local-llm:PORT` — swapping backends means swapping the `BACKEND` variable, not editing internal service names.
 
 ### Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
 | `Connection refused` on port 8000 | Is the agent running? `make run` or `docker compose ps` |
-| `Connection refused` to Ollama | Start it: `ollama serve` — verify with `ollama list` |
+| `Connection refused` to Ollama | Start it: `ollama serve` — verify with `ollama list`. In Docker mode with `BACKEND=ollama`, check `docker compose ps` and confirm `local-llm` is healthy. |
 | Slow first response | Normal — first inference loads the model into GPU memory |
-| `Model not found` | `ollama pull gemma4:12b` |
+| `Model not found` | `ollama pull gemma4:12b` (native) or `docker compose exec local-llm ollama pull gemma4:12b` (Docker) |
+| `ANTHROPIC_API_KEY not set` | Export it in `.env` (copied from `.env.example`). Required when `llm.provider: "anthropic"`. |
 | `Config file not found` | Run from the project root (where `config/` and `data/` live) |
 | PWA shows "Disconnected" | Cosmetic — chat works via POST regardless of SSE status |
 
@@ -162,17 +187,19 @@ This section documents key decisions about where we use proven third-party libra
 
 **Alternatives evaluated:** `scrubadub`, `detect-secrets`, `trufflehog`. None operate as real-time field validators.
 
-#### 3. Ollama LLM Client (`llm.py`) -- Custom httpx Client
+#### 3. LLM Clients (`llm_ollama.py`, `llm_anthropic.py`, `llm_openai.py`) -- Mixed Strategy
 
-**Decision:** Custom async client instead of the official `ollama-python` SDK.
+**Decision:** Custom httpx client for Ollama, official SDKs (`anthropic`, `openai`) for the proprietary providers. A shared `llm.py` module defines the `LLMClient` protocol, a factory that imports only the provider selected in config, and shared sanitizers (control-char stripping, size limits, Pydantic tool-call validation).
 
 **Why:**
-- The Ollama HTTP API is trivial (one endpoint: `POST /api/chat`). The HTTP call is ~20 lines.
-- The value of our code is in what happens around the call: response sanitization (control character removal), size limits (per-chunk and cumulative), tool call validation against Pydantic schemas, and graceful degradation on malformed responses.
-- The `ollama-python` SDK would abstract away our sanitization layer, which is security-critical.
-- The spec explicitly bans libraries that "abstract the agent's decision-making" -- LLM interaction is part of that.
+- **Ollama:** its HTTP API is one endpoint (`POST /api/chat`). A ~20-line custom httpx client is simpler than pulling in `ollama-python`, and lets us own the sanitization layer directly around the network boundary.
+- **Anthropic / OpenAI:** their APIs are much more involved (multipart content blocks, typed errors, streaming, retries, tool-use IDs). The official SDKs handle this correctly and are maintained by the vendors. We wrap them with the same sanitizers and tool-call validators used for Ollama, so the security-critical layer still runs at the trust boundary.
+- **Isolation:** only the configured provider's module (and its SDK) is imported at startup. An admino deployment running on Ollama never loads `anthropic` or `openai`.
+- **Interchangeability:** every provider module implements the same `LLMClient` protocol, so the agent loop is provider-agnostic.
 
-**Alternatives evaluated:** `ollama-python` (official SDK). Rejected because it would hide our security-critical sanitization and validation logic behind an abstraction.
+**Alternatives evaluated:**
+- `ollama-python` (official SDK) — rejected. Abstracting the single-endpoint call buys nothing and hides the sanitization layer.
+- Hand-rolling Anthropic/OpenAI clients from httpx — rejected. The APIs are rich enough that re-implementing them would be an ongoing maintenance burden with no security benefit; the SDKs do not make decisions for us, they just format requests and parse responses.
 
 #### 4. Permission Engine (`permissions.py`) -- Custom Pure Function
 
@@ -207,28 +234,38 @@ This section documents key decisions about where we use proven third-party libra
 ## Project Structure
 
 ```
-src/admino/
-  main.py         -- entry point, load config, start uvicorn
-  server.py       -- FastAPI app, routes, SSE, static files
-  agent.py        -- agent loop, LLM interaction, tool dispatch
-  llm.py          -- Ollama client via httpx
-  permissions.py  -- permission engine (pure function, isolated)
-  audit.py        -- append-only NDJSON logger
-  config.py       -- Pydantic config models for YAML + env vars
-  models.py       -- shared Pydantic models
-  oauth.py        -- OAuth token management, Fernet encryption
-  oauth_setup.py  -- CLI for one-time OAuth consent
-  tools/
-    registry.py   -- tool registration + dispatch
-    gmail.py      -- Gmail read/list/search
-    calendar.py   -- Calendar read/list/create
-    news.py       -- News fetch
-    documents.py  -- Document store/classify/search/query + OCR
-    search.py     -- Web search
-    files.py      -- Local file read/list/search/write/move
-    memory.py     -- Persistent key-value notes (SQLite)
-    aggregate.py  -- Cross-source search + dedup
-    recipes.py    -- YAML recipe loader + executor
+admino/
+  docker-compose.yml         -- base: agent only (provider-agnostic)
+  docker-compose.ollama.yml  -- overlay: adds `local-llm` via Ollama
+  docker-compose.vllm.yml    -- overlay: adds `local-llm` via vLLM (GPU)
+  Dockerfile
+  Makefile                   -- docker-{build,up,down,logs} accept BACKEND={ollama,vllm}
+  entrypoint.sh              -- iptables egress whitelist + start server
+  src/admino/
+    main.py            -- entry point, load config, start uvicorn
+    server.py          -- FastAPI app, routes, SSE, static files
+    agent.py           -- agent loop, LLM interaction, tool dispatch
+    llm.py             -- LLM client protocol + provider factory + shared sanitizers
+    llm_ollama.py      -- Ollama backend (default): httpx client for /api/chat
+    llm_anthropic.py   -- Anthropic Claude backend (opt-in): anthropic SDK
+    llm_openai.py      -- OpenAI backend (opt-in): openai SDK
+    permissions.py     -- permission engine (pure function, isolated)
+    audit.py           -- append-only NDJSON logger
+    config.py          -- Pydantic config models for YAML + env vars
+    models.py          -- shared Pydantic models
+    oauth.py           -- OAuth token management, Fernet encryption
+    oauth_setup.py     -- CLI for one-time OAuth consent
+    tools/
+      registry.py      -- tool registration + dispatch
+      gmail.py         -- Gmail read/list/search
+      calendar.py      -- Calendar read/list/create
+      news.py          -- News fetch
+      documents.py     -- Document store/classify/search/query + OCR
+      search.py        -- Web search
+      files.py         -- Local file read/list/search/write/move
+      memory.py        -- Persistent key-value notes (SQLite)
+      aggregate.py     -- Cross-source search + dedup
+      recipes.py       -- YAML recipe loader + executor
 ```
 
 ## Deviations from Specification
@@ -243,7 +280,7 @@ The following intentional deviations from `final_requirements.md` improve securi
 | SSE event names | `thinking`, `confirmation_required`, `confirmation_resolved`, `tool_result` | `status`, `confirm`, `tool_call`, `message`, `done` | Functionally equivalent; the PWA uses these names. Will align naming in v2 if needed. |
 | Session ID generation | Server-generated UUID | Client-generated (timestamp + random hex) | Acceptable for single-user, local-only deployment. |
 | Default model | `qwen2.5-coder:14b` | `gemma4:12b` | Gemma 4 (April 2026) has native tool calling, better quality at similar size. |
-| Docker Compose Ollama | Always starts | Behind `with-ollama` profile | Laptop mode uses native Ollama for Metal GPU acceleration. |
+| Docker Compose Ollama | Always starts | Provider-agnostic `local-llm` service in `docker-compose.ollama.yml` overlay (opt-in via `make docker-up BACKEND=ollama`) | Laptop mode uses native Ollama for Metal GPU acceleration; the overlay pattern also accommodates vLLM and future backends without touching the base file. |
 | Health endpoint | Returns `model`, `ollama_reachable`, `uptime_s` | Returns `{"status": "ok"}` only | Enriched response planned for v1 completion. |
 
 ## Outstanding for Complete v1
@@ -280,7 +317,7 @@ The following intentional deviations from `final_requirements.md` improve securi
 - **Tool registry**: tools/registry.py (registration, dispatch, permission enforcement)
 - **Tool modules**: tools/memory.py (SQLite key-value store), tools/files.py (path-validated file access)
 - **PWA**: index.html, style.css, app.js, service-worker.js, manifest.json, icons
-- **DevOps**: Dockerfile, docker-compose.yml, entrypoint.sh, Makefile, .env.example, .gitignore, .dockerignore
+- **DevOps**: Dockerfile, docker-compose.yml (base), docker-compose.ollama.yml + docker-compose.vllm.yml (provider overlays), entrypoint.sh (iptables egress whitelist), Makefile (BACKEND variable for overlay selection), .env.example, .gitignore, .dockerignore
 - **Tests**: 1043 tests, 93% overall coverage (all core modules above 80%)
 - **Security**: CSP headers, egress whitelist, credential sanitization, TOCTOU-safe file writes, path confinement
 

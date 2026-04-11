@@ -6,7 +6,7 @@
 # Security model:
 #   - All outbound traffic is blocked by default (DROP policy on OUTPUT chain).
 #   - Loopback (127.0.0.1) is always allowed (required for internal IPC).
-#   - The internal Docker bridge network is allowed (Ollama communication).
+#   - The internal Docker bridge network is allowed (local LLM backend communication).
 #   - DNS (UDP/TCP port 53) to the Docker embedded DNS resolver is allowed
 #     so that whitelisted hostnames can be resolved.
 #   - Only whitelisted external destinations are opened by hostname. Docker's
@@ -71,7 +71,7 @@ apply_iptables() {
     iptables -A OUTPUT -d "${DOCKER_DNS_IP}" -p udp --dport 53 -j ACCEPT
     iptables -A OUTPUT -d "${DOCKER_DNS_IP}" -p tcp --dport 53 -j ACCEPT
 
-    # Allow all traffic on the internal Docker bridge network (Ollama access)
+    # Allow all traffic on the internal Docker bridge network (local LLM backend access)
     iptables -A OUTPUT -d "${INTERNAL_NETWORK}" -j ACCEPT
 
     # Allow egress to whitelisted external hosts (HTTPS only, port 443)

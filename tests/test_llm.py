@@ -21,11 +21,11 @@ from admino.llm import (
     _CONTROL_CHAR_TABLE,
     _MAX_CONTENT_LENGTH,
     LLMResponse,
-    OllamaClient,
     OllamaError,
-    _parse_tool_calls,
-    _sanitize_content,
+    parse_tool_calls,
+    sanitize_content,
 )
+from admino.llm_ollama import OllamaClient
 from admino.models import LLMMessage
 
 # ---------------------------------------------------------------------------
@@ -237,26 +237,26 @@ class TestToolCallParsing:
 
 
 # ---------------------------------------------------------------------------
-# _parse_tool_calls unit tests (direct function tests)
+# parse_tool_calls unit tests (direct function tests)
 # ---------------------------------------------------------------------------
 
 
 class TestParseToolCalls:
-    """Direct unit tests for the _parse_tool_calls helper."""
+    """Direct unit tests for the parse_tool_calls helper."""
 
     def test_malformed_function_not_dict(self) -> None:
         """Non-dict function value is skipped."""
-        result = _parse_tool_calls([{"function": "not-a-dict"}])
+        result = parse_tool_calls([{"function": "not-a-dict"}])
         assert result == []
 
     def test_missing_name(self) -> None:
         """Missing or empty name is skipped."""
-        result = _parse_tool_calls([{"function": {"arguments": {}}}])
+        result = parse_tool_calls([{"function": {"arguments": {}}}])
         assert result == []
 
     def test_arguments_not_dict(self) -> None:
         """Non-dict arguments value is skipped."""
-        result = _parse_tool_calls([{"function": {"name": "gmail.read", "arguments": "bad"}}])
+        result = parse_tool_calls([{"function": {"name": "gmail.read", "arguments": "bad"}}])
         assert result == []
 
 
@@ -765,11 +765,32 @@ class TestSanitization:
         assert result == "abcdefghi"
 
     def test_sanitize_content_truncates_and_strips(self) -> None:
-        """_sanitize_content strips control chars and enforces length limit."""
+        """sanitize_content strips control chars and enforces length limit."""
         dirty = "\x00A" * (_MAX_CONTENT_LENGTH + 100)
-        result = _sanitize_content(dirty)
+        result = sanitize_content(dirty)
         assert "\x00" not in result
         assert len(result) <= _MAX_CONTENT_LENGTH
+
+    def test_strip_control_chars_removes_c1_nel(self) -> None:
+        """U+0085 (NEL — Next Line) is stripped by the control char table."""
+        text = "Hello\x85World"
+        result = text.translate(_CONTROL_CHAR_TABLE)
+        assert result == "HelloWorld"
+
+    def test_strip_control_chars_removes_c1_csi(self) -> None:
+        """U+009B (CSI — Control Sequence Introducer) is stripped."""
+        text = "data\x9b31mred"
+        result = text.translate(_CONTROL_CHAR_TABLE)
+        assert "\x9b" not in result
+        assert result == "data31mred"
+
+    def test_strip_control_chars_removes_full_c1_range(self) -> None:
+        """All C1 control characters (U+0080-U+009F) are stripped."""
+        # Build a string with all 32 C1 chars interspersed with 'X'
+        c1_chars = "".join(chr(i) for i in range(0x80, 0xA0))
+        text = f"A{c1_chars}B"
+        result = text.translate(_CONTROL_CHAR_TABLE)
+        assert result == "AB"
 
 
 # ---------------------------------------------------------------------------
@@ -805,23 +826,23 @@ class TestChatStreamCumulativeCap:
 
 
 # ---------------------------------------------------------------------------
-# Additional _parse_tool_calls security tests
+# Additional parse_tool_calls security tests
 # ---------------------------------------------------------------------------
 
 
 class TestParseToolCallsSecurity:
-    """Security-focused tests for _parse_tool_calls."""
+    """Security-focused tests for parse_tool_calls."""
 
     def test_oversized_arguments_rejected(self) -> None:
         """Arguments with JSON payload > 16384 bytes are rejected."""
         big_args = {"data": "x" * 16385}
-        result = _parse_tool_calls([{"function": {"name": "gmail.read", "arguments": big_args}}])
+        result = parse_tool_calls([{"function": {"name": "gmail.read", "arguments": big_args}}])
         assert result == []
 
     def test_too_many_argument_keys_rejected(self) -> None:
         """Arguments with more than 32 keys are rejected."""
         many_keys = {f"key_{i}": "v" for i in range(33)}
-        result = _parse_tool_calls([{"function": {"name": "gmail.read", "arguments": many_keys}}])
+        result = parse_tool_calls([{"function": {"name": "gmail.read", "arguments": many_keys}}])
         assert result == []
 
     def test_deeply_nested_arguments_rejected(self) -> None:
@@ -829,22 +850,22 @@ class TestParseToolCallsSecurity:
         nested: dict[str, Any] = {"a": "val"}
         for _ in range(4):
             nested = {"a": nested}
-        result = _parse_tool_calls([{"function": {"name": "gmail.read", "arguments": nested}}])
+        result = parse_tool_calls([{"function": {"name": "gmail.read", "arguments": nested}}])
         assert result == []
 
     def test_trailing_dot_name_rejected(self) -> None:
         """Tool name 'gmail.' splits to action='' which fails Pydantic validation."""
-        result = _parse_tool_calls([{"function": {"name": "gmail.", "arguments": {}}}])
+        result = parse_tool_calls([{"function": {"name": "gmail.", "arguments": {}}}])
         assert result == []
 
     def test_leading_dot_name_rejected(self) -> None:
         """Tool name '.read' splits to tool='' which fails Pydantic validation."""
-        result = _parse_tool_calls([{"function": {"name": ".read", "arguments": {}}}])
+        result = parse_tool_calls([{"function": {"name": ".read", "arguments": {}}}])
         assert result == []
 
     def test_null_byte_in_name_sanitised(self) -> None:
         """Null byte in tool name is stripped by sanitisation; clean name is parsed."""
-        result = _parse_tool_calls([{"function": {"name": "gmail\x00.read", "arguments": {}}}])
+        result = parse_tool_calls([{"function": {"name": "gmail\x00.read", "arguments": {}}}])
         # The null byte is removed by _CONTROL_CHAR_TABLE before the split,
         # so "gmail\x00.read" becomes "gmail.read" which is a valid tool call.
         assert len(result) == 1
@@ -854,14 +875,14 @@ class TestParseToolCallsSecurity:
     def test_many_tool_calls_all_parsed(self) -> None:
         """50 valid tool calls are all parsed (no artificial limit in parser)."""
         raw = [{"function": {"name": f"tool{i}.action", "arguments": {}}} for i in range(50)]
-        result = _parse_tool_calls(raw)
+        result = parse_tool_calls(raw)
         # tool names like "tool0" match ^[a-z][a-z0-9_]{0,62}$
         assert len(result) == 50
 
     def test_too_many_tool_calls_rejected(self) -> None:
         """More than 128 tool calls in a single response are rejected."""
         raw = [{"function": {"name": f"tool{i}.action", "arguments": {}}} for i in range(129)]
-        result = _parse_tool_calls(raw)
+        result = parse_tool_calls(raw)
         assert result == []
 
 

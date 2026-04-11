@@ -1,0 +1,86 @@
+# admino — vLLM local LLM overlay (GPU required)
+#
+# Adds a vLLM inference server as the "local-llm" service, exposing an
+# OpenAI-compatible API. Merge with the base file to enable it:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d
+#
+# Or via Make:
+#
+#   make docker-up BACKEND=vllm
+#
+# The agent reaches this service at http://local-llm:8000/v1 using the
+# OpenAI provider client (vLLM is OpenAI-compatible). Set in config.yaml:
+#
+#   llm:
+#     provider: "openai"
+#     openai_model: "meta-llama/Llama-3.2-3B-Instruct"
+#     openai_base_url: "http://local-llm:8000/v1"
+#
+# Prerequisites:
+#   - NVIDIA GPU and nvidia-container-toolkit installed on the host.
+#   - The HuggingFace model either pre-downloaded into ./data/hf-cache or
+#     fetched out-of-band — the internal network has no external egress.
+
+services:
+
+  # --------------------------------------------------------------------------
+  # local-llm (vLLM) — Local OSS inference server with GPU acceleration.
+  # ZERO external network access: attached to the internal bridge only.
+  # No ports are published to the host.
+  # --------------------------------------------------------------------------
+  local-llm:
+    # Pin to a specific version — never use :latest in production.
+    image: vllm/vllm-openai:v0.6.3
+    restart: unless-stopped
+
+    # vLLM model to serve and server listen address.
+    # Override the model with the VLLM_MODEL env var in .env.
+    command:
+      - "--model"
+      - "${VLLM_MODEL:-meta-llama/Llama-3.2-3B-Instruct}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+
+    # vLLM needs access to /dev/shm for tensor-parallel workers.
+    ipc: host
+
+    # Internal network only — no external routing.
+    # Port 8000 is intentionally NOT published to the host.
+    networks:
+      - internal
+
+    volumes:
+      # HuggingFace model cache. Pre-download the model on the host or
+      # temporarily attach this service to the egress network for the first run.
+      - ./data/hf-cache:/root/.cache/huggingface
+
+    # GPU reservation — requires nvidia-container-toolkit on the host.
+    deploy:
+      resources:
+        limits:
+          memory: 16g
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    # vLLM does not need any elevated capabilities beyond the GPU runtime.
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 5
+
+  # Extend the agent so it waits for the local LLM to become healthy.
+  agent:
+    depends_on:
+      local-llm:
+        condition: service_healthy

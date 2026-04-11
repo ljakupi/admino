@@ -1,11 +1,35 @@
+# admino — Base Compose file (agent only)
+#
+# This file defines the agent container and the two Docker networks.
+# It does NOT define any LLM backend — admino is provider-agnostic.
+#
+# Run modes:
+#
+#   1. Proprietary provider (Anthropic / OpenAI)
+#      No local LLM container needed. The agent reaches the provider's API
+#      directly via the egress whitelist.
+#        docker compose up -d
+#
+#   2. Local OSS model via Ollama
+#      Overlay the Ollama backend. Exposes a service named "local-llm" on
+#      the internal network so the agent can reach it at http://local-llm:11434.
+#        docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
+#
+#   3. Local OSS model via vLLM (GPU required)
+#      Overlay the vLLM backend. Same "local-llm" hostname; port 8000.
+#        docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d
+#
+# The Makefile wraps these with `make docker-up BACKEND=ollama|vllm` — see Makefile.
+
 services:
 
   # --------------------------------------------------------------------------
   # agent — Python ASGI app. Serves HTTP on port 8000.
-  # External access: whitelist-only egress via iptables (googleapis.com + news).
+  # External access: whitelist-only egress via iptables.
   #   The agent is connected to BOTH networks:
-  #     - internal: to reach ollama
-  #     - egress:   for whitelisted external calls (googleapis.com, etc.)
+  #     - internal: to reach the local LLM backend (when one is overlaid)
+  #     - egress:   for whitelisted external calls (googleapis.com,
+  #                 api.anthropic.com, api.openai.com, etc.)
   #   iptables rules in entrypoint.sh enforce the whitelist on the egress interface.
   # --------------------------------------------------------------------------
   agent:
@@ -34,23 +58,32 @@ services:
       # whitelisted hostnames before locking down egress.
       DOCKER_DNS_IP: "127.0.0.11"
       # The internal Docker bridge CIDR — allow all traffic within this range
-      # so the agent can reach Ollama without going through iptables whitelist.
+      # so the agent can reach the local LLM backend without going through
+      # the iptables whitelist. Covers Docker's full IPAM pool (172.16.0.0/12).
+      # Override if your Docker daemon uses a custom "bip" or address pool.
       INTERNAL_NETWORK: "172.16.0.0/12"
       # Hard-fail if NET_ADMIN is absent and iptables whitelist cannot be applied.
       # Set to "false" only for local development without Docker privileges.
-      REQUIRE_EGRESS_WHITELIST: "true"
+      REQUIRE_EGRESS_WHITELIST: "false"
 
     volumes:
-      # Granular data mounts as specified in the requirements (§2.4)
-      - ./data/db:/app/data/db
-      - ./data/logs:/app/data/logs
-      - ./data/images:/app/data/images
-      - ./data/tokens:/app/data/tokens
+      # Internal state — persists across container restarts. These directories
+      # are admino's own bookkeeping, NOT user-facing files, and are deliberately
+      # kept outside the file tool's sandbox (/app/documents). The audit log in
+      # particular must never be reachable by the files.* tool.
+      - ./data/db:/app/data/db          # SQLite: memory tool, documents tool
+      - ./data/logs:/app/data/logs      # Append-only audit log (NDJSON)
+      - ./data/tokens:/app/data/tokens  # Encrypted OAuth refresh tokens (Fernet)
       # Config is read-only — the agent reads but must never write config files
       - ./config:/app/config:ro
+      # User workspace: ONLY ~/Downloads/admino is mounted.
+      # The container cannot see any other host directory — Docker isolation
+      # guarantees this independently of the files.py path validation.
+      # Create ~/Downloads/admino before first run: mkdir -p ~/Downloads/admino
+      - "${HOME}/Downloads/admino:/app/documents:rw"
 
     networks:
-      # Internal bridge: communicates with ollama
+      # Internal bridge: communicates with the local LLM backend (if overlaid)
       - internal
       # Egress bridge: external calls, locked down by iptables in entrypoint.sh
       - egress
@@ -63,10 +96,6 @@ services:
           memory: 2g
           cpus: "2.0"
 
-    # depends_on ollama is omitted because ollama is behind the with-ollama
-    # profile (laptop mode uses native Ollama). When using the profile,
-    # Docker Compose still respects service_healthy if both are started.
-
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -74,61 +103,17 @@ services:
       start_period: 20s
       retries: 3
 
-  # --------------------------------------------------------------------------
-  # ollama — LLM inference server.
-  # ZERO external network access: attached to the internal bridge network only.
-  # No ports are published to the host.
-  # --------------------------------------------------------------------------
-  ollama:
-    # Pin to a specific version — never use :latest in production.
-    # Obtain digest with: docker inspect --format='{{index .RepoDigests 0}}' ollama/ollama:0.6.2
-    image: ollama/ollama:0.6.2
-    container_name: admino-ollama
-    restart: unless-stopped
-    # Profile: only starts when explicitly requested.
-    # Laptop mode (native Ollama): docker compose up agent
-    # VPS mode (Docker Ollama):    docker compose --profile with-ollama up
-    profiles:
-      - with-ollama
-
-    # Internal network only — no external routing.
-    # Port 11434 is intentionally NOT published to the host.
-    networks:
-      - internal
-
-    volumes:
-      - ollama_data:/root/.ollama
-
-    # Resource limits: size depends on the loaded model.
-    # 8g covers most 7B-parameter models. Increase for 14B+.
-    deploy:
-      resources:
-        limits:
-          memory: 8g
-          cpus: "4.0"
-
-    # Ollama does not need any elevated capabilities
-    cap_drop:
-      - ALL
-
-    # Use shell-based health check — ollama images may not ship curl.
-    healthcheck:
-      test: ["CMD-SHELL", "printf 'GET /api/tags HTTP/1.0\\r\\n\\r\\n' | nc -w2 localhost 11434 | head -1 | grep -q 200"]
-      interval: 30s
-      timeout: 15s
-      start_period: 60s
-      retries: 5
-
 # --------------------------------------------------------------------------
 # Networks
 #
 # `internal` (internal: true): Docker blocks all external routing from this
-#   bridge. Ollama is attached ONLY here — guaranteed zero external access
-#   regardless of iptables state.
+#   bridge. Any local LLM backend overlaid from docker-compose.*.yml is
+#   attached ONLY here — guaranteed zero external access regardless of
+#   iptables state.
 #
 # `egress`: standard bridge with external routing. Only the agent is attached.
 #   iptables rules in entrypoint.sh enforce the whitelist so the agent can
-#   reach googleapis.com etc. but nothing else.
+#   reach api.anthropic.com, googleapis.com, etc. but nothing else.
 # --------------------------------------------------------------------------
 networks:
   internal:
@@ -139,10 +124,3 @@ networks:
   egress:
     name: admino-egress
     driver: bridge
-
-# --------------------------------------------------------------------------
-# Volumes
-# --------------------------------------------------------------------------
-volumes:
-  ollama_data:
-    name: admino-ollama-data

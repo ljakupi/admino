@@ -66,60 +66,50 @@ class ServerConfig(BaseModel):
 
 
 class OllamaConfig(BaseModel):
-    """Ollama LLM inference settings.
+    """Ollama-specific settings extracted from LLMConfig for OllamaClient.
 
-    Security note: use http:// only for local/Docker networking (ollama, localhost,
-    127.0.0.1). For remote Ollama instances, use https:// to prevent cleartext
-    transmission of conversation history.
+    This is a convenience model passed to OllamaClient. It is constructed
+    from LLMConfig fields, not parsed from YAML directly.
     """
 
-    url: str = Field(
-        default="http://ollama:11434",
+    url: str = Field(default="http://local-llm:11434", max_length=500)
+    model: str = Field(default="gemma4:e2b", max_length=200)
+    timeout_s: int = Field(default=120, ge=1, le=600)
+
+
+class LLMConfig(BaseModel):
+    """LLM provider configuration.
+
+    Supports three providers:
+    - "ollama" (default): Local inference via Ollama. No data leaves the machine.
+    - "anthropic" (opt-in): Anthropic Claude API. Messages sent to Anthropic servers.
+    - "openai" (opt-in): OpenAI API. Messages sent to OpenAI servers.
+
+    Proprietary providers require their respective API key env vars
+    (ANTHROPIC_API_KEY or OPENAI_API_KEY). The agent logs a clear warning
+    at startup when a proprietary provider is selected.
+
+    Security note: use http:// for ollama_url only with local/Docker networking
+    (local-llm, localhost, 127.0.0.1). For remote Ollama, use https://.
+    """
+
+    provider: Literal["ollama", "anthropic", "openai"] = Field(
+        default="ollama",
+        description=(
+            "LLM provider: 'ollama' (default, local), "
+            "'anthropic' (opt-in, cloud), 'openai' (opt-in, cloud)."
+        ),
+    )
+
+    # -- Ollama settings (used when provider=ollama) --
+    ollama_url: str = Field(
+        default="http://local-llm:11434",
         max_length=500,
         pattern=r"^https?://",
         description="Base URL for the Ollama API.",
     )
-
-    @field_validator("url")
-    @classmethod
-    def warn_on_insecure_remote_url(cls, v: str) -> str:
-        """Warn when http:// is used with a non-local host.
-
-        Uses ipaddress to detect loopback and link-local addresses so that
-        non-standard loopback IPs (e.g. 127.0.0.2) and IPv6 link-local
-        addresses (fe80::) are correctly treated as local.
-        """
-        # Reject control characters (CRLF injection, null bytes).
-        if any(c in v for c in "\r\n\x00"):
-            msg = "OllamaConfig.url must not contain control characters."
-            raise ValueError(msg)
-
-        if v.startswith("http://"):
-            host_match = re.match(r"^http://([^/:]+)", v)
-            host = host_match.group(1) if host_match else ""
-            if not host:
-                msg = "OllamaConfig.url must include a hostname."
-                raise ValueError(msg)
-            # Named local hosts and Docker service names
-            local_names = frozenset({"localhost", "ollama"})
-            is_local = host in local_names
-            if not is_local:
-                try:
-                    addr = ipaddress.ip_address(host)
-                    is_local = addr.is_loopback or addr.is_link_local
-                except ValueError:
-                    pass  # Not an IP address — treat as remote
-            if not is_local:
-                logger.warning(
-                    "OllamaConfig.url uses http:// with non-local host '%s'. "
-                    "Conversation history will be transmitted in cleartext. "
-                    "Use https:// for remote Ollama instances.",
-                    host,
-                )
-        return v
-
     model: str = Field(
-        default="qwen2.5-coder:14b",
+        default="gemma4:e2b",
         max_length=200,
         description="Model name to request from Ollama.",
     )
@@ -127,17 +117,117 @@ class OllamaConfig(BaseModel):
         default=120,
         ge=1,
         le=600,
-        description="Request timeout in seconds for Ollama API calls.",
+        description="Request timeout in seconds for LLM API calls.",
     )
 
-    @field_validator("model")
+    # -- Anthropic settings (used when provider=anthropic) --
+    anthropic_model: str = Field(
+        default="claude-sonnet-4-20250514",
+        max_length=200,
+        description="Anthropic model ID (e.g. claude-sonnet-4-20250514).",
+    )
+
+    # -- OpenAI settings (used when provider=openai) --
+    openai_model: str = Field(
+        default="gpt-4o",
+        max_length=200,
+        description="OpenAI model ID (e.g. gpt-4o).",
+    )
+
+    # -- Shared settings for proprietary providers --
+    max_response_tokens: int = Field(
+        default=4096,
+        ge=1,
+        le=65536,
+        description="Maximum tokens in LLM response (Anthropic/OpenAI max_tokens).",
+    )
+
+    @field_validator("ollama_url")
+    @classmethod
+    def warn_on_insecure_remote_url(cls, v: str) -> str:
+        """Warn when http:// is used with a non-local host."""
+        if any(c in v for c in "\r\n\x00"):
+            msg = "LLMConfig.ollama_url must not contain control characters."
+            raise ValueError(msg)
+
+        if v.startswith("http://"):
+            host_match = re.match(r"^http://([^/:]+)", v)
+            host = host_match.group(1) if host_match else ""
+            if not host:
+                msg = "LLMConfig.ollama_url must include a hostname."
+                raise ValueError(msg)
+            local_names = frozenset({"localhost", "ollama", "local-llm"})
+            is_local = host in local_names
+            if not is_local:
+                try:
+                    addr = ipaddress.ip_address(host)
+                    is_local = addr.is_loopback or addr.is_link_local
+                except ValueError:
+                    pass
+            if not is_local:
+                logger.warning(
+                    "LLMConfig.ollama_url uses http:// with non-local host '%s'. "
+                    "Conversation history will be transmitted in cleartext. "
+                    "Use https:// for remote Ollama instances.",
+                    host,
+                )
+        return v
+
+    @field_validator("model", "anthropic_model", "openai_model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
-        """Reject model names containing shell metacharacters."""
+        """Reject model names containing shell metacharacters or control chars."""
         if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$", v):
-            msg = "OllamaConfig.model contains invalid characters."
+            msg = "LLMConfig model field contains invalid characters."
             raise ValueError(msg)
         return v
+
+    @model_validator(mode="after")
+    def validate_provider_requirements(self) -> LLMConfig:
+        """Validate provider-specific requirements at config load time.
+
+        Proprietary providers require API key env vars and log a warning.
+        """
+        if self.provider == "anthropic":
+            if not os.environ.get("ANTHROPIC_API_KEY"):
+                msg = (
+                    "llm.provider is 'anthropic' but ANTHROPIC_API_KEY env var is not set. "
+                    "Set the API key or switch to llm.provider: 'ollama'."
+                )
+                raise ValueError(msg)
+            logger.warning(
+                "LLM provider is 'anthropic' — user messages and tool results "
+                "will be sent to Anthropic's servers. Ensure you accept this trade-off."
+            )
+        elif self.provider == "openai":
+            if not os.environ.get("OPENAI_API_KEY"):
+                msg = (
+                    "llm.provider is 'openai' but OPENAI_API_KEY env var is not set. "
+                    "Set the API key or switch to llm.provider: 'ollama'."
+                )
+                raise ValueError(msg)
+            logger.warning(
+                "LLM provider is 'openai' — user messages and tool results "
+                "will be sent to OpenAI's servers. Ensure you accept this trade-off."
+            )
+        return self
+
+    @property
+    def active_model_name(self) -> str:
+        """Return the model name for the currently configured provider."""
+        if self.provider == "anthropic":
+            return self.anthropic_model
+        if self.provider == "openai":
+            return self.openai_model
+        return self.model
+
+    def to_ollama_config(self) -> OllamaConfig:
+        """Extract Ollama-specific settings for the OllamaClient."""
+        return OllamaConfig(
+            url=self.ollama_url,
+            model=self.model,
+            timeout_s=self.timeout_s,
+        )
 
 
 class AuthConfig(BaseModel):
@@ -385,7 +475,7 @@ class AppConfig(BaseModel):
     """
 
     server: ServerConfig = Field(default_factory=ServerConfig)
-    ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
     files: FilesConfig = Field(default_factory=FilesConfig)
@@ -482,22 +572,32 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     """
     ollama_url = os.environ.get("OLLAMA_BASE_URL")
     if ollama_url:
-        ollama_section = data.setdefault("ollama", {})
-        if isinstance(ollama_section, dict):
-            ollama_section["url"] = ollama_url
+        llm_section = data.setdefault("llm", {})
+        if isinstance(llm_section, dict):
+            llm_section["ollama_url"] = ollama_url
         else:
             logger.warning(
-                "Cannot apply OLLAMA_BASE_URL override: 'ollama' config section is not a mapping."
+                "Cannot apply OLLAMA_BASE_URL override: 'llm' config section is not a mapping."
             )
 
     ollama_model = os.environ.get("OLLAMA_MODEL")
     if ollama_model:
-        ollama_section = data.setdefault("ollama", {})
-        if isinstance(ollama_section, dict):
-            ollama_section["model"] = ollama_model
+        llm_section = data.setdefault("llm", {})
+        if isinstance(llm_section, dict):
+            llm_section["model"] = ollama_model
         else:
             logger.warning(
-                "Cannot apply OLLAMA_MODEL override: 'ollama' config section is not a mapping."
+                "Cannot apply OLLAMA_MODEL override: 'llm' config section is not a mapping."
+            )
+
+    llm_provider = os.environ.get("LLM_PROVIDER")
+    if llm_provider:
+        llm_section = data.setdefault("llm", {})
+        if isinstance(llm_section, dict):
+            llm_section["provider"] = llm_provider
+        else:
+            logger.warning(
+                "Cannot apply LLM_PROVIDER override: 'llm' config section is not a mapping."
             )
 
     log_level = os.environ.get("LOG_LEVEL")

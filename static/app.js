@@ -1055,21 +1055,27 @@ function initMessageInput(sessionId, getToken) {
       const data = await sendMessage(text || ' ', sessionId, token, imageUrl);
       hideTyping();
 
-      // Check if this is a confirmation-required response
-      const needsConfirm = data.tool_calls &&
-        data.tool_calls.some((tc) => tc.permission === 'confirm');
-
-      if (needsConfirm) {
-        // The confirm card will be shown by SSE or we handle it here
-        // if SSE didn't fire (non-streaming mode)
-        const tc = data.tool_calls.find((tc) => tc.permission === 'confirm');
-        if (tc && data.response) {
-          const fragment = renderMarkdown(data.response);
-          appendMessage('assistant', fragment, data.tool_calls);
-        }
-      } else if (data.response) {
+      // Render the assistant message (if any) first so the user sees
+      // the explanation above the confirmation card.
+      if (data.response) {
         const fragment = renderMarkdown(data.response);
         appendMessage('assistant', fragment, data.tool_calls || []);
+      }
+
+      // If the agent is awaiting confirmation, render the inline
+      // Approve/Deny card. The server includes pending_confirmation with
+      // the confirmation_id, tool, and action in the REST response when
+      // status === 'awaiting_confirmation'.
+      if (data.status === 'awaiting_confirmation' && data.pending_confirmation) {
+        const pc = data.pending_confirmation;
+        if (
+          typeof pc.confirmation_id === 'string' &&
+          _CONFIRM_ID_RE.test(pc.confirmation_id) &&
+          typeof pc.tool === 'string' &&
+          typeof pc.action === 'string'
+        ) {
+          appendConfirmCard(pc.confirmation_id, pc.tool, pc.action, sessionId, token);
+        }
       }
     } catch (err) {
       hideTyping();

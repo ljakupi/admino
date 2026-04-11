@@ -8,6 +8,7 @@ checks that plaintext tokens are never leaked to stdout or disk.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -586,15 +587,17 @@ class TestMainEntryPoint:
         """main() delegates to asyncio.run with _run_setup."""
         from admino.oauth_setup import main
 
-        called = False
-
         async def fake_setup() -> None:
-            nonlocal called
-            called = True
+            return None
 
         monkeypatch.setattr("admino.oauth_setup._run_setup", fake_setup)
 
-        with patch("admino.oauth_setup.asyncio.run", side_effect=lambda coro: None) as mock_run:
+        # Close the coroutine inside the mock so it is not left un-awaited,
+        # which would otherwise raise a RuntimeWarning at GC time.
+        def _consume(coro: Any) -> None:
+            coro.close()
+
+        with patch("admino.oauth_setup.asyncio.run", side_effect=_consume) as mock_run:
             main()
             mock_run.assert_called_once()
 

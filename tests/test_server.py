@@ -271,26 +271,6 @@ class TestAuth:
             )
         assert resp.status_code == 401
 
-    def test_server_auth_uses_constant_time_comparison(self) -> None:
-        """Verify server.py uses hmac.compare_digest for token comparison."""
-        import inspect
-
-        import admino.server as server_module
-
-        source = inspect.getsource(server_module)
-        tree = ast.parse(source)
-        found = False
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "hmac"
-                and node.attr == "compare_digest"
-            ):
-                found = True
-                break
-        assert found, "server.py must use hmac.compare_digest for token comparison"
-
 
 class TestPostMessage:
     """POST /api/message — happy path and agent status variants."""
@@ -1065,6 +1045,21 @@ class TestSecurityInvariants:
                         found_hmac = True
         assert found_hmac, "server.py must import hmac"
 
+    def test_server_auth_uses_constant_time_comparison(self) -> None:
+        """Verify server.py uses hmac.compare_digest for token comparison."""
+        tree = self._get_server_ast()
+        found = False
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "hmac"
+                and node.attr == "compare_digest"
+            ):
+                found = True
+                break
+        assert found, "server.py must use hmac.compare_digest for token comparison"
+
 
 class TestStaticFiles:
     """Static file serving — API routes take priority."""
@@ -1150,6 +1145,10 @@ class TestSSEStreamHelper:
         combined = "".join(frames)
         assert "event: confirm" in combined
         assert "event: done" in combined
+
+
+class TestSSEHelperFunctions:
+    """Sync helper function tests for SSE formatting (no event loop needed)."""
 
     def test_server_format_sse_wire_format(self) -> None:
         """_format_sse produces correct wire format."""
@@ -1283,6 +1282,167 @@ class TestConfirmationEdgeCases:
         assert len(agent.run_calls) == 2
         assert agent.run_calls[1]["pending_confirmation"] is not None
         assert agent.run_calls[1]["pending_confirmation"].confirmation_id == pending.confirmation_id
+
+    async def test_server_awaiting_confirmation_response_exposes_pending_summary(
+        self,
+    ) -> None:
+        """When the agent is awaiting confirmation, POST /api/message must
+        return ``status='awaiting_confirmation'`` plus a ``pending_confirmation``
+        summary carrying the confirmation_id, tool, and action. Without these
+        fields the PWA has no way to render its Approve/Deny card.
+        """
+        pending = _make_pending_confirmation(
+            session_id="sess1",
+            confirmation_id="confirm-xyz-42",
+            tool="files",
+            action="write",
+        )
+        awaiting_result = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Action files.write requires user confirmation.",
+            pending_confirmation=pending,
+        )
+        agent = FakeAgent([awaiting_result])
+        app = _make_app(agent)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/api/message",
+                json={"message": "write a file", "session_id": "sess1"},
+                headers=_AUTH_HEADER,
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "awaiting_confirmation"
+        assert data["pending_confirmation"] is not None
+        pc = data["pending_confirmation"]
+        assert pc["confirmation_id"] == "confirm-xyz-42"
+        assert pc["tool"] == "files"
+        assert pc["action"] == "write"
+        assert "expires_at" in pc
+        # Tool args must NOT leak via the summary — they may contain secrets
+        # or large content and are already summarised in ``tool_calls``.
+        assert "args" not in pc
+        assert "tool_call" not in pc
+        assert "input" not in pc
+
+    async def test_server_final_response_omits_pending_confirmation(self) -> None:
+        """A plain final response has status='final' and pending_confirmation=None."""
+        agent = FakeAgent([_make_agent_result(status="final", response="Hello!")])
+        app = _make_app(agent)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post(
+                "/api/message",
+                json={"message": "hi", "session_id": "sess1"},
+                headers=_AUTH_HEADER,
+            )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "final"
+        assert data["pending_confirmation"] is None
+
+    async def test_server_new_message_during_pending_closes_tool_use(self) -> None:
+        """Regression: sending a freeform /api/message while a confirmation is
+        pending must (a) cancel the pending confirmation and (b) append a
+        synthetic cancelled tool_result so the history handed to the next
+        agent.run() does not leave a ``tool_use`` dangling — which would
+        otherwise make Anthropic reject the next LLM call with HTTP 400.
+        """
+        import admino.server as srv
+
+        pending = _make_pending_confirmation(session_id="sess1")
+        # First turn: agent returns awaiting_confirmation with a history that
+        # ends in an assistant message carrying a tool_use block — the exact
+        # shape that produced the Anthropic 400 in production.
+        awaiting_history = [
+            LLMMessage(role="user", content="write a file"),
+            LLMMessage(
+                role="assistant",
+                content="I'll write the file.",
+                tool_use_blocks=[
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_abc123",
+                        "name": "files.write",
+                        "input": {"path": "/app/documents/x.txt", "content": "hi"},
+                    }
+                ],
+            ),
+        ]
+        awaiting_result = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Action files.write requires user confirmation.",
+            history=awaiting_history,
+            pending_confirmation=pending,
+        )
+        followup_result = _make_agent_result(
+            status="final",
+            response="OK, cancelled. What would you like to do instead?",
+        )
+        agent = FakeAgent([awaiting_result, followup_result])
+        app = _make_app(agent)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            # Turn 1: triggers the pending confirmation.
+            await c.post(
+                "/api/message",
+                json={"message": "write a file", "session_id": "sess1"},
+                headers=_AUTH_HEADER,
+            )
+            assert "sess1" in srv._pending_confirmations
+
+            # Turn 2: user sends a new chat message instead of calling
+            # /api/confirm/{id}. Must succeed (no 500) and the pending
+            # confirmation must have been cleared.
+            resp = await c.post(
+                "/api/message",
+                json={"message": "I confirm it!", "session_id": "sess1"},
+                headers=_AUTH_HEADER,
+            )
+
+        assert resp.status_code == 200
+        assert "sess1" not in srv._pending_confirmations
+
+        # Inspect the history passed to agent.run() on the second call: the
+        # dangling tool_use must have been closed with a synthetic tool
+        # message referencing the same tool_call_id.
+        assert len(agent.run_calls) == 2
+        second_history = agent.run_calls[1]["history"]
+        trailing_tool = [m for m in second_history if m.role == "tool"]
+        assert any(
+            m.tool_call_id == "toolu_abc123" and "cancelled" in m.content.lower()
+            for m in trailing_tool
+        ), "dangling tool_use must be closed by a synthetic cancelled tool_result"
+
+    async def test_server_close_dangling_tool_use_noop_on_clean_history(self) -> None:
+        """_close_dangling_tool_use is a no-op on well-formed history."""
+        from admino.server import _close_dangling_tool_use
+
+        history = [
+            LLMMessage(role="user", content="hi"),
+            LLMMessage(role="assistant", content="hello"),
+        ]
+        assert _close_dangling_tool_use(history) == history
+
+    async def test_server_close_dangling_tool_use_leaves_answered_blocks(self) -> None:
+        """Already-answered tool_use blocks are not duplicated."""
+        from admino.server import _close_dangling_tool_use
+
+        history = [
+            LLMMessage(role="user", content="list files"),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_use_blocks=[
+                    {"type": "tool_use", "id": "toolu_1", "name": "files.list", "input": {}},
+                ],
+            ),
+            LLMMessage(role="tool", content="[]", tool_call_id="toolu_1"),
+        ]
+        assert _close_dangling_tool_use(history) == history
 
 
 class TestSessionCap:

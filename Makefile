@@ -1,4 +1,4 @@
-.PHONY: lint format typecheck test docker-build docker-up docker-down run clean
+.PHONY: lint format typecheck test docker-build docker-up docker-down docker-logs run clean
 
 # Source and package configuration
 SRC_DIR    := src
@@ -7,6 +7,27 @@ PACKAGE    := admino
 
 # Detect OS for cross-platform compatibility
 UNAME := $(shell uname -s)
+
+# --------------------------------------------------------------------------
+# Local LLM backend selection.
+#
+# BACKEND controls which (if any) OSS LLM overlay is merged with the base
+# docker-compose.yml. admino itself is provider-agnostic — set BACKEND only
+# when you want a local model running inside Docker.
+#
+#   (unset)        Agent only. Use with proprietary providers (Anthropic, OpenAI).
+#   BACKEND=ollama Agent + Ollama.        make docker-up BACKEND=ollama
+#   BACKEND=vllm   Agent + vLLM (GPU).    make docker-up BACKEND=vllm
+# --------------------------------------------------------------------------
+BACKEND ?=
+COMPOSE_FILES := -f docker-compose.yml
+ifeq ($(BACKEND),ollama)
+  COMPOSE_FILES += -f docker-compose.ollama.yml
+else ifeq ($(BACKEND),vllm)
+  COMPOSE_FILES += -f docker-compose.vllm.yml
+else ifneq ($(BACKEND),)
+  $(error Unknown BACKEND '$(BACKEND)' — use 'ollama', 'vllm', or leave unset)
+endif
 
 lint:
 	python -m ruff check $(SRC_DIR)/ $(TESTS_DIR)/
@@ -21,13 +42,16 @@ test:
 	python -m pytest $(TESTS_DIR)/ -v --tb=short --cov=$(SRC_DIR)/$(PACKAGE) --cov-report=term-missing
 
 docker-build:
-	docker compose build
+	docker compose $(COMPOSE_FILES) build
 
 docker-up:
-	docker compose up -d
+	docker compose $(COMPOSE_FILES) up -d
 
 docker-down:
-	docker compose down
+	docker compose $(COMPOSE_FILES) down
+
+docker-logs:
+	docker compose $(COMPOSE_FILES) logs -f
 
 run:
 	python -m $(PACKAGE).main

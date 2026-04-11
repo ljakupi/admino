@@ -13,8 +13,11 @@ RUN pip install --no-cache-dir hatchling==1.27.0
 COPY pyproject.toml .
 COPY src/ src/
 
-# Install the package and all runtime dependencies into /install prefix
-RUN pip install --no-cache-dir --prefix=/install .
+# Install the package and all runtime dependencies into /install prefix.
+# The `all-providers` extra bundles the Anthropic and OpenAI SDKs so the image
+# supports any provider chosen in config.yaml (ollama / anthropic / openai)
+# without rebuilding. Ollama uses only httpx and needs no extra.
+RUN pip install --no-cache-dir --prefix=/install ".[all-providers]"
 
 # -------------------------------------------------------------------
 # Stage 2: runtime — minimal image with Tesseract + non-root user
@@ -47,9 +50,13 @@ COPY --from=builder /install /usr/local
 WORKDIR /app
 COPY --chown=admino:admino src/ src/
 
+# Copy PWA static files. server.py resolves the static directory from
+# /app/static when running inside the image (see server.py create_app).
+COPY --chown=admino:admino static/ /app/static/
+
 # Create data and config directories; they will be volume-mounted at runtime
 # but must exist in the image so the container starts cleanly if volumes are empty
-RUN mkdir -p /app/data/db /app/data/logs /app/data/images /app/data/tokens /app/config \
+RUN mkdir -p /app/data/db /app/data/logs /app/data/tokens /app/config /app/documents \
     && chown -R admino:admino /app
 
 # Copy and enable the entrypoint script

@@ -43,6 +43,7 @@ from secrets import token_urlsafe
 from typing import TYPE_CHECKING
 
 from admino.audit import AuditWriteError
+from admino.llm import LLMError
 from admino.models import (
     AgentConfig,
     AgentResult,
@@ -56,7 +57,7 @@ from admino.tools.registry import dispatch_tool_call, get_registered_tools
 
 if TYPE_CHECKING:
     from admino.audit import AuditLogger
-    from admino.llm import OllamaClient
+    from admino.llm import LLMClient
     from admino.permissions import PermissionsConfig
     from admino.tools.registry import ToolCallResult, ToolDescription
 
@@ -103,7 +104,7 @@ class Agent:
     def __init__(
         self,
         *,
-        llm_client: OllamaClient,
+        llm_client: LLMClient,
         audit_logger: AuditLogger,
         permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
@@ -113,7 +114,8 @@ class Agent:
         """Initialise the agent with its collaborators.
 
         Args:
-            llm_client: Async Ollama client used for ``/api/chat`` calls.
+            llm_client: LLM client implementing the LLMClient protocol.
+                Can be OllamaClient, AnthropicClient, or OpenAIClient.
             audit_logger: Append-only audit sink. Passed through to every
                 ``dispatch_tool_call`` invocation so tool-call audit entries
                 are written at the enforcement point.
@@ -240,10 +242,12 @@ class Agent:
                     message="Internal error: audit unavailable.",
                 )
             except Exception as exc:
-                # Log only the exception type — never str(exc) which may
-                # embed HTTP response bodies or credentials. See llm.py
-                # OllamaError docstring.
-                logger.error("LLM chat call failed: %s", type(exc).__name__)
+                # For LLMError, log .message (our own safe string, never an HTTP
+                # body or credential). For other exceptions, log only the type.
+                if isinstance(exc, LLMError):
+                    logger.error("LLM chat call failed: %s", exc.message)
+                else:
+                    logger.error("LLM chat call failed: %s", type(exc).__name__)
                 return self._terminal_error(
                     session_id=session_id,
                     history=working_history,
@@ -281,10 +285,27 @@ class Agent:
             #    global max_tool_calls cap. If a call comes back pending
             #    confirmation, short-circuit — the caller will resume us.
             batch: list[ToolCall] = response.tool_calls
-            # Record the assistant's tool-call turn in history as an empty
-            # assistant message. The LLM needs its own prior turn present so
-            # the tool responses that follow are contextualised correctly.
-            working_history.append(LLMMessage(role="assistant", content=response.content or ""))
+            # Record the assistant's tool-call turn in history. Include the
+            # tool_use_blocks so that providers requiring structured content in
+            # the assistant message (Anthropic) can reconstruct the proper
+            # tool_use / tool_result pairing. Ollama and OpenAI ignore this field.
+            working_history.append(
+                LLMMessage(
+                    role="assistant",
+                    content=response.content or "",
+                    tool_use_blocks=[
+                        {
+                            "type": "tool_use",
+                            "id": tc.tool_call_id,
+                            "name": f"{tc.tool}.{tc.action}",
+                            "input": tc.args,
+                        }
+                        for tc in response.tool_calls
+                        if tc.tool_call_id
+                    ]
+                    or None,
+                )
+            )
             # L-4: Clamp batch count to le=50 limit on ConversationAuditEntry.
             # tool_calls_count to avoid a ValidationError crash that would
             # bypass audit.
@@ -373,10 +394,13 @@ class Agent:
                     )
 
                 # Feed the tool result back to the LLM as a tool-role message.
+                # Carry tool_call_id from the ToolCall so Anthropic/OpenAI can
+                # link the result to the originating tool_use/tool_call block.
                 working_history.append(
                     LLMMessage(
                         role="tool",
                         content=result.result,
+                        tool_call_id=tool_call.tool_call_id,
                     )
                 )
                 # H-3: Audit the tool-result turn so the audit log can

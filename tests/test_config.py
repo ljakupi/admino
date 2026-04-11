@@ -21,8 +21,8 @@ from admino.config import (
     AuthConfig,
     EgressConfig,
     LimitsConfig,
+    LLMConfig,
     OcrConfig,
-    OllamaConfig,
     PathsConfig,
     ServerConfig,
     load_app_config,
@@ -67,8 +67,9 @@ class TestValidConfigLoading:
             server:
               host: "127.0.0.1"
               port: 9090
-            ollama:
-              url: "http://localhost:11434"
+            llm:
+              provider: "ollama"
+              ollama_url: "http://localhost:11434"
               model: "llama3"
               timeout_s: 60
             auth:
@@ -99,9 +100,10 @@ class TestValidConfigLoading:
 
         assert config.server.host == "127.0.0.1"
         assert config.server.port == 9090
-        assert config.ollama.url == "http://localhost:11434"
-        assert config.ollama.model == "llama3"
-        assert config.ollama.timeout_s == 60
+        assert config.llm.ollama_url == "http://localhost:11434"
+        assert config.llm.model == "llama3"
+        assert config.llm.timeout_s == 60
+        assert config.llm.provider == "ollama"
         assert config.auth.mode == "token"
         assert config.paths.database.is_absolute()
         assert str(config.paths.database).endswith("db.sqlite")
@@ -135,9 +137,10 @@ class TestDefaults:
 
         assert config.server.host == "0.0.0.0"  # noqa: S104
         assert config.server.port == 8000
-        assert config.ollama.url == "http://ollama:11434"
-        assert config.ollama.model == "qwen2.5-coder:14b"
-        assert config.ollama.timeout_s == 120
+        assert config.llm.ollama_url == "http://local-llm:11434"
+        assert config.llm.model == "gemma4:e2b"
+        assert config.llm.timeout_s == 120
+        assert config.llm.provider == "ollama"
         assert config.auth.mode == "vpn"
         assert config.limits.max_tool_calls_per_message == 10
         assert config.limits.confirmation_timeout_s == 300
@@ -169,30 +172,30 @@ class TestEnvVarOverrides:
     def test_ollama_base_url_override(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """OLLAMA_BASE_URL env var overrides ollama.url from YAML."""
+        """OLLAMA_BASE_URL env var overrides llm.ollama_url from YAML."""
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
-            ollama:
-              url: "http://yaml-value:11434"
+            llm:
+              ollama_url: "http://yaml-value:11434"
             """,
         )
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-value:11434")
         config = load_app_config(yaml_path)
-        assert config.ollama.url == "http://env-value:11434"
+        assert config.llm.ollama_url == "http://env-value:11434"
 
     def test_ollama_model_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """OLLAMA_MODEL env var overrides ollama.model from YAML."""
+        """OLLAMA_MODEL env var overrides llm.model from YAML."""
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
-            ollama:
+            llm:
               model: "yaml-model"
             """,
         )
         monkeypatch.setenv("OLLAMA_MODEL", "env-model")
         config = load_app_config(yaml_path)
-        assert config.ollama.model == "env-model"
+        assert config.llm.model == "env-model"
 
     def test_log_level_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """LOG_LEVEL env var overrides log_level from YAML."""
@@ -226,7 +229,7 @@ class TestEnvVarOverrides:
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-only:11434")
         monkeypatch.setenv("LOG_LEVEL", "WARNING")
         config = load_app_config(tmp_path / "nonexistent.yaml")
-        assert config.ollama.url == "http://env-only:11434"
+        assert config.llm.ollama_url == "http://env-only:11434"
         assert config.log_level == "WARNING"
 
 
@@ -276,7 +279,7 @@ class TestInvalidFieldValues:
         [
             ("server:\n  port: 0", "port below minimum"),
             ("server:\n  port: 70000", "port above maximum"),
-            ("ollama:\n  url: 'ftp://bad'", "bad URL scheme"),
+            ("llm:\n  ollama_url: 'ftp://bad'", "bad URL scheme"),
             ("log_level: 'TRACE'", "invalid log level"),
             ("limits:\n  max_tool_calls_per_message: 0", "below min"),
             ("limits:\n  confirmation_timeout_s: 5", "below min timeout"),
@@ -603,7 +606,7 @@ class TestSubModelsPresent:
         config = load_app_config(tmp_path / "nonexistent.yaml")
 
         assert isinstance(config.server, ServerConfig)
-        assert isinstance(config.ollama, OllamaConfig)
+        assert isinstance(config.llm, LLMConfig)
         assert isinstance(config.auth, AuthConfig)
         assert isinstance(config.paths, PathsConfig)
         assert isinstance(config.limits, LimitsConfig)
@@ -885,33 +888,72 @@ class TestAuthConfigValidation:
         assert config.auth.mode == "token"
 
 
-class TestOllamaConfigValidation:
-    """OllamaConfig URL pattern and timeout validation."""
+class TestLLMConfigValidation:
+    """LLMConfig URL pattern, timeout, and provider validation."""
 
     def test_ftp_url_rejected(self) -> None:
         """A URL not starting with http(s):// is rejected."""
-        with pytest.raises(ValidationError, match="url"):
-            OllamaConfig(url="ftp://bad:11434")
+        with pytest.raises(ValidationError, match="ollama_url"):
+            LLMConfig(ollama_url="ftp://bad:11434")
 
     def test_timeout_below_min_raises(self) -> None:
         """Timeout below 1 raises ValidationError."""
         with pytest.raises(ValidationError):
-            OllamaConfig(timeout_s=0)
+            LLMConfig(timeout_s=0)
 
     def test_timeout_above_max_raises(self) -> None:
         """Timeout above 600 raises ValidationError."""
         with pytest.raises(ValidationError):
-            OllamaConfig(timeout_s=601)
+            LLMConfig(timeout_s=601)
 
     def test_crlf_in_url_rejected(self) -> None:
         """A URL containing CRLF is rejected."""
         with pytest.raises(ValidationError, match="control characters"):
-            OllamaConfig(url="http://localhost:11434\r\nX-Injected: true")
+            LLMConfig(ollama_url="http://localhost:11434\r\nX-Injected: true")
 
     def test_model_name_shell_chars_rejected(self) -> None:
         """Model name with shell metacharacters is rejected."""
         with pytest.raises(ValidationError, match="invalid characters"):
-            OllamaConfig(model="evil; rm -rf /")
+            LLMConfig(model="evil; rm -rf /")
+
+    def test_anthropic_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Anthropic provider requires ANTHROPIC_API_KEY env var."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY"):
+            LLMConfig(provider="anthropic")
+
+    def test_openai_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OpenAI provider requires OPENAI_API_KEY env var."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
+            LLMConfig(provider="openai")
+
+    def test_anthropic_with_api_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Anthropic provider with ANTHROPIC_API_KEY set passes validation."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+        config = LLMConfig(provider="anthropic")
+        assert config.provider == "anthropic"
+        assert config.active_model_name == "claude-sonnet-4-20250514"
+
+    def test_openai_with_api_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OpenAI provider with OPENAI_API_KEY set passes validation."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        config = LLMConfig(provider="openai")
+        assert config.provider == "openai"
+        assert config.active_model_name == "gpt-4o"
+
+    def test_active_model_name_ollama(self) -> None:
+        """active_model_name returns ollama model for ollama provider."""
+        config = LLMConfig(provider="ollama", model="test-model:7b")
+        assert config.active_model_name == "test-model:7b"
+
+    def test_to_ollama_config(self) -> None:
+        """to_ollama_config extracts ollama-specific settings."""
+        config = LLMConfig(ollama_url="http://localhost:11434", model="test:7b", timeout_s=60)
+        ollama = config.to_ollama_config()
+        assert ollama.url == "http://localhost:11434"
+        assert ollama.model == "test:7b"
+        assert ollama.timeout_s == 60
 
 
 # ---------------------------------------------------------------------------

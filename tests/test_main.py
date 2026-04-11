@@ -51,8 +51,10 @@ def _make_mock_config() -> MagicMock:
     mock_audit_log.parent = Path("/tmp")  # noqa: S108
     config.paths.audit_log = mock_audit_log
 
-    config.ollama.url = "http://localhost:11434"
-    config.ollama.model = "test-model:7b"
+    config.llm.provider = "ollama"
+    config.llm.active_model_name = "test-model:7b"
+    config.llm.ollama_url = "http://localhost:11434"
+    config.llm.model = "test-model:7b"
     config.limits.max_tool_calls_per_message = 10
     config.limits.max_context_messages = 20
     config.limits.confirmation_timeout_s = 300
@@ -100,7 +102,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     # These are imported lazily inside main(), so we patch the module paths
     monkeypatch.setattr("admino.audit.AuditLogger", mock_audit_cls)
-    monkeypatch.setattr("admino.llm.OllamaClient", mock_ollama_cls)
+    monkeypatch.setattr("admino.llm.create_llm_client", mock_ollama_cls)
     monkeypatch.setattr("admino.agent.Agent", mock_agent_cls)
     monkeypatch.setattr("admino.server.create_app", mock_create_app)
     monkeypatch.setattr("admino.tools.registry.freeze_registry", mock_freeze)
@@ -116,7 +118,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "load_app_config": mock_load_app_config,
         "load_permissions_config": mock_load_permissions_config,
         "AuditLogger": mock_audit_cls,
-        "OllamaClient": mock_ollama_cls,
+        "create_llm_client": mock_ollama_cls,
         "Agent": mock_agent_cls,
         "create_app": mock_create_app,
         "freeze_registry": mock_freeze,
@@ -461,16 +463,16 @@ class TestAgentConfigWiring:
         assert agent_config.confirmation_timeout_s == 200.0
 
     def test_agent_receives_correct_model_name(self, mock_deps: dict[str, Any]) -> None:
-        """Agent is created with model_name from config.ollama.model."""
-        mock_deps["config"].ollama.model = "llama3:8b"
+        """Agent is created with model_name from config.llm.active_model_name."""
+        mock_deps["config"].llm.active_model_name = "llama3:8b"
 
         main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["model_name"] == "llama3:8b"
 
-    def test_agent_receives_ollama_client(self, mock_deps: dict[str, Any]) -> None:
-        """Agent is created with the OllamaClient instance."""
+    def test_agent_receives_llm_client(self, mock_deps: dict[str, Any]) -> None:
+        """Agent is created with the LLM client instance from create_llm_client."""
         main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs

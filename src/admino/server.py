@@ -41,6 +41,7 @@ import asyncio
 import hmac
 import json
 import logging
+import os
 import time
 from collections import OrderedDict
 from datetime import UTC, datetime
@@ -61,6 +62,7 @@ from admino.models import (
     ConfirmRequest,
     LLMMessage,
     PendingConfirmation,
+    PendingConfirmationSummary,
     SSEEvent,
 )
 
@@ -282,6 +284,90 @@ def _reap_expired_confirmations() -> None:
         del _pending_confirmations[sid]
 
 
+_CANCELLED_TOOL_RESULT_MSG = "Tool call cancelled — user sent a new message instead of confirming."
+
+
+def _summarise_pending(pending: PendingConfirmation) -> PendingConfirmationSummary:
+    """Project a ``PendingConfirmation`` into the API-safe summary.
+
+    Strips the tool arguments and the internal ``session_id`` — the PWA only
+    needs the confirmation ID, the tool/action being confirmed (for display),
+    and the expiry so it can show a countdown.
+    """
+    return PendingConfirmationSummary(
+        confirmation_id=pending.confirmation_id,
+        tool=pending.tool_call.tool,
+        action=pending.tool_call.action,
+        expires_at=pending.expires_at,
+    )
+
+
+def _close_dangling_tool_use(history: list[LLMMessage]) -> list[LLMMessage]:
+    """Append synthetic cancelled tool_result messages for any dangling tool_use.
+
+    Anthropic's API rejects a conversation where an assistant message with
+    ``tool_use`` blocks is not immediately followed by matching ``tool_result``
+    blocks. That situation arises when the agent short-circuits on a pending
+    confirmation (see ``agent.py`` returning ``awaiting_confirmation`` after
+    appending the assistant turn): the stored history now ends with a
+    trailing ``tool_use`` that has no companion result.
+
+    If the user then posts a new ``/api/message`` (instead of using
+    ``/api/confirm/{id}``), the next LLM call would fail with HTTP 400. This
+    helper rewrites the history so the contract holds: for each tool_use_block
+    in the last assistant message without a matching ``tool`` message after
+    it, append a synthetic ``tool`` message stating the call was cancelled.
+
+    Returns a new list; the input is not mutated.
+    """
+    if not history:
+        return history
+
+    # Walk from the end collecting trailing tool messages, until we hit
+    # the most recent assistant turn. A user/system message before reaching
+    # an assistant means there is nothing to close.
+    trailing_tool_ids: set[str] = set()
+    assistant_idx: int | None = None
+    for i in range(len(history) - 1, -1, -1):
+        msg = history[i]
+        if msg.role == "tool":
+            if msg.tool_call_id:
+                trailing_tool_ids.add(msg.tool_call_id)
+            continue
+        if msg.role == "assistant":
+            assistant_idx = i
+            break
+        # user or system — no dangling tool_use in play.
+        return history
+
+    if assistant_idx is None:
+        return history
+
+    assistant = history[assistant_idx]
+    if not assistant.tool_use_blocks:
+        return history
+
+    dangling_ids: list[str] = []
+    for block in assistant.tool_use_blocks:
+        block_id = block.get("id")
+        if isinstance(block_id, str) and block_id and block_id not in trailing_tool_ids:
+            dangling_ids.append(block_id)
+
+    if not dangling_ids:
+        return history
+
+    cleaned = list(history)
+    for block_id in dangling_ids:
+        cleaned.append(
+            LLMMessage(
+                role="tool",
+                content=_CANCELLED_TOOL_RESULT_MSG,
+                tool_call_id=block_id,
+            )
+        )
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Auth dependency
 # ---------------------------------------------------------------------------
@@ -465,6 +551,21 @@ async def post_message(
     async with _get_session_lock(session_id):
         history = _sessions.get(session_id, [])
 
+        # If a confirmation was pending for this session, the user has
+        # implicitly cancelled it by sending a new chat message. Drop the
+        # pending record and close any dangling ``tool_use`` in the stored
+        # history so the next LLM call is well-formed. We also call the
+        # cleanup unconditionally as a defence-in-depth step — it is a
+        # no-op on a well-formed history.
+        if session_id in _pending_confirmations:
+            logger.info(
+                "Session %s sent a new message while confirmation was pending — "
+                "cancelling the pending tool call",
+                session_id,
+            )
+            del _pending_confirmations[session_id]
+        history = _close_dangling_tool_use(history)
+
         logger.info("Processing message for session %s", session_id)
 
         try:
@@ -483,8 +584,10 @@ async def post_message(
         _touch_session(session_id, result.history)
 
         # Store pending confirmation if the agent is awaiting one.
+        pending_summary: PendingConfirmationSummary | None = None
         if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
             _pending_confirmations[session_id] = result.pending_confirmation
+            pending_summary = _summarise_pending(result.pending_confirmation)
 
         logger.info(
             "Completed message for session %s: status=%s, tool_calls=%d",
@@ -497,6 +600,8 @@ async def post_message(
             session_id=session_id,
             response=result.response,
             tool_calls=result.tool_calls,
+            status=result.status,
+            pending_confirmation=pending_summary,
         )
 
 
@@ -621,6 +726,10 @@ async def post_confirm(
 
         if not body.approved:
             logger.info("Confirmation %s denied for session %s", confirmation_id, session_id)
+            # The dangling tool_use in session history will be closed the next
+            # time the user sends a chat message (see _close_dangling_tool_use
+            # in post_message). We could also close it eagerly here, but the
+            # lazy approach keeps the denial path minimal.
             # Safe f-string: tool and action are Pydantic-validated with
             # pattern=r"^[a-z][a-z0-9_]{0,62}$", restricting to alphanumeric/
             # underscore. ChatResponse.sanitize_response provides defence-in-depth.
@@ -628,6 +737,8 @@ async def post_confirm(
                 session_id=session_id,
                 response=f"Action {pending.tool_call.tool}.{pending.tool_call.action} was denied.",
                 tool_calls=[],
+                status="final",
+                pending_confirmation=None,
             )
 
         # Approved — resume the agent with the pending confirmation.
@@ -654,13 +765,17 @@ async def post_confirm(
 
         _touch_session(session_id, result.history)
 
+        pending_summary: PendingConfirmationSummary | None = None
         if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
             _pending_confirmations[session_id] = result.pending_confirmation
+            pending_summary = _summarise_pending(result.pending_confirmation)
 
         return ChatResponse(
             session_id=session_id,
             response=result.response,
             tool_calls=result.tool_calls,
+            status=result.status,
+            pending_confirmation=pending_summary,
         )
 
 
@@ -822,9 +937,23 @@ def create_app(
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
 
     # --- Static files (MUST be last so API routes take priority) ---
-    # Mount only if the static directory exists; skip in tests.
-    static_dir = PathLib(__file__).parent.parent.parent / "static"
-    if static_dir.is_dir():
+    # Resolve the PWA static directory. Checked in order:
+    #   1. ADMINO_STATIC_DIR env var (explicit override, e.g. for tests)
+    #   2. /app/static (Docker image layout — copied by Dockerfile)
+    #   3. <repo>/static (dev layout: src/admino/server.py -> repo root -> static)
+    # Mount only if a directory is found; skip silently in tests.
+    static_dir: PathLib | None = None
+    env_static = os.environ.get("ADMINO_STATIC_DIR")
+    candidates: list[PathLib] = []
+    if env_static:
+        candidates.append(PathLib(env_static))
+    candidates.append(PathLib("/app/static"))
+    candidates.append(PathLib(__file__).parent.parent.parent / "static")
+    for candidate in candidates:
+        if candidate.is_dir():
+            static_dir = candidate
+            break
+    if static_dir is not None:
         from fastapi.staticfiles import StaticFiles
 
         app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")

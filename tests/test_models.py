@@ -577,7 +577,7 @@ class TestLLMMessage:
 
     def test_tool_call_id_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
-            LLMMessage(role="tool", content="r", tool_call_id="x" * 65)
+            LLMMessage(role="tool", content="r", tool_call_id="x" * 129)
 
 
 # ===========================================================================

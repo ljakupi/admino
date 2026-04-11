@@ -1,35 +1,35 @@
-"""Async Ollama API client for LLM inference.
+"""LLM client protocol, shared utilities, and provider factory.
 
-Provides the OllamaClient class that communicates with Ollama's /api/chat
-endpoint via httpx. Supports both synchronous (non-streaming) and streaming
-chat completions with tool calling.
+Defines the ``LLMClient`` protocol that all provider backends implement,
+shared sanitization/parsing utilities, and the ``create_llm_client()``
+factory that instantiates the correct backend based on config.
+
+Provider modules:
+- ``llm_ollama.py`` — Ollama backend (default, local)
+- ``llm_anthropic.py`` — Anthropic Claude backend (opt-in)
+- ``llm_openai.py`` — OpenAI backend (opt-in)
 
 Security notes:
 - No credentials are stored or logged by this module.
-- Timeouts are enforced on all HTTP requests to prevent indefinite hangs.
-- Does not import from agent.py, server.py, or tools/.
-- LLM output length is bounded; callers should additionally sanitize
-  control characters before processing (see SEC-16 in requirements).
-- Callers must log only str(OllamaError), never __cause__ or repr(),
-  to prevent leaking HTTP response bodies that may contain conversation context.
+- LLM output is sanitized: control characters stripped, length bounded.
+- Tool call arguments are validated for size and nesting depth.
+- Callers must log only str(LLMError), never __cause__ or repr(),
+  to prevent leaking HTTP response bodies containing conversation context.
+- Only the configured provider's SDK is imported (lazy import in factory).
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
-
-    from admino.config import OllamaConfig
+    from admino.config import LLMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,8 @@ _MAX_TOOLS_PAYLOAD: int = 65536
 # ---------------------------------------------------------------------------
 
 
-class OllamaError(Exception):
-    """Error raised when communication with the Ollama API fails.
+class LLMError(Exception):
+    """Base error for all LLM provider failures.
 
     Callers must log only the .message attribute, never __cause__,
     to prevent leaking HTTP response bodies.
@@ -63,18 +63,22 @@ class OllamaError(Exception):
         super().__init__(message)
 
 
+# Keep OllamaError as an alias for backward compatibility with existing code/tests
+OllamaError = LLMError
+
+
 # ---------------------------------------------------------------------------
 # Response model
 # ---------------------------------------------------------------------------
 
 
 class LLMResponse(BaseModel):
-    """Parsed response from an Ollama /api/chat call.
+    """Parsed response from an LLM provider.
 
     Attributes:
         content: The assistant's text response.
         tool_calls: Parsed tool calls from the LLM (empty list if none).
-        model: Model name echoed back from Ollama.
+        model: Model name echoed back from the provider.
         done: Whether generation is complete.
     """
 
@@ -90,7 +94,7 @@ class LLMResponse(BaseModel):
     model: str = Field(
         default="",
         max_length=200,
-        description="Model name echoed back from the Ollama response.",
+        description="Model name echoed back from the provider.",
     )
     done: bool = Field(
         default=False,
@@ -98,11 +102,18 @@ class LLMResponse(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Shared sanitization utilities
+# ---------------------------------------------------------------------------
+
 # Control characters to strip from LLM output (keep tab, newline, carriage return).
 # Also strips Unicode direction-override and zero-width characters that could be
 # used to spoof displayed text in confirmation dialogs (display-spoofing attack).
+# Includes C1 controls (0x80-0x9F) — notably U+009B (CSI) which can trigger
+# terminal escape sequences, and U+0085 (NEL) which is a Unicode line break.
 _CONTROL_CHAR_TABLE = dict.fromkeys(
     [i for i in range(32) if i not in (9, 10, 13)]  # ASCII controls except \t \n \r
+    + list(range(0x80, 0xA0))  # C1 controls (includes CSI U+009B, NEL U+0085)
     + [
         0x200B,  # ZERO WIDTH SPACE
         0x200C,  # ZERO WIDTH NON-JOINER
@@ -123,18 +134,16 @@ _CONTROL_CHAR_TABLE = dict.fromkeys(
 )
 
 
-def _strip_control_chars(content: str) -> str:
+def strip_control_chars(content: str) -> str:
     """Strip dangerous control and Unicode characters without truncating.
 
     Removes:
     - ASCII control characters (0x00-0x1F) except tab, newline, carriage return
-    - Unicode direction-override characters (U+202A-U+202E) that can spoof
-      displayed text in confirmation dialogs
+    - C1 control characters (0x80-0x9F) including CSI (U+009B) and NEL (U+0085)
+    - Unicode direction-override characters (U+202A-U+202E)
     - BiDi isolate characters (U+2066-U+2069)
-    - Zero-width characters (U+200B-U+200D, U+FEFF) used for invisible injection
+    - Zero-width characters (U+200B-U+200D, U+FEFF)
     - Line/paragraph separators (U+2028, U+2029)
-
-    Use _sanitize_content() when truncation is also needed (non-streaming path).
 
     Args:
         content: Raw string from LLM response.
@@ -145,7 +154,7 @@ def _strip_control_chars(content: str) -> str:
     return content.translate(_CONTROL_CHAR_TABLE)
 
 
-def _sanitize_content(content: str) -> str:
+def sanitize_content(content: str) -> str:
     """Truncate and strip dangerous control/Unicode characters from LLM content.
 
     Args:
@@ -154,27 +163,22 @@ def _sanitize_content(content: str) -> str:
     Returns:
         Sanitized, length-limited string.
     """
-    return _strip_control_chars(content)[:_MAX_CONTENT_LENGTH]
+    return strip_control_chars(content)[:_MAX_CONTENT_LENGTH]
 
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
-
-
-def _check_args_depth(obj: object, limit: int = 4) -> bool:
+def check_args_depth(obj: object, limit: int = 4) -> bool:
     """Return True if the object's nesting depth is within the limit."""
     if limit <= 0:
         return False
     if isinstance(obj, dict):
-        return all(_check_args_depth(v, limit - 1) for v in obj.values())
+        return all(check_args_depth(v, limit - 1) for v in obj.values())
     if isinstance(obj, list):
-        return all(_check_args_depth(v, limit - 1) for v in obj)
+        return all(check_args_depth(v, limit - 1) for v in obj)
     return True
 
 
-def _parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
-    """Parse raw Ollama tool call objects into ToolCall models.
+def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
+    """Parse raw tool call objects into ToolCall models.
 
     Each raw tool call has the shape:
         {"function": {"name": "tool.action", "arguments": {...}}}
@@ -183,7 +187,7 @@ def _parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
     into separate tool and action fields.
 
     Args:
-        raw_tool_calls: List of raw tool call dicts from Ollama's response.
+        raw_tool_calls: List of raw tool call dicts from the LLM response.
 
     Returns:
         List of validated ToolCall models.
@@ -215,12 +219,13 @@ def _parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
             continue
 
         # Guard against deeply nested or pathologically large argument payloads
-        if not _check_args_depth(arguments):
+        if not check_args_depth(arguments):
             logger.warning(
                 "Skipping tool call '%s': arguments exceed nesting depth limit", name_safe
             )
             continue
-        # Quick pre-screen: reject any single string value > 2048 chars before full serialisation
+        # Quick pre-screen on top-level values only; nested strings are covered
+        # by the 16 KiB total-size check below and Pydantic's 64 KiB backstop.
         if len(arguments) > 32 or any(
             isinstance(v, str) and len(v) > 2048 for v in arguments.values()
         ):
@@ -253,8 +258,12 @@ def _parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
     return parsed
 
 
-def _serialize_messages(messages: list[LLMMessage]) -> list[dict[str, str]]:
-    """Serialize LLMMessage models to the format expected by Ollama's /api/chat.
+def serialize_messages(messages: list[LLMMessage]) -> list[dict[str, str]]:
+    """Serialize LLMMessage models to basic role/content dicts.
+
+    Used by Ollama directly. Anthropic and OpenAI clients have their
+    own converters that handle provider-specific fields (tool_call_id,
+    system prompt extraction, etc.).
 
     Args:
         messages: List of LLMMessage models.
@@ -269,42 +278,35 @@ def _serialize_messages(messages: list[LLMMessage]) -> list[dict[str, str]]:
     return serialized
 
 
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
+def validate_tools_payload(tools: list[dict[str, Any]]) -> None:
+    """Validate tool definitions against size limits.
 
+    Args:
+        tools: List of tool definitions.
 
-class OllamaClient:
-    """Async client for Ollama's /api/chat endpoint.
-
-    Creates a single httpx.AsyncClient in __init__ and reuses it across
-    all requests. Use as an async context manager or call close() explicitly.
-
-    Example::
-
-        async with OllamaClient(config) as client:
-            response = await client.chat(messages)
-            print(response.content)
+    Raises:
+        ValueError: If tools exceed count or byte size limits.
     """
-
-    def __init__(self, config: OllamaConfig) -> None:
-        """Initialize the Ollama client.
-
-        Args:
-            config: Ollama configuration with url, model, and timeout_s.
-        """
-        self._config = config
-        self._client = httpx.AsyncClient(
-            base_url=config.url,
-            timeout=httpx.Timeout(
-                connect=10.0,
-                read=float(config.timeout_s),
-                write=10.0,
-                pool=5.0,
-            ),
-            follow_redirects=False,
-            verify=True,
+    if len(tools) > _MAX_TOOLS_COUNT or len(json.dumps(tools)) > _MAX_TOOLS_PAYLOAD:
+        msg = (
+            f"tools list exceeds size limits"
+            f" (max {_MAX_TOOLS_COUNT} tools, {_MAX_TOOLS_PAYLOAD} bytes)"
         )
+        raise ValueError(msg)
+
+
+# ---------------------------------------------------------------------------
+# LLMClient Protocol
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class LLMClient(Protocol):
+    """Protocol defining the interface all LLM provider backends must implement.
+
+    Each provider (Ollama, Anthropic, OpenAI) implements this protocol.
+    The agent loop uses this interface exclusively — it is provider-agnostic.
+    """
 
     async def chat(
         self,
@@ -313,255 +315,58 @@ class OllamaClient:
         *,
         stream: bool = False,
     ) -> LLMResponse:
-        """Send a non-streaming chat request to Ollama.
-
-        Posts to /api/chat with the given messages and optional tool definitions.
-        Parses the response into an LLMResponse with text content and any
-        tool calls requested by the model.
-
-        The ``tools`` parameter accepts ``list[dict[str, Any]]`` because LLM
-        tool definitions are untyped JSON Schema objects whose structure is
-        defined by Ollama's API, not by admino's type system.
+        """Send a chat request and return the parsed response.
 
         Args:
-            messages: Conversation messages to send as context.
-            tools: Optional list of tool definitions (JSON Schema format).
-            stream: Must be False for this method; use chat_stream() for streaming.
+            messages: Conversation messages.
+            tools: Optional tool definitions (JSON Schema format).
+            stream: Must be False (streaming not yet unified across providers).
 
         Returns:
             Parsed LLMResponse with content, tool_calls, model, and done flag.
-
-        Raises:
-            OllamaError: On HTTP errors, connection failures, or timeouts.
-            ValueError: If stream=True is passed (use chat_stream instead).
         """
-        if stream:
-            msg = "Use chat_stream() for streaming responses, not chat(stream=True)"
-            raise ValueError(msg)
-
-        body: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": _serialize_messages(messages),
-            "stream": False,
-        }
-        if tools:
-            if len(tools) > _MAX_TOOLS_COUNT or len(json.dumps(tools)) > _MAX_TOOLS_PAYLOAD:
-                msg = (
-                    f"tools list exceeds size limits"
-                    f" (max {_MAX_TOOLS_COUNT} tools, {_MAX_TOOLS_PAYLOAD} bytes)"
-                )
-                raise ValueError(msg)
-            body["tools"] = tools
-
-        try:
-            response = await self._client.post("/api/chat", json=body)
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            raise OllamaError(
-                message=f"Ollama returned HTTP {exc.response.status_code}",
-                status_code=exc.response.status_code,
-            ) from exc
-        except httpx.ConnectError as exc:
-            raise OllamaError(
-                message="Failed to connect to Ollama — check OLLAMA_BASE_URL and service status",
-                status_code=None,
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise OllamaError(
-                message=f"Ollama request timed out after {self._config.timeout_s}s",
-                status_code=None,
-            ) from exc
-
-        try:
-            data: dict[str, Any] = response.json()
-        except json.JSONDecodeError as exc:
-            raise OllamaError(
-                message="Ollama returned a non-JSON response body",
-                status_code=None,
-            ) from exc
-
-        message_data = data.get("message", {})
-        if not isinstance(message_data, dict):
-            raise OllamaError(
-                message="Ollama response missing or malformed 'message' field",
-                status_code=None,
-            )
-
-        content = message_data.get("content", "")
-        if not isinstance(content, str):
-            content = str(content)
-        # Enforce length limit and strip dangerous control characters
-        content = _sanitize_content(content)
-
-        raw_tool_calls = message_data.get("tool_calls", [])
-        if not isinstance(raw_tool_calls, list):
-            raw_tool_calls = []
-
-        tool_calls = _parse_tool_calls(raw_tool_calls)
-
-        raw_model = data.get("model", self._config.model)
-        if not isinstance(raw_model, str):
-            raw_model = str(raw_model)
-        model_name = _strip_control_chars(raw_model)[:200]
-
-        done_flag = data.get("done")
-        if done_flag is None:
-            logger.warning("Ollama response missing 'done' field; defaulting to True")
-            done_flag = True
-
-        return LLMResponse(
-            content=content,
-            tool_calls=tool_calls,
-            model=model_name,
-            done=bool(done_flag),
-        )
-
-    @asynccontextmanager
-    async def chat_stream(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[AsyncIterator[str]]:
-        """Send a streaming chat request to Ollama.
-
-        Yields an async iterator of content chunks as they arrive from
-        the LLM. Empty chunks are skipped. Stops on the final chunk
-        (``"done": true``).
-
-        The ``tools`` parameter accepts ``list[dict[str, Any]]`` because LLM
-        tool definitions are untyped JSON Schema objects whose structure is
-        defined by Ollama's API, not by admino's type system.
-
-        Usage::
-
-            async with client.chat_stream(messages) as chunks:
-                async for chunk in chunks:
-                    print(chunk, end="", flush=True)
-
-        Args:
-            messages: Conversation messages to send as context.
-            tools: Optional list of tool definitions (JSON Schema format).
-
-        Yields:
-            An async iterator of string content chunks.
-
-        Raises:
-            OllamaError: On HTTP errors, connection failures, or timeouts.
-        """
-        body: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": _serialize_messages(messages),
-            "stream": True,
-        }
-        if tools:
-            if len(tools) > _MAX_TOOLS_COUNT or len(json.dumps(tools)) > _MAX_TOOLS_PAYLOAD:
-                msg = (
-                    f"tools list exceeds size limits"
-                    f" (max {_MAX_TOOLS_COUNT} tools, {_MAX_TOOLS_PAYLOAD} bytes)"
-                )
-                raise ValueError(msg)
-            body["tools"] = tools
-
-        try:
-            async with self._client.stream("POST", "/api/chat", json=body) as response:
-                if response.status_code >= 400:
-                    raise OllamaError(
-                        message=f"Ollama returned HTTP {response.status_code}",
-                        status_code=response.status_code,
-                    )
-                # The inner async generator (_iter_stream) is cleaned up by Python's
-                # async generator protocol when the outer context manager exits.
-                # httpx's stream() context manager handles HTTP response cleanup.
-                yield self._iter_stream(response)
-        # NOTE: httpx.stream() does not call raise_for_status() automatically,
-        # so HTTPStatusError cannot be raised here. HTTP errors are handled by
-        # the manual status_code >= 400 check above.
-        except httpx.ConnectError as exc:
-            raise OllamaError(
-                message="Failed to connect to Ollama — check OLLAMA_BASE_URL and service status",
-                status_code=None,
-            ) from exc
-        except httpx.TimeoutException as exc:
-            raise OllamaError(
-                message=f"Ollama request timed out after {self._config.timeout_s}s",
-                status_code=None,
-            ) from exc
-
-    @staticmethod
-    async def _iter_stream(response: httpx.Response) -> AsyncIterator[str]:
-        """Iterate over a streaming Ollama response, yielding content chunks.
-
-        Each line from Ollama is a JSON object. We extract the content delta
-        from each and yield non-empty strings. Stops when "done" is true.
-
-        Note: sanitization is applied per-chunk via _sanitize_content(). This
-        is safe for the current translate-table approach. If regex-based
-        sanitization is ever added (e.g., ANSI escape stripping), it must
-        operate on the fully reassembled content, not individual chunks,
-        as sequences may split across chunk boundaries.
-
-        Args:
-            response: The httpx streaming response to iterate over.
-
-        Yields:
-            Non-empty content strings from the streaming response.
-        """
-        # NOTE: total_yielded counts code points, consistent with Pydantic's
-        # max_length. Worst-case UTF-8 byte usage is 4x (e.g. all emoji),
-        # capping at ~256 KB — acceptable for a 65 KB code-point limit.
-        total_yielded = 0
-        async for line in response.aiter_lines():
-            line = line.rstrip("\r")
-            if not line.strip():
-                continue
-
-            try:
-                chunk_data: dict[str, Any] = json.loads(line)
-            except json.JSONDecodeError:
-                logger.warning("Skipping malformed JSON line in Ollama stream")
-                continue
-
-            # Extract content from message delta
-            message_data = chunk_data.get("message", {})
-            if isinstance(message_data, dict):
-                content = message_data.get("content", "")
-                if isinstance(content, str) and content:
-                    content = _strip_control_chars(content)
-                    # Enforce cumulative size cap across all chunks
-                    remaining = _MAX_CONTENT_LENGTH - total_yielded
-                    if remaining <= 0:
-                        return
-                    chunk = content[:remaining]
-                    if chunk:
-                        total_yielded += len(chunk)
-                        # SECURITY: translate-table sanitization (applied above
-                        # via _sanitize_content) is chunk-safe because it
-                        # operates on individual code points. Do NOT add
-                        # regex-based sanitization here — multi-byte sequences
-                        # (e.g. ANSI escapes) may split across chunk boundaries.
-                        yield chunk
-
-            # Stop on final chunk
-            if chunk_data.get("done", False):
-                return
+        ...
 
     async def close(self) -> None:
-        """Close the underlying httpx client.
+        """Close the underlying HTTP client."""
+        ...
 
-        Should be called when the client is no longer needed. Automatically
-        called when used as an async context manager.
-        """
-        await self._client.aclose()
 
-    async def __aenter__(self) -> OllamaClient:
-        """Enter the async context manager."""
-        return self
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc_val: BaseException | None,
-        exc_tb: object | None,
-    ) -> None:
-        """Exit the async context manager, closing the HTTP client."""
-        await self.close()
+
+def create_llm_client(config: LLMConfig) -> LLMClient:
+    """Create the appropriate LLM client based on the provider config.
+
+    Only imports the provider-specific module when needed, so unused
+    provider SDKs are never loaded.
+
+    Args:
+        config: Validated LLMConfig with provider selection.
+
+    Returns:
+        An LLMClient implementation for the configured provider.
+
+    Raises:
+        ValueError: If the provider is unknown.
+        ImportError: If the provider's SDK is not installed.
+    """
+    if config.provider == "ollama":
+        from admino.llm_ollama import OllamaClient
+
+        return OllamaClient(config.to_ollama_config())
+
+    if config.provider == "anthropic":
+        from admino.llm_anthropic import AnthropicClient
+
+        return AnthropicClient(config)
+
+    if config.provider == "openai":
+        from admino.llm_openai import OpenAIClient
+
+        return OpenAIClient(config)
+
+    msg = f"Unknown LLM provider: {config.provider!r}"
+    raise ValueError(msg)

@@ -380,6 +380,36 @@ class ToolCallRecord(BaseModel):
     )
 
 
+class PendingConfirmationSummary(BaseModel):
+    """Subset of ``PendingConfirmation`` safe to expose over the HTTP API.
+
+    Excludes the full tool arguments (which may contain secrets, paths, or
+    large content) and the internal session_id. The PWA only needs the
+    confirmation ID (to POST /api/confirm), the tool and action being
+    confirmed (for display), and the expiry so it can show a countdown.
+    """
+
+    confirmation_id: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-zA-Z0-9_-]+$",
+        description="Pending confirmation identifier.",
+    )
+    tool: str = Field(
+        max_length=63,
+        pattern=r"^[a-z][a-z0-9_]{0,62}$",
+        description="The tool name awaiting confirmation.",
+    )
+    action: str = Field(
+        max_length=63,
+        pattern=r"^[a-z][a-z0-9_]{0,62}$",
+        description="The action name awaiting confirmation.",
+    )
+    expires_at: datetime = Field(
+        description="UTC timestamp after which this confirmation is auto-denied.",
+    )
+
+
 class ChatResponse(BaseModel):
     """Response body from POST /chat."""
 
@@ -417,6 +447,26 @@ class ChatResponse(BaseModel):
         default_factory=list,
         max_length=50,
         description="Summary of tool calls made during this response.",
+    )
+
+    status: Literal["final", "awaiting_confirmation", "limit_reached", "error"] = Field(
+        default="final",
+        description=(
+            "Terminal status of this agent run. When 'awaiting_confirmation', "
+            "``pending_confirmation`` describes the action the user must "
+            "approve or deny via POST /api/confirm/{confirmation_id}."
+        ),
+    )
+
+    pending_confirmation: PendingConfirmationSummary | None = Field(
+        default=None,
+        description=(
+            "Present only when ``status='awaiting_confirmation'``. Carries the "
+            "information the PWA needs to render a confirmation card and call "
+            "POST /api/confirm/{confirmation_id}. Deliberately excludes tool "
+            "arguments — those may contain secrets or large content and are "
+            "already summarised in ``tool_calls``."
+        ),
     )
 
 
@@ -511,6 +561,15 @@ class ToolCall(BaseModel):
         default_factory=dict,
         description="Raw arguments from the LLM. Validated by individual tool schemas.",
     )
+    tool_call_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Provider-assigned ID linking this tool call to its result. "
+            "Required by Anthropic (tool_use id) and OpenAI (tool_calls[].id) "
+            "for multi-turn tool calling. None for Ollama."
+        ),
+    )
 
     @field_validator("args")
     @classmethod
@@ -546,9 +605,17 @@ class LLMMessage(BaseModel):
     )
     tool_call_id: str | None = Field(
         default=None,
-        max_length=64,
+        max_length=128,
         pattern=r"^[a-zA-Z0-9_-]+$",
         description="Identifier linking a tool response to its originating call.",
+    )
+    tool_use_blocks: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Structured tool_use blocks for providers that require them in the assistant "
+            "message (e.g. Anthropic). Each entry has type, id, name (dot notation), "
+            "and input. Ignored by Ollama and OpenAI serializers."
+        ),
     )
 
 

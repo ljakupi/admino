@@ -203,13 +203,28 @@ def main(
     logger.debug("Audit log path: %s", config.paths.audit_log)
 
     # ------------------------------------------------------------------
-    # 5. Create the Ollama LLM client
+    # 5. Create the LLM client (Ollama, Anthropic, or OpenAI)
     # ------------------------------------------------------------------
-    from admino.llm import OllamaClient
+    from admino.llm import create_llm_client
 
-    llm_client = OllamaClient(config.ollama)
-    logger.info("Ollama client configured.")
-    logger.debug("Ollama URL: %s", config.ollama.url)
+    llm_client = create_llm_client(config.llm)
+    logger.info("LLM client configured (provider=%s).", config.llm.provider)
+
+    # Warn if proprietary provider's API host is missing from egress whitelist
+    provider_hosts: dict[str, str] = {
+        "anthropic": "api.anthropic.com",
+        "openai": "api.openai.com",
+    }
+    required_host = provider_hosts.get(config.llm.provider)
+    if required_host and required_host not in config.egress.allowed_hosts:
+        logger.warning(
+            "LLM provider '%s' requires egress to '%s', but it is not in "
+            "egress.allowed_hosts. Outbound connections will be blocked by "
+            "iptables. Add '%s' to egress.allowed_hosts in config.yaml.",
+            config.llm.provider,
+            required_host,
+            required_host,
+        )
 
     # ------------------------------------------------------------------
     # 6. Configure and import tool modules, then freeze the registry
@@ -256,10 +271,16 @@ def main(
         audit_logger=audit_logger,
         permissions_config=permissions_config,
         agent_config=agent_config,
-        model_name=config.ollama.model,
+        model_name=config.llm.active_model_name,
         system_prompt=system_prompt,
     )
-    logger.info("Agent initialized with model %s", config.ollama.model)
+    from admino.llm import strip_control_chars
+
+    logger.info(
+        "Agent initialized with model %s (provider=%s)",
+        strip_control_chars(config.llm.active_model_name),
+        config.llm.provider,
+    )
 
     # ------------------------------------------------------------------
     # 9. Create the FastAPI app
