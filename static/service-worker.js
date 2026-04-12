@@ -16,7 +16,7 @@
 // handler deletes all caches that don't match this name, forcing clients
 // to re-fetch updated assets. Without a build system, this is the manual
 // cache-busting mechanism.
-const CACHE_NAME = 'admino-shell-20260408';
+const CACHE_NAME = 'admino-shell-20260411';
 
 /** Static assets that form the offline-capable app shell. */
 const SHELL_ASSETS = [

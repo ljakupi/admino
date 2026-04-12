@@ -55,6 +55,13 @@ HARDCODED_DENIALS: frozenset[tuple[str, str]] = frozenset(
         ("calendar", "update"),
         ("documents", "delete"),
         ("files", "delete"),
+        # ``files.overwrite`` is modelled as a first-class action so an
+        # attempted overwrite by the LLM produces a permission-engine deny
+        # with a clear audit trail. Overwriting a file is semantically a
+        # delete-then-create, and since ``files.delete`` is hardcoded-denied,
+        # permitting overwrite would be a bypass. No handler is registered
+        # — the permission check rejects the call before dispatch.
+        ("files", "overwrite"),
         ("memory", "delete"),
     }
 )
@@ -73,6 +80,7 @@ _CONFIRM_ONLY_ACTIONS: frozenset[tuple[str, str]] = frozenset(
         ("files", "write"),
         ("files", "move"),
         ("files", "delete"),
+        ("files", "overwrite"),
         ("memory", "delete"),
         ("memory", "write"),
     }

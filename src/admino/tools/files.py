@@ -11,6 +11,18 @@ Security notes:
 - Read-only paths reject write and move operations.
 - File content is truncated to max_read_chars before returning to the LLM.
 - No DELETE capability. files.delete is a hardcoded deny in permissions.py.
+- No OVERWRITE capability. ``files.write`` is create-only: if the destination
+  already exists, the call is refused. Overwriting a file is a silent delete
+  of its prior content and would bypass the ``files.delete`` hardcoded denial.
+  The ``files.overwrite`` action is also modelled as a first-class permission
+  and is itself hardcoded-denied in permissions.py — there is no registered
+  handler for it; the permission engine rejects the call before dispatch so
+  the audit log records the attempt explicitly.
+  Create-only enforcement on ``files.write`` is defence-in-depth: a pre-check
+  in the handler (for a friendly error message) plus ``O_EXCL`` on the sync
+  open (kernel-level TOCTOU defence). If a destination already exists, the
+  caller is guided to ask the user for a different filename — NOT to move
+  the old file aside, which would still be a destructive workaround.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -318,7 +330,13 @@ def _sync_search_files(
 
 
 def _sync_write_file(path: Path, content: str) -> None:
-    """Write content to a file, creating parent directories if needed.
+    """Write content to a NEW file, creating parent directories if needed.
+
+    Create-only: if the file already exists, ``os.open`` with ``O_EXCL``
+    raises ``FileExistsError``. This is the kernel-level TOCTOU defence
+    paired with the handler's pre-check — even if another process creates
+    the file in the window between the pre-check and this open, the open
+    itself refuses to clobber it.
 
     Uses O_NOFOLLOW via os.open to prevent writing through symlinks (H1 fix).
     Re-validates the resolved path inside the thread.
@@ -327,9 +345,11 @@ def _sync_write_file(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # O_NOFOLLOW: refuse to open if path is a symlink.  This prevents a race
     # where a symlink is planted between validation and open.
+    # O_EXCL:     refuse to open if the file already exists — create-only.
+    #             We never destroy existing content via this handler.
     fd = os.open(
         str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
         0o644,
     )
     try:
@@ -441,20 +461,58 @@ async def files_search(args: FileSearchArgs, **kwargs: object) -> str:
 @register_tool(
     tool="files",
     action="write",
-    description="Write content to a file. The path must be in a readwrite-allowed directory.",
+    description=(
+        "Create a NEW file with the given content. The path must be in a "
+        "readwrite-allowed directory and must NOT already exist. Overwriting "
+        "existing files is permanently disabled (files.overwrite is hardcoded-"
+        "denied, equivalent to files.delete). If the destination already "
+        "exists, do NOT attempt to move the old file aside — instead, stop "
+        "and ask the user to choose a different filename."
+    ),
     args_schema=FileWriteArgs,
 )
 async def files_write(args: FileWriteArgs, **kwargs: object) -> str:
-    """Write content to a file within a writable allowed path.
+    """Create a new file within a writable allowed path.
+
+    This action is strictly create-only. If the destination already exists
+    (as a regular file, directory, or symlink — anything ``os.path.lexists``
+    reports), the call is refused with a descriptive message so the LLM can
+    surface the situation to the user and ask them for a different filename.
+
+    The existence check here is for a friendly error message. The
+    authoritative defence is ``O_EXCL`` inside ``_sync_write_file``, which
+    catches the TOCTOU race where another process creates the file
+    between this check and the open.
 
     Args:
         args: Validated write arguments (path, content).
 
     Returns:
-        A confirmation message.
+        A confirmation message on success, or a refusal message if the
+        destination already exists.
     """
     validated_path = _validate_path(args.path, require_write=True)
-    await asyncio.to_thread(_sync_write_file, validated_path, args.content)
+    # Pre-check: refuse if the target already exists. ``lexists`` catches
+    # symlinks (even broken ones) and directories in addition to regular
+    # files — all of which we refuse to clobber.
+    if os.path.lexists(str(validated_path)):
+        return (
+            f"Cannot write to {validated_path}: a file or directory already "
+            "exists at that path. Overwriting existing files is not permitted "
+            "— it would destroy the prior content, which is equivalent to "
+            "deletion. Please ask the user to choose a different filename."
+        )
+    try:
+        await asyncio.to_thread(_sync_write_file, validated_path, args.content)
+    except FileExistsError:
+        # TOCTOU race: the file was created between the lexists check and
+        # the O_EXCL open. Surface the same refusal message so the behaviour
+        # is consistent regardless of which layer catches it.
+        return (
+            f"Cannot write to {validated_path}: a file was created at that "
+            "path concurrently. Overwriting is not permitted. Please ask the "
+            "user to choose a different filename."
+        )
     return f"Written {len(args.content)} characters to {validated_path}"
 
 

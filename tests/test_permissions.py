@@ -420,10 +420,24 @@ class TestHardcodedDenialsConstant:
                 ("calendar", "update"),
                 ("documents", "delete"),
                 ("files", "delete"),
+                # files.overwrite is modelled as a first-class denied action
+                # so any LLM attempt is rejected at the permission layer with
+                # a clear audit trail — see permissions.py.
+                ("files", "overwrite"),
                 ("memory", "delete"),
             }
         )
         assert expected == HARDCODED_DENIALS
+
+    def test_files_overwrite_is_hardcoded_denied(self) -> None:
+        """files.overwrite must be permanently denied, like files.delete.
+
+        Regression guard: overwriting a file is semantically a delete-then-
+        create, and since files.delete is hardcoded-denied, permitting
+        overwrite would be a bypass of that invariant. This test exists to
+        fail loudly if a future refactor removes the denial.
+        """
+        assert ("files", "overwrite") in HARDCODED_DENIALS
 
     def test_is_frozenset(self) -> None:
         """HARDCODED_DENIALS must be immutable (frozenset)."""

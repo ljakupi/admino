@@ -178,28 +178,38 @@ class Agent:
         if self._system_prompt:
             working_history.append(LLMMessage(role="system", content=self._system_prompt))
         working_history.extend(history)
-        working_history.append(LLMMessage(role="user", content=user_message))
 
-        # Audit the user turn before any LLM call so the trail is complete
-        # even if the model call fails — including session-mismatch rejections.
-        try:
-            self._audit_conversation(
-                session_id=session_id,
-                role="user",
-                content=user_message,
-                tool_calls_count=0,
-            )
-        except AuditWriteError:
-            # H-1: Audit failure is fatal for the run.  We cannot continue
-            # without a guaranteed audit trail.  Return a structured error
-            # rather than letting the raw exception propagate to the server.
-            logger.error("Audit write failed for user turn — aborting run")
-            return AgentResult(
-                status="error",
-                response="Internal error: audit unavailable.",
-                history=working_history,
-                tool_calls=[],
-            )
+        # Resume mode: ``pending_confirmation`` is set, meaning the user just
+        # approved a previously-issued confirmation via ``/api/confirm``. In
+        # that case there is NO new user message — the "user input" is the
+        # approval itself, which is a control-plane action, not a chat turn.
+        # Appending an empty user message here would (a) break Anthropic's
+        # API contract ("user messages must have non-empty content") and
+        # (b) pollute the LLM context with a meaningless empty turn.
+        is_resume = pending_confirmation is not None
+        if not is_resume:
+            working_history.append(LLMMessage(role="user", content=user_message))
+
+            # Audit the user turn before any LLM call so the trail is complete
+            # even if the model call fails — including session-mismatch rejections.
+            try:
+                self._audit_conversation(
+                    session_id=session_id,
+                    role="user",
+                    content=user_message,
+                    tool_calls_count=0,
+                )
+            except AuditWriteError:
+                # H-1: Audit failure is fatal for the run.  We cannot continue
+                # without a guaranteed audit trail.  Return a structured error
+                # rather than letting the raw exception propagate to the server.
+                logger.error("Audit write failed for user turn — aborting run")
+                return AgentResult(
+                    status="error",
+                    response="Internal error: audit unavailable.",
+                    history=working_history,
+                    tool_calls=[],
+                )
 
         # H-2: Session-identity check — reject cross-session confirmation replay.
         # Placed AFTER the user turn is audited so the attempt is recorded.
@@ -221,6 +231,27 @@ class Agent:
         # dispatch only, then cleared. This matches the server contract:
         # a confirmation resumes exactly one tool call.
         carry_confirmation: PendingConfirmation | None = pending_confirmation
+
+        # Resume pre-dispatch: when resuming, the stored history already
+        # contains the assistant turn with the ``tool_use`` block from the
+        # previous run. The LLM does not need to be called again to decide
+        # what to do — it already said "call this tool". Dispatch the
+        # pending tool call directly, append its ``tool_result`` to history,
+        # and THEN let the main loop call the LLM with a completed history
+        # so the assistant can produce its natural-language follow-up.
+        if is_resume and pending_confirmation is not None:
+            pre_result = await self._resume_pending_dispatch(
+                pending_confirmation=pending_confirmation,
+                session_id=session_id,
+                working_history=working_history,
+                tool_records=tool_records,
+            )
+            if pre_result is not None:
+                # Audit write failed during pre-dispatch — ``_resume_pending_dispatch``
+                # has already logged and built the terminal error. Return it.
+                return pre_result
+            tool_calls_used += 1
+            carry_confirmation = None  # consumed on pre-dispatch
 
         # Bounded loop. Each iteration = one LLM round trip, possibly followed
         # by a batch of tool dispatches.
@@ -466,6 +497,80 @@ class Agent:
             pending_confirmation=pending_confirmation,
             audit_logger=self._audit,
         )
+
+    async def _resume_pending_dispatch(
+        self,
+        *,
+        pending_confirmation: PendingConfirmation,
+        session_id: str,
+        working_history: list[LLMMessage],
+        tool_records: list[ToolCallRecord],
+    ) -> AgentResult | None:
+        """Resume an approved pending confirmation by dispatching the tool call.
+
+        Called once at the top of ``run()`` when resuming. Dispatches the
+        tool call stored inside ``pending_confirmation`` through the registry
+        (which verifies tool/action/args identity and expiry one more time),
+        appends the resulting ``tool_result`` to ``working_history``, and
+        records the call in ``tool_records``.
+
+        Returns ``None`` on success, or a terminal ``AgentResult`` if an
+        audit write failed — in which case the caller must return it
+        immediately so the run aborts with an auditable error.
+
+        The caller is responsible for bumping ``tool_calls_used`` and
+        clearing ``carry_confirmation`` after a successful return.
+        """
+        tool_call = pending_confirmation.tool_call
+        try:
+            result = await self._dispatch_one(
+                tool_call=tool_call,
+                session_id=session_id,
+                pending_confirmation=pending_confirmation,
+            )
+        except AuditWriteError:
+            logger.error("Audit write failed during resume dispatch — aborting run")
+            return AgentResult(
+                status="error",
+                response="Internal error: audit unavailable.",
+                history=working_history,
+                tool_calls=tool_records,
+            )
+
+        tool_records.append(
+            ToolCallRecord(
+                tool=_safe_identifier(tool_call.tool),
+                action=_safe_identifier(tool_call.action),
+                permission=result.permission.allowed,
+                success=result.success,
+            )
+        )
+
+        # Append the tool_result so the next LLM call sees a well-formed
+        # history: [..., assistant(tool_use), tool(tool_result)].
+        working_history.append(
+            LLMMessage(
+                role="tool",
+                content=result.result,
+                tool_call_id=tool_call.tool_call_id,
+            )
+        )
+        try:
+            self._audit_conversation(
+                session_id=session_id,
+                role="tool",
+                content=result.result,
+                tool_calls_count=0,
+            )
+        except AuditWriteError:
+            logger.error("Audit write failed for resumed tool-result turn — aborting run")
+            return AgentResult(
+                status="error",
+                response="Internal error: audit unavailable.",
+                history=working_history,
+                tool_calls=tool_records,
+            )
+        return None
 
     def _audit_conversation(
         self,

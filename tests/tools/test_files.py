@@ -459,6 +459,69 @@ class TestFilesWrite:
         # The result should use the resolved path, not raw user input
         assert str(target.resolve()) in result
 
+    @pytest.mark.asyncio
+    async def test_files_write_refuses_to_overwrite_existing_file_preserves_content(
+        self, configured_files: None, writable_dir: Path
+    ) -> None:
+        """files_write refuses overwrite; original content is preserved.
+
+        Overwriting silently deletes prior content, which would bypass the
+        ``files.delete`` hardcoded denial. The handler must refuse the call
+        and leave the existing file untouched.
+        """
+        target = writable_dir / "existing.txt"
+        target.write_text("original content")
+        result = await files.files_write(
+            FileWriteArgs(path=str(target), content="malicious replacement")
+        )
+        # Refusal guides toward renaming, NOT toward files.move workaround.
+        assert "Cannot write" in result
+        assert "already exists" in result
+        assert "different filename" in result
+        assert target.read_text() == "original content"
+
+    @pytest.mark.asyncio
+    async def test_files_write_refuses_overwrite_of_existing_directory(
+        self, configured_files: None, writable_dir: Path
+    ) -> None:
+        """files_write refuses when the target path is an existing directory."""
+        target = writable_dir / "subdir"
+        target.mkdir()
+        result = await files.files_write(FileWriteArgs(path=str(target) + "/", content="data"))
+        # Either the refusal message or a PermissionError from validation;
+        # the critical guarantee is that the directory is not replaced.
+        assert "Cannot write" in result or target.is_dir()
+        assert target.is_dir()
+
+    @pytest.mark.asyncio
+    async def test_files_write_refusal_does_not_recommend_move_workaround(
+        self, configured_files: None, writable_dir: Path
+    ) -> None:
+        """Refusal must NOT instruct the LLM to chain files.move.
+
+        Regression guard for the prior behaviour where the tool description
+        suggested "move the old file aside, then write the new one", which
+        caused the LLM to request a confusing ``files.move`` confirmation
+        instead of surfacing the name collision to the user.
+        """
+        target = writable_dir / "existing.txt"
+        target.write_text("original")
+        result = await files.files_write(FileWriteArgs(path=str(target), content="new content"))
+        assert "files.move" not in result
+        assert "move the old" not in result.lower()
+
+    def test_sync_write_file_uses_o_excl_flag(self) -> None:
+        """Verify O_EXCL is used in _sync_write_file (code inspection).
+
+        Regression guard for the create-only invariant: if a future refactor
+        replaces O_EXCL with O_TRUNC, overwrites would silently succeed.
+        """
+        import inspect
+
+        source = inspect.getsource(files._sync_write_file)
+        assert "O_EXCL" in source
+        assert "O_TRUNC" not in source
+
 
 class TestFilesMove:
     """Tests for the files_move handler."""

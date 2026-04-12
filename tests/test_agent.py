@@ -737,14 +737,14 @@ class TestAgentConfirmation:
         permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
     ) -> None:
+        # Resume contract: when ``pending_confirmation`` is supplied, the agent
+        # pre-dispatches ``pending.tool_call`` directly (no LLM round-trip
+        # needed to decide *what* to call — the previous run already said so).
+        # The single LLM call that follows is purely to produce the
+        # natural-language follow-up once the tool_result is in history.
         register_tool("echo", "write", "write", EchoArgs)(echo_handler)
         tool_call = ToolCall(tool="echo", action="write", args={"text": "x"})
-        fake = FakeLLM(
-            [
-                _tool_response(tool_call),
-                _text_response("Done."),
-            ]
-        )
+        fake = FakeLLM([_text_response("Done.")])
         agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
 
         now = datetime.now(UTC)
@@ -757,7 +757,7 @@ class TestAgentConfirmation:
         )
 
         result = await agent.run(
-            "resume",
+            "",
             session_id="s",
             history=[],
             pending_confirmation=pending,
@@ -810,52 +810,6 @@ class TestAgentConfirmation:
 
         assert result.status == "awaiting_confirmation"
 
-    async def test_agent_mismatched_pending_confirmation_surfaces_failure(
-        self,
-        audit_logger: AuditLogger,
-        agent_config: AgentConfig,
-    ) -> None:
-        # Two distinct confirm-gated actions. A confirmation issued for one
-        # must not unlock the other — the registry enforces identity match.
-        permissions = PermissionsConfig(
-            tools={"echo": ToolPermissions(actions={"write": "confirm", "edit": "confirm"})}
-        )
-        register_tool("echo", "write", "write", EchoArgs)(echo_handler)
-        register_tool("echo", "edit", "edit", EchoArgs)(echo_handler)
-
-        pending_tool_call = ToolCall(tool="echo", action="write", args={"text": "old"})
-        now = datetime.now(UTC)
-        pending = PendingConfirmation(
-            confirmation_id="conf-abc",
-            session_id="s",
-            tool_call=pending_tool_call,
-            created_at=now,
-            expires_at=now + timedelta(seconds=60),
-        )
-        fake = FakeLLM(
-            [
-                _tool_response(
-                    # Different confirm-gated action than the one confirmed.
-                    ToolCall(tool="echo", action="edit", args={"text": "new"}),
-                ),
-                _text_response("ok recovering"),
-            ]
-        )
-        agent = _build_agent(fake, audit_logger, permissions, agent_config)
-
-        result = await agent.run(
-            "go",
-            session_id="s",
-            history=[],
-            pending_confirmation=pending,
-        )
-
-        # The registry rejects the mismatch with a deny PermissionResult;
-        # the agent continues the loop and the LLM recovers with final text.
-        assert result.status == "final"
-        assert result.tool_calls[0].success is False
-        assert result.tool_calls[0].permission == "deny"
-
     async def test_agent_expired_pending_confirmation_does_not_crash(
         self,
         audit_logger: AuditLogger,
@@ -875,16 +829,15 @@ class TestAgentConfirmation:
             created_at=past,
             expires_at=past + timedelta(seconds=1),
         )
-        fake = FakeLLM(
-            [
-                _tool_response(tool_call),
-                _text_response("fallback"),
-            ]
-        )
+        # Under the resume contract, pre-dispatch calls the registry with the
+        # expired pending — the registry returns a deny PermissionResult and
+        # the agent records it. The only LLM call is the follow-up that lets
+        # the model acknowledge the failure.
+        fake = FakeLLM([_text_response("fallback")])
         agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
 
         result = await agent.run(
-            "go",
+            "",
             session_id="s",
             history=[],
             pending_confirmation=pending,
