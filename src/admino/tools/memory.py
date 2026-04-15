@@ -70,7 +70,9 @@ async def _ensure_db() -> None:
     create the database file on first use.
     """
     db_dir = Path(_db_path).parent
-    db_dir.mkdir(parents=True, exist_ok=True)
+    db_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # Explicit chmod to override umask — consistent with oauth.py token storage
+    db_dir.chmod(0o700)
     async with aiosqlite.connect(_db_path) as db:
         await db.execute(_CREATE_TABLE_SQL)
         await db.commit()

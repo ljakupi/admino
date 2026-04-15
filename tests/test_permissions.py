@@ -41,7 +41,7 @@ def sample_config() -> PermissionsConfig:
     return PermissionsConfig(
         tools={
             "gmail": ToolPermissions(actions={"read": "allow", "list": "confirm"}),
-            "calendar": ToolPermissions(actions={"list": "allow", "create": "confirm"}),
+            "google_calendar": ToolPermissions(actions={"list": "allow", "create": "confirm"}),
             "news": ToolPermissions(actions={"fetch": "allow"}),
             "documents": ToolPermissions(actions={"search": "deny"}),
         }
@@ -257,12 +257,12 @@ class TestValidateCleanConfig:
         """validate_permissions_config preserves allow/confirm/deny states correctly."""
         raw: dict[str, dict[str, str]] = {
             "gmail": {"read": "allow", "list": "confirm"},
-            "calendar": {"list": "allow"},
+            "google_calendar": {"list": "allow"},
         }
         config = validate_permissions_config(raw)
         assert config.tools["gmail"].actions["read"] == "allow"
         assert config.tools["gmail"].actions["list"] == "confirm"
-        assert config.tools["calendar"].actions["list"] == "allow"
+        assert config.tools["google_calendar"].actions["list"] == "allow"
 
 
 # ---------------------------------------------------------------------------
@@ -414,10 +414,19 @@ class TestHardcodedDenialsConstant:
         """HARDCODED_DENIALS contains the exact expected set."""
         expected = frozenset(
             {
+                # Google
                 ("gmail", "send"),
                 ("gmail", "delete"),
-                ("calendar", "delete"),
-                ("calendar", "update"),
+                ("google_calendar", "delete"),
+                ("google_calendar", "update"),
+                ("google_drive", "delete"),
+                # Microsoft
+                ("outlook", "send"),
+                ("outlook", "delete"),
+                ("outlook_calendar", "delete"),
+                ("outlook_calendar", "update"),
+                ("onedrive", "delete"),
+                # Local
                 ("documents", "delete"),
                 ("files", "delete"),
                 # files.overwrite is modelled as a first-class denied action

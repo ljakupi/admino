@@ -237,7 +237,7 @@ class AuthConfig(BaseModel):
     """
 
     mode: Literal["vpn", "token"] = Field(
-        default="vpn",
+        default="token",
         description="Auth mode: 'vpn' trusts all connections, 'token' requires Bearer token.",
     )
     token: SecretStr | None = Field(
@@ -610,6 +610,16 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
                 "Ignoring invalid LOG_LEVEL value %r. Valid: %s",
                 log_level,
                 ", ".join(sorted(_VALID_LOG_LEVELS)),
+            )
+
+    auth_mode = os.environ.get("AUTH_MODE")
+    if auth_mode:
+        auth_section = data.setdefault("auth", {})
+        if isinstance(auth_section, dict):
+            auth_section["mode"] = auth_mode
+        else:
+            logger.warning(
+                "Cannot apply AUTH_MODE override: 'auth' config section is not a mapping."
             )
 
     audit_log_path = os.environ.get("AUDIT_LOG_PATH")

@@ -31,7 +31,9 @@ const LS_SESSION_KEY = 'admino_session_id';
 // local-only, single-user deployment where the primary threat is XSS — and
 // this app prevents XSS via CSP ('self' only), textContent-only rendering,
 // and a DOM-based markdown parser that never uses innerHTML on raw strings.
-// For higher-security deployments, consider server-side HttpOnly session cookies.
+// Browser extensions with host permissions for this origin can also read
+// localStorage. For higher-security deployments, consider server-side
+// HttpOnly session cookies.
 const LS_TOKEN_KEY   = 'admino_auth_token';
 
 // ---------------------------------------------------------------------------

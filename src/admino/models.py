@@ -806,6 +806,7 @@ class FileSearchArgs(BaseModel):
         description="Root directory to search within. Validated against allowed_paths at runtime.",
     )
     pattern: str = Field(
+        min_length=1,
         max_length=200,
         description="Filename glob pattern or text query.",
     )
@@ -844,4 +845,343 @@ class FileMoveArgs(BaseModel):
     destination: str = Field(
         max_length=500,
         description="Destination file path. Must be in a readwrite-allowed path.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Gmail tool argument models (tools/gmail.py imports these)
+# ---------------------------------------------------------------------------
+
+
+class GmailSearchArgs(BaseModel):
+    """Arguments for the gmail.search action."""
+
+    query: str = Field(
+        min_length=1,
+        max_length=500,
+        pattern=r"^[\x20-\x7E]+$",
+        description="Gmail search query (printable ASCII only).",
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of messages to return.",
+    )
+
+
+class GmailReadArgs(BaseModel):
+    """Arguments for the gmail.read action."""
+
+    message_id: str = Field(
+        pattern=r"^[a-zA-Z0-9]+$",
+        max_length=64,
+        description="Gmail message ID.",
+    )
+
+
+class GmailListArgs(BaseModel):
+    """Arguments for the gmail.list action."""
+
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of messages to return.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Google Calendar tool argument models (tools/google_calendar.py imports these)
+# ---------------------------------------------------------------------------
+
+
+class GoogleCalendarListArgs(BaseModel):
+    """Arguments for the google_calendar.list action."""
+
+    time_min: datetime = Field(
+        description="Start of the time range (ISO 8601 UTC).",
+    )
+    time_max: datetime = Field(
+        description="End of the time range (ISO 8601 UTC).",
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of events to return.",
+    )
+
+
+class GoogleCalendarReadArgs(BaseModel):
+    """Arguments for the google_calendar.read action."""
+
+    event_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_]+$",
+        description="Google Calendar event ID.",
+    )
+
+
+class GoogleCalendarCreateArgs(BaseModel):
+    """Arguments for the google_calendar.create action (requires confirm)."""
+
+    summary: str = Field(
+        max_length=200,
+        description="Event title.",
+    )
+    start: datetime = Field(
+        description="Event start time (ISO 8601 UTC).",
+    )
+    end: datetime = Field(
+        description="Event end time (ISO 8601 UTC).",
+    )
+    description: str = Field(
+        default="",
+        max_length=1000,
+        description="Event description.",
+    )
+    location: str = Field(
+        default="",
+        max_length=200,
+        description="Event location.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Google Drive tool argument models (tools/google_drive.py imports these)
+# ---------------------------------------------------------------------------
+
+
+class GoogleDriveListArgs(BaseModel):
+    """Arguments for the google_drive.list action."""
+
+    # SECURITY: The pattern MUST exclude single quotes — folder_id is interpolated
+    # into a Drive API q= query string in google_drive.py google_drive_list().
+    folder_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+        description="Folder ID to list. None = root. Only alphanumeric, hyphens, underscores.",
+    )
+    max_results: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of files to return.",
+    )
+
+
+class GoogleDriveReadArgs(BaseModel):
+    """Arguments for the google_drive.read action."""
+
+    file_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+        description="Google Drive file ID.",
+    )
+
+
+class GoogleDriveSearchArgs(BaseModel):
+    """Arguments for the google_drive.search action."""
+
+    query: str = Field(
+        min_length=1,
+        max_length=500,
+        pattern=r"^[^'\\]+$",
+        description="Search query for Google Drive files. No quotes or backslashes.",
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of results to return.",
+    )
+
+
+class GoogleDriveDownloadArgs(BaseModel):
+    """Arguments for the google_drive.download action (requires confirm)."""
+
+    file_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_\-]+$",
+        description="Google Drive file ID to download.",
+    )
+    destination: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Destination path. Validated against allowed_paths.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outlook (Microsoft Graph) tool argument models (tools/outlook.py imports these)
+# ---------------------------------------------------------------------------
+
+
+class OutlookSearchArgs(BaseModel):
+    """Arguments for the outlook.search action."""
+
+    query: str = Field(
+        min_length=1,
+        max_length=500,
+        pattern=r"^[a-zA-Z0-9 ._@\-]+$",
+        description="Search query for Outlook messages. Alphanumeric, spaces, dots, @, hyphens.",
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of messages to return.",
+    )
+
+
+class OutlookReadArgs(BaseModel):
+    """Arguments for the outlook.read action."""
+
+    message_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9_\-]+$",
+        description="Outlook message ID.",
+    )
+
+
+class OutlookListArgs(BaseModel):
+    """Arguments for the outlook.list action."""
+
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of messages to return.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Outlook Calendar (Microsoft Graph) tool argument models
+# ---------------------------------------------------------------------------
+
+
+class OutlookCalendarListArgs(BaseModel):
+    """Arguments for the outlook_calendar.list action."""
+
+    time_min: datetime = Field(
+        description="Start of the time range (ISO 8601 UTC).",
+    )
+    time_max: datetime = Field(
+        description="End of the time range (ISO 8601 UTC).",
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of events to return.",
+    )
+
+
+class OutlookCalendarReadArgs(BaseModel):
+    """Arguments for the outlook_calendar.read action."""
+
+    event_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9_\-]+$",
+        description="Outlook Calendar event ID.",
+    )
+
+
+class OutlookCalendarCreateArgs(BaseModel):
+    """Arguments for the outlook_calendar.create action (requires confirm)."""
+
+    subject: str = Field(
+        max_length=200,
+        description="Event subject.",
+    )
+    start: datetime = Field(
+        description="Event start time (ISO 8601 UTC).",
+    )
+    end: datetime = Field(
+        description="Event end time (ISO 8601 UTC).",
+    )
+    body: str = Field(
+        default="",
+        max_length=1000,
+        description="Event body/description.",
+    )
+    location: str = Field(
+        default="",
+        max_length=200,
+        description="Event location.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# OneDrive (Microsoft Graph) tool argument models (tools/onedrive.py imports these)
+# ---------------------------------------------------------------------------
+
+
+class OneDriveListArgs(BaseModel):
+    """Arguments for the onedrive.list action."""
+
+    folder_path: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=500,
+        pattern=r"^[a-zA-Z0-9 ._/\-]+$",
+        description="Folder path to list. None = root. Only safe path chars allowed.",
+    )
+    max_results: int = Field(
+        default=20,
+        ge=1,
+        le=100,
+        description="Maximum number of items to return.",
+    )
+
+
+class OneDriveReadArgs(BaseModel):
+    """Arguments for the onedrive.read action."""
+
+    item_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9_\-]+$",
+        description="OneDrive item ID.",
+    )
+
+
+class OneDriveSearchArgs(BaseModel):
+    """Arguments for the onedrive.search action."""
+
+    query: str = Field(
+        min_length=1,
+        max_length=500,
+        pattern=r"^[^'\\]+$",
+        description="Search query for OneDrive files. No quotes or backslashes.",
+    )
+    max_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Maximum number of results to return.",
+    )
+
+
+class OneDriveDownloadArgs(BaseModel):
+    """Arguments for the onedrive.download action (requires confirm)."""
+
+    item_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9_\-]+$",
+        description="OneDrive item ID to download.",
+    )
+    destination: str = Field(
+        min_length=1,
+        max_length=500,
+        description="Destination path. Validated against allowed_paths.",
     )

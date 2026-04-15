@@ -1,10 +1,10 @@
 """OAuth token management for admino.
 
-Handles encrypted storage of Google OAuth refresh tokens using Fernet
-symmetric encryption, and manages token refresh via Google's OAuth2
-token endpoint.
+Handles encrypted storage of OAuth refresh tokens for Google and Microsoft
+using Fernet symmetric encryption, and manages token refresh via each
+provider's OAuth2 token endpoint.
 
-Storage format (on disk as ``{tokens_dir}/google.json``):
+Storage format (on disk as ``{tokens_dir}/{provider}.json``):
 - ``provider``, ``scopes``, ``encrypted_refresh_token``, ``created_at``,
   ``last_refreshed_at``.
 - Access tokens are NEVER written to disk — they are held in-memory only
@@ -26,8 +26,9 @@ import json
 import logging
 import os
 import secrets
+import unicodedata
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 from urllib.parse import urlencode
 
 import httpx
@@ -39,28 +40,64 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Google OAuth2 endpoints
+# ---------------------------------------------------------------------------
+# Provider type
+# ---------------------------------------------------------------------------
+
+OAuthProvider = Literal["google", "microsoft"]
+
+# ---------------------------------------------------------------------------
+# Google OAuth2 endpoints and scopes
+# ---------------------------------------------------------------------------
+
 GOOGLE_TOKEN_ENDPOINT: str = "https://oauth2.googleapis.com/token"  # noqa: S105
 GOOGLE_AUTH_ENDPOINT: str = "https://accounts.google.com/o/oauth2/v2/auth"
 
-# Scopes: narrowest possible per SEC-11.
-# calendar.events covers both read and create (needed for calendar.create).
-# calendar.events.readonly is intentionally omitted — it is a strict subset
-# of calendar.events, so requesting both is redundant.
+# Scopes: broad at the API level — the agent's permission engine (permissions.py
+# hardcoded denials + permissions.yaml) is the actual access control layer.
+# This avoids re-running the OAuth consent flow when enabling new agent actions.
+# gmail.modify: read + send + draft + label (no permanent delete via API).
+# calendar.events: read + create + update + delete.
+# drive: full read/write/delete.
 GOOGLE_SCOPES: list[str] = [
-    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar.events",
+    "https://www.googleapis.com/auth/drive",
 ]
 
-# Token file name per provider
-_TOKEN_FILENAME: str = "google.json"  # noqa: S105
+# ---------------------------------------------------------------------------
+# Microsoft OAuth2 endpoints and scopes (Azure AD v2.0)
+# ---------------------------------------------------------------------------
+
+MICROSOFT_TOKEN_ENDPOINT: str = "https://login.microsoftonline.com/common/oauth2/v2.0/token"  # noqa: S105
+MICROSOFT_AUTH_ENDPOINT: str = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+
+# Scopes: broad at the API level — the agent's permission engine is the actual
+# access control layer. This avoids re-running OAuth consent when enabling new actions.
+# Mail.ReadWrite: read + send + draft. Calendars.ReadWrite: read + create + update + delete.
+# Files.ReadWrite: read + write + delete. offline_access: allows token refresh.
+MICROSOFT_SCOPES: list[str] = [
+    "Mail.ReadWrite",
+    "Calendars.ReadWrite",
+    "Files.ReadWrite",
+    "offline_access",
+]
+
+# ---------------------------------------------------------------------------
+# Token file names per provider
+# ---------------------------------------------------------------------------
+
+_TOKEN_FILENAMES: dict[OAuthProvider, str] = {
+    "google": "google.json",
+    "microsoft": "microsoft.json",
+}
 
 # Refresh buffer: refresh if token expires within this many seconds
 _EXPIRY_BUFFER_SECONDS: int = 60
 
 # Maximum accepted expires_in from token endpoint (seconds).
-# Google's standard is 3600. Anything higher is suspicious.
-_MAX_TOKEN_LIFETIME_S: int = 3600
+# Google's standard is 3600. Microsoft's default is 3600-5400.
+_MAX_TOKEN_LIFETIME_S: int = 7200
 
 
 class OAuthError(Exception):
@@ -80,10 +117,9 @@ class TokenFile(BaseModel):
     """
 
     provider: str = Field(
-        default="google",
         max_length=64,
         pattern=r"^[a-z][a-z0-9_]*$",
-        description="OAuth provider identifier.",
+        description="OAuth provider identifier (google or microsoft).",
     )
     scopes: list[str] = Field(
         description="OAuth scopes granted by the user.",
@@ -99,6 +135,11 @@ class TokenFile(BaseModel):
     last_refreshed_at: datetime = Field(
         description="UTC timestamp of the most recent token refresh.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Fernet encryption helpers
+# ---------------------------------------------------------------------------
 
 
 def _get_fernet() -> Fernet:
@@ -122,81 +163,20 @@ def _get_fernet() -> Fernet:
         raise OAuthError(msg) from exc
 
 
-def _get_client_credentials() -> tuple[str, str]:
-    """Read Google OAuth client credentials from environment variables.
-
-    Returns:
-        A (client_id, client_secret) tuple.
-
-    Raises:
-        OAuthError: If either env var is missing.
-    """
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
-    if not client_id:
-        msg = "GOOGLE_CLIENT_ID environment variable is not set."
-        raise OAuthError(msg)
-    if not client_secret:
-        msg = "GOOGLE_CLIENT_SECRET environment variable is not set."
-        raise OAuthError(msg)
-    return client_id, client_secret
-
-
-def _token_file_path(tokens_dir: Path) -> Path:
-    """Return the path to the Google token file.
+def encrypt_refresh_token(refresh_token: str) -> str:
+    """Encrypt a refresh token using Fernet.
 
     Args:
-        tokens_dir: Directory where token files are stored.
+        refresh_token: The plaintext refresh token.
 
     Returns:
-        Path to ``google.json`` within the tokens directory.
-    """
-    return tokens_dir / _TOKEN_FILENAME
-
-
-def _safe_error_code(response: httpx.Response) -> str:
-    """Extract the ``error`` field from a JSON error response.
-
-    Returns the error code string (e.g. ``invalid_grant``) or ``"unknown"``
-    if the response is not JSON or lacks an ``error`` field. Never returns
-    credential material — only the error code.
-    """
-    try:
-        body = response.json()
-        if isinstance(body, dict):
-            code = body.get("error", "unknown")
-            # Truncate to prevent log injection from oversized error strings
-            return str(code)[:64]
-    except (json.JSONDecodeError, ValueError):
-        pass
-    return "unknown"
-
-
-def load_token(tokens_dir: Path) -> TokenFile | None:
-    """Read and parse the token file from disk.
-
-    The ``encrypted_refresh_token`` field remains encrypted in the returned
-    model. Use ``decrypt_refresh_token`` to obtain the plaintext.
-
-    Args:
-        tokens_dir: Directory containing token files.
-
-    Returns:
-        A TokenFile instance, or None if no token file exists.
+        The Fernet-encrypted token as a string.
 
     Raises:
-        OAuthError: If the file exists but cannot be parsed.
+        OAuthError: If the encryption key is missing or invalid.
     """
-    path = _token_file_path(tokens_dir)
-    if not path.is_file():
-        return None
-    try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        return TokenFile.model_validate(data)
-    except (json.JSONDecodeError, OSError, ValidationError) as exc:
-        msg = "Failed to read or parse token file."
-        raise OAuthError(msg) from exc
+    fernet = _get_fernet()
+    return fernet.encrypt(refresh_token.encode()).decode("utf-8")
 
 
 def decrypt_refresh_token(token_file: TokenFile) -> str:
@@ -217,6 +197,52 @@ def decrypt_refresh_token(token_file: TokenFile) -> str:
         return decrypted.decode("utf-8")
     except InvalidToken as exc:
         msg = "Failed to decrypt refresh token. Check OAUTH_ENCRYPTION_KEY."
+        raise OAuthError(msg) from exc
+
+
+# ---------------------------------------------------------------------------
+# Token file I/O (shared across providers)
+# ---------------------------------------------------------------------------
+
+
+def _token_file_path(tokens_dir: Path, provider: OAuthProvider) -> Path:
+    """Return the path to the token file for a given provider.
+
+    Args:
+        tokens_dir: Directory where token files are stored.
+        provider: OAuth provider name.
+
+    Returns:
+        Path to the provider's token file within the tokens directory.
+    """
+    return tokens_dir / _TOKEN_FILENAMES[provider]
+
+
+def load_token(tokens_dir: Path, provider: OAuthProvider = "google") -> TokenFile | None:
+    """Read and parse the token file from disk.
+
+    The ``encrypted_refresh_token`` field remains encrypted in the returned
+    model. Use ``decrypt_refresh_token`` to obtain the plaintext.
+
+    Args:
+        tokens_dir: Directory containing token files.
+        provider: OAuth provider name.
+
+    Returns:
+        A TokenFile instance, or None if no token file exists.
+
+    Raises:
+        OAuthError: If the file exists but cannot be parsed.
+    """
+    path = _token_file_path(tokens_dir, provider)
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        return TokenFile.model_validate(data)
+    except (json.JSONDecodeError, OSError, ValidationError) as exc:
+        msg = f"Failed to read or parse {provider} token file."
         raise OAuthError(msg) from exc
 
 
@@ -243,7 +269,11 @@ def save_token(tokens_dir: Path, token: TokenFile) -> None:
         msg = "Failed to create tokens directory."
         raise OAuthError(msg) from exc
 
-    path = _token_file_path(tokens_dir)
+    if token.provider not in _TOKEN_FILENAMES:
+        msg = f"Unknown provider: {token.provider}"
+        raise OAuthError(msg)
+    provider: OAuthProvider = token.provider  # type: ignore[assignment]
+    path = _token_file_path(tokens_dir, provider)
     try:
         data = token.model_dump_json(indent=2)
         # Atomic-permission write: open with 0o600 from the start to avoid
@@ -256,31 +286,92 @@ def save_token(tokens_dir: Path, token: TokenFile) -> None:
         raise OAuthError(msg) from exc
 
 
-def encrypt_refresh_token(refresh_token: str) -> str:
-    """Encrypt a refresh token using Fernet.
+def _safe_error_code(response: httpx.Response) -> str:
+    """Extract the ``error`` field from a JSON error response.
 
-    Args:
-        refresh_token: The plaintext refresh token.
+    Returns the error code string (e.g. ``invalid_grant``) or ``"unknown"``
+    if the response is not JSON or lacks an ``error`` field. Never returns
+    credential material — only the error code.
+    """
+    try:
+        body = response.json()
+        if isinstance(body, dict):
+            code = body.get("error", "unknown")
+            # Strip control characters (newlines, ANSI escapes) and Unicode format
+            # characters (BiDi overrides, zero-width spaces) to prevent log injection.
+            sanitized = "".join(
+                c for c in str(code) if c.isprintable() and unicodedata.category(c) != "Cf"
+            )
+            return sanitized[:64]
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Google OAuth helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_google_client_credentials() -> tuple[str, str]:
+    """Read Google OAuth client credentials from environment variables.
 
     Returns:
-        The Fernet-encrypted token as a string.
+        A (client_id, client_secret) tuple.
 
     Raises:
-        OAuthError: If the encryption key is missing or invalid.
+        OAuthError: If either env var is missing.
     """
-    fernet = _get_fernet()
-    return fernet.encrypt(refresh_token.encode()).decode("utf-8")
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET")
+    if not client_id:
+        msg = "GOOGLE_CLIENT_ID environment variable is not set."
+        raise OAuthError(msg)
+    if not client_secret:
+        msg = "GOOGLE_CLIENT_SECRET environment variable is not set."
+        raise OAuthError(msg)
+    return client_id, client_secret
 
 
-async def exchange_code(
+def build_google_consent_url(redirect_uri: str) -> tuple[str, str]:
+    """Build the Google OAuth consent URL with CSRF ``state`` parameter.
+
+    A cryptographically random ``state`` token is generated and included
+    in the URL for CSRF protection (RFC 6749 section 10.12).
+
+    Args:
+        redirect_uri: The redirect URI for the OAuth callback.
+
+    Returns:
+        A (url, state) tuple.
+
+    Raises:
+        OAuthError: If GOOGLE_CLIENT_ID is not set.
+    """
+    client_id = os.environ.get("GOOGLE_CLIENT_ID")
+    if not client_id:
+        msg = "GOOGLE_CLIENT_ID environment variable is not set."
+        raise OAuthError(msg)
+
+    state = secrets.token_urlsafe(32)
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": state,
+    }
+    return f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}", state
+
+
+async def exchange_google_code(
     code: str,
     redirect_uri: str,
     http_client: httpx.AsyncClient,
 ) -> tuple[str, str, list[str]]:
-    """Exchange an authorization code for access and refresh tokens.
-
-    Posts to Google's token endpoint with the authorization code and
-    client credentials.
+    """Exchange a Google authorization code for access and refresh tokens.
 
     Args:
         code: The authorization code from the OAuth consent flow.
@@ -293,7 +384,7 @@ async def exchange_code(
     Raises:
         OAuthError: If the exchange fails or the response is malformed.
     """
-    client_id, client_secret = _get_client_credentials()
+    client_id, client_secret = _get_google_client_credentials()
 
     try:
         response = await http_client.post(
@@ -308,23 +399,23 @@ async def exchange_code(
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
     except httpx.HTTPError as exc:
-        msg = "HTTP request to token endpoint failed during code exchange."
+        msg = "HTTP request to Google token endpoint failed during code exchange."
         raise OAuthError(msg) from exc
 
     if response.status_code != 200:
         error_code = _safe_error_code(response)
         logger.error(
-            "Token exchange failed with status %d (error=%s).",
+            "Google token exchange failed with status %d (error=%s).",
             response.status_code,
             error_code,
         )
-        msg = "Token exchange failed. Check client credentials and auth code."
+        msg = "Google token exchange failed. Check client credentials and auth code."
         raise OAuthError(msg)
 
     try:
         data = response.json()
     except (json.JSONDecodeError, ValueError) as exc:
-        msg = "Token endpoint returned invalid JSON."
+        msg = "Google token endpoint returned invalid JSON."
         raise OAuthError(msg) from exc
 
     access_token = data.get("access_token")
@@ -332,28 +423,289 @@ async def exchange_code(
     scope_str = data.get("scope", "")
 
     if not access_token or not refresh_token:
-        msg = "Token endpoint response missing access_token or refresh_token."
+        msg = "Google token endpoint response missing access_token or refresh_token."
         raise OAuthError(msg)
 
     scopes = scope_str.split() if scope_str else []
     return access_token, refresh_token, scopes
 
 
+async def _refresh_google_token(
+    refresh_token: str,
+    http_client: httpx.AsyncClient,
+) -> tuple[str, int]:
+    """Refresh a Google access token using the refresh token.
+
+    Args:
+        refresh_token: The decrypted refresh token.
+        http_client: An httpx async client.
+
+    Returns:
+        A (access_token, expires_in_seconds) tuple.
+
+    Raises:
+        OAuthError: If refresh fails.
+    """
+    client_id, client_secret = _get_google_client_credentials()
+
+    try:
+        response = await http_client.post(
+            GOOGLE_TOKEN_ENDPOINT,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except httpx.HTTPError as exc:
+        msg = "HTTP request to Google token endpoint failed during refresh."
+        raise OAuthError(msg) from exc
+
+    if response.status_code != 200:
+        error_code = _safe_error_code(response)
+        logger.error(
+            "Google token refresh failed with status %d (error=%s).",
+            response.status_code,
+            error_code,
+        )
+        msg = "Google token refresh failed. The refresh token may have been revoked."
+        raise OAuthError(msg)
+
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        msg = "Google token endpoint returned invalid JSON during refresh."
+        raise OAuthError(msg) from exc
+
+    access_token = data.get("access_token")
+    expires_in = data.get("expires_in")
+
+    if not access_token:
+        msg = "Google token refresh response missing access_token."
+        raise OAuthError(msg)
+
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        expires_in = 3600
+
+    return access_token, min(expires_in, _MAX_TOKEN_LIFETIME_S)
+
+
+# ---------------------------------------------------------------------------
+# Microsoft OAuth helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_microsoft_client_credentials() -> tuple[str, str]:
+    """Read Microsoft OAuth client credentials from environment variables.
+
+    Returns:
+        A (client_id, client_secret) tuple.
+
+    Raises:
+        OAuthError: If either env var is missing.
+    """
+    client_id = os.environ.get("MICROSOFT_CLIENT_ID")
+    client_secret = os.environ.get("MICROSOFT_CLIENT_SECRET")
+    if not client_id:
+        msg = "MICROSOFT_CLIENT_ID environment variable is not set."
+        raise OAuthError(msg)
+    if not client_secret:
+        msg = "MICROSOFT_CLIENT_SECRET environment variable is not set."
+        raise OAuthError(msg)
+    return client_id, client_secret
+
+
+def build_microsoft_consent_url(redirect_uri: str) -> tuple[str, str]:
+    """Build the Microsoft OAuth consent URL with CSRF ``state`` parameter.
+
+    Uses the Azure AD v2.0 authorization endpoint.
+
+    Args:
+        redirect_uri: The redirect URI for the OAuth callback.
+
+    Returns:
+        A (url, state) tuple.
+
+    Raises:
+        OAuthError: If MICROSOFT_CLIENT_ID is not set.
+    """
+    client_id = os.environ.get("MICROSOFT_CLIENT_ID")
+    if not client_id:
+        msg = "MICROSOFT_CLIENT_ID environment variable is not set."
+        raise OAuthError(msg)
+
+    state = secrets.token_urlsafe(32)
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(MICROSOFT_SCOPES),
+        "response_mode": "query",
+        "state": state,
+    }
+    return f"{MICROSOFT_AUTH_ENDPOINT}?{urlencode(params)}", state
+
+
+async def exchange_microsoft_code(
+    code: str,
+    redirect_uri: str,
+    http_client: httpx.AsyncClient,
+) -> tuple[str, str, list[str]]:
+    """Exchange a Microsoft authorization code for access and refresh tokens.
+
+    Args:
+        code: The authorization code from the OAuth consent flow.
+        redirect_uri: The redirect URI used in the consent URL.
+        http_client: An httpx async client for making the HTTP request.
+
+    Returns:
+        A tuple of (access_token, refresh_token, scopes).
+
+    Raises:
+        OAuthError: If the exchange fails or the response is malformed.
+    """
+    client_id, client_secret = _get_microsoft_client_credentials()
+
+    try:
+        response = await http_client.post(
+            MICROSOFT_TOKEN_ENDPOINT,
+            data={
+                "code": code,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "grant_type": "authorization_code",
+                "scope": " ".join(MICROSOFT_SCOPES),
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except httpx.HTTPError as exc:
+        msg = "HTTP request to Microsoft token endpoint failed during code exchange."
+        raise OAuthError(msg) from exc
+
+    if response.status_code != 200:
+        error_code = _safe_error_code(response)
+        error_desc = ""
+        try:
+            err_body = response.json()
+            if isinstance(err_body, dict):
+                error_desc = str(err_body.get("error_description", ""))[:300]
+        except (ValueError, TypeError):
+            pass
+        logger.error(
+            "Microsoft token exchange failed with status %d (error=%s): %s",
+            response.status_code,
+            error_code,
+            error_desc,
+        )
+        msg = "Microsoft token exchange failed. Check client credentials and auth code."
+        raise OAuthError(msg)
+
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        msg = "Microsoft token endpoint returned invalid JSON."
+        raise OAuthError(msg) from exc
+
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    scope_str = data.get("scope", "")
+
+    if not access_token or not refresh_token:
+        msg = "Microsoft token endpoint response missing access_token or refresh_token."
+        raise OAuthError(msg)
+
+    scopes = scope_str.split() if scope_str else []
+    return access_token, refresh_token, scopes
+
+
+async def _refresh_microsoft_token(
+    refresh_token: str,
+    http_client: httpx.AsyncClient,
+) -> tuple[str, int]:
+    """Refresh a Microsoft access token using the refresh token.
+
+    Args:
+        refresh_token: The decrypted refresh token.
+        http_client: An httpx async client.
+
+    Returns:
+        A (access_token, expires_in_seconds) tuple.
+
+    Raises:
+        OAuthError: If refresh fails.
+    """
+    client_id, client_secret = _get_microsoft_client_credentials()
+
+    try:
+        response = await http_client.post(
+            MICROSOFT_TOKEN_ENDPOINT,
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "refresh_token": refresh_token,
+                "grant_type": "refresh_token",
+                "scope": " ".join(MICROSOFT_SCOPES),
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except httpx.HTTPError as exc:
+        msg = "HTTP request to Microsoft token endpoint failed during refresh."
+        raise OAuthError(msg) from exc
+
+    if response.status_code != 200:
+        error_code = _safe_error_code(response)
+        logger.error(
+            "Microsoft token refresh failed with status %d (error=%s).",
+            response.status_code,
+            error_code,
+        )
+        msg = "Microsoft token refresh failed. The refresh token may have been revoked."
+        raise OAuthError(msg)
+
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, ValueError) as exc:
+        msg = "Microsoft token endpoint returned invalid JSON during refresh."
+        raise OAuthError(msg) from exc
+
+    access_token = data.get("access_token")
+    expires_in = data.get("expires_in")
+
+    if not access_token:
+        msg = "Microsoft token refresh response missing access_token."
+        raise OAuthError(msg)
+
+    if not isinstance(expires_in, int) or expires_in <= 0:
+        expires_in = 3600
+
+    return access_token, min(expires_in, _MAX_TOKEN_LIFETIME_S)
+
+
+# ---------------------------------------------------------------------------
+# Unified token refresh (used by tool modules)
+# ---------------------------------------------------------------------------
+
+
 async def get_valid_access_token(
     tokens_dir: Path,
+    provider: OAuthProvider,
     cached_token: str | None,
     cached_expires_at: datetime | None,
     http_client: httpx.AsyncClient,
 ) -> tuple[str, datetime]:
-    """Return a valid access token, refreshing if needed.
+    """Return a valid access token for the given provider, refreshing if needed.
 
     If ``cached_token`` is still valid (not expired within the 60-second
     buffer), it is returned as-is. Otherwise, the refresh token is
     decrypted from disk and used to obtain a new access token from
-    Google's token endpoint.
+    the provider's token endpoint.
 
     Args:
         tokens_dir: Directory containing the encrypted token file.
+        provider: OAuth provider ("google" or "microsoft").
         cached_token: The currently cached access token, or None.
         cached_expires_at: Expiry time of the cached token, or None.
         http_client: An httpx async client for the refresh request.
@@ -376,59 +728,18 @@ async def get_valid_access_token(
         return cached_token, cached_expires_at
 
     # Need to refresh — load and decrypt the refresh token
-    token_file = load_token(tokens_dir)
+    token_file = load_token(tokens_dir, provider)
     if token_file is None:
-        msg = "No OAuth token file found. Run oauth_setup first."
+        msg = f"No {provider} OAuth token file found. Run oauth_setup first."
         raise OAuthError(msg)
 
-    refresh_token = decrypt_refresh_token(token_file)
-    client_id, client_secret = _get_client_credentials()
+    refresh_tok = decrypt_refresh_token(token_file)
 
-    try:
-        response = await http_client.post(
-            GOOGLE_TOKEN_ENDPOINT,
-            data={
-                "client_id": client_id,
-                "client_secret": client_secret,
-                "refresh_token": refresh_token,
-                "grant_type": "refresh_token",
-            },
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-        )
-    except httpx.HTTPError as exc:
-        msg = "HTTP request to token endpoint failed during refresh."
-        raise OAuthError(msg) from exc
-
-    if response.status_code != 200:
-        error_code = _safe_error_code(response)
-        logger.error(
-            "Token refresh failed with status %d (error=%s).",
-            response.status_code,
-            error_code,
-        )
-        msg = "Token refresh failed. The refresh token may have been revoked."
-        raise OAuthError(msg)
-
-    try:
-        data = response.json()
-    except (json.JSONDecodeError, ValueError) as exc:
-        msg = "Token endpoint returned invalid JSON during refresh."
-        raise OAuthError(msg) from exc
-
-    access_token = data.get("access_token")
-    expires_in = data.get("expires_in")
-
-    if not access_token:
-        msg = "Token refresh response missing access_token."
-        raise OAuthError(msg)
-
-    if not isinstance(expires_in, int) or expires_in <= 0:
-        # Default to 1 hour if expires_in is missing or invalid
-        expires_in = 3600
-
-    # Cap to 1 hour — Google's standard is 3600s; anything higher is
-    # suspicious and could cause stale token caching.
-    expires_in = min(expires_in, _MAX_TOKEN_LIFETIME_S)
+    # Dispatch to provider-specific refresh
+    if provider == "google":
+        access_token, expires_in = await _refresh_google_token(refresh_tok, http_client)
+    else:
+        access_token, expires_in = await _refresh_microsoft_token(refresh_tok, http_client)
 
     expires_at = now + timedelta(seconds=expires_in)
 
@@ -438,45 +749,18 @@ async def get_valid_access_token(
         save_token(tokens_dir, token_file)
     except OAuthError:
         # Non-fatal: log but don't fail the refresh
-        logger.warning("Failed to update last_refreshed_at in token file.")
+        logger.warning("Failed to update last_refreshed_at in %s token file.", provider)
 
-    logger.info("OAuth access token refreshed successfully.")
+    logger.info("%s OAuth access token refreshed successfully.", provider.capitalize())
     return access_token, expires_at
 
 
-def build_consent_url(redirect_uri: str) -> tuple[str, str]:
-    """Build the Google OAuth consent URL with CSRF ``state`` parameter.
+# ---------------------------------------------------------------------------
+# Backwards-compatible aliases (used by existing oauth_setup.py and tests)
+# ---------------------------------------------------------------------------
 
-    Only ``GOOGLE_CLIENT_ID`` is required — the client secret is not
-    included in consent URLs (it is server-side only).
-
-    A cryptographically random ``state`` token is generated and included
-    in the URL for CSRF protection (RFC 6749 §10.12). The caller must
-    verify this ``state`` matches when the authorization code is received.
-
-    Args:
-        redirect_uri: The redirect URI for the OAuth callback.
-
-    Returns:
-        A (url, state) tuple. The caller must store ``state`` and verify
-        it matches the value returned by Google's redirect.
-
-    Raises:
-        OAuthError: If GOOGLE_CLIENT_ID is not set.
-    """
-    client_id = os.environ.get("GOOGLE_CLIENT_ID")
-    if not client_id:
-        msg = "GOOGLE_CLIENT_ID environment variable is not set."
-        raise OAuthError(msg)
-
-    state = secrets.token_urlsafe(32)
-    params = {
-        "client_id": client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": " ".join(GOOGLE_SCOPES),
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": state,
-    }
-    return f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(params)}", state
+# These are kept for backwards compatibility with existing code that
+# imports from oauth.py. New code should use the provider-specific functions.
+build_consent_url = build_google_consent_url
+exchange_code = exchange_google_code
+_get_client_credentials = _get_google_client_credentials

@@ -404,13 +404,20 @@ class TestImportToolModules:
             _import_tool_modules()
 
         assert "admino.tools.gmail" in imported
-        assert "admino.tools.calendar" in imported
+        assert "admino.tools.google_calendar" in imported
         assert "admino.tools.memory" in imported
-        # All 9 top-level tool modules must be attempted; transitive imports
+        # All top-level tool modules must be attempted; transitive imports
         # (e.g. admino.tools.registry from within a tool) may add extras.
         top_level_modules = {
+            # Google API tools
             "admino.tools.gmail",
-            "admino.tools.calendar",
+            "admino.tools.google_calendar",
+            "admino.tools.google_drive",
+            # Microsoft Graph API tools
+            "admino.tools.outlook",
+            "admino.tools.outlook_calendar",
+            "admino.tools.onedrive",
+            # Other tools
             "admino.tools.news",
             "admino.tools.documents",
             "admino.tools.search",
@@ -436,8 +443,8 @@ class TestImportToolModules:
         with patch("builtins.__import__", side_effect=_side_effect):
             _import_tool_modules()
 
-        # All 9 modules attempted despite first one failing
-        assert call_count == 9
+        # All 13 modules attempted despite first one failing
+        assert call_count == 13
 
 
 # ---------------------------------------------------------------------------

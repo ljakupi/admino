@@ -131,8 +131,11 @@ class TestValidConfigLoading:
 class TestDefaults:
     """When config file does not exist, AppConfig uses defaults."""
 
-    def test_defaults_with_missing_file(self, tmp_path: Path) -> None:
+    def test_defaults_with_missing_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """load_app_config with a nonexistent path returns defaults."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         config = load_app_config(tmp_path / "nonexistent.yaml")
 
         assert config.server.host == "0.0.0.0"  # noqa: S104
@@ -141,20 +144,26 @@ class TestDefaults:
         assert config.llm.model == "gemma4:e2b"
         assert config.llm.timeout_s == 120
         assert config.llm.provider == "ollama"
-        assert config.auth.mode == "vpn"
+        assert config.auth.mode == "vpn"  # explicitly set via AUTH_MODE env
         assert config.limits.max_tool_calls_per_message == 10
         assert config.limits.confirmation_timeout_s == 300
         assert config.log_level == "INFO"
 
-    def test_defaults_with_empty_yaml(self, tmp_path: Path) -> None:
+    def test_defaults_with_empty_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """An empty YAML file (parses as None) uses defaults."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(tmp_path / "config.yaml", "")
         config = load_app_config(yaml_path)
         assert config.server.port == 8000
         assert config.log_level == "INFO"
 
-    def test_defaults_with_comment_only_yaml(self, tmp_path: Path) -> None:
+    def test_defaults_with_comment_only_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A YAML file containing only comments (parses as None) uses defaults."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(tmp_path / "config.yaml", "# just a comment\n")
         config = load_app_config(yaml_path)
         assert config.server.port == 8000
@@ -180,6 +189,7 @@ class TestEnvVarOverrides:
               ollama_url: "http://yaml-value:11434"
             """,
         )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-value:11434")
         config = load_app_config(yaml_path)
         assert config.llm.ollama_url == "http://env-value:11434"
@@ -193,6 +203,7 @@ class TestEnvVarOverrides:
               model: "yaml-model"
             """,
         )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("OLLAMA_MODEL", "env-model")
         config = load_app_config(yaml_path)
         assert config.llm.model == "env-model"
@@ -205,6 +216,7 @@ class TestEnvVarOverrides:
             log_level: "INFO"
             """,
         )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("LOG_LEVEL", "debug")
         config = load_app_config(yaml_path)
         assert config.log_level == "DEBUG"
@@ -218,6 +230,7 @@ class TestEnvVarOverrides:
               audit_log: "/yaml/audit.jsonl"
             """,
         )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("AUDIT_LOG_PATH", "/env/audit.jsonl")
         config = load_app_config(yaml_path)
         assert config.paths.audit_log == Path("/env/audit.jsonl")
@@ -226,6 +239,7 @@ class TestEnvVarOverrides:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Env vars work even when config file is missing (defaults + env)."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-only:11434")
         monkeypatch.setenv("LOG_LEVEL", "WARNING")
         config = load_app_config(tmp_path / "nonexistent.yaml")
@@ -308,8 +322,9 @@ class TestInvalidFieldValues:
 class TestPathResolution:
     """Relative paths in YAML are resolved to absolute paths after loading."""
 
-    def test_relative_paths_resolved(self, tmp_path: Path) -> None:
+    def test_relative_paths_resolved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Relative path values become absolute after model validation."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -328,8 +343,11 @@ class TestPathResolution:
         assert config.paths.tokens_dir.is_absolute()
         # ocr.binary is validated separately — must be under a safe prefix
 
-    def test_ocr_binary_default_is_absolute(self, tmp_path: Path) -> None:
+    def test_ocr_binary_default_is_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Default OCR binary path is absolute and under a safe prefix."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(tmp_path / "config.yaml", "")
         config = load_app_config(yaml_path)
         assert config.ocr.binary.is_absolute()
@@ -337,8 +355,11 @@ class TestPathResolution:
             ("/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/")
         )
 
-    def test_absolute_paths_stay_absolute(self, tmp_path: Path) -> None:
+    def test_absolute_paths_stay_absolute(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Absolute paths remain unchanged after resolution."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -367,7 +388,7 @@ class TestPermissionsLoading:
               gmail:
                 read: allow
                 list: confirm
-              calendar:
+              google_calendar:
                 list: allow
                 create: confirm
               news:
@@ -378,8 +399,8 @@ class TestPermissionsLoading:
 
         assert config.tools["gmail"].actions["read"] == "allow"
         assert config.tools["gmail"].actions["list"] == "confirm"
-        assert config.tools["calendar"].actions["list"] == "allow"
-        assert config.tools["calendar"].actions["create"] == "confirm"
+        assert config.tools["google_calendar"].actions["list"] == "allow"
+        assert config.tools["google_calendar"].actions["create"] == "confirm"
         assert config.tools["news"].actions["fetch"] == "allow"
 
     def test_permissions_with_deny(self, tmp_path: Path) -> None:
@@ -423,8 +444,14 @@ class TestHardcodedDenialOverride:
         [
             ("gmail", "send"),
             ("gmail", "delete"),
-            ("calendar", "delete"),
-            ("calendar", "update"),
+            ("google_calendar", "delete"),
+            ("google_calendar", "update"),
+            ("google_drive", "delete"),
+            ("outlook", "send"),
+            ("outlook", "delete"),
+            ("outlook_calendar", "delete"),
+            ("outlook_calendar", "update"),
+            ("onedrive", "delete"),
             ("documents", "delete"),
             ("files", "delete"),
             ("memory", "delete"),
@@ -432,8 +459,14 @@ class TestHardcodedDenialOverride:
         ids=[
             "gmail.send",
             "gmail.delete",
-            "calendar.delete",
-            "calendar.update",
+            "google_calendar.delete",
+            "google_calendar.update",
+            "google_drive.delete",
+            "outlook.send",
+            "outlook.delete",
+            "outlook_calendar.delete",
+            "outlook_calendar.update",
+            "onedrive.delete",
             "documents.delete",
             "files.delete",
             "memory.delete",
@@ -601,8 +634,9 @@ class TestEgressHostValidation:
 class TestSubModelsPresent:
     """A loaded AppConfig has all expected sub-model attributes."""
 
-    def test_all_submodels_present(self, tmp_path: Path) -> None:
+    def test_all_submodels_present(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Default AppConfig contains all sub-model instances."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
         config = load_app_config(tmp_path / "nonexistent.yaml")
 
         assert isinstance(config.server, ServerConfig)

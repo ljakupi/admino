@@ -49,10 +49,19 @@ PermissionState = Literal["allow", "confirm", "deny"]
 
 HARDCODED_DENIALS: frozenset[tuple[str, str]] = frozenset(
     {
+        # Google
         ("gmail", "send"),
         ("gmail", "delete"),
-        ("calendar", "delete"),
-        ("calendar", "update"),
+        ("google_calendar", "delete"),
+        ("google_calendar", "update"),
+        ("google_drive", "delete"),
+        # Microsoft
+        ("outlook", "send"),
+        ("outlook", "delete"),
+        ("outlook_calendar", "delete"),
+        ("outlook_calendar", "update"),
+        ("onedrive", "delete"),
+        # Local
         ("documents", "delete"),
         ("files", "delete"),
         # ``files.overwrite`` is modelled as a first-class action so an
@@ -71,11 +80,23 @@ HARDCODED_DENIALS: frozenset[tuple[str, str]] = frozenset(
 # ensuring human confirmation before any state-changing external action.
 _CONFIRM_ONLY_ACTIONS: frozenset[tuple[str, str]] = frozenset(
     {
+        # Google
         ("gmail", "send"),
         ("gmail", "delete"),
-        ("calendar", "create"),
-        ("calendar", "delete"),
-        ("calendar", "update"),
+        ("google_calendar", "create"),
+        ("google_calendar", "delete"),
+        ("google_calendar", "update"),
+        ("google_drive", "delete"),
+        ("google_drive", "download"),
+        # Microsoft
+        ("outlook", "send"),
+        ("outlook", "delete"),
+        ("outlook_calendar", "create"),
+        ("outlook_calendar", "delete"),
+        ("outlook_calendar", "update"),
+        ("onedrive", "delete"),
+        ("onedrive", "download"),
+        # Local
         ("documents", "delete"),
         ("files", "write"),
         ("files", "move"),

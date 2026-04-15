@@ -81,8 +81,15 @@ def _import_tool_modules() -> None:
     (tools may not all be implemented yet during development).
     """
     _names = [
+        # Google API tools
         "admino.tools.gmail",
-        "admino.tools.calendar",
+        "admino.tools.google_calendar",
+        "admino.tools.google_drive",
+        # Microsoft Graph API tools
+        "admino.tools.outlook",
+        "admino.tools.outlook_calendar",
+        "admino.tools.onedrive",
+        # Other tools
         "admino.tools.news",
         "admino.tools.documents",
         "admino.tools.search",

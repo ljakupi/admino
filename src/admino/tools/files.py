@@ -371,10 +371,14 @@ def _sync_move_file(source: Path, destination: Path) -> None:
         msg = "Refusing to move a symlink."
         raise PermissionError(msg)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Check destination is not an existing symlink.
-    if destination.exists() and destination.is_symlink():
-        msg = "Refusing to move to a symlink destination."
-        raise PermissionError(msg)
+    # Refuse to overwrite existing files — consistent with files.write and
+    # download actions. This prevents move from acting as a de-facto delete.
+    if os.path.lexists(str(destination)):
+        if destination.is_symlink():
+            msg = "Refusing to move to a symlink destination."
+            raise PermissionError(msg)
+        msg = "Destination already exists. Choose a different path."
+        raise FileExistsError(msg)
     shutil.move(str(source), str(destination))
 
 

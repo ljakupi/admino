@@ -52,7 +52,7 @@ The config defaults in `config/config.yaml` currently target Anthropic (`llm.pro
 2. Type a message and press Enter
 3. The agent sends your message to the configured LLM provider, which may respond with tool calls
 4. Currently implemented tools: `memory.store/recall/list` and `files.read/list/search/write/move`
-5. Other tools (gmail, calendar, news, etc.) are not yet implemented — the agent handles those gracefully with a text-only response
+5. Other tools (gmail, google_calendar, google_drive, outlook, outlook_calendar, onedrive, news, etc.) are not yet implemented — the agent handles those gracefully with a text-only response
 
 ### Docker mode (optional)
 
@@ -156,7 +156,8 @@ This section documents key decisions about where we use proven third-party libra
 | **pyyaml** | YAML config parsing | `yaml.safe_load()` is safe and standard. YAML is more readable than JSON for human-edited config. |
 | **cryptography** | Fernet encryption for OAuth tokens | Well-audited, widely-used. We never implement our own crypto. |
 | **aiosqlite** | Async SQLite (memory tool, documents) | Thin async wrapper around sqlite3. Required for non-blocking DB access in the async stack. |
-| **google-api-python-client** | Gmail, Calendar API access | Official Google SDK. |
+| **google-api-python-client** | Gmail, Google Calendar, Google Drive API access | Official Google SDK. |
+| **msal** | Microsoft OAuth2 (Outlook, Outlook Calendar, OneDrive) | Official Microsoft Authentication Library. Handles token acquisition and refresh for Microsoft Graph API. |
 | **Pillow** | Image processing for document OCR | Standard image library. |
 | **beautifulsoup4 + lxml** | HTML parsing (news, web scraping) | Proven parsers, no reason to hand-roll HTML parsing. |
 
@@ -256,16 +257,20 @@ admino/
     oauth.py           -- OAuth token management, Fernet encryption
     oauth_setup.py     -- CLI for one-time OAuth consent
     tools/
-      registry.py      -- tool registration + dispatch
-      gmail.py         -- Gmail read/list/search
-      calendar.py      -- Calendar read/list/create
-      news.py          -- News fetch
-      documents.py     -- Document store/classify/search/query + OCR
-      search.py        -- Web search
-      files.py         -- Local file read/list/search/write/move
-      memory.py        -- Persistent key-value notes (SQLite)
-      aggregate.py     -- Cross-source search + dedup
-      recipes.py       -- YAML recipe loader + executor
+      registry.py        -- tool registration + dispatch
+      gmail.py           -- Gmail read/list/search (Google API)
+      google_calendar.py -- Google Calendar read/list/create (Google API)
+      google_drive.py    -- Google Drive read/list/search/download (Google API)
+      outlook.py         -- Outlook mail read/list/search (Microsoft Graph)
+      outlook_calendar.py -- Outlook Calendar read/list/create (Microsoft Graph)
+      onedrive.py        -- OneDrive read/list/search/download (Microsoft Graph)
+      news.py            -- News fetch
+      documents.py       -- Document store/classify/search/query + OCR
+      search.py          -- Web search
+      files.py           -- Local file read/list/search/write/move
+      memory.py          -- Persistent key-value notes (SQLite)
+      aggregate.py       -- Cross-source search + dedup
+      recipes.py         -- YAML recipe loader + executor
 ```
 
 ## Deviations from Specification
@@ -290,25 +295,30 @@ The following intentional deviations from `final_requirements.md` improve securi
 | # | Item | Files Needed | Priority |
 |---|------|-------------|----------|
 | 1 | **Tool modules: Gmail** — read, list, search via Google API | `tools/gmail.py` | P0 |
-| 2 | **Tool modules: Calendar** — read, list, create (with confirmation) via Google API | `tools/calendar.py` | P0 |
-| 3 | **Tool modules: News** — fetch via RSS or privacy-respecting API | `tools/news.py` | P1 |
-| 4 | **Tool modules: Documents** — store (OCR + LLM classification), search, query. SQLite schema from spec §3.4 | `tools/documents.py` | P1 |
-| 5 | **Tool modules: Web Search** — via SearXNG or Brave Search API | `tools/search.py` | P2 |
-| 6 | **Tool modules: Aggregate** — cross-source search + deduplication | `tools/aggregate.py` | P1 |
-| 7 | **Tool modules: Recipes** — YAML loader, date resolver, step runner | `tools/recipes.py` | P1 |
-| 8 | **Tool argument Pydantic models** — Gmail, Calendar, News, Documents, WebSearch, Aggregate, Recipe arg schemas | `models.py` additions | P0 |
-| 9 | **SQLite schema initialization** — `CREATE TABLE documents(...)` and migration logic | `tools/documents.py` | P1 |
+| 2 | **Tool modules: Google Calendar** — read, list, create (with confirmation) via Google API | `tools/google_calendar.py` | P0 |
+| 3 | **Tool modules: Google Drive** — read, list, search, download (with confirmation) via Google API | `tools/google_drive.py` | P0 |
+| 4 | **Tool modules: Outlook** — read, list, search via Microsoft Graph API | `tools/outlook.py` | P0 |
+| 5 | **Tool modules: Outlook Calendar** — read, list, create (with confirmation) via Microsoft Graph API | `tools/outlook_calendar.py` | P0 |
+| 6 | **Tool modules: OneDrive** — read, list, search, download (with confirmation) via Microsoft Graph API | `tools/onedrive.py` | P0 |
+| 7 | **Tool modules: News** — fetch via RSS or privacy-respecting API | `tools/news.py` | P1 |
+| 8 | **Tool modules: Documents** — store (OCR + LLM classification), search, query. SQLite schema from spec §3.4 | `tools/documents.py` | P1 |
+| 9 | **Tool modules: Web Search** — via SearXNG or Brave Search API | `tools/search.py` | P2 |
+| 10 | **Tool modules: Aggregate** — cross-source search + deduplication | `tools/aggregate.py` | P1 |
+| 11 | **Tool modules: Recipes** — YAML loader, date resolver, step runner | `tools/recipes.py` | P1 |
+| 12 | **Tool argument Pydantic models** — all tool arg schemas (Google, Microsoft, News, Documents, etc.) | `models.py` additions | P0 |
+| 13 | **SQLite schema initialization** — `CREATE TABLE documents(...)` and migration logic | `tools/documents.py` | P1 |
+| 14 | **Microsoft OAuth support** — MSAL-based token acquisition + refresh for Microsoft Graph API | `oauth.py`, `oauth_setup.py` | P0 |
 
 ### Non-Blocking (required for v1 but not for basic operation)
 
 | # | Item | Details | Priority |
 |---|------|---------|----------|
-| 10 | **Tool-specific tests** | `test_gmail.py`, `test_calendar.py`, `test_documents.py`, `test_aggregate.py`, `test_recipes.py` (files + memory done) | P1 |
-| 11 | **Health endpoint enrichment** | Add `model`, `ollama_reachable`, `uptime_s` to GET /health response | P2 |
-| 12 | **`DEPENDENCIES.md`** | Document every direct dependency with name, version, purpose, justification (§9.7) | P2 |
-| 13 | **`conftest.py` shared fixtures** | Mock Ollama, test config, test DB fixtures for test organization | P3 |
-| 14 | **Adversarial/security tests** | `tests/test_security.py` — prompt injection, SQL injection, path traversal, control chars (§12.2) | P1 |
-| 15 | **Integration tests** | Full request flow: POST message -> tool execution -> response; confirmation flow end-to-end | P1 |
+| 15 | **Tool-specific tests** | `test_gmail.py`, `test_google_calendar.py`, `test_google_drive.py`, `test_outlook.py`, `test_outlook_calendar.py`, `test_onedrive.py`, `test_documents.py`, `test_aggregate.py`, `test_recipes.py` (files + memory done) | P1 |
+| 16 | **Health endpoint enrichment** | Add `model`, `ollama_reachable`, `uptime_s` to GET /health response | P2 |
+| 17 | **`DEPENDENCIES.md`** | Document every direct dependency with name, version, purpose, justification (§9.7) | P2 |
+| 18 | **`conftest.py` shared fixtures** | Mock Ollama, test config, test DB fixtures for test organization | P3 |
+| 19 | **Adversarial/security tests** | `tests/test_security.py` — prompt injection, SQL injection, path traversal, control chars (§12.2) | P1 |
+| 20 | **Integration tests** | Full request flow: POST message -> tool execution -> response; confirmation flow end-to-end | P1 |
 
 ### Currently Implemented
 

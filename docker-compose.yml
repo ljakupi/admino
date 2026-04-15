@@ -63,8 +63,9 @@ services:
       # Override if your Docker daemon uses a custom "bip" or address pool.
       INTERNAL_NETWORK: "172.16.0.0/12"
       # Hard-fail if NET_ADMIN is absent and iptables whitelist cannot be applied.
-      # Set to "false" only for local development without Docker privileges.
-      REQUIRE_EGRESS_WHITELIST: "false"
+      # Set to "false" ONLY for local development without Docker privileges.
+      # Defaults to "true" for production safety; override via .env file.
+      REQUIRE_EGRESS_WHITELIST: "${REQUIRE_EGRESS_WHITELIST:-true}"
 
     volumes:
       # Internal state — persists across container restarts. These directories
