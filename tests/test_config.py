@@ -391,8 +391,6 @@ class TestPermissionsLoading:
               google_calendar:
                 list: allow
                 create: confirm
-              news:
-                fetch: allow
             """,
         )
         config = load_permissions_config(yaml_path)
@@ -401,7 +399,6 @@ class TestPermissionsLoading:
         assert config.tools["gmail"].actions["list"] == "confirm"
         assert config.tools["google_calendar"].actions["list"] == "allow"
         assert config.tools["google_calendar"].actions["create"] == "confirm"
-        assert config.tools["news"].actions["fetch"] == "allow"
 
     def test_permissions_with_deny(self, tmp_path: Path) -> None:
         """Explicit deny in permissions.yaml is preserved."""
@@ -534,8 +531,8 @@ class TestInvalidPermissionStates:
             tmp_path / "permissions.yaml",
             f"""\
             tools:
-              news:
-                fetch: {state if state else '""'}
+              files:
+                read: {state if state else '""'}
             """,
         )
         with pytest.raises(ValueError, match=r"Invalid permission state|must be"):
@@ -545,7 +542,7 @@ class TestInvalidPermissionStates:
         """A YAML null action value (no value after colon) raises ValueError."""
         yaml_path = _write_yaml(
             tmp_path / "permissions.yaml",
-            "tools:\n  news:\n    fetch:\n",
+            "tools:\n  files:\n    read:\n",
         )
         with pytest.raises(ValueError, match="must be a string"):
             load_permissions_config(yaml_path)

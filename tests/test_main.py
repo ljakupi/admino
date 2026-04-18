@@ -418,13 +418,10 @@ class TestImportToolModules:
             "admino.tools.outlook_calendar",
             "admino.tools.onedrive",
             # Other tools
-            "admino.tools.news",
             "admino.tools.documents",
             "admino.tools.search",
             "admino.tools.files",
             "admino.tools.memory",
-            "admino.tools.aggregate",
-            "admino.tools.recipes",
         }
         assert top_level_modules.issubset(set(imported))
 
@@ -443,8 +440,8 @@ class TestImportToolModules:
         with patch("builtins.__import__", side_effect=_side_effect):
             _import_tool_modules()
 
-        # All 13 modules attempted despite first one failing
-        assert call_count == 13
+        # All 10 modules attempted despite first one failing
+        assert call_count == 10
 
 
 # ---------------------------------------------------------------------------

@@ -224,7 +224,7 @@ class TestGetRegisteredTools:
 
     def test_get_registered_tools_returns_sorted(self) -> None:
         """Multiple tools registered are returned sorted by (tool, action)."""
-        register_tool("news", "fetch", "Fetch news", SampleArgs)(sample_handler)
+        register_tool("weather", "fetch", "Fetch weather", SampleArgs)(sample_handler)
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         register_tool("gmail", "list", "List emails", SampleArgs)(sample_handler)
         register_tool("calendar", "list", "List events", SampleArgs)(sample_handler)
@@ -236,7 +236,7 @@ class TestGetRegisteredTools:
             ("calendar", "list"),
             ("gmail", "list"),
             ("gmail", "read"),
-            ("news", "fetch"),
+            ("weather", "fetch"),
         ]
 
     def test_get_registered_tools_includes_json_schema(self) -> None:
@@ -507,7 +507,7 @@ class TestClearRegistry:
     def test_clear_registry_empties_all(self) -> None:
         """After clear, get_registered_tools returns empty list."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
-        register_tool("news", "fetch", "Fetch news", SampleArgs)(sample_handler)
+        register_tool("weather", "fetch", "Fetch weather", SampleArgs)(sample_handler)
         assert len(get_registered_tools()) == 2
         clear_registry()
         assert get_registered_tools() == []
@@ -647,12 +647,12 @@ class TestRegisterToolAdditional:
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         register_tool("gmail", "list", "List emails", SampleArgs)(sample_handler)
         register_tool("calendar", "list", "List events", SampleArgs)(sample_handler)
-        register_tool("news", "fetch", "Fetch news", SampleArgs)(sample_handler)
+        register_tool("weather", "fetch", "Fetch weather", SampleArgs)(sample_handler)
 
         assert get_tool_entry("gmail", "read") is not None
         assert get_tool_entry("gmail", "list") is not None
         assert get_tool_entry("calendar", "list") is not None
-        assert get_tool_entry("news", "fetch") is not None
+        assert get_tool_entry("weather", "fetch") is not None
         assert len(get_registered_tools()) == 4
 
     def test_register_tool_preserves_function_name(self) -> None:
@@ -1477,7 +1477,7 @@ class TestFreezeRegistry:
         register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
         freeze_registry()
         with pytest.raises(RuntimeError, match="frozen"):
-            register_tool("news", "fetch", "Fetch", SampleArgs)(sample_handler)
+            register_tool("weather", "fetch", "Fetch", SampleArgs)(sample_handler)
         # autouse clear_registry fixture resets the frozen flag after the test
 
     def test_clear_registry_unfreezes(self) -> None:

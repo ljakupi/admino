@@ -90,13 +90,10 @@ def _import_tool_modules() -> None:
         "admino.tools.outlook_calendar",
         "admino.tools.onedrive",
         # Other tools
-        "admino.tools.news",
         "admino.tools.documents",
         "admino.tools.search",
         "admino.tools.files",
         "admino.tools.memory",
-        "admino.tools.aggregate",
-        "admino.tools.recipes",
     ]
 
     for module_name in _names:

@@ -42,7 +42,7 @@ def sample_config() -> PermissionsConfig:
         tools={
             "gmail": ToolPermissions(actions={"read": "allow", "list": "confirm"}),
             "google_calendar": ToolPermissions(actions={"list": "allow", "create": "confirm"}),
-            "news": ToolPermissions(actions={"fetch": "allow"}),
+            "files": ToolPermissions(actions={"read": "allow"}),
             "documents": ToolPermissions(actions={"search": "deny"}),
         }
     )
@@ -244,7 +244,7 @@ class TestValidateCleanConfig:
         """A config with no overridden hardcoded denials produces no warnings."""
         raw: dict[str, dict[str, str]] = {
             "gmail": {"read": "allow", "list": "confirm", "send": "deny"},
-            "news": {"fetch": "allow"},
+            "files": {"read": "allow"},
         }
         with caplog.at_level(logging.WARNING, logger="admino.permissions"):
             config = validate_permissions_config(raw)
@@ -391,13 +391,13 @@ class TestValidateInvalidState:
 
     def test_invalid_state_raises_validation_error(self) -> None:
         """An unrecognized state like 'maybe' should raise ValueError."""
-        raw: dict[str, dict[str, str]] = {"news": {"fetch": "maybe"}}
+        raw: dict[str, dict[str, str]] = {"files": {"read": "maybe"}}
         with pytest.raises(ValueError):
             validate_permissions_config(raw)
 
     def test_empty_state_raises_validation_error(self) -> None:
         """An empty string state should raise ValueError."""
-        raw: dict[str, dict[str, str]] = {"news": {"fetch": ""}}
+        raw: dict[str, dict[str, str]] = {"files": {"read": ""}}
         with pytest.raises(ValueError):
             validate_permissions_config(raw)
 
