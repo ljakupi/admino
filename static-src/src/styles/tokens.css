@@ -1,0 +1,154 @@
+/* ============================================================
+   admino — Private Garden Design Tokens
+   Source: handoff/tokens.css
+   ============================================================ */
+
+/* --- Web fonts -----------------------------------------------
+   Self-hosted from /src/fonts/. Vite's assetFileNames rule in
+   vite.config.ts pins them to /fonts/[name][extname] in the build. */
+
+/* Plus Jakarta Sans — display */
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 200; font-display: swap; src: url('../fonts/PlusJakartaSans-ExtraLight.ttf') format('truetype'); }
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 300; font-display: swap; src: url('../fonts/PlusJakartaSans-Light.ttf') format('truetype'); }
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 400; font-display: swap; src: url('../fonts/PlusJakartaSans-Regular.ttf') format('truetype'); }
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 500; font-display: swap; src: url('../fonts/PlusJakartaSans-Medium.ttf') format('truetype'); }
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 600; font-display: swap; src: url('../fonts/PlusJakartaSans-SemiBold.ttf') format('truetype'); }
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 700; font-display: swap; src: url('../fonts/PlusJakartaSans-Bold.ttf') format('truetype'); }
+@font-face { font-family: 'Plus Jakarta Sans'; font-style: normal; font-weight: 800; font-display: swap; src: url('../fonts/PlusJakartaSans-ExtraBold.ttf') format('truetype'); }
+
+/* Inter — body */
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 200; font-display: swap; src: url('../fonts/Inter_18pt-ExtraLight.ttf') format('truetype'); }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 300; font-display: swap; src: url('../fonts/Inter_18pt-Light.ttf') format('truetype'); }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 400; font-display: swap; src: url('../fonts/Inter_18pt-Regular.ttf') format('truetype'); }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 500; font-display: swap; src: url('../fonts/Inter_18pt-Medium.ttf') format('truetype'); }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 600; font-display: swap; src: url('../fonts/Inter_18pt-SemiBold.ttf') format('truetype'); }
+@font-face { font-family: 'Inter'; font-style: normal; font-weight: 700; font-display: swap; src: url('../fonts/Inter_18pt-Bold.ttf') format('truetype'); }
+
+/* JetBrains Mono — monospace */
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 300; font-display: swap; src: url('../fonts/JetBrainsMono-Light.ttf') format('truetype'); }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 400; font-display: swap; src: url('../fonts/JetBrainsMono-Regular.ttf') format('truetype'); }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 500; font-display: swap; src: url('../fonts/JetBrainsMono-Medium.ttf') format('truetype'); }
+@font-face { font-family: 'JetBrains Mono'; font-style: normal; font-weight: 700; font-display: swap; src: url('../fonts/JetBrainsMono-Bold.ttf') format('truetype'); }
+
+:root {
+  /* --- Color: "Garden Green" palette --- */
+  --color-primary:        #075E54;
+  --color-primary-hover:  #0B7164;
+  --color-primary-press:  #054842;
+  --color-primary-mid:    #128C7E;
+
+  --color-bg:             #F7F4EE;
+  --color-bg-surface:     #FFFDF9;
+  --color-bg-elevated:    #FFFFFF;
+  --color-bg-tint:        #DCF8C6;
+
+  --color-accent:         #25D366;
+  --color-accent-hover:   #1FBE5A;
+  --color-accent-soft:    #DCF8C6;
+
+  --color-text:           #111B21;
+  --color-text-muted:     #667781;
+  --color-text-on-dark:   #FFFFFF;
+
+  --color-sage:           #25D366;
+  --color-sage-soft:      #DCF8C6;
+
+  --color-warn:           #E9A23B;
+  --color-warn-soft:      #FFF4DC;
+
+  --color-error:          #E35353;
+  --color-error-soft:     #FCE4E4;
+
+  --color-border:         #EAE5DC;
+  --color-border-strong:  #D4CDBF;
+  --color-overlay:        rgba(11, 20, 26, 0.45);
+
+  /* Semantic state borders for tool-call cards */
+  --state-pending-border:  var(--color-warn);
+  --state-approved-border: var(--color-accent);
+  --state-denied-border:   var(--color-error);
+
+  /* --- Type families --- */
+  --font-display: 'Plus Jakarta Sans', system-ui, -apple-system, Segoe UI, sans-serif;
+  --font-body:    'Inter', system-ui, -apple-system, Segoe UI, sans-serif;
+  --font-mono:    'JetBrains Mono', ui-monospace, SF Mono, Menlo, monospace;
+
+  /* --- Type scale (mobile -> desktop) --- */
+  --fs-h1:        26px;
+  --fs-h1-mobile: 22px;
+  --fs-h2:        20px;
+  --fs-h2-mobile: 18px;
+  --fs-h3:        16px;
+  --fs-h3-mobile: 15px;
+  --fs-body:      15px;
+  --fs-caption:   13px;
+  --fs-caption-mobile: 12px;
+  --fs-mono:      13px;
+
+  /* --- Weights --- */
+  --fw-regular:  400;
+  --fw-medium:   500;
+  --fw-semibold: 600;
+  --fw-bold:     700;
+
+  /* --- Line heights --- */
+  --lh-tight:    1.25;
+  --lh-normal:   1.5;
+  --lh-relaxed:  1.6;
+
+  /* --- Radii --- */
+  --radius-card:   10px;
+  --radius-input:   8px;
+  --radius-pill:   20px;
+  --radius-avatar: 50%;
+
+  /* --- Shadows --- */
+  --shadow-card:  0 1px 4px rgba(28, 32, 28, 0.08);
+  --shadow-modal: 0 4px 20px rgba(28, 32, 28, 0.14);
+  --shadow-focus: 0 0 0 2px var(--color-bg), 0 0 0 4px var(--color-primary);
+
+  /* --- Spacing (4px grid) --- */
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* --- Motion --- */
+  --ease: cubic-bezier(0.2, 0.6, 0.2, 1);
+  --dur-fast:  150ms;
+  --dur-med:   200ms;
+  --dur-slow:  300ms;
+  --transition-hover: color var(--dur-fast) var(--ease),
+                      background-color var(--dur-fast) var(--ease),
+                      border-color var(--dur-fast) var(--ease);
+
+  /* --- Layout --- */
+  --nav-rail-w:    64px;
+  --right-panel-w: 320px;
+  --content-max:   720px;
+  --header-h:      56px;
+  --tabbar-h:      56px;
+}
+
+/* Dark mode (v2 — dead code kept for future PR) */
+:root[data-theme="dark"] {
+  --color-bg:          #2A2E2C;
+  --color-bg-surface:  #343937;
+  --color-bg-elevated: #3D4240;
+  --color-bg-tint:     #005C4B;
+  --color-text:        #ECEFED;
+  --color-text-muted:  #9BA3A0;
+  --color-text-on-dark:#FFFFFF;
+  --color-border:      #424745;
+  --color-border-strong:#525856;
+  --color-primary:       #25D366;
+  --color-primary-hover: #1FBE5A;
+  --color-primary-press: #18A14A;
+  --color-primary-mid:   #4ADD82;
+}
