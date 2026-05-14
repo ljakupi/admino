@@ -119,7 +119,7 @@ def _format_item_summary(item: dict[str, object]) -> str:
     modified = item.get("lastModifiedDateTime", "unknown")
 
     item_type = "folder" if "folder" in item else "file"
-    size_str = _human_readable_size(int(size)) if isinstance(size, (int, float)) else "unknown"
+    size_str = _human_readable_size(int(size)) if isinstance(size, int | float) else "unknown"
 
     return f"ID: {item_id}\nName: {name}\nType: {item_type}\nSize: {size_str}\nModified: {modified}"
 
@@ -191,7 +191,7 @@ async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
 
     item_type = "folder" if "folder" in item else "file"
     size = item.get("size", 0)
-    size_str = _human_readable_size(int(size)) if isinstance(size, (int, float)) else "unknown"
+    size_str = _human_readable_size(int(size)) if isinstance(size, int | float) else "unknown"
 
     return (
         f"Name: {item.get('name', '(unnamed)')}\n"

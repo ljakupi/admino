@@ -1,0 +1,54 @@
+name: Feature Request
+description: Propose a new feature or enhancement
+title: "[Feature] "
+labels: ["type: feature", "status: triage"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: One-paragraph description of what the feature does and why it matters.
+      placeholder: Describe the feature...
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Bulleted list of conditions that must be true for this to be considered done.
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+    validations:
+      required: true
+  - type: textarea
+    id: technical-notes
+    attributes:
+      label: Technical Notes
+      description: Implementation hints, relevant files, architectural constraints.
+      placeholder: Optional implementation details...
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected Area
+      options:
+        - Backend
+        - Frontend
+        - DevOps
+        - Documentation
+        - Testing
+    validations:
+      required: true
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - P0 - Critical
+        - P1 - High
+        - P2 - Medium
+        - P3 - Low
+    validations:
+      required: false

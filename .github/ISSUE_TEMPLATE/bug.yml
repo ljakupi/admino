@@ -1,0 +1,55 @@
+name: Bug Report
+description: Report a bug or regression
+title: "[Bug] "
+labels: ["type: bug", "status: triage"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened vs. what you expected.
+      placeholder: Describe the bug...
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: Numbered steps to reproduce the issue.
+      placeholder: |
+        1. Step one
+        2. Step two
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Python version, LLM provider, Docker vs native.
+      placeholder: macOS 15, Python 3.12, Anthropic provider, native
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected Area
+      options:
+        - Backend
+        - Frontend
+        - DevOps
+        - Documentation
+        - Testing
+    validations:
+      required: true
+  - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      options:
+        - Critical (data loss / security)
+        - High (feature broken)
+        - Medium (workaround exists)
+        - Low (cosmetic)
+    validations:
+      required: true
