@@ -66,16 +66,16 @@ data
 # data/logs/
 # data/tokens/
 
-# Config (may contain tokens or local overrides — keep template only)
-config/config.yaml
-config/permissions.yaml
-config/recipes.yaml
 
 # Demo / scratch scripts
 demo/
 
 # Local development files
 .local/
+
+# Claude Code local-only files
+.claude/settings.local.json
+.claude/agent-memory/
 
 # Static files (built client)
 static

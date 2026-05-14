@@ -1,0 +1,81 @@
+# admino — Application Configuration
+#
+# This file is validated at startup by Pydantic. The agent refuses to start
+# on invalid config with a clear error message.
+#
+# Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
+# MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, AUTH_TOKEN) are NEVER read
+# from this file — they come from env vars only.
+
+server:
+  host: "0.0.0.0"
+  port: 8000
+
+llm:
+  # Provider: "ollama" (default, local), "anthropic" (opt-in), "openai" (opt-in)
+  # Proprietary providers send messages to their servers — use only if you accept this trade-off.
+  provider: "anthropic"
+
+  # Ollama settings (used when provider=ollama)
+  # Pick the URL that matches your setup:
+  #   Local dev (native Ollama):        "http://localhost:11434"
+  #   Docker agent + native Mac:        "http://host.docker.internal:11434"
+  #   Docker agent + native Linux:      "http://172.17.0.1:11434"
+  #   Full Docker (BACKEND=ollama):     "http://local-llm:11434"
+  # ollama_url: "http://localhost:11434"
+  # model: "gemma4:e2b"
+  timeout_s: 120
+
+  # Proprietary provider settings (used when provider=anthropic or openai)
+  # API keys MUST be set via env vars: ANTHROPIC_API_KEY or OPENAI_API_KEY
+  anthropic_model: "claude-sonnet-4-20250514"
+  # openai_model: "gpt-4o"
+
+auth:
+  # "vpn" = trust all connections (VPN handles auth at network layer)
+  # "token" = require Bearer token on every request
+  mode: "vpn"
+
+paths:
+  # Local dev: relative to project root (where you run `make run`).
+  # Docker: these are overridden by volume mounts at /app/data/*.
+  database: "data/db/admino.db"
+  audit_log: "data/logs/audit.ndjson"
+  tokens: "data/tokens"
+  # images: "data/images"  # Added when the documents tool lands.
+
+files:
+  allowed_paths:
+    # Docker: ~/Downloads/admino on the host is mounted at /app/files/personal.
+    # The agent can read and write anything inside that directory.
+    # Nothing outside it is accessible — Docker does not mount any other host path.
+    # Local dev (make run): change this to an absolute path on your laptop.
+    - path: "/app/documents"
+      label: "Documents (~/Downloads/admino)"
+      access: "readwrite"
+  max_read_chars: 10000
+
+limits:
+  max_tool_calls_per_message: 10
+  max_pending_confirmations: 3
+  confirmation_timeout_s: 300
+  max_message_length: 4000
+  max_context_messages: 20
+
+egress:
+  allowed_hosts:
+    # Google APIs (Gmail, Calendar, Drive)
+    - "oauth2.googleapis.com"
+    - "accounts.google.com"
+    - "www.googleapis.com"
+    # Microsoft Graph API (Outlook, Calendar, OneDrive)
+    - "login.microsoftonline.com"
+    - "graph.microsoft.com"
+    # Uncomment when using proprietary LLM providers:
+    - "api.anthropic.com"
+    # - "api.openai.com"
+
+
+ocr:
+  binary: "/usr/bin/tesseract"
+  languages: ["eng"]
