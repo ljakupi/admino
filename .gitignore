@@ -73,3 +73,9 @@ config/recipes.yaml
 
 # Demo / scratch scripts
 demo/
+
+# Local development files
+.local/
+
+# Static files (built client)
+static

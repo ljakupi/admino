@@ -53,6 +53,7 @@ const dotClass = computed(() => {
         v-for="tc in toolCalls"
         :key="tc.id"
         :tool-call="tc"
+        :readonly="true"
       />
     </div>
   </div>

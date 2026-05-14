@@ -13,11 +13,22 @@ const labelMap: Record<string, string> = {
   allowed: 'Allowed',
   confirm: 'Requires approval',
 };
+
+/** Map status to badge variant class */
+const variantMap: Record<string, string> = {
+  approved: 'leaf',
+  allowed: 'leaf',
+  denied: 'clay',
+  'hardcoded-deny': 'locked',
+  pending: 'amber',
+  confirm: 'amber',
+};
 </script>
 
 <template>
-  <span class="badge" :class="props.status">
-    <Lock v-if="props.status === 'hardcoded-deny'" :size="12" :stroke-width="2" />
+  <span class="badge" :class="variantMap[props.status]">
+    <Lock v-if="props.status === 'hardcoded-deny'" :size="12" :stroke-width="2" class="lock-icon" />
+    <span v-else class="dot" />
     {{ labelMap[props.status] }}
   </span>
 </template>
@@ -26,26 +37,52 @@ const labelMap: Record<string, string> = {
 .badge {
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-pill);
-  font-size: var(--fs-caption-mobile);
-  font-weight: var(--fw-semibold);
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  font-family: var(--font-body);
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid transparent;
   white-space: nowrap;
 }
 
-.approved, .allowed {
-  background: var(--color-sage);
-  color: white;
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 
-.denied, .hardcoded-deny {
-  background: var(--color-error);
-  color: white;
+/* Leaf — Approved, Allowed, Connected */
+.leaf {
+  background: #DCF8C6;
+  color: #1F5C2F;
+  border-color: #BFE6A3;
 }
+.leaf .dot { background: #25D366; }
 
-.pending, .confirm {
-  background: var(--color-warn);
-  color: white;
+/* Amber — Awaiting approval, Pending */
+.amber {
+  background: #FFF4DC;
+  color: #8A5A14;
+  border-color: #F1D495;
 }
+.amber .dot { background: #E9A23B; }
+
+/* Clay — Denied, Error */
+.clay {
+  background: #FCE4E4;
+  color: #8A2A2A;
+  border-color: #F0BFBF;
+}
+.clay .dot { background: #E35353; }
+
+/* Locked — Hardcoded deny (neutral, immutable) */
+.locked {
+  background: #FFFFFF;
+  color: #475560;
+  border-color: #CFC7B4;
+}
+.locked .lock-icon { color: #667781; }
 </style>

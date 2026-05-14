@@ -83,6 +83,8 @@ export const useChatStore = defineStore('chat', () => {
         id: uid(),
         tool: tc.tool,
         action: tc.action,
+        args: tc.args,
+        durationMs: tc.duration_ms,
         state: tc.permission === 'confirm'
           ? (tc.success ? 'completed' : 'error')
           : tc.success
@@ -100,6 +102,7 @@ export const useChatStore = defineStore('chat', () => {
         id: uid(),
         tool: pc.tool,
         action: pc.action,
+        args: pc.args,
         state: 'pending',
         confirmationId: pc.confirmation_id,
         expiresAt: pc.expires_at,

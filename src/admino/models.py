@@ -360,7 +360,12 @@ class ChatRequest(BaseModel):
 
 
 class ToolCallRecord(BaseModel):
-    """Summary of a tool call included in a chat response."""
+    """Summary of a tool call included in a chat response.
+
+    The ``args`` dict is sanitized via ``_sanitize_args`` to strip known
+    credential patterns from string values before the record reaches the
+    API layer or any log sink.
+    """
 
     tool: str = Field(
         max_length=63,
@@ -372,21 +377,42 @@ class ToolCallRecord(BaseModel):
         pattern=r"^[a-z][a-z0-9_]{0,62}$",
         description="The action name.",
     )
+    # Any is justified here: tool call arguments are arbitrary JSON objects
+    # whose schema varies per tool. Values are sanitized by _sanitize_args.
+    args: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Sanitized tool call arguments for UI display.",
+    )
     permission: Literal["allow", "confirm", "deny"] = Field(
         description="The permission decision for this tool call.",
     )
     success: bool = Field(
         description="Whether the tool call executed successfully.",
     )
+    duration_ms: int | None = Field(
+        default=None,
+        ge=0,
+        description="Execution duration in milliseconds, if available.",
+    )
+
+    @field_validator("args", mode="before")
+    @classmethod
+    def _sanitize_args(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """Strip credential patterns from string values in args."""
+        return {
+            k: _strip_credentials(val) if isinstance(val, str) else val
+            for k, val in v.items()
+        }
 
 
 class PendingConfirmationSummary(BaseModel):
     """Subset of ``PendingConfirmation`` safe to expose over the HTTP API.
 
-    Excludes the full tool arguments (which may contain secrets, paths, or
-    large content) and the internal session_id. The PWA only needs the
-    confirmation ID (to POST /api/confirm), the tool and action being
-    confirmed (for display), and the expiry so it can show a countdown.
+    Excludes the internal session_id. Includes sanitized tool arguments so
+    the PWA can display call details (e.g. ``query``, ``max_results``) in the
+    confirmation card. The PWA also needs the confirmation ID (to POST
+    /api/confirm), the tool/action being confirmed, and the expiry so it
+    can show a countdown.
     """
 
     confirmation_id: str = Field(
@@ -405,9 +431,24 @@ class PendingConfirmationSummary(BaseModel):
         pattern=r"^[a-z][a-z0-9_]{0,62}$",
         description="The action name awaiting confirmation.",
     )
+    # Any is justified here: tool call arguments are arbitrary JSON objects
+    # whose schema varies per tool. Values are sanitized by _sanitize_args.
+    args: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Tool call arguments for display in the confirmation card.",
+    )
     expires_at: datetime = Field(
         description="UTC timestamp after which this confirmation is auto-denied.",
     )
+
+    @field_validator("args", mode="before")
+    @classmethod
+    def _sanitize_args(cls, v: dict[str, Any]) -> dict[str, Any]:
+        """Strip credential patterns from string values in args."""
+        return {
+            k: _strip_credentials(val) if isinstance(val, str) else val
+            for k, val in v.items()
+        }
 
 
 class ChatResponse(BaseModel):

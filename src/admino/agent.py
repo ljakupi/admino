@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from datetime import UTC, datetime, timedelta
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING
@@ -78,7 +79,7 @@ _LIMIT_REACHED_MESSAGE: str = (
     " Please try breaking it into smaller steps."
 )
 _LLM_ERROR_MESSAGE: str = (
-    "I hit an error while talking to the local model. Please try again in a moment."
+    "I hit an error while processing your request. Please try again in a moment."
 )
 
 
@@ -366,11 +367,13 @@ class Agent:
                     )
 
                 try:
+                    dispatch_start = time.monotonic()
                     result = await self._dispatch_one(
                         tool_call=tool_call,
                         session_id=session_id,
                         pending_confirmation=carry_confirmation,
                     )
+                    dispatch_duration_ms = int((time.monotonic() - dispatch_start) * 1000)
                 except AuditWriteError:
                     # H-1: Audit failure inside dispatch is fatal.
                     logger.error("Audit write failed during tool dispatch — aborting run")
@@ -393,8 +396,10 @@ class Agent:
                     ToolCallRecord(
                         tool=_safe_identifier(tool_call.tool),
                         action=_safe_identifier(tool_call.action),
+                        args=tool_call.args,
                         permission=result.permission.allowed,
                         success=result.success,
+                        duration_ms=dispatch_duration_ms,
                     )
                 )
 
@@ -523,11 +528,13 @@ class Agent:
         """
         tool_call = pending_confirmation.tool_call
         try:
+            dispatch_start = time.monotonic()
             result = await self._dispatch_one(
                 tool_call=tool_call,
                 session_id=session_id,
                 pending_confirmation=pending_confirmation,
             )
+            dispatch_duration_ms = int((time.monotonic() - dispatch_start) * 1000)
         except AuditWriteError:
             logger.error("Audit write failed during resume dispatch — aborting run")
             return AgentResult(
@@ -541,8 +548,10 @@ class Agent:
             ToolCallRecord(
                 tool=_safe_identifier(tool_call.tool),
                 action=_safe_identifier(tool_call.action),
+                args=tool_call.args,
                 permission=result.permission.allowed,
                 success=result.success,
+                duration_ms=dispatch_duration_ms,
             )
         )
 
@@ -708,7 +717,15 @@ def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessa
             len(leading_system),
         )
         return leading_system[:max_messages]
-    return leading_system + rest[-budget:]
+    trimmed = rest[-budget:]
+    # Most LLMs require every tool_result to reference a tool_use block in
+    # the immediately preceding assistant message. If the trim boundary
+    # falls between an assistant tool_use and its tool_result responses, the
+    # orphaned tool_result messages at the start would cause a 400 error.
+    # Drop any leading tool-role messages that lost their assistant parent.
+    while trimmed and trimmed[0].role == "tool":
+        trimmed.pop(0)
+    return leading_system + trimmed
 
 
 def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:

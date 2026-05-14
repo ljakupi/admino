@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Wrench, Check, X, AlertCircle, ChevronDown, ChevronUp } from 'lucide-vue-next';
+import { Check, X, AlertCircle, ChevronDown, ChevronUp } from 'lucide-vue-next';
 import StatusBadge from './StatusBadge.vue';
 import BaseButton from './BaseButton.vue';
 import type { ToolCallUI } from '@/api/types';
@@ -7,6 +7,8 @@ import { ref, computed } from 'vue';
 
 const props = defineProps<{
   toolCall: ToolCallUI;
+  /** When shown inside a chip expansion, hide approve/deny since already resolved */
+  readonly?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -36,121 +38,223 @@ const badgeStatus = computed(() => {
   };
   return map[props.toolCall.state] as 'pending' | 'approved' | 'denied';
 });
+
+const isPending = computed(() => props.toolCall.state === 'pending' && !props.readonly);
+const isCompleted = computed(() => props.toolCall.state === 'completed' || props.toolCall.state === 'approved');
+
+/** Classify a value for color coding: 'str', 'num', or default */
+function valueClass(val: unknown): string {
+  if (typeof val === 'number') return 'v num';
+  if (typeof val === 'string') return 'v str';
+  return 'v';
+}
+
+/** Format a value for display */
+function formatValue(val: unknown): string {
+  if (typeof val === 'string') return `"${val}"`;
+  return JSON.stringify(val);
+}
 </script>
 
 <template>
   <div class="tool-card" :class="borderClass">
+    <!-- Header: tool/action + badge -->
     <div class="tool-header">
-      <div class="tool-name">
-        <Wrench :size="16" :stroke-width="1.75" class="tool-icon" />
-        <span class="mono">{{ props.toolCall.tool }} &middot; {{ props.toolCall.action }}</span>
-      </div>
-      <StatusBadge :status="badgeStatus" />
+      <span class="tool-title">
+        <span class="tool-name">{{ props.toolCall.tool }}</span>
+        <span class="tool-sep">/</span>
+        <span class="tool-action">{{ props.toolCall.action }}</span>
+      </span>
+      <StatusBadge :status="badgeStatus" class="card-badge" />
     </div>
 
-    <div v-if="props.toolCall.args" class="tool-args mono">
-      <div v-for="(val, key) in props.toolCall.args" :key="String(key)" class="arg-row">
-        <span class="arg-key">{{ key }}:</span>
-        <span class="arg-val">{{ JSON.stringify(val) }}</span>
-      </div>
+    <!-- Args grid -->
+    <div v-if="props.toolCall.args && Object.keys(props.toolCall.args).length" class="args-grid">
+      <template v-for="(val, key) in props.toolCall.args" :key="String(key)">
+        <span class="k">{{ key }}</span>
+        <span :class="valueClass(val)">{{ formatValue(val) }}</span>
+      </template>
     </div>
 
-    <div v-if="props.toolCall.state === 'pending'" class="tool-actions">
-      <BaseButton variant="primary" @click="emit('approve')">
+    <!-- Approve / Deny actions (pending only) -->
+    <div v-if="isPending" class="tool-actions">
+      <button class="btn approve" @click="emit('approve')">
         <Check :size="16" :stroke-width="2" />
         Approve
         <kbd class="shortcut">&#8984;&#9166;</kbd>
-      </BaseButton>
-      <BaseButton variant="destructive" @click="emit('deny')">
+      </button>
+      <button class="btn deny" @click="emit('deny')">
         <X :size="16" :stroke-width="2" />
         Deny
         <kbd class="shortcut">Esc</kbd>
-      </BaseButton>
+      </button>
     </div>
 
-    <div v-if="props.toolCall.state === 'error' && props.toolCall.error" class="tool-error mono">
+    <!-- Error display -->
+    <div v-if="props.toolCall.state === 'error' && props.toolCall.error" class="tool-error">
       <AlertCircle :size="14" :stroke-width="2" />
       {{ props.toolCall.error }}
     </div>
 
-    <div v-if="props.toolCall.state === 'completed' && props.toolCall.result" class="tool-result">
-      <button class="expand-toggle caption" @click="expanded = !expanded">
-        <component :is="expanded ? ChevronUp : ChevronDown" :size="14" />
-        {{ expanded ? 'Hide result' : 'Show result' }}
-      </button>
-      <div v-if="expanded" class="result-body mono">
-        {{ props.toolCall.result }}
-      </div>
+    <!-- Result footer (completed/approved) -->
+    <div v-if="isCompleted" class="result-footer">
+      <span v-if="props.toolCall.resultCount != null" class="result-ok">{{ props.toolCall.resultCount }} results</span>
+      <span v-if="props.toolCall.resultCount != null && props.toolCall.durationMs != null" class="result-sep">&middot;</span>
+      <span v-if="props.toolCall.durationMs != null">{{ props.toolCall.durationMs }} ms</span>
+      <template v-if="props.toolCall.result">
+        <button class="expand-toggle" @click="expanded = !expanded">
+          <component :is="expanded ? ChevronUp : ChevronDown" :size="14" />
+          {{ expanded ? 'Hide' : 'Details' }}
+        </button>
+      </template>
+    </div>
+
+    <!-- Expanded result body -->
+    <div v-if="expanded && props.toolCall.result" class="result-body">
+      {{ props.toolCall.result }}
     </div>
   </div>
 </template>
 
 <style scoped>
 .tool-card {
-  background: var(--color-bg-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-card);
-  padding: var(--space-4);
+  background: #FFFFFF;
+  border: 1px solid #E4E8EA;
+  border-radius: 12px;
+  padding: 14px 16px;
   border-left-width: 3px;
+  max-width: 560px;
   width: 100%;
+  box-shadow: 0 1px 2px rgba(17,27,33,0.04), 0 2px 8px rgba(17,27,33,0.04);
 }
 
-.border-pending  { border-left-color: var(--color-warn); }
-.border-approved { border-left-color: var(--color-sage); }
-.border-denied   { border-left-color: var(--color-error); }
+.border-pending  { border-left-color: #E9A23B; }
+.border-approved { border-left-color: #25D366; }
+.border-denied   { border-left-color: #E35353; }
 
+/* Header */
 .tool-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: var(--space-3);
-  margin-bottom: var(--space-3);
+  gap: 12px;
+  padding-bottom: 12px;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #EEF1F2;
+}
+
+.tool-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-text);
+  letter-spacing: -0.005em;
 }
 
 .tool-name {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
+  color: #075E54;
 }
 
-.tool-icon {
-  color: var(--color-sage);
+.tool-sep {
+  color: #CFD8D8;
+  font-weight: 400;
+  margin: 0 1px;
 }
 
-.tool-args {
-  padding: var(--space-2) var(--space-3);
-  background: var(--color-bg);
-  border-radius: var(--radius-input);
-  margin-bottom: var(--space-3);
-  font-size: var(--fs-mono);
+.tool-action {
+  color: #475560;
+  font-weight: 500;
 }
 
-.arg-row {
-  display: flex;
-  gap: var(--space-2);
-  padding: 2px 0;
+/* Badge override for card context (slightly smaller) */
+.card-badge :deep(.badge) {
+  font-size: 11.5px;
+  padding: 3px 10px;
 }
 
-.arg-key {
-  color: var(--color-text-muted);
-  flex-shrink: 0;
+/* Args grid */
+.args-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  column-gap: 10px;
+  row-gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
 }
 
-.arg-val {
+.k {
+  color: #667781;
+}
+
+.v {
   color: var(--color-text);
   word-break: break-all;
 }
 
+.v.str {
+  color: #1F5C2F;
+}
+
+.v.num {
+  color: #8A5A14;
+}
+
+/* Actions */
 .tool-actions {
   display: flex;
-  gap: var(--space-3);
+  gap: 8px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid #EEF1F2;
+}
+
+.btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border-radius: 8px;
+  font-family: var(--font-body);
+  font-size: 13px;
+  font-weight: 600;
+  border: 1px solid;
+  cursor: pointer;
+  line-height: 1;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease;
+}
+
+.approve {
+  background: #075E54;
+  color: #FFFFFF;
+  border-color: #075E54;
+}
+.approve:hover {
+  background: #0B7164;
+  border-color: #0B7164;
+}
+
+.deny {
+  background: #FFFFFF;
+  color: #C73B3B;
+  border-color: #E0C7C7;
+}
+.deny:hover {
+  background: #FCE4E4;
+  border-color: #E35353;
+  color: #B82F2F;
 }
 
 @media (max-width: 767px) {
   .tool-actions {
     flex-direction: column;
   }
-  .tool-actions .base-btn {
+  .btn {
     width: 100%;
   }
   .shortcut { display: none; }
@@ -159,37 +263,72 @@ const badgeStatus = computed(() => {
 .shortcut {
   font-size: 11px;
   opacity: 0.6;
-  margin-left: var(--space-1);
+  margin-left: 2px;
   font-family: var(--font-body);
 }
 
+/* Error */
 .tool-error {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  color: var(--color-error);
-  font-size: var(--fs-mono);
+  gap: 8px;
+  color: #E35353;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #EEF1F2;
+}
+
+/* Result footer */
+.result-footer {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #EEF1F2;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  color: #667781;
+}
+
+.result-ok {
+  color: #1F5C2F;
+  font-weight: 500;
+}
+
+.result-sep {
+  color: #CFD8D8;
 }
 
 .expand-toggle {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
+  gap: 4px;
   cursor: pointer;
-  color: var(--color-text-muted);
+  color: #667781;
   background: none;
   border: none;
-  padding: var(--space-1) 0;
+  padding: 0;
+  font-size: 12px;
+  margin-left: auto;
 }
 
+.expand-toggle:hover {
+  color: var(--color-text);
+}
+
+/* Result body */
 .result-body {
-  margin-top: var(--space-2);
-  padding: var(--space-3);
+  margin-top: 8px;
+  padding: 12px;
   background: var(--color-bg);
-  border-radius: var(--radius-input);
+  border-radius: 8px;
   white-space: pre-wrap;
-  font-size: var(--fs-mono);
+  font-family: var(--font-mono);
+  font-size: 12px;
   max-height: 200px;
   overflow-y: auto;
+  color: var(--color-text);
 }
 </style>

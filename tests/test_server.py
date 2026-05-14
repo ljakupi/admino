@@ -1321,9 +1321,9 @@ class TestConfirmationEdgeCases:
         assert pc["tool"] == "files"
         assert pc["action"] == "write"
         assert "expires_at" in pc
-        # Tool args must NOT leak via the summary — they may contain secrets
-        # or large content and are already summarised in ``tool_calls``.
-        assert "args" not in pc
+        # Args are now included (sanitized) for UI display in the confirmation card.
+        assert "args" in pc
+        # Internal fields must not leak.
         assert "tool_call" not in pc
         assert "input" not in pc
 

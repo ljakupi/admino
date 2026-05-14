@@ -8,12 +8,15 @@ export interface ToolCallRecord {
   action: string;
   permission: 'allow' | 'confirm' | 'deny';
   success: boolean;
+  args?: Record<string, unknown>;
+  duration_ms?: number;
 }
 
 export interface PendingConfirmationSummary {
   confirmation_id: string;
   tool: string;
   action: string;
+  args?: Record<string, unknown>;
   expires_at: string;
 }
 
@@ -69,6 +72,8 @@ export interface ToolCallUI {
   confirmationId?: string;
   expiresAt?: string;
   result?: string;
+  resultCount?: number;
+  durationMs?: number;
   error?: string;
   timestamp: Date;
 }

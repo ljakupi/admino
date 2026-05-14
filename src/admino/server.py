@@ -290,14 +290,16 @@ _CANCELLED_TOOL_RESULT_MSG = "Tool call cancelled — user sent a new message in
 def _summarise_pending(pending: PendingConfirmation) -> PendingConfirmationSummary:
     """Project a ``PendingConfirmation`` into the API-safe summary.
 
-    Strips the tool arguments and the internal ``session_id`` — the PWA only
-    needs the confirmation ID, the tool/action being confirmed (for display),
-    and the expiry so it can show a countdown.
+    Includes sanitized tool arguments so the PWA can display call details
+    in the confirmation card. Excludes the internal ``session_id``.
+    Credential patterns in string argument values are stripped by the
+    ``PendingConfirmationSummary`` validator.
     """
     return PendingConfirmationSummary(
         confirmation_id=pending.confirmation_id,
         tool=pending.tool_call.tool,
         action=pending.tool_call.action,
+        args=pending.tool_call.args,
         expires_at=pending.expires_at,
     )
 
