@@ -1,0 +1,35 @@
+name: Task
+description: Internal work item (refactor, chore, infra)
+title: "[Task] "
+labels: ["type: task", "status: triage"]
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What needs to be done and why.
+      placeholder: Describe the task...
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Bulleted list of conditions for completion.
+      placeholder: |
+        - [ ] Criterion 1
+        - [ ] Criterion 2
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected Area
+      options:
+        - Backend
+        - Frontend
+        - DevOps
+        - Documentation
+        - Testing
+    validations:
+      required: true
