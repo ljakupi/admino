@@ -242,6 +242,26 @@ async def seed_permissions(
 # ---------------------------------------------------------------------------
 
 
+async def update_setting(pool: asyncpg.Pool, key: str, value: dict[str, Any]) -> None:
+    """Upsert a single settings row by key.
+
+    Inserts the row if it does not exist, updates it otherwise.
+    Uses parameterized query — no string interpolation.
+
+    Args:
+        pool: The asyncpg connection pool.
+        key: The settings section key (e.g. "llm", "appearance").
+        value: The new JSONB value for the settings row.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO settings (key, value) VALUES ($1, $2::jsonb) "
+            "ON CONFLICT (key) DO UPDATE SET value = $2::jsonb, updated_at = now()",
+            key,
+            json.dumps(value),
+        )
+
+
 async def load_settings_from_db(
     pool: asyncpg.Pool,
 ) -> dict[str, Any]:
