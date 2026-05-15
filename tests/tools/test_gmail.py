@@ -182,7 +182,7 @@ class TestGmailRead:
             args = GmailReadArgs(message_id="msg123")
             result = await gmail.gmail_read(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
         assert "oauth_setup" in result
 
     async def test_api_error_non_200(self, mock_http: AsyncMock) -> None:
@@ -292,7 +292,7 @@ class TestGmailList:
             args = GmailListArgs(max_results=5)
             result = await gmail.gmail_list(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
 
 # ---------------------------------------------------------------------------
@@ -342,7 +342,7 @@ class TestGmailSearch:
             args = GmailSearchArgs(query="test")
             result = await gmail.gmail_search(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_api_error(self, mock_http: AsyncMock) -> None:
         """Non-200 on search call returns API error."""
