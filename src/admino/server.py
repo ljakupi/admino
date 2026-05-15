@@ -44,6 +44,7 @@ import logging
 import os
 import time
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
 from typing import TYPE_CHECKING
@@ -508,11 +509,19 @@ async def _stream_agent_result(result: AgentResult) -> AsyncIterator[str]:
 
 
 async def health_check() -> dict[str, str]:
-    """Health check endpoint. No auth required.
+    """Health check endpoint. No auth required. Checks database connectivity.
 
     Returns:
         Simple status dict.
+
+    Raises:
+        HTTPException: 503 if the database is unreachable.
     """
+    from admino.database import check_health
+
+    db_ok = await check_health()
+    if not db_ok:
+        raise HTTPException(status_code=503, detail="Database unreachable")
     return {"status": "ok"}
 
 
@@ -849,6 +858,15 @@ async def _request_validation_error_handler(
 # ---------------------------------------------------------------------------
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Manage application lifespan — close DB pool on shutdown."""
+    yield
+    from admino.database import close_pool
+
+    await close_pool()
+
+
 def create_app(
     *,
     agent: Agent,
@@ -896,6 +914,7 @@ def create_app(
         version="0.1.0",
         docs_url=None,  # Disable Swagger UI in production
         redoc_url=None,  # Disable ReDoc in production
+        lifespan=_lifespan,
     )
 
     # --- Security headers middleware ---

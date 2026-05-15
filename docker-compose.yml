@@ -24,6 +24,34 @@
 services:
 
   # --------------------------------------------------------------------------
+  # postgres — Relational database. Internal only; no external network access.
+  # Data persists via bind-mount at ./data/postgres on the host.
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: admino-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: admino
+      POSTGRES_USER: admino
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admino -d admino"]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+
+  # --------------------------------------------------------------------------
   # agent — Python ASGI app. Serves HTTP on port 8000.
   # External access: whitelist-only egress via iptables.
   #   The agent is connected to BOTH networks:
@@ -50,6 +78,10 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
 
+    depends_on:
+      postgres:
+        condition: service_healthy
+
     env_file:
       - .env
 
@@ -66,13 +98,13 @@ services:
       # Set to "false" ONLY for local development without Docker privileges.
       # Defaults to "true" for production safety; override via .env file.
       REQUIRE_EGRESS_WHITELIST: "${REQUIRE_EGRESS_WHITELIST:-true}"
+      DATABASE_URL: "postgresql://admino:${PG_PASSWORD}@postgres:5432/admino"
 
     volumes:
       # Internal state — persists across container restarts. These directories
       # are admino's own bookkeeping, NOT user-facing files, and are deliberately
       # kept outside the file tool's sandbox (/app/documents). The audit log in
       # particular must never be reachable by the files.* tool.
-      - ./data/db:/app/data/db          # SQLite: memory tool, documents tool
       - ./data/logs:/app/data/logs      # Append-only audit log (NDJSON)
       - ./data/tokens:/app/data/tokens  # Encrypted OAuth refresh tokens (Fernet)
       # Config is read-only — the agent reads but must never write config files

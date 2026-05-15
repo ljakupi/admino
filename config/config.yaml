@@ -11,6 +11,10 @@ server:
   host: "0.0.0.0"
   port: 8000
 
+database:
+  min_pool_size: 2
+  max_pool_size: 5
+
 llm:
   # Provider: "ollama" (default, local), "anthropic" (opt-in), "openai" (opt-in)
   # Proprietary providers send messages to their servers — use only if you accept this trade-off.
@@ -39,7 +43,6 @@ auth:
 paths:
   # Local dev: relative to project root (where you run `make run`).
   # Docker: these are overridden by volume mounts at /app/data/*.
-  database: "data/db/admino.db"
   audit_log: "data/logs/audit.ndjson"
   tokens: "data/tokens"
   # images: "data/images"  # Added when the documents tool lands.
