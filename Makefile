@@ -1,4 +1,4 @@
-.PHONY: lint format typecheck test docker-build docker-up docker-down docker-logs run clean
+.PHONY: lint format typecheck test docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean
 
 # Source and package configuration
 SRC_DIR    := src
@@ -52,6 +52,12 @@ docker-down:
 
 docker-logs:
 	docker compose $(COMPOSE_FILES) logs -f
+
+dev-db:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml up postgres -d
+
+dev-db-down:
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml down postgres
 
 run:
 	python -m $(PACKAGE).main

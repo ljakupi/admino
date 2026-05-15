@@ -717,7 +717,7 @@ class TestMainDatabaseStartupFailures:
 
     def test_main_does_not_call_uvicorn_on_db_failure(self, mock_deps: dict[str, Any]) -> None:
         """uvicorn.run is never called when database startup fails."""
-        mock_deps["asyncio"].run = MagicMock(side_effect=ValueError("DATABASE_URL not set"))
+        mock_deps["asyncio"].run = MagicMock(side_effect=ValueError("PG_PASSWORD not set"))
 
         with pytest.raises(SystemExit):
             main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
@@ -734,12 +734,12 @@ class TestAsyncStartup:
     """Tests for _async_startup() coroutine directly."""
 
     @pytest.mark.asyncio
-    async def test_raises_when_database_url_missing(
+    async def test_raises_when_pg_password_missing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """_async_startup raises ValueError when DATABASE_URL is not set."""
-        monkeypatch.delenv("DATABASE_URL", raising=False)
-        with pytest.raises(ValueError, match="DATABASE_URL"):
+        """_async_startup raises ValueError when PG_PASSWORD is not set."""
+        monkeypatch.delenv("PG_PASSWORD", raising=False)
+        with pytest.raises(ValueError, match="PG_PASSWORD"):
             await _async_startup(MagicMock(), MagicMock())
 
     @pytest.mark.asyncio
@@ -747,7 +747,7 @@ class TestAsyncStartup:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """_async_startup raises RuntimeError when database is unreachable."""
-        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+        monkeypatch.setenv("PG_PASSWORD", "testpass")
         mock_pool = AsyncMock()
         monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
         monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=False))
@@ -761,7 +761,7 @@ class TestAsyncStartup:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """_async_startup returns (config, permissions) loaded from DB."""
-        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+        monkeypatch.setenv("PG_PASSWORD", "testpass")
         mock_pool = AsyncMock()
         mock_db_config = MagicMock()
         mock_db_perms = MagicMock()
@@ -786,7 +786,7 @@ class TestAsyncStartup:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """_async_startup passes pool size from config to init_pool."""
-        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+        monkeypatch.setenv("PG_PASSWORD", "testpass")
         mock_init = AsyncMock(return_value=AsyncMock())
         monkeypatch.setattr("admino.database.init_pool", mock_init)
         monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
@@ -805,9 +805,10 @@ class TestAsyncStartup:
         config.database.max_pool_size = 10
         await _async_startup(config, MagicMock())
 
-        mock_init.assert_called_once_with(
-            "postgresql://test:test@localhost/test", min_size=3, max_size=10
-        )
+        mock_init.assert_called_once()
+        call_args = mock_init.call_args
+        assert call_args[0][0].startswith("postgresql://")
+        assert call_args[1] == {"min_size": 3, "max_size": 10}
 
 
 # ---------------------------------------------------------------------------

@@ -860,10 +860,26 @@ async def _request_validation_error_handler(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Manage application lifespan — close DB pool on shutdown."""
-    yield
-    from admino.database import close_pool
+    """Manage application lifespan — init DB pool on startup, close on shutdown.
 
+    The pool must be created here (on uvicorn's event loop), not in main(),
+    because asyncio.run() closes its event loop on return, which would
+    invalidate any connections created there.
+    """
+    import os
+    from urllib.parse import quote_plus
+
+    from admino.database import close_pool, init_pool
+
+    password = os.environ.get("PG_PASSWORD", "")
+    host = os.environ.get("PG_HOST", "localhost")
+    port = os.environ.get("PG_PORT", "5432")
+    user = os.environ.get("PG_USER", "admino")
+    database = os.environ.get("PG_DATABASE", "admino")
+    database_url = f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
+
+    await init_pool(database_url)
+    yield
     await close_pool()
 
 

@@ -155,6 +155,29 @@ def _build_system_prompt(config: object) -> str:
     return "\n".join(lines)
 
 
+def _build_database_url() -> str | None:
+    """Build a PostgreSQL DSN from individual env vars, URL-encoding the password.
+
+    Reads PG_HOST, PG_PORT, PG_USER, PG_DATABASE, and PG_PASSWORD from the
+    environment. Returns None if PG_PASSWORD is not set.
+
+    Returns:
+        A postgresql:// connection string, or None if required vars are missing.
+    """
+    from urllib.parse import quote_plus
+
+    password = os.environ.get("PG_PASSWORD")
+    if not password:
+        return None
+
+    host = os.environ.get("PG_HOST", "localhost")
+    port = os.environ.get("PG_PORT", "5432")
+    user = os.environ.get("PG_USER", "admino")
+    database = os.environ.get("PG_DATABASE", "admino")
+
+    return f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
+
+
 async def _async_startup(
     config: AppConfig,
     permissions_config: PermissionsConfig,
@@ -172,7 +195,7 @@ async def _async_startup(
         A tuple of (db_config, db_permissions) loaded from the database.
 
     Raises:
-        ValueError: If DATABASE_URL is not set.
+        ValueError: If PG_PASSWORD is not set.
         RuntimeError: If the database health check fails.
     """
     from admino.config import load_app_config_from_db, load_permissions_config_from_db
@@ -185,9 +208,9 @@ async def _async_startup(
         seed_settings,
     )
 
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = _build_database_url()
     if not database_url:
-        msg = "DATABASE_URL environment variable is required but not set."
+        msg = "PG_PASSWORD environment variable is required but not set."
         raise ValueError(msg)
 
     pool = await init_pool(
@@ -207,6 +230,11 @@ async def _async_startup(
 
     db_config = await load_app_config_from_db(pool)
     db_permissions = await load_permissions_config_from_db(pool)
+
+    # Close the pool — it was created on asyncio.run()'s event loop which
+    # will be destroyed when asyncio.run() returns.  The server lifespan
+    # creates a fresh pool on uvicorn's event loop for runtime use.
+    await close_pool()
 
     return db_config, db_permissions
 

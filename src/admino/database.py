@@ -263,7 +263,10 @@ async def load_settings_from_db(
     for row in rows:
         key: str = row["key"]
         value: Any = row["value"]
-        # asyncpg returns JSONB as Python objects (dict, list, etc.)
+        # asyncpg returns JSONB as str when the default codec is not active
+        # (e.g. certain pool configurations). Parse if needed.
+        if isinstance(value, str):
+            value = json.loads(value)
         if key == "log_level" and isinstance(value, dict):
             result[key] = value.get("value", "INFO")
         else:
