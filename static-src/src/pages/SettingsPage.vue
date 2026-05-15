@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import BaseInput from '@/components/BaseInput.vue';
 import BaseToggle from '@/components/BaseToggle.vue';
 import BaseButton from '@/components/BaseButton.vue';
@@ -12,20 +12,114 @@ const settings = useSettingsStore();
 const chatStore = useChatStore();
 const toasts = useToastStore();
 
+const showClearConfirm = ref(false);
+
+// --- LLM section ---
 const providers: { value: LLMProvider; label: string }[] = [
   { value: 'ollama', label: 'Ollama' },
   { value: 'claude', label: 'Claude' },
   { value: 'openai', label: 'OpenAI' },
 ];
 
-const toolApprovalAlerts = ref(true);
-const taskCompletedAlerts = ref(false);
-const showClearConfirm = ref(false);
+// Local draft values for text inputs so we only patch on blur
+const draftOllamaModel = ref('');
+const draftOllamaUrl = ref('');
+const draftAnthropicModel = ref('');
+const draftOpenAiModel = ref('');
 
-function onSettingSaved() {
-  toasts.add('success', 'Saved');
+// Inline validation errors
+const ollamaUrlError = ref<string | undefined>(undefined);
+const ollamaModelError = ref<string | undefined>(undefined);
+const anthropicModelError = ref<string | undefined>(undefined);
+const openAiModelError = ref<string | undefined>(undefined);
+
+function syncDrafts() {
+  draftOllamaModel.value = settings.llmModel;
+  draftOllamaUrl.value = settings.llmOllamaUrl;
+  draftAnthropicModel.value = settings.llmAnthropicModel;
+  draftOpenAiModel.value = settings.llmOpenAiModel;
 }
 
+onMounted(async () => {
+  await settings.loadSettings();
+  syncDrafts();
+});
+
+async function onProviderChange(p: LLMProvider) {
+  await settings.setProvider(p);
+}
+
+function validateOllamaUrl(value: string): string | undefined {
+  if (!value.startsWith('http://') && !value.startsWith('https://')) {
+    return 'URL must start with http:// or https://';
+  }
+  return undefined;
+}
+
+function validateModel(value: string): string | undefined {
+  if (!value.trim()) return 'Model name must not be empty';
+  return undefined;
+}
+
+async function onOllamaModelBlur() {
+  const err = validateModel(draftOllamaModel.value);
+  ollamaModelError.value = err;
+  if (err) return;
+  if (draftOllamaModel.value !== settings.llmModel) {
+    await settings.setOllamaModel(draftOllamaModel.value.trim());
+  }
+}
+
+async function onOllamaUrlBlur() {
+  const err = validateOllamaUrl(draftOllamaUrl.value);
+  ollamaUrlError.value = err;
+  if (err) return;
+  if (draftOllamaUrl.value !== settings.llmOllamaUrl) {
+    await settings.setOllamaUrl(draftOllamaUrl.value.trim());
+  }
+}
+
+async function onAnthropicModelBlur() {
+  const err = validateModel(draftAnthropicModel.value);
+  anthropicModelError.value = err;
+  if (err) return;
+  if (draftAnthropicModel.value !== settings.llmAnthropicModel) {
+    await settings.setAnthropicModel(draftAnthropicModel.value.trim());
+  }
+}
+
+async function onOpenAiModelBlur() {
+  const err = validateModel(draftOpenAiModel.value);
+  openAiModelError.value = err;
+  if (err) return;
+  if (draftOpenAiModel.value !== settings.llmOpenAiModel) {
+    await settings.setOpenAiModel(draftOpenAiModel.value.trim());
+  }
+}
+
+// --- Notifications ---
+async function onNotificationsChange(value: boolean) {
+  await settings.setNotificationsEnabled(value);
+}
+
+// --- Connected accounts ---
+function connectGoogle() {
+  window.location.href = '/api/oauth/google/start';
+}
+
+function connectMicrosoft() {
+  window.location.href = '/api/oauth/microsoft/start';
+}
+
+function disconnectGoogle() {
+  toasts.add('info', 'Coming soon', 'Account disconnection is not yet available.');
+}
+
+function disconnectMicrosoft() {
+  toasts.add('info', 'Coming soon', 'Account disconnection is not yet available.');
+}
+
+// --- Data section ---
 function handleClearChat() {
   chatStore.clearThread();
   showClearConfirm.value = false;
@@ -37,6 +131,10 @@ function handleNewSession() {
   chatStore.clearThread();
   toasts.add('success', 'New session started');
 }
+
+const currentProvider = computed(() => settings.llmProvider);
+const anthropicConfigured = computed(() => settings.anthropicKeyConfigured);
+const openAiConfigured = computed(() => settings.openAiKeyConfigured);
 </script>
 
 <template>
@@ -45,10 +143,22 @@ function handleNewSession() {
       <h1>Settings</h1>
     </header>
 
-    <div class="page-content">
+    <!-- Loading state -->
+    <div v-if="settings.loading" class="loading-overlay">
+      <span class="loading-spinner" aria-label="Loading settings" />
+    </div>
+
+    <div v-else class="page-content">
+      <!-- Error banner -->
+      <div v-if="settings.error" class="error-banner caption">
+        Failed to load settings: {{ settings.error }}
+      </div>
+
+      <!-- Agent / LLM section -->
       <div class="settings-section">
         <h3>Agent</h3>
         <div class="setting-card">
+          <!-- Provider segmented control -->
           <div class="setting-row">
             <span class="setting-label">LLM Provider</span>
             <div class="segmented-control">
@@ -57,27 +167,68 @@ function handleNewSession() {
                 :key="p.value"
                 class="segment"
                 :class="{ active: settings.provider === p.value }"
-                @click="settings.provider = p.value; onSettingSaved()"
+                @click="onProviderChange(p.value)"
               >
                 {{ p.label }}
               </button>
             </div>
           </div>
 
-          <BaseInput
-            v-model="settings.model"
-            label="Model"
-            placeholder="e.g. llama3.2:3b"
-            @blur="onSettingSaved"
-          />
+          <!-- Ollama fields -->
+          <template v-if="currentProvider === 'ollama'">
+            <BaseInput
+              v-model="draftOllamaModel"
+              label="Model"
+              placeholder="e.g. llama3.2:3b"
+              :error="ollamaModelError"
+              @blur="onOllamaModelBlur"
+            />
+            <BaseInput
+              v-model="draftOllamaUrl"
+              label="Ollama URL"
+              placeholder="http://localhost:11434"
+              :error="ollamaUrlError"
+              @blur="onOllamaUrlBlur"
+            />
+          </template>
 
-          <BaseInput
-            v-if="settings.provider === 'ollama'"
-            v-model="settings.ollamaUrl"
-            label="Ollama URL"
-            placeholder="http://localhost:11434"
-            @blur="onSettingSaved"
-          />
+          <!-- Anthropic / Claude fields -->
+          <template v-else-if="currentProvider === 'anthropic'">
+            <BaseInput
+              v-model="draftAnthropicModel"
+              label="Model"
+              placeholder="e.g. claude-3-5-sonnet-20241022"
+              :error="anthropicModelError"
+              @blur="onAnthropicModelBlur"
+            />
+            <div class="api-key-row">
+              <span
+                class="caption"
+                :class="anthropicConfigured ? 'text-success' : 'text-muted'"
+              >
+                API key {{ anthropicConfigured ? 'configured ✓' : 'not configured' }}
+              </span>
+            </div>
+          </template>
+
+          <!-- OpenAI fields -->
+          <template v-else-if="currentProvider === 'openai'">
+            <BaseInput
+              v-model="draftOpenAiModel"
+              label="Model"
+              placeholder="e.g. gpt-4o"
+              :error="openAiModelError"
+              @blur="onOpenAiModelBlur"
+            />
+            <div class="api-key-row">
+              <span
+                class="caption"
+                :class="openAiConfigured ? 'text-success' : 'text-muted'"
+              >
+                API key {{ openAiConfigured ? 'configured ✓' : 'not configured' }}
+              </span>
+            </div>
+          </template>
 
           <div class="setting-row">
             <span class="setting-label">Session</span>
@@ -88,6 +239,7 @@ function handleNewSession() {
         </div>
       </div>
 
+      <!-- Appearance section -->
       <div class="settings-section">
         <h3>Appearance</h3>
         <div class="setting-card">
@@ -105,20 +257,103 @@ function handleNewSession() {
         </div>
       </div>
 
+      <!-- Notifications section -->
       <div class="settings-section">
         <h3>Notifications</h3>
         <div class="setting-card">
           <div class="setting-row">
-            <span class="setting-label">Tool approval alerts</span>
-            <BaseToggle v-model="toolApprovalAlerts" />
-          </div>
-          <div class="setting-row">
-            <span class="setting-label">Task completed alerts</span>
-            <BaseToggle v-model="taskCompletedAlerts" />
+            <span class="setting-label">Push notifications</span>
+            <BaseToggle
+              :model-value="settings.notificationsEnabled"
+              @update:model-value="onNotificationsChange"
+            />
           </div>
         </div>
       </div>
 
+      <!-- Connected Accounts section -->
+      <div class="settings-section">
+        <h3>Connected Accounts</h3>
+        <div class="setting-card">
+          <!-- Google -->
+          <div class="account-row">
+            <div class="account-info">
+              <span class="setting-label">Google</span>
+              <template v-if="settings.connectedAccounts.google.connected">
+                <span class="caption text-success">Connected</span>
+                <span
+                  v-if="settings.connectedAccounts.google.email"
+                  class="caption text-muted"
+                >
+                  {{ settings.connectedAccounts.google.email }}
+                </span>
+                <span
+                  v-if="settings.connectedAccounts.google.services.length"
+                  class="caption text-muted"
+                >
+                  {{ settings.connectedAccounts.google.services.join(', ') }}
+                </span>
+              </template>
+              <span v-else class="caption text-muted">Not connected</span>
+            </div>
+            <BaseButton
+              v-if="settings.connectedAccounts.google.connected"
+              variant="secondary"
+              @click="disconnectGoogle"
+            >
+              Disconnect
+            </BaseButton>
+            <BaseButton
+              v-else
+              variant="secondary"
+              @click="connectGoogle"
+            >
+              Connect
+            </BaseButton>
+          </div>
+
+          <div class="account-divider" />
+
+          <!-- Microsoft -->
+          <div class="account-row">
+            <div class="account-info">
+              <span class="setting-label">Microsoft</span>
+              <template v-if="settings.connectedAccounts.microsoft.connected">
+                <span class="caption text-success">Connected</span>
+                <span
+                  v-if="settings.connectedAccounts.microsoft.email"
+                  class="caption text-muted"
+                >
+                  {{ settings.connectedAccounts.microsoft.email }}
+                </span>
+                <span
+                  v-if="settings.connectedAccounts.microsoft.services.length"
+                  class="caption text-muted"
+                >
+                  {{ settings.connectedAccounts.microsoft.services.join(', ') }}
+                </span>
+              </template>
+              <span v-else class="caption text-muted">Not connected</span>
+            </div>
+            <BaseButton
+              v-if="settings.connectedAccounts.microsoft.connected"
+              variant="secondary"
+              @click="disconnectMicrosoft"
+            >
+              Disconnect
+            </BaseButton>
+            <BaseButton
+              v-else
+              variant="secondary"
+              @click="connectMicrosoft"
+            >
+              Connect
+            </BaseButton>
+          </div>
+        </div>
+      </div>
+
+      <!-- Data section -->
       <div class="settings-section">
         <h3>Data</h3>
         <div class="setting-card">
@@ -131,6 +366,7 @@ function handleNewSession() {
         </div>
       </div>
 
+      <!-- About section -->
       <div class="settings-section">
         <h3>About</h3>
         <div class="setting-card">
@@ -169,6 +405,36 @@ function handleNewSession() {
   border-bottom: 1px solid var(--color-border);
   background: var(--color-bg-surface);
   flex-shrink: 0;
+}
+
+.loading-overlay {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.loading-spinner {
+  width: 28px;
+  height: 28px;
+  border: 3px solid var(--color-border);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  display: inline-block;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.error-banner {
+  background: color-mix(in srgb, var(--color-error) 10%, transparent);
+  border: 1px solid var(--color-error);
+  color: var(--color-error);
+  border-radius: var(--radius-input);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
 }
 
 .page-content {
@@ -210,6 +476,7 @@ function handleNewSession() {
   font-size: var(--fs-body);
 }
 
+/* Segmented control */
 .segmented-control {
   display: flex;
   border: 1px solid var(--color-border);
@@ -246,6 +513,41 @@ function handleNewSession() {
   cursor: not-allowed;
 }
 
+/* API key indicator row */
+.api-key-row {
+  padding: var(--space-1) 0;
+}
+
+/* Connected accounts */
+.account-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+
+.account-info {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.account-divider {
+  height: 1px;
+  background: var(--color-border);
+  margin: 0 calc(var(--space-4) * -1);
+}
+
+/* Color utilities */
+.text-success {
+  color: var(--color-sage);
+}
+
+.text-muted {
+  color: var(--color-text-muted);
+}
+
+/* About section */
 .about-line {
   padding: var(--space-1) 0;
 }
