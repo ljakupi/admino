@@ -152,7 +152,7 @@ class TestOutlookRead:
             args = OutlookReadArgs(message_id="msg-1")
             result = await outlook_read(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
         assert "oauth_setup" in result
 
     async def test_read_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
@@ -253,7 +253,7 @@ class TestOutlookList:
             args = OutlookListArgs(max_results=10)
             result = await outlook_list(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_list_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-200 status returns Graph error."""
@@ -349,7 +349,7 @@ class TestOutlookSearch:
             args = OutlookSearchArgs(query="test")
             result = await outlook_search(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_search_api_error(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
