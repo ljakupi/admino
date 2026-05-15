@@ -47,7 +47,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -62,8 +62,17 @@ from admino.models import (
     ChatResponse,
     ConfirmRequest,
     LLMMessage,
+    OAuthConnectionStatus,
     PendingConfirmation,
     PendingConfirmationSummary,
+    SettingsAppearance,
+    SettingsConnectedAccounts,
+    SettingsImmutable,
+    SettingsLimits,
+    SettingsLLM,
+    SettingsNotifications,
+    SettingsPatch,
+    SettingsResponse,
     SSEEvent,
 )
 
@@ -791,6 +800,232 @@ async def post_confirm(
 
 
 # ---------------------------------------------------------------------------
+# Settings helpers
+# ---------------------------------------------------------------------------
+
+
+async def _build_settings_response() -> SettingsResponse:
+    """Load settings from DB and construct the SettingsResponse.
+
+    Masks sensitive fields (API keys replaced by boolean flags).
+    Checks OAuth token file existence for connected_accounts.
+
+    Returns:
+        A fully populated SettingsResponse.
+
+    Raises:
+        HTTPException: 500 if DB or config is unavailable.
+    """
+    from admino.database import get_pool, load_settings_from_db
+
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    pool = get_pool()
+    settings = await load_settings_from_db(pool)
+
+    # LLM section with masked key flags.
+    llm_data = settings.get("llm", {})
+    llm_section = SettingsLLM(
+        provider=llm_data.get("provider", "ollama"),
+        model=llm_data.get("model", "gemma4:e2b"),
+        ollama_url=llm_data.get("ollama_url", "http://local-llm:11434"),
+        anthropic_model=llm_data.get("anthropic_model", "claude-sonnet-4-20250514"),
+        openai_model=llm_data.get("openai_model", "gpt-4o"),
+        anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
+        openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
+    )
+
+    # Appearance section (default to light if missing).
+    appearance_data = settings.get("appearance", {})
+    appearance_section = SettingsAppearance(
+        theme=appearance_data.get("theme", "light"),
+    )
+
+    # Notifications section (default to enabled if missing).
+    notifications_data = settings.get("notifications", {})
+    notifications_section = SettingsNotifications(
+        enabled=notifications_data.get("enabled", True),
+    )
+
+    # Limits section.
+    limits_data = settings.get("limits", {})
+    limits_section = SettingsLimits(
+        max_tool_calls_per_message=limits_data.get("max_tool_calls_per_message", 10),
+        confirmation_timeout_s=limits_data.get("confirmation_timeout_s", 300),
+        max_message_length=limits_data.get("max_message_length", 4000),
+    )
+
+    # Server section (immutable, read-only).
+    server_data = settings.get("server", {})
+    server_section = SettingsImmutable(
+        host=server_data.get("host", _config.server.host),
+        port=server_data.get("port", _config.server.port),
+    )
+
+    # Connected accounts — check token file existence.
+    connected = SettingsConnectedAccounts()
+    tokens_dir = _config.paths.tokens_dir
+    google_token = tokens_dir / "google.json"
+    microsoft_token = tokens_dir / "microsoft.json"
+    if google_token.exists():
+        connected.google = OAuthConnectionStatus(
+            connected=True,
+            services=["gmail", "google_calendar", "google_drive"],
+        )
+    if microsoft_token.exists():
+        connected.microsoft = OAuthConnectionStatus(
+            connected=True,
+            services=["outlook", "outlook_calendar", "onedrive"],
+        )
+
+    return SettingsResponse(
+        llm=llm_section,
+        appearance=appearance_section,
+        notifications=notifications_section,
+        limits=limits_section,
+        server=server_section,
+        connected_accounts=connected,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Settings route handlers
+# ---------------------------------------------------------------------------
+
+
+async def get_settings(
+    _auth: None = Depends(require_auth),
+) -> SettingsResponse:
+    """Handle GET /api/settings — return current settings with masked secrets.
+
+    Loads settings from the database, maps them to the response model, and
+    replaces sensitive fields (API keys) with boolean flags.
+
+    Args:
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        SettingsResponse with current settings.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/settings/get")
+    return await _build_settings_response()
+
+
+async def patch_settings(
+    body: SettingsPatch,
+    _auth: None = Depends(require_auth),
+) -> SettingsResponse:
+    """Handle PATCH /api/settings — partially update settings.
+
+    Validates the patch, merges with current DB values, validates the merged
+    result against the full config model, persists, and optionally re-initialises
+    the LLM client if the provider changed.
+
+    Args:
+        body: Validated SettingsPatch with optional sections.
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        Updated SettingsResponse after applying the patch.
+
+    Raises:
+        HTTPException: 400 on validation errors, 500 on server errors.
+    """
+    from admino.config import LLMConfig
+    from admino.database import get_pool, load_settings_from_db, update_setting
+    from admino.llm import create_llm_client
+
+    if _agent is None or _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/settings/patch")
+
+    pool = get_pool()
+    current_settings = await load_settings_from_db(pool)
+    provider_changed = False
+
+    # --- LLM section ---
+    if body.llm is not None:
+        llm_current: dict[str, Any] = dict(current_settings.get("llm", {}))
+        patch_fields = body.llm.model_dump(exclude_none=True)
+
+        # Track whether provider changed before merging.
+        if "provider" in patch_fields and patch_fields["provider"] != llm_current.get("provider"):
+            provider_changed = True
+
+        # Merge non-None patch fields into current values.
+        for key, value in patch_fields.items():
+            llm_current[key] = value
+
+        # Validate merged result against the full LLMConfig model.
+        try:
+            LLMConfig.model_validate(llm_current)
+        except ValidationError as exc:
+            safe_errors = []
+            for err in exc.errors(include_input=False):
+                safe_errors.append(
+                    {
+                        "loc": [str(loc) for loc in err["loc"]],
+                        "msg": err["msg"],
+                        "type": err["type"],
+                    }
+                )
+            raise HTTPException(status_code=400, detail=safe_errors) from None
+
+        await update_setting(pool, "llm", llm_current)
+
+    # --- Appearance section ---
+    if body.appearance is not None:
+        appearance_current: dict[str, Any] = dict(current_settings.get("appearance", {}))
+        patch_fields = body.appearance.model_dump(exclude_none=True)
+        for key, value in patch_fields.items():
+            appearance_current[key] = value
+        await update_setting(pool, "appearance", appearance_current)
+
+    # --- Notifications section ---
+    if body.notifications is not None:
+        notifications_current: dict[str, Any] = dict(
+            current_settings.get("notifications", {}),
+        )
+        patch_fields = body.notifications.model_dump(exclude_none=True)
+        for key, value in patch_fields.items():
+            notifications_current[key] = value
+        await update_setting(pool, "notifications", notifications_current)
+
+    # --- Re-initialise LLM client if provider changed ---
+    if provider_changed:
+        refreshed_settings = await load_settings_from_db(pool)
+        llm_data = refreshed_settings.get("llm", {})
+        try:
+            new_llm_config = LLMConfig.model_validate(llm_data)
+        except ValidationError:
+            logger.error("Failed to reconstruct LLMConfig after provider change")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to re-initialise LLM client",
+            ) from None
+        try:
+            new_client = create_llm_client(new_llm_config)
+        except (ValueError, ImportError) as exc:
+            logger.error("Failed to create LLM client: %s", type(exc).__name__)
+            raise HTTPException(
+                status_code=400,
+                detail="Failed to create LLM client for the selected provider",
+            ) from None
+        # Single-user, single-worker deployment: concurrent requests are
+        # serialised by the event loop, so this plain assignment is safe.
+        # The GIL guarantees the reference swap is atomic.
+        _agent._llm = new_client
+        logger.info("LLM client re-initialised for provider: %s", new_llm_config.provider)
+
+    return await _build_settings_response()
+
+
+# ---------------------------------------------------------------------------
 # Validation error handler
 # ---------------------------------------------------------------------------
 
@@ -915,6 +1150,8 @@ def create_app(
     _rate_limiters["/api/message"] = _TokenBucket(rate=0.5, capacity=5)
     _rate_limiters["/api/confirm"] = _TokenBucket(rate=0.5, capacity=5)
     _rate_limiters["/api/events"] = _TokenBucket(rate=0.17, capacity=3)
+    _rate_limiters["/api/settings/get"] = _TokenBucket(rate=1.0, capacity=5)
+    _rate_limiters["/api/settings/patch"] = _TokenBucket(rate=0.2, capacity=2)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.
@@ -954,7 +1191,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_credentials=False,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PATCH"],
         allow_headers=["Authorization", "Content-Type"],
     )
 
@@ -972,6 +1209,8 @@ def create_app(
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
+    app.get("/api/settings", response_model=SettingsResponse)(get_settings)
+    app.patch("/api/settings", response_model=SettingsResponse)(patch_settings)
 
     # --- Static files (MUST be last so API routes take priority) ---
     # Resolve the PWA static directory. Checked in order:

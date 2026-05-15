@@ -169,7 +169,7 @@ class TestOutlookCalendarRead:
             args = OutlookCalendarReadArgs(event_id="evt-1")
             result = await outlook_calendar_read(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_read_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-200 returns Graph error message."""
@@ -307,7 +307,7 @@ class TestOutlookCalendarList:
             args = OutlookCalendarListArgs(time_min=now, time_max=now + timedelta(days=1))
             result = await outlook_calendar_list(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_list_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-200 status returns Graph error."""
@@ -374,7 +374,7 @@ class TestOutlookCalendarCreate:
             )
             result = await outlook_calendar_create(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_create_api_error(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock

@@ -173,7 +173,7 @@ class TestDriveRead:
             args = GoogleDriveReadArgs(file_id="file123")
             result = await google_drive.google_drive_read(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_api_error(self, mock_http: AsyncMock) -> None:
         """Non-200 returns API error."""
@@ -272,7 +272,7 @@ class TestDriveList:
             args = GoogleDriveListArgs()
             result = await google_drive.google_drive_list(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +341,7 @@ class TestDriveSearch:
             args = GoogleDriveSearchArgs(query="test")
             result = await google_drive.google_drive_search(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +453,7 @@ class TestDriveDownload:
             args = GoogleDriveDownloadArgs(file_id="f1", destination=str(dest))
             result = await google_drive.google_drive_download(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_api_error_on_metadata(self, mock_http: AsyncMock, tmp_path: Path) -> None:
         """Non-200 on metadata fetch returns API error."""

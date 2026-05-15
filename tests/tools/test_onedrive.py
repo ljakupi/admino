@@ -186,7 +186,7 @@ class TestOneDriveRead:
             args = OneDriveReadArgs(item_id="item-1")
             result = await onedrive_read(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_read_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-200 returns Graph error."""
@@ -297,7 +297,7 @@ class TestOneDriveList:
             args = OneDriveListArgs()
             result = await onedrive_list(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_list_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-200 returns Graph error."""
@@ -374,7 +374,7 @@ class TestOneDriveSearch:
             args = OneDriveSearchArgs(query="test")
             result = await onedrive_search(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_search_api_error(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
@@ -467,7 +467,7 @@ class TestOneDriveDownload:
             args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
             result = await onedrive_download(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_download_api_error(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path

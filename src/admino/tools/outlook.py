@@ -143,8 +143,8 @@ async def outlook_read(args: OutlookReadArgs, **kwargs: object) -> str:
     """
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     url = (
         f"{_GRAPH_BASE}/me/messages/{args.message_id}"
@@ -203,8 +203,8 @@ async def outlook_list(args: OutlookListArgs, **kwargs: object) -> str:
     """
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     url = (
         f"{_GRAPH_BASE}/me/messages"
@@ -259,8 +259,8 @@ async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
     """
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     # $search uses KQL syntax; the query is wrapped in double quotes in the URL.
     # Escape double-quotes and backslashes to prevent KQL injection / OData
