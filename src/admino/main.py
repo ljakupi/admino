@@ -26,16 +26,21 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import uvicorn
 
 from admino.config import load_app_config, load_permissions_config
 from admino.models import AgentConfig
+
+if TYPE_CHECKING:
+    from admino.config import AppConfig
+    from admino.permissions import PermissionsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +155,62 @@ def _build_system_prompt(config: object) -> str:
     return "\n".join(lines)
 
 
+async def _async_startup(
+    config: AppConfig,
+    permissions_config: PermissionsConfig,
+) -> tuple[AppConfig, PermissionsConfig]:
+    """Initialise database, run migrations, seed data, and load config from DB.
+
+    Returns the DB-loaded config and permissions (which become the runtime
+    source of truth).
+
+    Args:
+        config: The YAML-loaded application config (used for seeding).
+        permissions_config: The YAML-loaded permissions config (used for seeding).
+
+    Returns:
+        A tuple of (db_config, db_permissions) loaded from the database.
+
+    Raises:
+        ValueError: If DATABASE_URL is not set.
+        RuntimeError: If the database health check fails.
+    """
+    from admino.config import load_app_config_from_db, load_permissions_config_from_db
+    from admino.database import (
+        check_health,
+        close_pool,
+        init_pool,
+        run_migrations,
+        seed_permissions,
+        seed_settings,
+    )
+
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        msg = "DATABASE_URL environment variable is required but not set."
+        raise ValueError(msg)
+
+    pool = await init_pool(
+        database_url,
+        min_size=config.database.min_pool_size,
+        max_size=config.database.max_pool_size,
+    )
+
+    if not await check_health():
+        await close_pool()
+        msg = "PostgreSQL health check failed — database is unreachable."
+        raise RuntimeError(msg)
+
+    await run_migrations(pool)
+    await seed_settings(pool, config)
+    await seed_permissions(pool, permissions_config)
+
+    db_config = await load_app_config_from_db(pool)
+    db_permissions = await load_permissions_config_from_db(pool)
+
+    return db_config, db_permissions
+
+
 def main(
     *,
     config_path: Path = _DEFAULT_CONFIG_PATH,
@@ -192,7 +253,20 @@ def main(
     logger.info("Permissions config loaded successfully.")
 
     # ------------------------------------------------------------------
-    # 4. Open the audit logger with path confinement
+    # 4. Initialize database, run migrations, seed and load from DB
+    # ------------------------------------------------------------------
+    try:
+        config, permissions_config = asyncio.run(
+            _async_startup(config, permissions_config)
+        )
+    except (ValueError, RuntimeError, OSError) as exc:
+        logger.error("Database startup failed: %s", exc)
+        sys.exit(1)
+
+    logger.info("Database initialized, config loaded from DB.")
+
+    # ------------------------------------------------------------------
+    # 5. Open the audit logger with path confinement
     # ------------------------------------------------------------------
     from admino.audit import AuditLogger
 
@@ -237,10 +311,8 @@ def main(
     # Configure tool modules with paths from the validated config BEFORE
     # importing them (import triggers @register_tool decorators, not config).
     from admino.tools import files as files_tool
-    from admino.tools import memory as memory_tool
     from admino.tools.registry import freeze_registry
 
-    memory_tool.configure(config.paths.database)
     files_tool.configure(
         allowed_paths=[
             {"path": entry.path, "label": entry.label, "access": entry.access}
@@ -248,7 +320,7 @@ def main(
         ],
         max_read_chars=config.files.max_read_chars,
     )
-    logger.info("Tool modules configured (memory, files).")
+    logger.info("Tool modules configured (files).")
 
     _import_tool_modules()
     freeze_registry()

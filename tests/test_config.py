@@ -12,6 +12,7 @@ import logging
 import secrets
 import textwrap
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -19,6 +20,7 @@ from pydantic import ValidationError
 from admino.config import (
     AppConfig,
     AuthConfig,
+    DatabaseConfig,
     EgressConfig,
     LimitsConfig,
     LLMConfig,
@@ -26,7 +28,9 @@ from admino.config import (
     PathsConfig,
     ServerConfig,
     load_app_config,
+    load_app_config_from_db,
     load_permissions_config,
+    load_permissions_config_from_db,
 )
 
 
@@ -75,7 +79,6 @@ class TestValidConfigLoading:
             auth:
               mode: "token"
             paths:
-              database: "/data/db.sqlite"
               audit_log: "/data/audit.jsonl"
               images: "/data/images"
               tokens_dir: "/data/tokens"
@@ -105,8 +108,6 @@ class TestValidConfigLoading:
         assert config.llm.timeout_s == 60
         assert config.llm.provider == "ollama"
         assert config.auth.mode == "token"
-        assert config.paths.database.is_absolute()
-        assert str(config.paths.database).endswith("db.sqlite")
         assert config.paths.audit_log.is_absolute()
         assert str(config.paths.audit_log).endswith("audit.jsonl")
         assert config.limits.max_tool_calls_per_message == 5
@@ -329,7 +330,6 @@ class TestPathResolution:
             tmp_path / "config.yaml",
             """\
             paths:
-              database: "relative/db.sqlite"
               audit_log: "relative/audit.jsonl"
               images: "relative/images"
               tokens_dir: "relative/tokens"
@@ -337,7 +337,6 @@ class TestPathResolution:
         )
         config = load_app_config(yaml_path)
 
-        assert config.paths.database.is_absolute()
         assert config.paths.audit_log.is_absolute()
         assert config.paths.images.is_absolute()
         assert config.paths.tokens_dir.is_absolute()
@@ -364,11 +363,11 @@ class TestPathResolution:
             tmp_path / "config.yaml",
             """\
             paths:
-              database: "/absolute/db.sqlite"
+              audit_log: "/absolute/audit.jsonl"
             """,
         )
         config = load_app_config(yaml_path)
-        assert config.paths.database == Path("/absolute/db.sqlite")
+        assert config.paths.audit_log == Path("/absolute/audit.jsonl")
 
 
 # ---------------------------------------------------------------------------
@@ -1112,3 +1111,121 @@ class TestEnvVarInjection:
         yaml_path = _write_yaml(tmp_path / "config.yaml", "")
         with pytest.raises(ValueError):
             load_app_config(yaml_path)
+
+
+# ---------------------------------------------------------------------------
+# DatabaseConfig validation
+# ---------------------------------------------------------------------------
+
+
+class TestDatabaseConfig:
+    """DatabaseConfig defaults and validation."""
+
+    def test_database_config_defaults(self) -> None:
+        """DatabaseConfig has correct default pool sizes."""
+        config = DatabaseConfig()
+        assert config.min_pool_size == 2
+        assert config.max_pool_size == 5
+
+    def test_database_config_in_app_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AppConfig includes DatabaseConfig with defaults."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        config = load_app_config(tmp_path / "nonexistent.yaml")
+        assert isinstance(config.database, DatabaseConfig)
+        assert config.database.min_pool_size == 2
+        assert config.database.max_pool_size == 5
+
+    def test_paths_config_no_database_field(self) -> None:
+        """PathsConfig no longer has a 'database' field."""
+        paths = PathsConfig()
+        assert not hasattr(paths, "database")
+
+
+# ---------------------------------------------------------------------------
+# Database-backed config loaders
+# ---------------------------------------------------------------------------
+
+
+class TestLoadAppConfigFromDb:
+    """Tests for load_app_config_from_db()."""
+
+    async def test_calls_load_settings_from_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """load_app_config_from_db calls load_settings_from_db and returns AppConfig."""
+        mock_pool = MagicMock()
+        mock_data: dict[str, object] = {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "llm": {"provider": "ollama"},
+            "auth": {"mode": "vpn"},
+            "paths": {},
+            "files": {},
+            "limits": {},
+            "egress": {},
+            "ocr": {},
+            "database": {},
+            "log_level": "INFO",
+        }
+        mock_load = AsyncMock(return_value=mock_data)
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+
+        with patch("admino.database.load_settings_from_db", new=mock_load):
+            result = await load_app_config_from_db(mock_pool)
+
+        mock_load.assert_awaited_once_with(mock_pool)
+        assert isinstance(result, AppConfig)
+        assert result.server.host == "127.0.0.1"
+
+    async def test_applies_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """load_app_config_from_db applies environment variable overrides."""
+        mock_pool = MagicMock()
+        mock_data: dict[str, object] = {
+            "server": {},
+            "llm": {},
+            "auth": {"mode": "vpn"},
+            "paths": {},
+            "files": {},
+            "limits": {},
+            "egress": {},
+            "ocr": {},
+            "database": {},
+            "log_level": "INFO",
+        }
+        mock_load = AsyncMock(return_value=mock_data)
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+
+        with patch("admino.database.load_settings_from_db", new=mock_load):
+            result = await load_app_config_from_db(mock_pool)
+
+        assert result.log_level == "DEBUG"
+
+
+class TestLoadPermissionsConfigFromDb:
+    """Tests for load_permissions_config_from_db()."""
+
+    async def test_calls_load_permissions_from_db(self) -> None:
+        """load_permissions_config_from_db calls load_permissions_from_db and returns config."""
+        mock_pool = MagicMock()
+        mock_data = {
+            "gmail": {"read": "allow", "list": "allow"},
+            "memory": {"store": "allow", "recall": "allow", "list": "allow"},
+        }
+        mock_load = AsyncMock(return_value=mock_data)
+
+        with patch("admino.database.load_permissions_from_db", new=mock_load):
+            result = await load_permissions_config_from_db(mock_pool)
+
+        mock_load.assert_awaited_once_with(mock_pool)
+        assert result.tools["gmail"].actions["read"] == "allow"
+        assert result.tools["memory"].actions["store"] == "allow"
+
+    async def test_empty_permissions_returns_empty_config(self) -> None:
+        """load_permissions_config_from_db handles empty permissions dict."""
+        mock_pool = MagicMock()
+        mock_load = AsyncMock(return_value={})
+
+        with patch("admino.database.load_permissions_from_db", new=mock_load):
+            result = await load_permissions_config_from_db(mock_pool)
+
+        assert result.tools == {}

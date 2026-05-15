@@ -23,11 +23,11 @@ import ast
 import logging
 from pathlib import Path
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from admino.main import _configure_logging, _import_tool_modules, main
+from admino.main import _async_startup, _configure_logging, _import_tool_modules, main
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,6 +60,8 @@ def _make_mock_config() -> MagicMock:
     config.limits.confirmation_timeout_s = 300
     config.server.host = "127.0.0.1"
     config.server.port = 8000
+    config.database.min_pool_size = 2
+    config.database.max_pool_size = 5
     return config
 
 
@@ -96,9 +98,16 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_uvicorn_run = MagicMock()
     mock_import_tools = MagicMock()
 
+    # _async_startup is called via asyncio.run() inside main().
+    # We mock asyncio.run to return (config, perms) directly so the DB
+    # init path is bypassed without needing real asyncpg.
+    mock_asyncio = MagicMock()
+    mock_asyncio.run = MagicMock(return_value=(mock_config, mock_perms))
+
     monkeypatch.setattr("admino.main.load_app_config", mock_load_app_config)
     monkeypatch.setattr("admino.main.load_permissions_config", mock_load_permissions_config)
     monkeypatch.setattr("admino.main._import_tool_modules", mock_import_tools)
+    monkeypatch.setattr("admino.main.asyncio", mock_asyncio)
 
     # These are imported lazily inside main(), so we patch the module paths
     monkeypatch.setattr("admino.audit.AuditLogger", mock_audit_cls)
@@ -124,6 +133,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "freeze_registry": mock_freeze,
         "uvicorn_run": mock_uvicorn_run,
         "import_tool_modules": mock_import_tools,
+        "asyncio": mock_asyncio,
     }
 
 
@@ -678,6 +688,126 @@ class TestStartupOrdering:
         main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
 
         assert call_order.index("freeze") < call_order.index("agent")
+
+
+# ---------------------------------------------------------------------------
+# Database startup failure tests
+# ---------------------------------------------------------------------------
+
+
+class TestMainDatabaseStartupFailures:
+    """Tests for main() when _async_startup fails via asyncio.run."""
+
+    @pytest.mark.parametrize(
+        "exc_type",
+        [ValueError, RuntimeError, OSError],
+    )
+    def test_main_exits_1_on_async_startup_failure(
+        self,
+        mock_deps: dict[str, Any],
+        exc_type: type[Exception],
+    ) -> None:
+        """main() exits with code 1 when asyncio.run raises ValueError/RuntimeError/OSError."""
+        mock_deps["asyncio"].run = MagicMock(side_effect=exc_type("db failed"))
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+
+        assert exc_info.value.code == 1
+
+    def test_main_does_not_call_uvicorn_on_db_failure(self, mock_deps: dict[str, Any]) -> None:
+        """uvicorn.run is never called when database startup fails."""
+        mock_deps["asyncio"].run = MagicMock(side_effect=ValueError("DATABASE_URL not set"))
+
+        with pytest.raises(SystemExit):
+            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+
+        mock_deps["uvicorn_run"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _async_startup direct tests
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncStartup:
+    """Tests for _async_startup() coroutine directly."""
+
+    @pytest.mark.asyncio
+    async def test_raises_when_database_url_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_async_startup raises ValueError when DATABASE_URL is not set."""
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+        with pytest.raises(ValueError, match="DATABASE_URL"):
+            await _async_startup(MagicMock(), MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_raises_when_health_check_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_async_startup raises RuntimeError when database is unreachable."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+        mock_pool = AsyncMock()
+        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
+        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=False))
+        monkeypatch.setattr("admino.database.close_pool", AsyncMock())
+
+        with pytest.raises(RuntimeError, match="health check failed"):
+            await _async_startup(MagicMock(), MagicMock())
+
+    @pytest.mark.asyncio
+    async def test_happy_path_returns_db_config_and_permissions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_async_startup returns (config, permissions) loaded from DB."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+        mock_pool = AsyncMock()
+        mock_db_config = MagicMock()
+        mock_db_perms = MagicMock()
+
+        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
+        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr(
+            "admino.config.load_app_config_from_db", AsyncMock(return_value=mock_db_config)
+        )
+        monkeypatch.setattr(
+            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=mock_db_perms)
+        )
+
+        result = await _async_startup(MagicMock(), MagicMock())
+        assert result == (mock_db_config, mock_db_perms)
+
+    @pytest.mark.asyncio
+    async def test_calls_init_pool_with_config_values(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_async_startup passes pool size from config to init_pool."""
+        monkeypatch.setenv("DATABASE_URL", "postgresql://test:test@localhost/test")
+        mock_init = AsyncMock(return_value=AsyncMock())
+        monkeypatch.setattr("admino.database.init_pool", mock_init)
+        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr(
+            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(
+            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+
+        config = MagicMock()
+        config.database.min_pool_size = 3
+        config.database.max_pool_size = 10
+        await _async_startup(config, MagicMock())
+
+        mock_init.assert_called_once_with(
+            "postgresql://test:test@localhost/test", min_size=3, max_size=10
+        )
 
 
 # ---------------------------------------------------------------------------
