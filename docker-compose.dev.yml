@@ -1,0 +1,15 @@
+# admino — Dev overlay: expose Postgres to the host for `make run`.
+#
+# Usage:
+#   make dev-db          (starts Postgres with host port 5432)
+#   make dev-db-down     (stops it)
+#
+# This overlay adds a host port mapping so the Python process running
+# natively on the host can reach Postgres at localhost:5432.
+# It is NOT used in production — the base docker-compose.yml keeps
+# Postgres on the internal network only.
+
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
