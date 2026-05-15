@@ -195,8 +195,8 @@ async def google_calendar_read(args: GoogleCalendarReadArgs, **kwargs: object) -
             f"{_CALENDAR_API_BASE}/events/{args.event_id}",
             headers=_auth_headers(token),
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -264,8 +264,8 @@ async def google_calendar_list(args: GoogleCalendarListArgs, **kwargs: object) -
             params=params,
             headers=_auth_headers(token),
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -327,8 +327,8 @@ async def google_calendar_create(args: GoogleCalendarCreateArgs, **kwargs: objec
                 "Content-Type": "application/json",
             },
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 

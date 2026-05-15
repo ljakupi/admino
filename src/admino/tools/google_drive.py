@@ -196,8 +196,8 @@ async def google_drive_read(args: GoogleDriveReadArgs, **kwargs: object) -> str:
             params={"fields": fields},
             headers=_auth_headers(token),
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -248,8 +248,8 @@ async def google_drive_list(args: GoogleDriveListArgs, **kwargs: object) -> str:
             params={"q": query, "pageSize": str(args.max_results), "fields": fields},
             headers=_auth_headers(token),
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -302,8 +302,8 @@ async def google_drive_search(args: GoogleDriveSearchArgs, **kwargs: object) -> 
             params={"q": query, "pageSize": str(args.max_results), "fields": fields},
             headers=_auth_headers(token),
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -373,8 +373,8 @@ async def google_drive_download(args: GoogleDriveDownloadArgs, **kwargs: object)
             params={"fields": "id,name,mimeType,size"},
             headers=_auth_headers(token),
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -407,8 +407,8 @@ async def google_drive_download(args: GoogleDriveDownloadArgs, **kwargs: object)
                 params={"alt": "media"},
                 headers=_auth_headers(token),
             )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed during download: {type(exc).__name__}"
 
