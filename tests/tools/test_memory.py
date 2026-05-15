@@ -1,202 +1,157 @@
-"""Tests for the memory tool (admino.tools.memory).
+"""Tests for the memory tool (admino.tools.memory) — PostgreSQL-backed.
 
-Covers configuration, database initialization, store/recall/list actions,
-Pydantic model validation, and adversarial input handling (SQL injection,
-special characters).
+Covers store/recall/list actions with a mocked asyncpg pool,
+Pydantic model validation, and adversarial input handling.
+
+Security notes:
+- All database calls are mocked — no real PostgreSQL connections.
+- Verifies parameterized queries ($1, $2) are used, not string interpolation.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
-if TYPE_CHECKING:
-    from collections.abc import Generator
-
 from pydantic import ValidationError
 
 from admino.models import MemoryListArgs, MemoryRecallArgs, MemoryStoreArgs
-from admino.tools import memory
-from admino.tools.registry import clear_registry
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(autouse=True)
-def _clean_registry() -> Generator[None, None, None]:
-    """Ensure the registry is clean before and after every test."""
-    clear_registry()
-    import importlib
-
-    importlib.reload(memory)
-    yield
-    clear_registry()
 
 
 @pytest.fixture()
-def db_path(tmp_path: Path) -> Path:
-    """Return a temporary database path."""
-    return tmp_path / "db" / "test_memory.db"
-
-
-@pytest.fixture()
-def configured_memory(db_path: Path) -> None:
-    """Configure the memory tool with a temporary database path."""
-    memory.configure(db_path)
-
-
-# ---------------------------------------------------------------------------
-# 1. Configuration Tests
-# ---------------------------------------------------------------------------
-
-
-class TestConfigure:
-    """Tests for memory.configure()."""
-
-    def test_configure_with_absolute_path(self, tmp_path: Path) -> None:
-        """configure() with an absolute path succeeds."""
-        db = tmp_path / "test.db"
-        memory.configure(db)
-        assert memory._db_path == str(db.resolve())
-
-    def test_configure_resolves_path(self, tmp_path: Path) -> None:
-        """configure() resolves the path to absolute."""
-        db = tmp_path / "sub" / ".." / "test.db"
-        memory.configure(db)
-        expected = (tmp_path / "test.db").resolve()
-        assert memory._db_path == str(expected)
-
-    def test_configure_with_relative_path_raises(self) -> None:
-        """configure() with a relative path raises ValueError.
-
-        Note: Path.resolve() always returns an absolute path, so the
-        is_absolute check always passes after resolve. This test verifies
-        the resolve+check mechanism works as intended.
-        """
-        # Path("relative").resolve() returns an absolute path, so this
-        # will actually succeed. The L2 fix documented in the spec means
-        # the configure function always resolves first, which makes all
-        # paths absolute. We verify the resolved path is absolute.
-        db = Path("relative/path/test.db")
-        memory.configure(db)
-        assert Path(memory._db_path).is_absolute()
+def mock_pool() -> MagicMock:
+    """Return a mock asyncpg pool for memory tool tests."""
+    pool = MagicMock()
+    pool.execute = AsyncMock()
+    pool.fetch = AsyncMock(return_value=[])
+    pool.fetchrow = AsyncMock(return_value=None)
+    pool.fetchval = AsyncMock(return_value=None)
+    return pool
 
 
 # ---------------------------------------------------------------------------
-# 2. Database Initialization Tests
-# ---------------------------------------------------------------------------
-
-
-class TestEnsureDb:
-    """Tests for memory._ensure_db()."""
-
-    @pytest.mark.asyncio
-    async def test_creates_database_file_and_table(
-        self, configured_memory: None, db_path: Path
-    ) -> None:
-        """_ensure_db() creates the database file and memory table."""
-        await memory._ensure_db()
-        assert db_path.exists()
-
-    @pytest.mark.asyncio
-    async def test_creates_parent_directories(self, tmp_path: Path) -> None:
-        """_ensure_db() creates parent directories if needed."""
-        deep_db = tmp_path / "deep" / "nested" / "dir" / "test.db"
-        memory.configure(deep_db)
-        await memory._ensure_db()
-        assert deep_db.parent.exists()
-
-    @pytest.mark.asyncio
-    async def test_idempotent(self, configured_memory: None, db_path: Path) -> None:
-        """_ensure_db() can be called multiple times without error."""
-        await memory._ensure_db()
-        await memory._ensure_db()
-        await memory._ensure_db()
-        assert db_path.exists()
-
-
-# ---------------------------------------------------------------------------
-# 3. Store Tests
+# 1. Store Tests
 # ---------------------------------------------------------------------------
 
 
 class TestMemoryStore:
     """Tests for the memory_store handler."""
 
-    @pytest.mark.asyncio
-    async def test_stores_new_key(self, configured_memory: None) -> None:
-        """memory_store stores a new key-value pair."""
-        result = await memory.memory_store(MemoryStoreArgs(key="greeting", value="hello world"))
+    async def test_stores_new_key(self, mock_pool: MagicMock) -> None:
+        """memory_store calls pool.execute with INSERT/ON CONFLICT SQL."""
+        from admino.tools.memory import memory_store
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            result = await memory_store(MemoryStoreArgs(key="greeting", value="hello world"))
+
         assert "Stored memory: greeting" in result
+        mock_pool.execute.assert_awaited_once()
 
-    @pytest.mark.asyncio
-    async def test_upsert_existing_key(self, configured_memory: None) -> None:
-        """memory_store updates an existing key (upsert)."""
-        await memory.memory_store(MemoryStoreArgs(key="counter", value="1"))
-        await memory.memory_store(MemoryStoreArgs(key="counter", value="2"))
-        recalled = await memory.memory_recall(MemoryRecallArgs(key="counter"))
-        assert recalled == "2"
+    async def test_store_uses_parameterized_query(self, mock_pool: MagicMock) -> None:
+        """memory_store uses $1, $2 placeholders, not string interpolation."""
+        from admino.tools.memory import memory_store
 
-    @pytest.mark.asyncio
-    async def test_returns_confirmation_message(self, configured_memory: None) -> None:
-        """memory_store returns a confirmation message."""
-        result = await memory.memory_store(MemoryStoreArgs(key="mykey", value="myval"))
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            await memory_store(MemoryStoreArgs(key="mykey", value="myval"))
+
+        call_args = mock_pool.execute.call_args
+        sql = call_args.args[0]
+        assert "$1" in sql
+        assert "$2" in sql
+        assert call_args.args[1] == "mykey"
+        assert call_args.args[2] == "myval"
+
+    async def test_returns_confirmation_message(self, mock_pool: MagicMock) -> None:
+        """memory_store returns 'Stored memory: <key>'."""
+        from admino.tools.memory import memory_store
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            result = await memory_store(MemoryStoreArgs(key="mykey", value="myval"))
+
         assert result == "Stored memory: mykey"
 
 
 # ---------------------------------------------------------------------------
-# 4. Recall Tests
+# 2. Recall Tests
 # ---------------------------------------------------------------------------
 
 
 class TestMemoryRecall:
     """Tests for the memory_recall handler."""
 
-    @pytest.mark.asyncio
-    async def test_recalls_existing_key(self, configured_memory: None) -> None:
-        """memory_recall retrieves a stored value."""
-        await memory.memory_store(MemoryStoreArgs(key="name", value="admino"))
-        result = await memory.memory_recall(MemoryRecallArgs(key="name"))
+    async def test_recalls_existing_key(self, mock_pool: MagicMock) -> None:
+        """memory_recall returns the value when a row is found."""
+        from admino.tools.memory import memory_recall
+
+        mock_pool.fetchrow = AsyncMock(return_value={"value": "admino"})
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            result = await memory_recall(MemoryRecallArgs(key="name"))
+
         assert result == "admino"
 
-    @pytest.mark.asyncio
-    async def test_returns_not_found_for_missing_key(self, configured_memory: None) -> None:
-        """memory_recall returns not-found for missing key."""
-        result = await memory.memory_recall(MemoryRecallArgs(key="nonexistent"))
+    async def test_returns_not_found_for_missing_key(self, mock_pool: MagicMock) -> None:
+        """memory_recall returns not-found when fetchrow returns None."""
+        from admino.tools.memory import memory_recall
+
+        mock_pool.fetchrow = AsyncMock(return_value=None)
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            result = await memory_recall(MemoryRecallArgs(key="nonexistent"))
+
         assert "No memory found for key: nonexistent" in result
+
+    async def test_recall_uses_parameterized_query(self, mock_pool: MagicMock) -> None:
+        """memory_recall uses $1 placeholder for the key."""
+        from admino.tools.memory import memory_recall
+
+        mock_pool.fetchrow = AsyncMock(return_value=None)
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            await memory_recall(MemoryRecallArgs(key="testkey"))
+
+        call_args = mock_pool.fetchrow.call_args
+        sql = call_args.args[0]
+        assert "$1" in sql
+        assert call_args.args[1] == "testkey"
 
 
 # ---------------------------------------------------------------------------
-# 5. List Tests
+# 3. List Tests
 # ---------------------------------------------------------------------------
 
 
 class TestMemoryList:
     """Tests for the memory_list handler."""
 
-    @pytest.mark.asyncio
-    async def test_lists_all_keys_alphabetically(self, configured_memory: None) -> None:
-        """memory_list returns keys in alphabetical order."""
-        await memory.memory_store(MemoryStoreArgs(key="zebra", value="z"))
-        await memory.memory_store(MemoryStoreArgs(key="alpha", value="a"))
-        await memory.memory_store(MemoryStoreArgs(key="middle", value="m"))
-        result = await memory.memory_list(MemoryListArgs())
+    async def test_lists_all_keys(self, mock_pool: MagicMock) -> None:
+        """memory_list returns keys from pool.fetch results."""
+        from admino.tools.memory import memory_list
+
+        mock_pool.fetch = AsyncMock(
+            return_value=[{"key": "alpha"}, {"key": "middle"}, {"key": "zebra"}]
+        )
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            result = await memory_list(MemoryListArgs())
+
         lines = result.strip().split("\n")
         assert lines == ["alpha", "middle", "zebra"]
 
-    @pytest.mark.asyncio
-    async def test_empty_returns_no_memories_message(self, configured_memory: None) -> None:
-        """memory_list returns 'No memories stored.' when empty."""
-        result = await memory.memory_list(MemoryListArgs())
+    async def test_empty_returns_no_memories_message(self, mock_pool: MagicMock) -> None:
+        """memory_list returns 'No memories stored.' when fetch returns empty."""
+        from admino.tools.memory import memory_list
+
+        mock_pool.fetch = AsyncMock(return_value=[])
+
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            result = await memory_list(MemoryListArgs())
+
         assert result == "No memories stored."
 
 
 # ---------------------------------------------------------------------------
-# 6. Pydantic Model Validation Tests
+# 4. Pydantic Model Validation Tests
 # ---------------------------------------------------------------------------
 
 
@@ -229,7 +184,7 @@ class TestMemoryModelValidation:
         ],
     )
     def test_recall_args_rejects_special_chars(self, invalid_key: str) -> None:
-        """MemoryRecallArgs rejects keys with special characters (M1 fix)."""
+        """MemoryRecallArgs rejects keys with special characters."""
         with pytest.raises(ValidationError):
             MemoryRecallArgs(key=invalid_key)
 
@@ -260,47 +215,52 @@ class TestMemoryModelValidation:
 
 
 # ---------------------------------------------------------------------------
-# 7. Adversarial / SQL Injection Tests
+# 5. Adversarial / SQL Injection Tests
 # ---------------------------------------------------------------------------
 
 
 class TestAdversarialInputs:
-    """Adversarial tests for SQL injection and data integrity."""
+    """Adversarial tests verifying parameterized queries block SQL injection."""
 
-    @pytest.mark.asyncio
-    async def test_sql_injection_in_value_is_stored_literally(
-        self, configured_memory: None
+    async def test_sql_injection_in_value_uses_parameterized_query(
+        self, mock_pool: MagicMock
     ) -> None:
-        """SQL injection attempts in values are stored as literal strings."""
+        """SQL injection attempts in values are passed as parameters, not interpolated."""
+        from admino.tools.memory import memory_store
+
         malicious_value = "'; DROP TABLE memory; --"
-        await memory.memory_store(MemoryStoreArgs(key="safe-key", value=malicious_value))
-        result = await memory.memory_recall(MemoryRecallArgs(key="safe-key"))
-        assert result == malicious_value
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            await memory_store(MemoryStoreArgs(key="safe-key", value=malicious_value))
 
-    @pytest.mark.asyncio
-    async def test_store_then_list_after_sql_injection_value(self, configured_memory: None) -> None:
-        """Table remains intact after storing SQL injection payloads."""
-        await memory.memory_store(
-            MemoryStoreArgs(
-                key="inject-test",
-                value="Robert'); DROP TABLE memory;--",
-            )
-        )
-        # Table should still work
-        result = await memory.memory_list(MemoryListArgs())
-        assert "inject-test" in result
+        call_args = mock_pool.execute.call_args
+        sql = call_args.args[0]
+        # The malicious value must NOT appear in the SQL string itself
+        assert "DROP TABLE" not in sql
+        # It must be passed as a separate parameter
+        assert call_args.args[2] == malicious_value
 
-    @pytest.mark.asyncio
-    async def test_unicode_values_handled(self, configured_memory: None) -> None:
-        """Unicode content is stored and recalled correctly."""
-        await memory.memory_store(MemoryStoreArgs(key="emoji-test", value="Hello world!"))
-        result = await memory.memory_recall(MemoryRecallArgs(key="emoji-test"))
-        assert result == "Hello world!"
+    async def test_unicode_values_passed_as_parameters(self, mock_pool: MagicMock) -> None:
+        """Unicode content is passed as a parameter to pool.execute."""
+        from admino.tools.memory import memory_store
 
-    @pytest.mark.asyncio
-    async def test_very_long_valid_value(self, configured_memory: None) -> None:
-        """Values at exactly max_length are accepted."""
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            await memory_store(MemoryStoreArgs(key="emoji-test", value="Hello world!"))
+
+        call_args = mock_pool.execute.call_args
+        assert call_args.args[2] == "Hello world!"
+
+    async def test_very_long_valid_value_passed_as_parameter(self, mock_pool: MagicMock) -> None:
+        """Values at exactly max_length are passed as parameters."""
+        from admino.tools.memory import memory_store
+
         long_value = "x" * 2000
-        await memory.memory_store(MemoryStoreArgs(key="long-val", value=long_value))
-        result = await memory.memory_recall(MemoryRecallArgs(key="long-val"))
-        assert result == long_value
+        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
+            await memory_store(MemoryStoreArgs(key="long-val", value=long_value))
+
+        call_args = mock_pool.execute.call_args
+        assert call_args.args[2] == long_value
+
+    async def test_recall_sql_injection_key_rejected_by_pydantic(self) -> None:
+        """SQL injection in recall key is rejected by Pydantic validation."""
+        with pytest.raises(ValidationError):
+            MemoryRecallArgs(key="'; DROP TABLE memory; --")

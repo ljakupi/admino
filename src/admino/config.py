@@ -22,12 +22,15 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
 
 from admino.permissions import PermissionsConfig, validate_permissions_config
+
+if TYPE_CHECKING:
+    import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -252,10 +255,6 @@ class PathsConfig(BaseModel):
     All paths are resolved to absolute paths during validation.
     """
 
-    database: Path = Field(
-        default=Path("/app/data/db/admino.db"),
-        description="Path to the SQLite database file.",
-    )
     audit_log: Path = Field(
         default=Path("/app/data/logs/audit.jsonl"),
         description="Path to the append-only NDJSON audit log.",
@@ -430,6 +429,13 @@ class OcrConfig(BaseModel):
         return v
 
 
+class DatabaseConfig(BaseModel):
+    """PostgreSQL connection pool settings."""
+
+    min_pool_size: int = Field(default=2, ge=1, le=20)
+    max_pool_size: int = Field(default=5, ge=1, le=50)
+
+
 class FilePathEntry(BaseModel):
     """A single allowed file path entry from config.yaml files.allowed_paths."""
 
@@ -482,6 +488,7 @@ class AppConfig(BaseModel):
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
     ocr: OcrConfig = Field(default_factory=OcrConfig)
+    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO",
         description="Python logging level for the application.",
@@ -490,7 +497,6 @@ class AppConfig(BaseModel):
     @model_validator(mode="after")
     def resolve_paths(self) -> AppConfig:
         """Ensure all path fields are absolute."""
-        self.paths.database = self.paths.database.resolve()
         self.paths.audit_log = self.paths.audit_log.resolve()
         self.paths.images = self.paths.images.resolve()
         self.paths.tokens_dir = self.paths.tokens_dir.resolve()
@@ -761,3 +767,46 @@ def load_permissions_config(permissions_path: Path) -> PermissionsConfig:
         tools_typed[tool_name] = {str(k): str(v) for k, v in actions.items()}
 
     return validate_permissions_config(tools_typed)
+
+
+# ---------------------------------------------------------------------------
+# Database-backed config loaders
+# ---------------------------------------------------------------------------
+
+
+async def load_app_config_from_db(pool: asyncpg.Pool) -> AppConfig:
+    """Load application config from the database.
+
+    Fetches settings rows, reconstructs the config dict, applies env
+    overrides, and validates via Pydantic.
+
+    Args:
+        pool: The asyncpg connection pool.
+
+    Returns:
+        A validated AppConfig instance loaded from the database.
+    """
+    from admino.database import load_settings_from_db
+
+    data = await load_settings_from_db(pool)
+    data = _apply_env_overrides(data)
+    return AppConfig.model_validate(data)
+
+
+async def load_permissions_config_from_db(
+    pool: asyncpg.Pool,
+) -> PermissionsConfig:
+    """Load permissions config from the database.
+
+    Fetches permission rows and validates via validate_permissions_config().
+
+    Args:
+        pool: The asyncpg connection pool.
+
+    Returns:
+        A validated PermissionsConfig instance loaded from the database.
+    """
+    from admino.database import load_permissions_from_db
+
+    tools_dict = await load_permissions_from_db(pool)
+    return validate_permissions_config(tools_dict)
