@@ -261,8 +261,8 @@ async def gmail_read(args: GmailReadArgs, **kwargs: object) -> str:
             f"{_GMAIL_API_BASE}/messages/{args.message_id}",
             params={"format": "full"},
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -316,8 +316,8 @@ async def gmail_list(args: GmailListArgs, **kwargs: object) -> str:
             f"{_GMAIL_API_BASE}/messages",
             params={"maxResults": str(args.max_results)},
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -365,8 +365,8 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
             f"{_GMAIL_API_BASE}/messages",
             params={"q": args.query, "maxResults": str(args.max_results)},
         )
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup google"
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 

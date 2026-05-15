@@ -83,3 +83,71 @@ export type ThreadItem =
   | { type: 'message'; data: ChatMessage }
   | { type: 'tool_call'; data: ToolCallUI }
   | { type: 'thinking'; data: { id: string } };
+
+// Settings types
+
+export type LLMProviderName = 'ollama' | 'anthropic' | 'openai';
+export type AppTheme = 'light' | 'dark' | 'system';
+
+export interface LLMSettings {
+  provider: LLMProviderName;
+  model: string;
+  ollama_url: string;
+  anthropic_model: string;
+  openai_model: string;
+  anthropic_key_configured: boolean;
+  openai_key_configured: boolean;
+}
+
+export interface AppearanceSettings {
+  theme: AppTheme;
+}
+
+export interface NotificationSettings {
+  enabled: boolean;
+}
+
+export interface LimitsSettings {
+  max_tool_calls_per_message: number;
+  confirmation_timeout_s: number;
+  max_message_length: number;
+}
+
+export interface ServerSettings {
+  host: string;
+  port: number;
+}
+
+export interface OAuthAccountInfo {
+  connected: boolean;
+  email: string | null;
+  services: string[];
+}
+
+export interface ConnectedAccounts {
+  google: OAuthAccountInfo;
+  microsoft: OAuthAccountInfo;
+}
+
+export interface SettingsResponse {
+  llm: LLMSettings;
+  appearance: AppearanceSettings;
+  notifications: NotificationSettings;
+  limits: LimitsSettings;
+  server: ServerSettings;
+  connected_accounts: ConnectedAccounts;
+}
+
+export interface LLMSettingsPatch {
+  provider?: LLMProviderName;
+  model?: string;
+  ollama_url?: string;
+  anthropic_model?: string;
+  openai_model?: string;
+}
+
+export interface SettingsPatch {
+  llm?: LLMSettingsPatch;
+  appearance?: { theme?: AppTheme };
+  notifications?: { enabled?: boolean };
+}

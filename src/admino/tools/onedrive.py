@@ -165,8 +165,8 @@ async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
     """
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     url = (
         f"{_GRAPH_BASE}/me/drive/items/{args.item_id}"
@@ -220,8 +220,8 @@ async def onedrive_list(args: OneDriveListArgs, **kwargs: object) -> str:
     """
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     if args.folder_path:
         # Reject path traversal attempts before any URL construction
@@ -289,8 +289,8 @@ async def onedrive_search(args: OneDriveSearchArgs, **kwargs: object) -> str:
     """
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     # Model-level pattern validation rejects single quotes and backslashes.
     # Defence-in-depth: escape any that slip through.
@@ -393,8 +393,8 @@ async def onedrive_download(args: OneDriveDownloadArgs, **kwargs: object) -> str
 
     try:
         token = await _get_microsoft_token()
-    except OAuthError:
-        return "OAuth not configured. Run: python -m admino.oauth_setup microsoft"
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
 
     url = f"{_GRAPH_BASE}/me/drive/items/{args.item_id}/content"
     try:

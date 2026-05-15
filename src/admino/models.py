@@ -1226,3 +1226,129 @@ class OneDriveDownloadArgs(BaseModel):
         max_length=500,
         description="Destination path. Validated against allowed_paths.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Settings API models (server.py Settings endpoints)
+# ---------------------------------------------------------------------------
+
+# Shell metacharacter pattern for model name validation (mirrors LLMConfig).
+_MODEL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$")
+
+
+class SettingsLLM(BaseModel):
+    """LLM settings exposed via the Settings API."""
+
+    provider: Literal["ollama", "anthropic", "openai"]
+    model: str = Field(max_length=200)
+    ollama_url: str = Field(max_length=500, pattern=r"^https?://")
+    anthropic_model: str = Field(max_length=200)
+    openai_model: str = Field(max_length=200)
+    # Boolean flags — never expose actual API key values.
+    anthropic_key_configured: bool = False
+    openai_key_configured: bool = False
+
+    @field_validator("model", "anthropic_model", "openai_model")
+    @classmethod
+    def validate_model_name(cls, v: str) -> str:
+        """Reject model names containing shell metacharacters or control chars."""
+        if not _MODEL_NAME_RE.match(v):
+            msg = "Model name contains invalid characters."
+            raise ValueError(msg)
+        return v
+
+
+class SettingsAppearance(BaseModel):
+    """Appearance settings."""
+
+    theme: Literal["light", "dark", "system"] = "light"
+
+
+class SettingsNotifications(BaseModel):
+    """Notification preferences."""
+
+    enabled: bool = True
+
+
+class SettingsLimits(BaseModel):
+    """Rate and size limits (read-only subset exposed to frontend)."""
+
+    max_tool_calls_per_message: int = Field(ge=1, le=100)
+    confirmation_timeout_s: int = Field(ge=10, le=3600)
+    max_message_length: int = Field(ge=1, le=100_000)
+
+
+class SettingsImmutable(BaseModel):
+    """Immutable server settings — read-only in API response."""
+
+    host: str
+    port: int
+
+
+class OAuthConnectionStatus(BaseModel):
+    """OAuth connection status for a provider."""
+
+    connected: bool = False
+    email: str | None = None
+    services: list[str] = Field(default_factory=list)
+
+
+class SettingsConnectedAccounts(BaseModel):
+    """Connected OAuth account statuses."""
+
+    google: OAuthConnectionStatus = Field(default_factory=OAuthConnectionStatus)
+    microsoft: OAuthConnectionStatus = Field(default_factory=OAuthConnectionStatus)
+
+
+class SettingsResponse(BaseModel):
+    """GET /api/settings response — full settings with masked sensitive fields."""
+
+    llm: SettingsLLM
+    appearance: SettingsAppearance
+    notifications: SettingsNotifications
+    limits: SettingsLimits
+    server: SettingsImmutable
+    connected_accounts: SettingsConnectedAccounts = Field(
+        default_factory=SettingsConnectedAccounts,
+    )
+
+
+class SettingsPatchLLM(BaseModel):
+    """Partial LLM settings for PATCH."""
+
+    provider: Literal["ollama", "anthropic", "openai"] | None = None
+    model: str | None = Field(default=None, max_length=200)
+    ollama_url: str | None = Field(default=None, max_length=500, pattern=r"^https?://")
+    anthropic_model: str | None = Field(default=None, max_length=200)
+    openai_model: str | None = Field(default=None, max_length=200)
+
+    @field_validator("model", "anthropic_model", "openai_model", mode="before")
+    @classmethod
+    def validate_model_name(cls, v: str | None) -> str | None:
+        """Reject model names containing shell metacharacters or control chars."""
+        if v is None:
+            return v
+        if not _MODEL_NAME_RE.match(v):
+            msg = "Model name contains invalid characters."
+            raise ValueError(msg)
+        return v
+
+
+class SettingsPatchAppearance(BaseModel):
+    """Partial appearance settings for PATCH."""
+
+    theme: Literal["light", "dark", "system"] | None = None
+
+
+class SettingsPatchNotifications(BaseModel):
+    """Partial notification settings for PATCH."""
+
+    enabled: bool | None = None
+
+
+class SettingsPatch(BaseModel):
+    """PATCH /api/settings request body — all fields optional for partial update."""
+
+    llm: SettingsPatchLLM | None = None
+    appearance: SettingsPatchAppearance | None = None
+    notifications: SettingsPatchNotifications | None = None

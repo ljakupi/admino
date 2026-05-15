@@ -168,7 +168,7 @@ class TestCalendarRead:
             args = GoogleCalendarReadArgs(event_id="evt123")
             result = await google_calendar.google_calendar_read(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
     async def test_api_error(self, mock_http: AsyncMock) -> None:
         """Non-200 returns API error."""
@@ -279,7 +279,7 @@ class TestCalendarList:
             args = GoogleCalendarListArgs(time_min=_NOW, time_max=_LATER)
             result = await google_calendar.google_calendar_list(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
 
 # ---------------------------------------------------------------------------
@@ -376,7 +376,7 @@ class TestCalendarCreate:
             args = GoogleCalendarCreateArgs(summary="Test", start=_NOW, end=_LATER)
             result = await google_calendar.google_calendar_create(args)
 
-        assert "OAuth not configured" in result
+        assert "OAuth error" in result
 
 
 # ---------------------------------------------------------------------------
