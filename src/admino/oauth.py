@@ -672,18 +672,10 @@ async def exchange_microsoft_code(
 
     if response.status_code != 200:
         error_code = _safe_error_code(response)
-        error_desc = ""
-        try:
-            err_body = response.json()
-            if isinstance(err_body, dict):
-                error_desc = str(err_body.get("error_description", ""))[:300]
-        except (ValueError, TypeError):
-            pass
         logger.error(
-            "Microsoft token exchange failed with status %d (error=%s): %s",
+            "Microsoft token exchange failed with status %d (error=%s).",
             response.status_code,
             error_code,
-            error_desc,
         )
         msg = "Microsoft token exchange failed. Check client credentials and auth code."
         raise OAuthError(msg)
