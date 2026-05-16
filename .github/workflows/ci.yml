@@ -33,9 +33,6 @@ jobs:
       - name: Install dependencies
         working-directory: static-src
         run: npm ci
-      - name: Generate permissions data
-        working-directory: static-src
-        run: node scripts/build-permissions.mjs
       - name: Type check
         working-directory: static-src
         run: npm run typecheck
