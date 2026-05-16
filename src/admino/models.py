@@ -1352,3 +1352,30 @@ class SettingsPatch(BaseModel):
     llm: SettingsPatchLLM | None = None
     appearance: SettingsPatchAppearance | None = None
     notifications: SettingsPatchNotifications | None = None
+
+
+# ---------------------------------------------------------------------------
+# Permissions API models
+# ---------------------------------------------------------------------------
+
+
+class PermissionEntry(BaseModel):
+    """A single permission row: (tool, action) → permission state."""
+
+    tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    permission: Literal["allow", "confirm", "deny"]
+
+
+class PermissionsResponse(BaseModel):
+    """GET /api/permissions response — full permission matrix."""
+
+    permissions: list[PermissionEntry]
+
+
+class PermissionPatch(BaseModel):
+    """PATCH /api/permissions request body — update a single permission."""
+
+    tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    permission: Literal["allow", "confirm", "deny"]

@@ -262,6 +262,33 @@ async def update_setting(pool: asyncpg.Pool, key: str, value: dict[str, Any]) ->
         )
 
 
+async def update_permission(
+    pool: asyncpg.Pool,
+    tool: str,
+    action: str,
+    permission: str,
+) -> None:
+    """Upsert a single permission row.
+
+    Inserts the row if it does not exist, updates it otherwise.
+    Uses parameterized query — no string interpolation.
+
+    Args:
+        pool: The asyncpg connection pool.
+        tool: Tool identifier (e.g. "gmail").
+        action: Action identifier (e.g. "search").
+        permission: One of "allow", "confirm", "deny".
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO permissions (tool, action, permission) VALUES ($1, $2, $3) "
+            "ON CONFLICT (tool, action) DO UPDATE SET permission = $3, updated_at = now()",
+            tool,
+            action,
+            permission,
+        )
+
+
 async def load_settings_from_db(
     pool: asyncpg.Pool,
 ) -> dict[str, Any]:
