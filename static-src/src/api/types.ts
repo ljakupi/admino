@@ -151,3 +151,23 @@ export interface SettingsPatch {
   appearance?: { theme?: AppTheme };
   notifications?: { enabled?: boolean };
 }
+
+// Permissions types
+
+export type PermissionState = 'allow' | 'confirm' | 'deny';
+
+export interface PermissionEntry {
+  tool: string;
+  action: string;
+  permission: PermissionState;
+}
+
+export interface PermissionsResponse {
+  permissions: PermissionEntry[];
+}
+
+export interface PermissionPatchRequest {
+  tool: string;
+  action: string;
+  permission: PermissionState;
+}
