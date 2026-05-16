@@ -483,7 +483,7 @@ class TestPatchPermissionsHardcodedDenials:
         assert resp.status_code == 200
 
     async def test_patch_hardcoded_denial_error_message_includes_details(self) -> None:
-        """Error response for hardcoded denial includes tool.action in detail."""
+        """Error response for hardcoded denial uses generic message (no input echo)."""
         app = _make_app()
         with (
             patch("admino.database.get_pool", _mock_get_pool()),
@@ -498,8 +498,10 @@ class TestPatchPermissionsHardcodedDenials:
                     json={"tool": "gmail", "action": "send", "permission": "allow"},
                 )
         body = resp.json()
-        assert "gmail.send" in body["detail"]
         assert "hardcoded denial" in body["detail"]
+        # User input must NOT be echoed in the error message.
+        assert "gmail" not in body["detail"]
+        assert "send" not in body["detail"]
 
 
 # ---------------------------------------------------------------------------
