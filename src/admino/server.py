@@ -1101,14 +1101,25 @@ async def patch_permissions(
     if (body.tool, body.action) in HARDCODED_DENIALS and body.permission != "deny":
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"'{body.tool}.{body.action}' is a hardcoded denial and cannot be "
-                f"set to '{body.permission}'. Only 'deny' is allowed."
-            ),
+            detail="This tool/action pair is a hardcoded denial and cannot be changed.",
         )
 
     pool = get_pool()
+
+    # Load old value for audit trail before mutation.
+    old_permissions = await load_permissions_from_db(pool)
+    old_value = old_permissions.get(body.tool, {}).get(body.action, "deny")
+
     await update_permission(pool, body.tool, body.action, body.permission)
+
+    # Audit log: record the permission change at WARNING level.
+    logger.warning(
+        "Permission changed: tool=%s action=%s old=%s new=%s",
+        body.tool,
+        body.action,
+        old_value,
+        body.permission,
+    )
 
     # Reload permissions config and update the running agent immediately.
     new_permissions = await load_permissions_config_from_db(pool)
@@ -1254,7 +1265,7 @@ def create_app(
     _rate_limiters["/api/settings/get"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/settings/patch"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/permissions/patch"] = _TokenBucket(rate=0.5, capacity=3)
+    _rate_limiters["/api/permissions/patch"] = _TokenBucket(rate=0.2, capacity=2)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.
