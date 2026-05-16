@@ -76,6 +76,20 @@ function syncDrafts() {
 onMounted(async () => {
   await settings.loadSettings();
   syncDrafts();
+
+  // Handle OAuth callback result from URL params
+  const params = new URLSearchParams(window.location.search);
+  const oauthResult = params.get('oauth');
+  if (oauthResult === 'success') {
+    toasts.add('success', 'Google connected', 'Your Google account has been linked.');
+    window.history.replaceState({}, '', window.location.pathname);
+    activeSection.value = 'accounts';
+  } else if (oauthResult === 'error') {
+    const reason = params.get('reason') || 'unknown';
+    toasts.add('error', 'Connection failed', `OAuth failed: ${reason}`);
+    window.history.replaceState({}, '', window.location.pathname);
+    activeSection.value = 'accounts';
+  }
 });
 
 async function onProviderChange(p: LLMProvider) {
@@ -144,19 +158,19 @@ async function onNotificationsChange(value: boolean) {
 
 // --- Connected accounts ---
 function connectGoogle() {
-  window.location.href = '/api/oauth/google/start';
+  settings.connectGoogle();
 }
 
 function connectMicrosoft() {
-  window.location.href = '/api/oauth/microsoft/start';
+  toasts.add('info', 'Coming soon', 'Microsoft OAuth is not yet available.');
 }
 
 function disconnectGoogle() {
-  toasts.add('info', 'Coming soon', 'Account disconnection is not yet available.');
+  settings.disconnectGoogle();
 }
 
 function disconnectMicrosoft() {
-  toasts.add('info', 'Coming soon', 'Account disconnection is not yet available.');
+  toasts.add('info', 'Coming soon', 'Microsoft OAuth is not yet available.');
 }
 
 // --- Data / Danger section ---
@@ -173,8 +187,10 @@ function handleNewSession() {
   toasts.add('success', 'New session started');
 }
 
-function handleDisconnectAll() {
-  toasts.add('info', 'Coming soon', 'Disconnect all accounts is not yet available.');
+async function handleDisconnectAll() {
+  if (settings.connectedAccounts.google.connected) {
+    await settings.disconnectGoogle();
+  }
 }
 
 function handleResetSettings() {

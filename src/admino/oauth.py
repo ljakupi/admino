@@ -52,6 +52,7 @@ OAuthProvider = Literal["google", "microsoft"]
 
 GOOGLE_TOKEN_ENDPOINT: str = "https://oauth2.googleapis.com/token"  # noqa: S105
 GOOGLE_AUTH_ENDPOINT: str = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_USERINFO_ENDPOINT: str = "https://www.googleapis.com/oauth2/v2/userinfo"
 
 # Scopes: broad at the API level — the agent's permission engine (permissions.py
 # hardcoded denials + permissions.yaml) is the actual access control layer.
@@ -286,6 +287,36 @@ def save_token(tokens_dir: Path, token: TokenFile) -> None:
         raise OAuthError(msg) from exc
 
 
+def delete_token(tokens_dir: Path, provider: OAuthProvider = "google") -> bool:
+    """Delete the token file for a given provider.
+
+    Uses ``_token_file_path`` to resolve the file location and removes it
+    if it exists. This is used during account disconnection flows.
+
+    Args:
+        tokens_dir: Directory containing token files.
+        provider: OAuth provider name.
+
+    Returns:
+        True if the file existed and was deleted, False if it did not exist.
+
+    Raises:
+        OAuthError: If the file exists but deletion fails.
+
+    Security notes:
+        No credentials are logged or included in error messages.
+    """
+    path = _token_file_path(tokens_dir, provider)
+    if not path.is_file():
+        return False
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        msg = "Failed to delete token file."
+        raise OAuthError(msg) from exc
+    return True
+
+
 def _safe_error_code(response: httpx.Response) -> str:
     """Extract the ``error`` field from a JSON error response.
 
@@ -490,6 +521,60 @@ async def _refresh_google_token(
         expires_in = 3600
 
     return access_token, min(expires_in, _MAX_TOKEN_LIFETIME_S)
+
+
+async def get_google_user_email(
+    access_token: str,
+    http_client: httpx.AsyncClient,
+) -> str | None:
+    """Fetch the authenticated Google user's email address.
+
+    Calls the Google userinfo endpoint with the provided access token
+    and returns the ``email`` field from the JSON response.
+
+    This function never raises — all errors are caught and logged, and
+    ``None`` is returned on any failure. This makes it safe to call in
+    non-critical paths (e.g. displaying the connected account) without
+    risking an unhandled exception.
+
+    Args:
+        access_token: A valid Google OAuth2 access token.
+        http_client: An httpx async client for making the HTTP request.
+
+    Returns:
+        The user's email address as a string, or None on any failure.
+
+    Security notes:
+        No credentials (access tokens) are included in log output.
+    """
+    try:
+        response = await http_client.get(
+            GOOGLE_USERINFO_ENDPOINT,
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+    except httpx.HTTPError:
+        logger.warning("HTTP request to Google userinfo endpoint failed.")
+        return None
+
+    if response.status_code != 200:
+        logger.warning(
+            "Google userinfo endpoint returned status %d.",
+            response.status_code,
+        )
+        return None
+
+    try:
+        data = response.json()
+    except (json.JSONDecodeError, ValueError):
+        logger.warning("Google userinfo endpoint returned invalid JSON.")
+        return None
+
+    email = data.get("email") if isinstance(data, dict) else None
+    if not isinstance(email, str) or not email:
+        logger.warning("Google userinfo response missing email field.")
+        return None
+
+    return email
 
 
 # ---------------------------------------------------------------------------

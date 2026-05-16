@@ -11,3 +11,11 @@ export async function patchSettings(patch: SettingsPatch): Promise<SettingsRespo
     body: JSON.stringify(patch),
   });
 }
+
+export async function getOAuthAuthorizeUrl(): Promise<{ url: string }> {
+  return fetchJson<{ url: string }>('/api/oauth/google/authorize');
+}
+
+export async function disconnectOAuth(provider: 'google' | 'microsoft'): Promise<void> {
+  await fetchJson<{ status: string }>(`/api/oauth/${provider}`, { method: 'DELETE' });
+}

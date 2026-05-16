@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import { getSettings, patchSettings } from '@/api/settings';
+import { getSettings, patchSettings, getOAuthAuthorizeUrl, disconnectOAuth } from '@/api/settings';
 import { useToastStore } from '@/stores/toasts';
 import type {
   SettingsResponse,
@@ -190,6 +190,41 @@ export const useSettingsStore = defineStore('settings', () => {
     await saveSetting({ notifications: { enabled: value } });
   }
 
+  async function connectGoogle() {
+    try {
+      const { url } = await getOAuthAuthorizeUrl();
+      window.location.href = url;
+    } catch (e) {
+      const toasts = useToastStore();
+      const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
+      toasts.add('error', 'Connection failed', msg);
+    }
+  }
+
+  async function disconnectGoogle() {
+    const toasts = useToastStore();
+    try {
+      await disconnectOAuth('google');
+      await loadSettings();
+      toasts.add('success', 'Google disconnected');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to disconnect';
+      toasts.add('error', 'Disconnect failed', msg);
+    }
+  }
+
+  async function disconnectMicrosoft() {
+    const toasts = useToastStore();
+    try {
+      await disconnectOAuth('microsoft');
+      await loadSettings();
+      toasts.add('success', 'Microsoft disconnected');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : 'Failed to disconnect';
+      toasts.add('error', 'Disconnect failed', msg);
+    }
+  }
+
   return {
     // Auth
     token,
@@ -229,5 +264,8 @@ export const useSettingsStore = defineStore('settings', () => {
     setAnthropicModel,
     setOpenAiModel,
     setNotificationsEnabled,
+    connectGoogle,
+    disconnectGoogle,
+    disconnectMicrosoft,
   };
 });
