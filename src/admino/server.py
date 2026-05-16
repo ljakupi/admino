@@ -1199,7 +1199,7 @@ async def oauth_google_authorize(
         - State tokens expire after ``_OAUTH_STATE_TTL_S`` seconds.
         - Never logs credentials or tokens.
     """
-    _check_rate_limit("/api/oauth/authorize")
+    _check_rate_limit("/api/oauth/google/authorize")
 
     # Reap expired states to prevent unbounded growth.
     now = time.time()
@@ -1220,7 +1220,7 @@ async def oauth_google_authorize(
 
 
 async def oauth_callback(
-    code: str | None = Query(default=None, max_length=512),
+    code: str | None = Query(default=None, max_length=512, pattern=r"^[A-Za-z0-9/_\-]+$"),
     state: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_\-]+$"),
     error: str | None = Query(default=None, max_length=64),
 ) -> RedirectResponse:
@@ -1276,7 +1276,9 @@ async def oauth_callback(
     redirect_uri = _build_oauth_redirect_uri()
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0),
+        ) as client:
             access_token, refresh_token, scopes = await exchange_google_code(
                 code, redirect_uri, client
             )
@@ -1326,7 +1328,7 @@ async def oauth_google_status(
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/status")
+    _check_rate_limit("/api/oauth/google/status")
 
     token_path = _config.paths.tokens_dir / "google.json"
     if token_path.is_file():
@@ -1359,7 +1361,7 @@ async def oauth_google_disconnect(
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/disconnect")
+    _check_rate_limit("/api/oauth/google/disconnect")
 
     try:
         deleted = delete_token(_config.paths.tokens_dir, "google")
@@ -1504,10 +1506,10 @@ def create_app(
     _rate_limiters["/api/settings/patch"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/permissions/patch"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/authorize"] = _TokenBucket(rate=0.2, capacity=2)
+    _rate_limiters["/api/oauth/google/authorize"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/callback"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/status"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/oauth/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
+    _rate_limiters["/api/oauth/google/status"] = _TokenBucket(rate=1.0, capacity=5)
+    _rate_limiters["/api/oauth/google/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.

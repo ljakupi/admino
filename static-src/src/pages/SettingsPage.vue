@@ -85,8 +85,15 @@ onMounted(async () => {
     window.history.replaceState({}, '', window.location.pathname);
     activeSection.value = 'accounts';
   } else if (oauthResult === 'error') {
-    const reason = params.get('reason') || 'unknown';
-    toasts.add('error', 'Connection failed', `OAuth failed: ${reason}`);
+    const REASON_MESSAGES: Record<string, string> = {
+      denied: 'You declined the consent screen.',
+      invalid_state: 'Session expired. Please try again.',
+      missing_code: 'No authorization code received.',
+      exchange_failed: 'Token exchange failed. Check OAuth credentials.',
+    };
+    const reason = params.get('reason') || '';
+    const message = REASON_MESSAGES[reason] ?? 'An unexpected error occurred.';
+    toasts.add('error', 'Connection failed', message);
     window.history.replaceState({}, '', window.location.pathname);
     activeSection.value = 'accounts';
   }

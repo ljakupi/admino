@@ -17,5 +17,8 @@ export async function getOAuthAuthorizeUrl(): Promise<{ url: string }> {
 }
 
 export async function disconnectOAuth(provider: 'google' | 'microsoft'): Promise<void> {
+  if (provider !== 'google' && provider !== 'microsoft') {
+    throw new Error('Invalid provider');
+  }
   await fetchJson<{ status: string }>(`/api/oauth/${provider}`, { method: 'DELETE' });
 }

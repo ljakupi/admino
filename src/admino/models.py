@@ -1295,7 +1295,11 @@ class OAuthConnectionStatus(BaseModel):
     """OAuth connection status for a provider."""
 
     connected: bool = False
-    email: str | None = None
+    email: str | None = Field(
+        default=None,
+        max_length=254,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
     services: list[str] = Field(default_factory=list)
 
 
