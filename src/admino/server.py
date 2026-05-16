@@ -65,6 +65,9 @@ from admino.models import (
     OAuthConnectionStatus,
     PendingConfirmation,
     PendingConfirmationSummary,
+    PermissionEntry,
+    PermissionPatch,
+    PermissionsResponse,
     SettingsAppearance,
     SettingsConnectedAccounts,
     SettingsImmutable,
@@ -1026,6 +1029,104 @@ async def patch_settings(
 
 
 # ---------------------------------------------------------------------------
+# Permissions route handlers
+# ---------------------------------------------------------------------------
+
+
+async def get_permissions(
+    _auth: None = Depends(require_auth),
+) -> PermissionsResponse:
+    """Handle GET /api/permissions — return full permission matrix.
+
+    Loads all permission rows from the database and returns them as a flat
+    list of (tool, action, permission) entries.
+
+    Args:
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        PermissionsResponse with all configured permissions.
+    """
+    from admino.database import get_pool, load_permissions_from_db
+
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/permissions/get")
+
+    pool = get_pool()
+    raw = await load_permissions_from_db(pool)
+
+    entries: list[PermissionEntry] = []
+    for tool, actions in sorted(raw.items()):
+        for action, permission in sorted(actions.items()):
+            entries.append(
+                PermissionEntry(tool=tool, action=action, permission=permission)  # type: ignore[arg-type]
+            )
+
+    return PermissionsResponse(permissions=entries)
+
+
+async def patch_permissions(
+    body: PermissionPatch,
+    _auth: None = Depends(require_auth),
+) -> PermissionsResponse:
+    """Handle PATCH /api/permissions — update a single permission.
+
+    Validates that the update does not attempt to override a hardcoded denial,
+    persists the change to the database, reloads the permissions config into
+    the running agent, and returns the updated full permission matrix.
+
+    Args:
+        body: Validated PermissionPatch with tool, action, permission.
+        _auth: Auth dependency (side-effect only).
+
+    Returns:
+        Updated PermissionsResponse after applying the change.
+
+    Raises:
+        HTTPException: 400 if attempting to override a hardcoded denial,
+                       500 if server not configured.
+    """
+    from admino.config import load_permissions_config_from_db
+    from admino.database import get_pool, load_permissions_from_db, update_permission
+    from admino.permissions import HARDCODED_DENIALS
+
+    if _agent is None or _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/permissions/patch")
+
+    # Enforce hardcoded denials: these cannot be set to anything other than "deny".
+    if (body.tool, body.action) in HARDCODED_DENIALS and body.permission != "deny":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"'{body.tool}.{body.action}' is a hardcoded denial and cannot be "
+                f"set to '{body.permission}'. Only 'deny' is allowed."
+            ),
+        )
+
+    pool = get_pool()
+    await update_permission(pool, body.tool, body.action, body.permission)
+
+    # Reload permissions config and update the running agent immediately.
+    new_permissions = await load_permissions_config_from_db(pool)
+    _agent._permissions = new_permissions
+
+    # Return updated full matrix.
+    raw = await load_permissions_from_db(pool)
+    entries: list[PermissionEntry] = []
+    for tool, actions in sorted(raw.items()):
+        for action, permission in sorted(actions.items()):
+            entries.append(
+                PermissionEntry(tool=tool, action=action, permission=permission)  # type: ignore[arg-type]
+            )
+
+    return PermissionsResponse(permissions=entries)
+
+
+# ---------------------------------------------------------------------------
 # Validation error handler
 # ---------------------------------------------------------------------------
 
@@ -1152,6 +1253,8 @@ def create_app(
     _rate_limiters["/api/events"] = _TokenBucket(rate=0.17, capacity=3)
     _rate_limiters["/api/settings/get"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/settings/patch"] = _TokenBucket(rate=0.2, capacity=2)
+    _rate_limiters["/api/permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
+    _rate_limiters["/api/permissions/patch"] = _TokenBucket(rate=0.5, capacity=3)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.
@@ -1211,6 +1314,8 @@ def create_app(
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
     app.get("/api/settings", response_model=SettingsResponse)(get_settings)
     app.patch("/api/settings", response_model=SettingsResponse)(patch_settings)
+    app.get("/api/permissions", response_model=PermissionsResponse)(get_permissions)
+    app.patch("/api/permissions", response_model=PermissionsResponse)(patch_permissions)
 
     # --- Static files (MUST be last so API routes take priority) ---
     # Resolve the PWA static directory. Checked in order:
