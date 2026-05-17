@@ -245,11 +245,11 @@ _pending_confirmations: dict[str, PendingConfirmation] = {}
 # eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
 _session_locks: dict[str, asyncio.Lock] = {}
 
-# OAuth CSRF state tokens: maps state string -> (creation_timestamp, provider).
+# OAuth CSRF state tokens: maps state string -> (timestamp, provider, redirect_uri).
 # Entries expire after _OAUTH_STATE_TTL_S seconds. Reaped on each authorize call.
 _OAUTH_STATE_TTL_S: int = 600  # 10 minutes
 _OAUTH_PENDING_STATES_MAX: int = 50
-_oauth_pending_states: dict[str, tuple[float, OAuthProvider]] = {}
+_oauth_pending_states: dict[str, tuple[float, OAuthProvider, str]] = {}
 
 # Injected at app creation time by create_app().
 _agent: Agent | None = None
@@ -1169,6 +1169,26 @@ async def patch_permissions(
 # ---------------------------------------------------------------------------
 
 
+def _reap_oauth_states() -> None:
+    """Reap expired CSRF state tokens and enforce the capacity cap.
+
+    Removes all entries older than ``_OAUTH_STATE_TTL_S`` seconds,
+    then evicts the oldest entry if the dict is at capacity. This is
+    a synchronous function (no ``await``) to ensure atomicity within
+    the single-threaded asyncio event loop.
+    """
+    now = time.time()
+    expired = [
+        s for s, (ts, _p, _u) in _oauth_pending_states.items()
+        if now - ts > _OAUTH_STATE_TTL_S
+    ]
+    for s in expired:
+        del _oauth_pending_states[s]
+    if len(_oauth_pending_states) >= _OAUTH_PENDING_STATES_MAX:
+        oldest = min(_oauth_pending_states, key=lambda s: _oauth_pending_states[s][0])
+        del _oauth_pending_states[oldest]
+
+
 def _build_oauth_redirect_uri() -> str:
     """Build the OAuth callback redirect URI.
 
@@ -1214,15 +1234,7 @@ async def oauth_google_authorize(
         - Never logs credentials or tokens.
     """
     _check_rate_limit("/api/oauth/google/authorize")
-
-    # Reap expired states and enforce capacity cap.
-    now = time.time()
-    expired = [s for s, (ts, _p) in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S]
-    for s in expired:
-        del _oauth_pending_states[s]
-    if len(_oauth_pending_states) >= _OAUTH_PENDING_STATES_MAX:
-        oldest = min(_oauth_pending_states, key=lambda s: _oauth_pending_states[s][0])
-        del _oauth_pending_states[oldest]
+    _reap_oauth_states()
 
     redirect_uri = _build_oauth_redirect_uri()
     try:
@@ -1231,7 +1243,7 @@ async def oauth_google_authorize(
         logger.error("Failed to build Google consent URL — check OAuth env vars.")
         raise HTTPException(status_code=500, detail="OAuth configuration error.")  # noqa: B904
 
-    _oauth_pending_states[state] = (time.time(), "google")
+    _oauth_pending_states[state] = (time.time(), "google", redirect_uri)
     logger.info("Google OAuth authorize URL generated.")
     return OAuthAuthorizeResponse(url=url)
 
@@ -1258,15 +1270,7 @@ async def oauth_microsoft_authorize(
         - Never logs credentials or tokens.
     """
     _check_rate_limit("/api/oauth/microsoft/authorize")
-
-    # Reap expired states and enforce capacity cap.
-    now = time.time()
-    expired = [s for s, (ts, _p) in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S]
-    for s in expired:
-        del _oauth_pending_states[s]
-    if len(_oauth_pending_states) >= _OAUTH_PENDING_STATES_MAX:
-        oldest = min(_oauth_pending_states, key=lambda s: _oauth_pending_states[s][0])
-        del _oauth_pending_states[oldest]
+    _reap_oauth_states()
 
     redirect_uri = _build_oauth_redirect_uri()
     try:
@@ -1275,13 +1279,13 @@ async def oauth_microsoft_authorize(
         logger.error("Failed to build Microsoft consent URL — check OAuth env vars.")
         raise HTTPException(status_code=500, detail="OAuth configuration error.")  # noqa: B904
 
-    _oauth_pending_states[state] = (time.time(), "microsoft")
+    _oauth_pending_states[state] = (time.time(), "microsoft", redirect_uri)
     logger.info("Microsoft OAuth authorize URL generated.")
     return OAuthAuthorizeResponse(url=url)
 
 
 async def oauth_callback(
-    code: str | None = Query(default=None, max_length=2048, pattern=r"^[A-Za-z0-9/_.\-+=*!]+$"),
+    code: str | None = Query(default=None, max_length=2048, pattern=r"^[A-Za-z0-9/_.\-+=]+$"),
     state: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_\-]+$"),
     error: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_]+$"),
 ) -> RedirectResponse:
@@ -1320,7 +1324,7 @@ async def oauth_callback(
         return RedirectResponse(url="/settings?oauth=error&reason=invalid_state", status_code=307)
 
     # Pop and validate state expiry.
-    created_at, provider = _oauth_pending_states.pop(state)
+    created_at, provider, redirect_uri = _oauth_pending_states.pop(state)
     if time.time() - created_at > _OAUTH_STATE_TTL_S:
         logger.warning("%s OAuth callback received expired state token.", provider.capitalize())
         return RedirectResponse(url="/settings?oauth=error&reason=invalid_state", status_code=307)
@@ -1334,8 +1338,6 @@ async def oauth_callback(
     if not code:
         logger.warning("%s OAuth callback missing authorization code.", provider.capitalize())
         return RedirectResponse(url="/settings?oauth=error&reason=missing_code", status_code=307)
-
-    redirect_uri = _build_oauth_redirect_uri()
 
     try:
         async with httpx.AsyncClient(
@@ -1353,8 +1355,10 @@ async def oauth_callback(
                 )
                 email = None
 
-            # Encrypt and persist the refresh token.
+            # Encrypt and persist the refresh token, then clear plaintext
+            # from the local scope to minimise in-memory exposure.
             encrypted = encrypt_refresh_token(refresh_token)
+            del refresh_token
             now_utc = datetime.now(UTC)
             token_file = TokenFile(
                 provider=provider,
