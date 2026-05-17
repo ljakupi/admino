@@ -192,7 +192,18 @@ export const useSettingsStore = defineStore('settings', () => {
 
   async function connectGoogle() {
     try {
-      const { url } = await getOAuthAuthorizeUrl();
+      const { url } = await getOAuthAuthorizeUrl('google');
+      window.location.href = url;
+    } catch (e) {
+      const toasts = useToastStore();
+      const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
+      toasts.add('error', 'Connection failed', msg);
+    }
+  }
+
+  async function connectMicrosoft() {
+    try {
+      const { url } = await getOAuthAuthorizeUrl('microsoft');
       window.location.href = url;
     } catch (e) {
       const toasts = useToastStore();
@@ -265,6 +276,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setOpenAiModel,
     setNotificationsEnabled,
     connectGoogle,
+    connectMicrosoft,
     disconnectGoogle,
     disconnectMicrosoft,
   };

@@ -68,6 +68,20 @@ async def _get_google_token() -> str:
         return _cached_token
 
 
+async def clear_token_cache() -> None:
+    """Reset the in-memory cached access token.
+
+    Acquires ``_token_lock`` to avoid clearing the cache while a
+    concurrent tool call is mid-refresh. Called by the OAuth disconnect
+    endpoint to ensure stale tokens are not reused after the user
+    disconnects their Google account.
+    """
+    async with _token_lock:
+        global _cached_token, _cached_expires_at
+        _cached_token = None
+        _cached_expires_at = None
+
+
 def _auth_headers(token: str) -> dict[str, str]:
     """Build Authorization header for Google API requests."""
     return {"Authorization": f"Bearer {token}"}
