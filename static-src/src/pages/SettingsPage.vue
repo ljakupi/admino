@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
+import { useRouter } from 'vue-router';
 import {
   Key, PlugZap, BrainCircuit, Palette, Bell, Info, TriangleAlert,
   Mail, Calendar, Folder, ShieldCheck, Plus, Link, Github,
@@ -10,6 +11,7 @@ import { useSettingsStore, type LLMProvider } from '@/stores/settings';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
 
+const router = useRouter();
 const settings = useSettingsStore();
 const chatStore = useChatStore();
 const toasts = useToastStore();
@@ -76,6 +78,27 @@ function syncDrafts() {
 onMounted(async () => {
   await settings.loadSettings();
   syncDrafts();
+
+  // Handle OAuth callback result from URL params
+  const params = new URLSearchParams(window.location.search);
+  const oauthResult = params.get('oauth');
+  if (oauthResult === 'success') {
+    toasts.add('success', 'Account connected', 'Your account has been linked successfully.');
+    await router.replace({ path: '/settings' });
+    activeSection.value = 'accounts';
+  } else if (oauthResult === 'error') {
+    const REASON_MESSAGES: Record<string, string> = {
+      denied: 'You declined the consent screen.',
+      invalid_state: 'Session expired. Please try again.',
+      missing_code: 'No authorization code received.',
+      exchange_failed: 'Token exchange failed. Check OAuth credentials.',
+    };
+    const reason = params.get('reason') || '';
+    const message = REASON_MESSAGES[reason] ?? 'An unexpected error occurred.';
+    toasts.add('error', 'Connection failed', message);
+    await router.replace({ path: '/settings' });
+    activeSection.value = 'accounts';
+  }
 });
 
 async function onProviderChange(p: LLMProvider) {
@@ -144,19 +167,19 @@ async function onNotificationsChange(value: boolean) {
 
 // --- Connected accounts ---
 function connectGoogle() {
-  window.location.href = '/api/oauth/google/start';
+  settings.connectGoogle();
 }
 
 function connectMicrosoft() {
-  window.location.href = '/api/oauth/microsoft/start';
+  settings.connectMicrosoft();
 }
 
-function disconnectGoogle() {
-  toasts.add('info', 'Coming soon', 'Account disconnection is not yet available.');
+async function disconnectGoogle() {
+  await settings.disconnectGoogle();
 }
 
-function disconnectMicrosoft() {
-  toasts.add('info', 'Coming soon', 'Account disconnection is not yet available.');
+async function disconnectMicrosoft() {
+  await settings.disconnectMicrosoft();
 }
 
 // --- Data / Danger section ---
@@ -173,8 +196,13 @@ function handleNewSession() {
   toasts.add('success', 'New session started');
 }
 
-function handleDisconnectAll() {
-  toasts.add('info', 'Coming soon', 'Disconnect all accounts is not yet available.');
+async function handleDisconnectAll() {
+  if (settings.connectedAccounts.google.connected) {
+    await settings.disconnectGoogle();
+  }
+  if (settings.connectedAccounts.microsoft.connected) {
+    await settings.disconnectMicrosoft();
+  }
 }
 
 function handleResetSettings() {
