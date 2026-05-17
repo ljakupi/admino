@@ -82,14 +82,23 @@ from admino.models import (
 )
 from admino.oauth import (
     OAuthError,
+    OAuthProvider,
     TokenFile,
     build_google_consent_url,
-    delete_token,
+    build_microsoft_consent_url,
     encrypt_refresh_token,
     exchange_google_code,
+    exchange_microsoft_code,
     get_google_user_email,
+    revoke_and_delete_token,
     save_token,
 )
+from admino.tools.gmail import clear_token_cache as _clear_gmail_cache
+from admino.tools.google_calendar import clear_token_cache as _clear_gcal_cache
+from admino.tools.google_drive import clear_token_cache as _clear_gdrive_cache
+from admino.tools.onedrive import clear_token_cache as _clear_onedrive_cache
+from admino.tools.outlook import clear_token_cache as _clear_outlook_cache
+from admino.tools.outlook_calendar import clear_token_cache as _clear_outcal_cache
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -236,10 +245,11 @@ _pending_confirmations: dict[str, PendingConfirmation] = {}
 # eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
 _session_locks: dict[str, asyncio.Lock] = {}
 
-# OAuth CSRF state tokens: maps state string -> creation timestamp (epoch seconds).
+# OAuth CSRF state tokens: maps state string -> (creation_timestamp, provider).
 # Entries expire after _OAUTH_STATE_TTL_S seconds. Reaped on each authorize call.
 _OAUTH_STATE_TTL_S: int = 600  # 10 minutes
-_oauth_pending_states: dict[str, float] = {}
+_OAUTH_PENDING_STATES_MAX: int = 50
+_oauth_pending_states: dict[str, tuple[float, OAuthProvider]] = {}
 
 # Injected at app creation time by create_app().
 _agent: Agent | None = None
@@ -1160,18 +1170,22 @@ async def patch_permissions(
 
 
 def _build_oauth_redirect_uri() -> str:
-    """Build the OAuth callback redirect URI from server config.
+    """Build the OAuth callback redirect URI.
 
-    Uses the configured host and port. Replaces ``0.0.0.0`` with
-    ``localhost`` because OAuth providers reject wildcard bind addresses.
+    Reads ``OAUTH_REDIRECT_URI`` from the environment if set (preferred —
+    must match the URI registered in the OAuth provider's console). Falls
+    back to constructing from server config (host + port).
 
     Returns:
         The fully-qualified callback URL string.
 
     Security notes:
-        The redirect URI is deterministic from config — never derived from
-        untrusted request headers (Host, X-Forwarded-*).
+        The redirect URI is deterministic from config/env — never derived
+        from untrusted request headers (Host, X-Forwarded-*).
     """
+    env_uri = os.environ.get("OAUTH_REDIRECT_URI")
+    if env_uri:
+        return env_uri
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
     host = "localhost" if _config.server.host == "0.0.0.0" else _config.server.host  # noqa: S104
@@ -1201,11 +1215,14 @@ async def oauth_google_authorize(
     """
     _check_rate_limit("/api/oauth/google/authorize")
 
-    # Reap expired states to prevent unbounded growth.
+    # Reap expired states and enforce capacity cap.
     now = time.time()
-    expired = [s for s, ts in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S]
+    expired = [s for s, (ts, _p) in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S]
     for s in expired:
         del _oauth_pending_states[s]
+    if len(_oauth_pending_states) >= _OAUTH_PENDING_STATES_MAX:
+        oldest = min(_oauth_pending_states, key=lambda s: _oauth_pending_states[s][0])
+        del _oauth_pending_states[oldest]
 
     redirect_uri = _build_oauth_redirect_uri()
     try:
@@ -1214,28 +1231,73 @@ async def oauth_google_authorize(
         logger.error("Failed to build Google consent URL — check OAuth env vars.")
         raise HTTPException(status_code=500, detail="OAuth configuration error.")  # noqa: B904
 
-    _oauth_pending_states[state] = time.time()
+    _oauth_pending_states[state] = (time.time(), "google")
     logger.info("Google OAuth authorize URL generated.")
     return OAuthAuthorizeResponse(url=url)
 
 
+async def oauth_microsoft_authorize(
+    _auth: None = Depends(require_auth),
+) -> OAuthAuthorizeResponse:
+    """Build and return a Microsoft OAuth consent URL.
+
+    Generates a CSRF state token, stores it in ``_oauth_pending_states``,
+    and returns the consent URL for the frontend to redirect the user.
+    Expired state tokens are reaped on each call.
+
+    Returns:
+        OAuthAuthorizeResponse with the consent URL.
+
+    Raises:
+        HTTPException: 500 if OAuth env vars are not configured.
+
+    Security notes:
+        - Requires Bearer auth.
+        - Rate limited to prevent state-token flooding.
+        - State tokens expire after ``_OAUTH_STATE_TTL_S`` seconds.
+        - Never logs credentials or tokens.
+    """
+    _check_rate_limit("/api/oauth/microsoft/authorize")
+
+    # Reap expired states and enforce capacity cap.
+    now = time.time()
+    expired = [s for s, (ts, _p) in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S]
+    for s in expired:
+        del _oauth_pending_states[s]
+    if len(_oauth_pending_states) >= _OAUTH_PENDING_STATES_MAX:
+        oldest = min(_oauth_pending_states, key=lambda s: _oauth_pending_states[s][0])
+        del _oauth_pending_states[oldest]
+
+    redirect_uri = _build_oauth_redirect_uri()
+    try:
+        url, state = build_microsoft_consent_url(redirect_uri)
+    except OAuthError:
+        logger.error("Failed to build Microsoft consent URL — check OAuth env vars.")
+        raise HTTPException(status_code=500, detail="OAuth configuration error.")  # noqa: B904
+
+    _oauth_pending_states[state] = (time.time(), "microsoft")
+    logger.info("Microsoft OAuth authorize URL generated.")
+    return OAuthAuthorizeResponse(url=url)
+
+
 async def oauth_callback(
-    code: str | None = Query(default=None, max_length=512, pattern=r"^[A-Za-z0-9/_\-]+$"),
+    code: str | None = Query(default=None, max_length=2048, pattern=r"^[A-Za-z0-9/_.\-+=*!]+$"),
     state: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_\-]+$"),
-    error: str | None = Query(default=None, max_length=64),
+    error: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_]+$"),
 ) -> RedirectResponse:
-    """Handle the Google OAuth callback redirect.
+    """Handle the OAuth callback redirect for Google and Microsoft.
 
-    Validates the CSRF state, exchanges the authorization code for tokens,
-    encrypts the refresh token, and persists it to disk.
+    Validates the CSRF state, determines the provider from the stored state,
+    exchanges the authorization code for tokens, encrypts the refresh token,
+    and persists it to disk.
 
-    No auth required — this endpoint is called by Google's redirect, not
-    by the authenticated frontend.
+    No auth required — this endpoint is called by the provider's redirect,
+    not by the authenticated frontend.
 
     Args:
-        code: Authorization code from Google (present on success).
+        code: Authorization code from the provider (present on success).
         state: CSRF state token (must match a pending state).
-        error: Error string from Google (present on user denial).
+        error: Error string from the provider (present on user denial).
 
     Returns:
         RedirectResponse to the settings page with status query params.
@@ -1252,25 +1314,25 @@ async def oauth_callback(
         raise HTTPException(status_code=500, detail="Server not configured")
 
     # Validate CSRF state first (RFC 6749 §10.12) — before inspecting any
-    # other parameter, including the error parameter from Google.
+    # other parameter, including the error parameter from the provider.
     if not state or state not in _oauth_pending_states:
-        logger.warning("Google OAuth callback received invalid or missing state.")
+        logger.warning("OAuth callback received invalid or missing state.")
         return RedirectResponse(url="/settings?oauth=error&reason=invalid_state", status_code=307)
 
     # Pop and validate state expiry.
-    created_at = _oauth_pending_states.pop(state)
+    created_at, provider = _oauth_pending_states.pop(state)
     if time.time() - created_at > _OAUTH_STATE_TTL_S:
-        logger.warning("Google OAuth callback received expired state token.")
+        logger.warning("%s OAuth callback received expired state token.", provider.capitalize())
         return RedirectResponse(url="/settings?oauth=error&reason=invalid_state", status_code=307)
 
-    # Google denied consent.
+    # Provider denied consent.
     if error:
-        logger.info("Google OAuth callback received denial from user.")
+        logger.info("%s OAuth callback received denial from user.", provider.capitalize())
         return RedirectResponse(url="/settings?oauth=error&reason=denied", status_code=307)
 
     # Missing authorization code.
     if not code:
-        logger.warning("Google OAuth callback missing authorization code.")
+        logger.warning("%s OAuth callback missing authorization code.", provider.capitalize())
         return RedirectResponse(url="/settings?oauth=error&reason=missing_code", status_code=307)
 
     redirect_uri = _build_oauth_redirect_uri()
@@ -1279,34 +1341,39 @@ async def oauth_callback(
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=5.0),
         ) as client:
-            access_token, refresh_token, scopes = await exchange_google_code(
-                code, redirect_uri, client
-            )
+            if provider == "google":
+                access_token, refresh_token, scopes = await exchange_google_code(
+                    code, redirect_uri, client
+                )
+                # Best-effort: fetch user email for display purposes.
+                email = await get_google_user_email(access_token, client)
+            else:
+                access_token, refresh_token, scopes = await exchange_microsoft_code(
+                    code, redirect_uri, client
+                )
+                email = None
 
             # Encrypt and persist the refresh token.
             encrypted = encrypt_refresh_token(refresh_token)
             now_utc = datetime.now(UTC)
             token_file = TokenFile(
-                provider="google",
+                provider=provider,
                 scopes=scopes,
                 encrypted_refresh_token=encrypted,
                 created_at=now_utc,
                 last_refreshed_at=now_utc,
             )
             save_token(_config.paths.tokens_dir, token_file)
-
-            # Best-effort: fetch user email for display purposes.
-            email = await get_google_user_email(access_token, client)
     except OAuthError:
-        logger.error("Google OAuth token exchange or storage failed.")
+        logger.error("%s OAuth token exchange or storage failed.", provider.capitalize())
         return RedirectResponse(
             url="/settings?oauth=error&reason=exchange_failed", status_code=307
         )
 
     if email:
-        logger.info("Google OAuth connected successfully for user.")
+        logger.info("%s OAuth connected successfully for user.", provider.capitalize())
     else:
-        logger.info("Google OAuth connected successfully (email not retrieved).")
+        logger.info("%s OAuth connected successfully (email not retrieved).", provider.capitalize())
 
     return RedirectResponse(url="/settings?oauth=success", status_code=307)
 
@@ -1364,15 +1431,71 @@ async def oauth_google_disconnect(
     _check_rate_limit("/api/oauth/google/disconnect")
 
     try:
-        deleted = delete_token(_config.paths.tokens_dir, "google")
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0),
+        ) as client:
+            deleted = await revoke_and_delete_token(_config.paths.tokens_dir, "google", client)
     except OAuthError:
-        logger.error("Failed to delete Google token file.")
+        logger.error("Failed to disconnect Google account.")
         raise HTTPException(status_code=500, detail="Failed to disconnect.")  # noqa: B904
 
     if not deleted:
         raise HTTPException(status_code=404, detail="Google account is not connected.")
 
+    # Invalidate in-memory cached access tokens so tool modules stop
+    # reusing a stale token after the refresh token file is gone.
+    await _clear_gmail_cache()
+    await _clear_gcal_cache()
+    await _clear_gdrive_cache()
+
     logger.info("Google OAuth account disconnected.")
+    return {"status": "disconnected"}
+
+
+async def oauth_microsoft_disconnect(
+    _auth: None = Depends(require_auth),
+) -> dict[str, str]:
+    """Disconnect the Microsoft OAuth account by deleting the token file.
+
+    Removes the encrypted token file from disk and invalidates all
+    in-memory cached access tokens for Microsoft tool modules.
+    Returns 404 if no Microsoft account is connected.
+
+    Returns:
+        A dict with ``{"status": "disconnected"}`` on success.
+
+    Raises:
+        HTTPException: 404 if not connected, 500 if deletion fails.
+
+    Security notes:
+        - Requires Bearer auth.
+        - Rate limited to prevent abuse.
+        - Never logs token contents.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/oauth/microsoft/disconnect")
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0),
+        ) as client:
+            deleted = await revoke_and_delete_token(_config.paths.tokens_dir, "microsoft", client)
+    except OAuthError:
+        logger.error("Failed to disconnect Microsoft account.")
+        raise HTTPException(status_code=500, detail="Failed to disconnect.")  # noqa: B904
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Microsoft account is not connected.")
+
+    # Invalidate in-memory cached access tokens so tool modules stop
+    # reusing a stale token after the refresh token file is gone.
+    await _clear_outlook_cache()
+    await _clear_outcal_cache()
+    await _clear_onedrive_cache()
+
+    logger.info("Microsoft OAuth account disconnected.")
     return {"status": "disconnected"}
 
 
@@ -1507,9 +1630,11 @@ def create_app(
     _rate_limiters["/api/permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/permissions/patch"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/google/authorize"] = _TokenBucket(rate=0.2, capacity=2)
+    _rate_limiters["/api/oauth/microsoft/authorize"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/callback"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/google/status"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/oauth/google/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
+    _rate_limiters["/api/oauth/microsoft/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.
@@ -1576,11 +1701,15 @@ def create_app(
     app.get("/api/oauth/google/authorize", response_model=OAuthAuthorizeResponse)(
         oauth_google_authorize
     )
+    app.get("/api/oauth/microsoft/authorize", response_model=OAuthAuthorizeResponse)(
+        oauth_microsoft_authorize
+    )
     app.get("/api/oauth/callback")(oauth_callback)
     app.get("/api/oauth/google/status", response_model=OAuthConnectionStatus)(
         oauth_google_status
     )
     app.delete("/api/oauth/google")(oauth_google_disconnect)
+    app.delete("/api/oauth/microsoft")(oauth_microsoft_disconnect)
 
     # --- Static files (MUST be last so API routes take priority) ---
     # Resolve the PWA static directory. Checked in order:

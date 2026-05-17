@@ -53,6 +53,7 @@ OAuthProvider = Literal["google", "microsoft"]
 GOOGLE_TOKEN_ENDPOINT: str = "https://oauth2.googleapis.com/token"  # noqa: S105
 GOOGLE_AUTH_ENDPOINT: str = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_USERINFO_ENDPOINT: str = "https://www.googleapis.com/oauth2/v2/userinfo"
+GOOGLE_REVOKE_ENDPOINT: str = "https://oauth2.googleapis.com/revoke"
 
 # Scopes: broad at the API level — the agent's permission engine (permissions.py
 # hardcoded denials + permissions.yaml) is the actual access control layer.
@@ -315,6 +316,134 @@ def delete_token(tokens_dir: Path, provider: OAuthProvider = "google") -> bool:
         msg = "Failed to delete token file."
         raise OAuthError(msg) from exc
     return True
+
+
+async def revoke_and_delete_token(
+    tokens_dir: Path,
+    provider: OAuthProvider,
+    http_client: httpx.AsyncClient,
+) -> bool:
+    """Revoke the refresh token at the provider, then delete the local file.
+
+    Decrypts the refresh token from the on-disk file, POSTs it to the
+    provider's revocation endpoint (best-effort), then deletes the file.
+    This ensures both the provider-side credential and the local copy are
+    invalidated during account disconnection.
+
+    If revocation fails (network error, provider error), the local file
+    is still deleted and a warning is logged. The disconnect proceeds
+    regardless so the user is not stuck.
+
+    Args:
+        tokens_dir: Directory containing token files.
+        provider: OAuth provider name (``"google"`` or ``"microsoft"``).
+        http_client: An httpx async client for the revocation request.
+
+    Returns:
+        True if the file existed and was deleted, False if it did not exist.
+
+    Raises:
+        OAuthError: If the file exists but local deletion fails.
+
+    Security notes:
+        No credentials are logged or included in error messages.
+    """
+    token_file = load_token(tokens_dir, provider)
+    if token_file is None:
+        return False
+
+    # Best-effort revocation: decrypt and POST to provider endpoint.
+    try:
+        refresh_tok = decrypt_refresh_token(token_file)
+        if provider == "google":
+            await _revoke_google_token(refresh_tok, http_client)
+        else:
+            await _revoke_microsoft_token(refresh_tok, http_client)
+    except OAuthError:
+        logger.warning(
+            "Provider-side token revocation failed for %s; proceeding with local delete.",
+            provider,
+        )
+
+    # Always delete the local file regardless of revocation outcome.
+    return delete_token(tokens_dir, provider)
+
+
+async def _revoke_google_token(
+    token: str,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Revoke a Google OAuth token via the revocation endpoint.
+
+    Args:
+        token: The refresh (or access) token to revoke.
+        http_client: An httpx async client.
+
+    Raises:
+        OAuthError: If the HTTP request fails or the provider returns an error.
+
+    Security notes:
+        No credentials are logged or included in error messages.
+    """
+    try:
+        response = await http_client.post(
+            GOOGLE_REVOKE_ENDPOINT,
+            data={"token": token},
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    except httpx.HTTPError as exc:
+        msg = "HTTP request to Google revocation endpoint failed."
+        raise OAuthError(msg) from exc
+
+    if response.status_code != 200:
+        error_code = _safe_error_code(response)
+        logger.warning(
+            "Google token revocation returned status %d (error=%s).",
+            response.status_code,
+            error_code,
+        )
+        msg = "Google token revocation failed."
+        raise OAuthError(msg)
+
+    logger.info("Google token revoked at provider.")
+
+
+async def _revoke_microsoft_token(
+    refresh_token: str,
+    http_client: httpx.AsyncClient,
+) -> None:
+    """Revoke a Microsoft OAuth refresh token via the logout endpoint.
+
+    Microsoft's OAuth2 v2.0 does not have a dedicated per-token
+    revocation endpoint. We call the logout endpoint for defense-in-depth.
+    The refresh token parameter is accepted for API symmetry with the
+    Google revocation function but is not sent to Microsoft.
+
+    Args:
+        refresh_token: The decrypted refresh token (unused by Microsoft).
+        http_client: An httpx async client.
+
+    Raises:
+        OAuthError: If the HTTP request fails.
+
+    Security notes:
+        No credentials are logged or included in error messages.
+    """
+    try:
+        response = await http_client.get(
+            "https://login.microsoftonline.com/common/oauth2/v2.0/logout",
+        )
+    except httpx.HTTPError as exc:
+        msg = "HTTP request to Microsoft logout endpoint failed."
+        raise OAuthError(msg) from exc
+
+    # Microsoft logout endpoint typically returns 200 or 302; either is acceptable.
+    if response.status_code >= 400:
+        logger.warning("Microsoft logout endpoint returned status %d.", response.status_code)
+        msg = "Microsoft token revocation failed."
+        raise OAuthError(msg)
+
+    logger.info("Microsoft logout endpoint called successfully.")
 
 
 def _safe_error_code(response: httpx.Response) -> str:
@@ -628,6 +757,7 @@ def build_microsoft_consent_url(redirect_uri: str) -> tuple[str, str]:
         "response_type": "code",
         "scope": " ".join(MICROSOFT_SCOPES),
         "response_mode": "query",
+        "prompt": "consent",
         "state": state,
     }
     return f"{MICROSOFT_AUTH_ENDPOINT}?{urlencode(params)}", state

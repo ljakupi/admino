@@ -12,8 +12,8 @@ export async function patchSettings(patch: SettingsPatch): Promise<SettingsRespo
   });
 }
 
-export async function getOAuthAuthorizeUrl(): Promise<{ url: string }> {
-  return fetchJson<{ url: string }>('/api/oauth/google/authorize');
+export async function getOAuthAuthorizeUrl(provider: 'google' | 'microsoft' = 'google'): Promise<{ url: string }> {
+  return fetchJson<{ url: string }>(`/api/oauth/${provider}/authorize`);
 }
 
 export async function disconnectOAuth(provider: 'google' | 'microsoft'): Promise<void> {

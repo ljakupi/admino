@@ -152,7 +152,7 @@ class TestOAuthCallback:
 
         # Pre-populate CSRF state.
         state_token = "valid-state-token"
-        srv._oauth_pending_states[state_token] = time.time()
+        srv._oauth_pending_states[state_token] = (time.time(), "google")
 
         with (
             patch(
@@ -209,7 +209,7 @@ class TestOAuthCallback:
 
         # Insert state that expired 11 minutes ago.
         state_token = "expired-state"
-        srv._oauth_pending_states[state_token] = time.time() - 660
+        srv._oauth_pending_states[state_token] = (time.time() - 660, "google")
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -233,7 +233,7 @@ class TestOAuthCallback:
         app = _make_app()
 
         state_token = "valid-state-no-code"
-        srv._oauth_pending_states[state_token] = time.time()
+        srv._oauth_pending_states[state_token] = (time.time(), "google")
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -257,7 +257,7 @@ class TestOAuthCallback:
         app = _make_app()
 
         state_token = "valid-state-exchange-fail"
-        srv._oauth_pending_states[state_token] = time.time()
+        srv._oauth_pending_states[state_token] = (time.time(), "google")
 
         with patch(
             "admino.server.exchange_google_code",
@@ -345,20 +345,33 @@ class TestOAuthDisconnect:
     pytestmark = pytest.mark.asyncio
 
     async def test_oauth_disconnect_success(self) -> None:
-        """Returns 200 when delete_token returns True."""
+        """Returns 200 when revoke_and_delete_token returns True."""
         app = _make_app()
-        with patch("admino.server.delete_token", return_value=True):
+        mock_revoke = AsyncMock(return_value=True)
+        mock_gmail = AsyncMock()
+        mock_gcal = AsyncMock()
+        mock_gdrive = AsyncMock()
+        with (
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.server._clear_gmail_cache", mock_gmail),
+            patch("admino.server._clear_gcal_cache", mock_gcal),
+            patch("admino.server._clear_gdrive_cache", mock_gdrive),
+        ):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as c:
                 resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
+        mock_gmail.assert_awaited_once()
+        mock_gcal.assert_awaited_once()
+        mock_gdrive.assert_awaited_once()
 
     async def test_oauth_disconnect_not_connected(self) -> None:
-        """Returns 404 when delete_token returns False (no token to delete)."""
+        """Returns 404 when revoke_and_delete_token returns False (no token)."""
         app = _make_app()
-        with patch("admino.server.delete_token", return_value=False):
+        mock_revoke = AsyncMock(return_value=False)
+        with patch("admino.server.revoke_and_delete_token", mock_revoke):
             async with AsyncClient(
                 transport=ASGITransport(app=app), base_url="http://test"
             ) as c:
@@ -375,3 +388,84 @@ class TestOAuthDisconnect:
             resp = await c.delete("/api/oauth/google")
 
         assert resp.status_code == 401
+
+    async def test_oauth_disconnect_oauth_error(self) -> None:
+        """Returns 500 when revoke_and_delete_token raises OAuthError."""
+        app = _make_app()
+        mock_revoke = AsyncMock(side_effect=OAuthError("fail"))
+        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 500
+
+
+# ---------------------------------------------------------------------------
+# DELETE /api/oauth/microsoft
+# ---------------------------------------------------------------------------
+
+
+class TestMicrosoftOAuthDisconnect:
+    """DELETE /api/oauth/microsoft — disconnects Microsoft OAuth."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_microsoft_disconnect_success(self) -> None:
+        """Returns 200 and clears all Microsoft caches on success."""
+        app = _make_app()
+        mock_revoke = AsyncMock(return_value=True)
+        mock_outlook = AsyncMock()
+        mock_outcal = AsyncMock()
+        mock_onedrive = AsyncMock()
+        with (
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.server._clear_outlook_cache", mock_outlook),
+            patch("admino.server._clear_outcal_cache", mock_outcal),
+            patch("admino.server._clear_onedrive_cache", mock_onedrive),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        assert resp.json() == {"status": "disconnected"}
+        mock_outlook.assert_awaited_once()
+        mock_outcal.assert_awaited_once()
+        mock_onedrive.assert_awaited_once()
+
+    async def test_microsoft_disconnect_not_connected(self) -> None:
+        """Returns 404 when revoke_and_delete_token returns False (no token)."""
+        app = _make_app()
+        mock_revoke = AsyncMock(return_value=False)
+        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 404
+
+    async def test_microsoft_disconnect_requires_auth(self) -> None:
+        """Returns 401 when no Authorization header is provided."""
+        app = _make_app()
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as c:
+            resp = await c.delete("/api/oauth/microsoft")
+
+        assert resp.status_code == 401
+
+    async def test_microsoft_disconnect_oauth_error(self) -> None:
+        """Returns 500 when revoke_and_delete_token raises OAuthError."""
+        app = _make_app()
+        mock_revoke = AsyncMock(side_effect=OAuthError("fail"))
+        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 500
