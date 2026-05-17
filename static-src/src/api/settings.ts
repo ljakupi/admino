@@ -11,3 +11,14 @@ export async function patchSettings(patch: SettingsPatch): Promise<SettingsRespo
     body: JSON.stringify(patch),
   });
 }
+
+export async function getOAuthAuthorizeUrl(provider: 'google' | 'microsoft' = 'google'): Promise<{ url: string }> {
+  return fetchJson<{ url: string }>(`/api/oauth/${provider}/authorize`);
+}
+
+export async function disconnectOAuth(provider: 'google' | 'microsoft'): Promise<void> {
+  if (provider !== 'google' && provider !== 'microsoft') {
+    throw new Error('Invalid provider');
+  }
+  await fetchJson<{ status: string }>(`/api/oauth/${provider}`, { method: 'DELETE' });
+}

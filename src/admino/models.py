@@ -1285,11 +1285,21 @@ class SettingsImmutable(BaseModel):
     port: int
 
 
+class OAuthAuthorizeResponse(BaseModel):
+    """GET /api/oauth/google/authorize response — consent URL for the frontend."""
+
+    url: str = Field(max_length=2048, pattern=r"^https://")
+
+
 class OAuthConnectionStatus(BaseModel):
     """OAuth connection status for a provider."""
 
     connected: bool = False
-    email: str | None = None
+    email: str | None = Field(
+        default=None,
+        max_length=254,
+        pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    )
     services: list[str] = Field(default_factory=list)
 
 
