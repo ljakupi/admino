@@ -1406,6 +1406,34 @@ async def oauth_google_status(
     return OAuthConnectionStatus(connected=False)
 
 
+async def oauth_microsoft_status(
+    _auth: None = Depends(require_auth),
+) -> OAuthConnectionStatus:
+    """Return the connection status for the Microsoft OAuth account.
+
+    Checks whether an encrypted token file exists on disk for Microsoft.
+
+    Returns:
+        OAuthConnectionStatus indicating whether Microsoft is connected.
+
+    Security notes:
+        - Requires Bearer auth.
+        - Never exposes token contents or file paths in the response.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/oauth/microsoft/status")
+
+    token_path = _config.paths.tokens_dir / "microsoft.json"
+    if token_path.is_file():
+        return OAuthConnectionStatus(
+            connected=True,
+            services=["outlook", "outlook_calendar", "onedrive"],
+        )
+    return OAuthConnectionStatus(connected=False)
+
+
 async def oauth_google_disconnect(
     _auth: None = Depends(require_auth),
 ) -> dict[str, str]:
@@ -1633,6 +1661,7 @@ def create_app(
     _rate_limiters["/api/oauth/microsoft/authorize"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/callback"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/google/status"] = _TokenBucket(rate=1.0, capacity=5)
+    _rate_limiters["/api/oauth/microsoft/status"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/oauth/google/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/microsoft/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
@@ -1707,6 +1736,9 @@ def create_app(
     app.get("/api/oauth/callback")(oauth_callback)
     app.get("/api/oauth/google/status", response_model=OAuthConnectionStatus)(
         oauth_google_status
+    )
+    app.get("/api/oauth/microsoft/status", response_model=OAuthConnectionStatus)(
+        oauth_microsoft_status
     )
     app.delete("/api/oauth/google")(oauth_google_disconnect)
     app.delete("/api/oauth/microsoft")(oauth_microsoft_disconnect)
