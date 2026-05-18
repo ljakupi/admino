@@ -179,7 +179,7 @@ class TestOAuthCallback:
                 )
 
         assert resp.status_code == 307
-        assert "/settings" in resp.headers["location"]
+        assert "/tools" in resp.headers["location"]
         assert "oauth=success" in resp.headers["location"]
 
     async def test_oauth_callback_invalid_state_redirects_error(self) -> None:
@@ -620,7 +620,7 @@ class TestMicrosoftOAuthCallback:
                 )
 
         assert resp.status_code == 307
-        assert "/settings" in resp.headers["location"]
+        assert "/tools" in resp.headers["location"]
         assert "oauth=success" in resp.headers["location"]
 
     async def test_microsoft_callback_exchange_failure(self) -> None:
