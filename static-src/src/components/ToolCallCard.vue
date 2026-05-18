@@ -61,9 +61,9 @@ function formatValue(val: unknown): string {
     <!-- Header: tool/action + badge -->
     <div class="tool-header">
       <span class="tool-title">
-        <span class="tool-name">{{ props.toolCall.tool }}</span>
-        <span class="tool-sep">/</span>
-        <span class="tool-action">{{ props.toolCall.action }}</span>
+        {{ props.toolCall.tool }}
+        <span class="tool-sep">&middot;</span>
+        {{ props.toolCall.action }}
       </span>
       <StatusBadge :status="badgeStatus" class="card-badge" />
     </div>
@@ -119,13 +119,13 @@ function formatValue(val: unknown): string {
 <style scoped>
 .tool-card {
   background: #FFFFFF;
-  border: 1px solid #E4E8EA;
-  border-radius: 12px;
-  padding: 14px 16px;
+  border: 1px solid #E9EDEF;
+  border-radius: 10px;
+  padding: 12px 14px;
   border-left-width: 3px;
   max-width: 560px;
   width: 100%;
-  box-shadow: 0 1px 2px rgba(17,27,33,0.04), 0 2px 8px rgba(17,27,33,0.04);
+  box-shadow: 0 1px 4px rgba(17,27,33,0.06);
 }
 
 .border-pending  { border-left-color: #E9A23B; }
@@ -140,7 +140,7 @@ function formatValue(val: unknown): string {
   gap: 12px;
   padding-bottom: 12px;
   margin-bottom: 12px;
-  border-bottom: 1px solid #EEF1F2;
+  border-bottom: 1px dashed #E9EDEF;
 }
 
 .tool-title {
@@ -150,23 +150,14 @@ function formatValue(val: unknown): string {
   font-family: var(--font-body);
   font-size: 13px;
   font-weight: 600;
-  color: var(--color-text);
+  color: #128C7E;
   letter-spacing: -0.005em;
-}
-
-.tool-name {
-  color: #075E54;
 }
 
 .tool-sep {
   color: #CFD8D8;
   font-weight: 400;
   margin: 0 1px;
-}
-
-.tool-action {
-  color: #475560;
-  font-weight: 500;
 }
 
 /* Badge override for card context (slightly smaller) */
@@ -182,8 +173,8 @@ function formatValue(val: unknown): string {
   column-gap: 10px;
   row-gap: 4px;
   font-family: var(--font-mono);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 11.5px;
+  line-height: 1.6;
 }
 
 .k {
@@ -209,7 +200,7 @@ function formatValue(val: unknown): string {
   gap: 8px;
   margin-top: 14px;
   padding-top: 12px;
-  border-top: 1px solid #EEF1F2;
+  border-top: 1px dashed #E9EDEF;
 }
 
 .btn {
@@ -218,8 +209,8 @@ function formatValue(val: unknown): string {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 9px 14px;
-  border-radius: 8px;
+  padding: 8px 12px;
+  border-radius: 6px;
   font-family: var(--font-body);
   font-size: 13px;
   font-weight: 600;
@@ -240,9 +231,9 @@ function formatValue(val: unknown): string {
 }
 
 .deny {
-  background: #FFFFFF;
+  background: transparent;
   color: #C73B3B;
-  border-color: #E0C7C7;
+  border-color: #E35353;
 }
 .deny:hover {
   background: #FCE4E4;
@@ -277,14 +268,14 @@ function formatValue(val: unknown): string {
   font-size: 12px;
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid #EEF1F2;
+  border-top: 1px dashed #E9EDEF;
 }
 
 /* Result footer */
 .result-footer {
   margin-top: 12px;
   padding-top: 12px;
-  border-top: 1px solid #EEF1F2;
+  border-top: 1px dashed #E9EDEF;
   display: flex;
   align-items: center;
   gap: 10px;

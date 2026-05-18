@@ -88,7 +88,7 @@ function autoGrow() {
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-input);
-  background: var(--color-bg);
+  background: #FFFFFF;
   font-family: var(--font-body);
   font-size: var(--fs-body);
   line-height: 22px;
@@ -99,11 +99,12 @@ function autoGrow() {
 }
 
 .input-textarea::placeholder {
-  color: var(--color-text-muted);
+  color: #8A9199;
 }
 
 .input-textarea:focus {
-  outline: none;
+  outline: 2px solid rgba(7, 94, 84, 0.18);
+  outline-offset: 0;
   border-color: var(--color-primary);
 }
 
