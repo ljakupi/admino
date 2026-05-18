@@ -47,21 +47,15 @@ PermissionState = Literal["allow", "confirm", "deny"]
 # Hardcoded denials — cannot be overridden by YAML config
 # ---------------------------------------------------------------------------
 
-HARDCODED_DENIALS: frozenset[tuple[str, str]] = frozenset(
+# Tier-1: immutable denials — truly permanent, never promotable.
+IMMUTABLE_DENIALS: frozenset[tuple[str, str]] = frozenset(
     {
-        # Google
-        ("gmail", "send"),
         ("gmail", "delete"),
         ("google_calendar", "delete"),
-        ("google_calendar", "update"),
         ("google_drive", "delete"),
-        # Microsoft
-        ("outlook", "send"),
         ("outlook", "delete"),
         ("outlook_calendar", "delete"),
-        ("outlook_calendar", "update"),
         ("onedrive", "delete"),
-        # Local
         ("documents", "delete"),
         ("files", "delete"),
         # ``files.overwrite`` is modelled as a first-class action so an
@@ -74,6 +68,24 @@ HARDCODED_DENIALS: frozenset[tuple[str, str]] = frozenset(
         ("memory", "delete"),
     }
 )
+
+# Tier-2: promotable denials — can be promoted from ``deny`` to ``confirm``
+# by the user via the Critical Permissions API, with re-authentication and
+# a 5-minute cooldown. When promoted, the permission engine returns
+# ``confirm`` (agent proposes, user approves) instead of ``deny``.
+PROMOTABLE_DENIALS: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("gmail", "send"),
+        ("outlook", "send"),
+        ("google_calendar", "update"),
+        ("outlook_calendar", "update"),
+    }
+)
+
+# Union of both tiers — backward-compatible alias used by config validation,
+# the _CONFIRM_ONLY_ACTIONS invariant check, and the PATCH /api/permissions
+# guard that blocks overriding any hardcoded denial via YAML/API.
+HARDCODED_DENIALS: frozenset[tuple[str, str]] = IMMUTABLE_DENIALS | PROMOTABLE_DENIALS
 
 # Write-mutating actions that must never be set to 'allow' via YAML config.
 # These are downgraded to 'confirm' if an operator sets them to 'allow',
@@ -277,22 +289,30 @@ def check_permission(
     tool: str,
     action: str,
     config: PermissionsConfig,
+    *,
+    promoted: frozenset[tuple[str, str]] = frozenset(),
 ) -> PermissionResult:
     """Determine whether a tool action is allowed, requires confirmation, or is denied.
 
     Decision rules (evaluated in order):
     0. Input validation — reject malformed identifiers.
-    1. Hardcoded denials — always deny, config cannot override.
+    1. Hardcoded denials:
+       a. Immutable denials — always deny, cannot be overridden.
+       b. Promotable denials — deny by default, but return ``confirm`` if the
+          (tool, action) pair appears in the ``promoted`` set.
     2. Config lookup — return the configured state if found.
     3. Default deny — unlisted tool/action combinations are denied.
 
     This is a **pure function**: no side effects, no logging, no network calls,
-    no state mutation. It receives (tool, action, config) and returns a result.
+    no state mutation. It receives (tool, action, config, promoted) and returns
+    a result.
 
     Args:
         tool: The tool name (e.g. "gmail", "calendar").
         action: The action name (e.g. "read", "send", "delete").
         config: The validated permissions configuration.
+        promoted: Set of (tool, action) pairs that have been promoted from
+            tier-2 deny to confirm via the Critical Permissions API.
 
     Returns:
         A PermissionResult with the decision and a human-readable reason.
@@ -304,8 +324,20 @@ def check_permission(
             reason="Invalid tool or action identifier.",
         )
 
-    # 1. Hardcoded denials — checked first, cannot be overridden
-    if (tool, action) in HARDCODED_DENIALS:
+    # 1a. Immutable denials — checked first, cannot be overridden
+    if (tool, action) in IMMUTABLE_DENIALS:
+        return PermissionResult(
+            allowed="deny",
+            reason=f"Action {tool[:64]}.{action[:64]} is permanently denied (hardcoded).",
+        )
+
+    # 1b. Promotable denials — deny unless promoted to confirm
+    if (tool, action) in PROMOTABLE_DENIALS:
+        if (tool, action) in promoted:
+            return PermissionResult(
+                allowed="confirm",
+                reason=f"Action {tool[:64]}.{action[:64]} promoted from deny to confirm.",
+            )
         return PermissionResult(
             allowed="deny",
             reason=f"Action {tool[:64]}.{action[:64]} is permanently denied (hardcoded).",

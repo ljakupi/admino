@@ -272,6 +272,7 @@ async def dispatch_tool_call(
     session_id: str,
     pending_confirmation: PendingConfirmation | None = None,
     audit_logger: AuditLogger | None = None,
+    promoted: frozenset[tuple[str, str]] = frozenset(),
 ) -> ToolCallResult:
     """Dispatch a tool call: check permissions, validate args, execute handler.
 
@@ -343,9 +344,11 @@ async def dispatch_tool_call(
         )
 
     # 1. Permission check — ALWAYS first, before any arg parsing or execution.
-    #    SECURITY: check_permission receives ONLY (tool, action, config).
+    #    SECURITY: check_permission receives ONLY (tool, action, config, promoted).
     #    It must never see LLM-supplied args, session state, or conversation.
-    permission = check_permission(raw_tool, raw_action, permissions_config)
+    permission = check_permission(
+        raw_tool, raw_action, permissions_config, promoted=promoted
+    )
 
     # 2. Denied — return immediately.
     if permission.allowed == "deny":
