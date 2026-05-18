@@ -62,6 +62,10 @@ from admino.models import (
     ChatRequest,
     ChatResponse,
     ConfirmRequest,
+    CriticalPermissionEntry,
+    CriticalPermissionPromote,
+    CriticalPermissionsResponse,
+    CriticalPermissionState,
     LLMMessage,
     OAuthAuthorizeResponse,
     OAuthConnectionStatus,
@@ -251,6 +255,21 @@ _session_locks: dict[str, asyncio.Lock] = {}
 _OAUTH_STATE_TTL_S: int = 600  # 10 minutes
 _OAUTH_PENDING_STATES_MAX: int = 50
 _oauth_pending_states: dict[str, tuple[float, OAuthProvider, str]] = {}
+
+# ---------------------------------------------------------------------------
+# Critical permissions state (tier-2 promotable denials)
+# ---------------------------------------------------------------------------
+
+# Pending promotion cooldowns: (tool, action) -> pending_at datetime.
+# In-memory only — lost on restart (acceptable per spec). During cooldown,
+# the permission stays deny; it flips to confirm when the cooldown expires.
+_pending_promotions: dict[tuple[str, str], datetime] = {}
+
+# Completed promotions: set of (tool, action) pairs promoted to confirm.
+# Loaded from DB on startup, updated when cooldowns expire or demotions occur.
+_promoted_permissions: set[tuple[str, str]] = set()
+
+_PROMOTION_COOLDOWN_S: int = 300  # 5 minutes
 
 # Injected at app creation time by create_app().
 _agent: Agent | None = None
@@ -1184,6 +1203,191 @@ async def patch_permissions(
 
 
 # ---------------------------------------------------------------------------
+# Critical permissions route handlers (tier-2 promotable denials)
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_pending_promotions() -> None:
+    """Check pending promotions and complete any whose cooldown has expired.
+
+    Mutates ``_pending_promotions`` and ``_promoted_permissions`` in place.
+    Persists completed promotions to the database. This is a lazy resolution
+    — called on GET and PATCH to avoid background asyncio tasks.
+
+    Safety: builds a list of expired keys first, then mutates the dict in a
+    separate loop to avoid ``RuntimeError`` from modifying a dict during
+    iteration.
+    """
+    now = datetime.now(UTC)
+    expired: list[tuple[str, str]] = [
+        key
+        for key, pending_at in _pending_promotions.items()
+        if (now - pending_at).total_seconds() >= _PROMOTION_COOLDOWN_S
+    ]
+
+    if not expired:
+        return
+
+    from admino.database import get_pool, update_permission
+
+    pool = get_pool()
+    for key in expired:
+        tool, action = key
+        _pending_promotions.pop(key, None)
+        _promoted_permissions.add(key)
+        await update_permission(pool, tool, action, "confirm")
+        logger.warning(
+            "Critical permission promoted: tool=%s action=%s (cooldown expired)",
+            tool,
+            action,
+        )
+
+    # Update agent's promoted set so check_permission sees the change.
+    if _agent is not None:
+        _agent._promoted = frozenset(_promoted_permissions)
+
+
+def get_promoted_permissions() -> frozenset[tuple[str, str]]:
+    """Return the current set of promoted critical permissions.
+
+    Used by the tool registry (via agent) to pass to ``check_permission()``.
+    """
+    return frozenset(_promoted_permissions)
+
+
+async def get_critical_permissions(
+    _auth: None = Depends(require_auth),
+) -> CriticalPermissionsResponse:
+    """Return the 4 promotable permissions with current state and cooldown info."""
+    from admino.permissions import PROMOTABLE_DENIALS
+
+    _check_rate_limit("/api/critical-permissions/get")
+    await _resolve_pending_promotions()
+
+    entries: list[CriticalPermissionEntry] = []
+    for tool, action in sorted(PROMOTABLE_DENIALS):
+        key = (tool, action)
+        state: str = "confirm" if key in _promoted_permissions else "deny"
+        pending_at = _pending_promotions.get(key)
+        entries.append(
+            CriticalPermissionEntry(
+                tool=tool,
+                action=action,
+                state=state,  # type: ignore[arg-type]
+                pending_at=pending_at,
+            )
+        )
+    return CriticalPermissionsResponse(permissions=entries)
+
+
+async def patch_critical_permission(
+    tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
+    action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
+    body: CriticalPermissionPromote | None = None,
+    _auth: None = Depends(require_auth),
+) -> CriticalPermissionState:
+    """Promote (deny -> confirm with cooldown) or demote (confirm -> deny) a permission."""
+    from admino.permissions import PROMOTABLE_DENIALS
+
+    if (tool, action) not in PROMOTABLE_DENIALS:
+        raise HTTPException(status_code=404, detail="Not a promotable permission")
+
+    key = (tool, action)
+
+    # Resolve any expired cooldowns before deciding the current state.
+    await _resolve_pending_promotions()
+
+    # DEMOTE path: if currently promoted, revert to deny immediately.
+    if key in _promoted_permissions:
+        _check_rate_limit("/api/critical-permissions/promote")
+        _promoted_permissions.discard(key)
+        _pending_promotions.pop(key, None)
+
+        from admino.config import load_permissions_config_from_db
+        from admino.database import get_pool, update_permission
+
+        pool = get_pool()
+        await update_permission(pool, tool, action, "deny")
+        new_perms = await load_permissions_config_from_db(pool)
+        if _agent is not None:
+            _agent._permissions = new_perms
+            _agent._promoted = frozenset(_promoted_permissions)
+
+        logger.warning(
+            "Critical permission demoted: tool=%s action=%s", tool, action
+        )
+        return CriticalPermissionState(tool=tool, action=action, state="deny")
+
+    # PROMOTE path: deny -> confirm with re-auth and cooldown.
+    _check_rate_limit("/api/critical-permissions/promote")
+
+    if body is None:
+        raise HTTPException(
+            status_code=400, detail="Re-auth token required for promotion"
+        )
+
+    # Validate re-auth token against active session token.
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    expected_token = _config.auth.token
+    if expected_token is None:
+        raise HTTPException(status_code=500, detail="Server misconfigured")
+    if not hmac.compare_digest(
+        body.bearer_token.get_secret_value().encode(),
+        expected_token.get_secret_value().encode(),
+    ):
+        raise HTTPException(status_code=401, detail="Re-auth failed")
+
+    # Already pending? Return existing pending state.
+    if key in _pending_promotions:
+        return CriticalPermissionState(
+            tool=tool,
+            action=action,
+            state="deny",
+            pending_at=_pending_promotions[key],
+        )
+
+    # Start cooldown.
+    now = datetime.now(UTC)
+    _pending_promotions[key] = now
+    logger.warning(
+        "Critical permission promotion started: tool=%s action=%s pending_at=%s",
+        tool,
+        action,
+        now.isoformat(),
+    )
+    return CriticalPermissionState(
+        tool=tool, action=action, state="deny", pending_at=now
+    )
+
+
+async def cancel_critical_permission_pending(
+    tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
+    action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
+    _auth: None = Depends(require_auth),
+) -> CriticalPermissionState:
+    """Cancel a pending promotion cooldown and revert to deny."""
+    from admino.permissions import PROMOTABLE_DENIALS
+
+    _check_rate_limit("/api/critical-permissions/cancel")
+
+    if (tool, action) not in PROMOTABLE_DENIALS:
+        raise HTTPException(status_code=404, detail="Not a promotable permission")
+
+    key = (tool, action)
+    if key not in _pending_promotions:
+        raise HTTPException(
+            status_code=404, detail="No pending promotion for this permission"
+        )
+
+    del _pending_promotions[key]
+    logger.warning(
+        "Critical permission promotion cancelled: tool=%s action=%s", tool, action
+    )
+    return CriticalPermissionState(tool=tool, action=action, state="deny")
+
+
+# ---------------------------------------------------------------------------
 # OAuth route handlers
 # ---------------------------------------------------------------------------
 
@@ -1669,6 +1873,8 @@ def create_app(
     _pending_confirmations.clear()
     _session_locks.clear()
     _oauth_pending_states.clear()
+    _pending_promotions.clear()
+    _promoted_permissions.clear()
 
     # Initialize rate limiters (reset on app creation for test isolation).
     global _global_rate_limiter
@@ -1687,6 +1893,13 @@ def create_app(
     _rate_limiters["/api/oauth/microsoft/status"] = _TokenBucket(rate=1.0, capacity=5)
     _rate_limiters["/api/oauth/google/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/microsoft/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
+    _rate_limiters["/api/critical-permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
+    _rate_limiters["/api/critical-permissions/promote"] = _TokenBucket(
+        rate=5 / 60, capacity=5
+    )
+    _rate_limiters["/api/critical-permissions/cancel"] = _TokenBucket(
+        rate=0.5, capacity=5
+    )
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.
@@ -1748,6 +1961,17 @@ def create_app(
     app.patch("/api/settings", response_model=SettingsResponse)(patch_settings)
     app.get("/api/permissions", response_model=PermissionsResponse)(get_permissions)
     app.patch("/api/permissions", response_model=PermissionsResponse)(patch_permissions)
+    app.get(
+        "/api/critical-permissions", response_model=CriticalPermissionsResponse
+    )(get_critical_permissions)
+    app.patch(
+        "/api/critical-permissions/{tool}/{action}",
+        response_model=CriticalPermissionState,
+    )(patch_critical_permission)
+    app.delete(
+        "/api/critical-permissions/{tool}/{action}/pending",
+        response_model=CriticalPermissionState,
+    )(cancel_critical_permission_pending)
 
     # OAuth routes.
     app.get("/api/oauth/google/authorize", response_model=OAuthAuthorizeResponse)(

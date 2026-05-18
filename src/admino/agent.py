@@ -134,6 +134,7 @@ class Agent:
         self._llm = llm_client
         self._audit = audit_logger
         self._permissions = permissions_config
+        self._promoted: frozenset[tuple[str, str]] = frozenset()
         self._config = agent_config
         self._model_name = model_name
         self._system_prompt = system_prompt
@@ -501,6 +502,7 @@ class Agent:
             session_id=session_id,
             pending_confirmation=pending_confirmation,
             audit_logger=self._audit,
+            promoted=self._promoted,
         )
 
     async def _resume_pending_dispatch(
