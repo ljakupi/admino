@@ -654,8 +654,7 @@ class TestToolsSettings:
     async def test_patch_settings_tools_rejects_non_boolean(self) -> None:
         """PATCH with non-boolean tool value returns 422 Pydantic validation error.
 
-        Note: Pydantic v2 coerces some strings ("yes"/"no"/"true"/"false") to
-        bool, so we use a string that cannot be interpreted as boolean.
+        SettingsPatchTools uses strict=True so string coercion is rejected.
         """
         app = _make_app()
         with (
@@ -669,6 +668,24 @@ class TestToolsSettings:
                     "/api/settings",
                     headers=_AUTH_HEADER,
                     json={"tools": {"gmail": "notabool"}},
+                )
+
+        assert resp.status_code == 422
+
+    async def test_patch_settings_tools_rejects_string_true(self) -> None:
+        """PATCH with string 'true' is rejected — strict mode requires JSON boolean."""
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": "true"}},
                 )
 
         assert resp.status_code == 422
@@ -705,6 +722,27 @@ class TestToolsSettings:
         if tools_calls:
             saved = tools_calls[0][0][2]
             assert "unknown_tool" not in saved
+
+    async def test_get_settings_tools_fallback_on_corrupt_db(self) -> None:
+        """GET with corrupt tools JSONB in DB falls back to all-enabled defaults."""
+        corrupt_settings = dict(_DEFAULT_DB_SETTINGS)
+        corrupt_settings["tools"] = {"gmail": [1, 2, 3]}  # not a bool
+
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(corrupt_settings)),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        tools = resp.json()["tools"]
+        # All tools should be at their default (True) after fallback.
+        assert tools["gmail"] is True
+        assert tools["memory"] is True
 
 
 # ---------------------------------------------------------------------------
