@@ -17,6 +17,8 @@ from pydantic import ValidationError
 from admino.permissions import (
     _CONFIRM_ONLY_ACTIONS,
     HARDCODED_DENIALS,
+    IMMUTABLE_DENIALS,
+    PROMOTABLE_DENIALS,
     PermissionResult,
     PermissionsConfig,
     ToolPermissions,
@@ -666,3 +668,89 @@ class TestValidateRejectsInvalidIdentifiers:
         """Tool name containing a newline should be rejected."""
         with pytest.raises(ValueError, match="Invalid tool name"):
             validate_permissions_config({"gmail\nfake": {"read": "allow"}})
+
+
+# ---------------------------------------------------------------------------
+# Promoted parameter (tier-2 promotable denials)
+# ---------------------------------------------------------------------------
+
+
+class TestPromotedParameter:
+    """Tests for the `promoted` kwarg on check_permission — tier-2 promotable denials."""
+
+    def test_promotable_denial_denied_by_default(
+        self, empty_config: PermissionsConfig
+    ) -> None:
+        """Promotable denial without promoted set returns deny."""
+        result = check_permission("gmail", "send", empty_config)
+        assert result.allowed == "deny"
+
+    def test_promotable_denial_promoted_returns_confirm(
+        self, empty_config: PermissionsConfig
+    ) -> None:
+        """Promotable denial with matching promoted entry returns confirm."""
+        result = check_permission(
+            "gmail", "send", empty_config, promoted=frozenset({("gmail", "send")})
+        )
+        assert result.allowed == "confirm"
+
+    @pytest.mark.parametrize(
+        ("tool", "action"),
+        sorted(PROMOTABLE_DENIALS),
+        ids=[f"{t}.{a}" for t, a in sorted(PROMOTABLE_DENIALS)],
+    )
+    def test_all_promotable_denials_can_be_promoted(
+        self, tool: str, action: str, empty_config: PermissionsConfig
+    ) -> None:
+        """Each of the 4 promotable denials returns confirm when promoted."""
+        result = check_permission(
+            tool, action, empty_config, promoted=frozenset({(tool, action)})
+        )
+        assert result.allowed == "confirm"
+
+    @pytest.mark.parametrize(
+        ("tool", "action"),
+        sorted(IMMUTABLE_DENIALS),
+        ids=[f"{t}.{a}" for t, a in sorted(IMMUTABLE_DENIALS)],
+    )
+    def test_immutable_denial_cannot_be_promoted(
+        self, tool: str, action: str, empty_config: PermissionsConfig
+    ) -> None:
+        """Immutable denials stay denied even if they appear in promoted set."""
+        result = check_permission(
+            tool, action, empty_config, promoted=frozenset({(tool, action)})
+        )
+        assert result.allowed == "deny"
+
+    def test_promoted_set_does_not_affect_non_denial(
+        self, sample_config: PermissionsConfig
+    ) -> None:
+        """Promoted set has no effect on actions that aren't in HARDCODED_DENIALS."""
+        result = check_permission(
+            "gmail", "read", sample_config, promoted=frozenset({("gmail", "read")})
+        )
+        assert result.allowed == "allow"
+
+    def test_hardcoded_denials_is_union_of_immutable_and_promotable(self) -> None:
+        """HARDCODED_DENIALS == IMMUTABLE_DENIALS | PROMOTABLE_DENIALS."""
+        assert HARDCODED_DENIALS == IMMUTABLE_DENIALS | PROMOTABLE_DENIALS
+
+    def test_immutable_and_promotable_are_disjoint(self) -> None:
+        """IMMUTABLE_DENIALS and PROMOTABLE_DENIALS share no entries."""
+        assert frozenset() == IMMUTABLE_DENIALS & PROMOTABLE_DENIALS
+
+    def test_promotable_denials_has_exactly_4_entries(self) -> None:
+        """There are exactly 4 promotable denials."""
+        assert len(PROMOTABLE_DENIALS) == 4
+
+    def test_immutable_denials_has_exactly_10_entries(self) -> None:
+        """There are exactly 10 immutable denials."""
+        assert len(IMMUTABLE_DENIALS) == 10
+
+    def test_promoted_empty_frozenset_is_default(
+        self, empty_config: PermissionsConfig
+    ) -> None:
+        """Calling without promoted kwarg behaves same as promoted=frozenset()."""
+        r1 = check_permission("gmail", "send", empty_config)
+        r2 = check_permission("gmail", "send", empty_config, promoted=frozenset())
+        assert r1.allowed == r2.allowed

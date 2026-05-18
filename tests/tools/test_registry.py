@@ -1419,8 +1419,8 @@ class TestCheckPermissionIsolation:
         assert positional[0] == "gmail"
         assert positional[1] == "read"
         assert positional[2] is allow_config
-        # No kwargs snuck in
-        assert captured_kwargs[0] == {}
+        # Only 'promoted' kwarg allowed (internal set, not LLM input)
+        assert set(captured_kwargs[0].keys()) <= {"promoted"}
         # Defence-in-depth: no arg value passed
         for value in positional:
             assert "sensitive-value-should-not-reach-engine" not in repr(value)
