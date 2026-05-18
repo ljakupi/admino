@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 # Control characters to strip from free-text audit fields.
 # Keeps tab (0x09), newline (0x0A), carriage return (0x0D) because they are
@@ -1433,3 +1433,45 @@ class PermissionPatch(BaseModel):
     tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
     action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
     permission: Literal["allow", "confirm", "deny"]
+
+
+# ---------------------------------------------------------------------------
+# Critical permissions (tier-2 promotable denials)
+# ---------------------------------------------------------------------------
+
+
+class CriticalPermissionEntry(BaseModel):
+    """A single promotable permission with current state and optional cooldown."""
+
+    tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    state: Literal["deny", "confirm"]
+    pending_at: datetime | None = Field(
+        default=None,
+        description="ISO 8601 timestamp when promotion cooldown started.",
+    )
+
+
+class CriticalPermissionsResponse(BaseModel):
+    """GET /api/critical-permissions response."""
+
+    permissions: list[CriticalPermissionEntry]
+
+
+class CriticalPermissionPromote(BaseModel):
+    """PATCH body for promoting a critical permission (deny -> confirm)."""
+
+    bearer_token: SecretStr = Field(
+        min_length=1,
+        max_length=2048,
+        description="Re-auth token that must match the active session token.",
+    )
+
+
+class CriticalPermissionState(BaseModel):
+    """Response after PATCH or DELETE on a critical permission."""
+
+    tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    state: Literal["deny", "confirm"]
+    pending_at: datetime | None = None
