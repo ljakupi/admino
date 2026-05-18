@@ -36,34 +36,35 @@ defineEmits<{
 .input-group {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: 6px;
 }
 
 .input-label {
-  font-size: var(--fs-caption);
-  font-weight: var(--fw-semibold);
-  color: var(--color-text);
+  font-size: 13px;
+  font-weight: 500;
+  color: #475560;
 }
 
 .input-field {
-  height: 44px;
-  padding: 0 var(--space-3);
-  background: var(--color-bg-surface);
-  border: 1px solid var(--color-border);
+  padding: 10px 14px;
+  background: #FFFFFF;
+  border: 1px solid #CFC7B4;
   border-radius: var(--radius-input);
-  font-size: var(--fs-body);
+  font-size: 14px;
+  font-weight: 400;
   color: var(--color-text);
   transition: border-color var(--dur-fast) var(--ease);
 }
 
 .input-field::placeholder {
-  color: var(--color-text-muted);
+  color: #8A9199;
+  font-weight: 400;
 }
 
 .input-field:focus {
-  outline: none;
+  outline: 2px solid rgba(7, 94, 84, 0.18);
+  outline-offset: 0;
   border-color: var(--color-primary);
-  box-shadow: var(--shadow-focus);
 }
 
 .input-field:disabled {

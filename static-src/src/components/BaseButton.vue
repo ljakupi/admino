@@ -1,6 +1,6 @@
 <script setup lang="ts">
 defineProps<{
-  variant?: 'primary' | 'secondary' | 'destructive' | 'ghost';
+  variant?: 'primary' | 'secondary' | 'destructive' | 'ghost' | 'warn';
   size?: 'md' | 'lg';
   disabled?: boolean;
   loading?: boolean;
@@ -37,7 +37,7 @@ defineEmits<{
   font-weight: var(--fw-semibold);
   font-size: var(--fs-body);
   min-height: 44px;
-  padding: var(--space-2) var(--space-5);
+  padding: 10px 16px;
   transition: var(--transition-hover);
   cursor: pointer;
   user-select: none;
@@ -62,9 +62,9 @@ defineEmits<{
 }
 
 .variant-secondary {
-  background: transparent;
+  background: #FFFFFF;
   color: var(--color-text);
-  border: 1px solid var(--color-border-strong);
+  border: 1px solid #CFC7B4;
 }
 .variant-secondary:hover:not(:disabled) {
   background: var(--color-bg);
@@ -80,12 +80,23 @@ defineEmits<{
 }
 
 .variant-ghost {
-  background: transparent;
-  color: var(--color-text-muted);
+  background: #FFFFFF;
+  color: #475560;
+  border: 1px solid #E4DFD4;
 }
 .variant-ghost:hover:not(:disabled) {
   color: var(--color-text);
   background: var(--color-bg);
+}
+
+.variant-warn {
+  background: #E9A23B;
+  color: #3A2608;
+  border: 1px solid #E9A23B;
+}
+.variant-warn:hover:not(:disabled) {
+  background: #D4912F;
+  border-color: #D4912F;
 }
 
 /* Sizes */
