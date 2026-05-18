@@ -13,13 +13,13 @@ function formatTime(d: Date): string {
 
 <template>
   <div class="bubble-row" :class="props.message.role">
-    <div class="bubble" :class="[props.message.role, { streaming: props.message.streaming }]">
+    <div class="bubble" :class="props.message.role">
       <MarkdownBlock
         v-if="props.message.role === 'agent'"
         :content="props.message.content"
       />
       <span v-else class="user-text">{{ props.message.content }}</span>
-      <span v-if="props.message.streaming" class="cursor">&#9613;</span>
+      <span v-if="props.message.streaming" class="cursor"></span>
     </div>
     <div class="bubble-meta caption">
       <span>{{ formatTime(props.message.timestamp) }}</span>
@@ -32,12 +32,12 @@ function formatTime(d: Date): string {
 .bubble-row {
   display: flex;
   flex-direction: column;
-  max-width: 85%;
+  max-width: 82%;
 }
 
 .bubble-row.user {
   align-self: flex-end;
-  max-width: 75%;
+  max-width: 78%;
   align-items: flex-end;
 }
 
@@ -47,7 +47,9 @@ function formatTime(d: Date): string {
 }
 
 .bubble {
-  padding: var(--space-3) var(--space-4);
+  padding: 10px 14px;
+  font-size: 14.5px;
+  line-height: 1.5;
   word-break: break-word;
 }
 
@@ -58,14 +60,10 @@ function formatTime(d: Date): string {
 }
 
 .bubble.agent {
-  background: var(--color-bg-surface);
+  background: #FFFFFF;
   color: var(--color-text);
   border-radius: 10px 10px 10px 2px;
-  border: 1px solid var(--color-border);
-}
-
-.bubble.streaming {
-  border-left: 3px solid var(--color-sage);
+  border: 1px solid #E9EDEF;
 }
 
 .user-text {
@@ -73,14 +71,21 @@ function formatTime(d: Date): string {
 }
 
 .cursor {
-  animation: blink 1s step-end infinite;
-  color: var(--color-sage);
+  display: inline-block;
+  width: 6px;
+  height: 0.95em;
+  background: #111B21;
+  margin-left: 2px;
+  vertical-align: -1px;
+  animation: blink 1.2s infinite;
 }
 
 .bubble-meta {
   display: flex;
   gap: var(--space-2);
-  padding: var(--space-1) var(--space-1);
+  font-size: 11px;
+  padding: 0 6px;
+  margin-top: 2px;
 }
 
 .model-name {
@@ -88,6 +93,7 @@ function formatTime(d: Date): string {
 }
 
 @keyframes blink {
-  50% { opacity: 0; }
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.1; }
 }
 </style>
