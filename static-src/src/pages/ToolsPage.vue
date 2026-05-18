@@ -18,22 +18,30 @@ const toasts = useToastStore();
 onMounted(async () => {
   await settings.loadSettings();
 
+  // Only process OAuth callback params if we actually initiated a flow
+  const oauthPending = sessionStorage.getItem('oauth_pending');
   const params = new URLSearchParams(window.location.search);
   const oauthResult = params.get('oauth');
-  if (oauthResult === 'success') {
+  if (oauthResult && oauthPending) {
+    sessionStorage.removeItem('oauth_pending');
+    if (oauthResult === 'success') {
+      await router.replace({ path: '/tools' });
+      toasts.add('success', 'Account connected', 'Your account has been linked successfully.');
+    } else if (oauthResult === 'error') {
+      const REASON_MESSAGES: Record<string, string> = {
+        denied: 'You declined the consent screen.',
+        invalid_state: 'Session expired. Please try again.',
+        missing_code: 'No authorization code received.',
+        exchange_failed: 'Token exchange failed. Check OAuth credentials.',
+      };
+      const reason = params.get('reason') || '';
+      const message = REASON_MESSAGES[reason] ?? 'An unexpected error occurred.';
+      await router.replace({ path: '/tools' });
+      toasts.add('error', 'Connection failed', message);
+    }
+  } else if (oauthResult) {
+    // Strip stale or crafted oauth params without showing a toast
     await router.replace({ path: '/tools' });
-    toasts.add('success', 'Account connected', 'Your account has been linked successfully.');
-  } else if (oauthResult === 'error') {
-    const REASON_MESSAGES: Record<string, string> = {
-      denied: 'You declined the consent screen.',
-      invalid_state: 'Session expired. Please try again.',
-      missing_code: 'No authorization code received.',
-      exchange_failed: 'Token exchange failed. Check OAuth credentials.',
-    };
-    const reason = params.get('reason') || '';
-    const message = REASON_MESSAGES[reason] ?? 'An unexpected error occurred.';
-    await router.replace({ path: '/tools' });
-    toasts.add('error', 'Connection failed', message);
   }
 });
 
