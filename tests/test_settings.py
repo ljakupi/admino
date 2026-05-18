@@ -483,6 +483,231 @@ class TestSettingsAuth:
 
 
 # ---------------------------------------------------------------------------
+# Tools settings (per-tool enable/disable)
+# ---------------------------------------------------------------------------
+
+
+class TestToolsSettings:
+    """GET/PATCH /api/settings — tools section for per-tool enable/disable."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_get_settings_includes_tools_all_enabled_by_default(self) -> None:
+        """When DB settings have no 'tools' key, all tools default to enabled."""
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        tools = resp.json()["tools"]
+        for tool_name in (
+            "gmail", "google_calendar", "google_drive", "outlook",
+            "outlook_calendar", "onedrive", "documents", "files",
+            "web_search", "memory",
+        ):
+            assert tools[tool_name] is True, f"{tool_name} should default to True"
+
+    async def test_get_settings_includes_tools_with_custom_state(self) -> None:
+        """When DB settings have tools with gmail=False, response reflects that."""
+        settings = dict(_DEFAULT_DB_SETTINGS)
+        settings["tools"] = {"gmail": False}
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch(
+                "admino.database.load_settings_from_db",
+                _mock_load_settings(settings),
+            ),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        tools = resp.json()["tools"]
+        assert tools["gmail"] is False
+        # Other tools still default to True.
+        assert tools["google_calendar"] is True
+        assert tools["memory"] is True
+
+    async def test_patch_settings_disables_tool(self) -> None:
+        """PATCH with gmail=false persists the change and GET reflects it."""
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        # After the PATCH, load_settings returns updated tools.
+        updated = dict(_DEFAULT_DB_SETTINGS)
+        updated["tools"] = {"gmail": False}
+        mock_load = AsyncMock(
+            side_effect=[
+                dict(_DEFAULT_DB_SETTINGS),  # read current settings
+                updated,                     # build response after update
+            ]
+        )
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": False}},
+                )
+
+        assert resp.status_code == 200
+        # Verify update_setting was called for the tools section.
+        tools_calls = [
+            c for c in mock_update.call_args_list if c[0][1] == "tools"
+        ]
+        assert len(tools_calls) == 1
+        assert tools_calls[0][0][2]["gmail"] is False
+        # Response should show gmail disabled.
+        assert resp.json()["tools"]["gmail"] is False
+
+    async def test_patch_settings_enables_tool(self) -> None:
+        """PATCH with gmail=true re-enables a previously disabled tool."""
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        # Current settings have gmail disabled.
+        current = dict(_DEFAULT_DB_SETTINGS)
+        current["tools"] = {"gmail": False}
+        # After update, gmail is re-enabled.
+        updated = dict(_DEFAULT_DB_SETTINGS)
+        updated["tools"] = {"gmail": True}
+        mock_load = AsyncMock(side_effect=[current, updated])
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": True}},
+                )
+
+        assert resp.status_code == 200
+        tools_calls = [
+            c for c in mock_update.call_args_list if c[0][1] == "tools"
+        ]
+        assert len(tools_calls) == 1
+        assert tools_calls[0][0][2]["gmail"] is True
+        assert resp.json()["tools"]["gmail"] is True
+
+    async def test_patch_settings_tools_partial_update(self) -> None:
+        """Patching one tool does not affect the stored state of others."""
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        # Current settings have gmail and outlook disabled.
+        current = dict(_DEFAULT_DB_SETTINGS)
+        current["tools"] = {"gmail": False, "outlook": False}
+        mock_load = AsyncMock(
+            side_effect=[
+                current,
+                current,  # response re-read (outlook still disabled)
+            ]
+        )
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": True}},
+                )
+
+        assert resp.status_code == 200
+        # The merged dict sent to update_setting should have gmail=True
+        # AND preserve outlook=False from the current state.
+        tools_calls = [
+            c for c in mock_update.call_args_list if c[0][1] == "tools"
+        ]
+        assert len(tools_calls) == 1
+        saved = tools_calls[0][0][2]
+        assert saved["gmail"] is True
+        assert saved["outlook"] is False
+
+    async def test_patch_settings_tools_rejects_non_boolean(self) -> None:
+        """PATCH with non-boolean tool value returns 422 Pydantic validation error.
+
+        Note: Pydantic v2 coerces some strings ("yes"/"no"/"true"/"false") to
+        bool, so we use a string that cannot be interpreted as boolean.
+        """
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": "notabool"}},
+                )
+
+        assert resp.status_code == 422
+
+    async def test_patch_settings_tools_ignores_unknown_fields(self) -> None:
+        """PATCH with an unknown tool name is silently ignored (Pydantic drops it)."""
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"unknown_tool": True}},
+                )
+
+        # Should succeed — unknown field is simply dropped by Pydantic.
+        assert resp.status_code == 200
+        # No tools update should be persisted since exclude_none leaves
+        # nothing after the unknown field is stripped.
+        tools_calls = [
+            c for c in mock_update.call_args_list if c[0][1] == "tools"
+        ]
+        # The handler still calls update_setting for the tools section,
+        # but the merged dict should have no new fields from the patch.
+        # Either no call (if handler checks for empty patch) or an empty merge.
+        if tools_calls:
+            saved = tools_calls[0][0][2]
+            assert "unknown_tool" not in saved
+
+
+# ---------------------------------------------------------------------------
 # Adversarial inputs
 # ---------------------------------------------------------------------------
 
