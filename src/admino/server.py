@@ -79,6 +79,7 @@ from admino.models import (
     SettingsPatch,
     SettingsResponse,
     SSEEvent,
+    ToolsSettings,
 )
 from admino.oauth import (
     OAuthError,
@@ -909,6 +910,15 @@ async def _build_settings_response() -> SettingsResponse:
             services=["outlook", "outlook_calendar", "onedrive"],
         )
 
+    # Tools section — per-tool enabled/disabled state.
+    # Defensive: fall back to defaults if DB data is corrupted.
+    tools_data = settings.get("tools", {})
+    try:
+        tools_section = ToolsSettings(**tools_data)
+    except ValidationError:
+        logger.warning("Corrupt tools settings in DB — falling back to defaults")
+        tools_section = ToolsSettings()
+
     return SettingsResponse(
         llm=llm_section,
         appearance=appearance_section,
@@ -916,6 +926,7 @@ async def _build_settings_response() -> SettingsResponse:
         limits=limits_section,
         server=server_section,
         connected_accounts=connected,
+        tools=tools_section,
     )
 
 
@@ -1025,6 +1036,14 @@ async def patch_settings(
         for key, value in patch_fields.items():
             notifications_current[key] = value
         await update_setting(pool, "notifications", notifications_current)
+
+    # --- Tools section ---
+    if body.tools is not None:
+        tools_current: dict[str, Any] = dict(current_settings.get("tools", {}))
+        patch_fields = body.tools.model_dump(exclude_none=True)
+        for key, value in patch_fields.items():
+            tools_current[key] = value
+        await update_setting(pool, "tools", tools_current)
 
     # --- Re-initialise LLM client if provider changed ---
     if provider_changed:
