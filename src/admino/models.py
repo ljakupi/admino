@@ -254,7 +254,7 @@ class ToolCallAuditEntry(BaseModel):
         pattern=r"^[a-z][a-z0-9_]{0,62}$",
         description="The action name (e.g. 'read', 'search', 'create').",
     )
-    permission: Literal["allow", "confirm", "deny"] = Field(
+    permission: Literal["allow", "confirm", "deny", "disabled"] = Field(
         description="The permission engine's decision for this tool call.",
     )
     args_summary: str = Field(
@@ -383,7 +383,7 @@ class ToolCallRecord(BaseModel):
         default_factory=dict,
         description="Sanitized tool call arguments for UI display.",
     )
-    permission: Literal["allow", "confirm", "deny"] = Field(
+    permission: Literal["allow", "confirm", "deny", "disabled"] = Field(
         description="The permission decision for this tool call.",
     )
     success: bool = Field(

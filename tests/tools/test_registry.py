@@ -1725,3 +1725,146 @@ class TestProductionAuditEnforcement:
         )
         assert result.success is True
         assert len(spy.entries) == 1
+
+
+# ---------------------------------------------------------------------------
+# 33. Tool Enabled Gating
+# ---------------------------------------------------------------------------
+
+
+class TestToolEnabledGating:
+    """Tests for the enabled_tools filter on get_registered_tools and dispatch_tool_call.
+
+    The ``enabled_tools`` parameter gates both tool listing (for the LLM ``tools``
+    array) and dispatch (rejecting calls to disabled tools before any permission
+    check).  Missing keys default to enabled for backward compatibility.
+    """
+
+    # -- get_registered_tools filtering --
+
+    def test_get_registered_tools_excludes_disabled_tool(
+        self, registered_tool: None
+    ) -> None:
+        """A tool explicitly disabled in enabled_tools is omitted from the listing."""
+        result = get_registered_tools(enabled_tools={"gmail": False})
+        assert result == []
+
+    def test_get_registered_tools_includes_enabled_tool(
+        self, registered_tool: None
+    ) -> None:
+        """A tool explicitly enabled in enabled_tools is included in the listing."""
+        result = get_registered_tools(enabled_tools={"gmail": True})
+        assert len(result) == 1
+        assert result[0].tool == "gmail"
+        assert result[0].action == "read"
+
+    def test_get_registered_tools_no_filter_returns_all(
+        self, registered_tool: None
+    ) -> None:
+        """Omitting enabled_tools returns all registered tools (backward compat)."""
+        result = get_registered_tools()
+        assert len(result) == 1
+        assert result[0].tool == "gmail"
+
+    def test_get_registered_tools_missing_key_defaults_enabled(
+        self, registered_tool: None
+    ) -> None:
+        """A tool not mentioned in enabled_tools is treated as enabled."""
+        result = get_registered_tools(enabled_tools={"outlook": False})
+        assert len(result) == 1
+        assert result[0].tool == "gmail"
+
+    def test_get_registered_tools_filters_multiple_tools(self) -> None:
+        """Disabled tool name excludes ALL its actions; enabled tools pass through."""
+        register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
+        register_tool("gmail", "list", "List emails", SampleArgs)(sample_handler)
+        register_tool("outlook", "read", "Read outlook", SampleArgs)(sample_handler)
+
+        result = get_registered_tools(enabled_tools={"gmail": False, "outlook": True})
+        assert len(result) == 1
+        assert result[0].tool == "outlook"
+        assert result[0].action == "read"
+
+    # -- dispatch_tool_call gating --
+
+    async def test_dispatch_rejects_disabled_tool(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """Dispatching a disabled tool returns success=False with a clear message."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+        )
+        assert result.success is False
+        assert "Tool 'gmail' is disabled" in result.result
+
+    async def test_dispatch_disabled_tool_audit_entry(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """Dispatch of a disabled tool writes an audit entry with permission='disabled'."""
+        spy = _SpyAuditLogger()
+        tc = _make_tool_call()
+        await dispatch_tool_call(
+            tc,
+            allow_config,
+            session_id="sess-1",
+            enabled_tools={"gmail": False},
+            audit_logger=spy,  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        assert spy.entries[0].permission == "disabled"
+        assert spy.entries[0].success is False
+
+    async def test_dispatch_disabled_tool_before_permission_check(
+        self, registered_tool: None, deny_config: PermissionsConfig
+    ) -> None:
+        """Enabled check runs before permission check: 'disabled' trumps 'deny'."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, deny_config, session_id="sess-1", enabled_tools={"gmail": False}
+        )
+        assert result.success is False
+        assert "disabled" in result.result.lower()
+
+    async def test_dispatch_enabled_tool_proceeds_normally(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """An explicitly enabled tool dispatches normally."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": True}
+        )
+        assert result.success is True
+
+    async def test_dispatch_no_enabled_filter_proceeds_normally(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """Omitting enabled_tools allows dispatch as before (backward compat)."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        assert result.success is True
+
+    def test_reenable_tool_makes_it_available(self, registered_tool: None) -> None:
+        """Toggling enabled_tools from False to True restores the tool in listing."""
+        disabled = get_registered_tools(enabled_tools={"gmail": False})
+        assert disabled == []
+
+        enabled = get_registered_tools(enabled_tools={"gmail": True})
+        assert len(enabled) == 1
+        assert enabled[0].tool == "gmail"
+
+    async def test_dispatch_disabled_tool_with_pending_confirmation(
+        self, registered_tool: None, confirm_config: PermissionsConfig
+    ) -> None:
+        """Disabled check runs before confirmation handling: tool is still rejected."""
+        tc = _make_tool_call()
+        pending = _make_pending_confirmation(tc)
+        result = await dispatch_tool_call(
+            tc,
+            confirm_config,
+            session_id="sess-1",
+            pending_confirmation=pending,
+            enabled_tools={"gmail": False},
+        )
+        assert result.success is False
+        assert "disabled" in result.result.lower()

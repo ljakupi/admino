@@ -1243,6 +1243,7 @@ class TestAgentAuditPassthrough:
             pending_confirmation: PendingConfirmation | None = None,
             audit_logger: Any = None,
             promoted: frozenset[tuple[str, str]] = frozenset(),
+            enabled_tools: dict[str, bool] | None = None,
         ) -> ToolCallResult:
             received_loggers.append(audit_logger)
             return await real_dispatch(
@@ -1252,6 +1253,7 @@ class TestAgentAuditPassthrough:
                 pending_confirmation=pending_confirmation,
                 audit_logger=audit_logger,
                 promoted=promoted,
+                enabled_tools=enabled_tools,
             )
 
         monkeypatch.setattr(agent_module, "dispatch_tool_call", spy_dispatch)
