@@ -136,6 +136,7 @@ export interface SettingsResponse {
   limits: LimitsSettings;
   server: ServerSettings;
   connected_accounts: ConnectedAccounts;
+  tools: ToolsSettings;
 }
 
 export interface LLMSettingsPatch {
@@ -146,10 +147,24 @@ export interface LLMSettingsPatch {
   openai_model?: string;
 }
 
+export interface ToolsSettings {
+  gmail: boolean;
+  google_calendar: boolean;
+  google_drive: boolean;
+  outlook: boolean;
+  outlook_calendar: boolean;
+  onedrive: boolean;
+  documents: boolean;
+  files: boolean;
+  web_search: boolean;
+  memory: boolean;
+}
+
 export interface SettingsPatch {
   llm?: LLMSettingsPatch;
   appearance?: { theme?: AppTheme };
   notifications?: { enabled?: boolean };
+  tools?: Partial<ToolsSettings>;
 }
 
 // Permissions types

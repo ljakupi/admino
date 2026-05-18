@@ -8,6 +8,7 @@ import type {
   LLMProviderName,
   AppTheme,
   ConnectedAccounts,
+  ToolsSettings,
 } from '@/api/types';
 
 // Keep the old union type alias for backward compat with components
@@ -109,6 +110,20 @@ export const useSettingsStore = defineStore('settings', () => {
     microsoft: { connected: false, email: null, services: [] },
   });
 
+  // Tools enabled state
+  const tools = ref<ToolsSettings>({
+    gmail: true,
+    google_calendar: true,
+    google_drive: true,
+    outlook: true,
+    outlook_calendar: true,
+    onedrive: true,
+    documents: true,
+    files: true,
+    web_search: true,
+    memory: true,
+  });
+
   // Computed refs for backward compat with components that use provider/model/ollamaUrl
   const provider = computed<LLMProvider>(() => apiToUiProvider(llmProvider.value));
   const model = computed(() =>
@@ -131,6 +146,7 @@ export const useSettingsStore = defineStore('settings', () => {
     theme.value = data.appearance.theme;
     notificationsEnabled.value = data.notifications.enabled;
     connectedAccounts.value = data.connected_accounts;
+    tools.value = data.tools;
   }
 
   async function loadSettings() {
@@ -191,22 +207,34 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function connectGoogle() {
+    const toasts = useToastStore();
     try {
       const { url } = await getOAuthAuthorizeUrl('google');
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:') {
+        toasts.add('error', 'Connection failed', 'Unexpected OAuth redirect URL.');
+        return;
+      }
+      sessionStorage.setItem('oauth_pending', 'google');
       window.location.href = url;
     } catch (e) {
-      const toasts = useToastStore();
       const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
       toasts.add('error', 'Connection failed', msg);
     }
   }
 
   async function connectMicrosoft() {
+    const toasts = useToastStore();
     try {
       const { url } = await getOAuthAuthorizeUrl('microsoft');
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:') {
+        toasts.add('error', 'Connection failed', 'Unexpected OAuth redirect URL.');
+        return;
+      }
+      sessionStorage.setItem('oauth_pending', 'microsoft');
       window.location.href = url;
     } catch (e) {
-      const toasts = useToastStore();
       const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
       toasts.add('error', 'Connection failed', msg);
     }
@@ -233,6 +261,16 @@ export const useSettingsStore = defineStore('settings', () => {
     } catch (e) {
       const msg = e instanceof Error ? e.message : 'Failed to disconnect';
       toasts.add('error', 'Disconnect failed', msg);
+    }
+  }
+
+  async function setToolEnabled(tool: keyof ToolsSettings, enabled: boolean) {
+    const previous = tools.value[tool];
+    tools.value = { ...tools.value, [tool]: enabled };
+    try {
+      await saveSetting({ tools: { [tool]: enabled } });
+    } catch {
+      tools.value = { ...tools.value, [tool]: previous };
     }
   }
 
@@ -263,6 +301,9 @@ export const useSettingsStore = defineStore('settings', () => {
     notificationsEnabled,
     // Connected accounts
     connectedAccounts,
+    // Tools
+    tools,
+    setToolEnabled,
     // Loading state
     loading,
     error,
