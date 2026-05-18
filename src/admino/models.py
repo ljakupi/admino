@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Control characters to strip from free-text audit fields.
 # Keeps tab (0x09), newline (0x0A), carriage return (0x0D) because they are
@@ -1303,6 +1303,26 @@ class OAuthConnectionStatus(BaseModel):
     services: list[str] = Field(default_factory=list)
 
 
+class ToolsSettings(BaseModel):
+    """Per-tool enabled/disabled state.
+
+    Each field corresponds to a registered tool name. Default is True
+    (enabled) for all tools, matching the implicit behavior before this
+    feature was added.
+    """
+
+    gmail: bool = True
+    google_calendar: bool = True
+    google_drive: bool = True
+    outlook: bool = True
+    outlook_calendar: bool = True
+    onedrive: bool = True
+    documents: bool = True
+    files: bool = True
+    web_search: bool = True
+    memory: bool = True
+
+
 class SettingsConnectedAccounts(BaseModel):
     """Connected OAuth account statuses."""
 
@@ -1321,6 +1341,7 @@ class SettingsResponse(BaseModel):
     connected_accounts: SettingsConnectedAccounts = Field(
         default_factory=SettingsConnectedAccounts,
     )
+    tools: ToolsSettings = Field(default_factory=ToolsSettings)
 
 
 class SettingsPatchLLM(BaseModel):
@@ -1356,12 +1377,35 @@ class SettingsPatchNotifications(BaseModel):
     enabled: bool | None = None
 
 
+class SettingsPatchTools(BaseModel):
+    """Partial tool enable/disable updates for PATCH.
+
+    Only provided fields are updated; omitted tools keep their current state.
+    Unknown tool names are rejected at the API layer via registry validation.
+    strict=True rejects string coercion (e.g. "yes") — only JSON booleans accepted.
+    """
+
+    model_config = ConfigDict(strict=True)
+
+    gmail: bool | None = None
+    google_calendar: bool | None = None
+    google_drive: bool | None = None
+    outlook: bool | None = None
+    outlook_calendar: bool | None = None
+    onedrive: bool | None = None
+    documents: bool | None = None
+    files: bool | None = None
+    web_search: bool | None = None
+    memory: bool | None = None
+
+
 class SettingsPatch(BaseModel):
     """PATCH /api/settings request body — all fields optional for partial update."""
 
     llm: SettingsPatchLLM | None = None
     appearance: SettingsPatchAppearance | None = None
     notifications: SettingsPatchNotifications | None = None
+    tools: SettingsPatchTools | None = None
 
 
 # ---------------------------------------------------------------------------
