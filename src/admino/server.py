@@ -911,8 +911,13 @@ async def _build_settings_response() -> SettingsResponse:
         )
 
     # Tools section — per-tool enabled/disabled state.
+    # Defensive: fall back to defaults if DB data is corrupted.
     tools_data = settings.get("tools", {})
-    tools_section = ToolsSettings(**tools_data)
+    try:
+        tools_section = ToolsSettings(**tools_data)
+    except ValidationError:
+        logger.warning("Corrupt tools settings in DB — falling back to defaults")
+        tools_section = ToolsSettings()
 
     return SettingsResponse(
         llm=llm_section,

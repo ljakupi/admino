@@ -35,7 +35,7 @@ from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Final, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Control characters to strip from free-text audit fields.
 # Keeps tab (0x09), newline (0x0A), carriage return (0x0D) because they are
@@ -1382,7 +1382,10 @@ class SettingsPatchTools(BaseModel):
 
     Only provided fields are updated; omitted tools keep their current state.
     Unknown tool names are rejected at the API layer via registry validation.
+    strict=True rejects string coercion (e.g. "yes") — only JSON booleans accepted.
     """
+
+    model_config = ConfigDict(strict=True)
 
     gmail: bool | None = None
     google_calendar: bool | None = None
