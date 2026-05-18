@@ -1534,7 +1534,7 @@ async def oauth_callback(
         error: Error string from the provider (present on user denial).
 
     Returns:
-        RedirectResponse to the settings page with status query params.
+        RedirectResponse to the tools page with oauth status query params.
 
     Security notes:
         - CSRF protection via state token validation.
@@ -1551,23 +1551,23 @@ async def oauth_callback(
     # other parameter, including the error parameter from the provider.
     if not state or state not in _oauth_pending_states:
         logger.warning("OAuth callback received invalid or missing state.")
-        return RedirectResponse(url="/settings?oauth=error&reason=invalid_state", status_code=307)
+        return RedirectResponse(url="/tools?oauth=error&reason=invalid_state", status_code=307)
 
     # Pop and validate state expiry.
     created_at, provider, redirect_uri = _oauth_pending_states.pop(state)
     if time.time() - created_at > _OAUTH_STATE_TTL_S:
         logger.warning("%s OAuth callback received expired state token.", provider.capitalize())
-        return RedirectResponse(url="/settings?oauth=error&reason=invalid_state", status_code=307)
+        return RedirectResponse(url="/tools?oauth=error&reason=invalid_state", status_code=307)
 
     # Provider denied consent.
     if error:
         logger.info("%s OAuth callback received denial from user.", provider.capitalize())
-        return RedirectResponse(url="/settings?oauth=error&reason=denied", status_code=307)
+        return RedirectResponse(url="/tools?oauth=error&reason=denied", status_code=307)
 
     # Missing authorization code.
     if not code:
         logger.warning("%s OAuth callback missing authorization code.", provider.capitalize())
-        return RedirectResponse(url="/settings?oauth=error&reason=missing_code", status_code=307)
+        return RedirectResponse(url="/tools?oauth=error&reason=missing_code", status_code=307)
 
     try:
         async with httpx.AsyncClient(
@@ -1601,7 +1601,7 @@ async def oauth_callback(
     except OAuthError:
         logger.error("%s OAuth token exchange or storage failed.", provider.capitalize())
         return RedirectResponse(
-            url="/settings?oauth=error&reason=exchange_failed", status_code=307
+            url="/tools?oauth=error&reason=exchange_failed", status_code=307
         )
 
     if email:
@@ -1609,7 +1609,7 @@ async def oauth_callback(
     else:
         logger.info("%s OAuth connected successfully (email not retrieved).", provider.capitalize())
 
-    return RedirectResponse(url="/settings?oauth=success", status_code=307)
+    return RedirectResponse(url="/tools?oauth=success", status_code=307)
 
 
 async def oauth_google_status(
