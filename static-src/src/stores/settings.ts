@@ -207,22 +207,34 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   async function connectGoogle() {
+    const toasts = useToastStore();
     try {
       const { url } = await getOAuthAuthorizeUrl('google');
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:') {
+        toasts.add('error', 'Connection failed', 'Unexpected OAuth redirect URL.');
+        return;
+      }
+      sessionStorage.setItem('oauth_pending', 'google');
       window.location.href = url;
     } catch (e) {
-      const toasts = useToastStore();
       const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
       toasts.add('error', 'Connection failed', msg);
     }
   }
 
   async function connectMicrosoft() {
+    const toasts = useToastStore();
     try {
       const { url } = await getOAuthAuthorizeUrl('microsoft');
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:') {
+        toasts.add('error', 'Connection failed', 'Unexpected OAuth redirect URL.');
+        return;
+      }
+      sessionStorage.setItem('oauth_pending', 'microsoft');
       window.location.href = url;
     } catch (e) {
-      const toasts = useToastStore();
       const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
       toasts.add('error', 'Connection failed', msg);
     }
