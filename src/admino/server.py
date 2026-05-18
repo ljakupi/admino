@@ -1062,7 +1062,14 @@ async def patch_settings(
         patch_fields = body.tools.model_dump(exclude_none=True)
         for key, value in patch_fields.items():
             tools_current[key] = value
-        await update_setting(pool, "tools", tools_current)
+        # Validate through ToolsSettings to strip unknown keys and ensure
+        # all values are proper booleans before persisting and hot-reloading.
+        validated_tools = ToolsSettings.model_validate(tools_current).model_dump()
+        await update_setting(pool, "tools", validated_tools)
+        # Hot-reload: push updated tools-enabled state to the running agent
+        # so the next dispatch respects the change immediately.
+        if _agent is not None:
+            _agent._tools_enabled = validated_tools
 
     # --- Re-initialise LLM client if provider changed ---
     if provider_changed:
@@ -1843,6 +1850,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     database_url = f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
 
     await init_pool(database_url)
+
+    # Load persisted tools-enabled state so previously-disabled tools are
+    # respected immediately on startup (before any PATCH arrives).
+    if _agent is not None:
+        try:
+            from admino.database import get_pool, load_settings_from_db
+
+            pool = get_pool()
+            db_settings = await load_settings_from_db(pool)
+            tools_data = db_settings.get("tools", {})
+            if isinstance(tools_data, dict):
+                validated = ToolsSettings.model_validate(tools_data)
+                _agent._tools_enabled = validated.model_dump()
+        except Exception:
+            logger.warning("Failed to load tools settings on startup; defaulting to all enabled.")
+
     yield
     await close_pool()
 

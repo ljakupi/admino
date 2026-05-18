@@ -111,6 +111,7 @@ class Agent:
         agent_config: AgentConfig,
         model_name: str,
         system_prompt: str = "",
+        tools_enabled: dict[str, bool] | None = None,
     ) -> None:
         """Initialise the agent with its collaborators.
 
@@ -130,6 +131,10 @@ class Agent:
             system_prompt: Optional system message prepended to every run's
                 context window. Used to communicate available file paths,
                 operator constraints, and other static context to the LLM.
+            tools_enabled: Per-tool enabled/disabled state from settings.
+                Tools whose name maps to ``False`` are excluded from the
+                LLM tool list and rejected at dispatch time.  Hot-reloaded
+                by the server when settings change.
         """
         self._llm = llm_client
         self._audit = audit_logger
@@ -138,6 +143,7 @@ class Agent:
         self._config = agent_config
         self._model_name = model_name
         self._system_prompt = system_prompt
+        self._tools_enabled: dict[str, bool] = dict(tools_enabled) if tools_enabled else {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -227,7 +233,7 @@ class Agent:
         tool_records: list[ToolCallRecord] = []
         tool_calls_used: int = 0
         tools_payload: list[dict[str, object]] = _tool_descriptions_to_payload(
-            get_registered_tools()
+            get_registered_tools(enabled_tools=self._tools_enabled or None)
         )
         # Carry a one-shot pending_confirmation that is applied to the FIRST
         # dispatch only, then cleared. This matches the server contract:
@@ -503,6 +509,7 @@ class Agent:
             pending_confirmation=pending_confirmation,
             audit_logger=self._audit,
             promoted=self._promoted,
+            enabled_tools=self._tools_enabled or None,
         )
 
     async def _resume_pending_dispatch(

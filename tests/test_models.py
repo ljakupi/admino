@@ -253,6 +253,15 @@ class TestToolCallAuditEntry:
         with pytest.raises(ValidationError):
             _make_tool_call_entry(action="a" * 65)
 
+    def test_permission_accepts_disabled(self) -> None:
+        """ToolCallAuditEntry accepts 'disabled' as a valid permission value.
+
+        The 'disabled' literal is needed for audit entries when a tool is
+        rejected because it is toggled off via settings (enabled_tools filter).
+        """
+        entry = _make_tool_call_entry(permission="disabled")
+        assert entry.permission == "disabled"
+
 
 # ===========================================================================
 # AuditEntry union
@@ -374,6 +383,17 @@ class TestToolCallRecord:
     def test_action_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
             ToolCallRecord(tool="t", action="a" * 65, permission="allow", success=True)
+
+    def test_permission_accepts_disabled(self) -> None:
+        """ToolCallRecord accepts 'disabled' as a valid permission value.
+
+        Needed when a tool call is rejected because the tool is toggled off
+        via settings, so the record accurately reflects the reason.
+        """
+        rec = ToolCallRecord(
+            tool="gmail", action="read", permission="disabled", success=False  # type: ignore[arg-type]
+        )
+        assert rec.permission == "disabled"
 
 
 # ===========================================================================
