@@ -744,6 +744,35 @@ class TestToolsSettings:
         assert tools["gmail"] is True
         assert tools["memory"] is True
 
+    async def test_patch_tools_hotreloads_agent_tools_enabled(self) -> None:
+        """PATCH /api/settings tools section updates agent._tools_enabled in-place.
+
+        When the user disables a tool via the settings UI, the agent must
+        immediately reflect the change so subsequent dispatches respect it.
+        """
+        agent = MagicMock()
+        agent._tools_enabled = {}
+
+        app = _make_app(agent=agent)
+        mock_update = AsyncMock()
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": False}},
+                )
+
+        assert resp.status_code == 200
+        assert agent._tools_enabled["gmail"] is False
+
 
 # ---------------------------------------------------------------------------
 # Adversarial inputs
