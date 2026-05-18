@@ -30,7 +30,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -240,12 +240,18 @@ def _write_audit(
     args_keys: list[str],
     success: bool,
     error: str | None,
+    permission_override: Literal["disabled"] | None = None,
 ) -> None:
     """Write a ToolCallAuditEntry for a dispatch outcome, if a logger is set.
 
     The audit entry records only argument *key names*, never values, to
     avoid credential leakage.  Malformed tool/action identifiers are
     replaced with fixed placeholders so the Pydantic model validates.
+
+    Args:
+        permission_override: When set, used instead of ``permission.allowed``
+            for the audit entry's permission field.  Used for the ``"disabled"``
+            state which is not part of the permission engine's vocabulary.
     """
     if audit_logger is None:
         return
@@ -253,11 +259,14 @@ def _write_audit(
     safe_action = action if _VALID_IDENTIFIER.fullmatch(action) else "rejected"
     # Sort for determinism; truncate to the audit-entry field limit.
     args_summary = ",".join(sorted(args_keys))[:512] if args_keys else "[no args]"
+    perm_value: Literal["allow", "confirm", "deny", "disabled"] = (
+        permission_override if permission_override is not None else permission.allowed
+    )
     entry = ToolCallAuditEntry(
         session_id=session_id,
         tool=safe_tool,
         action=safe_action,
-        permission=permission.allowed,
+        permission=perm_value,
         args_summary=args_summary,
         success=success,
         error=error,
@@ -273,18 +282,21 @@ async def dispatch_tool_call(
     pending_confirmation: PendingConfirmation | None = None,
     audit_logger: AuditLogger | None = None,
     promoted: frozenset[tuple[str, str]] = frozenset(),
+    enabled_tools: dict[str, bool] | None = None,
 ) -> ToolCallResult:
-    """Dispatch a tool call: check permissions, validate args, execute handler.
+    """Dispatch a tool call: check enabled state, permissions, validate args, execute.
 
     This is the single entry point for tool execution.  The sequence is:
-    1. Check permission via the isolated permission engine.
-    2. If denied, return immediately with the denial reason.
-    3. If ``confirm`` and no pending_confirmation supplied, return a result
+    0. Reject malformed identifiers.
+    1. Check enabled state — disabled tools are rejected before permission check.
+    2. Check permission via the isolated permission engine.
+    3. If denied, return immediately with the denial reason.
+    4. If ``confirm`` and no pending_confirmation supplied, return a result
        indicating that user confirmation is required.  If pending_confirmation
        IS supplied, verify its tool/action identity and expiry.
-    4. Look up the tool in the registry (reject hallucinated tool names).
-    5. Reject unknown args keys, then validate against the Pydantic schema.
-    6. Execute the async handler.
+    5. Look up the tool in the registry (reject hallucinated tool names).
+    6. Reject unknown args keys, then validate against the Pydantic schema.
+    7. Execute the async handler.
 
     Every terminal path writes a ``ToolCallAuditEntry`` via ``audit_logger``
     if one is supplied.  In production (``ADMINO_ENV=production``), an audit
@@ -302,6 +314,9 @@ async def dispatch_tool_call(
             the sole line of defence.
         audit_logger: Sink for ``ToolCallAuditEntry`` records.  Required in
             production; optional in dev/tests for ergonomic reasons.
+        enabled_tools: Per-tool enabled state from settings.  When provided,
+            tools whose name maps to ``False`` are rejected before any
+            permission check.  Missing keys default to enabled.
 
     Returns:
         A ``ToolCallResult`` with the outcome of the dispatch.
@@ -343,7 +358,29 @@ async def dispatch_tool_call(
             permission=permission,
         )
 
-    # 1. Permission check — ALWAYS first, before any arg parsing or execution.
+    # 1. Enabled check — reject disabled tools before the permission engine runs.
+    if enabled_tools is not None and enabled_tools.get(raw_tool) is False:
+        disabled_permission = PermissionResult(
+            allowed="deny", reason="Tool is disabled."
+        )
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=disabled_permission,
+            args_keys=args_keys,
+            success=False,
+            error="Tool is disabled.",
+            permission_override="disabled",
+        )
+        return ToolCallResult(
+            success=False,
+            result=f"Tool '{raw_tool}' is disabled.",
+            permission=disabled_permission,
+        )
+
+    # 2. Permission check — before any arg parsing or execution.
     #    SECURITY: check_permission receives ONLY (tool, action, config, promoted).
     #    It must never see LLM-supplied args, session state, or conversation.
     permission = check_permission(
@@ -614,17 +651,27 @@ async def dispatch_tool_call(
 # ---------------------------------------------------------------------------
 
 
-def get_registered_tools() -> list[ToolDescription]:
-    """Return metadata for all registered tools.
+def get_registered_tools(
+    *,
+    enabled_tools: dict[str, bool] | None = None,
+) -> list[ToolDescription]:
+    """Return metadata for registered tools, optionally filtered by enabled state.
 
-    Used to build the ``tools`` array in the Ollama ``/api/chat`` request so
+    Used to build the ``tools`` array in the LLM ``/api/chat`` request so
     the LLM knows which tools are available and their parameter schemas.
+
+    Args:
+        enabled_tools: When provided, tools whose name maps to ``False``
+            are excluded.  Missing keys default to enabled for backward
+            compatibility.
 
     Returns:
         A list of ``ToolDescription`` models sorted by (tool, action).
     """
     descriptions: list[ToolDescription] = []
-    for (_tool, _action), entry in sorted(_REGISTRY.items()):
+    for _key, entry in sorted(_REGISTRY.items()):
+        if enabled_tools is not None and enabled_tools.get(entry.tool) is False:
+            continue
         schema = entry.args_schema.model_json_schema()
         descriptions.append(
             ToolDescription(
