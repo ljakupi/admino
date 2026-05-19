@@ -1303,12 +1303,15 @@ async def patch_critical_permission(
 
     key = (tool, action)
 
+    # Rate-limit before any await to prevent concurrent requests from
+    # racing past the limiter while a coroutine is suspended.
+    _check_rate_limit("/api/critical-permissions/promote")
+
     # Resolve any expired cooldowns before deciding the current state.
     await _resolve_pending_promotions()
 
     # DEMOTE path: if currently promoted, revert to deny immediately.
     if key in _promoted_permissions:
-        _check_rate_limit("/api/critical-permissions/promote")
         _promoted_permissions.discard(key)
         _pending_promotions.pop(key, None)
 
@@ -1328,8 +1331,6 @@ async def patch_critical_permission(
         return CriticalPermissionState(tool=tool, action=action, state="deny")
 
     # PROMOTE path: deny -> confirm with re-auth and cooldown.
-    _check_rate_limit("/api/critical-permissions/promote")
-
     if body is None:
         raise HTTPException(
             status_code=400, detail="Re-auth token required for promotion"

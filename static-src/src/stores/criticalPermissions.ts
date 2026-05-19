@@ -96,7 +96,7 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
       if (e instanceof ApiError && e.status === 401) {
         toasts.add('error', 'Authentication failed', 'The token you entered is invalid.');
       } else {
-        toasts.add('error', 'Promotion failed', e instanceof Error ? e.message : 'Unknown error');
+        toasts.add('error', 'Promotion failed');
       }
       throw e;
     }
@@ -110,21 +110,21 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
       permissions.value = new Map(permissions.value);
       toasts.add('success', 'Pending promotion cancelled');
     } catch (e) {
-      toasts.add('error', 'Cancel failed', e instanceof Error ? e.message : 'Unknown error');
+      toasts.add('error', 'Cancel failed');
     }
   }
 
   async function demote(tool: string, action: string) {
     const toasts = useToastStore();
-    const label = CRIT_PERMS.find(p => p.tool === tool && p.action === action)?.label ?? `${tool}.${action}`;
-    const service = label.split(' \u00b7 ')[1] ?? tool;
+    const perm = CRIT_PERMS.find(p => p.tool === tool && p.action === action);
+    const displayName = perm?.label ?? 'permission';
     try {
       await demoteCriticalPermission(tool, action);
       permissions.value.set(critKey(tool, action), { state: 'deny', pendingAt: null });
       permissions.value = new Map(permissions.value);
-      toasts.add('success', `Disabled ${action} on ${service}`);
+      toasts.add('success', `Disabled: ${displayName}`);
     } catch (e) {
-      toasts.add('error', 'Disable failed', e instanceof Error ? e.message : 'Unknown error');
+      toasts.add('error', 'Disable failed');
     }
   }
 
