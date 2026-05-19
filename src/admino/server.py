@@ -605,6 +605,7 @@ async def post_message(
 
     _check_rate_limit("/api/message")
     _reap_expired_confirmations()
+    await _resolve_pending_promotions()
 
     # Enforce max_message_length from config (tighter than Pydantic's 32768).
     max_len = _config.limits.max_message_length
@@ -768,6 +769,7 @@ async def post_confirm(
 
     _check_rate_limit("/api/confirm")
     _reap_expired_confirmations()
+    await _resolve_pending_promotions()
 
     session_id = body.session_id
 
@@ -1865,6 +1867,27 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 _agent._tools_enabled = validated.model_dump()
         except Exception:
             logger.warning("Failed to load tools settings on startup; defaulting to all enabled.")
+
+    # Load previously-promoted critical permissions from the database so
+    # tier-2 promotions survive server restarts.
+    try:
+        from admino.database import get_pool, load_permissions_from_db
+        from admino.permissions import PROMOTABLE_DENIALS
+
+        pool = get_pool()
+        db_perms = await load_permissions_from_db(pool)
+        for tool, action in PROMOTABLE_DENIALS:
+            if db_perms.get(tool, {}).get(action) == "confirm":
+                _promoted_permissions.add((tool, action))
+        if _agent is not None and _promoted_permissions:
+            _agent._promoted = frozenset(_promoted_permissions)
+            logger.info(
+                "Loaded %d promoted permission(s) from database: %s",
+                len(_promoted_permissions),
+                sorted(f"{t}.{a}" for t, a in _promoted_permissions),
+            )
+    except Exception:
+        logger.warning("Failed to load promoted permissions on startup; defaulting to none.")
 
     yield
     await close_pool()
