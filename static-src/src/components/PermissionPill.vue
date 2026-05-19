@@ -1,16 +1,21 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { Lock } from 'lucide-vue-next';
+import { useRouter } from 'vue-router';
+import { Lock, ShieldAlert } from 'lucide-vue-next';
 import type { PermissionState } from '@/api/types';
 
 const props = withDefaults(defineProps<{
   permission: PermissionState;
   hardcoded?: boolean;
+  promotable?: boolean;
   saving?: boolean;
 }>(), {
   hardcoded: false,
+  promotable: false,
   saving: false,
 });
+
+const router = useRouter();
 
 const emit = defineEmits<{
   change: [permission: PermissionState];
@@ -20,6 +25,10 @@ const open = ref(false);
 
 function toggle() {
   if (props.hardcoded || props.saving) return;
+  if (props.promotable) {
+    router.push({ path: '/settings', hash: '#danger' });
+    return;
+  }
   open.value = !open.value;
 }
 
@@ -48,14 +57,19 @@ const options: { value: PermissionState; label: string }[] = [
 
     <button
       class="pill"
-      :class="[permission, { hardcoded, saving }]"
-      :title="hardcoded ? 'This permission is enforced by security policy and cannot be changed' : undefined"
+      :class="[permission, { hardcoded, promotable, saving }]"
+      :title="promotable
+        ? 'This permission can be managed from Settings \u203a Danger Zone'
+        : hardcoded
+          ? 'This permission is enforced by security policy and cannot be changed'
+          : undefined"
       :style="saving ? 'opacity: 0.5; cursor: wait;' : undefined"
       @click="toggle"
     >
-      <Lock v-if="hardcoded" :size="11" :stroke-width="2" />
+      <ShieldAlert v-if="promotable" :size="11" :stroke-width="2" />
+      <Lock v-else-if="hardcoded" :size="11" :stroke-width="2" />
       <span class="dot" />
-      <span class="label">{{ hardcoded ? 'Denied' : options.find(o => o.value === permission)?.label }}</span>
+      <span class="label">{{ (hardcoded || promotable) ? 'Denied' : options.find(o => o.value === permission)?.label }}</span>
     </button>
 
     <div v-if="open" class="dropdown">
@@ -127,6 +141,13 @@ const options: { value: PermissionState; label: string }[] = [
   border-color: #D6D9DB;
 }
 
+.pill.promotable {
+  cursor: pointer;
+  background: #FFFFFF;
+  color: #8A5A14;
+  border-color: #F1D495;
+}
+
 .pill .dot {
   width: 7px;
   height: 7px;
@@ -138,6 +159,7 @@ const options: { value: PermissionState; label: string }[] = [
 .pill.confirm .dot { background: #E9A23B; }
 .pill.deny .dot { background: #8A9199; }
 .pill.hardcoded .dot { display: none; }
+.pill.promotable .dot { display: none; }
 
 .dropdown {
   position: absolute;
