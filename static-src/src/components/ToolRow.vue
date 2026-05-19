@@ -47,6 +47,7 @@ function toggleExpand() {
         :key="entry.action"
         :entry="entry"
         :hardcoded="store.isHardcoded(entry.tool, entry.action)"
+        :promotable="store.isPromotable(entry.tool, entry.action)"
         :saving="store.savingKey === `${entry.tool}.${entry.action}`"
         @change="(perm) => store.updatePermission(entry.tool, entry.action, perm)"
       />

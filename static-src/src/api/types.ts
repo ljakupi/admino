@@ -186,3 +186,23 @@ export interface PermissionPatchRequest {
   action: string;
   permission: PermissionState;
 }
+
+// Critical Permissions types
+
+export interface CriticalPermissionEntry {
+  tool: string;
+  action: string;
+  state: 'deny' | 'confirm';
+  pending_at: string | null;
+}
+
+export interface CriticalPermissionsResponse {
+  permissions: CriticalPermissionEntry[];
+}
+
+export interface CriticalPermissionPatchResponse {
+  tool: string;
+  action: string;
+  state: 'deny' | 'confirm';
+  pending_at: string | null;
+}
