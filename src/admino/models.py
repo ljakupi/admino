@@ -890,6 +890,41 @@ class FileMoveArgs(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Shared email validation helpers (used by GmailSendArgs, OutlookSendArgs)
+# ---------------------------------------------------------------------------
+
+_EMAIL_ADDRESS_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$"
+)
+
+
+def _validate_email_list(v: list[str]) -> list[str]:
+    """Validate each email address in a list.
+
+    Rejects addresses with control characters, newlines, or missing @.
+    Intentionally strict to prevent header injection.
+    """
+    for addr in v:
+        if not isinstance(addr, str) or not _EMAIL_ADDRESS_RE.match(addr):
+            msg = f"Invalid email address: {addr!r}"
+            raise ValueError(msg)
+    return v
+
+
+def _reject_control_chars(v: str, field_name: str) -> str:
+    """Reject strings containing CR, LF, or null bytes.
+
+    Defence-in-depth against header injection and log spoofing. The email
+    transport layer (stdlib EmailMessage for Gmail, JSON for Graph) also
+    prevents injection, but we reject at the model boundary.
+    """
+    if "\r" in v or "\n" in v or "\x00" in v:
+        msg = f"{field_name} must not contain CR, LF, or null bytes"
+        raise ValueError(msg)
+    return v
+
+
+# ---------------------------------------------------------------------------
 # Gmail tool argument models (tools/gmail.py imports these)
 # ---------------------------------------------------------------------------
 
@@ -930,6 +965,55 @@ class GmailListArgs(BaseModel):
         le=50,
         description="Maximum number of messages to return.",
     )
+
+
+class GmailSendArgs(BaseModel):
+    """Arguments for the gmail.send action (requires promotion + confirm).
+
+    Email addresses are validated with a basic pattern that rejects obvious
+    injection attempts (newlines, control chars). The stdlib ``email`` module
+    handles RFC 2822 encoding safely.
+    """
+
+    to: list[str] = Field(
+        min_length=1,
+        max_length=20,
+        description="Recipient email addresses (1-20).",
+    )
+    subject: str = Field(
+        default="",
+        max_length=500,
+        description="Email subject line.",
+    )
+    body: str = Field(
+        max_length=50_000,
+        description="Plain-text email body (max 50 000 chars).",
+    )
+    cc: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="CC recipients (optional, max 20).",
+    )
+    bcc: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="BCC recipients (optional, max 20).",
+    )
+
+    @field_validator("to", "cc", "bcc", mode="before")
+    @classmethod
+    def _validate_email_addresses(cls, v: list[str]) -> list[str]:
+        return _validate_email_list(v)
+
+    @field_validator("subject", mode="after")
+    @classmethod
+    def _validate_subject(cls, v: str) -> str:
+        return _reject_control_chars(v, "subject")
+
+    @field_validator("body", mode="after")
+    @classmethod
+    def _validate_body(cls, v: str) -> str:
+        return _reject_control_chars(v, "body")
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1185,55 @@ class OutlookListArgs(BaseModel):
         le=50,
         description="Maximum number of messages to return.",
     )
+
+
+class OutlookSendArgs(BaseModel):
+    """Arguments for the outlook.send action (requires promotion + confirm).
+
+    Email addresses are validated with a basic pattern that rejects obvious
+    injection attempts (newlines, control chars). The JSON payload structure
+    of Microsoft Graph prevents header injection by design.
+    """
+
+    to: list[str] = Field(
+        min_length=1,
+        max_length=20,
+        description="Recipient email addresses (1-20).",
+    )
+    subject: str = Field(
+        default="",
+        max_length=500,
+        description="Email subject line.",
+    )
+    body: str = Field(
+        max_length=50_000,
+        description="Plain-text email body (max 50 000 chars).",
+    )
+    cc: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="CC recipients (optional, max 20).",
+    )
+    bcc: list[str] = Field(
+        default_factory=list,
+        max_length=20,
+        description="BCC recipients (optional, max 20).",
+    )
+
+    @field_validator("to", "cc", "bcc", mode="before")
+    @classmethod
+    def _validate_email_addresses(cls, v: list[str]) -> list[str]:
+        return _validate_email_list(v)
+
+    @field_validator("subject", mode="after")
+    @classmethod
+    def _validate_subject(cls, v: str) -> str:
+        return _reject_control_chars(v, "subject")
+
+    @field_validator("body", mode="after")
+    @classmethod
+    def _validate_body(cls, v: str) -> str:
+        return _reject_control_chars(v, "body")
 
 
 # ---------------------------------------------------------------------------

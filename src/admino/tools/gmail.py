@@ -1,15 +1,18 @@
-"""Gmail tool for reading, listing, and searching emails via Google Gmail API v1.
+"""Gmail tool for reading, listing, searching, and sending emails via Google Gmail API v1.
 
-Provides read, list, and search actions for Gmail messages using the
+Provides read, list, search, and send actions for Gmail messages using the
 authenticated user's account. OAuth tokens are managed by admino.oauth.
 
 Security notes:
-- No send, delete, or modify capabilities. gmail.send and gmail.delete are
-  hardcoded denials in permissions.py.
+- gmail.send is a tier-2 promotable denial in permissions.py. It is denied
+  by default and requires explicit user promotion + cooldown before use.
+  gmail.delete remains a hardcoded immutable denial.
 - OAuth tokens are cached in module-level state; refresh tokens never appear
   in memory outside oauth.py.
 - Email body content is truncated to 10000 characters to prevent LLM context
   overflow.
+- RFC 2822 message construction uses stdlib email.message.EmailMessage to
+  prevent header injection.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -28,7 +31,7 @@ import httpx
 if TYPE_CHECKING:
     from datetime import datetime
 
-from admino.models import GmailListArgs, GmailReadArgs, GmailSearchArgs
+from admino.models import GmailListArgs, GmailReadArgs, GmailSearchArgs, GmailSendArgs
 from admino.oauth import OAuthError, get_valid_access_token
 from admino.tools.registry import register_tool
 
@@ -403,3 +406,100 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
                 continue
 
     return _format_message_list(messages)
+
+
+# ---------------------------------------------------------------------------
+# gmail.send
+# ---------------------------------------------------------------------------
+
+def _build_rfc2822(args: GmailSendArgs) -> str:
+    """Build an RFC 2822 email message and return it as base64url-encoded string.
+
+    Uses stdlib ``email.message.EmailMessage`` which safely encodes headers
+    and prevents header injection.
+
+    Args:
+        args: Validated send arguments.
+
+    Returns:
+        Base64url-encoded RFC 2822 message string (no padding).
+    """
+    from email.message import EmailMessage
+
+    msg = EmailMessage()
+    msg["To"] = ", ".join(args.to)
+    if args.cc:
+        msg["Cc"] = ", ".join(args.cc)
+    if args.bcc:
+        msg["Bcc"] = ", ".join(args.bcc)
+    msg["Subject"] = args.subject
+    msg.set_content(args.body)
+
+    raw_bytes = msg.as_bytes()
+    return base64.urlsafe_b64encode(raw_bytes).decode("ascii").rstrip("=")
+
+
+def _send_summary(args: GmailSendArgs) -> str:
+    """Build a confirmation-friendly summary of a sent email.
+
+    Args:
+        args: The send arguments used.
+
+    Returns:
+        Human-readable summary with recipients, subject, and body preview.
+    """
+    recipients = ", ".join(args.to)
+    parts = [f"Email sent to: {recipients}"]
+    if args.cc:
+        parts.append(f"CC: {', '.join(args.cc)}")
+    if args.bcc:
+        parts.append(f"BCC: {len(args.bcc)} recipient(s)")
+    parts.append(f"Subject: {args.subject}")
+    return "\n".join(parts)
+
+
+@register_tool(
+    tool="gmail",
+    action="send",
+    description=(
+        "Send an email via Gmail. Requires promotion from deny to confirm "
+        "via Critical Permissions. Returns a confirmation summary."
+    ),
+    args_schema=GmailSendArgs,
+)
+async def gmail_send(args: GmailSendArgs, **kwargs: object) -> str:
+    """Send an email via the Gmail API.
+
+    Constructs an RFC 2822 message, base64url-encodes it, and POSTs to the
+    Gmail API ``messages.send`` endpoint.
+
+    Args:
+        args: Validated send arguments (to, subject, body, cc, bcc).
+
+    Returns:
+        Confirmation summary string, or an error message.
+    """
+    try:
+        token = await _get_google_token()
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+
+    raw_message = _build_rfc2822(args)
+
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+
+    try:
+        response = await _http_client.post(
+            f"{_GMAIL_API_BASE}/messages/send",
+            headers=_auth_headers(token),
+            json={"raw": raw_message},
+        )
+    except httpx.HTTPError as exc:
+        return f"HTTP request failed: {type(exc).__name__}"
+
+    if response.status_code != 200:
+        return _format_api_error(response)
+
+    return _send_summary(args)

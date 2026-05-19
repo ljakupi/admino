@@ -1,14 +1,16 @@
 """Outlook mail tool using Microsoft Graph API.
 
-Provides read, list, and search actions for Outlook messages via the
-Microsoft Graph ``/me/messages`` endpoints. Authentication is handled
-via OAuth tokens managed by ``admino.oauth``.
+Provides read, list, search, and send actions for Outlook messages via the
+Microsoft Graph ``/me/messages`` and ``/me/sendMail`` endpoints.
+Authentication is handled via OAuth tokens managed by ``admino.oauth``.
 
 Security notes:
-- No send or delete capabilities. outlook.send and outlook.delete are
-  hardcoded denials in permissions.py.
+- outlook.send is a tier-2 promotable denial in permissions.py. It is denied
+  by default and requires explicit user promotion + cooldown before use.
+  outlook.delete remains a hardcoded immutable denial.
 - Message body content is truncated to 10 000 characters before returning.
 - OAuth tokens are cached in-memory only; refresh tokens stay encrypted on disk.
+- JSON payload structure of Microsoft Graph prevents header injection by design.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -26,7 +28,7 @@ import httpx
 if TYPE_CHECKING:
     from datetime import datetime
 
-from admino.models import OutlookListArgs, OutlookReadArgs, OutlookSearchArgs
+from admino.models import OutlookListArgs, OutlookReadArgs, OutlookSearchArgs, OutlookSendArgs
 from admino.oauth import OAuthError, get_valid_access_token
 from admino.tools.registry import register_tool
 
@@ -314,3 +316,96 @@ async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
     if not parts:
         return "No messages found matching the search query."
     return "\n---\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# outlook.send
+# ---------------------------------------------------------------------------
+
+def _build_sendmail_payload(args: OutlookSendArgs) -> dict[str, object]:
+    """Build the Microsoft Graph ``sendMail`` JSON payload.
+
+    Args:
+        args: Validated send arguments.
+
+    Returns:
+        Dict suitable for ``json=`` in an httpx POST.
+    """
+
+    def _recipients(addrs: list[str]) -> list[dict[str, dict[str, str]]]:
+        return [{"emailAddress": {"address": a}} for a in addrs]
+
+    message: dict[str, object] = {
+        "subject": args.subject,
+        "body": {
+            "contentType": "text",
+            "content": args.body,
+        },
+        "toRecipients": _recipients(args.to),
+    }
+    if args.cc:
+        message["ccRecipients"] = _recipients(args.cc)
+    if args.bcc:
+        message["bccRecipients"] = _recipients(args.bcc)
+
+    return {"message": message}
+
+
+def _outlook_send_summary(args: OutlookSendArgs) -> str:
+    """Build a confirmation-friendly summary of a sent email.
+
+    Args:
+        args: The send arguments used.
+
+    Returns:
+        Human-readable summary with recipients, subject, and body preview.
+    """
+    recipients = ", ".join(args.to)
+    parts = [f"Email sent to: {recipients}"]
+    if args.cc:
+        parts.append(f"CC: {', '.join(args.cc)}")
+    if args.bcc:
+        parts.append(f"BCC: {len(args.bcc)} recipient(s)")
+    parts.append(f"Subject: {args.subject}")
+    return "\n".join(parts)
+
+
+@register_tool(
+    tool="outlook",
+    action="send",
+    description=(
+        "Send an email via Outlook (Microsoft Graph). Requires promotion from "
+        "deny to confirm via Critical Permissions. Returns a confirmation summary."
+    ),
+    args_schema=OutlookSendArgs,
+)
+async def outlook_send(args: OutlookSendArgs, **kwargs: object) -> str:
+    """Send an email via the Microsoft Graph ``sendMail`` endpoint.
+
+    Args:
+        args: Validated send arguments (to, subject, body, cc, bcc).
+
+    Returns:
+        Confirmation summary string, or an error message.
+    """
+    try:
+        token = await _get_microsoft_token()
+    except OAuthError as exc:
+        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+
+    payload = _build_sendmail_payload(args)
+
+    try:
+        response = await _http_client.post(  # type: ignore[union-attr]
+            f"{_GRAPH_BASE}/me/sendMail",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+    except httpx.HTTPError as exc:
+        logger.error("HTTP error sending Outlook email: %s", type(exc).__name__)
+        return "Failed to connect to Microsoft Graph API."
+
+    if response.status_code != 202:
+        return f"Microsoft Graph error: {_extract_graph_error(response)}"
+
+    return _outlook_send_summary(args)
