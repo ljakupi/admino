@@ -1,21 +1,24 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
+import { useRoute } from 'vue-router';
 import {
   Key, BrainCircuit, Palette, Bell, Info, TriangleAlert,
   ShieldCheck, Plus, Github,
 } from 'lucide-vue-next';
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
+import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
 import { useSettingsStore, type LLMProvider } from '@/stores/settings';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
 
+const route = useRoute();
 const settings = useSettingsStore();
 const chatStore = useChatStore();
 const toasts = useToastStore();
 
 const showClearConfirm = ref(false);
-const activeSection = ref('agent');
+const activeSection = ref(route.hash === '#danger' ? 'danger' : 'agent');
 
 // --- Subnav definition ---
 const NAV = [
@@ -444,6 +447,9 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
             <h2 class="section-title danger-title">Danger zone</h2>
             <p class="section-sub">These actions cannot be undone. Each one prompts for confirmation.</p>
           </div>
+
+          <CriticalPermissionsCard />
+
           <div class="danger-card">
             <div class="s-row">
               <div class="row-label">

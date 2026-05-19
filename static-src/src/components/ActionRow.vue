@@ -7,6 +7,7 @@ import type { PermissionEntry, PermissionState } from '@/api/types';
 const props = defineProps<{
   entry: PermissionEntry;
   hardcoded: boolean;
+  promotable: boolean;
   saving: boolean;
 }>();
 
@@ -26,6 +27,7 @@ const description = computed(() => store.getActionDescription(props.entry.tool, 
     <PermissionPill
       :permission="entry.permission"
       :hardcoded="hardcoded"
+      :promotable="promotable"
       :saving="saving"
       @change="$emit('change', $event)"
     />

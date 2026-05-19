@@ -625,3 +625,254 @@ class TestCriticalPermissionsAdversarial:
                 json={"bearer_token": _TEST_TOKEN},
             )
         assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression: _resolve_pending_promotions called on POST /api/message
+# ---------------------------------------------------------------------------
+
+
+class TestPostMessageResolvesPromotions:
+    """POST /api/message must call _resolve_pending_promotions so expired
+    cooldowns are resolved before the agent processes the request."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_post_message_resolves_expired_cooldown(self) -> None:
+        """An expired pending promotion is resolved when POST /api/message fires."""
+        from admino import server
+        from admino.models import AgentResult, LLMMessage
+
+        result = AgentResult(
+            status="final",
+            response="ok",
+            history=[
+                LLMMessage(role="user", content="hi"),
+                LLMMessage(role="assistant", content="ok"),
+            ],
+            tool_calls=[],
+            pending_confirmation=None,
+        )
+
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=result)
+        agent._promoted = frozenset()
+        agent._tools_enabled = {}
+
+        app = _make_app(agent=agent)
+        _clear_critical_state()
+
+        # Set a pending promotion that expired 6 minutes ago.
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(
+            minutes=6
+        )
+        mock_update = AsyncMock()
+
+        try:
+            with (
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.update_permission", mock_update),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as c:
+                    resp = await c.post(
+                        "/api/message",
+                        headers=_AUTH_HEADER,
+                        json={"message": "hello", "session_id": "sess-1"},
+                    )
+
+            assert resp.status_code == 200
+            assert ("gmail", "send") in server._promoted_permissions
+            assert ("gmail", "send") not in server._pending_promotions
+            # Agent's _promoted field should also be updated.
+            assert ("gmail", "send") in agent._promoted
+            mock_update.assert_called_once()
+        finally:
+            _clear_critical_state()
+
+    async def test_post_message_no_resolution_when_cooldown_not_expired(self) -> None:
+        """A pending promotion whose cooldown has NOT expired stays pending."""
+        from admino import server
+        from admino.models import AgentResult, LLMMessage
+
+        result = AgentResult(
+            status="final",
+            response="ok",
+            history=[
+                LLMMessage(role="user", content="hi"),
+                LLMMessage(role="assistant", content="ok"),
+            ],
+            tool_calls=[],
+            pending_confirmation=None,
+        )
+
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=result)
+        agent._promoted = frozenset()
+        agent._tools_enabled = {}
+
+        app = _make_app(agent=agent)
+        _clear_critical_state()
+
+        # Set a pending promotion that is only 1 minute old (not expired).
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(
+            minutes=1
+        )
+
+        try:
+            with (
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.update_permission", AsyncMock()),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as c:
+                    resp = await c.post(
+                        "/api/message",
+                        headers=_AUTH_HEADER,
+                        json={"message": "hello", "session_id": "sess-2"},
+                    )
+
+            assert resp.status_code == 200
+            # Still pending — not yet promoted.
+            assert ("gmail", "send") in server._pending_promotions
+            assert ("gmail", "send") not in server._promoted_permissions
+        finally:
+            _clear_critical_state()
+
+    async def test_post_message_promotes_multiple_expired_cooldowns(self) -> None:
+        """Multiple expired cooldowns are all resolved in a single request."""
+        from admino import server
+        from admino.models import AgentResult, LLMMessage
+
+        result = AgentResult(
+            status="final",
+            response="ok",
+            history=[
+                LLMMessage(role="user", content="hi"),
+                LLMMessage(role="assistant", content="ok"),
+            ],
+            tool_calls=[],
+            pending_confirmation=None,
+        )
+
+        agent = MagicMock()
+        agent.run = AsyncMock(return_value=result)
+        agent._promoted = frozenset()
+        agent._tools_enabled = {}
+
+        app = _make_app(agent=agent)
+        _clear_critical_state()
+
+        expired_time = datetime.now(UTC) - timedelta(minutes=6)
+        server._pending_promotions[("gmail", "send")] = expired_time
+        server._pending_promotions[("outlook", "send")] = expired_time
+        mock_update = AsyncMock()
+
+        try:
+            with (
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.update_permission", mock_update),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as c:
+                    resp = await c.post(
+                        "/api/message",
+                        headers=_AUTH_HEADER,
+                        json={"message": "hello", "session_id": "sess-3"},
+                    )
+
+            assert resp.status_code == 200
+            assert ("gmail", "send") in server._promoted_permissions
+            assert ("outlook", "send") in server._promoted_permissions
+            assert mock_update.call_count == 2
+        finally:
+            _clear_critical_state()
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression: _promoted_permissions loaded from DB on startup
+# ---------------------------------------------------------------------------
+
+
+class TestLifespanLoadsPromotedPermissions:
+    """The lifespan startup must load previously-promoted permissions from the
+    database so that tier-2 promotions survive server restarts."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_lifespan_loads_promoted_permission_from_db(self) -> None:
+        """When the DB has gmail.send as 'confirm', lifespan populates the
+        _promoted_permissions set and the agent's _promoted field."""
+        from admino import server
+        from admino.server import _lifespan
+
+        agent = MagicMock()
+        agent._promoted = frozenset()
+        agent._tools_enabled = {}
+
+        app = _make_app(agent=agent)
+        _clear_critical_state()
+
+        # Mock DB to return gmail.send as promoted.
+        db_perms: dict[str, dict[str, str]] = {
+            "gmail": {"send": "confirm"},
+        }
+        mock_load_perms = AsyncMock(return_value=db_perms)
+        mock_load_settings = AsyncMock(return_value={})
+        mock_init = AsyncMock()
+        mock_close = AsyncMock()
+
+        try:
+            with (
+                patch("admino.database.init_pool", mock_init),
+                patch("admino.database.close_pool", mock_close),
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.load_permissions_from_db", mock_load_perms),
+                patch("admino.database.load_settings_from_db", mock_load_settings),
+            ):
+                # Drive the lifespan context manager directly.
+                async with _lifespan(app):
+                    assert ("gmail", "send") in server._promoted_permissions
+                    assert ("gmail", "send") in agent._promoted
+        finally:
+            _clear_critical_state()
+
+    async def test_lifespan_ignores_non_promotable_permissions_from_db(self) -> None:
+        """Only PROMOTABLE_DENIALS pairs are loaded; other DB rows are ignored."""
+        from admino import server
+        from admino.server import _lifespan
+
+        agent = MagicMock()
+        agent._promoted = frozenset()
+        agent._tools_enabled = {}
+
+        app = _make_app(agent=agent)
+        _clear_critical_state()
+
+        # gmail.delete is an immutable denial, not promotable — must be ignored.
+        db_perms: dict[str, dict[str, str]] = {
+            "gmail": {"send": "confirm", "delete": "confirm"},
+        }
+        mock_load_perms = AsyncMock(return_value=db_perms)
+        mock_load_settings = AsyncMock(return_value={})
+        mock_init = AsyncMock()
+        mock_close = AsyncMock()
+
+        try:
+            with (
+                patch("admino.database.init_pool", mock_init),
+                patch("admino.database.close_pool", mock_close),
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.load_permissions_from_db", mock_load_perms),
+                patch("admino.database.load_settings_from_db", mock_load_settings),
+            ):
+                async with _lifespan(app):
+                    # gmail.send is promotable — should be loaded.
+                    assert ("gmail", "send") in server._promoted_permissions
+                    # gmail.delete is NOT promotable — must not appear.
+                    assert ("gmail", "delete") not in server._promoted_permissions
+        finally:
+            _clear_critical_state()

@@ -4,19 +4,27 @@ import { getPermissions, patchPermission } from '@/api/permissions';
 import { useToastStore } from '@/stores/toasts';
 import type { PermissionEntry, PermissionState } from '@/api/types';
 
-// Must mirror HARDCODED_DENIALS in src/admino/permissions.py exactly.
-// This is a UI-only display hint — backend enforces the real constraint.
-// When adding a new hardcoded denial to permissions.py, update this set too.
+// Tier-1: truly immutable denials — cannot be overridden by any config.
+// Must mirror HARDCODED_DENIALS in src/admino/permissions.py (minus promotable entries).
 const HARDCODED_DENIALS = new Set([
-  'gmail.send', 'gmail.delete',
-  'google_calendar.delete', 'google_calendar.update',
+  'gmail.delete',
+  'google_calendar.delete',
   'google_drive.delete',
-  'outlook.send', 'outlook.delete',
-  'outlook_calendar.delete', 'outlook_calendar.update',
+  'outlook.delete',
+  'outlook_calendar.delete',
   'onedrive.delete',
   'documents.delete',
   'files.delete', 'files.overwrite',
   'memory.delete',
+]);
+
+// Tier-2: promotable via Settings > Danger Zone (deny → confirm with cooldown).
+// Must mirror PROMOTABLE_DENIALS in src/admino/permissions.py.
+export const PROMOTABLE_DENIALS = new Set([
+  'gmail.send',
+  'outlook.send',
+  'google_calendar.update',
+  'outlook_calendar.update',
 ]);
 
 const TOOL_META: Record<string, { label: string; description: string; actions: Record<string, string> }> = {
@@ -181,6 +189,10 @@ export const usePermissionsStore = defineStore('permissions', () => {
     return HARDCODED_DENIALS.has(`${tool}.${action}`);
   }
 
+  function isPromotable(tool: string, action: string): boolean {
+    return PROMOTABLE_DENIALS.has(`${tool}.${action}`);
+  }
+
   function getToolMeta(tool: string): { label: string; description: string; actions: Record<string, string> } {
     return TOOL_META[tool] ?? { label: tool, description: '', actions: {} };
   }
@@ -226,6 +238,7 @@ export const usePermissionsStore = defineStore('permissions', () => {
     statusCounts,
     toolSummary,
     isHardcoded,
+    isPromotable,
     getToolMeta,
     getActionDescription,
     loadPermissions,
