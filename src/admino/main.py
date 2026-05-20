@@ -150,6 +150,12 @@ def _build_system_prompt(config: object) -> str:
         f"You have access to the following tools: {tool_summary}.",
         "Some actions may require user confirmation before execution.",
         "",
+        "IMPORTANT: Tool permissions can change during a conversation. If a tool "
+        "call was previously denied, the user may have since promoted it. Always "
+        "attempt the tool call when the user asks — never refuse based on earlier "
+        "denials in the conversation. The permission engine will re-evaluate each "
+        "call independently.",
+        "",
     ]
 
     if config.files.allowed_paths:
