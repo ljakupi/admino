@@ -132,10 +132,23 @@ def _build_system_prompt(config: object) -> str:
     if not isinstance(config, AppConfig):
         return ""
 
+    from admino.tools.registry import get_registered_tools
+
+    # Build a dynamic tool summary from the registry so the LLM knows
+    # about ALL registered tools, not a hardcoded subset. Tools are
+    # grouped by name with their actions listed.
+    tool_actions: dict[str, list[str]] = {}
+    for desc in get_registered_tools():
+        tool_actions.setdefault(desc.tool, []).append(desc.action)
+    tool_summary = ", ".join(
+        f"{name} ({'/'.join(sorted(actions))})"
+        for name, actions in sorted(tool_actions.items())
+    )
+
     lines: list[str] = [
         "You are admino, a local personal AI assistant.",
-        "You have access to the following tools: memory (store/recall/list key-value notes) "
-        "and files (read/list/search/write/move files).",
+        f"You have access to the following tools: {tool_summary}.",
+        "Some actions may require user confirmation before execution.",
         "",
     ]
 
