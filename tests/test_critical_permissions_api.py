@@ -876,3 +876,143 @@ class TestLifespanLoadsPromotedPermissions:
                     assert ("gmail", "delete") not in server._promoted_permissions
         finally:
             _clear_critical_state()
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression: session notification on promotion resolution
+# ---------------------------------------------------------------------------
+
+
+class TestPromotionSessionNotification:
+    """When _resolve_pending_promotions() resolves expired cooldowns, a system
+    message must be injected into every active session in _sessions so the LLM
+    knows the permission changed and won't refuse based on stale denials."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_resolve_promotions_injects_system_message_into_sessions(
+        self,
+    ) -> None:
+        """Expired cooldown resolution appends a system LLMMessage to all sessions."""
+        from admino import server
+        from admino.models import LLMMessage
+        from admino.server import _resolve_pending_promotions
+
+        _clear_critical_state()
+
+        # Populate two active sessions with some existing history.
+        sess1_history: list[LLMMessage] = [
+            LLMMessage(role="user", content="hello"),
+        ]
+        sess2_history: list[LLMMessage] = [
+            LLMMessage(role="user", content="send an email"),
+            LLMMessage(role="assistant", content="I cannot do that yet."),
+        ]
+        server._sessions["sess-a"] = sess1_history
+        server._sessions["sess-b"] = sess2_history
+
+        # Set an expired pending promotion (6 minutes ago).
+        server._pending_promotions[("gmail", "send")] = datetime.now(
+            UTC
+        ) - timedelta(minutes=6)
+
+        mock_update = AsyncMock()
+        agent_mock = MagicMock()
+        agent_mock._promoted = frozenset()
+        server._agent = agent_mock
+
+        try:
+            with (
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.update_permission", mock_update),
+            ):
+                await _resolve_pending_promotions()
+
+            # Both sessions should have gained exactly one new message.
+            assert len(sess1_history) == 2
+            assert len(sess2_history) == 3
+
+            # The injected message should be a system message mentioning the action.
+            injected_1 = sess1_history[-1]
+            injected_2 = sess2_history[-1]
+
+            assert injected_1.role == "system"
+            assert injected_2.role == "system"
+            assert "gmail.send" in injected_1.content
+            assert "gmail.send" in injected_2.content
+        finally:
+            server._sessions.clear()
+            server._agent = None
+            _clear_critical_state()
+
+    async def test_resolve_promotions_no_injection_when_no_expired(self) -> None:
+        """When no pending promotions have expired, sessions remain unchanged."""
+        from admino import server
+        from admino.models import LLMMessage
+        from admino.server import _resolve_pending_promotions
+
+        _clear_critical_state()
+
+        # Populate a session.
+        sess_history: list[LLMMessage] = [
+            LLMMessage(role="user", content="hello"),
+        ]
+        server._sessions["sess-x"] = sess_history
+
+        # Set a pending promotion only 1 minute old (not expired).
+        server._pending_promotions[("gmail", "send")] = datetime.now(
+            UTC
+        ) - timedelta(minutes=1)
+
+        try:
+            await _resolve_pending_promotions()
+
+            # Session should be untouched — still just the one user message.
+            assert len(sess_history) == 1
+            assert sess_history[0].role == "user"
+        finally:
+            server._sessions.clear()
+            _clear_critical_state()
+
+
+# ---------------------------------------------------------------------------
+# Bug-fix regression: system prompt includes dynamic permission guidance
+# ---------------------------------------------------------------------------
+
+
+class TestSystemPromptDynamicPermissionGuidance:
+    """The system prompt built by _build_system_prompt() must tell the LLM
+    that permissions can change during a conversation so it doesn't refuse
+    tool calls based on stale denial messages in the history."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_system_prompt_includes_dynamic_permission_guidance(self) -> None:
+        """System prompt contains guidance about permissions changing mid-conversation."""
+        import os
+
+        from admino.config import AppConfig
+        from admino.main import _build_system_prompt
+        from admino.tools.registry import ToolDescription
+
+        # AppConfig requires AUTH_TOKEN >= 48 chars with >= 20 unique chars.
+        fake_token = _TEST_TOKEN
+        fake_tool = ToolDescription(
+            tool="gmail",
+            action="send",
+            description="Send an email.",
+            parameters_schema={"type": "object", "properties": {}},
+        )
+
+        with (
+            patch.dict(os.environ, {"AUTH_TOKEN": fake_token}),
+            patch(
+                "admino.tools.registry.get_registered_tools",
+                return_value=[fake_tool],
+            ),
+        ):
+            config = AppConfig()
+            prompt = _build_system_prompt(config)
+
+        assert "permissions can change during a conversation" in prompt.lower()
+        assert "never refuse based on earlier" in prompt.lower()
