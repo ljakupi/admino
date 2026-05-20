@@ -19,7 +19,7 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-from admino.models import GmailListArgs, GmailReadArgs, GmailSearchArgs
+from admino.models import GmailListArgs, GmailReadArgs, GmailSearchArgs, GmailSendArgs
 from admino.oauth import OAuthError
 from admino.tools import gmail
 from admino.tools.registry import clear_registry, get_registered_tools
@@ -475,3 +475,204 @@ class TestGmailHelpers:
         resp = httpx.Response(status_code=500, content=b"not json")
         result = gmail._format_api_error(resp)
         assert "500" in result
+
+
+# ---------------------------------------------------------------------------
+# 7. gmail.send registration
+# ---------------------------------------------------------------------------
+
+
+class TestGmailSendRegistration:
+    """Verify gmail.send is registered after import."""
+
+    def test_gmail_send_registered(self) -> None:
+        """gmail.send action is present in the registry."""
+        tools = get_registered_tools()
+        keys = [(t.tool, t.action) for t in tools]
+        assert ("gmail", "send") in keys
+
+
+# ---------------------------------------------------------------------------
+# 8. gmail.send handler
+# ---------------------------------------------------------------------------
+
+
+class TestGmailSend:
+    """Tests for the gmail.send handler."""
+
+    async def test_send_happy_path(self, mock_http: AsyncMock) -> None:
+        """Successful send returns confirmation with recipient and subject."""
+        mock_http.post.return_value = _make_response(200, {"id": "sent123"})
+
+        args = GmailSendArgs(
+            to=["recipient@example.com"],
+            subject="Test Email",
+            body="Hello from test!",
+        )
+        result = await gmail.gmail_send(args)
+
+        assert "sent" in result.lower()
+        assert "recipient@example.com" in result
+        assert "Test Email" in result
+
+    async def test_send_oauth_error(self) -> None:
+        """OAuthError from token retrieval returns setup instructions."""
+        with patch.object(
+            gmail, "_get_google_token", new_callable=AsyncMock, side_effect=OAuthError("no token")
+        ):
+            args = GmailSendArgs(
+                to=["user@example.com"],
+                subject="Hi",
+                body="test",
+            )
+            result = await gmail.gmail_send(args)
+
+        assert "OAuth error" in result
+        assert "oauth_setup" in result
+
+    async def test_send_api_error_non_200(self, mock_http: AsyncMock) -> None:
+        """Non-200 status returns a formatted API error."""
+        error_body = {"error": {"code": 400, "message": "Bad Request"}}
+        mock_http.post.return_value = _make_response(400, error_body)
+
+        args = GmailSendArgs(
+            to=["user@example.com"],
+            subject="Hi",
+            body="test",
+        )
+        result = await gmail.gmail_send(args)
+
+        assert "Google API error" in result
+
+    async def test_send_http_connection_error(self) -> None:
+        """httpx.ConnectError returns a friendly error message."""
+        with patch.object(
+            gmail, "_get_google_token", new_callable=AsyncMock, return_value=_FAKE_TOKEN
+        ):
+            client = AsyncMock(spec=httpx.AsyncClient)
+            client.post.side_effect = httpx.ConnectError("connection refused")
+            with patch.object(gmail, "_http_client", client):
+                args = GmailSendArgs(
+                    to=["user@example.com"],
+                    subject="Hi",
+                    body="test",
+                )
+                result = await gmail.gmail_send(args)
+
+        assert "HTTP request failed" in result
+
+    async def test_send_includes_cc_bcc(self, mock_http: AsyncMock) -> None:
+        """When cc/bcc are provided, they appear in the RFC 2822 message body."""
+        mock_http.post.return_value = _make_response(200, {"id": "sent456"})
+
+        args = GmailSendArgs(
+            to=["to@example.com"],
+            cc=["cc@example.com"],
+            bcc=["bcc@example.com"],
+            subject="With CC",
+            body="test body",
+        )
+        await gmail.gmail_send(args)
+
+        # Inspect the raw POST body sent to the API (json={"raw": base64url_message})
+        call_kwargs = mock_http.post.call_args
+        post_json = call_kwargs.kwargs.get("json", {})
+        raw_b64 = post_json["raw"]
+
+        # Pad base64url and decode the RFC 2822 message
+        padded = raw_b64 + "=" * (4 - len(raw_b64) % 4)
+        raw_message = base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+        assert "cc@example.com" in raw_message
+        assert "bcc@example.com" in raw_message
+
+    async def test_send_response_omits_body_content(self, mock_http: AsyncMock) -> None:
+        """Response summary does not include email body content (audit safety)."""
+        mock_http.post.return_value = _make_response(200, {"id": "sent789"})
+
+        body = "Sensitive medical information here"
+        args = GmailSendArgs(
+            to=["user@example.com"],
+            subject="Long body",
+            body=body,
+        )
+        result = await gmail.gmail_send(args)
+
+        assert body not in result
+        assert "Email sent to" in result
+
+
+# ---------------------------------------------------------------------------
+# 9. gmail.send argument validation
+# ---------------------------------------------------------------------------
+
+
+class TestGmailSendArgValidation:
+    """Pydantic validation for GmailSendArgs."""
+
+    def test_send_empty_to_rejected(self) -> None:
+        """Empty recipient list is rejected."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(to=[], subject="Hi", body="test")
+
+    def test_send_invalid_email_rejected(self) -> None:
+        """Invalid email address is rejected."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(to=["not-an-email"], subject="Hi", body="test")
+
+    def test_send_header_injection_email_rejected(self) -> None:
+        """Email with CRLF header injection is rejected."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(to=["evil@test.com\r\nBcc: spam@evil.com"], subject="Hi", body="test")
+
+    def test_send_too_many_recipients_rejected(self) -> None:
+        """More than 20 recipients is rejected."""
+        recipients = [f"user{i}@example.com" for i in range(21)]
+        with pytest.raises(ValidationError):
+            GmailSendArgs(to=recipients, subject="Hi", body="test")
+
+    def test_send_subject_too_long_rejected(self) -> None:
+        """Subject exceeding 500 chars is rejected."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(to=["user@example.com"], subject="x" * 501, body="test")
+
+    def test_send_body_too_long_rejected(self) -> None:
+        """Body exceeding 50000 chars is rejected."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(to=["user@example.com"], subject="Hi", body="x" * 50001)
+
+    def test_send_valid_args_accepted(self) -> None:
+        """Valid send arguments pass validation."""
+        args = GmailSendArgs(
+            to=["user@example.com"],
+            subject="Hello",
+            body="This is a test email.",
+        )
+        assert args.to == ["user@example.com"]
+        assert args.subject == "Hello"
+
+    def test_send_subject_with_crlf_rejected(self) -> None:
+        """Subject containing CRLF is rejected (header injection prevention)."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(
+                to=["user@example.com"],
+                subject="Legit\r\nBcc: attacker@evil.com",
+                body="test",
+            )
+
+    def test_send_body_with_null_byte_rejected(self) -> None:
+        """Body containing null byte is rejected."""
+        with pytest.raises(ValidationError):
+            GmailSendArgs(
+                to=["user@example.com"],
+                subject="Hi",
+                body="test\x00payload",
+            )
+
+    def test_send_empty_subject_allowed(self) -> None:
+        """Empty subject is allowed."""
+        args = GmailSendArgs(
+            to=["user@example.com"],
+            subject="",
+            body="No subject email",
+        )
+        assert args.subject == ""

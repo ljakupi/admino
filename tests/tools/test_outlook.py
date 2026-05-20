@@ -18,7 +18,7 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from collections.abc import Generator
 
-from admino.models import OutlookListArgs, OutlookReadArgs, OutlookSearchArgs
+from admino.models import OutlookListArgs, OutlookReadArgs, OutlookSearchArgs, OutlookSendArgs
 from admino.oauth import OAuthError
 from admino.tools import outlook as outlook_mod
 from admino.tools.registry import clear_registry, get_registered_tools
@@ -419,3 +419,224 @@ class TestOutlookArgValidation:
         """Default max_results is 10."""
         args = OutlookSearchArgs(query="test")
         assert args.max_results == 10
+
+
+# ---------------------------------------------------------------------------
+# 6. outlook.send registration
+# ---------------------------------------------------------------------------
+
+
+class TestOutlookSendRegistration:
+    """Verify outlook.send is registered after import."""
+
+    def test_outlook_send_registered(self) -> None:
+        """outlook.send action is present in the registry."""
+        tools = get_registered_tools()
+        keys = [(t.tool, t.action) for t in tools]
+        assert ("outlook", "send") in keys
+
+
+# ---------------------------------------------------------------------------
+# 7. outlook.send handler
+# ---------------------------------------------------------------------------
+
+
+class TestOutlookSend:
+    """Tests for the outlook.send handler."""
+
+    async def test_send_happy_path(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Successful send (202 Accepted) returns confirmation with recipients."""
+        mock_http_client.post.return_value = _make_response(202)
+
+        from admino.tools.outlook import outlook_send
+
+        args = OutlookSendArgs(
+            to=["recipient@example.com"],
+            subject="Test Email",
+            body="Hello from test!",
+        )
+        result = await outlook_send(args)
+
+        assert "sent" in result.lower()
+        assert "recipient@example.com" in result
+
+    async def test_send_oauth_error(self) -> None:
+        """OAuthError returns setup instructions."""
+        with patch(
+            "admino.tools.outlook._get_microsoft_token",
+            new_callable=AsyncMock,
+            side_effect=OAuthError("not configured"),
+        ):
+            from admino.tools.outlook import outlook_send
+
+            args = OutlookSendArgs(
+                to=["user@example.com"],
+                subject="Hi",
+                body="test",
+            )
+            result = await outlook_send(args)
+
+        assert "OAuth error" in result
+
+    async def test_send_api_error(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Non-2xx response returns Graph error message."""
+        error_body = {"error": {"message": "Bad Request"}}
+        mock_http_client.post.return_value = _make_response(400, error_body)
+
+        from admino.tools.outlook import outlook_send
+
+        args = OutlookSendArgs(
+            to=["user@example.com"],
+            subject="Hi",
+            body="test",
+        )
+        result = await outlook_send(args)
+
+        assert "Microsoft Graph error" in result
+
+    async def test_send_http_connection_error(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """httpx.ConnectError returns connection failure message."""
+        mock_http_client.post.side_effect = httpx.ConnectError("connection failed")
+
+        from admino.tools.outlook import outlook_send
+
+        args = OutlookSendArgs(
+            to=["user@example.com"],
+            subject="Hi",
+            body="test",
+        )
+        result = await outlook_send(args)
+
+        assert "Failed to connect" in result
+
+    async def test_send_payload_structure(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """JSON payload posted to Graph has the correct sendMail structure."""
+        mock_http_client.post.return_value = _make_response(202)
+
+        from admino.tools.outlook import outlook_send
+
+        args = OutlookSendArgs(
+            to=["to@example.com"],
+            cc=["cc@example.com"],
+            bcc=["bcc@example.com"],
+            subject="Structured Test",
+            body="body content",
+        )
+        await outlook_send(args)
+
+        call_kwargs = mock_http_client.post.call_args
+        payload = call_kwargs.kwargs.get("json") or call_kwargs[1].get("json", {})
+
+        message = payload["message"]
+        assert len(message["toRecipients"]) == 1
+        assert message["toRecipients"][0]["emailAddress"]["address"] == "to@example.com"
+        assert len(message["ccRecipients"]) == 1
+        assert message["ccRecipients"][0]["emailAddress"]["address"] == "cc@example.com"
+        assert len(message["bccRecipients"]) == 1
+        assert message["bccRecipients"][0]["emailAddress"]["address"] == "bcc@example.com"
+        assert message["subject"] == "Structured Test"
+        assert "body content" in message["body"]["content"]
+
+    async def test_send_response_omits_body_content(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Response summary does not include email body content (audit safety)."""
+        mock_http_client.post.return_value = _make_response(202)
+
+        from admino.tools.outlook import outlook_send
+
+        body = "Sensitive medical information here"
+        args = OutlookSendArgs(
+            to=["user@example.com"],
+            subject="Long body",
+            body=body,
+        )
+        result = await outlook_send(args)
+
+        assert body not in result
+        assert "Email sent to" in result
+
+
+# ---------------------------------------------------------------------------
+# 8. outlook.send argument validation
+# ---------------------------------------------------------------------------
+
+
+class TestOutlookSendArgValidation:
+    """Pydantic validation for OutlookSendArgs."""
+
+    def test_send_empty_to_rejected(self) -> None:
+        """Empty recipient list is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(to=[], subject="Hi", body="test")
+
+    def test_send_invalid_email_rejected(self) -> None:
+        """Invalid email address is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(to=["not-an-email"], subject="Hi", body="test")
+
+    def test_send_header_injection_email_rejected(self) -> None:
+        """Email with CRLF header injection is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(to=["evil@test.com\r\nBcc: spam@evil.com"], subject="Hi", body="test")
+
+    def test_send_too_many_recipients_rejected(self) -> None:
+        """More than 20 recipients is rejected."""
+        recipients = [f"user{i}@example.com" for i in range(21)]
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(to=recipients, subject="Hi", body="test")
+
+    def test_send_subject_too_long_rejected(self) -> None:
+        """Subject exceeding 500 chars is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(to=["user@example.com"], subject="x" * 501, body="test")
+
+    def test_send_body_too_long_rejected(self) -> None:
+        """Body exceeding 50000 chars is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(to=["user@example.com"], subject="Hi", body="x" * 50001)
+
+    def test_send_valid_args_accepted(self) -> None:
+        """Valid send arguments pass validation."""
+        args = OutlookSendArgs(
+            to=["user@example.com"],
+            subject="Hello",
+            body="This is a test email.",
+        )
+        assert args.to == ["user@example.com"]
+        assert args.subject == "Hello"
+
+    def test_send_subject_with_crlf_rejected(self) -> None:
+        """Subject containing CRLF is rejected (header injection prevention)."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(
+                to=["user@example.com"],
+                subject="Legit\r\nBcc: attacker@evil.com",
+                body="test",
+            )
+
+    def test_send_body_with_null_byte_rejected(self) -> None:
+        """Body containing null byte is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookSendArgs(
+                to=["user@example.com"],
+                subject="Hi",
+                body="test\x00payload",
+            )
+
+    def test_send_empty_subject_allowed(self) -> None:
+        """Empty subject is allowed."""
+        args = OutlookSendArgs(
+            to=["user@example.com"],
+            subject="",
+            body="No subject email",
+        )
+        assert args.subject == ""
