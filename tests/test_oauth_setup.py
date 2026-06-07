@@ -1073,8 +1073,9 @@ class TestMicrosoftScopesFallback:
         call_args = ms.call_args
         assert call_args is not None
         token_file = call_args[0][1]
-        assert len(token_file.scopes) == 4
+        assert len(token_file.scopes) == 5
         assert "Mail.ReadWrite" in token_file.scopes
+        assert "Mail.Send" in token_file.scopes
 
 
 # ---------------------------------------------------------------------------
