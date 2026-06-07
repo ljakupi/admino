@@ -278,6 +278,106 @@ class TestOAuthCallback:
         assert "oauth=error" in location
         assert "exchange_failed" in location
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            # Microsoft codes contain ! and * (GH-63)
+            "M.C528_SN1.2.U.abc!def*ghi",
+            "Du25G1wanmuq65hqd!19x8eYxbjymjltRq2IwX8dYNdl",
+            "Alj*yK6ZVKmizXKMYsUvaZ3Dw!6siJLPxCrvqa",
+            # Google-style codes (should still work)
+            "4/0AanRRrsR2_kkdT0xYQ-J7k_abc123",
+            "code-with.dots_and-dashes+plus=equals",
+            # Codes with tilde and comma (other providers)
+            "oauth~token,value",
+        ],
+        ids=[
+            "microsoft-bang",
+            "microsoft-real-prefix",
+            "microsoft-bang-and-star",
+            "google-slash-style",
+            "google-mixed-safe-chars",
+            "tilde-and-comma",
+        ],
+    )
+    async def test_oauth_callback_accepts_valid_codes(self, code: str) -> None:
+        """Auth codes with !, *, ~, and , characters must be accepted (GH-63)."""
+        import admino.server as srv
+
+        app = _make_app()
+
+        state_token = f"state-for-test-{id(code)}"
+        srv._oauth_pending_states[state_token] = (
+            time.time(),
+            "microsoft",
+            "http://test/api/oauth/callback",
+        )
+
+        with (
+            patch(
+                "admino.server.exchange_microsoft_code",
+                new=AsyncMock(
+                    return_value=("access-tok", "refresh-tok", ["Mail.ReadWrite"]),
+                ),
+            ),
+            patch("admino.server.encrypt_refresh_token", return_value="encrypted"),
+            patch("admino.server.save_token"),
+        ):
+            async with AsyncClient(
+                transport=ASGITransport(app=app),
+                base_url="http://test",
+                follow_redirects=False,
+            ) as c:
+                resp = await c.get(
+                    "/api/oauth/callback",
+                    params={"code": code, "state": state_token},
+                )
+
+        # Must reach the handler (not 422 validation error)
+        assert resp.status_code == 307, f"Code {code!r} rejected with {resp.status_code}"
+        assert "oauth=success" in resp.headers["location"]
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "code<script>alert(1)</script>",
+            'code"with"quotes',
+            "code'with'single",
+            "code&param=injected",
+            "code\x00null",
+            "code\nnewline",
+            "code{braces}",
+            "code[brackets]",
+            "code with spaces",
+        ],
+        ids=[
+            "xss-angle-brackets",
+            "double-quotes",
+            "single-quotes",
+            "ampersand-injection",
+            "null-byte",
+            "newline",
+            "curly-braces",
+            "square-brackets",
+            "spaces",
+        ],
+    )
+    async def test_oauth_callback_rejects_malicious_codes(self, code: str) -> None:
+        """Codes with dangerous characters must be rejected by validation."""
+        app = _make_app()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            follow_redirects=False,
+        ) as c:
+            resp = await c.get(
+                "/api/oauth/callback",
+                params={"code": code, "state": "some-state"},
+            )
+
+        assert resp.status_code == 422, f"Code {code!r} was not rejected"
+
 
 # ---------------------------------------------------------------------------
 # GET /api/oauth/google/status
