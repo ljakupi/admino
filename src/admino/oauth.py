@@ -76,10 +76,12 @@ MICROSOFT_AUTH_ENDPOINT: str = "https://login.microsoftonline.com/common/oauth2/
 
 # Scopes: broad at the API level — the agent's permission engine is the actual
 # access control layer. This avoids re-running OAuth consent when enabling new actions.
-# Mail.ReadWrite: read + send + draft. Calendars.ReadWrite: read + create + update + delete.
+# Mail.ReadWrite: read + draft + CRUD. Mail.Send: required for /me/sendMail.
+# Calendars.ReadWrite: read + create + update + delete.
 # Files.ReadWrite: read + write + delete. offline_access: allows token refresh.
 MICROSOFT_SCOPES: list[str] = [
     "Mail.ReadWrite",
+    "Mail.Send",
     "Calendars.ReadWrite",
     "Files.ReadWrite",
     "offline_access",

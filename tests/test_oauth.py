@@ -840,6 +840,10 @@ class TestBuildMicrosoftConsentUrl:
         for scope in MICROSOFT_SCOPES:
             assert scope in url or scope.replace(".", "%2E") in url
 
+    def test_mail_send_scope_present(self) -> None:
+        """Mail.Send scope is required for /me/sendMail — GH-61."""
+        assert "Mail.Send" in MICROSOFT_SCOPES
+
     def test_includes_redirect_uri(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """URL contains the provided redirect_uri."""
         monkeypatch.setenv("MICROSOFT_CLIENT_ID", _TEST_MS_CLIENT_ID)
