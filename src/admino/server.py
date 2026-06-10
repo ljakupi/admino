@@ -1538,7 +1538,7 @@ async def oauth_microsoft_authorize(
 
 
 async def oauth_callback(
-    code: str | None = Query(default=None, max_length=2048, pattern=r"^[A-Za-z0-9/_.\-+=]+$"),
+    code: str | None = Query(default=None, max_length=2048, pattern=r"^[A-Za-z0-9/_.\-+=!*~,]+$"),
     state: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_\-]+$"),
     error: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_]+$"),
 ) -> RedirectResponse:
