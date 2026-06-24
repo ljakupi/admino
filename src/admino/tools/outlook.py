@@ -322,6 +322,7 @@ async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
 # outlook.send
 # ---------------------------------------------------------------------------
 
+
 def _build_sendmail_payload(args: OutlookSendArgs) -> dict[str, object]:
     """Build the Microsoft Graph ``sendMail`` JSON payload.
 

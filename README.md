@@ -118,10 +118,11 @@ All four modes serve at **http://localhost:8000**. The agent inside the containe
 ### Quality checks
 
 ```bash
-make lint        # ruff check
-make format      # ruff format
-make typecheck   # mypy strict
-make test        # pytest with coverage (1043 tests, 93% coverage)
+make lint          # ruff check
+make format        # ruff format (writes changes)
+make format-check  # ruff format --check (CI gate, no writes)
+make typecheck     # mypy strict
+make test          # pytest with coverage
 ```
 
 ## Recommended Models
@@ -172,7 +173,7 @@ This section documents key decisions about where we use proven third-party libra
 - No logging library enforces a write-only API surface (our spec requires the agent cannot read its own audit log).
 - We need NDJSON (one validated Pydantic JSON object per line), not human-readable log messages. Using `logging` would mean writing a custom `Handler` + custom `Formatter` + custom opener -- the same amount of code, wrapped in an abstraction that buys us nothing.
 - Path confinement (preventing traversal attacks via `resolve()` + `is_relative_to()` + `dir_fd`) is not a feature of any logging library.
-- The implementation is ~65 statements with 100% test coverage. It is small, focused, and well-tested.
+- The implementation is small, focused, and well-tested.
 
 **Alternatives evaluated:** Python `logging` module, `structlog`, `loguru`. All would require the same custom security code as subclasses/plugins, adding abstraction without reducing complexity.
 
@@ -184,7 +185,7 @@ This section documents key decisions about where we use proven third-party libra
 - No existing library covers our exact credential pattern set: Google OAuth access tokens (`ya29.`), Google refresh tokens (`1//`), JWTs, Bearer headers, GitHub PATs (`ghp_`/`ghs_`), AWS access keys (`AKIA`), Slack tokens (`xoxb-`/`xoxp-`), Google client secrets (`GOCSPX-`), and generic API keys (`sk-`).
 - `scrubadub` targets PII (names, emails, SSNs) -- it would miss all of the above.
 - `detect-secrets` and `trufflehog` are repo-scanning CLI tools, not per-field runtime sanitizers.
-- The implementation is ~40 lines with exhaustive parametrized tests across all patterns.
+- The implementation is compact, with exhaustive parametrized tests across all patterns.
 
 **Alternatives evaluated:** `scrubadub`, `detect-secrets`, `trufflehog`. None operate as real-time field validators.
 
@@ -210,7 +211,7 @@ This section documents key decisions about where we use proven third-party libra
 - The permission model is a simple three-state lookup (allow/confirm/deny) with hardcoded denials that cannot be overridden by config.
 - It must be a pure function with zero side effects (no logging, no I/O, no state mutation) and must never import from the agent, LLM, or server modules.
 - No generic RBAC library (Casbin, OPA, etc.) would enforce our hardcoded security denials or write-mutation downgrade rules. We'd end up fighting the abstraction.
-- The implementation is ~44 statements. An RBAC library would be orders of magnitude more complex for a simpler result.
+- The implementation is small. An RBAC library would be orders of magnitude more complex for a simpler result.
 
 **Alternatives evaluated:** Casbin, django-guardian, OPA. All are designed for multi-user RBAC -- overkill and wrong abstraction for a single-user agent with static rules.
 
@@ -230,7 +231,7 @@ This section documents key decisions about where we use proven third-party libra
 | LangChain, LangGraph, CrewAI, AutoGen, LlamaIndex | Abstract the agent loop. Our agent logic must be explicit and auditable. |
 | Flask, Django | Wrong framework. FastAPI is the approved web framework. |
 | python-telegram-bot, signalbot, slack-sdk | Third-party messaging platforms. All data would route through their servers. |
-| pytesseract | Our OCR call is 3 lines of `subprocess.run` -- a dependency is not justified. |
+| pytesseract | Our OCR call is a few lines of `subprocess.run` -- a dependency is not justified. |
 
 ## Project Structure
 
@@ -264,15 +265,15 @@ admino/
       outlook.py         -- Outlook mail read/list/search (Microsoft Graph)
       outlook_calendar.py -- Outlook Calendar read/list/create (Microsoft Graph)
       onedrive.py        -- OneDrive read/list/search/download (Microsoft Graph)
-      documents.py       -- Document store/classify/search/query + OCR
-      search.py          -- Web search
+      documents.py       -- Document store/classify/search/query + OCR (planned, not yet implemented)
+      search.py          -- Web search (planned, not yet implemented)
       files.py           -- Local file read/list/search/write/move
       memory.py          -- Persistent key-value notes (SQLite)
 ```
 
 ## Deviations from Specification
 
-The following intentional deviations from `final_requirements.md` improve security or reflect practical v1 choices:
+The following intentional deviations from the original product specification improve security or reflect practical v1 choices:
 
 | Area | Spec Says | Implementation | Rationale |
 |------|-----------|---------------|-----------|
@@ -320,9 +321,9 @@ The following intentional deviations from `final_requirements.md` improve securi
 - **OAuth**: oauth.py (Fernet encryption, token refresh), oauth_setup.py (CLI consent flow)
 - **Tool registry**: tools/registry.py (registration, dispatch, permission enforcement)
 - **Tool modules**: tools/memory.py (SQLite key-value store), tools/files.py (path-validated file access)
-- **PWA**: index.html, style.css, app.js, service-worker.js, manifest.json, icons
+- **PWA**: Vue 3 + Vite app in `static-src/`, built to `static/` (`index.html`, hashed JS/CSS bundles under `assets/`, `manifest.webmanifest`, `service-worker.js`, fonts, icons)
 - **DevOps**: Dockerfile, docker-compose.yml (base), docker-compose.ollama.yml + docker-compose.vllm.yml (provider overlays), entrypoint.sh (iptables egress whitelist), Makefile (BACKEND variable for overlay selection), .env.example, .gitignore, .dockerignore
-- **Tests**: 1043 tests, 93% overall coverage (all core modules above 80%)
+- **Tests**: backend pytest suite with coverage reporting (coverage gate enforced in CI)
 - **Security**: CSP headers, egress whitelist, credential sanitization, TOCTOU-safe file writes, path confinement
 
 ## License

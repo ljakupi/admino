@@ -399,10 +399,7 @@ class ToolCallRecord(BaseModel):
     @classmethod
     def _sanitize_args(cls, v: dict[str, Any]) -> dict[str, Any]:
         """Strip credential patterns from string values in args."""
-        return {
-            k: _strip_credentials(val) if isinstance(val, str) else val
-            for k, val in v.items()
-        }
+        return {k: _strip_credentials(val) if isinstance(val, str) else val for k, val in v.items()}
 
 
 class PendingConfirmationSummary(BaseModel):
@@ -445,10 +442,7 @@ class PendingConfirmationSummary(BaseModel):
     @classmethod
     def _sanitize_args(cls, v: dict[str, Any]) -> dict[str, Any]:
         """Strip credential patterns from string values in args."""
-        return {
-            k: _strip_credentials(val) if isinstance(val, str) else val
-            for k, val in v.items()
-        }
+        return {k: _strip_credentials(val) if isinstance(val, str) else val for k, val in v.items()}
 
 
 class ChatResponse(BaseModel):

@@ -360,9 +360,7 @@ async def dispatch_tool_call(
 
     # 1. Enabled check — reject disabled tools before the permission engine runs.
     if enabled_tools is not None and enabled_tools.get(raw_tool) is False:
-        disabled_permission = PermissionResult(
-            allowed="deny", reason="Tool is disabled."
-        )
+        disabled_permission = PermissionResult(allowed="deny", reason="Tool is disabled.")
         _write_audit(
             audit_logger,
             session_id=session_id,
@@ -383,9 +381,7 @@ async def dispatch_tool_call(
     # 2. Permission check — before any arg parsing or execution.
     #    SECURITY: check_permission receives ONLY (tool, action, config, promoted).
     #    It must never see LLM-supplied args, session state, or conversation.
-    permission = check_permission(
-        raw_tool, raw_action, permissions_config, promoted=promoted
-    )
+    permission = check_permission(raw_tool, raw_action, permissions_config, promoted=promoted)
 
     # 2. Denied — return immediately.
     if permission.allowed == "deny":
