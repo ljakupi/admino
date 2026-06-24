@@ -1,4 +1,4 @@
-.PHONY: lint format typecheck test docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean
+.PHONY: lint format format-check typecheck test docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean
 
 # Source and package configuration
 SRC_DIR    := src
@@ -34,6 +34,9 @@ lint:
 
 format:
 	python -m ruff format $(SRC_DIR)/ $(TESTS_DIR)/
+
+format-check:
+	python -m ruff format --check $(SRC_DIR)/ $(TESTS_DIR)/
 
 typecheck:
 	python -m mypy $(SRC_DIR)/$(PACKAGE)/ --strict

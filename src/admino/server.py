@@ -1345,16 +1345,12 @@ async def patch_critical_permission(
             _agent._permissions = new_perms
             _agent._promoted = frozenset(_promoted_permissions)
 
-        logger.warning(
-            "Critical permission demoted: tool=%s action=%s", tool, action
-        )
+        logger.warning("Critical permission demoted: tool=%s action=%s", tool, action)
         return CriticalPermissionState(tool=tool, action=action, state="deny")
 
     # PROMOTE path: deny -> confirm with re-auth and cooldown.
     if body is None:
-        raise HTTPException(
-            status_code=400, detail="Re-auth token required for promotion"
-        )
+        raise HTTPException(status_code=400, detail="Re-auth token required for promotion")
 
     # Validate re-auth token against active session token.
     if _config is None:
@@ -1386,9 +1382,7 @@ async def patch_critical_permission(
         action,
         now.isoformat(),
     )
-    return CriticalPermissionState(
-        tool=tool, action=action, state="deny", pending_at=now
-    )
+    return CriticalPermissionState(tool=tool, action=action, state="deny", pending_at=now)
 
 
 async def cancel_critical_permission_pending(
@@ -1406,14 +1400,10 @@ async def cancel_critical_permission_pending(
 
     key = (tool, action)
     if key not in _pending_promotions:
-        raise HTTPException(
-            status_code=404, detail="No pending promotion for this permission"
-        )
+        raise HTTPException(status_code=404, detail="No pending promotion for this permission")
 
     del _pending_promotions[key]
-    logger.warning(
-        "Critical permission promotion cancelled: tool=%s action=%s", tool, action
-    )
+    logger.warning("Critical permission promotion cancelled: tool=%s action=%s", tool, action)
     return CriticalPermissionState(tool=tool, action=action, state="deny")
 
 
@@ -1432,8 +1422,7 @@ def _reap_oauth_states() -> None:
     """
     now = time.time()
     expired = [
-        s for s, (ts, _p, _u) in _oauth_pending_states.items()
-        if now - ts > _OAUTH_STATE_TTL_S
+        s for s, (ts, _p, _u) in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S
     ]
     for s in expired:
         del _oauth_pending_states[s]
@@ -1623,9 +1612,7 @@ async def oauth_callback(
             save_token(_config.paths.tokens_dir, token_file)
     except OAuthError:
         logger.error("%s OAuth token exchange or storage failed.", provider.capitalize())
-        return RedirectResponse(
-            url="/tools?oauth=error&reason=exchange_failed", status_code=307
-        )
+        return RedirectResponse(url="/tools?oauth=error&reason=exchange_failed", status_code=307)
 
     if email:
         logger.info("%s OAuth connected successfully for user.", provider.capitalize())
@@ -1961,12 +1948,8 @@ def create_app(
     _rate_limiters["/api/oauth/google/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/oauth/microsoft/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
     _rate_limiters["/api/critical-permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/critical-permissions/promote"] = _TokenBucket(
-        rate=5 / 60, capacity=5
-    )
-    _rate_limiters["/api/critical-permissions/cancel"] = _TokenBucket(
-        rate=0.5, capacity=5
-    )
+    _rate_limiters["/api/critical-permissions/promote"] = _TokenBucket(rate=5 / 60, capacity=5)
+    _rate_limiters["/api/critical-permissions/cancel"] = _TokenBucket(rate=0.5, capacity=5)
     _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
 
     # Log VPN mode warning at server startup.
@@ -2028,9 +2011,9 @@ def create_app(
     app.patch("/api/settings", response_model=SettingsResponse)(patch_settings)
     app.get("/api/permissions", response_model=PermissionsResponse)(get_permissions)
     app.patch("/api/permissions", response_model=PermissionsResponse)(patch_permissions)
-    app.get(
-        "/api/critical-permissions", response_model=CriticalPermissionsResponse
-    )(get_critical_permissions)
+    app.get("/api/critical-permissions", response_model=CriticalPermissionsResponse)(
+        get_critical_permissions
+    )
     app.patch(
         "/api/critical-permissions/{tool}/{action}",
         response_model=CriticalPermissionState,
@@ -2048,9 +2031,7 @@ def create_app(
         oauth_microsoft_authorize
     )
     app.get("/api/oauth/callback")(oauth_callback)
-    app.get("/api/oauth/google/status", response_model=OAuthConnectionStatus)(
-        oauth_google_status
-    )
+    app.get("/api/oauth/google/status", response_model=OAuthConnectionStatus)(oauth_google_status)
     app.get("/api/oauth/microsoft/status", response_model=OAuthConnectionStatus)(
         oauth_microsoft_status
     )

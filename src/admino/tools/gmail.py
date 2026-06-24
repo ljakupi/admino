@@ -412,6 +412,7 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
 # gmail.send
 # ---------------------------------------------------------------------------
 
+
 def _build_rfc2822(args: GmailSendArgs) -> str:
     """Build an RFC 2822 email message and return it as base64url-encoded string.
 
