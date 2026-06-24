@@ -73,9 +73,8 @@ demo/
 # Local development files
 .local/
 
-# Claude Code local-only files
-.claude/settings.local.json
-.claude/agent-memory/
+# Claude Code config (local-only, not tracked in this repo)
+.claude/
 
 # Static files (built client)
 static
