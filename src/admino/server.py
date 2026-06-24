@@ -1223,9 +1223,11 @@ async def _resolve_pending_promotions() -> None:
     Persists completed promotions to the database. This is a lazy resolution
     — called on GET and PATCH to avoid background asyncio tasks.
 
-    When promotions complete, a system message is injected into all active
-    sessions so the LLM is aware the permission changed and will not refuse
-    based on stale denial messages in the conversation history.
+    When promotions complete, a ``user``-role notification is injected into all
+    active sessions so the LLM is aware the permission changed and will not
+    refuse based on stale denial messages in the conversation history. A
+    ``user`` role (not ``system``) is required so the notice survives the
+    agent's ``_filter_mid_system`` prompt-injection defence (see GH-66).
 
     Safety: builds a list of expired keys first, then mutates the dict in a
     separate loop to avoid ``RuntimeError`` from modifying a dict during
@@ -1259,17 +1261,25 @@ async def _resolve_pending_promotions() -> None:
     if _agent is not None:
         _agent._promoted = frozenset(_promoted_permissions)
 
-    # Inject a system message into all active sessions so the LLM knows
-    # the permission changed and won't refuse based on stale denial messages
-    # in the conversation history.
+    # Inject a notification into all active sessions so the LLM knows the
+    # permission changed and won't refuse based on stale denial messages in
+    # the conversation history.
+    #
+    # GH-66: this MUST use a non-system role. The agent's ``_filter_mid_system``
+    # prompt-injection defence drops every ``system``-role message that appears
+    # after the leading system block, so a ``system``-role notification would be
+    # silently discarded before reaching the LLM. A ``user``-role message is
+    # informational (not a trusted directive) and survives the filter.
     promoted_names = ", ".join(f"{t}.{a}" for t, a in expired)
+    # Phrased as a neutral, factual notice rather than a directive: it occupies
+    # the human turn slot, so it must not read as a standing instruction to act
+    # (GH-66 security review, Finding 1).
     notification = LLMMessage(
-        role="system",
+        role="user",
         content=(
-            f"PERMISSION UPDATE: The following actions have been promoted and "
-            f"are now available with user confirmation: {promoted_names}. "
-            f"Previous denials for these actions are no longer in effect. "
-            f"You should attempt these tool calls when the user requests them."
+            f"PERMISSION UPDATE: The following actions are now available with "
+            f"user confirmation: {promoted_names}. Earlier denials for these "
+            f"actions no longer apply."
         ),
     )
     for history in _sessions.values():

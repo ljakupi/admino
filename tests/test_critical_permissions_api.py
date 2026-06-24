@@ -820,16 +820,23 @@ class TestLifespanLoadsPromotedPermissions:
 
 
 class TestPromotionSessionNotification:
-    """When _resolve_pending_promotions() resolves expired cooldowns, a system
-    message must be injected into every active session in _sessions so the LLM
-    knows the permission changed and won't refuse based on stale denials."""
+    """When _resolve_pending_promotions() resolves expired cooldowns, a
+    notification message must be injected into every active session in
+    _sessions so the LLM knows the permission changed and won't refuse based
+    on stale denials.
+
+    GH-66: the notification must use a non-system role so it survives the
+    agent's ``_filter_mid_system`` prompt-injection defence, which drops every
+    mid-conversation ``system``-role message. A ``system``-role notification
+    would be silently discarded before reaching the LLM.
+    """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_resolve_promotions_injects_system_message_into_sessions(
+    async def test_resolve_promotions_injects_notification_into_sessions(
         self,
     ) -> None:
-        """Expired cooldown resolution appends a system LLMMessage to all sessions."""
+        """Expired cooldown resolution appends a notification LLMMessage to all sessions."""
         from admino import server
         from admino.models import LLMMessage
         from admino.server import _resolve_pending_promotions
@@ -866,14 +873,60 @@ class TestPromotionSessionNotification:
             assert len(sess1_history) == 2
             assert len(sess2_history) == 3
 
-            # The injected message should be a system message mentioning the action.
             injected_1 = sess1_history[-1]
             injected_2 = sess2_history[-1]
 
-            assert injected_1.role == "system"
-            assert injected_2.role == "system"
+            # GH-66: must NOT be a system message — those are dropped mid-conversation
+            # by the agent's prompt-injection filter, silently discarding the notice.
+            assert injected_1.role != "system"
+            assert injected_2.role != "system"
             assert "gmail.send" in injected_1.content
             assert "gmail.send" in injected_2.content
+        finally:
+            server._sessions.clear()
+            server._agent = None
+            _clear_critical_state()
+
+    async def test_promotion_notification_survives_filter_mid_system(self) -> None:
+        """GH-66 end-to-end: the injected notification must survive _trim_context.
+
+        ``_trim_context`` runs ``_filter_mid_system`` over the non-leading
+        history, which drops every mid-conversation ``system``-role message.
+        The promotion notification must reach the LLM, so it must still be
+        present after trimming.
+        """
+        from admino import server
+        from admino.agent import _trim_context
+        from admino.models import LLMMessage
+        from admino.server import _resolve_pending_promotions
+
+        _clear_critical_state()
+
+        history: list[LLMMessage] = [
+            LLMMessage(role="system", content="leading system prompt"),
+            LLMMessage(role="user", content="send an email"),
+            LLMMessage(role="assistant", content="I cannot do that yet."),
+        ]
+        server._sessions["sess-e2e"] = history
+
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
+
+        mock_update = AsyncMock()
+        agent_mock = MagicMock()
+        agent_mock._promoted = frozenset()
+        server._agent = agent_mock
+
+        try:
+            with (
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.update_permission", mock_update),
+            ):
+                await _resolve_pending_promotions()
+
+            trimmed = _trim_context(history, max_messages=40)
+
+            # The notification mentioning gmail.send must survive the filter.
+            assert any("gmail.send" in m.content for m in trimmed)
         finally:
             server._sessions.clear()
             server._agent = None
