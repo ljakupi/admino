@@ -75,6 +75,7 @@ demo/
 
 # Claude Code config (local-only, not tracked in this repo)
 .claude/
+CLAUDE.md
 
 # Static files (built client)
 static
