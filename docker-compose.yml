@@ -37,8 +37,11 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
     networks:
       - internal
+      - host-bridge
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admino -d admino"]
       interval: 10s
@@ -159,4 +162,11 @@ networks:
 
   egress:
     name: admino-egress
+    driver: bridge
+
+  # Plain bridge — no internal isolation. Attached to postgres only so that
+  # Docker Desktop on macOS can resolve host port forwarding (5432 → localhost).
+  # The agent is NOT on this network; postgres<->agent traffic stays on internal.
+  host-bridge:
+    name: admino-host-bridge
     driver: bridge
