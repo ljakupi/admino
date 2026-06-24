@@ -63,9 +63,7 @@ _HARDCODED_DENIALS: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def _make_config(
-    *, auth_mode: str = "token", token: str | None = _TEST_TOKEN
-) -> MagicMock:
+def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> MagicMock:
     """Build a minimal mock AppConfig."""
     config = MagicMock()
     config.auth.mode = auth_mode
@@ -119,9 +117,7 @@ class TestGetPermissions:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -136,9 +132,7 @@ class TestGetPermissions:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
 
         entries = resp.json()["permissions"]
@@ -154,9 +148,7 @@ class TestGetPermissions:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
 
         entries = resp.json()["permissions"]
@@ -170,9 +162,7 @@ class TestGetPermissions:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
 
         entries = resp.json()["permissions"]
@@ -186,9 +176,7 @@ class TestGetPermissions:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
 
         entries = resp.json()["permissions"]
@@ -200,18 +188,14 @@ class TestGetPermissions:
     async def test_get_permissions_requires_auth(self) -> None:
         """GET /api/permissions without Authorization header returns 401."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/permissions")
         assert resp.status_code == 401
 
     async def test_get_permissions_wrong_token_returns_401(self) -> None:
         """GET /api/permissions with incorrect token returns 401."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get(
                 "/api/permissions",
                 headers={"Authorization": "Bearer wrong-token-value"},
@@ -241,9 +225,7 @@ class TestPatchPermissions:
             patch("admino.database.update_permission", mock_update),
             patch("admino.config.load_permissions_config_from_db", mock_load_config),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -265,9 +247,7 @@ class TestPatchPermissions:
             patch("admino.database.update_permission", mock_update),
             patch("admino.config.load_permissions_config_from_db", mock_load_config),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -292,9 +272,7 @@ class TestPatchPermissions:
             patch("admino.database.update_permission", AsyncMock()),
             patch("admino.config.load_permissions_config_from_db", mock_load_config),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -306,9 +284,7 @@ class TestPatchPermissions:
     async def test_patch_permissions_requires_auth(self) -> None:
         """PATCH /api/permissions without Authorization header returns 401."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/permissions",
                 json={"tool": "gmail", "action": "read", "permission": "allow"},
@@ -318,9 +294,7 @@ class TestPatchPermissions:
     async def test_patch_permissions_wrong_token_returns_401(self) -> None:
         """PATCH /api/permissions with incorrect token returns 401."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/permissions",
                 headers={"Authorization": "Bearer wrong-token-value"},
@@ -340,9 +314,7 @@ class TestPatchPermissions:
                 AsyncMock(return_value=MagicMock()),
             ),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -362,9 +334,7 @@ class TestPatchPermissions:
                 AsyncMock(return_value=MagicMock()),
             ),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -384,9 +354,7 @@ class TestPatchPermissions:
                 AsyncMock(return_value=MagicMock()),
             ),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -419,9 +387,7 @@ class TestPatchPermissionsHardcodedDenials:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -443,9 +409,7 @@ class TestPatchPermissionsHardcodedDenials:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -458,9 +422,7 @@ class TestPatchPermissionsHardcodedDenials:
         _HARDCODED_DENIALS,
         ids=[f"{t}.{a}" for t, a in _HARDCODED_DENIALS],
     )
-    async def test_patch_hardcoded_denial_to_deny_succeeds(
-        self, tool: str, action: str
-    ) -> None:
+    async def test_patch_hardcoded_denial_to_deny_succeeds(self, tool: str, action: str) -> None:
         """Setting a hardcoded denial to 'deny' is valid (no-op but not an error)."""
         app = _make_app()
         with (
@@ -472,9 +434,7 @@ class TestPatchPermissionsHardcodedDenials:
                 AsyncMock(return_value=MagicMock()),
             ),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -489,9 +449,7 @@ class TestPatchPermissionsHardcodedDenials:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -521,9 +479,7 @@ class TestPatchPermissionsValidation:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -534,13 +490,13 @@ class TestPatchPermissionsValidation:
     @pytest.mark.parametrize(
         "tool_name",
         [
-            "Gmail",           # uppercase
-            "123tool",         # starts with digit
-            "tool-name",       # contains hyphen
-            "tool name",       # contains space
-            "tool.name",       # contains dot
-            "",                # empty
-            "a" * 64,          # too long (max 63)
+            "Gmail",  # uppercase
+            "123tool",  # starts with digit
+            "tool-name",  # contains hyphen
+            "tool name",  # contains space
+            "tool.name",  # contains dot
+            "",  # empty
+            "a" * 64,  # too long (max 63)
         ],
         ids=[
             "uppercase",
@@ -552,18 +508,14 @@ class TestPatchPermissionsValidation:
             "too_long",
         ],
     )
-    async def test_patch_invalid_tool_identifier_returns_422(
-        self, tool_name: str
-    ) -> None:
+    async def test_patch_invalid_tool_identifier_returns_422(self, tool_name: str) -> None:
         """Tool identifiers not matching ^[a-z][a-z0-9_]{0,62}$ return 422."""
         app = _make_app()
         with (
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -574,12 +526,12 @@ class TestPatchPermissionsValidation:
     @pytest.mark.parametrize(
         "action_name",
         [
-            "Read",            # uppercase
-            "0action",         # starts with digit
-            "action-name",     # contains hyphen
-            "act ion",         # contains space
-            "",                # empty
-            "b" * 64,          # too long (max 63)
+            "Read",  # uppercase
+            "0action",  # starts with digit
+            "action-name",  # contains hyphen
+            "act ion",  # contains space
+            "",  # empty
+            "b" * 64,  # too long (max 63)
         ],
         ids=[
             "uppercase",
@@ -590,18 +542,14 @@ class TestPatchPermissionsValidation:
             "too_long",
         ],
     )
-    async def test_patch_invalid_action_identifier_returns_422(
-        self, action_name: str
-    ) -> None:
+    async def test_patch_invalid_action_identifier_returns_422(self, action_name: str) -> None:
         """Action identifiers not matching ^[a-z][a-z0-9_]{0,62}$ return 422."""
         app = _make_app()
         with (
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -616,9 +564,7 @@ class TestPatchPermissionsValidation:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -633,9 +579,7 @@ class TestPatchPermissionsValidation:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -650,9 +594,7 @@ class TestPatchPermissionsValidation:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -678,9 +620,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -699,9 +639,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -720,9 +658,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -741,9 +677,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -785,9 +719,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -806,9 +738,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -823,9 +753,7 @@ class TestPermissionsAdversarial:
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
@@ -845,9 +773,7 @@ class TestPermissionsAdversarial:
                 AsyncMock(return_value=MagicMock()),
             ),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,

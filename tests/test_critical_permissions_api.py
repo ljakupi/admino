@@ -48,9 +48,7 @@ _PROMOTABLE_PAIRS: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def _make_config(
-    *, auth_mode: str = "token", token: str | None = _TEST_TOKEN
-) -> MagicMock:
+def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> MagicMock:
     """Build a minimal mock AppConfig."""
     config = MagicMock()
     config.auth.mode = auth_mode
@@ -107,9 +105,7 @@ class TestGetCriticalPermissions:
         """Response contains exactly 4 promotable permission entries."""
         app = _make_app()
         _clear_critical_state()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -120,9 +116,7 @@ class TestGetCriticalPermissions:
         """All entries have state='deny' and pending_at=None by default."""
         app = _make_app()
         _clear_critical_state()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
         for entry in resp.json()["permissions"]:
@@ -133,9 +127,7 @@ class TestGetCriticalPermissions:
         """Each entry has tool, action, state, and pending_at keys."""
         app = _make_app()
         _clear_critical_state()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
         for entry in resp.json()["permissions"]:
@@ -148,9 +140,7 @@ class TestGetCriticalPermissions:
         """Response contains exactly the 4 expected tool/action pairs."""
         app = _make_app()
         _clear_critical_state()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
         pairs = {(e["tool"], e["action"]) for e in resp.json()["permissions"]}
@@ -159,18 +149,14 @@ class TestGetCriticalPermissions:
     async def test_get_critical_permissions_requires_auth(self) -> None:
         """GET without Authorization header returns 401."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/critical-permissions")
         assert resp.status_code == 401
 
     async def test_get_critical_permissions_wrong_token_returns_401(self) -> None:
         """GET with incorrect token returns 401."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get(
                 "/api/critical-permissions",
                 headers={"Authorization": "Bearer wrong-token-value"},
@@ -187,15 +173,11 @@ class TestGetCriticalPermissions:
         server._pending_promotions[("gmail", "send")] = now
 
         try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
             entries = resp.json()["permissions"]
-            gmail_send = next(
-                e for e in entries if e["tool"] == "gmail" and e["action"] == "send"
-            )
+            gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
             assert gmail_send["pending_at"] is not None
             assert gmail_send["state"] == "deny"
         finally:
@@ -210,15 +192,11 @@ class TestGetCriticalPermissions:
         server._promoted_permissions.add(("gmail", "send"))
 
         try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
             entries = resp.json()["permissions"]
-            gmail_send = next(
-                e for e in entries if e["tool"] == "gmail" and e["action"] == "send"
-            )
+            gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
             assert gmail_send["state"] == "confirm"
         finally:
             _clear_critical_state()
@@ -230,9 +208,7 @@ class TestGetCriticalPermissions:
         app = _make_app()
         _clear_critical_state()
         # Set pending_at to 6 minutes ago to simulate expired cooldown
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(
-            minutes=6
-        )
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
         mock_update = AsyncMock()
 
         try:
@@ -243,14 +219,10 @@ class TestGetCriticalPermissions:
                 async with AsyncClient(
                     transport=ASGITransport(app=app), base_url="http://test"
                 ) as c:
-                    resp = await c.get(
-                        "/api/critical-permissions", headers=_AUTH_HEADER
-                    )
+                    resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
 
             entries = resp.json()["permissions"]
-            gmail_send = next(
-                e for e in entries if e["tool"] == "gmail" and e["action"] == "send"
-            )
+            gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
             assert gmail_send["state"] == "confirm"
             # Verify the DB was updated to persist the promotion
             mock_update.assert_called_once()
@@ -274,9 +246,7 @@ class TestPromoteCriticalPermission:
         _clear_critical_state()
 
         try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/critical-permissions/gmail/send",
                     headers=_AUTH_HEADER,
@@ -295,9 +265,7 @@ class TestPromoteCriticalPermission:
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/critical-permissions/gmail/send",
                 headers=_AUTH_HEADER,
@@ -310,9 +278,7 @@ class TestPromoteCriticalPermission:
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/critical-permissions/gmail/send",
                 headers=_AUTH_HEADER,
@@ -325,9 +291,7 @@ class TestPromoteCriticalPermission:
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/critical-permissions/gmail/delete",
                 headers=_AUTH_HEADER,
@@ -341,9 +305,7 @@ class TestPromoteCriticalPermission:
         _clear_critical_state()
 
         try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp1 = await c.patch(
                     "/api/critical-permissions/gmail/send",
                     headers=_AUTH_HEADER,
@@ -367,9 +329,7 @@ class TestPromoteCriticalPermission:
         _clear_critical_state()
 
         try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 statuses = []
                 for _ in range(6):
                     resp = await c.patch(
@@ -410,9 +370,7 @@ class TestDemoteCriticalPermission:
             with (
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.update_permission", mock_update),
-                patch(
-                    "admino.config.load_permissions_config_from_db", mock_load_config
-                ),
+                patch("admino.config.load_permissions_config_from_db", mock_load_config),
             ):
                 async with AsyncClient(
                     transport=ASGITransport(app=app), base_url="http://test"
@@ -442,9 +400,7 @@ class TestDemoteCriticalPermission:
             with (
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.update_permission", mock_update),
-                patch(
-                    "admino.config.load_permissions_config_from_db", mock_load_config
-                ),
+                patch("admino.config.load_permissions_config_from_db", mock_load_config),
             ):
                 async with AsyncClient(
                     transport=ASGITransport(app=app), base_url="http://test"
@@ -475,9 +431,7 @@ class TestDemoteCriticalPermission:
             with (
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.update_permission", mock_update),
-                patch(
-                    "admino.config.load_permissions_config_from_db", mock_load_config
-                ),
+                patch("admino.config.load_permissions_config_from_db", mock_load_config),
             ):
                 async with AsyncClient(
                     transport=ASGITransport(app=app), base_url="http://test"
@@ -512,9 +466,7 @@ class TestCancelPendingPromotion:
         server._pending_promotions[("gmail", "send")] = datetime.now(UTC)
 
         try:
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete(
                     "/api/critical-permissions/gmail/send/pending",
                     headers=_AUTH_HEADER,
@@ -531,9 +483,7 @@ class TestCancelPendingPromotion:
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete(
                 "/api/critical-permissions/gmail/send/pending",
                 headers=_AUTH_HEADER,
@@ -545,9 +495,7 @@ class TestCancelPendingPromotion:
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete(
                 "/api/critical-permissions/gmail/delete/pending",
                 headers=_AUTH_HEADER,
@@ -558,9 +506,7 @@ class TestCancelPendingPromotion:
         """DELETE without Authorization header returns 401."""
         app = _make_app()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete(
                 "/api/critical-permissions/gmail/send/pending",
             )
@@ -592,16 +538,12 @@ class TestCriticalPermissionsAdversarial:
             "double_dot",
         ],
     )
-    async def test_promote_with_invalid_tool_identifier_returns_422(
-        self, tool: str
-    ) -> None:
+    async def test_promote_with_invalid_tool_identifier_returns_422(self, tool: str) -> None:
         """PATCH with invalid tool identifier returns 422."""
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 f"/api/critical-permissions/{tool}/send",
                 headers=_AUTH_HEADER,
@@ -616,9 +558,7 @@ class TestCriticalPermissionsAdversarial:
         app = _make_app()
         _clear_critical_state()
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/critical-permissions/gmail/delete",
                 headers=_AUTH_HEADER,
@@ -663,9 +603,7 @@ class TestPostMessageResolvesPromotions:
         _clear_critical_state()
 
         # Set a pending promotion that expired 6 minutes ago.
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(
-            minutes=6
-        )
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
         mock_update = AsyncMock()
 
         try:
@@ -716,9 +654,7 @@ class TestPostMessageResolvesPromotions:
         _clear_critical_state()
 
         # Set a pending promotion that is only 1 minute old (not expired).
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(
-            minutes=1
-        )
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=1)
 
         try:
             with (
@@ -912,9 +848,7 @@ class TestPromotionSessionNotification:
         server._sessions["sess-b"] = sess2_history
 
         # Set an expired pending promotion (6 minutes ago).
-        server._pending_promotions[("gmail", "send")] = datetime.now(
-            UTC
-        ) - timedelta(minutes=6)
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
 
         mock_update = AsyncMock()
         agent_mock = MagicMock()
@@ -960,9 +894,7 @@ class TestPromotionSessionNotification:
         server._sessions["sess-x"] = sess_history
 
         # Set a pending promotion only 1 minute old (not expired).
-        server._pending_promotions[("gmail", "send")] = datetime.now(
-            UTC
-        ) - timedelta(minutes=1)
+        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=1)
 
         try:
             await _resolve_pending_promotions()

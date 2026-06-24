@@ -141,8 +141,7 @@ def _build_system_prompt(config: object) -> str:
     for desc in get_registered_tools():
         tool_actions.setdefault(desc.tool, []).append(desc.action)
     tool_summary = ", ".join(
-        f"{name} ({'/'.join(sorted(actions))})"
-        for name, actions in sorted(tool_actions.items())
+        f"{name} ({'/'.join(sorted(actions))})" for name, actions in sorted(tool_actions.items())
     )
 
     lines: list[str] = [
@@ -303,9 +302,7 @@ def main(
     # 4. Initialize database, run migrations, seed and load from DB
     # ------------------------------------------------------------------
     try:
-        config, permissions_config = asyncio.run(
-            _async_startup(config, permissions_config)
-        )
+        config, permissions_config = asyncio.run(_async_startup(config, permissions_config))
     except (ValueError, RuntimeError, OSError) as exc:
         logger.error("Database startup failed: %s", exc)
         sys.exit(1)

@@ -221,9 +221,7 @@ class TestRunMigrations:
         # Transaction was entered
         conn.transaction.assert_called()
 
-    async def test_records_applied_migration(
-        self, mock_pool: MagicMock, tmp_path: Path
-    ) -> None:
+    async def test_records_applied_migration(self, mock_pool: MagicMock, tmp_path: Path) -> None:
         """run_migrations() inserts the applied migration into _migrations."""
         sql_file = tmp_path / "0001_initial.sql"
         sql_file.write_text("CREATE TABLE test (id INT);", encoding="utf-8")
@@ -267,7 +265,8 @@ class TestSeedSettings:
 
         # 10 sections: server, llm, auth, paths, files, limits, egress, ocr, database, log_level
         insert_calls = [
-            c for c in conn.execute.call_args_list
+            c
+            for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
         ]
         assert len(insert_calls) == 10
@@ -281,7 +280,8 @@ class TestSeedSettings:
         await db_mod.seed_settings(mock_pool, mock_config)
 
         insert_calls = [
-            c for c in conn.execute.call_args_list
+            c
+            for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
         ]
         assert len(insert_calls) == 0
@@ -309,7 +309,8 @@ class TestSeedPermissions:
         await db_mod.seed_permissions(mock_pool, mock_perms)
 
         insert_calls = [
-            c for c in conn.execute.call_args_list
+            c
+            for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO permissions" in c.args[0]
         ]
         assert len(insert_calls) == 3
@@ -323,7 +324,8 @@ class TestSeedPermissions:
         await db_mod.seed_permissions(mock_pool, mock_perms)
 
         insert_calls = [
-            c for c in conn.execute.call_args_list
+            c
+            for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO permissions" in c.args[0]
         ]
         assert len(insert_calls) == 0
@@ -341,7 +343,8 @@ class TestSeedPermissions:
         await db_mod.seed_permissions(mock_pool, mock_perms)
 
         insert_calls = [
-            c for c in conn.execute.call_args_list
+            c
+            for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO permissions" in c.args[0]
         ]
         assert len(insert_calls) == 1
@@ -361,10 +364,12 @@ class TestLoadSettingsFromDb:
     async def test_returns_correct_dict_structure(self, mock_pool: MagicMock) -> None:
         """load_settings_from_db() returns a dict keyed by section name."""
         conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(return_value=[
-            {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
-            {"key": "llm", "value": {"provider": "ollama"}},
-        ])
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
+                {"key": "llm", "value": {"provider": "ollama"}},
+            ]
+        )
 
         result = await db_mod.load_settings_from_db(mock_pool)
 
@@ -374,9 +379,11 @@ class TestLoadSettingsFromDb:
     async def test_unwraps_log_level(self, mock_pool: MagicMock) -> None:
         """load_settings_from_db() unwraps log_level from {"value": "X"} to "X"."""
         conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(return_value=[
-            {"key": "log_level", "value": {"value": "DEBUG"}},
-        ])
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"key": "log_level", "value": {"value": "DEBUG"}},
+            ]
+        )
 
         result = await db_mod.load_settings_from_db(mock_pool)
 
@@ -394,11 +401,13 @@ class TestLoadPermissionsFromDb:
     async def test_groups_by_tool(self, mock_pool: MagicMock) -> None:
         """load_permissions_from_db() groups rows by tool name."""
         conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(return_value=[
-            {"tool": "gmail", "action": "read", "permission": "allow"},
-            {"tool": "gmail", "action": "send", "permission": "confirm"},
-            {"tool": "memory", "action": "store", "permission": "allow"},
-        ])
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"tool": "gmail", "action": "read", "permission": "allow"},
+                {"tool": "gmail", "action": "send", "permission": "confirm"},
+                {"tool": "memory", "action": "store", "permission": "allow"},
+            ]
+        )
 
         result = await db_mod.load_permissions_from_db(mock_pool)
 

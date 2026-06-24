@@ -171,9 +171,7 @@ class TestHealthCheck:
     async def test_server_health_returns_200_ok(self) -> None:
         app = _make_app()
         with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
@@ -182,9 +180,7 @@ class TestHealthCheck:
         """Health check must succeed even with token auth enabled and no header."""
         app = _make_app(auth_mode="token")
         with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
 
@@ -192,9 +188,7 @@ class TestHealthCheck:
         """Health check returns 503 when check_health() returns False."""
         app = _make_app()
         with patch("admino.database.check_health", new=AsyncMock(return_value=False)):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 503
         assert resp.json()["detail"] == "Database unreachable"
@@ -1092,9 +1086,7 @@ class TestStaticFiles:
 
         app = _make_app()
         with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
@@ -1869,9 +1861,7 @@ class TestSecurityHeaders:
         """Health check response includes all security headers."""
         app = _make_app()
         with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
         assert resp.headers["x-content-type-options"] == "nosniff"
