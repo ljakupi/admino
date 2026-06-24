@@ -99,9 +99,7 @@ class TestOAuthAuthorize:
             "admino.server.build_google_consent_url",
             return_value=(fake_url, fake_state),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/oauth/google/authorize", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -112,9 +110,7 @@ class TestOAuthAuthorize:
     async def test_oauth_authorize_requires_auth(self) -> None:
         """Returns 401 when no Authorization header is provided."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/google/authorize")
 
         assert resp.status_code == 401
@@ -126,9 +122,7 @@ class TestOAuthAuthorize:
             "admino.server.build_google_consent_url",
             side_effect=OAuthError("GOOGLE_CLIENT_ID environment variable is not set."),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/oauth/google/authorize", headers=_AUTH_HEADER)
 
         assert resp.status_code == 500
@@ -152,7 +146,11 @@ class TestOAuthCallback:
 
         # Pre-populate CSRF state.
         state_token = "valid-state-token"
-        srv._oauth_pending_states[state_token] = (time.time(), "google", "http://test/api/oauth/callback")
+        srv._oauth_pending_states[state_token] = (
+            time.time(),
+            "google",
+            "http://test/api/oauth/callback",
+        )
 
         with (
             patch(
@@ -209,7 +207,11 @@ class TestOAuthCallback:
 
         # Insert state that expired 11 minutes ago.
         state_token = "expired-state"
-        srv._oauth_pending_states[state_token] = (time.time() - 660, "google", "http://test/api/oauth/callback")
+        srv._oauth_pending_states[state_token] = (
+            time.time() - 660,
+            "google",
+            "http://test/api/oauth/callback",
+        )
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -233,7 +235,11 @@ class TestOAuthCallback:
         app = _make_app()
 
         state_token = "valid-state-no-code"
-        srv._oauth_pending_states[state_token] = (time.time(), "google", "http://test/api/oauth/callback")
+        srv._oauth_pending_states[state_token] = (
+            time.time(),
+            "google",
+            "http://test/api/oauth/callback",
+        )
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -257,7 +263,11 @@ class TestOAuthCallback:
         app = _make_app()
 
         state_token = "valid-state-exchange-fail"
-        srv._oauth_pending_states[state_token] = (time.time(), "google", "http://test/api/oauth/callback")
+        srv._oauth_pending_states[state_token] = (
+            time.time(),
+            "google",
+            "http://test/api/oauth/callback",
+        )
 
         with patch(
             "admino.server.exchange_google_code",
@@ -397,9 +407,7 @@ class TestOAuthStatus:
 
         app = _make_app(tokens_dir=tmp_path)
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -413,9 +421,7 @@ class TestOAuthStatus:
         """Returns connected=False with empty services when no token file."""
         app = _make_app(tokens_dir=tmp_path)
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -426,9 +432,7 @@ class TestOAuthStatus:
     async def test_oauth_status_requires_auth(self) -> None:
         """Returns 401 when no Authorization header is provided."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/google/status")
 
         assert resp.status_code == 401
@@ -457,9 +461,7 @@ class TestOAuthDisconnect:
             patch("admino.server._clear_gcal_cache", mock_gcal),
             patch("admino.server._clear_gdrive_cache", mock_gdrive),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -472,9 +474,7 @@ class TestOAuthDisconnect:
         app = _make_app()
         mock_revoke = AsyncMock(return_value=False)
         with patch("admino.server.revoke_and_delete_token", mock_revoke):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
 
         assert resp.status_code == 404
@@ -482,9 +482,7 @@ class TestOAuthDisconnect:
     async def test_oauth_disconnect_requires_auth(self) -> None:
         """Returns 401 when no Authorization header is provided."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete("/api/oauth/google")
 
         assert resp.status_code == 401
@@ -494,9 +492,7 @@ class TestOAuthDisconnect:
         app = _make_app()
         mock_revoke = AsyncMock(side_effect=OAuthError("fail"))
         with patch("admino.server.revoke_and_delete_token", mock_revoke):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
 
         assert resp.status_code == 500
@@ -525,9 +521,7 @@ class TestMicrosoftOAuthDisconnect:
             patch("admino.server._clear_outcal_cache", mock_outcal),
             patch("admino.server._clear_onedrive_cache", mock_onedrive),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -541,9 +535,7 @@ class TestMicrosoftOAuthDisconnect:
         app = _make_app()
         mock_revoke = AsyncMock(return_value=False)
         with patch("admino.server.revoke_and_delete_token", mock_revoke):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
 
         assert resp.status_code == 404
@@ -551,9 +543,7 @@ class TestMicrosoftOAuthDisconnect:
     async def test_microsoft_disconnect_requires_auth(self) -> None:
         """Returns 401 when no Authorization header is provided."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete("/api/oauth/microsoft")
 
         assert resp.status_code == 401
@@ -563,9 +553,7 @@ class TestMicrosoftOAuthDisconnect:
         app = _make_app()
         mock_revoke = AsyncMock(side_effect=OAuthError("fail"))
         with patch("admino.server.revoke_and_delete_token", mock_revoke):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
 
         assert resp.status_code == 500
@@ -591,9 +579,7 @@ class TestMicrosoftOAuthAuthorize:
             "admino.server.build_microsoft_consent_url",
             return_value=(fake_url, fake_state),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/oauth/microsoft/authorize", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -604,9 +590,7 @@ class TestMicrosoftOAuthAuthorize:
     async def test_microsoft_authorize_requires_auth(self) -> None:
         """Returns 401 when no Authorization header is provided."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/microsoft/authorize")
 
         assert resp.status_code == 401
@@ -618,9 +602,7 @@ class TestMicrosoftOAuthAuthorize:
             "admino.server.build_microsoft_consent_url",
             side_effect=OAuthError("MICROSOFT_CLIENT_ID environment variable is not set."),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/oauth/microsoft/authorize", headers=_AUTH_HEADER)
 
         assert resp.status_code == 500
@@ -643,9 +625,7 @@ class TestMicrosoftOAuthStatus:
 
         app = _make_app(tokens_dir=tmp_path)
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -659,9 +639,7 @@ class TestMicrosoftOAuthStatus:
         """Returns connected=False with empty services when no token file."""
         app = _make_app(tokens_dir=tmp_path)
 
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
@@ -672,9 +650,7 @@ class TestMicrosoftOAuthStatus:
     async def test_microsoft_status_requires_auth(self) -> None:
         """Returns 401 when no Authorization header is provided."""
         app = _make_app()
-        async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
-        ) as c:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/microsoft/status")
 
         assert resp.status_code == 401
@@ -697,7 +673,11 @@ class TestMicrosoftOAuthCallback:
         app = _make_app()
 
         state_token = "valid-ms-state"
-        srv._oauth_pending_states[state_token] = (time.time(), "microsoft", "http://test/api/oauth/callback")
+        srv._oauth_pending_states[state_token] = (
+            time.time(),
+            "microsoft",
+            "http://test/api/oauth/callback",
+        )
 
         with (
             patch(
@@ -730,7 +710,11 @@ class TestMicrosoftOAuthCallback:
         app = _make_app()
 
         state_token = "valid-ms-state-fail"
-        srv._oauth_pending_states[state_token] = (time.time(), "microsoft", "http://test/api/oauth/callback")
+        srv._oauth_pending_states[state_token] = (
+            time.time(),
+            "microsoft",
+            "http://test/api/oauth/callback",
+        )
 
         with patch(
             "admino.server.exchange_microsoft_code",
@@ -782,9 +766,7 @@ class TestOAuthStateCapacityCap:
             "admino.server.build_google_consent_url",
             return_value=(fake_url, "new-state"),
         ):
-            async with AsyncClient(
-                transport=ASGITransport(app=app), base_url="http://test"
-            ) as c:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/oauth/google/authorize", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200

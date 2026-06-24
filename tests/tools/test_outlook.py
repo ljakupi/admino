@@ -480,9 +480,7 @@ class TestOutlookSend:
 
         assert "OAuth error" in result
 
-    async def test_send_api_error(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock
-    ) -> None:
+    async def test_send_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-2xx response returns Graph error message."""
         error_body = {"error": {"message": "Bad Request"}}
         mock_http_client.post.return_value = _make_response(400, error_body)

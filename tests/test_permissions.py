@@ -678,9 +678,7 @@ class TestValidateRejectsInvalidIdentifiers:
 class TestPromotedParameter:
     """Tests for the `promoted` kwarg on check_permission — tier-2 promotable denials."""
 
-    def test_promotable_denial_denied_by_default(
-        self, empty_config: PermissionsConfig
-    ) -> None:
+    def test_promotable_denial_denied_by_default(self, empty_config: PermissionsConfig) -> None:
         """Promotable denial without promoted set returns deny."""
         result = check_permission("gmail", "send", empty_config)
         assert result.allowed == "deny"
@@ -703,9 +701,7 @@ class TestPromotedParameter:
         self, tool: str, action: str, empty_config: PermissionsConfig
     ) -> None:
         """Each of the 4 promotable denials returns confirm when promoted."""
-        result = check_permission(
-            tool, action, empty_config, promoted=frozenset({(tool, action)})
-        )
+        result = check_permission(tool, action, empty_config, promoted=frozenset({(tool, action)}))
         assert result.allowed == "confirm"
 
     @pytest.mark.parametrize(
@@ -717,9 +713,7 @@ class TestPromotedParameter:
         self, tool: str, action: str, empty_config: PermissionsConfig
     ) -> None:
         """Immutable denials stay denied even if they appear in promoted set."""
-        result = check_permission(
-            tool, action, empty_config, promoted=frozenset({(tool, action)})
-        )
+        result = check_permission(tool, action, empty_config, promoted=frozenset({(tool, action)}))
         assert result.allowed == "deny"
 
     def test_promoted_set_does_not_affect_non_denial(
@@ -747,9 +741,7 @@ class TestPromotedParameter:
         """There are exactly 10 immutable denials."""
         assert len(IMMUTABLE_DENIALS) == 10
 
-    def test_promoted_empty_frozenset_is_default(
-        self, empty_config: PermissionsConfig
-    ) -> None:
+    def test_promoted_empty_frozenset_is_default(self, empty_config: PermissionsConfig) -> None:
         """Calling without promoted kwarg behaves same as promoted=frozenset()."""
         r1 = check_permission("gmail", "send", empty_config)
         r2 = check_permission("gmail", "send", empty_config, promoted=frozenset())

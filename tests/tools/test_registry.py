@@ -1742,33 +1742,25 @@ class TestToolEnabledGating:
 
     # -- get_registered_tools filtering --
 
-    def test_get_registered_tools_excludes_disabled_tool(
-        self, registered_tool: None
-    ) -> None:
+    def test_get_registered_tools_excludes_disabled_tool(self, registered_tool: None) -> None:
         """A tool explicitly disabled in enabled_tools is omitted from the listing."""
         result = get_registered_tools(enabled_tools={"gmail": False})
         assert result == []
 
-    def test_get_registered_tools_includes_enabled_tool(
-        self, registered_tool: None
-    ) -> None:
+    def test_get_registered_tools_includes_enabled_tool(self, registered_tool: None) -> None:
         """A tool explicitly enabled in enabled_tools is included in the listing."""
         result = get_registered_tools(enabled_tools={"gmail": True})
         assert len(result) == 1
         assert result[0].tool == "gmail"
         assert result[0].action == "read"
 
-    def test_get_registered_tools_no_filter_returns_all(
-        self, registered_tool: None
-    ) -> None:
+    def test_get_registered_tools_no_filter_returns_all(self, registered_tool: None) -> None:
         """Omitting enabled_tools returns all registered tools (backward compat)."""
         result = get_registered_tools()
         assert len(result) == 1
         assert result[0].tool == "gmail"
 
-    def test_get_registered_tools_missing_key_defaults_enabled(
-        self, registered_tool: None
-    ) -> None:
+    def test_get_registered_tools_missing_key_defaults_enabled(self, registered_tool: None) -> None:
         """A tool not mentioned in enabled_tools is treated as enabled."""
         result = get_registered_tools(enabled_tools={"outlook": False})
         assert len(result) == 1

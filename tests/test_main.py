@@ -734,18 +734,14 @@ class TestAsyncStartup:
     """Tests for _async_startup() coroutine directly."""
 
     @pytest.mark.asyncio
-    async def test_raises_when_pg_password_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_raises_when_pg_password_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_async_startup raises ValueError when PG_PASSWORD is not set."""
         monkeypatch.delenv("PG_PASSWORD", raising=False)
         with pytest.raises(ValueError, match="PG_PASSWORD"):
             await _async_startup(MagicMock(), MagicMock())
 
     @pytest.mark.asyncio
-    async def test_raises_when_health_check_fails(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_raises_when_health_check_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_async_startup raises RuntimeError when database is unreachable."""
         monkeypatch.setenv("PG_PASSWORD", "testpass")
         mock_pool = AsyncMock()

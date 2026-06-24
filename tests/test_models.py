@@ -391,7 +391,10 @@ class TestToolCallRecord:
         via settings, so the record accurately reflects the reason.
         """
         rec = ToolCallRecord(
-            tool="gmail", action="read", permission="disabled", success=False  # type: ignore[arg-type]
+            tool="gmail",
+            action="read",
+            permission="disabled",
+            success=False,  # type: ignore[arg-type]
         )
         assert rec.permission == "disabled"
 
