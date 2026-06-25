@@ -164,6 +164,21 @@ class TestOutlookCalendarRead:
         assert "Alice <alice@example.com>" in result
         assert "Web link:" in result
 
+    async def test_read_url_encodes_graph_event_id(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Real Graph IDs (=, /, +) must be percent-encoded in the request path."""
+        mock_http_client.get.return_value = _make_response(200, _sample_event())
+
+        from admino.tools.outlook_calendar import outlook_calendar_read
+
+        args = OutlookCalendarReadArgs(event_id="AAMkAGI1AB/Cd+Ef9=")
+        await outlook_calendar_read(args)
+
+        url = mock_http_client.get.call_args[0][0]
+        assert "/me/events/AAMkAGI1AB%2FCd%2BEf9%3D" in url
+        assert "AAMkAGI1AB/Cd+Ef9=" not in url
+
     async def test_read_oauth_not_configured(self) -> None:
         """OAuth not configured returns setup instructions."""
         with patch(
@@ -483,6 +498,24 @@ class TestOutlookCalendarUpdate:
         url = mock_http_client.patch.call_args[0][0]
         assert url.endswith("/me/events/evt-1")
 
+    async def test_update_url_encodes_graph_event_id(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Real Graph IDs contain =, /, + — they must be percent-encoded in the URL
+        path, never interpolated raw (which would break the path / allow traversal)."""
+        mock_http_client.patch.return_value = _make_response(200, {"id": "x", "subject": "X"})
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        raw_id = "AAMkAGI1AB/Cd+Ef9="
+        args = OutlookCalendarUpdateArgs(event_id=raw_id, subject="X")
+        await outlook_calendar_update(args)
+
+        url = mock_http_client.patch.call_args[0][0]
+        assert "/me/events/AAMkAGI1AB%2FCd%2BEf9%3D" in url
+        # The raw special characters must not appear unencoded in the path.
+        assert "AAMkAGI1AB/Cd+Ef9=" not in url
+
     async def test_update_partial_body_only_provided_fields(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
@@ -603,10 +636,22 @@ class TestOutlookCalendarArgValidation:
         args = OutlookCalendarReadArgs(event_id="AAMkAGI2")
         assert args.event_id == "AAMkAGI2"
 
+    def test_read_accepts_real_graph_event_id(self) -> None:
+        """Real Microsoft Graph event IDs are base64 and contain =, /, + — accept them."""
+        real_id = "AAMkAGI1AAAt9AHj/Ab+Cd9Ef=="
+        args = OutlookCalendarReadArgs(event_id=real_id)
+        assert args.event_id == real_id
+
+    def test_update_accepts_real_graph_event_id(self) -> None:
+        """Update must accept the same base64 Graph IDs (=, /, +)."""
+        real_id = "AAMkAGI1AAAt9AHj/Ab+Cd9Ef=="
+        args = OutlookCalendarUpdateArgs(event_id=real_id, subject="X")
+        assert args.event_id == real_id
+
     def test_read_overly_long_event_id_rejected(self) -> None:
         """event_id exceeding max_length is rejected."""
         with pytest.raises(ValidationError):
-            OutlookCalendarReadArgs(event_id="x" * 201)
+            OutlookCalendarReadArgs(event_id="x" * 513)
 
     def test_list_max_results_zero_rejected(self) -> None:
         """max_results=0 is rejected (ge=1)."""
