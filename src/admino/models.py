@@ -1304,13 +1304,24 @@ class OutlookCalendarListArgs(BaseModel):
     )
 
 
+# Microsoft Graph event IDs are base64 strings that legitimately contain
+# '=', '/', and '+' (as well as '-' and '_'). They are interpolated into the
+# Graph REST path, so the tool handlers URL-encode them (urllib.parse.quote,
+# safe="") before use — that encoding, not this charset, is the path-traversal
+# defence. This pattern is a permissive allow-list that still rejects
+# whitespace, control characters, '.', and other unexpected input. The length
+# cap is generous because recurring-instance / immutable IDs can be long.
+_GRAPH_EVENT_ID_PATTERN: Final[str] = r"^[A-Za-z0-9_\-=+/]+$"
+_GRAPH_EVENT_ID_MAX_LEN: Final[int] = 512
+
+
 class OutlookCalendarReadArgs(BaseModel):
     """Arguments for the outlook_calendar.read action."""
 
     event_id: str = Field(
         min_length=1,
-        max_length=200,
-        pattern=r"^[A-Za-z0-9_\-]+$",
+        max_length=_GRAPH_EVENT_ID_MAX_LEN,
+        pattern=_GRAPH_EVENT_ID_PATTERN,
         description="Outlook Calendar event ID.",
     )
 
@@ -1344,15 +1355,15 @@ class OutlookCalendarUpdateArgs(BaseModel):
     """Arguments for the outlook_calendar.update action (tier-2, requires promotion + confirm).
 
     All fields except ``event_id`` are optional; only the provided fields are
-    sent in the partial (PATCH) update. ``event_id`` is constrained to safe
-    characters to prevent path traversal in the Graph API URL, and attendee
-    addresses are validated to reject injection.
+    sent in the partial (PATCH) update. ``event_id`` allows the Microsoft Graph
+    base64 charset; the handler URL-encodes it to prevent path traversal in the
+    Graph API URL, and attendee addresses are validated to reject injection.
     """
 
     event_id: str = Field(
         min_length=1,
-        max_length=200,
-        pattern=r"^[A-Za-z0-9_\-]+$",
+        max_length=_GRAPH_EVENT_ID_MAX_LEN,
+        pattern=_GRAPH_EVENT_ID_PATTERN,
         description="Outlook Calendar event ID to update.",
     )
     subject: str | None = Field(

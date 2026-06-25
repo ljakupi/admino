@@ -23,6 +23,7 @@ import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
+from urllib.parse import quote
 
 import httpx
 
@@ -182,8 +183,10 @@ async def outlook_calendar_read(args: OutlookCalendarReadArgs, **kwargs: object)
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
+    # Graph event IDs contain '=', '/', '+'; percent-encode before path use.
+    event_id = quote(args.event_id, safe="")
     url = (
-        f"{_GRAPH_BASE}/me/events/{args.event_id}"
+        f"{_GRAPH_BASE}/me/events/{event_id}"
         "?$select=id,subject,start,end,body,location,attendees,webLink"
     )
     try:
@@ -446,9 +449,11 @@ async def outlook_calendar_update(args: OutlookCalendarUpdateArgs, **kwargs: obj
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
+    # Graph event IDs contain '=', '/', '+'; percent-encode before path use.
+    event_id = quote(args.event_id, safe="")
     try:
         response = await _http_client.patch(  # type: ignore[union-attr]
-            f"{_GRAPH_BASE}/me/events/{args.event_id}",
+            f"{_GRAPH_BASE}/me/events/{event_id}",
             json=event_payload,
             headers={
                 "Authorization": f"Bearer {token}",
