@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean
 
 # Source and package configuration
 SRC_DIR    := src
@@ -43,6 +43,17 @@ typecheck:
 
 test:
 	python -m pytest $(TESTS_DIR)/ -v --tb=short --cov=$(SRC_DIR)/$(PACKAGE) --cov-report=term-missing
+
+# Minimum overall test coverage. CI fails the build below this; `check` enforces
+# the same number locally so a green `make check` guarantees a green CI run.
+COV_MIN := 90
+
+# Full CI-parity gate bundle — the single source of truth for "are we green?".
+# CI (.github/workflows/ci.yml) and the local/dev loop both run this exact target
+# so the gates can never drift apart (e.g. format-check silently missing locally).
+# Order matches CI: lint -> format-check -> typecheck -> tests (coverage-gated).
+check: lint format-check typecheck
+	python -m pytest $(TESTS_DIR)/ --tb=short --cov=$(SRC_DIR)/$(PACKAGE) --cov-report=term-missing --cov-fail-under=$(COV_MIN)
 
 docker-build:
 	docker compose $(COMPOSE_FILES) build
