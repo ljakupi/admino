@@ -1,12 +1,15 @@
 """Outlook Calendar tool using Microsoft Graph API.
 
-Provides read, list, and create actions for Outlook Calendar events via
+Provides read, list, create, and update actions for Outlook Calendar events via
 the Microsoft Graph ``/me/events`` and ``/me/calendarView`` endpoints.
 Authentication is handled via OAuth tokens managed by ``admino.oauth``.
 
 Security notes:
-- Delete and update capabilities are hardcoded denials in permissions.py
-  (outlook_calendar.delete, outlook_calendar.update).
+- No delete capability. outlook_calendar.delete is an immutable hardcoded denial.
+- outlook_calendar.update is a tier-2 promotable denial: denied by default,
+  usable only after explicit user promotion (plus per-call confirmation) via the
+  Critical Permissions UI. event_id and attendee addresses are validated in
+  models.py to prevent path traversal and injection.
 - Event body content is truncated to 10 000 characters before returning.
 - OAuth tokens are cached in-memory only; refresh tokens stay encrypted on disk.
 - No eval, exec, shell=True, or importlib.
@@ -30,6 +33,7 @@ from admino.models import (
     OutlookCalendarCreateArgs,
     OutlookCalendarListArgs,
     OutlookCalendarReadArgs,
+    OutlookCalendarUpdateArgs,
 )
 from admino.oauth import OAuthError, get_valid_access_token
 from admino.tools.registry import register_tool
@@ -390,3 +394,88 @@ async def outlook_calendar_create(args: OutlookCalendarCreateArgs, **kwargs: obj
         f"End: {args.end.isoformat()}\n"
         f"Web link: {web_link}"
     )
+
+
+@register_tool(
+    tool="outlook_calendar",
+    action="update",
+    description=(
+        "Update an existing Outlook Calendar event by ID. Only the provided "
+        "fields are changed (partial update). Requires user confirmation."
+    ),
+    args_schema=OutlookCalendarUpdateArgs,
+)
+async def outlook_calendar_update(args: OutlookCalendarUpdateArgs, **kwargs: object) -> str:
+    """Update an existing Outlook Calendar event (partial PATCH).
+
+    Args:
+        args: Validated update arguments (event_id plus optional fields).
+
+    Returns:
+        Confirmation message with the updated event summary, or an error string.
+    """
+    event_payload: dict[str, object] = {}
+    if args.subject is not None:
+        event_payload["subject"] = args.subject
+    if args.body is not None:
+        event_payload["body"] = {"contentType": "text", "content": args.body}
+    if args.location is not None:
+        event_payload["location"] = {"displayName": args.location}
+    if args.start is not None:
+        event_payload["start"] = {
+            "dateTime": args.start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timeZone": "UTC",
+        }
+    if args.end is not None:
+        event_payload["end"] = {
+            "dateTime": args.end.strftime("%Y-%m-%dT%H:%M:%S"),
+            "timeZone": "UTC",
+        }
+    if args.attendees is not None:
+        event_payload["attendees"] = [
+            {"emailAddress": {"address": email}, "type": "required"}
+            for email in args.attendees
+        ]
+
+    if not event_payload:
+        return "No fields provided to update. Specify at least one field to change."
+
+    try:
+        token = await _get_microsoft_token()
+    except OAuthError as exc:
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
+
+    try:
+        response = await _http_client.patch(  # type: ignore[union-attr]
+            f"{_GRAPH_BASE}/me/events/{args.event_id}",
+            json=event_payload,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+    except httpx.HTTPError as exc:
+        logger.error("HTTP error updating Outlook Calendar event: %s", type(exc).__name__)
+        return "Failed to connect to Microsoft Graph API."
+
+    if response.status_code != 200:
+        return f"Microsoft Graph error: {_extract_graph_error(response)}"
+
+    try:
+        updated = response.json()
+    except (ValueError, TypeError):
+        return "Event may have been updated but failed to parse the response."
+
+    if not isinstance(updated, dict):
+        updated = {}
+    event_id = updated.get("id", args.event_id)
+    subject = updated.get("subject", "(no subject)")
+    web_link = updated.get("webLink", "")
+
+    result = f"Event updated successfully.\nID: {event_id}\nSubject: {subject}"
+    if web_link:
+        result += f"\nWeb link: {web_link}"
+
+    return result

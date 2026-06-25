@@ -23,6 +23,7 @@ from admino.models import (
     OutlookCalendarCreateArgs,
     OutlookCalendarListArgs,
     OutlookCalendarReadArgs,
+    OutlookCalendarUpdateArgs,
 )
 from admino.oauth import OAuthError
 from admino.tools import outlook_calendar as cal_mod
@@ -128,6 +129,12 @@ class TestOutlookCalendarRegistration:
         tools = get_registered_tools()
         keys = [(t.tool, t.action) for t in tools]
         assert ("outlook_calendar", "create") in keys
+
+    def test_update_registered(self) -> None:
+        """outlook_calendar.update is in the registry."""
+        tools = get_registered_tools()
+        keys = [(t.tool, t.action) for t in tools]
+        assert ("outlook_calendar", "update") in keys
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +442,169 @@ class TestOutlookCalendarCreate:
 
 
 # ---------------------------------------------------------------------------
+# 4b. outlook_calendar.update
+# ---------------------------------------------------------------------------
+
+
+class TestOutlookCalendarUpdate:
+    """Tests for the outlook_calendar.update action."""
+
+    async def test_update_happy_path(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Successful update returns the updated event summary."""
+        updated = {
+            "id": "evt-1",
+            "subject": "Renamed Meeting",
+            "webLink": "https://outlook.live.com/event/evt-1",
+        }
+        mock_http_client.patch.return_value = _make_response(200, updated)
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(event_id="evt-1", subject="Renamed Meeting")
+        result = await outlook_calendar_update(args)
+
+        assert "Renamed Meeting" in result
+        assert "evt-1" in result
+
+    async def test_update_uses_patch_to_correct_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Update issues a PATCH to /me/events/{id}."""
+        mock_http_client.patch.return_value = _make_response(
+            200, {"id": "evt-1", "subject": "X"}
+        )
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(event_id="evt-1", subject="X")
+        await outlook_calendar_update(args)
+
+        mock_http_client.patch.assert_called_once()
+        url = mock_http_client.patch.call_args[0][0]
+        assert url.endswith("/me/events/evt-1")
+
+    async def test_update_partial_body_only_provided_fields(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Only supplied fields are sent in the PATCH body."""
+        mock_http_client.patch.return_value = _make_response(
+            200, {"id": "evt-1", "subject": "New"}
+        )
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(event_id="evt-1", subject="New")
+        await outlook_calendar_update(args)
+
+        json_body = mock_http_client.patch.call_args.kwargs["json"]
+        assert json_body == {"subject": "New"}
+        assert "start" not in json_body
+        assert "body" not in json_body
+
+    async def test_update_body_and_location_structured(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """body and location are sent as Graph structured objects."""
+        mock_http_client.patch.return_value = _make_response(
+            200, {"id": "evt-1", "subject": "S"}
+        )
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(
+            event_id="evt-1", body="New agenda", location="Room 9"
+        )
+        await outlook_calendar_update(args)
+
+        json_body = mock_http_client.patch.call_args.kwargs["json"]
+        assert json_body["body"]["content"] == "New agenda"
+        assert json_body["location"]["displayName"] == "Room 9"
+
+    async def test_update_start_end_structured(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """start/end are sent as Graph dateTime/timeZone objects."""
+        mock_http_client.patch.return_value = _make_response(
+            200, {"id": "evt-1", "subject": "S"}
+        )
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        now = datetime.now(UTC)
+        args = OutlookCalendarUpdateArgs(
+            event_id="evt-1", start=now, end=now + timedelta(hours=1)
+        )
+        await outlook_calendar_update(args)
+
+        json_body = mock_http_client.patch.call_args.kwargs["json"]
+        assert "dateTime" in json_body["start"]
+        assert json_body["start"]["timeZone"] == "UTC"
+
+    async def test_update_attendees_structured(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Attendees are sent as Graph emailAddress objects."""
+        mock_http_client.patch.return_value = _make_response(
+            200, {"id": "evt-1", "subject": "S"}
+        )
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(
+            event_id="evt-1", attendees=["a@example.com", "b@example.com"]
+        )
+        await outlook_calendar_update(args)
+
+        json_body = mock_http_client.patch.call_args.kwargs["json"]
+        addresses = [a["emailAddress"]["address"] for a in json_body["attendees"]]
+        assert addresses == ["a@example.com", "b@example.com"]
+
+    async def test_update_oauth_not_configured(self) -> None:
+        """OAuth not configured returns reconnect instructions."""
+        with patch(
+            "admino.tools.outlook_calendar._get_microsoft_token",
+            new_callable=AsyncMock,
+            side_effect=OAuthError("not configured"),
+        ):
+            from admino.tools.outlook_calendar import outlook_calendar_update
+
+            args = OutlookCalendarUpdateArgs(event_id="evt-1", subject="X")
+            result = await outlook_calendar_update(args)
+
+        assert "OAuth error" in result
+
+    async def test_update_api_error(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Non-200 returns a Graph error."""
+        mock_http_client.patch.return_value = _make_response(
+            404, {"error": {"message": "Not found"}}
+        )
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(event_id="missing", subject="X")
+        result = await outlook_calendar_update(args)
+
+        assert "Microsoft Graph error" in result
+
+    async def test_update_http_error(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """A transport error reports a connection failure."""
+        mock_http_client.patch.side_effect = httpx.ConnectError("fail")
+
+        from admino.tools.outlook_calendar import outlook_calendar_update
+
+        args = OutlookCalendarUpdateArgs(event_id="evt-1", subject="X")
+        result = await outlook_calendar_update(args)
+
+        assert "Failed to connect" in result
+
+
+# ---------------------------------------------------------------------------
 # 5. Argument validation
 # ---------------------------------------------------------------------------
 
@@ -512,3 +682,37 @@ class TestOutlookCalendarArgValidation:
         now = datetime.now(UTC)
         args = OutlookCalendarListArgs(time_min=now, time_max=now + timedelta(days=1))
         assert args.max_results == 10
+
+    def test_update_requires_event_id(self) -> None:
+        """Missing event_id is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookCalendarUpdateArgs(subject="X")  # type: ignore[call-arg]
+
+    def test_update_rejects_unsafe_event_id(self) -> None:
+        """Path-traversal characters in event_id are rejected."""
+        with pytest.raises(ValidationError):
+            OutlookCalendarUpdateArgs(event_id="../../secrets")
+
+    def test_update_rejects_invalid_attendee(self) -> None:
+        """Malformed attendee addresses are rejected."""
+        with pytest.raises(ValidationError):
+            OutlookCalendarUpdateArgs(event_id="evt-1", attendees=["bad"])
+
+    def test_update_rejects_attendee_with_newline(self) -> None:
+        """Attendee header-injection attempts are rejected."""
+        with pytest.raises(ValidationError):
+            OutlookCalendarUpdateArgs(
+                event_id="evt-1", attendees=["a@example.com\r\nBcc: x@y.com"]
+            )
+
+    def test_update_subject_too_long_rejected(self) -> None:
+        """subject exceeding 200 chars is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookCalendarUpdateArgs(event_id="evt-1", subject="x" * 201)
+
+    def test_update_all_optional_default_none(self) -> None:
+        """Only event_id is required; everything else defaults to None."""
+        args = OutlookCalendarUpdateArgs(event_id="evt-1")
+        assert args.subject is None
+        assert args.start is None
+        assert args.attendees is None

@@ -23,6 +23,7 @@ from admino.models import (
     GoogleCalendarCreateArgs,
     GoogleCalendarListArgs,
     GoogleCalendarReadArgs,
+    GoogleCalendarUpdateArgs,
 )
 from admino.oauth import OAuthError
 from admino.tools import google_calendar
@@ -131,6 +132,12 @@ class TestCalendarRegistration:
         tools = get_registered_tools()
         keys = [(t.tool, t.action) for t in tools]
         assert ("google_calendar", "create") in keys
+
+    def test_calendar_update_registered(self) -> None:
+        """google_calendar.update is in the registry."""
+        tools = get_registered_tools()
+        keys = [(t.tool, t.action) for t in tools]
+        assert ("google_calendar", "update") in keys
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +387,114 @@ class TestCalendarCreate:
 
 
 # ---------------------------------------------------------------------------
+# 4b. google_calendar.update
+# ---------------------------------------------------------------------------
+
+
+class TestCalendarUpdate:
+    """Tests for the google_calendar.update handler."""
+
+    async def test_happy_path(self, mock_http: AsyncMock) -> None:
+        """Successful update returns the updated event summary."""
+        response_data = {
+            "id": "evt123",
+            "summary": "Updated Title",
+            "htmlLink": "https://calendar.google.com/event?eid=evt123",
+        }
+        mock_http.patch.return_value = _make_response(200, response_data)
+
+        args = GoogleCalendarUpdateArgs(event_id="evt123", summary="Updated Title")
+        result = await google_calendar.google_calendar_update(args)
+
+        assert "Updated Title" in result
+        assert "evt123" in result
+
+    async def test_uses_patch_to_correct_url(self, mock_http: AsyncMock) -> None:
+        """Update issues a PATCH to the primary calendar event endpoint."""
+        mock_http.patch.return_value = _make_response(200, {"id": "evt123", "summary": "X"})
+
+        args = GoogleCalendarUpdateArgs(event_id="evt123", summary="X")
+        await google_calendar.google_calendar_update(args)
+
+        mock_http.patch.assert_called_once()
+        url = mock_http.patch.call_args[0][0]
+        assert url.endswith("/events/evt123")
+
+    async def test_partial_body_only_includes_provided_fields(
+        self, mock_http: AsyncMock
+    ) -> None:
+        """Only the supplied fields are sent in the PATCH body."""
+        mock_http.patch.return_value = _make_response(200, {"id": "evt123", "summary": "New"})
+
+        args = GoogleCalendarUpdateArgs(event_id="evt123", summary="New", location="Room C")
+        await google_calendar.google_calendar_update(args)
+
+        json_body = mock_http.patch.call_args.kwargs["json"]
+        assert json_body == {"summary": "New", "location": "Room C"}
+        assert "description" not in json_body
+        assert "start" not in json_body
+
+    async def test_start_end_are_formatted_objects(self, mock_http: AsyncMock) -> None:
+        """start/end are sent as Calendar dateTime objects."""
+        mock_http.patch.return_value = _make_response(200, {"id": "evt123", "summary": "S"})
+
+        args = GoogleCalendarUpdateArgs(event_id="evt123", start=_NOW, end=_LATER)
+        await google_calendar.google_calendar_update(args)
+
+        json_body = mock_http.patch.call_args.kwargs["json"]
+        assert "dateTime" in json_body["start"]
+        assert "dateTime" in json_body["end"]
+
+    async def test_attendees_sent_as_email_dicts(self, mock_http: AsyncMock) -> None:
+        """Attendees are sent as a list of {email: ...} dicts."""
+        mock_http.patch.return_value = _make_response(200, {"id": "evt123", "summary": "S"})
+
+        args = GoogleCalendarUpdateArgs(
+            event_id="evt123", attendees=["a@example.com", "b@example.com"]
+        )
+        await google_calendar.google_calendar_update(args)
+
+        json_body = mock_http.patch.call_args.kwargs["json"]
+        assert json_body["attendees"] == [
+            {"email": "a@example.com"},
+            {"email": "b@example.com"},
+        ]
+
+    async def test_api_error(self, mock_http: AsyncMock) -> None:
+        """Non-200 returns a formatted API error."""
+        mock_http.patch.return_value = _make_response(
+            404, {"error": {"code": 404, "message": "Not Found"}}
+        )
+
+        args = GoogleCalendarUpdateArgs(event_id="missing", summary="X")
+        result = await google_calendar.google_calendar_update(args)
+
+        assert "Google API error 404" in result
+
+    async def test_oauth_error(self) -> None:
+        """OAuthError returns reconnect instructions."""
+        with patch.object(
+            google_calendar,
+            "_get_google_token",
+            new_callable=AsyncMock,
+            side_effect=OAuthError("no token"),
+        ):
+            args = GoogleCalendarUpdateArgs(event_id="evt123", summary="X")
+            result = await google_calendar.google_calendar_update(args)
+
+        assert "OAuth error" in result
+
+    async def test_http_error(self, mock_http: AsyncMock) -> None:
+        """A transport error is reported without leaking details."""
+        mock_http.patch.side_effect = httpx.ConnectError("boom")
+
+        args = GoogleCalendarUpdateArgs(event_id="evt123", summary="X")
+        result = await google_calendar.google_calendar_update(args)
+
+        assert "HTTP request failed" in result
+
+
+# ---------------------------------------------------------------------------
 # 5. Argument validation
 # ---------------------------------------------------------------------------
 
@@ -434,6 +549,38 @@ class TestCalendarArgValidation:
 
         create_args = GoogleCalendarCreateArgs(summary="Meeting", start=_NOW, end=_LATER)
         assert create_args.summary == "Meeting"
+
+    def test_update_requires_event_id(self) -> None:
+        """Missing event_id is rejected."""
+        with pytest.raises(ValidationError):
+            GoogleCalendarUpdateArgs(summary="X")  # type: ignore[call-arg]
+
+    def test_update_rejects_unsafe_event_id(self) -> None:
+        """Path-traversal characters in event_id are rejected."""
+        with pytest.raises(ValidationError):
+            GoogleCalendarUpdateArgs(event_id="../../etc/passwd")
+
+    def test_update_rejects_invalid_attendee(self) -> None:
+        """Malformed attendee addresses are rejected."""
+        with pytest.raises(ValidationError):
+            GoogleCalendarUpdateArgs(event_id="evt123", attendees=["not-an-email"])
+
+    def test_update_rejects_attendee_with_newline(self) -> None:
+        """Attendee header-injection attempts are rejected."""
+        with pytest.raises(ValidationError):
+            GoogleCalendarUpdateArgs(event_id="evt123", attendees=["a@example.com\r\nBcc: x@y.com"])
+
+    def test_update_summary_too_long(self) -> None:
+        """summary exceeding 200 chars is rejected."""
+        with pytest.raises(ValidationError):
+            GoogleCalendarUpdateArgs(event_id="evt123", summary="x" * 201)
+
+    def test_update_all_optional_fields_default_none(self) -> None:
+        """Only event_id is required; everything else defaults to None."""
+        args = GoogleCalendarUpdateArgs(event_id="evt123")
+        assert args.summary is None
+        assert args.start is None
+        assert args.attendees is None
 
 
 # ---------------------------------------------------------------------------

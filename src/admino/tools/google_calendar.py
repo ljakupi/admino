@@ -1,11 +1,14 @@
-"""Google Calendar tool for reading, listing, and creating events via Calendar API v3.
+"""Google Calendar tool for reading, listing, creating, and updating events via Calendar API v3.
 
-Provides read, list, and create actions for Google Calendar events on the
-authenticated user's primary calendar. OAuth tokens are managed by admino.oauth.
+Provides read, list, create, and update actions for Google Calendar events on
+the authenticated user's primary calendar. OAuth tokens are managed by admino.oauth.
 
 Security notes:
-- No delete or update capabilities. google_calendar.delete and
-  google_calendar.update are hardcoded denials in permissions.py.
+- No delete capability. google_calendar.delete is an immutable hardcoded denial.
+- google_calendar.update is a tier-2 promotable denial: it is denied by default
+  and can only be used after explicit user promotion (plus per-call confirmation)
+  via the Critical Permissions UI. event_id and attendee addresses are validated
+  in models.py to prevent path traversal and injection.
 - google_calendar.create requires user confirmation via the permission engine.
 - OAuth tokens are cached in module-level state; refresh tokens never appear
   in memory outside oauth.py.
@@ -30,6 +33,7 @@ from admino.models import (
     GoogleCalendarCreateArgs,
     GoogleCalendarListArgs,
     GoogleCalendarReadArgs,
+    GoogleCalendarUpdateArgs,
 )
 from admino.oauth import OAuthError, get_valid_access_token
 from admino.tools.registry import register_tool
@@ -357,6 +361,77 @@ async def google_calendar_create(args: GoogleCalendarCreateArgs, **kwargs: objec
     html_link = data.get("htmlLink", "")
 
     result = f"Event created successfully.\nEvent ID: {event_id}"
+    if html_link:
+        result += f"\nLink: {html_link}"
+
+    return result
+
+
+@register_tool(
+    tool="google_calendar",
+    action="update",
+    description=(
+        "Update an existing calendar event by ID. Only the provided fields are "
+        "changed (partial update). Requires user confirmation."
+    ),
+    args_schema=GoogleCalendarUpdateArgs,
+)
+async def google_calendar_update(args: GoogleCalendarUpdateArgs, **kwargs: object) -> str:
+    """Update an existing Google Calendar event (partial PATCH).
+
+    Args:
+        args: Validated update arguments (event_id plus optional fields).
+
+    Returns:
+        Confirmation message with the updated event summary, or an error string.
+    """
+    event_body: dict[str, object] = {}
+    if args.summary is not None:
+        event_body["summary"] = args.summary
+    if args.description is not None:
+        event_body["description"] = args.description
+    if args.location is not None:
+        event_body["location"] = args.location
+    if args.start is not None:
+        event_body["start"] = {"dateTime": args.start.isoformat(), "timeZone": "UTC"}
+    if args.end is not None:
+        event_body["end"] = {"dateTime": args.end.isoformat(), "timeZone": "UTC"}
+    if args.attendees is not None:
+        event_body["attendees"] = [{"email": email} for email in args.attendees]
+
+    if not event_body:
+        return "No fields provided to update. Specify at least one field to change."
+
+    try:
+        global _http_client
+        if _http_client is None:
+            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+        token = await _get_google_token()
+        response = await _http_client.patch(
+            f"{_CALENDAR_API_BASE}/events/{args.event_id}",
+            json=event_body,
+            headers={
+                **_auth_headers(token),
+                "Content-Type": "application/json",
+            },
+        )
+    except OAuthError as exc:
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
+    except httpx.HTTPError as exc:
+        return f"HTTP request failed: {type(exc).__name__}"
+
+    if response.status_code != 200:
+        return _format_api_error(response)
+
+    data = response.json()
+    if not isinstance(data, dict):
+        return "Event updated but received unexpected response format."
+
+    event_id = data.get("id", args.event_id)
+    summary = data.get("summary", "(no title)")
+    html_link = data.get("htmlLink", "")
+
+    result = f"Event updated successfully.\nEvent ID: {event_id}\nSummary: {summary}"
     if html_link:
         result += f"\nLink: {html_link}"
 
