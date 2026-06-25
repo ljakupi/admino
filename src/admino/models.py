@@ -1068,6 +1068,58 @@ class GoogleCalendarCreateArgs(BaseModel):
     )
 
 
+class GoogleCalendarUpdateArgs(BaseModel):
+    """Arguments for the google_calendar.update action (tier-2, requires promotion + confirm).
+
+    All fields except ``event_id`` are optional; only the provided fields are
+    sent in the partial (PATCH) update. ``event_id`` is constrained to safe
+    characters to prevent path traversal in the Calendar API URL, and attendee
+    addresses are validated to reject injection.
+    """
+
+    event_id: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[a-zA-Z0-9_]+$",
+        description="Google Calendar event ID to update.",
+    )
+    summary: str | None = Field(
+        default=None,
+        max_length=200,
+        description="New event title.",
+    )
+    description: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="New event description.",
+    )
+    start: datetime | None = Field(
+        default=None,
+        description="New event start time (ISO 8601 UTC).",
+    )
+    end: datetime | None = Field(
+        default=None,
+        description="New event end time (ISO 8601 UTC).",
+    )
+    location: str | None = Field(
+        default=None,
+        max_length=200,
+        description="New event location.",
+    )
+    attendees: list[str] | None = Field(
+        default=None,
+        max_length=50,
+        description="Replacement attendee email addresses (max 50).",
+    )
+
+    @field_validator("attendees", mode="before")
+    @classmethod
+    def _validate_attendees(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return _validate_email_list(v)
+
+
 # ---------------------------------------------------------------------------
 # Google Drive tool argument models (tools/google_drive.py imports these)
 # ---------------------------------------------------------------------------
@@ -1252,13 +1304,24 @@ class OutlookCalendarListArgs(BaseModel):
     )
 
 
+# Microsoft Graph event IDs are base64 strings that legitimately contain
+# '=', '/', and '+' (as well as '-' and '_'). They are interpolated into the
+# Graph REST path, so the tool handlers URL-encode them (urllib.parse.quote,
+# safe="") before use — that encoding, not this charset, is the path-traversal
+# defence. This pattern is a permissive allow-list that still rejects
+# whitespace, control characters, '.', and other unexpected input. The length
+# cap is generous because recurring-instance / immutable IDs can be long.
+_GRAPH_EVENT_ID_PATTERN: Final[str] = r"^[A-Za-z0-9_\-=+/]+$"
+_GRAPH_EVENT_ID_MAX_LEN: Final[int] = 512
+
+
 class OutlookCalendarReadArgs(BaseModel):
     """Arguments for the outlook_calendar.read action."""
 
     event_id: str = Field(
         min_length=1,
-        max_length=200,
-        pattern=r"^[A-Za-z0-9_\-]+$",
+        max_length=_GRAPH_EVENT_ID_MAX_LEN,
+        pattern=_GRAPH_EVENT_ID_PATTERN,
         description="Outlook Calendar event ID.",
     )
 
@@ -1286,6 +1349,58 @@ class OutlookCalendarCreateArgs(BaseModel):
         max_length=200,
         description="Event location.",
     )
+
+
+class OutlookCalendarUpdateArgs(BaseModel):
+    """Arguments for the outlook_calendar.update action (tier-2, requires promotion + confirm).
+
+    All fields except ``event_id`` are optional; only the provided fields are
+    sent in the partial (PATCH) update. ``event_id`` allows the Microsoft Graph
+    base64 charset; the handler URL-encodes it to prevent path traversal in the
+    Graph API URL, and attendee addresses are validated to reject injection.
+    """
+
+    event_id: str = Field(
+        min_length=1,
+        max_length=_GRAPH_EVENT_ID_MAX_LEN,
+        pattern=_GRAPH_EVENT_ID_PATTERN,
+        description="Outlook Calendar event ID to update.",
+    )
+    subject: str | None = Field(
+        default=None,
+        max_length=200,
+        description="New event subject.",
+    )
+    body: str | None = Field(
+        default=None,
+        max_length=1000,
+        description="New event body/description.",
+    )
+    start: datetime | None = Field(
+        default=None,
+        description="New event start time (ISO 8601 UTC).",
+    )
+    end: datetime | None = Field(
+        default=None,
+        description="New event end time (ISO 8601 UTC).",
+    )
+    location: str | None = Field(
+        default=None,
+        max_length=200,
+        description="New event location.",
+    )
+    attendees: list[str] | None = Field(
+        default=None,
+        max_length=50,
+        description="Replacement attendee email addresses (max 50).",
+    )
+
+    @field_validator("attendees", mode="before")
+    @classmethod
+    def _validate_attendees(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return _validate_email_list(v)
 
 
 # ---------------------------------------------------------------------------
