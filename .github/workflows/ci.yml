@@ -27,14 +27,11 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install dependencies
         run: pip install -e ".[dev]"
-      - name: Lint
-        run: make lint
-      - name: Format check
-        run: make format-check
-      - name: Type check
-        run: make typecheck
-      - name: Test
-        run: python -m pytest tests/ -v --tb=short --cov=src/admino --cov-report=term-missing --cov-fail-under=90
+      # Single source of truth: `make check` runs lint, format-check, typecheck,
+      # and the coverage-gated test suite (--cov-fail-under=90). The same target
+      # is what developers run locally, so CI and local gates cannot drift.
+      - name: Quality gates (lint, format-check, typecheck, tests, coverage)
+        run: make check
 
   frontend:
     runs-on: ubuntu-latest
