@@ -284,6 +284,9 @@ class AnthropicClient:
             )
             raise ImportError(msg) from exc
 
+        if not config.anthropic_model:
+            msg = "AnthropicClient requires llm.anthropic_model to be set in config."
+            raise ValueError(msg)
         self._model = config.anthropic_model
         self._timeout_s = config.timeout_s
         self._max_tokens = config.max_response_tokens

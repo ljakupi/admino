@@ -142,7 +142,7 @@ class TestDefaults:
         assert config.server.host == "0.0.0.0"  # noqa: S104
         assert config.server.port == 8000
         assert config.llm.ollama_url == "http://local-llm:11434"
-        assert config.llm.model == "gemma4:e2b"
+        assert config.llm.model is None  # no hardcoded model default
         assert config.llm.timeout_s == 120
         assert config.llm.provider == "ollama"
         assert config.auth.mode == "vpn"  # explicitly set via AUTH_MODE env
@@ -959,16 +959,16 @@ class TestLLMConfigValidation:
             LLMConfig(provider="openai")
 
     def test_anthropic_with_api_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Anthropic provider with ANTHROPIC_API_KEY set passes validation."""
+        """Anthropic provider with ANTHROPIC_API_KEY + model set passes validation."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
-        config = LLMConfig(provider="anthropic")
+        config = LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
         assert config.provider == "anthropic"
-        assert config.active_model_name == "claude-sonnet-4-20250514"
+        assert config.active_model_name == "claude-sonnet-4-6"
 
     def test_openai_with_api_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """OpenAI provider with OPENAI_API_KEY set passes validation."""
+        """OpenAI provider with OPENAI_API_KEY + model set passes validation."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
-        config = LLMConfig(provider="openai")
+        config = LLMConfig(provider="openai", openai_model="gpt-4o")
         assert config.provider == "openai"
         assert config.active_model_name == "gpt-4o"
 
@@ -976,6 +976,40 @@ class TestLLMConfigValidation:
         """active_model_name returns ollama model for ollama provider."""
         config = LLMConfig(provider="ollama", model="test-model:7b")
         assert config.active_model_name == "test-model:7b"
+
+    # -- No hardcoded model defaults: the model must come from config --
+
+    def test_model_fields_have_no_hardcoded_default(self) -> None:
+        """Inactive-provider model fields default to None, not a baked-in ID."""
+        config = LLMConfig(provider="ollama", model="test-model:7b")
+        assert config.anthropic_model is None
+        assert config.openai_model is None
+
+    def test_anthropic_missing_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Anthropic provider without anthropic_model fails validation."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+        with pytest.raises(ValidationError, match="anthropic_model"):
+            LLMConfig(provider="anthropic")
+
+    def test_anthropic_empty_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Anthropic provider with an empty model string fails validation."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+        with pytest.raises(ValidationError, match="anthropic_model"):
+            LLMConfig(provider="anthropic", anthropic_model="")
+
+    def test_openai_missing_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """OpenAI provider without openai_model fails validation."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        with pytest.raises(ValidationError, match="openai_model"):
+            LLMConfig(provider="openai")
+
+    def test_ollama_missing_model_active_name_raises(self) -> None:
+        """Ollama provider without a model has no default; active_model_name
+        fails gracefully (raised when the client is built)."""
+        config = LLMConfig(provider="ollama")
+        assert config.model is None
+        with pytest.raises(ValueError, match="No model configured"):
+            _ = config.active_model_name
 
     def test_to_ollama_config(self) -> None:
         """to_ollama_config extracts ollama-specific settings."""

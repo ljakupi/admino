@@ -32,7 +32,7 @@ llm:
 
   # Proprietary provider settings (used when provider=anthropic or openai)
   # API keys MUST be set via env vars: ANTHROPIC_API_KEY or OPENAI_API_KEY
-  anthropic_model: "claude-sonnet-4-20250514"
+  anthropic_model: "claude-sonnet-4-6"
   # openai_model: "gpt-4o"
 
 auth:
