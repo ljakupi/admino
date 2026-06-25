@@ -420,9 +420,7 @@ class TestCalendarUpdate:
         url = mock_http.patch.call_args[0][0]
         assert url.endswith("/events/evt123")
 
-    async def test_partial_body_only_includes_provided_fields(
-        self, mock_http: AsyncMock
-    ) -> None:
+    async def test_partial_body_only_includes_provided_fields(self, mock_http: AsyncMock) -> None:
         """Only the supplied fields are sent in the PATCH body."""
         mock_http.patch.return_value = _make_response(200, {"id": "evt123", "summary": "New"})
 
