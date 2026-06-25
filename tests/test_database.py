@@ -389,6 +389,77 @@ class TestLoadSettingsFromDb:
 
         assert result["log_level"] == "DEBUG"
 
+    async def test_strips_null_fields_within_section(self, mock_pool: MagicMock) -> None:
+        """A null field inside a section is dropped so the model default applies.
+
+        A persisted NULL means "not set" — Pydantic only applies a field
+        default when the key is absent, not when it is explicitly None. See
+        the openai_model startup-failure regression.
+        """
+        conn = mock_pool._mock_conn
+        conn.fetch = AsyncMock(
+            return_value=[
+                {
+                    "key": "llm",
+                    "value": {"provider": "anthropic", "openai_model": None, "model": "x"},
+                },
+            ]
+        )
+
+        result = await db_mod.load_settings_from_db(mock_pool)
+
+        assert "openai_model" not in result["llm"]
+        assert result["llm"] == {"provider": "anthropic", "model": "x"}
+
+    async def test_drops_top_level_none_section(self, mock_pool: MagicMock) -> None:
+        """A top-level section persisted as NULL is dropped entirely."""
+        conn = mock_pool._mock_conn
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"key": "llm", "value": {"provider": "ollama"}},
+                {"key": "appearance", "value": None},
+            ]
+        )
+
+        result = await db_mod.load_settings_from_db(mock_pool)
+
+        assert "appearance" not in result
+        assert result["llm"] == {"provider": "ollama"}
+
+    async def test_app_config_loads_when_openai_model_is_null(
+        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: a persisted null openai_model must not break startup.
+
+        Reproduces the container boot failure where the seeded llm row stored
+        ``openai_model: null`` (config.yaml omitted it after defaults were
+        dropped). load_app_config_from_db must fall back to the field default
+        rather than raising a validation error.
+        """
+        from admino.config import load_app_config_from_db
+
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        conn = mock_pool._mock_conn
+        conn.fetch = AsyncMock(
+            return_value=[
+                {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
+                {"key": "llm", "value": {"provider": "ollama", "openai_model": None}},
+                {"key": "auth", "value": {"mode": "vpn"}},
+                {"key": "paths", "value": {}},
+                {"key": "files", "value": {}},
+                {"key": "limits", "value": {}},
+                {"key": "egress", "value": {}},
+                {"key": "ocr", "value": {}},
+                {"key": "database", "value": {}},
+                {"key": "log_level", "value": {"value": "INFO"}},
+            ]
+        )
+
+        config = await load_app_config_from_db(mock_pool)
+
+        assert config.llm.openai_model == "gpt-4o"
+        assert config.llm.provider == "ollama"
+
 
 # ---------------------------------------------------------------------------
 # TestLoadPermissionsFromDb
