@@ -1530,3 +1530,111 @@ async def test_agent_audit_entries_conform_to_pydantic_schema(
             ToolCallAuditEntry.model_validate(e)
         else:
             pytest.fail(f"unexpected entry_type {e['entry_type']}")
+
+
+# ===========================================================================
+# 14. Permission-aware tool exposure to the LLM (GH-77)
+# ===========================================================================
+
+
+def _payload_tool_names(payload: list[dict[str, Any]] | None) -> set[str]:
+    """Extract the ``function.name`` ("<tool>.<action>") of each payload entry."""
+    assert payload is not None
+    names: set[str] = set()
+    for entry in payload:
+        function = entry["function"]
+        assert isinstance(function, dict)
+        names.add(str(function["name"]))
+    return names
+
+
+class TestAgentPermissionAwareToolPayload:
+    """The tools payload sent to the LLM must exclude unavailable actions.
+
+    GH-77: when an action the user wants is denied (immutable, promotable
+    and not promoted, or default-deny), the LLM must not even see a sibling
+    action to substitute. Allowed and confirm actions stay visible.
+    """
+
+    async def test_agent_payload_excludes_immutable_deny_tool(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """gmail.delete (immutable-deny) is absent from the LLM tools payload."""
+        register_tool("gmail", "read", "Read emails", EchoArgs)(echo_handler)
+        register_tool("gmail", "delete", "Delete email", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        names = _payload_tool_names(fake.received_tools[0])
+        assert "gmail.delete" not in names
+
+    async def test_agent_payload_includes_allowed_tool(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """gmail.read (allow) IS present in the LLM tools payload."""
+        register_tool("gmail", "read", "Read emails", EchoArgs)(echo_handler)
+        register_tool("gmail", "delete", "Delete email", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        names = _payload_tool_names(fake.received_tools[0])
+        assert "gmail.read" in names
+
+    async def test_agent_payload_includes_confirm_tool(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """echo.write (confirm) IS present — confirm actions stay visible."""
+        register_tool("echo", "write", "Write echo", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        names = _payload_tool_names(fake.received_tools[0])
+        assert "echo.write" in names
+
+    async def test_agent_payload_excludes_promotable_deny_not_promoted(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """gmail.send (promotable-deny, not promoted) is absent from the payload."""
+        register_tool("gmail", "send", "Send email", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        names = _payload_tool_names(fake.received_tools[0])
+        assert "gmail.send" not in names
+
+    async def test_agent_payload_includes_promoted_tool(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """A promoted promotable-deny tool (gmail.send) IS exposed to the LLM."""
+        register_tool("gmail", "send", "Send email", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+        agent._promoted = frozenset({("gmail", "send")})
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        names = _payload_tool_names(fake.received_tools[0])
+        assert "gmail.send" in names

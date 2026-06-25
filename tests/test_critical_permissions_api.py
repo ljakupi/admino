@@ -1001,3 +1001,81 @@ class TestSystemPromptDynamicPermissionGuidance:
 
         assert "permissions can change during a conversation" in prompt.lower()
         assert "never refuse based on earlier" in prompt.lower()
+
+    async def test_system_prompt_includes_no_substitution_guardrail(self) -> None:
+        """System prompt forbids substituting a different tool when one is unavailable.
+
+        GH-77 defence-in-depth: the prompt must instruct the LLM never to
+        substitute a different action (e.g. create instead of update) when the
+        requested tool is not available. The existing dynamic-permission
+        guidance must remain alongside this new guardrail.
+        """
+        import os
+
+        from admino.config import AppConfig
+        from admino.main import _build_system_prompt
+        from admino.tools.registry import ToolDescription
+
+        fake_token = _TEST_TOKEN
+        fake_tool = ToolDescription(
+            tool="google_calendar",
+            action="read",
+            description="Read events.",
+            parameters_schema={"type": "object", "properties": {}},
+        )
+
+        with (
+            patch.dict(os.environ, {"AUTH_TOKEN": fake_token}),
+            patch(
+                "admino.tools.registry.get_registered_tools",
+                return_value=[fake_tool],
+            ),
+        ):
+            config = AppConfig()
+            prompt = _build_system_prompt(config)
+
+        lowered = prompt.lower()
+        assert "never substitute" in lowered
+        assert "not available" in lowered or "isn't available" in lowered
+        # The pre-existing dynamic-permission guidance must remain.
+        assert "permissions can change during a conversation" in lowered
+
+    async def test_system_prompt_tool_summary_excludes_denied_actions(self) -> None:
+        """The tool summary must not advertise permission-denied actions.
+
+        GH-77 security follow-up: when a permissions config is supplied, the
+        summary in the system prompt is filtered through the permission engine
+        so it matches the per-turn tool payload. A hardcoded-denied action
+        (``gmail.delete``) must never appear as available, while an allowed
+        sibling (``gmail.read``) must.
+        """
+        import os
+
+        from pydantic import BaseModel, Field
+
+        from admino.config import AppConfig
+        from admino.main import _build_system_prompt
+        from admino.permissions import PermissionsConfig, ToolPermissions
+        from admino.tools.registry import clear_registry, register_tool
+
+        class _Args(BaseModel):
+            q: str = Field(min_length=1, max_length=10)
+
+        async def _handler(args: _Args, *, session_id: str) -> str:
+            return "ok"
+
+        clear_registry()
+        try:
+            register_tool("gmail", "read", "Read mail", _Args)(_handler)
+            register_tool("gmail", "delete", "Delete mail", _Args)(_handler)
+            permissions = PermissionsConfig(
+                tools={"gmail": ToolPermissions(actions={"read": "allow"})}
+            )
+            with patch.dict(os.environ, {"AUTH_TOKEN": _TEST_TOKEN}):
+                config = AppConfig()
+                prompt = _build_system_prompt(config, permissions)
+        finally:
+            clear_registry()
+
+        assert "read" in prompt
+        assert "delete" not in prompt
