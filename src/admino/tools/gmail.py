@@ -279,7 +279,7 @@ async def gmail_read(args: GmailReadArgs, **kwargs: object) -> str:
             params={"format": "full"},
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -334,7 +334,7 @@ async def gmail_list(args: GmailListArgs, **kwargs: object) -> str:
             params={"maxResults": str(args.max_results)},
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -383,7 +383,7 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
             params={"q": args.query, "maxResults": str(args.max_results)},
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -483,7 +483,7 @@ async def gmail_send(args: GmailSendArgs, **kwargs: object) -> str:
     try:
         token = await _get_google_token()
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
 
     raw_message = _build_rfc2822(args)
 

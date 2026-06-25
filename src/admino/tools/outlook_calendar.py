@@ -174,7 +174,9 @@ async def outlook_calendar_read(args: OutlookCalendarReadArgs, **kwargs: object)
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     url = (
         f"{_GRAPH_BASE}/me/events/{args.event_id}"
@@ -267,7 +269,9 @@ async def outlook_calendar_list(args: OutlookCalendarListArgs, **kwargs: object)
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     start_iso = args.time_min.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = args.time_max.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -331,7 +335,9 @@ async def outlook_calendar_create(args: OutlookCalendarCreateArgs, **kwargs: obj
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     event_payload: dict[str, object] = {
         "subject": args.subject,

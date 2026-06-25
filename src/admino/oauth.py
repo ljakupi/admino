@@ -665,8 +665,7 @@ async def _refresh_google_token(
         terminal = error_code in _TERMINAL_REFRESH_ERRORS
         if terminal:
             msg = (
-                "Google token refresh failed: the authorization has expired or been "
-                "revoked. Reconnect your Google account in Tools."
+                "Google token refresh failed: the saved authorization has expired or been revoked."
             )
         else:
             msg = "Google token refresh failed due to a transient token-endpoint error."
@@ -911,8 +910,8 @@ async def _refresh_microsoft_token(
         terminal = error_code in _TERMINAL_REFRESH_ERRORS
         if terminal:
             msg = (
-                "Microsoft token refresh failed: the authorization has expired or been "
-                "revoked. Reconnect your Microsoft account in Tools."
+                "Microsoft token refresh failed: the saved authorization has expired "
+                "or been revoked."
             )
         else:
             msg = "Microsoft token refresh failed due to a transient token-endpoint error."
@@ -983,7 +982,7 @@ async def get_valid_access_token(
     # Need to refresh — load and decrypt the refresh token
     token_file = load_token(tokens_dir, provider)
     if token_file is None:
-        msg = f"No {provider} OAuth token file found. Run oauth_setup first."
+        msg = f"No {provider} account is connected."
         raise OAuthError(msg)
 
     refresh_tok = decrypt_refresh_token(token_file)
