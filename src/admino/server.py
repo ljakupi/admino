@@ -876,14 +876,16 @@ async def _build_settings_response() -> SettingsResponse:
     pool = get_pool()
     settings = await load_settings_from_db(pool)
 
-    # LLM section with masked key flags.
+    # LLM section with masked key flags. Fall back to the live config
+    # (config.yaml-driven) rather than hardcoded literals so the displayed
+    # values reflect the authoritative source.
     llm_data = settings.get("llm", {})
     llm_section = SettingsLLM(
-        provider=llm_data.get("provider", "ollama"),
-        model=llm_data.get("model", "gemma4:e2b"),
-        ollama_url=llm_data.get("ollama_url", "http://local-llm:11434"),
-        anthropic_model=llm_data.get("anthropic_model", "claude-sonnet-4-20250514"),
-        openai_model=llm_data.get("openai_model", "gpt-4o"),
+        provider=llm_data.get("provider") or _config.llm.provider,
+        model=llm_data.get("model") or _config.llm.model or "",
+        ollama_url=llm_data.get("ollama_url") or _config.llm.ollama_url,
+        anthropic_model=llm_data.get("anthropic_model") or _config.llm.anthropic_model or "",
+        openai_model=llm_data.get("openai_model") or _config.llm.openai_model or "",
         anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
         openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
     )
@@ -1023,9 +1025,11 @@ async def patch_settings(
         for key, value in patch_fields.items():
             llm_current[key] = value
 
-        # Validate merged result against the full LLMConfig model.
+        # Validate merged result against the full LLMConfig model. Backfill
+        # from the live config (config.yaml) so model fields not stored in the
+        # DB are sourced from the authoritative config rather than defaults.
         try:
-            LLMConfig.model_validate(llm_current)
+            LLMConfig.model_validate({**_config.llm.model_dump(mode="json"), **llm_current})
         except ValidationError as exc:
             safe_errors = []
             for err in exc.errors(include_input=False):
@@ -1078,7 +1082,9 @@ async def patch_settings(
         refreshed_settings = await load_settings_from_db(pool)
         llm_data = refreshed_settings.get("llm", {})
         try:
-            new_llm_config = LLMConfig.model_validate(llm_data)
+            new_llm_config = LLMConfig.model_validate(
+                {**_config.llm.model_dump(mode="json"), **llm_data}
+            )
         except ValidationError:
             logger.error("Failed to reconstruct LLMConfig after provider change")
             raise HTTPException(

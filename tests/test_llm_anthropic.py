@@ -35,7 +35,7 @@ from admino.models import LLMMessage
 def _make_llm_config() -> Any:
     """Create a fake LLMConfig for testing."""
     return SimpleNamespace(
-        anthropic_model="claude-sonnet-4-20250514",
+        anthropic_model="claude-sonnet-4-6",
         timeout_s=30,
         max_response_tokens=4096,
     )
@@ -67,7 +67,7 @@ def _make_tool_use_block(
 
 def _make_response(
     content_blocks: list[Any] | None = None,
-    model: str = "claude-sonnet-4-20250514",
+    model: str = "claude-sonnet-4-6",
     stop_reason: str = "end_turn",
 ) -> SimpleNamespace:
     """Create a mock Anthropic Messages API response."""
@@ -572,7 +572,7 @@ class TestAnthropicClientConstructor:
         config = _make_llm_config()
         with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-ant-test123"}):
             client = AnthropicClient(config)
-            assert client._model == "claude-sonnet-4-20250514"
+            assert client._model == "claude-sonnet-4-6"
 
 
 # ---------------------------------------------------------------------------

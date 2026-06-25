@@ -1378,8 +1378,12 @@ class SettingsLLM(BaseModel):
     @field_validator("model", "anthropic_model", "openai_model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
-        """Reject model names containing shell metacharacters or control chars."""
-        if not _MODEL_NAME_RE.match(v):
+        """Reject model names containing shell metacharacters or control chars.
+
+        An empty string is allowed: inactive-provider model fields have no
+        hardcoded default and are rendered blank when unset in config.
+        """
+        if v and not _MODEL_NAME_RE.match(v):
             msg = "Model name contains invalid characters."
             raise ValueError(msg)
         return v

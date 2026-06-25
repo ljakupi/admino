@@ -214,6 +214,9 @@ class OpenAIClient:
             )
             raise ImportError(msg) from exc
 
+        if not config.openai_model:
+            msg = "OpenAIClient requires llm.openai_model to be set in config."
+            raise ValueError(msg)
         self._model = config.openai_model
         self._timeout_s = config.timeout_s
         self._max_tokens = config.max_response_tokens
