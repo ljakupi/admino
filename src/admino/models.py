@@ -1419,9 +1419,16 @@ class OAuthAuthorizeResponse(BaseModel):
 
 
 class OAuthConnectionStatus(BaseModel):
-    """OAuth connection status for a provider."""
+    """OAuth connection status for a provider.
+
+    ``connected`` means a token file exists on disk. ``healthy`` means the
+    stored refresh token is still believed valid (not flagged dead after a
+    terminal refresh failure). The frontend treats ``connected and not
+    healthy`` the same as "Not connected" — prompting a fresh Connect.
+    """
 
     connected: bool = False
+    healthy: bool = False
     email: str | None = Field(
         default=None,
         max_length=254,
