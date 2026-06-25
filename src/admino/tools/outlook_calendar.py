@@ -433,8 +433,7 @@ async def outlook_calendar_update(args: OutlookCalendarUpdateArgs, **kwargs: obj
         }
     if args.attendees is not None:
         event_payload["attendees"] = [
-            {"emailAddress": {"address": email}, "type": "required"}
-            for email in args.attendees
+            {"emailAddress": {"address": email}, "type": "required"} for email in args.attendees
         ]
 
     if not event_payload:

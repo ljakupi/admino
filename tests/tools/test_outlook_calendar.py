@@ -472,9 +472,7 @@ class TestOutlookCalendarUpdate:
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
         """Update issues a PATCH to /me/events/{id}."""
-        mock_http_client.patch.return_value = _make_response(
-            200, {"id": "evt-1", "subject": "X"}
-        )
+        mock_http_client.patch.return_value = _make_response(200, {"id": "evt-1", "subject": "X"})
 
         from admino.tools.outlook_calendar import outlook_calendar_update
 
@@ -489,9 +487,7 @@ class TestOutlookCalendarUpdate:
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
         """Only supplied fields are sent in the PATCH body."""
-        mock_http_client.patch.return_value = _make_response(
-            200, {"id": "evt-1", "subject": "New"}
-        )
+        mock_http_client.patch.return_value = _make_response(200, {"id": "evt-1", "subject": "New"})
 
         from admino.tools.outlook_calendar import outlook_calendar_update
 
@@ -507,15 +503,11 @@ class TestOutlookCalendarUpdate:
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
         """body and location are sent as Graph structured objects."""
-        mock_http_client.patch.return_value = _make_response(
-            200, {"id": "evt-1", "subject": "S"}
-        )
+        mock_http_client.patch.return_value = _make_response(200, {"id": "evt-1", "subject": "S"})
 
         from admino.tools.outlook_calendar import outlook_calendar_update
 
-        args = OutlookCalendarUpdateArgs(
-            event_id="evt-1", body="New agenda", location="Room 9"
-        )
+        args = OutlookCalendarUpdateArgs(event_id="evt-1", body="New agenda", location="Room 9")
         await outlook_calendar_update(args)
 
         json_body = mock_http_client.patch.call_args.kwargs["json"]
@@ -526,16 +518,12 @@ class TestOutlookCalendarUpdate:
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
         """start/end are sent as Graph dateTime/timeZone objects."""
-        mock_http_client.patch.return_value = _make_response(
-            200, {"id": "evt-1", "subject": "S"}
-        )
+        mock_http_client.patch.return_value = _make_response(200, {"id": "evt-1", "subject": "S"})
 
         from admino.tools.outlook_calendar import outlook_calendar_update
 
         now = datetime.now(UTC)
-        args = OutlookCalendarUpdateArgs(
-            event_id="evt-1", start=now, end=now + timedelta(hours=1)
-        )
+        args = OutlookCalendarUpdateArgs(event_id="evt-1", start=now, end=now + timedelta(hours=1))
         await outlook_calendar_update(args)
 
         json_body = mock_http_client.patch.call_args.kwargs["json"]
@@ -546,9 +534,7 @@ class TestOutlookCalendarUpdate:
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
         """Attendees are sent as Graph emailAddress objects."""
-        mock_http_client.patch.return_value = _make_response(
-            200, {"id": "evt-1", "subject": "S"}
-        )
+        mock_http_client.patch.return_value = _make_response(200, {"id": "evt-1", "subject": "S"})
 
         from admino.tools.outlook_calendar import outlook_calendar_update
 
@@ -701,9 +687,7 @@ class TestOutlookCalendarArgValidation:
     def test_update_rejects_attendee_with_newline(self) -> None:
         """Attendee header-injection attempts are rejected."""
         with pytest.raises(ValidationError):
-            OutlookCalendarUpdateArgs(
-                event_id="evt-1", attendees=["a@example.com\r\nBcc: x@y.com"]
-            )
+            OutlookCalendarUpdateArgs(event_id="evt-1", attendees=["a@example.com\r\nBcc: x@y.com"])
 
     def test_update_subject_too_long_rejected(self) -> None:
         """subject exceeding 200 chars is rejected."""
