@@ -314,8 +314,18 @@ async def load_settings_from_db(
         # (e.g. certain pool configurations). Parse if needed.
         if isinstance(value, str):
             value = json.loads(value)
+        # A persisted NULL means "not set" — drop the whole section so the
+        # config model's section default applies.
+        if value is None:
+            continue
         if key == "log_level" and isinstance(value, dict):
             result[key] = value.get("value", "INFO")
+        elif isinstance(value, dict):
+            # Drop NULL-valued fields within a section. Pydantic only applies a
+            # field default when the key is ABSENT, not when it is explicitly
+            # None, so a persisted null would otherwise fail validation for
+            # non-optional fields (e.g. llm.openai_model). See test_database.
+            result[key] = {k: v for k, v in value.items() if v is not None}
         else:
             result[key] = value
     return result
