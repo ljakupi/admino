@@ -434,9 +434,11 @@ class TestLoadSettingsFromDb:
         Reproduces the container boot failure where the seeded llm row stored
         ``openai_model: null`` (config.yaml omitted it after defaults were
         dropped). load_app_config_from_db must fall back to the field default
-        rather than raising a validation error.
+        rather than raising a validation error. Asserting against the declared
+        field default keeps this robust whether the default is a literal string
+        or None (it became optional in the LLM-config change).
         """
-        from admino.config import load_app_config_from_db
+        from admino.config import LLMConfig, load_app_config_from_db
 
         monkeypatch.setenv("AUTH_MODE", "vpn")
         conn = mock_pool._mock_conn
@@ -457,7 +459,7 @@ class TestLoadSettingsFromDb:
 
         config = await load_app_config_from_db(mock_pool)
 
-        assert config.llm.openai_model == "gpt-4o"
+        assert config.llm.openai_model == LLMConfig.model_fields["openai_model"].default
         assert config.llm.provider == "ollama"
 
 
