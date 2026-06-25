@@ -183,7 +183,9 @@ class TestGmailRead:
             result = await gmail.gmail_read(args)
 
         assert "OAuth error" in result
-        assert "oauth_setup" in result
+        assert "oauth_setup" not in result
+        assert "python" not in result.lower()
+        assert "Tools" in result
 
     async def test_api_error_non_200(self, mock_http: AsyncMock) -> None:
         """Non-200 status returns a formatted API error."""
@@ -528,7 +530,9 @@ class TestGmailSend:
             result = await gmail.gmail_send(args)
 
         assert "OAuth error" in result
-        assert "oauth_setup" in result
+        assert "oauth_setup" not in result
+        assert "python" not in result.lower()
+        assert "Tools" in result
 
     async def test_send_api_error_non_200(self, mock_http: AsyncMock) -> None:
         """Non-200 status returns a formatted API error."""

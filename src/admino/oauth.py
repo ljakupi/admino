@@ -112,6 +112,28 @@ class OAuthError(Exception):
     """
 
 
+class OAuthRefreshError(OAuthError):
+    """Raised when an access-token refresh fails.
+
+    The ``terminal`` flag distinguishes a permanently dead authorization
+    (e.g. the refresh token was revoked or expired — ``invalid_grant``),
+    which requires the user to reconnect the account, from a transient
+    failure (network error, provider 5xx) that may succeed on retry.
+
+    Only terminal failures cause the on-disk token to be flagged invalid.
+    """
+
+    def __init__(self, message: str, *, terminal: bool) -> None:
+        super().__init__(message)
+        self.terminal = terminal
+
+
+# Token-endpoint error codes that mean the refresh token is permanently dead.
+# Both Google and Microsoft return ``invalid_grant`` for expired/revoked
+# refresh tokens. Anything else (5xx, rate limits, network) is transient.
+_TERMINAL_REFRESH_ERRORS: frozenset[str] = frozenset({"invalid_grant"})
+
+
 class TokenFile(BaseModel):
     """On-disk representation of an encrypted OAuth token file.
 
@@ -138,6 +160,14 @@ class TokenFile(BaseModel):
     )
     last_refreshed_at: datetime = Field(
         description="UTC timestamp of the most recent token refresh.",
+    )
+    invalid: bool = Field(
+        default=False,
+        description=(
+            "True if the refresh token is known to be dead (a terminal "
+            "invalid_grant refresh failure). Surfaced to the UI as a "
+            "reconnect-required state. Defaults to False for legacy files."
+        ),
     )
 
 
@@ -632,8 +662,14 @@ async def _refresh_google_token(
             response.status_code,
             error_code,
         )
-        msg = "Google token refresh failed. The refresh token may have been revoked."
-        raise OAuthError(msg)
+        terminal = error_code in _TERMINAL_REFRESH_ERRORS
+        if terminal:
+            msg = (
+                "Google token refresh failed: the saved authorization has expired or been revoked."
+            )
+        else:
+            msg = "Google token refresh failed due to a transient token-endpoint error."
+        raise OAuthRefreshError(msg, terminal=terminal)
 
     try:
         data = response.json()
@@ -871,8 +907,15 @@ async def _refresh_microsoft_token(
             response.status_code,
             error_code,
         )
-        msg = "Microsoft token refresh failed. The refresh token may have been revoked."
-        raise OAuthError(msg)
+        terminal = error_code in _TERMINAL_REFRESH_ERRORS
+        if terminal:
+            msg = (
+                "Microsoft token refresh failed: the saved authorization has expired "
+                "or been revoked."
+            )
+        else:
+            msg = "Microsoft token refresh failed due to a transient token-endpoint error."
+        raise OAuthRefreshError(msg, terminal=terminal)
 
     try:
         data = response.json()
@@ -939,20 +982,33 @@ async def get_valid_access_token(
     # Need to refresh — load and decrypt the refresh token
     token_file = load_token(tokens_dir, provider)
     if token_file is None:
-        msg = f"No {provider} OAuth token file found. Run oauth_setup first."
+        msg = f"No {provider} account is connected."
         raise OAuthError(msg)
 
     refresh_tok = decrypt_refresh_token(token_file)
 
-    # Dispatch to provider-specific refresh
-    if provider == "google":
-        access_token, expires_in = await _refresh_google_token(refresh_tok, http_client)
-    else:
-        access_token, expires_in = await _refresh_microsoft_token(refresh_tok, http_client)
+    # Dispatch to provider-specific refresh. A terminal failure (the refresh
+    # token is dead) flags the token invalid on disk so the UI can surface a
+    # reconnect-required state; transient failures leave the flag untouched.
+    try:
+        if provider == "google":
+            access_token, expires_in = await _refresh_google_token(refresh_tok, http_client)
+        else:
+            access_token, expires_in = await _refresh_microsoft_token(refresh_tok, http_client)
+    except OAuthRefreshError as exc:
+        if exc.terminal and not token_file.invalid:
+            token_file.invalid = True
+            try:
+                save_token(tokens_dir, token_file)
+            except OAuthError:
+                logger.warning("Failed to persist invalid flag in %s token file.", provider)
+        raise
 
     expires_at = now + timedelta(seconds=expires_in)
 
-    # Update last_refreshed_at in the token file on disk
+    # Refresh succeeded — clear any stale invalid flag (recovery) and update
+    # last_refreshed_at in the token file on disk.
+    token_file.invalid = False
     token_file.last_refreshed_at = now
     try:
         save_token(tokens_dir, token_file)
@@ -962,6 +1018,39 @@ async def get_valid_access_token(
 
     logger.info("%s OAuth access token refreshed successfully.", provider.capitalize())
     return access_token, expires_at
+
+
+def get_connection_status(tokens_dir: Path, provider: OAuthProvider) -> tuple[bool, bool]:
+    """Return ``(connected, healthy)`` for a provider from local state only.
+
+    ``connected`` is True when a token file exists on disk. ``healthy`` is
+    True when that token file exists and is not flagged invalid (its refresh
+    token is still believed valid). A dead/revoked refresh token — detected
+    at tool-call time and persisted via the ``invalid`` flag — yields
+    ``(True, False)``, which the UI renders as "Not connected".
+
+    This reads only the local token file and performs no network calls, so
+    it never blocks the settings page load.
+
+    Args:
+        tokens_dir: Directory containing token files.
+        provider: OAuth provider name.
+
+    Returns:
+        A ``(connected, healthy)`` tuple.
+
+    Security notes:
+        No credentials are read into the response — only the boolean flags.
+    """
+    try:
+        token_file = load_token(tokens_dir, provider)
+    except OAuthError:
+        # A corrupt/unparseable token file exists but cannot be trusted —
+        # report connected-but-unhealthy so the UI prompts a reconnect.
+        return True, False
+    if token_file is None:
+        return False, False
+    return True, not token_file.invalid
 
 
 # ---------------------------------------------------------------------------

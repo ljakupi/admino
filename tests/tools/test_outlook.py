@@ -153,7 +153,9 @@ class TestOutlookRead:
             result = await outlook_read(args)
 
         assert "OAuth error" in result
-        assert "oauth_setup" in result
+        assert "oauth_setup" not in result
+        assert "python" not in result.lower()
+        assert "Tools" in result
 
     async def test_read_api_error(self, mock_token: AsyncMock, mock_http_client: AsyncMock) -> None:
         """Non-200 response returns Graph error message."""

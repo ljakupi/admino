@@ -211,7 +211,7 @@ async def google_drive_read(args: GoogleDriveReadArgs, **kwargs: object) -> str:
             headers=_auth_headers(token),
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -263,7 +263,7 @@ async def google_drive_list(args: GoogleDriveListArgs, **kwargs: object) -> str:
             headers=_auth_headers(token),
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -317,7 +317,7 @@ async def google_drive_search(args: GoogleDriveSearchArgs, **kwargs: object) -> 
             headers=_auth_headers(token),
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -388,7 +388,7 @@ async def google_drive_download(args: GoogleDriveDownloadArgs, **kwargs: object)
             headers=_auth_headers(token),
         )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed: {type(exc).__name__}"
 
@@ -422,7 +422,7 @@ async def google_drive_download(args: GoogleDriveDownloadArgs, **kwargs: object)
                 headers=_auth_headers(token),
             )
     except OAuthError as exc:
-        return f"Google OAuth error: {exc}. Re-run: python -m admino.oauth_setup google"
+        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
     except httpx.HTTPError as exc:
         return f"HTTP request failed during download: {type(exc).__name__}"
 

@@ -93,6 +93,19 @@ def _mock_get_pool(mock_pool: MagicMock | None = None) -> MagicMock:
     return MagicMock(return_value=mock_pool or MagicMock())
 
 
+def _conn_status(
+    *,
+    google: tuple[bool, bool] = (False, False),
+    microsoft: tuple[bool, bool] = (False, False),
+) -> Any:
+    """Build a fake get_connection_status returning (connected, healthy) per provider."""
+
+    def _side(_tokens_dir: Path, provider: str) -> tuple[bool, bool]:
+        return google if provider == "google" else microsoft
+
+    return _side
+
+
 # ---------------------------------------------------------------------------
 # GET /api/settings
 # ---------------------------------------------------------------------------
@@ -211,35 +224,47 @@ class TestGetSettings:
         with (
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_settings_from_db", _mock_load_settings()),
-            patch.object(Path, "exists", return_value=False),
+            patch("admino.server.get_connection_status", _conn_status()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/settings", headers=_AUTH_HEADER)
 
         body = resp.json()
         assert body["connected_accounts"]["google"]["connected"] is False
+        assert body["connected_accounts"]["google"]["healthy"] is False
         assert body["connected_accounts"]["microsoft"]["connected"] is False
+        assert body["connected_accounts"]["microsoft"]["healthy"] is False
 
     async def test_get_settings_connected_accounts_with_google_token(self) -> None:
-        """When google.json exists, google shows connected with services."""
+        """A healthy google token shows connected, healthy, and services."""
         app = _make_app()
-
-        def _exists_side_effect(self_path: Any = None) -> bool:
-            # Path.exists() is called on the Path instance directly
-            path_str = str(self_path) if self_path is not None else ""
-            return "google.json" in path_str
-
         with (
             patch("admino.database.get_pool", _mock_get_pool()),
             patch("admino.database.load_settings_from_db", _mock_load_settings()),
-            patch.object(Path, "exists", _exists_side_effect),
+            patch("admino.server.get_connection_status", _conn_status(google=(True, True))),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/api/settings", headers=_AUTH_HEADER)
 
         body = resp.json()
         assert body["connected_accounts"]["google"]["connected"] is True
+        assert body["connected_accounts"]["google"]["healthy"] is True
         assert "gmail" in body["connected_accounts"]["google"]["services"]
+
+    async def test_get_settings_expired_token_is_connected_but_unhealthy(self) -> None:
+        """An expired/revoked refresh token shows connected=True, healthy=False."""
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch("admino.server.get_connection_status", _conn_status(google=(True, False))),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        body = resp.json()
+        assert body["connected_accounts"]["google"]["connected"] is True
+        assert body["connected_accounts"]["google"]["healthy"] is False
 
 
 # ---------------------------------------------------------------------------
