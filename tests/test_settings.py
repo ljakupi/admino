@@ -38,7 +38,7 @@ _DEFAULT_DB_SETTINGS: dict[str, Any] = {
         "provider": "ollama",
         "model": "gemma4:e2b",
         "ollama_url": "http://local-llm:11434",
-        "anthropic_model": "claude-sonnet-4-20250514",
+        "anthropic_model": "claude-sonnet-4-6",
         "openai_model": "gpt-4o",
     },
     "appearance": {"theme": "light"},
@@ -122,6 +122,44 @@ class TestGetSettings:
         assert body["limits"]["max_tool_calls_per_message"] == 10
         assert body["server"]["host"] == "0.0.0.0"  # noqa: S104
         assert body["server"]["port"] == 8000
+
+    async def test_get_settings_anthropic_without_ollama_model_returns_200(self) -> None:
+        """GET must not 500 when inactive-provider models are unset.
+
+        On an anthropic deployment the ollama/openai models are None (no
+        hardcoded default), so SettingsLLM receives blank values for them.
+        The response must still validate and return 200.
+        """
+        from admino import server
+
+        app = _make_app()
+        server._config.llm.provider = "anthropic"
+        server._config.llm.model = None
+        server._config.llm.ollama_url = "http://local-llm:11434"
+        server._config.llm.anthropic_model = "claude-sonnet-4-6"
+        server._config.llm.openai_model = None
+
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "anthropic",
+            "model": None,
+            "ollama_url": "http://local-llm:11434",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": None,
+        }
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(db_settings)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["llm"]["provider"] == "anthropic"
+        assert body["llm"]["anthropic_model"] == "claude-sonnet-4-6"
+        assert body["llm"]["model"] == ""
+        assert body["llm"]["openai_model"] == ""
 
     async def test_get_settings_masks_api_keys_when_not_set(self) -> None:
         """API key fields are boolean flags, not actual values. False when unset."""

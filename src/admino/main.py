@@ -224,6 +224,7 @@ async def _async_startup(
         run_migrations,
         seed_permissions,
         seed_settings,
+        update_setting,
     )
 
     database_url = _build_database_url()
@@ -245,6 +246,12 @@ async def _async_startup(
     await run_migrations(pool)
     await seed_settings(pool, config)
     await seed_permissions(pool, permissions_config)
+
+    # config.yaml is authoritative for the LLM section on every boot. The
+    # settings table is only seeded once (when empty), so without this the DB
+    # would keep a stale provider/model after config.yaml is edited. Re-apply
+    # the validated llm section from config.yaml so edits always take effect.
+    await update_setting(pool, "llm", config.llm.model_dump(mode="json"))
 
     db_config = await load_app_config_from_db(pool)
     db_permissions = await load_permissions_config_from_db(pool)
