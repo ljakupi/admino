@@ -160,7 +160,9 @@ async def outlook_read(args: OutlookReadArgs, **kwargs: object) -> str:
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     url = (
         f"{_GRAPH_BASE}/me/messages/{args.message_id}"
@@ -220,7 +222,9 @@ async def outlook_list(args: OutlookListArgs, **kwargs: object) -> str:
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     url = (
         f"{_GRAPH_BASE}/me/messages"
@@ -276,7 +280,9 @@ async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     # $search uses KQL syntax; the query is wrapped in double quotes in the URL.
     # Escape double-quotes and backslashes to prevent KQL injection / OData
@@ -392,7 +398,9 @@ async def outlook_send(args: OutlookSendArgs, **kwargs: object) -> str:
     try:
         token = await _get_microsoft_token()
     except OAuthError as exc:
-        return f"Microsoft OAuth error: {exc}. Re-run: python -m admino.oauth_setup microsoft"
+        return (
+            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
+        )
 
     payload = _build_sendmail_payload(args)
 

@@ -264,7 +264,7 @@ class TestGetValidAccessToken:
     async def test_no_token_file_raises(self, tmp_path: Path) -> None:
         """No token file on disk raises OAuthError."""
         mock_client = AsyncMock(spec=httpx.AsyncClient)
-        with pytest.raises(OAuthError, match="No google OAuth token file"):
+        with pytest.raises(OAuthError, match="No google account is connected"):
             await get_valid_access_token(tmp_path, "google", None, None, mock_client)
 
     async def test_none_cached_triggers_refresh(
@@ -997,7 +997,7 @@ class TestRefreshMicrosoftToken:
     async def test_no_microsoft_token_file_raises(self, tmp_path: Path) -> None:
         """No Microsoft token file on disk raises OAuthError."""
         mock_client = AsyncMock(spec=httpx.AsyncClient)
-        with pytest.raises(OAuthError, match="No microsoft OAuth token file"):
+        with pytest.raises(OAuthError, match="No microsoft account is connected"):
             await get_valid_access_token(tmp_path, "microsoft", None, None, mock_client)
 
     async def test_microsoft_refresh_http_error_raises(
