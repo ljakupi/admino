@@ -232,8 +232,18 @@ class Agent:
 
         tool_records: list[ToolCallRecord] = []
         tool_calls_used: int = 0
+        # GH-77: Advertise only tools the permission engine would NOT deny.
+        # Passing permissions + promoted state here (the same values forwarded
+        # to dispatch) drops hardcoded-denied and un-promoted tier-2 actions
+        # from the tool list, so the LLM cannot substitute a sibling action
+        # for an unavailable one. The agent still never imports check_permission
+        # itself — it only forwards PermissionsConfig, preserving the boundary.
         tools_payload: list[dict[str, object]] = _tool_descriptions_to_payload(
-            get_registered_tools(enabled_tools=self._tools_enabled or None)
+            get_registered_tools(
+                enabled_tools=self._tools_enabled or None,
+                permissions_config=self._permissions,
+                promoted=self._promoted,
+            )
         )
         # Carry a one-shot pending_confirmation that is applied to the FIRST
         # dispatch only, then cleared. This matches the server contract:

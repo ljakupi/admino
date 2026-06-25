@@ -115,7 +115,10 @@ def _import_tool_modules() -> None:
             raise
 
 
-def _build_system_prompt(config: object) -> str:
+def _build_system_prompt(
+    config: object,
+    permissions_config: PermissionsConfig | None = None,
+) -> str:
     """Build a system prompt from the validated application config.
 
     Tells the LLM which file paths it can access so it doesn't have to
@@ -123,6 +126,12 @@ def _build_system_prompt(config: object) -> str:
 
     Args:
         config: Validated AppConfig instance.
+        permissions_config: When provided, the advertised tool summary is
+            filtered through the permission engine so it lists only actions
+            the agent can actually take (GH-77).  This keeps the summary
+            consistent with the permission-aware tool payload sent each turn
+            and avoids presenting hardcoded-denied or un-promoted actions as
+            available — which could otherwise invite tool substitution.
 
     Returns:
         A system prompt string, or empty string if nothing meaningful to say.
@@ -134,11 +143,12 @@ def _build_system_prompt(config: object) -> str:
 
     from admino.tools.registry import get_registered_tools
 
-    # Build a dynamic tool summary from the registry so the LLM knows
-    # about ALL registered tools, not a hardcoded subset. Tools are
-    # grouped by name with their actions listed.
+    # Build a dynamic tool summary from the registry so the LLM knows which
+    # tools are available, grouped by name with their actions listed. When a
+    # permissions config is supplied the list is permission-aware: denied and
+    # un-promoted actions are excluded so it matches the per-turn tool payload.
     tool_actions: dict[str, list[str]] = {}
-    for desc in get_registered_tools():
+    for desc in get_registered_tools(permissions_config=permissions_config):
         tool_actions.setdefault(desc.tool, []).append(desc.action)
     tool_summary = ", ".join(
         f"{name} ({'/'.join(sorted(actions))})" for name, actions in sorted(tool_actions.items())
@@ -154,6 +164,16 @@ def _build_system_prompt(config: object) -> str:
         "attempt the tool call when the user asks — never refuse based on earlier "
         "denials in the conversation. The permission engine will re-evaluate each "
         "call independently.",
+        "",
+        "CRITICAL — never substitute a different tool or action for the one the "
+        "user actually requested. If the exact capability the user asked for is "
+        "not available to you (not in your tool list, disabled, or not permitted), "
+        "STOP and tell the user that action is not available and why — for example, "
+        "that it needs to be enabled or promoted in Critical Permissions. Do NOT "
+        "approximate the request with a different tool. This is absolute for "
+        "mutating actions: never turn an update into a create, a move into an "
+        "overwrite, or send to a different recipient/channel. A duplicate or wrong "
+        "write is worse than doing nothing.",
         "",
     ]
 
@@ -391,7 +411,7 @@ def main(
     # ------------------------------------------------------------------
     from admino.agent import Agent
 
-    system_prompt = _build_system_prompt(config)
+    system_prompt = _build_system_prompt(config, permissions_config)
 
     agent = Agent(
         llm_client=llm_client,

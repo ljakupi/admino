@@ -1860,3 +1860,127 @@ class TestToolEnabledGating:
         )
         assert result.success is False
         assert "disabled" in result.result.lower()
+
+
+# ---------------------------------------------------------------------------
+# 34. Permission-aware tool exposure (GH-77)
+# ---------------------------------------------------------------------------
+
+
+def _register_substitution_tools() -> None:
+    """Register a realistic mix exercising every permission decision branch.
+
+    - google_calendar.read   -> allow (config)
+    - google_calendar.create -> confirm (config)
+    - google_calendar.update -> promotable-deny (PROMOTABLE_DENIALS)
+    - gmail.read             -> allow (config)
+    - gmail.delete           -> immutable-deny (IMMUTABLE_DENIALS)
+    """
+    register_tool("google_calendar", "read", "Read events", SampleArgs)(sample_handler)
+    register_tool("google_calendar", "create", "Create event", SampleArgs)(sample_handler)
+    register_tool("google_calendar", "update", "Update event", SampleArgs)(sample_handler)
+    register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
+    register_tool("gmail", "delete", "Delete email", SampleArgs)(sample_handler)
+
+
+def _substitution_config() -> PermissionsConfig:
+    """Config matching the tools registered by _register_substitution_tools."""
+    return PermissionsConfig(
+        tools={
+            "google_calendar": ToolPermissions(
+                actions={"read": "allow", "create": "confirm"},
+            ),
+            "gmail": ToolPermissions(actions={"read": "allow"}),
+        }
+    )
+
+
+class TestGetRegisteredToolsPermissionAware:
+    """get_registered_tools(permissions_config=...) excludes denied tools.
+
+    Defence-in-depth for GH-77: when the user asks for an action that is
+    unavailable (immutable-deny, promotable-deny-not-promoted, or default
+    deny), the LLM must never even see a sibling action it can substitute.
+    """
+
+    def test_get_registered_tools_permission_aware_keeps_allow_and_confirm(self) -> None:
+        """allow and confirm actions remain; deny actions are excluded."""
+        _register_substitution_tools()
+        result = get_registered_tools(permissions_config=_substitution_config())
+        keys = {(t.tool, t.action) for t in result}
+        assert keys == {
+            ("google_calendar", "read"),
+            ("google_calendar", "create"),
+            ("gmail", "read"),
+        }
+
+    def test_get_registered_tools_excludes_immutable_deny(self) -> None:
+        """An immutable-deny action (gmail.delete) is never exposed."""
+        _register_substitution_tools()
+        result = get_registered_tools(permissions_config=_substitution_config())
+        keys = {(t.tool, t.action) for t in result}
+        assert ("gmail", "delete") not in keys
+
+    def test_get_registered_tools_excludes_promotable_deny_when_not_promoted(self) -> None:
+        """A promotable-deny action is excluded when not in the promoted set."""
+        _register_substitution_tools()
+        result = get_registered_tools(permissions_config=_substitution_config())
+        keys = {(t.tool, t.action) for t in result}
+        assert ("google_calendar", "update") not in keys
+
+    def test_get_registered_tools_includes_promotable_deny_when_promoted(self) -> None:
+        """A promotable-deny action IS exposed (as confirm) once promoted."""
+        _register_substitution_tools()
+        result = get_registered_tools(
+            permissions_config=_substitution_config(),
+            promoted=frozenset({("google_calendar", "update")}),
+        )
+        keys = {(t.tool, t.action) for t in result}
+        assert ("google_calendar", "update") in keys
+
+    def test_get_registered_tools_promotion_does_not_expose_immutable_deny(self) -> None:
+        """Promoting an immutable-deny pair has no effect — still excluded."""
+        _register_substitution_tools()
+        result = get_registered_tools(
+            permissions_config=_substitution_config(),
+            promoted=frozenset({("gmail", "delete")}),
+        )
+        keys = {(t.tool, t.action) for t in result}
+        assert ("gmail", "delete") not in keys
+
+    def test_get_registered_tools_excludes_default_deny_unlisted(self) -> None:
+        """An action absent from config (default-deny) is excluded."""
+        register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
+        register_tool("gmail", "list", "List emails", SampleArgs)(sample_handler)
+        # Config lists only gmail.read; gmail.list defaults to deny.
+        config = PermissionsConfig(tools={"gmail": ToolPermissions(actions={"read": "allow"})})
+        result = get_registered_tools(permissions_config=config)
+        keys = {(t.tool, t.action) for t in result}
+        assert keys == {("gmail", "read")}
+
+    def test_get_registered_tools_no_permissions_config_unchanged(self) -> None:
+        """Omitting permissions_config returns all enabled tools (backward compat)."""
+        _register_substitution_tools()
+        result = get_registered_tools()
+        keys = {(t.tool, t.action) for t in result}
+        assert keys == {
+            ("google_calendar", "read"),
+            ("google_calendar", "create"),
+            ("google_calendar", "update"),
+            ("gmail", "read"),
+            ("gmail", "delete"),
+        }
+
+    def test_get_registered_tools_enabled_and_permission_filter_compose(self) -> None:
+        """enabled_tools and permissions_config filters compose together."""
+        _register_substitution_tools()
+        result = get_registered_tools(
+            enabled_tools={"gmail": False},
+            permissions_config=_substitution_config(),
+        )
+        keys = {(t.tool, t.action) for t in result}
+        # gmail.* removed by enabled filter; calendar deny removed by permission filter.
+        assert keys == {
+            ("google_calendar", "read"),
+            ("google_calendar", "create"),
+        }

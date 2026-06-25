@@ -650,16 +650,32 @@ async def dispatch_tool_call(
 def get_registered_tools(
     *,
     enabled_tools: dict[str, bool] | None = None,
+    permissions_config: PermissionsConfig | None = None,
+    promoted: frozenset[tuple[str, str]] = frozenset(),
 ) -> list[ToolDescription]:
     """Return metadata for registered tools, optionally filtered by enabled state.
 
     Used to build the ``tools`` array in the LLM ``/api/chat`` request so
     the LLM knows which tools are available and their parameter schemas.
 
+    Security (GH-77): when ``permissions_config`` is supplied, any (tool, action)
+    the permission engine would ``deny`` is EXCLUDED from the advertised list.
+    This makes tool exposure permission-aware so the LLM never sees — and thus
+    cannot substitute — an action that is hardcoded-denied or a tier-2
+    promotable action that has not yet been promoted.  ``allow`` and ``confirm``
+    actions remain advertised.  When ``permissions_config`` is None the result
+    is unchanged (module-enablement filtering only), preserving prior callers.
+
     Args:
         enabled_tools: When provided, tools whose name maps to ``False``
             are excluded.  Missing keys default to enabled for backward
             compatibility.
+        permissions_config: When provided, tools whose (tool, action) the
+            permission engine denies are excluded.  ``promoted`` is forwarded
+            to the engine so promoted tier-2 actions surface as ``confirm``.
+        promoted: Set of (tool, action) pairs promoted from tier-2 deny to
+            confirm via the Critical Permissions API.  Only consulted when
+            ``permissions_config`` is supplied.
 
     Returns:
         A list of ``ToolDescription`` models sorted by (tool, action).
@@ -668,6 +684,12 @@ def get_registered_tools(
     for _key, entry in sorted(_REGISTRY.items()):
         if enabled_tools is not None and enabled_tools.get(entry.tool) is False:
             continue
+        if permissions_config is not None:
+            decision = check_permission(
+                entry.tool, entry.action, permissions_config, promoted=promoted
+            )
+            if decision.allowed == "deny":
+                continue
         schema = entry.args_schema.model_json_schema()
         descriptions.append(
             ToolDescription(
