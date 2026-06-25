@@ -120,6 +120,12 @@ export interface ServerSettings {
 
 export interface OAuthAccountInfo {
   connected: boolean;
+  /**
+   * True when the stored refresh token is still believed valid. A connected
+   * but unhealthy account (dead/revoked refresh token) is shown as "Not
+   * connected" — see `effectivelyConnected` on the Tools page.
+   */
+  healthy: boolean;
   email: string | null;
   services: string[];
 }

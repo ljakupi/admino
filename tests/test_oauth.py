@@ -29,6 +29,7 @@ from admino.oauth import (
     MICROSOFT_AUTH_ENDPOINT,
     MICROSOFT_SCOPES,
     OAuthError,
+    OAuthRefreshError,
     TokenFile,
     _get_client_credentials,
     _get_fernet,
@@ -40,6 +41,7 @@ from admino.oauth import (
     encrypt_refresh_token,
     exchange_code,
     exchange_microsoft_code,
+    get_connection_status,
     get_valid_access_token,
     load_token,
     save_token,
@@ -262,7 +264,7 @@ class TestGetValidAccessToken:
     async def test_no_token_file_raises(self, tmp_path: Path) -> None:
         """No token file on disk raises OAuthError."""
         mock_client = AsyncMock(spec=httpx.AsyncClient)
-        with pytest.raises(OAuthError, match="No google OAuth token file"):
+        with pytest.raises(OAuthError, match="No google account is connected"):
             await get_valid_access_token(tmp_path, "google", None, None, mock_client)
 
     async def test_none_cached_triggers_refresh(
@@ -995,7 +997,7 @@ class TestRefreshMicrosoftToken:
     async def test_no_microsoft_token_file_raises(self, tmp_path: Path) -> None:
         """No Microsoft token file on disk raises OAuthError."""
         mock_client = AsyncMock(spec=httpx.AsyncClient)
-        with pytest.raises(OAuthError, match="No microsoft OAuth token file"):
+        with pytest.raises(OAuthError, match="No microsoft account is connected"):
             await get_valid_access_token(tmp_path, "microsoft", None, None, mock_client)
 
     async def test_microsoft_refresh_http_error_raises(
@@ -1261,3 +1263,196 @@ class TestGoogleRefreshExpiresInEdgeCases:
         assert token == "token-zero-expiry"
         expected_min = datetime.now(UTC) + timedelta(seconds=3500)
         assert expires > expected_min
+
+
+# ---------------------------------------------------------------------------
+# 21. Invalid-token marking (reconnect-required state) — GH-36 / GH-64
+# ---------------------------------------------------------------------------
+
+
+class TestTokenFileInvalidField:
+    """The TokenFile model carries an `invalid` flag, defaulting to False."""
+
+    def test_invalid_defaults_to_false(self, sample_token_file: TokenFile) -> None:
+        """A freshly constructed TokenFile is not flagged invalid."""
+        assert sample_token_file.invalid is False
+
+    def test_legacy_token_file_without_invalid_loads_as_false(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """A token file written before the field existed loads with invalid=False."""
+        save_token(tmp_path, sample_token_file)
+        path = tmp_path / "google.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("invalid", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        reloaded = load_token(tmp_path)
+        assert reloaded is not None
+        assert reloaded.invalid is False
+
+
+@pytest.mark.usefixtures("google_env")
+class TestTerminalRefreshMarksInvalid:
+    """A terminal (invalid_grant) refresh failure persists invalid=True."""
+
+    async def test_invalid_grant_raises_terminal_refresh_error(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """A 400 invalid_grant refresh failure raises a terminal OAuthRefreshError."""
+        save_token(tmp_path, sample_token_file)
+        response = _make_httpx_response(400, {"error": "invalid_grant"})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.return_value = response
+
+        with pytest.raises(OAuthRefreshError) as exc_info:
+            await get_valid_access_token(tmp_path, "google", None, None, mock_client)
+        assert exc_info.value.terminal is True
+
+    async def test_invalid_grant_persists_invalid_flag_on_disk(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """After a terminal refresh failure the token file is flagged invalid=True."""
+        save_token(tmp_path, sample_token_file)
+        response = _make_httpx_response(400, {"error": "invalid_grant"})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.return_value = response
+
+        with pytest.raises(OAuthRefreshError):
+            await get_valid_access_token(tmp_path, "google", None, None, mock_client)
+
+        reloaded = load_token(tmp_path)
+        assert reloaded is not None
+        assert reloaded.invalid is True
+
+    async def test_microsoft_invalid_grant_persists_invalid_flag(
+        self,
+        tmp_path: Path,
+        microsoft_token_file: TokenFile,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Microsoft terminal refresh failure also flags the token invalid."""
+        monkeypatch.setenv("MICROSOFT_CLIENT_ID", _TEST_MS_CLIENT_ID)
+        monkeypatch.setenv("MICROSOFT_CLIENT_SECRET", _TEST_MS_CLIENT_SECRET)
+        save_token(tmp_path, microsoft_token_file)
+        response = _make_httpx_response(400, {"error": "invalid_grant"})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.return_value = response
+
+        with pytest.raises(OAuthRefreshError):
+            await get_valid_access_token(tmp_path, "microsoft", None, None, mock_client)
+
+        reloaded = load_token(tmp_path, "microsoft")
+        assert reloaded is not None
+        assert reloaded.invalid is True
+
+
+@pytest.mark.usefixtures("google_env")
+class TestTransientRefreshDoesNotMarkInvalid:
+    """Transient failures (network, 5xx) must NOT flag the token invalid."""
+
+    async def test_http_error_does_not_mark_invalid(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """A network error during refresh leaves invalid=False."""
+        save_token(tmp_path, sample_token_file)
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.side_effect = httpx.ConnectError("connection failed")
+
+        with pytest.raises(OAuthError):
+            await get_valid_access_token(tmp_path, "google", None, None, mock_client)
+
+        reloaded = load_token(tmp_path)
+        assert reloaded is not None
+        assert reloaded.invalid is False
+
+    async def test_server_error_does_not_mark_invalid(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """A 503 from the token endpoint is transient and leaves invalid=False."""
+        save_token(tmp_path, sample_token_file)
+        response = _make_httpx_response(503, {"error": "temporarily_unavailable"})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.return_value = response
+
+        with pytest.raises(OAuthError) as exc_info:
+            await get_valid_access_token(tmp_path, "google", None, None, mock_client)
+        if isinstance(exc_info.value, OAuthRefreshError):
+            assert exc_info.value.terminal is False
+
+        reloaded = load_token(tmp_path)
+        assert reloaded is not None
+        assert reloaded.invalid is False
+
+
+@pytest.mark.usefixtures("google_env")
+class TestSuccessfulRefreshClearsInvalid:
+    """A successful refresh clears a previously-set invalid flag (recovery)."""
+
+    async def test_successful_refresh_resets_invalid_to_false(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """If a token was flagged invalid, a later successful refresh clears it."""
+        sample_token_file.invalid = True
+        save_token(tmp_path, sample_token_file)
+        response = _make_httpx_response(200, {"access_token": "ok", "expires_in": 3600})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.return_value = response
+
+        token, _ = await get_valid_access_token(tmp_path, "google", None, None, mock_client)
+        assert token == "ok"
+
+        reloaded = load_token(tmp_path)
+        assert reloaded is not None
+        assert reloaded.invalid is False
+
+
+@pytest.mark.usefixtures("microsoft_env")
+class TestMicrosoftTransientRefresh:
+    """Non-invalid_grant Microsoft refresh failures are transient, not terminal."""
+
+    async def test_microsoft_transient_error_is_not_terminal(
+        self, tmp_path: Path, microsoft_token_file: TokenFile
+    ) -> None:
+        """A 503 from the Microsoft token endpoint raises a non-terminal error."""
+        save_token(tmp_path, microsoft_token_file)
+        response = _make_httpx_response(503, {"error": "temporarily_unavailable"})
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        mock_client.post.return_value = response
+
+        with pytest.raises(OAuthRefreshError) as exc_info:
+            await get_valid_access_token(tmp_path, "microsoft", None, None, mock_client)
+        assert exc_info.value.terminal is False
+
+        reloaded = load_token(tmp_path, "microsoft")
+        assert reloaded is not None
+        assert reloaded.invalid is False
+
+
+class TestGetConnectionStatus:
+    """get_connection_status reports (connected, healthy) from local state only."""
+
+    def test_no_token_file_is_not_connected(self, tmp_path: Path) -> None:
+        """No token file → (False, False)."""
+        assert get_connection_status(tmp_path, "google") == (False, False)
+
+    def test_valid_token_is_connected_and_healthy(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """A token file that is not flagged invalid → (True, True)."""
+        save_token(tmp_path, sample_token_file)
+        assert get_connection_status(tmp_path, "google") == (True, True)
+
+    def test_invalid_token_is_connected_but_unhealthy(
+        self, tmp_path: Path, sample_token_file: TokenFile
+    ) -> None:
+        """A token file flagged invalid → (True, False)."""
+        sample_token_file.invalid = True
+        save_token(tmp_path, sample_token_file)
+        assert get_connection_status(tmp_path, "google") == (True, False)
+
+    def test_corrupt_token_file_is_connected_but_unhealthy(self, tmp_path: Path) -> None:
+        """An unparseable token file → (True, False) so the UI prompts reconnect."""
+        path = tmp_path / "google.json"
+        path.write_text("not valid json{{{", encoding="utf-8")
+        assert get_connection_status(tmp_path, "google") == (True, False)
