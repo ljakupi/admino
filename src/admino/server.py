@@ -94,6 +94,7 @@ from admino.oauth import (
     encrypt_refresh_token,
     exchange_google_code,
     exchange_microsoft_code,
+    get_connection_status,
     get_google_user_email,
     revoke_and_delete_token,
     save_token,
@@ -915,19 +916,23 @@ async def _build_settings_response() -> SettingsResponse:
         port=server_data.get("port", _config.server.port),
     )
 
-    # Connected accounts — check token file existence.
+    # Connected accounts — report connection AND health (a dead refresh token
+    # is connected-but-unhealthy, which the UI renders as "Not connected").
+    # get_connection_status reads only local state, so it never blocks load.
     connected = SettingsConnectedAccounts()
     tokens_dir = _config.paths.tokens_dir
-    google_token = tokens_dir / "google.json"
-    microsoft_token = tokens_dir / "microsoft.json"
-    if google_token.exists():
+    google_connected, google_healthy = get_connection_status(tokens_dir, "google")
+    microsoft_connected, microsoft_healthy = get_connection_status(tokens_dir, "microsoft")
+    if google_connected:
         connected.google = OAuthConnectionStatus(
             connected=True,
+            healthy=google_healthy,
             services=["gmail", "google_calendar", "google_drive"],
         )
-    if microsoft_token.exists():
+    if microsoft_connected:
         connected.microsoft = OAuthConnectionStatus(
             connected=True,
+            healthy=microsoft_healthy,
             services=["outlook", "outlook_calendar", "onedrive"],
         )
 

@@ -106,8 +106,8 @@ export const useSettingsStore = defineStore('settings', () => {
 
   // Connected accounts
   const connectedAccounts = ref<ConnectedAccounts>({
-    google: { connected: false, email: null, services: [] },
-    microsoft: { connected: false, email: null, services: [] },
+    google: { connected: false, healthy: false, email: null, services: [] },
+    microsoft: { connected: false, healthy: false, email: null, services: [] },
   });
 
   // Tools enabled state

@@ -99,6 +99,18 @@ function onLocalToolToggle(toolId: keyof ToolsSettings, enabled: boolean) {
   settings.setToolEnabled(toolId, enabled);
 }
 
+// --- Effective connection state ---
+// A connected-but-unhealthy account (dead/revoked refresh token) is treated
+// the same as not connected: it shows the grey "Not connected" pill and a
+// "Connect" button, never a "Reconnect" button. Two states only.
+const googleConnected = computed(
+  () => settings.connectedAccounts.google.connected && settings.connectedAccounts.google.healthy,
+);
+const microsoftConnected = computed(
+  () =>
+    settings.connectedAccounts.microsoft.connected && settings.connectedAccounts.microsoft.healthy,
+);
+
 // --- OAuth connect/disconnect ---
 function connectGoogle() {
   settings.connectGoogle();
@@ -140,22 +152,19 @@ async function confirmDisconnect() {
           </div>
 
           <!-- Google card -->
-          <div class="provider-card" :class="{ connected: settings.connectedAccounts.google.connected }">
+          <div class="provider-card" :class="{ connected: googleConnected }">
             <div class="provider-head">
               <div class="provider-logo google">G</div>
               <div class="provider-info">
                 <div class="provider-title">
                   Google
-                  <span
-                    class="pill"
-                    :class="settings.connectedAccounts.google.connected ? 'leaf' : 'amber'"
-                  >
+                  <span class="pill" :class="googleConnected ? 'leaf' : 'amber'">
                     <span class="pill-dot" />
-                    {{ settings.connectedAccounts.google.connected ? 'Connected' : 'Not connected' }}
+                    {{ googleConnected ? 'Connected' : 'Not connected' }}
                   </span>
                 </div>
                 <div class="provider-meta">
-                  <template v-if="settings.connectedAccounts.google.connected">
+                  <template v-if="googleConnected">
                     {{ settings.connectedAccounts.google.email }}
                   </template>
                   <template v-else>
@@ -164,17 +173,20 @@ async function confirmDisconnect() {
                 </div>
               </div>
               <div class="provider-actions">
-                <template v-if="settings.connectedAccounts.google.connected">
-                  <button class="s-btn secondary small" @click="connectGoogle">Reconnect</button>
-                  <button class="s-btn danger small" @click="disconnectTarget = 'google'">Disconnect</button>
-                </template>
+                <button
+                  v-if="googleConnected"
+                  class="s-btn danger small"
+                  @click="disconnectTarget = 'google'"
+                >
+                  Disconnect
+                </button>
                 <button v-else class="s-btn primary small" @click="connectGoogle">
                   <Link :size="13" :stroke-width="2" />
                   Connect
                 </button>
               </div>
             </div>
-            <div v-if="settings.connectedAccounts.google.connected" class="provider-services">
+            <div v-if="googleConnected" class="provider-services">
               <div v-for="svc in googleServices" :key="svc.id" class="service-row">
                 <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
@@ -189,22 +201,19 @@ async function confirmDisconnect() {
           </div>
 
           <!-- Microsoft card -->
-          <div class="provider-card" :class="{ connected: settings.connectedAccounts.microsoft.connected }">
+          <div class="provider-card" :class="{ connected: microsoftConnected }">
             <div class="provider-head">
               <div class="provider-logo microsoft">M</div>
               <div class="provider-info">
                 <div class="provider-title">
                   Microsoft
-                  <span
-                    class="pill"
-                    :class="settings.connectedAccounts.microsoft.connected ? 'leaf' : 'amber'"
-                  >
+                  <span class="pill" :class="microsoftConnected ? 'leaf' : 'amber'">
                     <span class="pill-dot" />
-                    {{ settings.connectedAccounts.microsoft.connected ? 'Connected' : 'Not connected' }}
+                    {{ microsoftConnected ? 'Connected' : 'Not connected' }}
                   </span>
                 </div>
                 <div class="provider-meta">
-                  <template v-if="settings.connectedAccounts.microsoft.connected">
+                  <template v-if="microsoftConnected">
                     {{ settings.connectedAccounts.microsoft.email }}
                   </template>
                   <template v-else>
@@ -213,17 +222,20 @@ async function confirmDisconnect() {
                 </div>
               </div>
               <div class="provider-actions">
-                <template v-if="settings.connectedAccounts.microsoft.connected">
-                  <button class="s-btn secondary small" @click="connectMicrosoft">Reconnect</button>
-                  <button class="s-btn danger small" @click="disconnectTarget = 'microsoft'">Disconnect</button>
-                </template>
+                <button
+                  v-if="microsoftConnected"
+                  class="s-btn danger small"
+                  @click="disconnectTarget = 'microsoft'"
+                >
+                  Disconnect
+                </button>
                 <button v-else class="s-btn primary small" @click="connectMicrosoft">
                   <Link :size="13" :stroke-width="2" />
                   Connect
                 </button>
               </div>
             </div>
-            <div v-if="settings.connectedAccounts.microsoft.connected" class="provider-services">
+            <div v-if="microsoftConnected" class="provider-services">
               <div v-for="svc in microsoftServices" :key="svc.id" class="service-row">
                 <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
