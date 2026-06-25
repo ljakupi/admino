@@ -76,7 +76,9 @@ class OllamaConfig(BaseModel):
     """
 
     url: str = Field(default="http://local-llm:11434", max_length=500)
-    model: str = Field(default="gemma4:e2b", max_length=200)
+    # No hardcoded model default — the model is always supplied from the
+    # validated LLMConfig (config.yaml) via ``to_ollama_config``.
+    model: str = Field(max_length=200)
     timeout_s: int = Field(default=120, ge=1, le=600)
 
 
@@ -111,10 +113,10 @@ class LLMConfig(BaseModel):
         pattern=r"^https?://",
         description="Base URL for the Ollama API.",
     )
-    model: str = Field(
-        default="gemma4:e2b",
+    model: str | None = Field(
+        default=None,
         max_length=200,
-        description="Model name to request from Ollama.",
+        description="Model name to request from Ollama (required when provider=ollama).",
     )
     timeout_s: int = Field(
         default=120,
@@ -124,17 +126,20 @@ class LLMConfig(BaseModel):
     )
 
     # -- Anthropic settings (used when provider=anthropic) --
-    anthropic_model: str = Field(
-        default="claude-sonnet-4-20250514",
+    # No hardcoded default: the model ID must come from config.yaml so that a
+    # stale or retired ID can never be silently substituted. Missing/empty
+    # values for the active provider fail validation (see below).
+    anthropic_model: str | None = Field(
+        default=None,
         max_length=200,
-        description="Anthropic model ID (e.g. claude-sonnet-4-20250514).",
+        description="Anthropic model ID, e.g. claude-sonnet-4-6 (required for provider=anthropic).",
     )
 
     # -- OpenAI settings (used when provider=openai) --
-    openai_model: str = Field(
-        default="gpt-4o",
+    openai_model: str | None = Field(
+        default=None,
         max_length=200,
-        description="OpenAI model ID (e.g. gpt-4o).",
+        description="OpenAI model ID, e.g. gpt-4o (required when provider=openai).",
     )
 
     # -- Shared settings for proprietary providers --
@@ -178,8 +183,14 @@ class LLMConfig(BaseModel):
 
     @field_validator("model", "anthropic_model", "openai_model")
     @classmethod
-    def validate_model_name(cls, v: str) -> str:
-        """Reject model names containing shell metacharacters or control chars."""
+    def validate_model_name(cls, v: str | None) -> str | None:
+        """Reject model names containing shell metacharacters or control chars.
+
+        ``None``/empty are allowed here (the field is unset); presence for the
+        active provider is enforced in ``validate_provider_requirements``.
+        """
+        if not v:
+            return v
         if not re.match(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$", v):
             msg = "LLMConfig model field contains invalid characters."
             raise ValueError(msg)
@@ -198,6 +209,12 @@ class LLMConfig(BaseModel):
                     "Set the API key or switch to llm.provider: 'ollama'."
                 )
                 raise ValueError(msg)
+            if not self.anthropic_model:
+                msg = (
+                    "llm.provider is 'anthropic' but llm.anthropic_model is not set. "
+                    "Set the model ID in config.yaml (e.g. claude-sonnet-4-6)."
+                )
+                raise ValueError(msg)
             logger.warning(
                 "LLM provider is 'anthropic' — user messages and tool results "
                 "will be sent to Anthropic's servers. Ensure you accept this trade-off."
@@ -209,26 +226,46 @@ class LLMConfig(BaseModel):
                     "Set the API key or switch to llm.provider: 'ollama'."
                 )
                 raise ValueError(msg)
+            if not self.openai_model:
+                msg = (
+                    "llm.provider is 'openai' but llm.openai_model is not set. "
+                    "Set the model ID in config.yaml (e.g. gpt-4o)."
+                )
+                raise ValueError(msg)
             logger.warning(
                 "LLM provider is 'openai' — user messages and tool results "
                 "will be sent to OpenAI's servers. Ensure you accept this trade-off."
             )
+        # For ollama, the model is validated lazily: ``active_model_name`` (used
+        # when the client is built) raises a clear error if it is missing, so a
+        # config without an ollama model fails gracefully at client creation.
         return self
 
     @property
     def active_model_name(self) -> str:
-        """Return the model name for the currently configured provider."""
-        if self.provider == "anthropic":
-            return self.anthropic_model
-        if self.provider == "openai":
-            return self.openai_model
-        return self.model
+        """Return the model name for the currently configured provider.
+
+        The active provider's model is guaranteed non-empty by
+        ``validate_provider_requirements``; this raises defensively if that
+        invariant is ever violated.
+        """
+        name = (
+            self.anthropic_model
+            if self.provider == "anthropic"
+            else self.openai_model
+            if self.provider == "openai"
+            else self.model
+        )
+        if not name:
+            msg = f"No model configured for llm.provider '{self.provider}'."
+            raise ValueError(msg)
+        return name
 
     def to_ollama_config(self) -> OllamaConfig:
         """Extract Ollama-specific settings for the OllamaClient."""
         return OllamaConfig(
             url=self.ollama_url,
-            model=self.model,
+            model=self.active_model_name,
             timeout_s=self.timeout_s,
         )
 

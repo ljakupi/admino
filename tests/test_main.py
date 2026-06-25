@@ -767,6 +767,7 @@ class TestAsyncStartup:
         monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
         monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
         monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
         monkeypatch.setattr(
             "admino.config.load_app_config_from_db", AsyncMock(return_value=mock_db_config)
         )
@@ -776,6 +777,37 @@ class TestAsyncStartup:
 
         result = await _async_startup(MagicMock(), MagicMock())
         assert result == (mock_db_config, mock_db_perms)
+
+    @pytest.mark.asyncio
+    async def test_reapplies_llm_section_from_config_on_boot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config.yaml is authoritative: the llm settings row is overwritten from
+        config on every boot, so editing config.yaml always takes effect."""
+        monkeypatch.setenv("PG_PASSWORD", "testpass")
+        mock_pool = AsyncMock()
+        mock_update = AsyncMock()
+
+        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
+        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr("admino.database.update_setting", mock_update)
+        monkeypatch.setattr(
+            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(
+            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+
+        config = MagicMock()
+        llm_dump = {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"}
+        config.llm.model_dump.return_value = llm_dump
+
+        await _async_startup(config, MagicMock())
+
+        mock_update.assert_awaited_once_with(mock_pool, "llm", llm_dump)
 
     @pytest.mark.asyncio
     async def test_calls_init_pool_with_config_values(
@@ -789,6 +821,7 @@ class TestAsyncStartup:
         monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
         monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
         monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
         monkeypatch.setattr(
             "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
         )
