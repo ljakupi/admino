@@ -248,7 +248,13 @@ async def google_drive_list(args: GoogleDriveListArgs, **kwargs: object) -> str:
     Returns:
         Formatted list of files in the folder.
     """
-    parent = f"'{args.folder_id}'" if args.folder_id else "'root'"
+    if args.folder_id:
+        # Model-level pattern validation rejects single quotes and backslashes.
+        # Defence-in-depth: escape any that slip through.
+        safe_folder_id = args.folder_id.replace("\\", "\\\\").replace("'", "\\'")
+        parent = f"'{safe_folder_id}'"
+    else:
+        parent = "'root'"
     query = f"{parent} in parents"
     fields = "files(id,name,mimeType,size,modifiedTime)"
 

@@ -230,6 +230,27 @@ class TestDriveList:
         params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params", {})
         assert "'folder_abc' in parents" in params.get("q", "")
 
+    async def test_folder_id_single_quote_escaped_in_query(self, mock_http: AsyncMock) -> None:
+        """folder_id single quotes are escaped before embedding in the q param.
+
+        Defence-in-depth: the model pattern rejects quotes at the Pydantic layer,
+        so we bypass validation with model_construct to verify the handler ALSO
+        escapes them (matching google_drive_search's behavior). A raw embedding
+        of ``a'b`` would break out of the quoted ``'...' in parents`` clause and
+        allow Drive query injection.
+        """
+        mock_http.get.return_value = _make_response(200, {"files": []})
+
+        args = GoogleDriveListArgs.model_construct(folder_id="a'b", max_results=10)
+        await google_drive.google_drive_list(args)
+
+        call_kwargs = mock_http.get.call_args
+        params = call_kwargs.kwargs.get("params") or call_kwargs[1].get("params", {})
+        q = params.get("q", "")
+        assert "a\\'b" in q
+        # The unescaped single quote must not appear adjacent (no raw 'a'b').
+        assert "'a'b'" not in q
+
     async def test_root_when_no_folder_id(self, mock_http: AsyncMock) -> None:
         """When folder_id is None, query uses 'root'."""
         mock_http.get.return_value = _make_response(200, {"files": []})
