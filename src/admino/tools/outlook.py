@@ -226,15 +226,16 @@ async def outlook_list(args: OutlookListArgs, **kwargs: object) -> str:
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
-    url = (
-        f"{_GRAPH_BASE}/me/messages"
-        f"?$top={args.max_results}"
-        "&$select=id,subject,from,receivedDateTime,bodyPreview"
-        "&$orderby=receivedDateTime desc"
-    )
+    url = f"{_GRAPH_BASE}/me/messages"
+    params: dict[str, str | int] = {
+        "$top": args.max_results,
+        "$select": "id,subject,from,receivedDateTime,bodyPreview",
+        "$orderby": "receivedDateTime desc",
+    }
     try:
         response = await _http_client.get(  # type: ignore[union-attr]
             url,
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
     except httpx.HTTPError as exc:
@@ -284,19 +285,21 @@ async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
-    # $search uses KQL syntax; the query is wrapped in double quotes in the URL.
-    # Escape double-quotes and backslashes to prevent KQL injection / OData
-    # query option injection via crafted query strings.
+    # $search uses KQL syntax; the query value is wrapped in double quotes.
+    # It is passed via params= (not the URL string) so httpx percent-encodes it
+    # and so it is not dropped: httpx replaces an existing URL query string when
+    # params= is supplied, rather than merging. Escape double-quotes and
+    # backslashes as defence-in-depth against KQL / OData option injection.
     safe_query = args.query.replace("\\", "\\\\").replace('"', '\\"')
-    url = (
-        f"{_GRAPH_BASE}/me/messages"
-        f'?$search="{safe_query}"'
-        f"&$top={args.max_results}"
-        "&$select=id,subject,from,receivedDateTime,bodyPreview"
-    )
+    params: dict[str, str | int] = {
+        "$search": f'"{safe_query}"',
+        "$top": args.max_results,
+        "$select": "id,subject,from,receivedDateTime,bodyPreview",
+    }
     try:
         response = await _http_client.get(  # type: ignore[union-attr]
-            url,
+            f"{_GRAPH_BASE}/me/messages",
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
     except httpx.HTTPError as exc:

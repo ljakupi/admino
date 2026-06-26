@@ -295,10 +295,10 @@ class TestOutlookCalendarList:
 
         assert "No events found" in result
 
-    async def test_list_url_contains_calendar_view_params(
+    async def test_list_url_uses_calendar_view_endpoint(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
-        """Request URL includes startDateTime, endDateTime, $top."""
+        """The calendarView endpoint path stays in the URL string."""
         mock_http_client.get.return_value = _make_response(200, {"value": []})
 
         from admino.tools.outlook_calendar import outlook_calendar_list
@@ -309,12 +309,46 @@ class TestOutlookCalendarList:
         )
         await outlook_calendar_list(args)
 
-        call_args = mock_http_client.get.call_args
-        url = call_args[0][0]
+        url = mock_http_client.get.call_args.args[0]
         assert "calendarView" in url
-        assert "startDateTime=" in url
-        assert "endDateTime=" in url
-        assert "$top=5" in url
+
+    async def test_list_query_options_passed_via_params(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """startDateTime, endDateTime, and $top are passed in the params dict."""
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.outlook_calendar import outlook_calendar_list
+
+        now = datetime.now(UTC)
+        args = OutlookCalendarListArgs(
+            time_min=now, time_max=now + timedelta(days=7), max_results=5
+        )
+        await outlook_calendar_list(args)
+
+        params = mock_http_client.get.call_args.kwargs.get("params") or {}
+        assert params["$top"] == 5
+        assert "startDateTime" in params
+        assert "endDateTime" in params
+
+    async def test_list_top_absent_from_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """$top and the time-range options must NOT be in the URL string anymore."""
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.outlook_calendar import outlook_calendar_list
+
+        now = datetime.now(UTC)
+        args = OutlookCalendarListArgs(
+            time_min=now, time_max=now + timedelta(days=7), max_results=5
+        )
+        await outlook_calendar_list(args)
+
+        url = mock_http_client.get.call_args.args[0]
+        assert "$top" not in url
+        assert "startDateTime=" not in url
+        assert "endDateTime=" not in url
 
     async def test_list_oauth_not_configured(self) -> None:
         """OAuth not configured returns setup instructions."""

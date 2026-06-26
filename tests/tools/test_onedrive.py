@@ -258,6 +258,22 @@ class TestOneDriveList:
         # Should NOT use the /root:/{path}:/children form
         assert "root:/" not in url
 
+    async def test_list_root_top_passed_via_params_not_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Root listing passes $top in the params dict as an int, absent from URL."""
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.onedrive import onedrive_list
+
+        args = OneDriveListArgs(folder_path=None, max_results=15)
+        await onedrive_list(args)
+
+        call_args = mock_http_client.get.call_args
+        params = call_args.kwargs.get("params") or {}
+        assert params["$top"] == 15
+        assert "$top" not in call_args.args[0]
+
     async def test_list_subfolder_url_uses_path(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
@@ -270,6 +286,27 @@ class TestOneDriveList:
         await onedrive_list(args)
 
         url = mock_http_client.get.call_args[0][0]
+        assert "/root:/Documents/Work:/children" in url
+
+    async def test_list_subfolder_top_passed_via_params_not_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Subfolder listing passes $top in the params dict, absent from URL.
+
+        The /root:/{path}:/children path fragment stays in the URL string.
+        """
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.onedrive import onedrive_list
+
+        args = OneDriveListArgs(folder_path="Documents/Work", max_results=12)
+        await onedrive_list(args)
+
+        call_args = mock_http_client.get.call_args
+        params = call_args.kwargs.get("params") or {}
+        assert params["$top"] == 12
+        url = call_args.args[0]
+        assert "$top" not in url
         assert "/root:/Documents/Work:/children" in url
 
     async def test_list_empty_results(
@@ -361,6 +398,27 @@ class TestOneDriveSearch:
 
         url = mock_http_client.get.call_args[0][0]
         assert "search(q='quarterly report')" in url
+
+    async def test_search_top_passed_via_params_not_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Search passes $top in the params dict, absent from URL.
+
+        The search(q='...') query fragment stays in the URL string.
+        """
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.onedrive import onedrive_search
+
+        args = OneDriveSearchArgs(query="budget", max_results=9)
+        await onedrive_search(args)
+
+        call_args = mock_http_client.get.call_args
+        params = call_args.kwargs.get("params") or {}
+        assert params["$top"] == 9
+        url = call_args.args[0]
+        assert "$top" not in url
+        assert "search(q='budget')" in url
 
     async def test_search_oauth_not_configured(self) -> None:
         """OAuth not configured returns setup instructions."""
