@@ -83,6 +83,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     """
     mock_config = _make_mock_config()
     mock_perms = _make_mock_permissions()
+    mock_tools_enabled = {"gmail": False, "memory": True}
     mock_audit_logger = MagicMock()
     mock_ollama_client = MagicMock()
     mock_agent = MagicMock()
@@ -99,10 +100,20 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_import_tools = MagicMock()
 
     # _async_startup is called via asyncio.run() inside main().
-    # We mock asyncio.run to return (config, perms) directly so the DB
-    # init path is bypassed without needing real asyncpg.
+    # We mock asyncio.run to return (config, perms, tools_enabled) directly so
+    # the DB init path is bypassed without needing real asyncpg. The third
+    # element is the persisted per-service enabled state loaded on boot (GH-80).
+    # The side_effect CLOSES the coroutine main() passes in so it is not left
+    # "never awaited" — a leaked coroutine is GC'd at an arbitrary later point
+    # and, when that coincides with another test's patched __import__, surfaces
+    # as a spurious PytestUnraisableExceptionWarning failure.
+    def _fake_run(coro: Any) -> tuple[Any, Any, Any]:
+        if hasattr(coro, "close"):
+            coro.close()
+        return (mock_config, mock_perms, mock_tools_enabled)
+
     mock_asyncio = MagicMock()
-    mock_asyncio.run = MagicMock(return_value=(mock_config, mock_perms))
+    mock_asyncio.run = MagicMock(side_effect=_fake_run)
 
     monkeypatch.setattr("admino.main.load_app_config", mock_load_app_config)
     monkeypatch.setattr("admino.main.load_permissions_config", mock_load_permissions_config)
@@ -120,6 +131,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     return {
         "config": mock_config,
         "permissions": mock_perms,
+        "tools_enabled": mock_tools_enabled,
         "audit_logger": mock_audit_logger,
         "ollama_client": mock_ollama_client,
         "agent": mock_agent,
@@ -192,6 +204,17 @@ class TestMainHappyPath:
         main(config_path=Path("c.yaml"), permissions_path=test_path)
 
         mock_deps["load_permissions_config"].assert_called_once_with(test_path)
+
+    def test_main_passes_tools_enabled_to_agent(self, mock_deps: dict[str, Any]) -> None:
+        """Agent is constructed with the persisted tools_enabled from startup (GH-80).
+
+        The per-service enabled state loaded from the DB on boot must flow into
+        the Agent so toggled-off services stay gated across restarts.
+        """
+        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+
+        mock_deps["Agent"].assert_called_once()
+        assert mock_deps["Agent"].call_args.kwargs["tools_enabled"] == mock_deps["tools_enabled"]
 
 
 # ---------------------------------------------------------------------------
@@ -708,7 +731,13 @@ class TestMainDatabaseStartupFailures:
         exc_type: type[Exception],
     ) -> None:
         """main() exits with code 1 when asyncio.run raises ValueError/RuntimeError/OSError."""
-        mock_deps["asyncio"].run = MagicMock(side_effect=exc_type("db failed"))
+
+        def _close_then_raise(coro: Any) -> None:
+            if hasattr(coro, "close"):
+                coro.close()
+            raise exc_type("db failed")
+
+        mock_deps["asyncio"].run = MagicMock(side_effect=_close_then_raise)
 
         with pytest.raises(SystemExit) as exc_info:
             main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
@@ -717,7 +746,13 @@ class TestMainDatabaseStartupFailures:
 
     def test_main_does_not_call_uvicorn_on_db_failure(self, mock_deps: dict[str, Any]) -> None:
         """uvicorn.run is never called when database startup fails."""
-        mock_deps["asyncio"].run = MagicMock(side_effect=ValueError("PG_PASSWORD not set"))
+
+        def _close_then_raise(coro: Any) -> None:
+            if hasattr(coro, "close"):
+                coro.close()
+            raise ValueError("PG_PASSWORD not set")
+
+        mock_deps["asyncio"].run = MagicMock(side_effect=_close_then_raise)
 
         with pytest.raises(SystemExit):
             main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
@@ -756,7 +791,11 @@ class TestAsyncStartup:
     async def test_happy_path_returns_db_config_and_permissions(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """_async_startup returns (config, permissions) loaded from DB."""
+        """_async_startup returns (config, permissions, tools_enabled) from DB.
+
+        GH-80: startup now returns a 3-tuple whose first two elements are the
+        DB-loaded config and permissions.
+        """
         monkeypatch.setenv("PG_PASSWORD", "testpass")
         mock_pool = AsyncMock()
         mock_db_config = MagicMock()
@@ -768,6 +807,7 @@ class TestAsyncStartup:
         monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
         monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
         monkeypatch.setattr("admino.database.update_setting", AsyncMock())
+        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
         monkeypatch.setattr(
             "admino.config.load_app_config_from_db", AsyncMock(return_value=mock_db_config)
         )
@@ -776,7 +816,79 @@ class TestAsyncStartup:
         )
 
         result = await _async_startup(MagicMock(), MagicMock())
-        assert result == (mock_db_config, mock_db_perms)
+        assert result[0] is mock_db_config
+        assert result[1] is mock_db_perms
+
+    @pytest.mark.asyncio
+    async def test_returns_tools_enabled_from_persisted_settings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The 3rd element reflects persisted 'off' state, defaulting others True.
+
+        GH-80: a service toggled off in the DB must come back disabled on the
+        next boot. The persisted ``tools`` section is validated through
+        ``ToolsSettings`` so the returned dict is a full enabled-state map.
+        """
+        monkeypatch.setenv("PG_PASSWORD", "testpass")
+        mock_pool = AsyncMock()
+
+        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
+        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
+        monkeypatch.setattr(
+            "admino.database.load_settings_from_db",
+            AsyncMock(return_value={"tools": {"gmail": False}}),
+        )
+        monkeypatch.setattr(
+            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(
+            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+
+        from admino.models import ToolsSettings
+
+        result = await _async_startup(MagicMock(), MagicMock())
+        tools_enabled = result[2]
+        assert tools_enabled == ToolsSettings(gmail=False).model_dump()
+        assert tools_enabled["gmail"] is False
+        assert tools_enabled["memory"] is True
+
+    @pytest.mark.asyncio
+    async def test_tools_enabled_all_true_when_no_tools_section(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the DB has no 'tools' key, tools_enabled is the all-True default.
+
+        GH-80: absence of persisted state must mean every service is enabled
+        (ToolsSettings defaults), never accidentally disabled.
+        """
+        monkeypatch.setenv("PG_PASSWORD", "testpass")
+        mock_pool = AsyncMock()
+
+        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
+        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
+        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
+        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(
+            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
+        )
+
+        from admino.models import ToolsSettings
+
+        result = await _async_startup(MagicMock(), MagicMock())
+        tools_enabled = result[2]
+        assert tools_enabled == ToolsSettings().model_dump()
+        assert all(tools_enabled.values())
 
     @pytest.mark.asyncio
     async def test_reapplies_llm_section_from_config_on_boot(
@@ -794,6 +906,7 @@ class TestAsyncStartup:
         monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
         monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
         monkeypatch.setattr("admino.database.update_setting", mock_update)
+        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
         monkeypatch.setattr(
             "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
         )
@@ -822,6 +935,7 @@ class TestAsyncStartup:
         monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
         monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
         monkeypatch.setattr("admino.database.update_setting", AsyncMock())
+        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
         monkeypatch.setattr(
             "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
         )

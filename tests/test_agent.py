@@ -1638,3 +1638,65 @@ class TestAgentPermissionAwareToolPayload:
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.send" in names
+
+
+class TestAgentToolsEnabledAllTrue:
+    """An all-True tools_enabled dict must behave like no filter (GH-80).
+
+    Passing a fully-True per-service map (e.g. nothing toggled off) must never
+    accidentally block a tool: the service is advertised and dispatches.
+    """
+
+    async def test_agent_all_true_dict_advertises_gmail(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """gmail.read is advertised to the LLM when every service is enabled."""
+        register_tool("gmail", "read", "Read emails", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = Agent(
+            llm_client=fake,  # type: ignore[arg-type]
+            audit_logger=audit_logger,
+            permissions_config=permissions_config,
+            agent_config=agent_config,
+            model_name="test-model",
+            tools_enabled={"gmail": True, "files": True, "memory": True},
+        )
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        names = _payload_tool_names(fake.received_tools[0])
+        assert "gmail.read" in names
+
+    async def test_agent_all_true_dict_dispatches_gmail(
+        self,
+        tmp_path: Path,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """gmail.read dispatches and runs when every service is enabled."""
+        register_tool("gmail", "read", "Read emails", EchoArgs)(echo_handler)
+        fake = FakeLLM(
+            [
+                _tool_response(
+                    ToolCall(tool="gmail", action="read", args={"text": "hi"}),
+                ),
+                _text_response("done"),
+            ]
+        )
+        agent = Agent(
+            llm_client=fake,  # type: ignore[arg-type]
+            audit_logger=audit_logger,
+            permissions_config=permissions_config,
+            agent_config=agent_config,
+            model_name="test-model",
+            tools_enabled={"gmail": True, "files": True, "memory": True},
+        )
+
+        await agent.run("hi", session_id="sess-1", history=[])
+
+        tool_entries = _filter_entries(_read_audit_entries(tmp_path), "tool_call")
+        assert any(e.get("tool") == "gmail" and e.get("success") is True for e in tool_entries)
