@@ -194,6 +194,15 @@ def _revalidate_resolved(resolved: Path) -> None:
         PermissionError: If re-resolution produces a different path (symlink swap)
             or the path is no longer under an allowed directory.
     """
+    # Residual TOCTOU window (documented, accepted for current threat model):
+    # There is still a gap between the async `_validate_path` call and this
+    # re-resolution inside `asyncio.to_thread`. An attacker who can atomically
+    # rename a directory component during that window would cause re-resolution
+    # to yield a different path -- which THIS check detects and rejects, so the
+    # window is closed defensively rather than left exploitable. Fully eliminating
+    # the window would require opening each path component with
+    # os.open(O_PATH | O_NOFOLLOW), which is not warranted for the current
+    # threat model (single-user, trusted local filesystem).
     current = Path(str(resolved)).resolve()
     if current != resolved:
         msg = "Path changed between validation and I/O (possible symlink attack)."

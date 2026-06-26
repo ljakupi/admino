@@ -248,21 +248,18 @@ async def onedrive_list(args: OneDriveListArgs, **kwargs: object) -> str:
         # URL-encode folder_path to prevent path traversal and query injection.
         # safe="/" preserves path separators; all other special chars are encoded.
         safe_path = quote(args.folder_path, safe="/")
-        url = (
-            f"{_GRAPH_BASE}/me/drive/root:/{safe_path}:/children"
-            f"?$top={args.max_results}"
-            "&$select=id,name,size,lastModifiedDateTime,file,folder"
-        )
+        url = f"{_GRAPH_BASE}/me/drive/root:/{safe_path}:/children"
     else:
-        url = (
-            f"{_GRAPH_BASE}/me/drive/root/children"
-            f"?$top={args.max_results}"
-            "&$select=id,name,size,lastModifiedDateTime,file,folder"
-        )
+        url = f"{_GRAPH_BASE}/me/drive/root/children"
 
+    params: dict[str, str | int] = {
+        "$top": args.max_results,
+        "$select": "id,name,size,lastModifiedDateTime,file,folder",
+    }
     try:
         response = await _http_client.get(  # type: ignore[union-attr]
             url,
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
     except httpx.HTTPError as exc:
@@ -315,14 +312,15 @@ async def onedrive_search(args: OneDriveSearchArgs, **kwargs: object) -> str:
     # Model-level pattern validation rejects single quotes and backslashes.
     # Defence-in-depth: escape any that slip through.
     safe_query = args.query.replace("\\", "\\\\").replace("'", "\\'")
-    url = (
-        f"{_GRAPH_BASE}/me/drive/root/search(q='{safe_query}')"
-        f"?$top={args.max_results}"
-        "&$select=id,name,size,lastModifiedDateTime,file,folder"
-    )
+    url = f"{_GRAPH_BASE}/me/drive/root/search(q='{safe_query}')"
+    params: dict[str, str | int] = {
+        "$top": args.max_results,
+        "$select": "id,name,size,lastModifiedDateTime,file,folder",
+    }
     try:
         response = await _http_client.get(  # type: ignore[union-attr]
             url,
+            params=params,
             headers={"Authorization": f"Bearer {token}"},
         )
     except httpx.HTTPError as exc:

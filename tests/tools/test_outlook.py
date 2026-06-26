@@ -271,10 +271,10 @@ class TestOutlookList:
         assert "Microsoft Graph error" in result
         assert "Access denied" in result
 
-    async def test_list_url_contains_top_and_orderby(
+    async def test_list_top_passed_via_params_not_url(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
-        """Request URL includes $top and $orderby params."""
+        """$top is passed in the httpx params dict as an int, not in the URL string."""
         mock_http_client.get.return_value = _make_response(200, {"value": []})
 
         from admino.tools.outlook import outlook_list
@@ -283,9 +283,36 @@ class TestOutlookList:
         await outlook_list(args)
 
         call_args = mock_http_client.get.call_args
-        url = call_args[0][0]
-        assert "$top=5" in url
-        assert "$orderby=receivedDateTime" in url
+        params = call_args.kwargs.get("params") or {}
+        assert params["$top"] == 5
+
+    async def test_list_top_absent_from_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """$top must NOT be interpolated into the URL string anymore."""
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.outlook import outlook_list
+
+        args = OutlookListArgs(max_results=5)
+        await outlook_list(args)
+
+        url = mock_http_client.get.call_args.args[0]
+        assert "$top" not in url
+
+    async def test_list_orderby_passed_via_params(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """$orderby is passed in the params dict and orders by receivedDateTime."""
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.outlook import outlook_list
+
+        args = OutlookListArgs(max_results=5)
+        await outlook_list(args)
+
+        params = mock_http_client.get.call_args.kwargs.get("params") or {}
+        assert params["$orderby"].startswith("receivedDateTime")
 
 
 # ---------------------------------------------------------------------------
@@ -323,10 +350,14 @@ class TestOutlookSearch:
 
         assert "No messages found" in result
 
-    async def test_search_url_contains_search_param(
+    async def test_search_query_passed_via_params_not_url(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
-        """Request URL includes $search param with query."""
+        """$search is passed in the params dict, not the URL string.
+
+        httpx replaces an existing URL query string when params= is supplied
+        (rather than merging), so $search must live in params or it is dropped.
+        """
         mock_http_client.get.return_value = _make_response(200, {"value": []})
 
         from admino.tools.outlook import outlook_search
@@ -335,9 +366,31 @@ class TestOutlookSearch:
         await outlook_search(args)
 
         call_args = mock_http_client.get.call_args
-        url = call_args[0][0]
-        assert "$search=" in url
-        assert "budget report" in url
+        params = call_args.kwargs.get("params") or {}
+        assert params["$search"] == '"budget report"'
+        url = call_args.args[0]
+        assert "$search" not in url
+
+    async def test_search_top_passed_via_params_not_url(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """$top is passed in the params dict as an int and absent from the URL.
+
+        $search, $top and the static $select all live in the params dict so
+        httpx encodes them correctly and none are dropped.
+        """
+        mock_http_client.get.return_value = _make_response(200, {"value": []})
+
+        from admino.tools.outlook import outlook_search
+
+        args = OutlookSearchArgs(query="budget", max_results=7)
+        await outlook_search(args)
+
+        call_args = mock_http_client.get.call_args
+        params = call_args.kwargs.get("params") or {}
+        assert params["$top"] == 7
+        url = call_args.args[0]
+        assert "$top" not in url
 
     async def test_search_oauth_not_configured(self) -> None:
         """OAuth not configured returns setup instructions."""
