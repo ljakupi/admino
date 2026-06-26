@@ -1076,6 +1076,19 @@ async def patch_settings(
         # Validate through ToolsSettings to strip unknown keys and ensure
         # all values are proper booleans before persisting and hot-reloading.
         validated_tools = ToolsSettings.model_validate(tools_current).model_dump()
+        # Audit log: record each real on/off change (skip no-ops) at WARNING so
+        # every DB-mutating service toggle from the UI is traceable, mirroring
+        # the permission-change audit trail. A tool with no stored value
+        # defaults to enabled, matching ToolsSettings defaults.
+        for key, new_value in patch_fields.items():
+            old_value = current_settings.get("tools", {}).get(key, True)
+            if old_value != new_value:
+                logger.warning(
+                    "Service toggled: tool=%s old=%s new=%s",
+                    key,
+                    old_value,
+                    new_value,
+                )
         await update_setting(pool, "tools", validated_tools)
         # Hot-reload: push updated tools-enabled state to the running agent
         # so the next dispatch respects the change immediately.
