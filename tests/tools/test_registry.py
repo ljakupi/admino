@@ -1861,6 +1861,95 @@ class TestToolEnabledGating:
         assert result.success is False
         assert "disabled" in result.result.lower()
 
+    # -- override lock-in: 'off' wins over EVERY permission decision (GH-80) --
+
+    async def test_dispatch_disabled_tool_overrides_allow(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """A tool the engine would ALLOW is still refused when disabled.
+
+        The per-service hard gate must win over an 'allow' decision so a
+        toggled-off service can never execute, regardless of permissions.
+        """
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+        )
+        assert result.success is False
+        assert "disabled" in result.result.lower()
+
+    async def test_dispatch_disabled_tool_overrides_confirm(
+        self, registered_tool: None, confirm_config: PermissionsConfig
+    ) -> None:
+        """A tool whose permission is 'confirm' is refused when disabled.
+
+        Disabled wins outright: no confirmation prompt is surfaced for a
+        toggled-off service.
+        """
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", enabled_tools={"gmail": False}
+        )
+        assert result.success is False
+        assert "disabled" in result.result.lower()
+        assert result.permission.allowed == "deny"
+
+    async def test_dispatch_disabled_tool_overrides_promoted(self) -> None:
+        """A disabled tool is refused even when its (tool, action) is promoted.
+
+        Promotion lifts a tier-2 deny to 'confirm'; the disabled gate must
+        short-circuit before promotion can grant the call any standing.
+        """
+        register_tool("google_calendar", "update", "Update event", SampleArgs)(sample_handler)
+        config = PermissionsConfig(
+            tools={"google_calendar": ToolPermissions(actions={"update": "confirm"})}
+        )
+        tc = _make_tool_call(tool="google_calendar", action="update")
+        result = await dispatch_tool_call(
+            tc,
+            config,
+            session_id="sess-1",
+            promoted=frozenset({("google_calendar", "update")}),
+            enabled_tools={"google_calendar": False},
+        )
+        assert result.success is False
+        assert "disabled" in result.result.lower()
+
+    # -- all-enabled (fully-True dict) still gates correctly (GH-80) --
+
+    def test_get_registered_tools_all_true_dict_includes_listed_tool(
+        self, registered_tool: None
+    ) -> None:
+        """A fully-True multi-tool dict never accidentally disables an enabled tool."""
+        result = get_registered_tools(enabled_tools={"gmail": True, "outlook": True})
+        assert len(result) == 1
+        assert result[0].tool == "gmail"
+
+    def test_get_registered_tools_all_true_dict_still_gates_false_tool(self) -> None:
+        """An all-True dict still honors a single False entry — gating is per-key.
+
+        Proves the all-True shortcut never collapses into 'disable everything'
+        or 'enable everything': the one False key still wins.
+        """
+        register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
+        register_tool("outlook", "read", "Read outlook", SampleArgs)(sample_handler)
+        result = get_registered_tools(enabled_tools={"gmail": True, "outlook": False})
+        assert len(result) == 1
+        assert result[0].tool == "gmail"
+
+    async def test_dispatch_all_true_dict_proceeds(
+        self, registered_tool: None, allow_config: PermissionsConfig
+    ) -> None:
+        """Dispatch with a fully-True multi-tool dict proceeds normally."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc,
+            allow_config,
+            session_id="sess-1",
+            enabled_tools={"gmail": True, "outlook": True},
+        )
+        assert result.success is True
+
 
 # ---------------------------------------------------------------------------
 # 34. Permission-aware tool exposure (GH-77)

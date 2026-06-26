@@ -1562,7 +1562,15 @@ class ToolsSettings(BaseModel):
     Each field corresponds to a registered tool name. Default is True
     (enabled) for all tools, matching the implicit behavior before this
     feature was added.
+
+    strict=True (mirrors :class:`SettingsPatchTools`): a non-boolean value
+    loaded from the DB JSONB ``tools`` column — e.g. a manually corrupted or
+    externally migrated ``"false"`` string — must raise ``ValidationError``
+    and trip the explicit all-enabled fallback, NOT be silently coerced to
+    ``True`` and re-enable a service the user disabled (GH-80 security gate).
     """
+
+    model_config = ConfigDict(strict=True)
 
     gmail: bool = True
     google_calendar: bool = True

@@ -34,9 +34,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import uvicorn
+from pydantic import ValidationError
 
 from admino.config import load_app_config, load_permissions_config
-from admino.models import AgentConfig
+from admino.models import AgentConfig, ToolsSettings
 
 if TYPE_CHECKING:
     from admino.config import AppConfig
@@ -219,18 +220,28 @@ def _build_database_url() -> str | None:
 async def _async_startup(
     config: AppConfig,
     permissions_config: PermissionsConfig,
-) -> tuple[AppConfig, PermissionsConfig]:
+) -> tuple[AppConfig, PermissionsConfig, dict[str, bool]]:
     """Initialise database, run migrations, seed data, and load config from DB.
 
     Returns the DB-loaded config and permissions (which become the runtime
-    source of truth).
+    source of truth) plus the persisted per-tool enabled state.
+
+    The tools-enabled map is loaded here, while the startup pool is still
+    open, so it can be passed into the ``Agent`` at construction time. This
+    is the security-critical fix for GH-80: a service the user toggled
+    **off** must stay off across a server restart — the gate has to be
+    active on the very first dispatch, before any PATCH arrives. Missing or
+    corrupt ``tools`` settings fall back to ``ToolsSettings`` defaults
+    (all enabled).
 
     Args:
         config: The YAML-loaded application config (used for seeding).
         permissions_config: The YAML-loaded permissions config (used for seeding).
 
     Returns:
-        A tuple of (db_config, db_permissions) loaded from the database.
+        A tuple of ``(db_config, db_permissions, tools_enabled)`` loaded from
+        the database. ``tools_enabled`` is a full ``ToolsSettings`` dump
+        (every tool name mapped to a bool).
 
     Raises:
         ValueError: If PG_PASSWORD is not set.
@@ -241,6 +252,7 @@ async def _async_startup(
         check_health,
         close_pool,
         init_pool,
+        load_settings_from_db,
         run_migrations,
         seed_permissions,
         seed_settings,
@@ -276,12 +288,25 @@ async def _async_startup(
     db_config = await load_app_config_from_db(pool)
     db_permissions = await load_permissions_config_from_db(pool)
 
+    # GH-80: Load the persisted per-tool enabled state while the pool is open
+    # so the gate can be active at Agent construction time. A service the user
+    # toggled off must remain off across a restart — not silently re-enabled
+    # until the first PATCH. Corrupt/missing tools data falls back to defaults
+    # (all enabled) rather than failing startup.
+    db_settings = await load_settings_from_db(pool)
+    tools_data = db_settings.get("tools", {})
+    try:
+        tools_enabled = ToolsSettings.model_validate(tools_data).model_dump()
+    except ValidationError:
+        logger.warning("Corrupt tools settings in DB — defaulting to all enabled.")
+        tools_enabled = ToolsSettings().model_dump()
+
     # Close the pool — it was created on asyncio.run()'s event loop which
     # will be destroyed when asyncio.run() returns.  The server lifespan
     # creates a fresh pool on uvicorn's event loop for runtime use.
     await close_pool()
 
-    return db_config, db_permissions
+    return db_config, db_permissions, tools_enabled
 
 
 def main(
@@ -329,7 +354,9 @@ def main(
     # 4. Initialize database, run migrations, seed and load from DB
     # ------------------------------------------------------------------
     try:
-        config, permissions_config = asyncio.run(_async_startup(config, permissions_config))
+        config, permissions_config, tools_enabled = asyncio.run(
+            _async_startup(config, permissions_config)
+        )
     except (ValueError, RuntimeError, OSError) as exc:
         logger.error("Database startup failed: %s", exc)
         sys.exit(1)
@@ -420,6 +447,9 @@ def main(
         agent_config=agent_config,
         model_name=config.llm.active_model_name,
         system_prompt=system_prompt,
+        # GH-80: seed the per-tool gate from persisted DB state so services
+        # the user toggled off stay off immediately on boot.
+        tools_enabled=tools_enabled,
     )
     from admino.llm import strip_control_chars
 
