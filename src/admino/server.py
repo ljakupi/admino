@@ -1310,14 +1310,6 @@ async def _resolve_pending_promotions() -> None:
         history.append(notification)
 
 
-def get_promoted_permissions() -> frozenset[tuple[str, str]]:
-    """Return the current set of promoted critical permissions.
-
-    Used by the tool registry (via agent) to pass to ``check_permission()``.
-    """
-    return frozenset(_promoted_permissions)
-
-
 async def get_critical_permissions(
     _auth: None = Depends(require_auth),
 ) -> CriticalPermissionsResponse:
