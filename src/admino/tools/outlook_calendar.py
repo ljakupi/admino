@@ -283,17 +283,18 @@ async def outlook_calendar_list(args: OutlookCalendarListArgs, **kwargs: object)
     start_iso = args.time_min.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = args.time_max.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    url = (
-        f"{_GRAPH_BASE}/me/calendarView"
-        f"?startDateTime={start_iso}"
-        f"&endDateTime={end_iso}"
-        f"&$top={args.max_results}"
-        "&$select=id,subject,start,end,location,bodyPreview"
-        "&$orderby=start/dateTime"
-    )
+    url = f"{_GRAPH_BASE}/me/calendarView"
+    params: dict[str, str | int] = {
+        "startDateTime": start_iso,
+        "endDateTime": end_iso,
+        "$top": args.max_results,
+        "$select": "id,subject,start,end,location,bodyPreview",
+        "$orderby": "start/dateTime",
+    }
     try:
         response = await _http_client.get(  # type: ignore[union-attr]
             url,
+            params=params,
             headers={
                 "Authorization": f"Bearer {token}",
                 "Prefer": 'outlook.timezone="UTC"',
