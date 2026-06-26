@@ -15,6 +15,7 @@ Security notes:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -593,6 +594,69 @@ class TestToolsSettings:
         assert tools_calls[0][0][2]["gmail"] is False
         # Response should show gmail disabled.
         assert resp.json()["tools"]["gmail"] is False
+
+    async def test_patch_settings_tool_toggle_is_audit_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Toggling a service writes an audit log line with old→new state.
+
+        Mirrors the permission-change audit trail: every DB-mutating config
+        action from the UI must be traceable. gmail starts enabled (default),
+        so toggling it off logs tool=gmail old=True new=False.
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        updated = dict(_DEFAULT_DB_SETTINGS)
+        updated["tools"] = {"gmail": False}
+        mock_load = AsyncMock(side_effect=[dict(_DEFAULT_DB_SETTINGS), updated])
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            caplog.at_level(logging.WARNING, logger="admino.server"),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": False}},
+                )
+
+        assert resp.status_code == 200
+        assert "Service toggled" in caplog.text
+        assert "gmail" in caplog.text
+        assert "old=True" in caplog.text
+        assert "new=False" in caplog.text
+
+    async def test_patch_settings_tool_toggle_no_change_not_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A no-op toggle (value unchanged) writes no audit line.
+
+        gmail is already enabled by default, so a PATCH setting gmail=True
+        changes nothing and must not produce a spurious 'toggled' record.
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+        mock_load = AsyncMock(side_effect=[dict(_DEFAULT_DB_SETTINGS), dict(_DEFAULT_DB_SETTINGS)])
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            caplog.at_level(logging.WARNING, logger="admino.server"),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": True}},
+                )
+
+        assert resp.status_code == 200
+        assert "Service toggled" not in caplog.text
 
     async def test_patch_settings_enables_tool(self) -> None:
         """PATCH with gmail=true re-enables a previously disabled tool."""
