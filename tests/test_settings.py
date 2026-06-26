@@ -744,6 +744,31 @@ class TestToolsSettings:
         assert tools["gmail"] is True
         assert tools["memory"] is True
 
+    async def test_get_settings_tools_string_value_does_not_coerce_to_enabled(self) -> None:
+        """A non-boolean string in the DB tools column must NOT coerce to True.
+
+        Security (GH-80): ToolsSettings is strict, so a corrupt/migrated
+        ``"false"`` string raises ValidationError and trips the all-enabled
+        fallback rather than being silently coerced to ``True``. The point is
+        that string coercion never silently re-enables a service — it forces
+        the explicit, auditable fallback path instead.
+        """
+        corrupt_settings = dict(_DEFAULT_DB_SETTINGS)
+        corrupt_settings["tools"] = {"gmail": "false"}  # string, not a JSON bool
+
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(corrupt_settings)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        # Strict validation rejected the string and the whole section fell back
+        # to defaults — gmail is the default True, NOT a coerced value.
+        assert resp.json()["tools"]["gmail"] is True
+
     async def test_patch_tools_hotreloads_agent_tools_enabled(self) -> None:
         """PATCH /api/settings tools section updates agent._tools_enabled in-place.
 

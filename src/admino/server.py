@@ -1882,8 +1882,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     await init_pool(database_url)
 
-    # Load persisted tools-enabled state so previously-disabled tools are
-    # respected immediately on startup (before any PATCH arrives).
+    # Defense-in-depth (GH-80): the Agent is already seeded with the persisted
+    # tools-enabled state at construction (main._async_startup). This reload on
+    # the runtime pool is a redundant safety net so a disabled service stays
+    # gated even if the construction-time seed is ever bypassed. Both paths use
+    # ToolsSettings validation, so they cannot diverge.
     if _agent is not None:
         try:
             from admino.database import get_pool, load_settings_from_db
@@ -1895,7 +1898,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 validated = ToolsSettings.model_validate(tools_data)
                 _agent._tools_enabled = validated.model_dump()
         except Exception:
-            logger.warning("Failed to load tools settings on startup; defaulting to all enabled.")
+            # The construction-time seed from main._async_startup remains in
+            # effect, so a disabled tool stays gated — this reload is only a
+            # defense-in-depth refresh, not the primary gate.
+            logger.warning(
+                "Lifespan tools-settings reload failed — construction-time gate remains active."
+            )
 
     # Load previously-promoted critical permissions from the database so
     # tier-2 promotions survive server restarts.
