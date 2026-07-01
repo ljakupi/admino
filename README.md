@@ -40,9 +40,9 @@ The config defaults in `config/config.yaml` currently target Anthropic (`llm.pro
 
 ### What happens at startup
 
-1. `main.py` loads `config/config.yaml` and `config/permissions.yaml`
+1. `main.py` loads `config/config.yaml` and builds the default permission ruleset from `admino.permissions.DEFAULT_PERMISSIONS`
 2. Opens the audit logger at `data/logs/audit.ndjson`
-3. Connects to PostgreSQL (via the `PG_*` env vars), runs migrations, and seeds settings/permissions; configures the files tool (allowed paths from config)
+3. Connects to PostgreSQL (via the `PG_*` env vars), runs migrations, and seeds settings/permissions (the defaults seed an empty DB only — the DB is authoritative thereafter); configures the files tool (allowed paths from config)
 4. Instantiates the LLM client for the configured `llm.provider` (Ollama / Anthropic / OpenAI), registers all tool handlers, freezes the registry
 5. Starts uvicorn on `0.0.0.0:8000` (single worker)
 

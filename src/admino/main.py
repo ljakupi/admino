@@ -2,7 +2,7 @@
 
 Startup sequence:
 1. Load and validate config.yaml (with env var overrides).
-2. Load and validate permissions.yaml.
+2. Build the default permissions ruleset (seeds an empty DB on first run).
 3. Configure Python logging from config.log_level.
 4. Open the append-only audit logger.
 5. Create the Ollama LLM client.
@@ -36,8 +36,9 @@ from typing import TYPE_CHECKING, Final
 import uvicorn
 from pydantic import ValidationError
 
-from admino.config import load_app_config, load_permissions_config
+from admino.config import load_app_config
 from admino.models import AgentConfig, ToolsSettings
+from admino.permissions import build_default_permissions_config
 
 if TYPE_CHECKING:
     from admino.config import AppConfig
@@ -49,7 +50,6 @@ logger = logging.getLogger(__name__)
 # fall back to ./config (local dev from project root).
 _CONFIG_DIR: Final[Path] = Path(os.environ.get("CONFIG_DIR", "config"))
 _DEFAULT_CONFIG_PATH: Final[Path] = _CONFIG_DIR / "config.yaml"
-_DEFAULT_PERMISSIONS_PATH: Final[Path] = _CONFIG_DIR / "permissions.yaml"
 
 # Valid Python log levels (explicit allowlist for _configure_logging).
 _VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset(
@@ -310,7 +310,6 @@ async def _async_startup(
 def main(
     *,
     config_path: Path = _DEFAULT_CONFIG_PATH,
-    permissions_path: Path = _DEFAULT_PERMISSIONS_PATH,
 ) -> None:
     """Load configuration, wire dependencies, and start the server.
 
@@ -320,7 +319,6 @@ def main(
 
     Args:
         config_path: Path to config.yaml.
-        permissions_path: Path to permissions.yaml.
     """
     # ------------------------------------------------------------------
     # 1. Load and validate application config
@@ -338,15 +336,12 @@ def main(
     logger.info("Configuration loaded successfully.")
 
     # ------------------------------------------------------------------
-    # 3. Load and validate permissions config
+    # 3. Build the default permissions ruleset (seeds an empty DB only)
     # ------------------------------------------------------------------
-    try:
-        permissions_config = load_permissions_config(permissions_path)
-    except (ValueError, FileNotFoundError, OSError):
-        logger.error("Failed to load permissions config.")
-        sys.exit(1)
-
-    logger.info("Permissions config loaded successfully.")
+    # The database is the source of truth for permissions; this in-code default
+    # (GH-85) is used solely to seed an empty ``permissions`` table on first run.
+    permissions_config = build_default_permissions_config()
+    logger.info("Default permissions ruleset built for DB seeding.")
 
     # ------------------------------------------------------------------
     # 4. Initialize database, run migrations, seed and load from DB

@@ -16,12 +16,14 @@ from pydantic import ValidationError
 
 from admino.permissions import (
     _CONFIRM_ONLY_ACTIONS,
+    DEFAULT_PERMISSIONS,
     HARDCODED_DENIALS,
     IMMUTABLE_DENIALS,
     PROMOTABLE_DENIALS,
     PermissionResult,
     PermissionsConfig,
     ToolPermissions,
+    build_default_permissions_config,
     check_permission,
     validate_permissions_config,
 )
@@ -56,6 +58,91 @@ def _build_config_with_hardcoded_allow(tool: str, action: str) -> PermissionsCon
             tool: ToolPermissions(actions={action: "allow"}),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# 0. Default permission ruleset (seed source)
+# ---------------------------------------------------------------------------
+
+# The exact tool/action rules the retired config/permissions.yaml shipped.
+# build_default_permissions_config() must seed an empty DB with precisely
+# these rows — this is the "same rows the YAML did" spec (GH-85).
+_LEGACY_YAML_PERMISSIONS: dict[str, dict[str, str]] = {
+    "gmail": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "send": "deny",
+        "delete": "deny",
+    },
+    "google_calendar": {
+        "read": "allow",
+        "list": "allow",
+        "create": "confirm",
+        "update": "deny",
+        "delete": "deny",
+    },
+    "google_drive": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "download": "confirm",
+        "delete": "deny",
+    },
+    "outlook": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "send": "deny",
+        "delete": "deny",
+    },
+    "outlook_calendar": {
+        "read": "allow",
+        "list": "allow",
+        "create": "confirm",
+        "update": "deny",
+        "delete": "deny",
+    },
+    "onedrive": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "download": "confirm",
+        "delete": "deny",
+    },
+    "files": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "write": "confirm",
+        "move": "confirm",
+        "delete": "deny",
+    },
+    "memory": {"store": "allow", "recall": "allow", "list": "allow", "delete": "deny"},
+}
+
+
+class TestDefaultPermissions:
+    """DEFAULT_PERMISSIONS + build_default_permissions_config() replace the YAML seed."""
+
+    def test_constant_matches_legacy_yaml(self) -> None:
+        """DEFAULT_PERMISSIONS holds exactly the retired permissions.yaml ruleset."""
+        assert DEFAULT_PERMISSIONS == _LEGACY_YAML_PERMISSIONS
+
+    def test_seed_returns_permissions_config(self) -> None:
+        """build_default_permissions_config() returns a validated PermissionsConfig."""
+        assert isinstance(build_default_permissions_config(), PermissionsConfig)
+
+    def test_seed_produces_same_rows_as_yaml(self) -> None:
+        """The seed config contains exactly the rows the old YAML file produced."""
+        config = build_default_permissions_config()
+        produced = {tool: dict(perms.actions) for tool, perms in config.tools.items()}
+        assert produced == _LEGACY_YAML_PERMISSIONS
+
+    def test_seed_goes_through_validation(self) -> None:
+        """The seed is built via validate_permissions_config (identical output)."""
+        expected = validate_permissions_config(DEFAULT_PERMISSIONS)
+        assert build_default_permissions_config().model_dump() == expected.model_dump()
 
 
 # ---------------------------------------------------------------------------
