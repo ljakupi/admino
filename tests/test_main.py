@@ -451,8 +451,6 @@ class TestImportToolModules:
             "admino.tools.outlook_calendar",
             "admino.tools.onedrive",
             # Other tools
-            "admino.tools.documents",
-            "admino.tools.search",
             "admino.tools.files",
             "admino.tools.memory",
         }
@@ -473,8 +471,8 @@ class TestImportToolModules:
         with patch("builtins.__import__", side_effect=_side_effect):
             _import_tool_modules()
 
-        # All 10 modules attempted despite first one failing
-        assert call_count == 10
+        # All 8 modules attempted despite first one failing
+        assert call_count == 8
 
 
 # ---------------------------------------------------------------------------

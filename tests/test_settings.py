@@ -531,9 +531,7 @@ class TestToolsSettings:
             "outlook",
             "outlook_calendar",
             "onedrive",
-            "documents",
             "files",
-            "web_search",
             "memory",
         ):
             assert tools[tool_name] is True, f"{tool_name} should default to True"

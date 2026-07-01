@@ -44,8 +44,7 @@ def sample_config() -> PermissionsConfig:
         tools={
             "gmail": ToolPermissions(actions={"read": "allow", "list": "confirm"}),
             "google_calendar": ToolPermissions(actions={"list": "allow", "create": "confirm"}),
-            "files": ToolPermissions(actions={"read": "allow"}),
-            "documents": ToolPermissions(actions={"search": "deny"}),
+            "files": ToolPermissions(actions={"read": "allow", "search": "deny"}),
         }
     )
 
@@ -129,8 +128,8 @@ class TestConfigDeny:
     """A configured 'deny' action returns deny."""
 
     def test_deny_returns_deny(self, sample_config: PermissionsConfig) -> None:
-        """documents.search configured as deny should return deny."""
-        result = check_permission("documents", "search", sample_config)
+        """files.search configured as deny should return deny."""
+        result = check_permission("files", "search", sample_config)
         assert result.allowed == "deny"
         assert "deny" in result.reason
 
