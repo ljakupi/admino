@@ -149,6 +149,7 @@ class TestGetSettings:
         from admino import server
 
         app = _make_app()
+        assert server._config is not None
         server._config.llm.provider = "anthropic"
         server._config.llm.model = None
         server._config.llm.ollama_url = "http://local-llm:11434"
