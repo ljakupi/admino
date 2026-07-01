@@ -1,8 +1,9 @@
 """Configuration loading and validation for admino.
 
-Reads and validates two YAML configuration files at startup:
-- config.yaml  -- main application config (server, Ollama, paths, limits, etc.)
-- permissions.yaml -- tool permission rules (delegated to permissions.py)
+Reads and validates the main application config (config.yaml) at startup, and
+provides the database-backed loaders that become the runtime source of truth
+once the DB is seeded. Tool permission rules live in permissions.py; their
+in-code defaults (DEFAULT_PERMISSIONS) seed an empty DB on first run.
 
 Environment variable overrides are supported for deployment flexibility.
 Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_TOKEN)
@@ -662,68 +663,6 @@ def load_app_config(config_path: Path) -> AppConfig:
             f"{error_count} field(s) — check server logs for details"
         )
         raise ValueError(msg) from exc
-
-
-def load_permissions_config(permissions_path: Path) -> PermissionsConfig:
-    """Load and validate the permissions config from a YAML file.
-
-    Reads permissions.yaml, extracts the 'tools' block, and delegates
-    validation to permissions.validate_permissions_config().
-
-    Args:
-        permissions_path: Path to permissions.yaml.
-
-    Returns:
-        A validated PermissionsConfig instance.
-
-    Raises:
-        ValueError: If the YAML is malformed or validation fails.
-        FileNotFoundError: If the permissions file does not exist.
-    """
-    try:
-        raw_text = permissions_path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        msg = f"Permissions config not found: {permissions_path}"
-        raise FileNotFoundError(msg) from None
-
-    logger.info("Loading permissions config from %s", permissions_path)
-    try:
-        parsed = yaml.safe_load(raw_text)
-    except yaml.YAMLError as exc:
-        msg = "permissions.yaml contains invalid YAML syntax."
-        raise ValueError(msg) from exc
-
-    if not isinstance(parsed, dict):
-        msg = f"permissions.yaml must contain a YAML mapping, got {type(parsed).__name__}"
-        raise ValueError(msg)
-
-    tools_raw = parsed.get("tools")
-    if tools_raw is None:
-        msg = "permissions.yaml must contain a 'tools' key."
-        raise ValueError(msg)
-
-    if not isinstance(tools_raw, dict):
-        msg = f"permissions.yaml 'tools' must be a mapping, got {type(tools_raw).__name__}"
-        raise ValueError(msg)
-
-    # Ensure values are dicts of str->str
-    tools_typed: dict[str, dict[str, str]] = {}
-    for tool_name, actions in tools_raw.items():
-        if not isinstance(tool_name, str):
-            msg = f"Tool name must be a string, got {type(tool_name).__name__}"
-            raise ValueError(msg)
-        if not isinstance(actions, dict):
-            msg = f"Actions for tool '{tool_name}' must be a mapping, got {type(actions).__name__}"
-            raise ValueError(msg)
-        for k, v in actions.items():
-            if not isinstance(v, str):
-                msg = (
-                    f"Action value for '{tool_name}.{k}' must be a string, got {type(v).__name__}."
-                )
-                raise ValueError(msg)
-        tools_typed[tool_name] = {str(k): str(v) for k, v in actions.items()}
-
-    return validate_permissions_config(tools_typed)
 
 
 # ---------------------------------------------------------------------------

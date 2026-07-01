@@ -4,7 +4,6 @@ Tests the main() entry point, _configure_logging(), and _import_tool_modules(),
 covering:
 - Happy path: config loaded, dependencies wired, uvicorn.run called correctly
 - Config failure paths: ValueError, OSError → sys.exit(1)
-- Permissions failure paths: ValueError, FileNotFoundError → sys.exit(1)
 - Audit logger failure paths: ValueError, OSError → sys.exit(1)
 - Logging configuration: level mapping, invalid fallback
 - Tool module imports: missing modules skipped, other errors re-raised
@@ -90,7 +89,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_app = MagicMock()
 
     mock_load_app_config = MagicMock(return_value=mock_config)
-    mock_load_permissions_config = MagicMock(return_value=mock_perms)
+    mock_build_permissions = MagicMock(return_value=mock_perms)
     mock_audit_cls = MagicMock(return_value=mock_audit_logger)
     mock_ollama_cls = MagicMock(return_value=mock_ollama_client)
     mock_agent_cls = MagicMock(return_value=mock_agent)
@@ -116,7 +115,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_asyncio.run = MagicMock(side_effect=_fake_run)
 
     monkeypatch.setattr("admino.main.load_app_config", mock_load_app_config)
-    monkeypatch.setattr("admino.main.load_permissions_config", mock_load_permissions_config)
+    monkeypatch.setattr("admino.main.build_default_permissions_config", mock_build_permissions)
     monkeypatch.setattr("admino.main._import_tool_modules", mock_import_tools)
     monkeypatch.setattr("admino.main.asyncio", mock_asyncio)
 
@@ -137,7 +136,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "agent": mock_agent,
         "app": mock_app,
         "load_app_config": mock_load_app_config,
-        "load_permissions_config": mock_load_permissions_config,
+        "build_default_permissions_config": mock_build_permissions,
         "AuditLogger": mock_audit_cls,
         "create_llm_client": mock_ollama_cls,
         "Agent": mock_agent_cls,
@@ -159,7 +158,7 @@ class TestMainHappyPath:
 
     def test_main_calls_uvicorn_run_with_correct_args(self, mock_deps: dict[str, Any]) -> None:
         """main() calls uvicorn.run with single worker, correct host/port, no access log."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         mock_deps["uvicorn_run"].assert_called_once()
         kw = mock_deps["uvicorn_run"].call_args
@@ -170,14 +169,14 @@ class TestMainHappyPath:
 
     def test_main_passes_app_to_uvicorn(self, mock_deps: dict[str, Any]) -> None:
         """uvicorn.run receives the app from create_app."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         positional_args = mock_deps["uvicorn_run"].call_args.args
         assert positional_args[0] is mock_deps["app"]
 
     def test_main_calls_create_app_with_agent_and_config(self, mock_deps: dict[str, Any]) -> None:
         """create_app is called with the agent instance and config."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         mock_deps["create_app"].assert_called_once_with(
             agent=mock_deps["agent"],
@@ -186,7 +185,7 @@ class TestMainHappyPath:
 
     def test_main_calls_freeze_registry_after_import(self, mock_deps: dict[str, Any]) -> None:
         """freeze_registry is called after _import_tool_modules."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         mock_deps["import_tool_modules"].assert_called_once()
         mock_deps["freeze_registry"].assert_called_once()
@@ -194,16 +193,15 @@ class TestMainHappyPath:
     def test_main_loads_config_with_provided_path(self, mock_deps: dict[str, Any]) -> None:
         """load_app_config is called with the config_path argument."""
         test_path = Path("/custom/config.yaml")
-        main(config_path=test_path, permissions_path=Path("p.yaml"))
+        main(config_path=test_path)
 
         mock_deps["load_app_config"].assert_called_once_with(test_path)
 
-    def test_main_loads_permissions_with_provided_path(self, mock_deps: dict[str, Any]) -> None:
-        """load_permissions_config is called with the permissions_path argument."""
-        test_path = Path("/custom/permissions.yaml")
-        main(config_path=Path("c.yaml"), permissions_path=test_path)
+    def test_main_builds_default_permissions_from_constant(self, mock_deps: dict[str, Any]) -> None:
+        """Permissions are seeded from the in-code default, not a YAML file (GH-85)."""
+        main(config_path=Path("c.yaml"))
 
-        mock_deps["load_permissions_config"].assert_called_once_with(test_path)
+        mock_deps["build_default_permissions_config"].assert_called_once_with()
 
     def test_main_passes_tools_enabled_to_agent(self, mock_deps: dict[str, Any]) -> None:
         """Agent is constructed with the persisted tools_enabled from startup (GH-80).
@@ -211,7 +209,7 @@ class TestMainHappyPath:
         The per-service enabled state loaded from the DB on boot must flow into
         the Agent so toggled-off services stay gated across restarts.
         """
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         mock_deps["Agent"].assert_called_once()
         assert mock_deps["Agent"].call_args.kwargs["tools_enabled"] == mock_deps["tools_enabled"]
@@ -230,7 +228,7 @@ class TestMainConfigFailures:
         mock_deps["load_app_config"].side_effect = ValueError("bad config")
 
         with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         assert exc_info.value.code == 1
 
@@ -239,7 +237,7 @@ class TestMainConfigFailures:
         mock_deps["load_app_config"].side_effect = OSError("permission denied")
 
         with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         assert exc_info.value.code == 1
 
@@ -250,7 +248,7 @@ class TestMainConfigFailures:
         mock_deps["load_app_config"].side_effect = ValueError("bad yaml")
 
         with pytest.raises(SystemExit):
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         captured = capsys.readouterr()
         assert "bad yaml" in captured.err
@@ -261,45 +259,7 @@ class TestMainConfigFailures:
         mock_deps["load_app_config"].side_effect = ValueError("fail")
 
         with pytest.raises(SystemExit):
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
-
-        mock_deps["uvicorn_run"].assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Permissions failure tests
-# ---------------------------------------------------------------------------
-
-
-class TestMainPermissionsFailures:
-    """Tests for main() behavior when permissions loading fails."""
-
-    def test_main_exits_1_on_permissions_value_error(self, mock_deps: dict[str, Any]) -> None:
-        """main() exits with code 1 when load_permissions_config raises ValueError."""
-        mock_deps["load_permissions_config"].side_effect = ValueError("bad perms")
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
-
-        assert exc_info.value.code == 1
-
-    def test_main_exits_1_on_permissions_file_not_found(self, mock_deps: dict[str, Any]) -> None:
-        """main() exits with code 1 when load_permissions_config raises FileNotFoundError."""
-        mock_deps["load_permissions_config"].side_effect = FileNotFoundError("missing")
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
-
-        assert exc_info.value.code == 1
-
-    def test_main_does_not_call_uvicorn_on_permissions_failure(
-        self, mock_deps: dict[str, Any]
-    ) -> None:
-        """uvicorn.run is never called when permissions loading fails."""
-        mock_deps["load_permissions_config"].side_effect = ValueError("fail")
-
-        with pytest.raises(SystemExit):
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         mock_deps["uvicorn_run"].assert_not_called()
 
@@ -317,7 +277,7 @@ class TestMainAuditLoggerFailures:
         mock_deps["AuditLogger"].side_effect = ValueError("bad path")
 
         with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         assert exc_info.value.code == 1
 
@@ -326,7 +286,7 @@ class TestMainAuditLoggerFailures:
         mock_deps["AuditLogger"].side_effect = OSError("disk full")
 
         with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         assert exc_info.value.code == 1
 
@@ -335,7 +295,7 @@ class TestMainAuditLoggerFailures:
         mock_deps["AuditLogger"].side_effect = ValueError("fail")
 
         with pytest.raises(SystemExit):
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         mock_deps["uvicorn_run"].assert_not_called()
 
@@ -489,7 +449,7 @@ class TestAgentConfigWiring:
         mock_deps["config"].limits.max_context_messages = 25
         mock_deps["config"].limits.confirmation_timeout_s = 200
 
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         agent_config = agent_call_kwargs["agent_config"]
@@ -501,28 +461,28 @@ class TestAgentConfigWiring:
         """Agent is created with model_name from config.llm.active_model_name."""
         mock_deps["config"].llm.active_model_name = "llama3:8b"
 
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["model_name"] == "llama3:8b"
 
     def test_agent_receives_llm_client(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the LLM client instance from create_llm_client."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["llm_client"] is mock_deps["ollama_client"]
 
     def test_agent_receives_audit_logger(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the AuditLogger instance."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["audit_logger"] is mock_deps["audit_logger"]
 
     def test_agent_receives_permissions_config(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the PermissionsConfig instance."""
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["permissions_config"] is mock_deps["permissions"]
@@ -554,7 +514,7 @@ class TestUvicornLogLevel:
         """uvicorn.run receives log_level as lowercase of config.log_level."""
         mock_deps["config"].log_level = config_level
 
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         kw = mock_deps["uvicorn_run"].call_args.kwargs
         assert kw["log_level"] == expected_uvicorn_level
@@ -568,7 +528,7 @@ class TestUvicornLogLevel:
         """workers=1 is enforced regardless of host (prevents split-brain state)."""
         mock_deps["config"].server.host = host
 
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         kw = mock_deps["uvicorn_run"].call_args.kwargs
         assert kw["workers"] == 1
@@ -687,7 +647,7 @@ class TestStartupOrdering:
         mock_deps["AuditLogger"].side_effect = track_audit
         mock_deps["Agent"].side_effect = track_agent
 
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         assert call_order.index("audit") < call_order.index("agent")
 
@@ -706,7 +666,7 @@ class TestStartupOrdering:
         mock_deps["freeze_registry"].side_effect = track_freeze
         mock_deps["Agent"].side_effect = track_agent
 
-        main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+        main(config_path=Path("c.yaml"))
 
         assert call_order.index("freeze") < call_order.index("agent")
 
@@ -738,7 +698,7 @@ class TestMainDatabaseStartupFailures:
         mock_deps["asyncio"].run = MagicMock(side_effect=_close_then_raise)
 
         with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         assert exc_info.value.code == 1
 
@@ -753,7 +713,7 @@ class TestMainDatabaseStartupFailures:
         mock_deps["asyncio"].run = MagicMock(side_effect=_close_then_raise)
 
         with pytest.raises(SystemExit):
-            main(config_path=Path("c.yaml"), permissions_path=Path("p.yaml"))
+            main(config_path=Path("c.yaml"))
 
         mock_deps["uvicorn_run"].assert_not_called()
 

@@ -7,7 +7,7 @@ history, user messages, or tool arguments.
 
 Security notes:
 - This module must NEVER import from agent.py, llm.py, or server.py.
-- Hardcoded denials cannot be overridden by YAML configuration.
+- Hardcoded denials cannot be overridden by configuration.
 - Default-deny: any unlisted tool/action combination is denied.
 - check_permission is a pure function: no logging, no network calls, no
   state mutation. (The module-level logger is used only by
@@ -15,8 +15,8 @@ Security notes:
 - Write-mutating actions cannot be configured as 'allow' — only 'confirm'
   or 'deny' are accepted. This prevents unconstrained writes via operator
   misconfiguration.
-- validate_permissions_config logs warnings when YAML attempts to override
-  hardcoded denials.
+- validate_permissions_config logs warnings when the config attempts to
+  override hardcoded denials.
 - Input validation: tool and action identifiers must match [a-z][a-z0-9_]{0,62}.
 """
 
@@ -182,9 +182,12 @@ class ToolPermissions(BaseModel):
 
 
 class PermissionsConfig(BaseModel):
-    """Top-level permissions configuration, validated from permissions.yaml.
+    """Top-level permissions configuration.
 
-    Structure:
+    Built by ``validate_permissions_config`` from either the in-code
+    ``DEFAULT_PERMISSIONS`` (initial DB seed) or the rows loaded from the
+    database at runtime. Structure (tool -> action -> state)::
+
         tools:
           gmail:
             read: allow
@@ -217,14 +220,15 @@ class PermissionsConfig(BaseModel):
 
 
 def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsConfig:
-    """Build a PermissionsConfig from a raw dict (e.g. parsed YAML 'tools' block).
+    """Build a PermissionsConfig from a raw tool -> {action: state} mapping.
 
-    Logs warnings if YAML attempts to override hardcoded denials, but the
-    hardcoded values are NOT stored — check_permission enforces them at
-    call time regardless.
+    The input comes from either ``DEFAULT_PERMISSIONS`` (initial DB seed) or the
+    rows loaded from the database at runtime. Logs warnings if the config tries
+    to override a hardcoded denial, but the hardcoded values are NOT stored —
+    check_permission enforces them at call time regardless.
 
     Args:
-        raw: Mapping of tool name -> {action: state} from the YAML file.
+        raw: Mapping of tool name -> {action: state}.
 
     Returns:
         A validated PermissionsConfig instance.
@@ -242,7 +246,7 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
             if (tool_name, action_name) in HARDCODED_DENIALS:
                 if state != "deny":
                     logger.warning(
-                        "permissions.yaml sets %s.%s to '%s', "
+                        "permission config sets %s.%s to '%s', "
                         "but this is a hardcoded denial — enforcing 'deny'.",
                         _safe_log(tool_name),
                         _safe_log(action_name),
@@ -262,7 +266,7 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
                 # Downgrade 'allow' to 'confirm' for write-mutating actions
                 if state == "allow" and (tool_name, action_name) in _CONFIRM_ONLY_ACTIONS:
                     logger.warning(
-                        "permissions.yaml sets %s.%s to 'allow', but this is a "
+                        "permission config sets %s.%s to 'allow', but this is a "
                         "write-mutating action — downgrading to 'confirm'.",
                         _safe_log(tool_name),
                         _safe_log(action_name),
@@ -273,11 +277,98 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
                     cleaned_actions[action_name] = state  # type: ignore[assignment]
         if not cleaned_actions:
             logger.warning(
-                "permissions.yaml tool %s has no actions configured.",
+                "permission config tool %s has no actions configured.",
                 _safe_log(tool_name),
             )
         tools[tool_name] = ToolPermissions(actions=cleaned_actions)
     return PermissionsConfig(tools=tools)
+
+
+# ---------------------------------------------------------------------------
+# Default permission ruleset (seed source)
+# ---------------------------------------------------------------------------
+
+# The default tool/action rules seeded into an empty ``permissions`` table on
+# first run. This constant is the single version-controlled source of truth —
+# it replaces the retired ``config/permissions.yaml`` seed file (GH-85). Nothing
+# here is needed before the database exists, so it lives in code rather than in
+# a shipped YAML file; the database is authoritative once seeded.
+#
+# Every listed action is one of allow / confirm / deny. Unlisted tool/action
+# combinations default to deny (see ``check_permission``). Hardcoded denials are
+# enforced by ``check_permission`` regardless of what appears here; this ruleset
+# still passes through ``validate_permissions_config`` when built, so the same
+# hardcoded-denial and write-mutating-action guarantees apply as with the YAML.
+DEFAULT_PERMISSIONS: Final[dict[str, dict[str, str]]] = {
+    # --- Google ---
+    "gmail": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "send": "deny",
+        "delete": "deny",
+    },
+    "google_calendar": {
+        "read": "allow",
+        "list": "allow",
+        "create": "confirm",
+        "update": "deny",
+        "delete": "deny",
+    },
+    "google_drive": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "download": "confirm",
+        "delete": "deny",
+    },
+    # --- Microsoft ---
+    "outlook": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "send": "deny",
+        "delete": "deny",
+    },
+    "outlook_calendar": {
+        "read": "allow",
+        "list": "allow",
+        "create": "confirm",
+        "update": "deny",
+        "delete": "deny",
+    },
+    "onedrive": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "download": "confirm",
+        "delete": "deny",
+    },
+    # --- Other ---
+    "files": {
+        "read": "allow",
+        "list": "allow",
+        "search": "allow",
+        "write": "confirm",
+        "move": "confirm",
+        "delete": "deny",
+    },
+    "memory": {"store": "allow", "recall": "allow", "list": "allow", "delete": "deny"},
+}
+
+
+def build_default_permissions_config() -> PermissionsConfig:
+    """Build the seed ``PermissionsConfig`` from ``DEFAULT_PERMISSIONS``.
+
+    Used at startup to seed an empty ``permissions`` table. The defaults are run
+    through ``validate_permissions_config`` so the identical hardcoded-denial and
+    write-mutating-action normalisation applies as when they were loaded from
+    ``permissions.yaml``.
+
+    Returns:
+        A validated PermissionsConfig holding the default ruleset.
+    """
+    return validate_permissions_config(DEFAULT_PERMISSIONS)
 
 
 # ---------------------------------------------------------------------------

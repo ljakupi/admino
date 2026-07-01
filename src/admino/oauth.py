@@ -56,7 +56,8 @@ GOOGLE_USERINFO_ENDPOINT: str = "https://www.googleapis.com/oauth2/v2/userinfo"
 GOOGLE_REVOKE_ENDPOINT: str = "https://oauth2.googleapis.com/revoke"
 
 # Scopes: broad at the API level — the agent's permission engine (permissions.py
-# hardcoded denials + permissions.yaml) is the actual access control layer.
+# hardcoded denials + the DB-backed permission rules) is the actual access
+# control layer.
 # This avoids re-running the OAuth consent flow when enabling new agent actions.
 # gmail.modify: read + send + draft + label (no permanent delete via API).
 # calendar.events: read + create + update + delete.
