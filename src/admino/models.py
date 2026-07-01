@@ -1578,9 +1578,7 @@ class ToolsSettings(BaseModel):
     outlook: bool = True
     outlook_calendar: bool = True
     onedrive: bool = True
-    documents: bool = True
     files: bool = True
-    web_search: bool = True
     memory: bool = True
 
 
@@ -1654,9 +1652,7 @@ class SettingsPatchTools(BaseModel):
     outlook: bool | None = None
     outlook_calendar: bool | None = None
     onedrive: bool | None = None
-    documents: bool | None = None
     files: bool | None = None
-    web_search: bool | None = None
     memory: bool | None = None
 
 

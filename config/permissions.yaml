@@ -52,15 +52,6 @@ tools:
     delete: deny
 
   # --- Other ---
-  documents:
-    store: confirm
-    search: allow
-    query: allow
-    delete: deny
-
-  web_search:
-    search: deny
-
   files:
     read: allow
     list: allow

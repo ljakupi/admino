@@ -127,7 +127,7 @@ services:
       # Egress bridge: external calls, locked down by iptables in entrypoint.sh
       - egress
 
-    # Resource limits: prevent runaway tool calls or OCR jobs from
+    # Resource limits: prevent runaway tool calls from
     # exhausting host memory and triggering the OOM killer.
     deploy:
       resources:
