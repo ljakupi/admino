@@ -56,7 +56,7 @@ COPY --chown=admino:admino static/ /app/static/
 
 # Create data and config directories; they will be volume-mounted at runtime
 # but must exist in the image so the container starts cleanly if volumes are empty
-RUN mkdir -p /app/data/db /app/data/logs /app/data/tokens /app/config /app/documents \
+RUN mkdir -p /app/data/logs /app/data/tokens /app/config /app/documents \
     && chown -R admino:admino /app
 
 # Copy and enable the entrypoint script

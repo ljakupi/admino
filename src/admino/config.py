@@ -293,7 +293,7 @@ class PathsConfig(BaseModel):
     """
 
     audit_log: Path = Field(
-        default=Path("/app/data/logs/audit.jsonl"),
+        default=Path("/app/data/logs/audit.ndjson"),
         description="Path to the append-only NDJSON audit log.",
     )
     images: Path = Field(
