@@ -28,7 +28,7 @@ ollama serve &               # skip if Ollama is already running
 ollama pull gemma4:12b
 
 # 3. Create data directories + the single sandboxed documents dir
-mkdir -p data/db data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
 
 # 4. Start the agent
 make run
@@ -42,7 +42,7 @@ The config defaults in `config/config.yaml` currently target Anthropic (`llm.pro
 
 1. `main.py` loads `config/config.yaml` and `config/permissions.yaml`
 2. Opens the audit logger at `data/logs/audit.ndjson`
-3. Configures the memory tool (SQLite at `data/db/admino.db`) and files tool (allowed paths from config)
+3. Connects to PostgreSQL (via the `PG_*` env vars), runs migrations, and seeds settings/permissions; configures the files tool (allowed paths from config)
 4. Instantiates the LLM client for the configured `llm.provider` (Ollama / Anthropic / OpenAI), registers all tool handlers, freezes the registry
 5. Starts uvicorn on `0.0.0.0:8000` (single worker)
 
@@ -51,8 +51,8 @@ The config defaults in `config/config.yaml` currently target Anthropic (`llm.pro
 1. The PWA loads — click **Skip** on the token prompt (VPN auth mode needs no token)
 2. Type a message and press Enter
 3. The agent sends your message to the configured LLM provider, which may respond with tool calls
-4. Currently implemented tools: `memory.store/recall/list` and `files.read/list/search/write/move`
-5. Other tools (gmail, google_calendar, google_drive, outlook, outlook_calendar, onedrive, etc.) are not yet implemented — the agent handles those gracefully with a text-only response
+4. Implemented tools: `memory`, `files`, `gmail`, `google_calendar`, `google_drive`, `outlook`, `outlook_calendar`, and `onedrive` (the Google/Microsoft tools require an OAuth connection — see `oauth_setup.py`)
+5. Not yet implemented: `documents` (store/classify/OCR) and `search` (web search) — the agent handles calls to these gracefully with a text-only response
 
 ### Docker mode (optional)
 
@@ -65,7 +65,7 @@ ollama serve &
 ollama pull gemma4:12b
 cp .env.example .env
 # Edit config/config.yaml: llm.provider: "ollama", ollama_url: "http://host.docker.internal:11434"
-mkdir -p data/db data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
 make docker-build && make docker-up
 ```
 
@@ -74,7 +74,7 @@ make docker-build && make docker-up
 ```bash
 cp .env.example .env
 # Defaults already point at http://local-llm:11434 — no edits needed.
-mkdir -p data/db data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
 make docker-build BACKEND=ollama
 make docker-up BACKEND=ollama
 docker compose exec local-llm ollama pull gemma4:12b
@@ -85,7 +85,7 @@ docker compose exec local-llm ollama pull gemma4:12b
 ```bash
 cp .env.example .env
 # Edit config/config.yaml: set llm.provider: "openai" and openai_base_url: "http://local-llm:8000/v1"
-mkdir -p data/db data/logs data/tokens data/hf-cache ~/Downloads/admino
+mkdir -p data/postgres data/logs data/tokens data/hf-cache ~/Downloads/admino
 make docker-build BACKEND=vllm
 make docker-up BACKEND=vllm
 ```
@@ -96,7 +96,7 @@ make docker-up BACKEND=vllm
 cp .env.example .env
 # Set ANTHROPIC_API_KEY (or OPENAI_API_KEY) in .env.
 # Set llm.provider in config/config.yaml to "anthropic" or "openai".
-mkdir -p data/db data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
 make docker-build
 make docker-up
 ```
@@ -156,7 +156,7 @@ This section documents key decisions about where we use proven third-party libra
 | **httpx** | Async HTTP client (Ollama, Google APIs) | Best async HTTP client for Python. We don't reinvent HTTP. |
 | **pyyaml** | YAML config parsing | `yaml.safe_load()` is safe and standard. YAML is more readable than JSON for human-edited config. |
 | **cryptography** | Fernet encryption for OAuth tokens | Well-audited, widely-used. We never implement our own crypto. |
-| **aiosqlite** | Async SQLite (memory tool, documents) | Thin async wrapper around sqlite3. Required for non-blocking DB access in the async stack. |
+| **asyncpg** | Async PostgreSQL driver (settings, permissions, memory, documents) | Fastest async Postgres driver for Python. Native connection pooling and prepared statements. Required for non-blocking DB access in the async stack. |
 | **google-api-python-client** | Gmail, Google Calendar, Google Drive API access | Official Google SDK. |
 | **msal** | Microsoft OAuth2 (Outlook, Outlook Calendar, OneDrive) | Official Microsoft Authentication Library. Handles token acquisition and refresh for Microsoft Graph API. |
 | **Pillow** | Image processing for document OCR | Standard image library. |
@@ -257,6 +257,8 @@ admino/
     models.py          -- shared Pydantic models
     oauth.py           -- OAuth token management, Fernet encryption
     oauth_setup.py     -- CLI for one-time OAuth consent
+    database.py        -- PostgreSQL connection pool, migration runner, seed logic (asyncpg)
+    migrations/        -- SQL schema migrations
     tools/
       registry.py        -- tool registration + dispatch
       gmail.py           -- Gmail read/list/search (Google API)
@@ -268,7 +270,7 @@ admino/
       documents.py       -- Document store/classify/search/query + OCR (planned, not yet implemented)
       search.py          -- Web search (planned, not yet implemented)
       files.py           -- Local file read/list/search/write/move
-      memory.py          -- Persistent key-value notes (SQLite)
+      memory.py          -- Persistent key-value notes (PostgreSQL)
 ```
 
 ## Deviations from Specification
@@ -292,35 +294,27 @@ The following intentional deviations from the original product specification imp
 
 | # | Item | Files Needed | Priority |
 |---|------|-------------|----------|
-| 1 | **Tool modules: Gmail** — read, list, search via Google API | `tools/gmail.py` | P0 |
-| 2 | **Tool modules: Google Calendar** — read, list, create (with confirmation) via Google API | `tools/google_calendar.py` | P0 |
-| 3 | **Tool modules: Google Drive** — read, list, search, download (with confirmation) via Google API | `tools/google_drive.py` | P0 |
-| 4 | **Tool modules: Outlook** — read, list, search via Microsoft Graph API | `tools/outlook.py` | P0 |
-| 5 | **Tool modules: Outlook Calendar** — read, list, create (with confirmation) via Microsoft Graph API | `tools/outlook_calendar.py` | P0 |
-| 6 | **Tool modules: OneDrive** — read, list, search, download (with confirmation) via Microsoft Graph API | `tools/onedrive.py` | P0 |
-| 7 | **Tool modules: Documents** — store (OCR + LLM classification), search, query. SQLite schema from spec §3.4 | `tools/documents.py` | P1 |
-| 8 | **Tool modules: Web Search** — via SearXNG or Brave Search API | `tools/search.py` | P2 |
-| 9 | **Tool argument Pydantic models** — all tool arg schemas (Google, Microsoft, Documents, etc.) | `models.py` additions | P0 |
-| 13 | **SQLite schema initialization** — `CREATE TABLE documents(...)` and migration logic | `tools/documents.py` | P1 |
-| 14 | **Microsoft OAuth support** — MSAL-based token acquisition + refresh for Microsoft Graph API | `oauth.py`, `oauth_setup.py` | P0 |
+| 1 | **Tool modules: Documents** — store (OCR + LLM classification), search, query. The `documents` table already exists in the PostgreSQL migration | `tools/documents.py` | P1 |
+| 2 | **Tool modules: Web Search** — via SearXNG or Brave Search API | `tools/search.py` | P2 |
 
 ### Non-Blocking (required for v1 but not for basic operation)
 
 | # | Item | Details | Priority |
 |---|------|---------|----------|
-| 15 | **Tool-specific tests** | `test_gmail.py`, `test_google_calendar.py`, `test_google_drive.py`, `test_outlook.py`, `test_outlook_calendar.py`, `test_onedrive.py`, `test_documents.py`, `test_search.py` (files + memory done) | P1 |
-| 16 | **Health endpoint enrichment** | Add `model`, `ollama_reachable`, `uptime_s` to GET /health response | P2 |
-| 17 | **`DEPENDENCIES.md`** | Document every direct dependency with name, version, purpose, justification (§9.7) | P2 |
-| 18 | **`conftest.py` shared fixtures** | Mock Ollama, test config, test DB fixtures for test organization | P3 |
-| 19 | **Adversarial/security tests** | `tests/test_security.py` — prompt injection, SQL injection, path traversal, control chars (§12.2) | P1 |
-| 20 | **Integration tests** | Full request flow: POST message -> tool execution -> response; confirmation flow end-to-end | P1 |
+| 3 | **Tests for outstanding tools** | `test_documents.py`, `test_search.py` (once those tools land) | P1 |
+| 4 | **Health endpoint enrichment** | Add `model`, `ollama_reachable`, `uptime_s` to GET /health response | P2 |
+| 5 | **`DEPENDENCIES.md`** | Document every direct dependency with name, version, purpose, justification (§9.7) | P2 |
+| 6 | **`conftest.py` shared fixtures** | Mock Ollama, test config, test DB fixtures for test organization | P3 |
+| 7 | **Adversarial/security tests** | `tests/test_security.py` — prompt injection, SQL injection, path traversal, control chars (§12.2) | P1 |
+| 8 | **Integration tests** | Full request flow: POST message -> tool execution -> response; confirmation flow end-to-end | P1 |
 
 ### Currently Implemented
 
 - **Core infrastructure**: server.py, agent.py, llm.py, permissions.py, audit.py, config.py, models.py, main.py
-- **OAuth**: oauth.py (Fernet encryption, token refresh), oauth_setup.py (CLI consent flow)
+- **Database**: database.py (asyncpg connection pool, migration runner, seed logic), migrations/ (PostgreSQL schema)
+- **OAuth**: oauth.py (Fernet encryption, token refresh — Google + Microsoft/MSAL), oauth_setup.py (CLI consent flow)
 - **Tool registry**: tools/registry.py (registration, dispatch, permission enforcement)
-- **Tool modules**: tools/memory.py (SQLite key-value store), tools/files.py (path-validated file access)
+- **Tool modules**: tools/memory.py (PostgreSQL key-value store), tools/files.py (path-validated file access), and the OAuth-backed tools/gmail.py, tools/google_calendar.py, tools/google_drive.py, tools/outlook.py, tools/outlook_calendar.py, tools/onedrive.py
 - **PWA**: Vue 3 + Vite app in `static-src/`, built to `static/` (`index.html`, hashed JS/CSS bundles under `assets/`, `manifest.webmanifest`, `service-worker.js`, fonts, icons)
 - **DevOps**: Dockerfile, docker-compose.yml (base), docker-compose.ollama.yml + docker-compose.vllm.yml (provider overlays), entrypoint.sh (iptables egress whitelist), Makefile (BACKEND variable for overlay selection), .env.example, .gitignore, .dockerignore
 - **Tests**: backend pytest suite with coverage reporting (coverage gate enforced in CI)
