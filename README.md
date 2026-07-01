@@ -27,7 +27,7 @@ pip install -e ".[dev]"
 ollama serve &               # skip if Ollama is already running
 ollama pull gemma4:12b
 
-# 3. Create data directories + the single sandboxed documents dir
+# 3. Create data directories + the single sandboxed files dir
 mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
 
 # 4. Start the agent
@@ -52,7 +52,6 @@ The config defaults in `config/config.yaml` currently target Anthropic (`llm.pro
 2. Type a message and press Enter
 3. The agent sends your message to the configured LLM provider, which may respond with tool calls
 4. Implemented tools: `memory`, `files`, `gmail`, `google_calendar`, `google_drive`, `outlook`, `outlook_calendar`, and `onedrive` (the Google/Microsoft tools require an OAuth connection — see `oauth_setup.py`)
-5. Not yet implemented: `documents` (store/classify/OCR) and `search` (web search) — the agent handles calls to these gracefully with a text-only response
 
 ### Docker mode (optional)
 
@@ -156,11 +155,9 @@ This section documents key decisions about where we use proven third-party libra
 | **httpx** | Async HTTP client (Ollama, Google APIs) | Best async HTTP client for Python. We don't reinvent HTTP. |
 | **pyyaml** | YAML config parsing | `yaml.safe_load()` is safe and standard. YAML is more readable than JSON for human-edited config. |
 | **cryptography** | Fernet encryption for OAuth tokens | Well-audited, widely-used. We never implement our own crypto. |
-| **asyncpg** | Async PostgreSQL driver (settings, permissions, memory, documents) | Fastest async Postgres driver for Python. Native connection pooling and prepared statements. Required for non-blocking DB access in the async stack. |
+| **asyncpg** | Async PostgreSQL driver (settings, permissions, memory) | Fastest async Postgres driver for Python. Native connection pooling and prepared statements. Required for non-blocking DB access in the async stack. |
 | **google-api-python-client** | Gmail, Google Calendar, Google Drive API access | Official Google SDK. |
 | **msal** | Microsoft OAuth2 (Outlook, Outlook Calendar, OneDrive) | Official Microsoft Authentication Library. Handles token acquisition and refresh for Microsoft Graph API. |
-| **Pillow** | Image processing for document OCR | Standard image library. |
-| **beautifulsoup4 + lxml** | HTML parsing (web search result extraction) | Proven parsers, no reason to hand-roll HTML parsing. |
 
 ### Where We Write Custom Code (and Why)
 
@@ -231,7 +228,6 @@ This section documents key decisions about where we use proven third-party libra
 | LangChain, LangGraph, CrewAI, AutoGen, LlamaIndex | Abstract the agent loop. Our agent logic must be explicit and auditable. |
 | Flask, Django | Wrong framework. FastAPI is the approved web framework. |
 | python-telegram-bot, signalbot, slack-sdk | Third-party messaging platforms. All data would route through their servers. |
-| pytesseract | Our OCR call is a few lines of `subprocess.run` -- a dependency is not justified. |
 
 ## Project Structure
 
@@ -267,8 +263,6 @@ admino/
       outlook.py         -- Outlook mail read/list/search (Microsoft Graph)
       outlook_calendar.py -- Outlook Calendar read/list/create (Microsoft Graph)
       onedrive.py        -- OneDrive read/list/search/download (Microsoft Graph)
-      documents.py       -- Document store/classify/search/query + OCR (planned, not yet implemented)
-      search.py          -- Web search (planned, not yet implemented)
       files.py           -- Local file read/list/search/write/move
       memory.py          -- Persistent key-value notes (PostgreSQL)
 ```
@@ -294,7 +288,7 @@ The following intentional deviations from the original product specification imp
 
 | # | Item | Files Needed | Priority |
 |---|------|-------------|----------|
-| 1 | **Tool modules: Documents** — store (OCR + LLM classification), search, query. The `documents` table already exists in the PostgreSQL migration | `tools/documents.py` | P1 |
+| 1 | **Tool modules: Documents** — store (LLM-based extraction/classification), search, query. Will define its own schema migration when built | `tools/documents.py` | P1 |
 | 2 | **Tool modules: Web Search** — via SearXNG or Brave Search API | `tools/search.py` | P2 |
 
 ### Non-Blocking (required for v1 but not for basic operation)

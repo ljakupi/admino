@@ -256,20 +256,20 @@ class TestSeedSettings:
         conn.fetchval = AsyncMock(return_value=0)
 
         mock_config = MagicMock()
-        for section in ("server", "llm", "paths", "files", "limits", "egress", "ocr", "database"):
+        for section in ("server", "llm", "paths", "files", "limits", "egress", "database"):
             getattr(mock_config, section).model_dump = MagicMock(return_value={"key": "val"})
         mock_config.auth.model_dump = MagicMock(return_value={"mode": "vpn"})
         mock_config.log_level = "INFO"
 
         await db_mod.seed_settings(mock_pool, mock_config)
 
-        # 10 sections: server, llm, auth, paths, files, limits, egress, ocr, database, log_level
+        # 9 sections: server, llm, auth, paths, files, limits, egress, database, log_level
         insert_calls = [
             c
             for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
         ]
-        assert len(insert_calls) == 10
+        assert len(insert_calls) == 9
 
     async def test_skips_when_table_has_rows(self, mock_pool: MagicMock) -> None:
         """seed_settings() skips seeding when settings table already has rows."""
@@ -451,7 +451,6 @@ class TestLoadSettingsFromDb:
                 {"key": "files", "value": {}},
                 {"key": "limits", "value": {}},
                 {"key": "egress", "value": {}},
-                {"key": "ocr", "value": {}},
                 {"key": "database", "value": {}},
                 {"key": "log_level", "value": {"value": "INFO"}},
             ]

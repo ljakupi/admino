@@ -22,7 +22,7 @@ const isEmpty = computed(() => chatStore.thread.length === 0);
 
 const suggestions = [
   'Search my emails',
-  "What's in my documents?",
+  "What's on my calendar today?",
   'Find a file',
 ];
 

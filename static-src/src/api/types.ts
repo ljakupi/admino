@@ -160,9 +160,7 @@ export interface ToolsSettings {
   outlook: boolean;
   outlook_calendar: boolean;
   onedrive: boolean;
-  documents: boolean;
   files: boolean;
-  web_search: boolean;
   memory: boolean;
 }
 

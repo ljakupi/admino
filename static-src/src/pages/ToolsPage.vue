@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import {
-  Mail, Calendar, Folder, FileText, FolderOpen, Search, Brain, Link,
+  Mail, Calendar, Folder, FolderOpen, Brain, Link,
 } from 'lucide-vue-next';
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
@@ -89,9 +89,7 @@ function onMicrosoftServiceToggle(serviceId: string, enabled: boolean) {
 
 // --- Local tools metadata ---
 const LOCAL_TOOLS: { id: keyof ToolsSettings; name: string; description: string; icon: typeof Mail }[] = [
-  { id: 'documents', name: 'Documents', description: 'Store, classify, search, and query documents with OCR', icon: FileText },
   { id: 'files', name: 'Files', description: 'Read, list, search, and write local files', icon: FolderOpen },
-  { id: 'web_search', name: 'Web Search', description: 'Search the web for information', icon: Search },
   { id: 'memory', name: 'Memory', description: 'Persistent key-value notes', icon: Brain },
 ];
 
