@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,7 +64,6 @@ def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    config.paths.tokens_dir = Path("/tmp/test-tokens")  # noqa: S108
     if token is not None:
         config.auth.token = SecretStr(token)
     else:
@@ -99,9 +97,13 @@ def _conn_status(
     google: tuple[bool, bool] = (False, False),
     microsoft: tuple[bool, bool] = (False, False),
 ) -> Any:
-    """Build a fake get_connection_status returning (connected, healthy) per provider."""
+    """Build a fake async get_connection_status returning (connected, healthy) per provider.
 
-    def _side(_tokens_dir: Path, provider: str) -> tuple[bool, bool]:
+    GH-86: get_connection_status is now async and takes the asyncpg pool as
+    its first argument instead of a tokens directory.
+    """
+
+    async def _side(_pool: Any, provider: str) -> tuple[bool, bool]:
         return google if provider == "google" else microsoft
 
     return _side

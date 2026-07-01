@@ -9,15 +9,17 @@ The script:
 2. Prints the URL for the user to open in a browser.
 3. Prompts the user to paste the authorization code.
 4. Exchanges the auth code for access and refresh tokens.
-5. Encrypts the refresh token with Fernet and saves it to the tokens directory.
+5. Encrypts the refresh token with Fernet and persists it to PostgreSQL
+   (the ``oauth_tokens`` table) via an asyncpg pool.
 6. Prints a confirmation message.
 
 Security notes:
 - Client credentials and the Fernet key (OAUTH_ENCRYPTION_KEY) are read from
   environment variables only. They are never printed, logged, or stored in
-  plaintext on disk.
-- The access token obtained during setup is discarded — it is not written to disk.
-- The tokens directory is created with mode 0o700; the token file with mode 0o600.
+  plaintext.
+- The access token obtained during setup is discarded — it is never persisted.
+- Only the Fernet ciphertext of the refresh token is written to the database;
+  the plaintext refresh token never reaches the DB.
 """
 
 from __future__ import annotations
@@ -26,16 +28,17 @@ import asyncio
 import os
 import sys
 from datetime import UTC, datetime
-from pathlib import Path
+from urllib.parse import quote_plus
 
 import httpx
 
+from admino.database import close_pool, init_pool, run_migrations
 from admino.oauth import (
     GOOGLE_SCOPES,
     MICROSOFT_SCOPES,
     OAuthError,
     OAuthProvider,
-    TokenFile,
+    OAuthToken,
     build_google_consent_url,
     build_microsoft_consent_url,
     encrypt_refresh_token,
@@ -44,20 +47,38 @@ from admino.oauth import (
     save_token,
 )
 
-# Default tokens directory; overridable via TOKENS_DIR env var
-_DEFAULT_TOKENS_DIR: str = "/app/data/tokens"
-
 # Default redirect URI for the OAuth callback
 _DEFAULT_REDIRECT_URI: str = "http://localhost:8000/oauth/callback"
 
 
-def _get_tokens_dir() -> Path:
-    """Resolve the tokens directory from env var or default.
+def _build_dsn() -> str:
+    """Build a PostgreSQL DSN from the PG_* env vars, URL-encoding the password.
+
+    Mirrors ``admino.main._build_database_url``: PG_HOST defaults to
+    localhost, PG_PORT to 5432, PG_USER/PG_DATABASE to admino. PG_PASSWORD
+    is required; if it is missing an error is printed to stderr and the
+    process exits with code 1.
 
     Returns:
-        Absolute path to the tokens directory.
+        A ``postgresql://`` connection string.
+
+    Raises:
+        SystemExit: If PG_PASSWORD is not set.
     """
-    return Path(os.environ.get("TOKENS_DIR", _DEFAULT_TOKENS_DIR)).resolve()
+    password = os.environ.get("PG_PASSWORD")
+    if not password:
+        print(
+            "Error: PG_PASSWORD environment variable is not set.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    host = os.environ.get("PG_HOST", "localhost")
+    port = os.environ.get("PG_PORT", "5432")
+    user = os.environ.get("PG_USER", "admino")
+    database = os.environ.get("PG_DATABASE", "admino")
+
+    return f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
 
 
 def _get_redirect_uri() -> str:
@@ -82,15 +103,34 @@ def _get_redirect_uri() -> str:
     return uri
 
 
+async def _persist_token(token: OAuthToken) -> None:
+    """Open a pool, run migrations, save the token, and close the pool.
+
+    Args:
+        token: The OAuthToken to persist (encrypted refresh token).
+
+    Raises:
+        SystemExit: If PG_PASSWORD is missing.
+        OAuthError: If the save fails.
+    """
+    dsn = _build_dsn()
+    pool = await init_pool(dsn)
+    try:
+        await run_migrations(pool)
+        await save_token(pool, token)
+    finally:
+        await close_pool()
+
+
 async def _run_google_setup() -> None:
     """Execute the Google OAuth setup flow.
 
     Raises:
         OAuthError: If any step of the OAuth flow fails.
-        SystemExit: On user cancellation (KeyboardInterrupt, EOF).
+        SystemExit: On user cancellation (KeyboardInterrupt, EOF) or
+            missing PG_PASSWORD.
     """
     redirect_uri = _get_redirect_uri()
-    tokens_dir = _get_tokens_dir()
 
     # Step 1-2: Build and display consent URL
     try:
@@ -143,24 +183,29 @@ async def _run_google_setup() -> None:
     # Auth code is single-use and no longer needed — discard immediately
     del code
 
-    # Step 5: Encrypt and save the refresh token
+    # Step 5: Encrypt the refresh token and persist it to the database
     try:
         encrypted = encrypt_refresh_token(refresh_token)
     except OAuthError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Plaintext tokens are no longer needed — discard before any await/exit
+    # so they do not linger as live locals across suspension points.
+    del access_token, refresh_token
+
     now = datetime.now(UTC)
-    token_file = TokenFile(
+    token = OAuthToken(
         provider="google",
         scopes=scopes if scopes else GOOGLE_SCOPES,
         encrypted_refresh_token=encrypted,
+        email=None,
         created_at=now,
         last_refreshed_at=now,
     )
 
     try:
-        save_token(tokens_dir, token_file)
+        await _persist_token(token)
     except OAuthError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -168,10 +213,9 @@ async def _run_google_setup() -> None:
     # Step 6: Confirmation
     print()
     print("Google OAuth setup complete.")
-    print(f"Encrypted refresh token saved to: {tokens_dir / 'google.json'}")
-    print(f"Scopes granted: {', '.join(token_file.scopes)}")
+    print("Encrypted refresh token saved to database.")
+    print(f"Scopes granted: {', '.join(token.scopes)}")
     print()
-    del access_token, refresh_token
 
 
 async def _run_microsoft_setup() -> None:
@@ -179,10 +223,10 @@ async def _run_microsoft_setup() -> None:
 
     Raises:
         OAuthError: If any step of the OAuth flow fails.
-        SystemExit: On user cancellation (KeyboardInterrupt, EOF).
+        SystemExit: On user cancellation (KeyboardInterrupt, EOF) or
+            missing PG_PASSWORD.
     """
     redirect_uri = _get_redirect_uri()
-    tokens_dir = _get_tokens_dir()
 
     # Step 1-2: Build and display consent URL
     try:
@@ -234,24 +278,29 @@ async def _run_microsoft_setup() -> None:
 
     del code
 
-    # Step 5: Encrypt and save the refresh token
+    # Step 5: Encrypt the refresh token and persist it to the database
     try:
         encrypted = encrypt_refresh_token(refresh_token)
     except OAuthError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    # Plaintext tokens are no longer needed — discard before any await/exit
+    # so they do not linger as live locals across suspension points.
+    del access_token, refresh_token
+
     now = datetime.now(UTC)
-    token_file = TokenFile(
+    token = OAuthToken(
         provider="microsoft",
         scopes=scopes if scopes else MICROSOFT_SCOPES,
         encrypted_refresh_token=encrypted,
+        email=None,
         created_at=now,
         last_refreshed_at=now,
     )
 
     try:
-        save_token(tokens_dir, token_file)
+        await _persist_token(token)
     except OAuthError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -259,10 +308,9 @@ async def _run_microsoft_setup() -> None:
     # Step 6: Confirmation
     print()
     print("Microsoft OAuth setup complete.")
-    print(f"Encrypted refresh token saved to: {tokens_dir / 'microsoft.json'}")
-    print(f"Scopes granted: {', '.join(token_file.scopes)}")
+    print("Encrypted refresh token saved to database.")
+    print(f"Scopes granted: {', '.join(token.scopes)}")
     print()
-    del access_token, refresh_token
 
 
 def main() -> None:

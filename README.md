@@ -28,7 +28,7 @@ ollama serve &               # skip if Ollama is already running
 ollama pull gemma4:12b
 
 # 3. Create data directories + the single sandboxed files dir
-mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs ~/Downloads/admino
 
 # 4. Start the agent
 make run
@@ -64,7 +64,7 @@ ollama serve &
 ollama pull gemma4:12b
 cp .env.example .env
 # Edit config/config.yaml: llm.provider: "ollama", ollama_url: "http://host.docker.internal:11434"
-mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build && make docker-up
 ```
 
@@ -73,7 +73,7 @@ make docker-build && make docker-up
 ```bash
 cp .env.example .env
 # Defaults already point at http://local-llm:11434 — no edits needed.
-mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build BACKEND=ollama
 make docker-up BACKEND=ollama
 docker compose exec local-llm ollama pull gemma4:12b
@@ -84,7 +84,7 @@ docker compose exec local-llm ollama pull gemma4:12b
 ```bash
 cp .env.example .env
 # Edit config/config.yaml: set llm.provider: "openai" and openai_base_url: "http://local-llm:8000/v1"
-mkdir -p data/postgres data/logs data/tokens data/hf-cache ~/Downloads/admino
+mkdir -p data/postgres data/logs data/hf-cache ~/Downloads/admino
 make docker-build BACKEND=vllm
 make docker-up BACKEND=vllm
 ```
@@ -95,7 +95,7 @@ make docker-up BACKEND=vllm
 cp .env.example .env
 # Set ANTHROPIC_API_KEY (or OPENAI_API_KEY) in .env.
 # Set llm.provider in config/config.yaml to "anthropic" or "openai".
-mkdir -p data/postgres data/logs data/tokens ~/Downloads/admino
+mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build
 make docker-up
 ```
