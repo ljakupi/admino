@@ -20,20 +20,16 @@ COPY src/ src/
 RUN pip install --no-cache-dir --prefix=/install ".[all-providers]"
 
 # -------------------------------------------------------------------
-# Stage 2: runtime — minimal image with Tesseract + non-root user
+# Stage 2: runtime — minimal image with a non-root user
 # -------------------------------------------------------------------
 FROM python:3.12.8-slim AS runtime
 
 # Install system runtime dependencies
 # iptables: egress whitelist enforcement in entrypoint.sh (requires NET_ADMIN cap)
-# tesseract-ocr: called via subprocess.run for OCR on uploaded images (SEC-20 compliant)
-# tesseract-ocr-eng: English language data for Tesseract
 # curl: used by healthcheck only; not available to application code
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         iptables \
-        tesseract-ocr \
-        tesseract-ocr-eng \
         curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*

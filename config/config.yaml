@@ -45,7 +45,6 @@ paths:
   # Docker: these are overridden by volume mounts at /app/data/*.
   audit_log: "data/logs/audit.ndjson"
   tokens: "data/tokens"
-  # images: "data/images"  # Added when the documents tool lands.
 
 files:
   allowed_paths:
@@ -77,8 +76,3 @@ egress:
     # Uncomment when using proprietary LLM providers:
     - "api.anthropic.com"
     # - "api.openai.com"
-
-
-ocr:
-  binary: "/usr/bin/tesseract"
-  languages: ["eng"]

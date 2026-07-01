@@ -24,7 +24,6 @@ from admino.config import (
     EgressConfig,
     LimitsConfig,
     LLMConfig,
-    OcrConfig,
     PathsConfig,
     ServerConfig,
     load_app_config,
@@ -80,7 +79,6 @@ class TestValidConfigLoading:
               mode: "token"
             paths:
               audit_log: "/data/audit.jsonl"
-              images: "/data/images"
               tokens_dir: "/data/tokens"
             limits:
               max_tool_calls_per_message: 5
@@ -91,11 +89,6 @@ class TestValidConfigLoading:
             egress:
               allowed_hosts:
                 - "example.com"
-            ocr:
-              binary: "/usr/local/bin/tesseract"
-              languages:
-                - "eng"
-                - "deu"
             log_level: "DEBUG"
             """,
         )
@@ -116,12 +109,8 @@ class TestValidConfigLoading:
         assert config.limits.max_message_length == 2000
         assert config.limits.max_context_messages == 10
         assert config.egress.allowed_hosts == ["example.com"]
-        assert config.ocr.languages == ["eng", "deu"]
         assert config.log_level == "DEBUG"
-        assert config.paths.images.is_absolute()
-        assert str(config.paths.images).endswith("images")
         assert str(config.paths.tokens_dir).endswith("tokens")
-        assert config.ocr.binary.is_absolute()
 
 
 # ---------------------------------------------------------------------------
@@ -331,28 +320,13 @@ class TestPathResolution:
             """\
             paths:
               audit_log: "relative/audit.jsonl"
-              images: "relative/images"
               tokens_dir: "relative/tokens"
             """,
         )
         config = load_app_config(yaml_path)
 
         assert config.paths.audit_log.is_absolute()
-        assert config.paths.images.is_absolute()
         assert config.paths.tokens_dir.is_absolute()
-        # ocr.binary is validated separately — must be under a safe prefix
-
-    def test_ocr_binary_default_is_absolute(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Default OCR binary path is absolute and under a safe prefix."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
-        config = load_app_config(yaml_path)
-        assert config.ocr.binary.is_absolute()
-        assert str(config.ocr.binary).startswith(
-            ("/usr/bin/", "/usr/local/bin/", "/opt/homebrew/bin/")
-        )
 
     def test_absolute_paths_stay_absolute(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -405,12 +379,12 @@ class TestPermissionsLoading:
             tmp_path / "permissions.yaml",
             """\
             tools:
-              documents:
+              files:
                 search: deny
             """,
         )
         config = load_permissions_config(yaml_path)
-        assert config.tools["documents"].actions["search"] == "deny"
+        assert config.tools["files"].actions["search"] == "deny"
 
 
 # ---------------------------------------------------------------------------
@@ -641,7 +615,6 @@ class TestSubModelsPresent:
         assert isinstance(config.paths, PathsConfig)
         assert isinstance(config.limits, LimitsConfig)
         assert isinstance(config.egress, EgressConfig)
-        assert isinstance(config.ocr, OcrConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -702,35 +675,46 @@ class TestPermissionsYamlEdgeCases:
             load_permissions_config(yaml_path)
 
 
-class TestOcrConfigValidation:
-    """OcrConfig language validation edge cases."""
+class TestUnimplementedToolScaffoldingRemoved:
+    """The OCR/documents config scaffolding for unimplemented tools is gone (GH-84)."""
 
-    def test_empty_language_code_raises(self) -> None:
-        """An empty language code string raises ValidationError."""
-        with pytest.raises(ValidationError, match="Invalid language code"):
-            OcrConfig(languages=[""])
+    def test_ocrconfig_symbol_removed(self) -> None:
+        """OcrConfig no longer exists in admino.config."""
+        import admino.config as config_module
 
-    def test_too_long_language_code_raises(self) -> None:
-        """A language code exceeding 10 characters raises ValidationError."""
-        with pytest.raises(ValidationError, match="Invalid language code"):
-            OcrConfig(languages=["x" * 11])
+        assert not hasattr(config_module, "OcrConfig")
 
-    def test_valid_languages_accepted(self) -> None:
-        """Valid language codes pass validation."""
-        config = OcrConfig(languages=["eng", "deu", "fra"])
-        assert config.languages == ["eng", "deu", "fra"]
+    def test_appconfig_has_no_ocr_field(self) -> None:
+        """AppConfig no longer carries an ocr section."""
+        assert "ocr" not in AppConfig.model_fields
 
-    def test_language_code_shell_chars_rejected(self) -> None:
-        """Language codes with shell metacharacters are rejected."""
-        with pytest.raises(ValidationError, match="letters, digits"):
-            OcrConfig(languages=["eng;rm"])
+    def test_pathsconfig_has_no_images_field(self) -> None:
+        """PathsConfig no longer carries the document-images path."""
+        assert "images" not in PathsConfig.model_fields
 
-    def test_ocr_symlink_outside_safe_prefix_rejected(self, tmp_path: Path) -> None:
-        """A symlink under a non-safe prefix is rejected even if it points to a safe target."""
-        link = tmp_path / "tesseract"
-        link.symlink_to("/tmp/evil")  # noqa: S108
-        with pytest.raises(ValidationError, match="safe prefix"):
-            OcrConfig(binary=link)
+    def test_leftover_ocr_and_images_db_settings_are_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DB seeded before GH-84 (stale ocr row + paths.images) still loads.
+
+        Pydantic ignores unknown keys, so an existing deployment with leftover
+        ``ocr``/``images`` settings must not fail config validation.
+        """
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            """\
+            paths:
+              audit_log: "/data/audit.jsonl"
+              images: "/data/images"
+            ocr:
+              binary: "/usr/bin/tesseract"
+              languages: ["eng"]
+            """,
+        )
+        config = load_app_config(yaml_path)
+        assert not hasattr(config, "ocr")
+        assert not hasattr(config.paths, "images")
 
 
 class TestServerConfigValidation:
@@ -1196,7 +1180,6 @@ class TestLoadAppConfigFromDb:
             "files": {},
             "limits": {},
             "egress": {},
-            "ocr": {},
             "database": {},
             "log_level": "INFO",
         }
@@ -1221,7 +1204,6 @@ class TestLoadAppConfigFromDb:
             "files": {},
             "limits": {},
             "egress": {},
-            "ocr": {},
             "database": {},
             "log_level": "INFO",
         }

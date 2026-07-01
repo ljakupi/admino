@@ -94,24 +94,6 @@ const TOOL_META: Record<string, { label: string; description: string; actions: R
       delete: 'Delete a file',
     },
   },
-  documents: {
-    label: 'Documents',
-    description: 'Private document store, scanned & indexed',
-    actions: {
-      store: 'Store a new document',
-      classify: 'Auto-classify a document',
-      search: 'Search stored documents',
-      query: 'Query document contents',
-      delete: 'Delete a document',
-    },
-  },
-  web_search: {
-    label: 'Web Search',
-    description: 'Search the web for information',
-    actions: {
-      search: 'Run a web search query',
-    },
-  },
   files: {
     label: 'Files',
     description: 'Local files under ~/Downloads/admino',

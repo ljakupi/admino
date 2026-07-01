@@ -296,10 +296,6 @@ class PathsConfig(BaseModel):
         default=Path("/app/data/logs/audit.ndjson"),
         description="Path to the append-only NDJSON audit log.",
     )
-    images: Path = Field(
-        default=Path("/app/data/images"),
-        description="Directory for uploaded document images.",
-    )
     tokens_dir: Path = Field(
         default=Path("/app/data/tokens"),
         description="Directory for encrypted OAuth refresh tokens.",
@@ -393,79 +389,6 @@ class EgressConfig(BaseModel):
         return v
 
 
-# SECURITY: Do not add entries without a security review. Each prefix expands
-# the set of directories from which the OCR binary may be loaded. An overly
-# broad prefix (e.g. "/tmp/") would allow binary substitution attacks.
-_SAFE_BINARY_PREFIXES: tuple[str, ...] = (
-    "/usr/bin/",
-    "/usr/local/bin/",
-    "/opt/homebrew/bin/",
-)
-
-
-class OcrConfig(BaseModel):
-    """OCR (Tesseract) configuration."""
-
-    binary: Path = Field(
-        default=Path("/usr/bin/tesseract"),
-        description="Path to the Tesseract binary. Must reside under a known-safe prefix.",
-    )
-    languages: list[str] = Field(
-        default_factory=lambda: ["eng"],
-        description="Language codes for Tesseract OCR.",
-    )
-
-    @field_validator("binary")
-    @classmethod
-    def validate_binary_path(cls, v: Path) -> Path:
-        """Restrict the Tesseract binary to known-safe directory prefixes.
-
-        Prevents an operator-supplied config from redirecting the OCR binary
-        to an arbitrary executable (e.g. /tmp/evil-tesseract).
-
-        Both the unresolved and resolved paths must reside under a safe prefix
-        to prevent symlink laundering (e.g. /tmp/tess -> /usr/bin/tesseract).
-        """
-        # Check unresolved path is also under a safe prefix (prevents symlink laundering)
-        if not any(str(v).startswith(prefix) for prefix in _SAFE_BINARY_PREFIXES):
-            msg = "OcrConfig.binary must reside under a safe prefix before and after resolution."
-            raise ValueError(msg)
-        resolved = v.resolve()
-        if not any(str(resolved).startswith(prefix) for prefix in _SAFE_BINARY_PREFIXES):
-            msg = "OcrConfig.binary resolves outside safe prefixes."
-            raise ValueError(msg)
-        # Warn if the binary does not exist yet (may not be installed on every dev machine).
-        # In production, a missing binary is a hard error.
-        if not resolved.is_file():
-            if os.environ.get("ADMINO_ENV", "").lower() == "production":
-                msg = (
-                    "OCR binary does not exist at the resolved path and "
-                    "ADMINO_ENV=production. Tesseract must be installed."
-                )
-                raise ValueError(msg)
-            logger.warning(
-                "OCR binary does not exist at the resolved path. "
-                "Tesseract may not be installed on this machine."
-            )
-        return resolved
-
-    @field_validator("languages")
-    @classmethod
-    def validate_languages(cls, v: list[str]) -> list[str]:
-        """Ensure language codes are reasonable and contain no shell metacharacters."""
-        for lang in v:
-            if not lang or len(lang) > 10:
-                msg = f"Invalid language code: '{lang}'. Must be 1-10 characters."
-                raise ValueError(msg)
-            if not re.match(r"^[a-zA-Z0-9_-]+$", lang):
-                msg = (
-                    "Invalid language code: must contain only"
-                    " letters, digits, underscores, and hyphens."
-                )
-                raise ValueError(msg)
-        return v
-
-
 class DatabaseConfig(BaseModel):
     """PostgreSQL connection pool settings."""
 
@@ -524,7 +447,6 @@ class AppConfig(BaseModel):
     files: FilesConfig = Field(default_factory=FilesConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
-    ocr: OcrConfig = Field(default_factory=OcrConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO",
@@ -535,9 +457,7 @@ class AppConfig(BaseModel):
     def resolve_paths(self) -> AppConfig:
         """Ensure all path fields are absolute."""
         self.paths.audit_log = self.paths.audit_log.resolve()
-        self.paths.images = self.paths.images.resolve()
         self.paths.tokens_dir = self.paths.tokens_dir.resolve()
-        # ocr.binary is already resolved in OcrConfig.validate_binary_path
         return self
 
     @model_validator(mode="after")
