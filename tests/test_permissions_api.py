@@ -16,7 +16,6 @@ Security notes:
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -70,7 +69,6 @@ def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    config.paths.tokens_dir = Path("/tmp/test-tokens")  # noqa: S108
     if token is not None:
         config.auth.token = SecretStr(token)
     else:

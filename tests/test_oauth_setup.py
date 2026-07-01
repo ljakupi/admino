@@ -1,15 +1,23 @@
 """Tests for the OAuth setup CLI module (admino.oauth_setup).
 
-Covers the full consent flow (happy path), environment variable handling,
-user input edge cases, error handling for each OAuth step, and security
-checks that plaintext tokens are never leaked to stdout or disk.
+GH-86: the CLI now persists the encrypted refresh token to PostgreSQL
+instead of an on-disk file. It builds a DSN from the PG_* env vars,
+opens an asyncpg pool via ``admino.database.init_pool``, runs migrations,
+then calls the async ``save_token(pool, token)``.
+
+Covers the full consent flow (happy path), PG env var handling
+(missing PG_PASSWORD must error), user input edge cases, per-step error
+handling, and security checks that plaintext tokens never reach stdout.
+
+Security notes:
+- All OAuth/network/DB dependencies are mocked — no real API or DB calls.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
+from contextlib import ExitStack
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -38,6 +46,16 @@ _FAKE_MS_SCOPES: list[str] = [
 _FAKE_AUTH_CODE: str = "4/0AX4XfWh-test-auth-code"
 
 
+@pytest.fixture()
+def pg_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set the PG_* env vars needed to build a DSN, including PG_PASSWORD."""
+    monkeypatch.setenv("PG_HOST", "localhost")
+    monkeypatch.setenv("PG_PORT", "5432")
+    monkeypatch.setenv("PG_USER", "admino")
+    monkeypatch.setenv("PG_DATABASE", "admino")
+    monkeypatch.setenv("PG_PASSWORD", "s3cr3t/p@ss")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -45,30 +63,44 @@ _FAKE_AUTH_CODE: str = "4/0AX4XfWh-test-auth-code"
 
 def _patch_setup_deps(
     *,
-    consent_url: str = _FAKE_CONSENT_URL,
+    provider: str = "google",
+    consent_url: str | None = None,
     exchange_return: tuple[str, str, list[str]] | None = None,
     encrypted: str = _FAKE_ENCRYPTED,
     build_side_effect: Exception | None = None,
     exchange_side_effect: Exception | None = None,
     encrypt_side_effect: Exception | None = None,
     save_side_effect: Exception | None = None,
-) -> tuple[AsyncMock, ...]:
-    """Create mocks for all oauth functions used by oauth_setup.
+) -> dict[str, Any]:
+    """Build patchers for all oauth_setup dependencies.
 
-    Returns (mock_build, mock_exchange, mock_encrypt, mock_save).
+    Returns a dict of context managers keyed by role, so tests can enter
+    them and inspect the resulting mocks. ``init_pool`` and ``run_migrations``
+    are mocked so no real DB connection is attempted.
     """
-    # build_consent_url now returns (url, state) tuple
-    build_return = (consent_url, _FAKE_STATE)
+    if provider == "google":
+        build_target = "admino.oauth_setup.build_google_consent_url"
+        exchange_target = "admino.oauth_setup.exchange_google_code"
+        default_url = _FAKE_CONSENT_URL
+        default_scopes = list(_FAKE_SCOPES)
+    else:
+        build_target = "admino.oauth_setup.build_microsoft_consent_url"
+        exchange_target = "admino.oauth_setup.exchange_microsoft_code"
+        default_url = _FAKE_MS_CONSENT_URL
+        default_scopes = list(_FAKE_MS_SCOPES)
+
+    url = consent_url if consent_url is not None else default_url
+    build_return = (url, _FAKE_STATE)
     mock_build = (
-        patch("admino.oauth_setup.build_google_consent_url", side_effect=build_side_effect)
+        patch(build_target, side_effect=build_side_effect)
         if build_side_effect
-        else patch("admino.oauth_setup.build_google_consent_url", return_value=build_return)
+        else patch(build_target, return_value=build_return)
     )
 
     if exchange_return is None:
-        exchange_return = (_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, list(_FAKE_SCOPES))
+        exchange_return = (_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, default_scopes)
     mock_exchange = patch(
-        "admino.oauth_setup.exchange_google_code",
+        exchange_target,
         new_callable=AsyncMock,
         side_effect=exchange_side_effect,
         return_value=exchange_return if not exchange_side_effect else None,
@@ -82,33 +114,54 @@ def _patch_setup_deps(
 
     mock_save = patch(
         "admino.oauth_setup.save_token",
+        new_callable=AsyncMock,
         side_effect=save_side_effect,
     )
 
-    return mock_build, mock_exchange, mock_encrypt, mock_save
+    mock_init_pool = patch(
+        "admino.oauth_setup.init_pool",
+        new_callable=AsyncMock,
+        return_value=MagicMock(),
+    )
+    mock_run_migrations = patch(
+        "admino.oauth_setup.run_migrations",
+        new_callable=AsyncMock,
+    )
+
+    return {
+        "build": mock_build,
+        "exchange": mock_exchange,
+        "encrypt": mock_encrypt,
+        "save": mock_save,
+        "init_pool": mock_init_pool,
+        "run_migrations": mock_run_migrations,
+    }
+
+
+def _enter_all(stack: ExitStack, patchers: dict[str, Any]) -> dict[str, Any]:
+    """Enter every patcher and return the entered mocks by role."""
+    return {role: stack.enter_context(p) for role, p in patchers.items()}
 
 
 # ---------------------------------------------------------------------------
-# 1. Happy path: full end-to-end flow
+# 1. Happy path: full end-to-end flow (Google)
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pg_env")
 class TestHappyPath:
-    """Full setup flow with all deps mocked."""
+    """Full Google setup flow with all deps mocked."""
+
+    pytestmark = pytest.mark.asyncio
 
     async def test_full_flow_prints_confirmation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Successful flow prints consent URL and confirmation message."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
@@ -118,59 +171,79 @@ class TestHappyPath:
         assert "OAuth setup complete" in captured.out
 
     async def test_build_consent_url_called_with_redirect_uri(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """build_consent_url receives the correct redirect URI."""
         redirect = "http://custom:9999/callback"
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setenv("OAUTH_REDIRECT_URI", redirect)
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build as mb, mock_exchange, mock_encrypt, mock_save:
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
 
-        mb.assert_called_once_with(redirect)
+        mocks["build"].assert_called_once_with(redirect)
 
-    async def test_save_token_called_with_tokens_dir(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
+    async def test_save_token_called_with_pool_and_token(
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """save_token is called with the resolved tokens directory."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
+        """save_token is called with the pool and an OAuthToken for google."""
+        from admino.oauth import OAuthToken
+
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save as ms:
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
 
-        call_args = ms.call_args
-        assert call_args is not None
-        saved_dir = call_args[0][0]
-        assert saved_dir == tmp_path.resolve()
+        call = mocks["save"].call_args
+        assert call is not None
+        pool_arg, token_arg = call.args[0], call.args[1]
+        assert pool_arg is mocks["init_pool"].return_value
+        assert isinstance(token_arg, OAuthToken)
+        assert token_arg.provider == "google"
+
+    async def test_init_pool_and_migrations_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The pool is initialised and migrations are run before saving."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps())
+            from admino.oauth_setup import _run_google_setup
+
+            await _run_google_setup()
+
+        mocks["init_pool"].assert_awaited_once()
+        mocks["run_migrations"].assert_awaited_once()
+
+    async def test_dsn_url_encodes_pg_password(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The DSN passed to init_pool URL-encodes the PG_PASSWORD."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps())
+            from admino.oauth_setup import _run_google_setup
+
+            await _run_google_setup()
+
+        dsn = mocks["init_pool"].call_args.args[0]
+        # The raw password contains "/" and "@" which must be percent-encoded,
+        # so the literal secret must not appear verbatim in the DSN.
+        assert "s3cr3t/p@ss" not in dsn
+        assert "s3cr3t%2Fp%40ss" in dsn
 
     async def test_scopes_listed_in_confirmation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Confirmation output lists the granted scopes."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
@@ -178,52 +251,57 @@ class TestHappyPath:
         captured = capsys.readouterr()
         assert "gmail.modify" in captured.out
 
-    async def test_token_file_path_shown_in_confirmation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+
+# ---------------------------------------------------------------------------
+# 2. PG env var handling — missing PG_PASSWORD must error
+# ---------------------------------------------------------------------------
+
+
+class TestPgEnvVars:
+    """Missing PG_PASSWORD errors out before any DB work."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_missing_pg_password_exits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """Confirmation output shows the token file path."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
+        """No PG_PASSWORD prints an error to stderr and exits with code 1."""
+        monkeypatch.delenv("PG_PASSWORD", raising=False)
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
+        assert exc_info.value.code == 1
         captured = capsys.readouterr()
-        assert "google.json" in captured.out
+        assert "PG_PASSWORD" in captured.err
+
+    async def test_missing_pg_password_does_not_save(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When PG_PASSWORD is missing, save_token is never called."""
+        monkeypatch.delenv("PG_PASSWORD", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps())
+            from admino.oauth_setup import _run_google_setup
+
+            with pytest.raises(SystemExit):
+                await _run_google_setup()
+
+        mocks["save"].assert_not_called()
 
 
 # ---------------------------------------------------------------------------
-# 2. Environment variable handling
+# 3. OAUTH_REDIRECT_URI handling
 # ---------------------------------------------------------------------------
 
 
-class TestEnvironmentVariables:
-    """TOKENS_DIR and OAUTH_REDIRECT_URI env var behavior."""
-
-    def test_tokens_dir_env_overrides_default(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """TOKENS_DIR env var overrides the default /app/data/tokens."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path / "custom_tokens"))
-        from admino.oauth_setup import _get_tokens_dir
-
-        result = _get_tokens_dir()
-        assert result == (tmp_path / "custom_tokens").resolve()
-
-    def test_tokens_dir_default_when_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Default tokens dir is /app/data/tokens when TOKENS_DIR is not set."""
-        monkeypatch.delenv("TOKENS_DIR", raising=False)
-        from admino.oauth_setup import _get_tokens_dir
-
-        result = _get_tokens_dir()
-        assert result == Path("/app/data/tokens").resolve()
+class TestRedirectUri:
+    """OAUTH_REDIRECT_URI env var behavior."""
 
     def test_redirect_uri_env_overrides_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """OAUTH_REDIRECT_URI env var overrides the default."""
@@ -241,121 +319,85 @@ class TestEnvironmentVariables:
 
 
 # ---------------------------------------------------------------------------
-# 3. User input handling
+# 4. User input handling
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pg_env")
 class TestUserInputHandling:
     """Edge cases for the authorization code input prompt."""
 
+    pytestmark = pytest.mark.asyncio
+
     async def test_empty_auth_code_exits_with_error(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """Empty authorization code prints error and exits with code 1."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: "")
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "No authorization code" in captured.err
 
     async def test_whitespace_only_auth_code_exits_with_error(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Whitespace-only authorization code treated as empty."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: "   \t  ")
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
 
     async def test_keyboard_interrupt_exits_with_cancellation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """KeyboardInterrupt during input prints cancellation and exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
 
         def raise_keyboard_interrupt(_prompt: str) -> str:
             raise KeyboardInterrupt
 
         monkeypatch.setattr("builtins.input", raise_keyboard_interrupt)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "cancelled" in captured.err.lower()
 
     async def test_eof_error_exits_with_cancellation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """EOFError during input prints cancellation and exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
 
         def raise_eof(_prompt: str) -> str:
             raise EOFError
 
         monkeypatch.setattr("builtins.input", raise_eof)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
@@ -363,150 +405,114 @@ class TestUserInputHandling:
 
 
 # ---------------------------------------------------------------------------
-# 4. Error handling for each OAuth step
+# 5. Error handling for each OAuth step
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pg_env")
 class TestErrorHandling:
     """Each OAuth step failure prints error to stderr and exits with code 1."""
 
+    pytestmark = pytest.mark.asyncio
+
     async def test_build_consent_url_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """OAuthError from build_consent_url prints error and exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps(
-            build_side_effect=OAuthError("GOOGLE_CLIENT_ID not set"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(
+                stack,
+                _patch_setup_deps(build_side_effect=OAuthError("GOOGLE_CLIENT_ID not set")),
+            )
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "GOOGLE_CLIENT_ID not set" in captured.err
 
     async def test_exchange_code_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """OAuthError from exchange_code prints error and exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps(
-            exchange_side_effect=OAuthError("Token exchange failed"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(
+                stack,
+                _patch_setup_deps(exchange_side_effect=OAuthError("Token exchange failed")),
+            )
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "Token exchange failed" in captured.err
 
     async def test_encrypt_refresh_token_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """OAuthError from encrypt_refresh_token prints error and exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps(
-            encrypt_side_effect=OAuthError("Encryption key missing"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(
+                stack,
+                _patch_setup_deps(encrypt_side_effect=OAuthError("Encryption key missing")),
+            )
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "Encryption key missing" in captured.err
 
     async def test_save_token_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """OAuthError from save_token prints error and exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps(
-            save_side_effect=OAuthError("Failed to write token file"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
+        with ExitStack() as stack:
+            _enter_all(
+                stack,
+                _patch_setup_deps(save_side_effect=OAuthError("Failed to persist token")),
+            )
             from admino.oauth_setup import _run_google_setup
 
-            await _run_google_setup()
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_google_setup()
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
-        assert "Failed to write token file" in captured.err
+        assert "Failed to persist token" in captured.err
 
 
 # ---------------------------------------------------------------------------
-# 5. Security / adversarial
+# 6. Security / adversarial — tokens never leak to stdout
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.usefixtures("pg_env")
 class TestSecurityTokenLeakage:
     """Verify plaintext tokens never appear in stdout output."""
 
+    pytestmark = pytest.mark.asyncio
+
     async def test_access_token_not_in_stdout(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """The access token must never appear in stdout output."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
@@ -516,18 +522,13 @@ class TestSecurityTokenLeakage:
         assert _FAKE_ACCESS_TOKEN not in captured.err
 
     async def test_refresh_token_not_in_stdout(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """The plaintext refresh token must never appear in stdout output."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
@@ -536,61 +537,274 @@ class TestSecurityTokenLeakage:
         assert _FAKE_REFRESH_TOKEN not in captured.out
         assert _FAKE_REFRESH_TOKEN not in captured.err
 
-    async def test_del_tokens_reached_on_success(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        """After successful setup, the function completes (del is reached).
-
-        The ``del access_token, refresh_token`` statement is at the end of
-        _run_google_setup. If we reach the end without error, the del was executed.
-        We verify this indirectly by confirming no exception is raised and
-        the function returns normally.
-        """
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
-            from admino.oauth_setup import _run_google_setup
-
-            # Should complete without error — del statement is reached
-            await _run_google_setup()
-
     async def test_encrypted_token_saved_not_plaintext(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """save_token receives the encrypted value, not plaintext."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
         monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
 
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save as ms:
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps())
             from admino.oauth_setup import _run_google_setup
 
             await _run_google_setup()
 
-        call_args = ms.call_args
-        assert call_args is not None
-        token_file = call_args[0][1]
-        assert token_file.encrypted_refresh_token == _FAKE_ENCRYPTED
-        assert _FAKE_REFRESH_TOKEN not in token_file.encrypted_refresh_token
+        token = mocks["save"].call_args.args[1]
+        assert token.encrypted_refresh_token == _FAKE_ENCRYPTED
+        assert _FAKE_REFRESH_TOKEN not in token.encrypted_refresh_token
 
 
 # ---------------------------------------------------------------------------
-# 6. main() entry point
+# 7. Default scopes fallback (Google)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("pg_env")
+class TestScopesFallback:
+    """When exchange_code returns empty scopes, default scopes are used."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_empty_scopes_uses_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Empty scopes from exchange_code triggers default scopes."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            mocks = _enter_all(
+                stack,
+                _patch_setup_deps(
+                    exchange_return=(_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, []),
+                ),
+            )
+            from admino.oauth_setup import _run_google_setup
+
+            await _run_google_setup()
+
+        token = mocks["save"].call_args.args[1]
+        assert len(token.scopes) == 3
+        assert "gmail.modify" in token.scopes[0]
+
+    async def test_provided_scopes_used_when_present(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Non-empty scopes from exchange_code are used as-is."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        custom_scopes = ["https://www.googleapis.com/auth/gmail.modify"]
+        with ExitStack() as stack:
+            mocks = _enter_all(
+                stack,
+                _patch_setup_deps(
+                    exchange_return=(_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, custom_scopes),
+                ),
+            )
+            from admino.oauth_setup import _run_google_setup
+
+            await _run_google_setup()
+
+        token = mocks["save"].call_args.args[1]
+        assert token.scopes == custom_scopes
+
+
+# ===========================================================================
+# Microsoft OAuth Setup Tests
+# ===========================================================================
+
+
+@pytest.mark.usefixtures("pg_env")
+class TestMicrosoftHappyPath:
+    """Full Microsoft setup flow with all deps mocked."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_full_flow_prints_confirmation(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Successful Microsoft flow prints consent URL and confirmation."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps(provider="microsoft"))
+            from admino.oauth_setup import _run_microsoft_setup
+
+            await _run_microsoft_setup()
+
+        captured = capsys.readouterr()
+        assert _FAKE_MS_CONSENT_URL in captured.out
+        assert "Microsoft OAuth setup complete" in captured.out
+
+    async def test_save_token_receives_microsoft_provider(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """save_token is called with an OAuthToken for provider='microsoft'."""
+        from admino.oauth import OAuthToken
+
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            mocks = _enter_all(stack, _patch_setup_deps(provider="microsoft"))
+            from admino.oauth_setup import _run_microsoft_setup
+
+            await _run_microsoft_setup()
+
+        token = mocks["save"].call_args.args[1]
+        assert isinstance(token, OAuthToken)
+        assert token.provider == "microsoft"
+
+    async def test_microsoft_scopes_listed_in_confirmation(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Confirmation output lists Microsoft scopes."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps(provider="microsoft"))
+            from admino.oauth_setup import _run_microsoft_setup
+
+            await _run_microsoft_setup()
+
+        captured = capsys.readouterr()
+        assert "Mail.ReadWrite" in captured.out
+
+
+@pytest.mark.usefixtures("pg_env")
+class TestMicrosoftUserInput:
+    """Edge cases for Microsoft authorization code input."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_empty_auth_code_exits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Empty authorization code exits with code 1."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: "")
+
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps(provider="microsoft"))
+            from admino.oauth_setup import _run_microsoft_setup
+
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_microsoft_setup()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "No authorization code" in captured.err
+
+
+class TestMicrosoftPgEnvVars:
+    """Missing PG_PASSWORD errors out on the Microsoft flow too."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_missing_pg_password_exits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No PG_PASSWORD prints an error to stderr and exits with code 1."""
+        monkeypatch.delenv("PG_PASSWORD", raising=False)
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            _enter_all(stack, _patch_setup_deps(provider="microsoft"))
+            from admino.oauth_setup import _run_microsoft_setup
+
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_microsoft_setup()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "PG_PASSWORD" in captured.err
+
+
+@pytest.mark.usefixtures("pg_env")
+class TestMicrosoftErrorHandling:
+    """Each Microsoft OAuth step failure exits with code 1."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_exchange_code_error_exits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """OAuthError from exchange_microsoft_code exits."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            _enter_all(
+                stack,
+                _patch_setup_deps(
+                    provider="microsoft",
+                    exchange_side_effect=OAuthError("Microsoft token exchange failed"),
+                ),
+            )
+            from admino.oauth_setup import _run_microsoft_setup
+
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_microsoft_setup()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Microsoft token exchange failed" in captured.err
+
+    async def test_save_token_error_exits(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """OAuthError from save_token exits."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            _enter_all(
+                stack,
+                _patch_setup_deps(
+                    provider="microsoft",
+                    save_side_effect=OAuthError("Failed to persist token"),
+                ),
+            )
+            from admino.oauth_setup import _run_microsoft_setup
+
+            with pytest.raises(SystemExit) as exc_info:
+                await _run_microsoft_setup()
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Failed to persist token" in captured.err
+
+
+@pytest.mark.usefixtures("pg_env")
+class TestMicrosoftScopesFallback:
+    """When exchange returns empty scopes, Microsoft defaults are used."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_empty_scopes_uses_microsoft_defaults(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Empty scopes from exchange triggers default Microsoft scopes."""
+        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
+
+        with ExitStack() as stack:
+            mocks = _enter_all(
+                stack,
+                _patch_setup_deps(
+                    provider="microsoft",
+                    exchange_return=(_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, []),
+                ),
+            )
+            from admino.oauth_setup import _run_microsoft_setup
+
+            await _run_microsoft_setup()
+
+        token = mocks["save"].call_args.args[1]
+        assert len(token.scopes) == 5
+        assert "Mail.ReadWrite" in token.scopes
+        assert "Mail.Send" in token.scopes
+
+
+# ---------------------------------------------------------------------------
+# main() entry point
 # ---------------------------------------------------------------------------
 
 
 class TestMainEntryPoint:
-    """The main() function calls asyncio.run(_run_google_setup)."""
+    """The main() function dispatches to the right provider setup."""
 
-    def test_main_calls_asyncio_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_main_calls_google_setup(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """main() delegates to asyncio.run with _run_google_setup."""
         from admino.oauth_setup import main
 
@@ -600,8 +814,6 @@ class TestMainEntryPoint:
         monkeypatch.setattr("admino.oauth_setup._run_google_setup", fake_setup)
         monkeypatch.setattr("sys.argv", ["oauth_setup", "google"])
 
-        # Close the coroutine inside the mock so it is not left un-awaited,
-        # which would otherwise raise a RuntimeWarning at GC time.
         def _consume(coro: Any) -> None:
             coro.close()
 
@@ -609,485 +821,8 @@ class TestMainEntryPoint:
             main()
             mock_run.assert_called_once()
 
-
-# ---------------------------------------------------------------------------
-# 7. Default scopes fallback
-# ---------------------------------------------------------------------------
-
-
-class TestScopesFallback:
-    """When exchange_code returns empty scopes, default scopes are used."""
-
-    async def test_empty_scopes_uses_defaults(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        """Empty scopes from exchange_code triggers default scopes."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps(
-            exchange_return=(_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, []),
-        )
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save as ms:
-            from admino.oauth_setup import _run_google_setup
-
-            await _run_google_setup()
-
-        call_args = ms.call_args
-        assert call_args is not None
-        token_file = call_args[0][1]
-        assert len(token_file.scopes) == 3
-        assert "gmail.modify" in token_file.scopes[0]
-
-    async def test_provided_scopes_used_when_present(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        """Non-empty scopes from exchange_code are used as-is."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        custom_scopes = ["https://www.googleapis.com/auth/gmail.modify"]
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_setup_deps(
-            exchange_return=(_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, custom_scopes),
-        )
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save as ms:
-            from admino.oauth_setup import _run_google_setup
-
-            await _run_google_setup()
-
-        call_args = ms.call_args
-        assert call_args is not None
-        token_file = call_args[0][1]
-        assert token_file.scopes == custom_scopes
-
-
-# ===========================================================================
-# Microsoft OAuth Setup Tests
-# ===========================================================================
-
-
-def _patch_microsoft_setup_deps(
-    *,
-    consent_url: str = _FAKE_MS_CONSENT_URL,
-    exchange_return: tuple[str, str, list[str]] | None = None,
-    encrypted: str = _FAKE_ENCRYPTED,
-    build_side_effect: Exception | None = None,
-    exchange_side_effect: Exception | None = None,
-    encrypt_side_effect: Exception | None = None,
-    save_side_effect: Exception | None = None,
-) -> tuple[Any, ...]:
-    """Create mocks for all oauth functions used by _run_microsoft_setup."""
-    build_return = (consent_url, _FAKE_STATE)
-    mock_build = (
-        patch("admino.oauth_setup.build_microsoft_consent_url", side_effect=build_side_effect)
-        if build_side_effect
-        else patch("admino.oauth_setup.build_microsoft_consent_url", return_value=build_return)
-    )
-
-    if exchange_return is None:
-        exchange_return = (_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, list(_FAKE_MS_SCOPES))
-    mock_exchange = patch(
-        "admino.oauth_setup.exchange_microsoft_code",
-        new_callable=AsyncMock,
-        side_effect=exchange_side_effect,
-        return_value=exchange_return if not exchange_side_effect else None,
-    )
-
-    mock_encrypt = patch(
-        "admino.oauth_setup.encrypt_refresh_token",
-        side_effect=encrypt_side_effect,
-        return_value=encrypted if not encrypt_side_effect else None,
-    )
-
-    mock_save = patch(
-        "admino.oauth_setup.save_token",
-        side_effect=save_side_effect,
-    )
-
-    return mock_build, mock_exchange, mock_encrypt, mock_save
-
-
-# ---------------------------------------------------------------------------
-# 8. Microsoft happy path
-# ---------------------------------------------------------------------------
-
-
-class TestMicrosoftHappyPath:
-    """Full Microsoft setup flow with all deps mocked."""
-
-    async def test_full_flow_prints_confirmation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Successful Microsoft flow prints consent URL and confirmation."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        captured = capsys.readouterr()
-        assert _FAKE_MS_CONSENT_URL in captured.out
-        assert "Microsoft OAuth setup complete" in captured.out
-
-    async def test_microsoft_token_file_path_shown(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Confirmation output shows microsoft.json path."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        captured = capsys.readouterr()
-        assert "microsoft.json" in captured.out
-
-    async def test_microsoft_scopes_listed_in_confirmation(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Confirmation output lists Microsoft scopes."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        captured = capsys.readouterr()
-        assert "Mail.ReadWrite" in captured.out
-
-    async def test_save_token_receives_microsoft_provider(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        """save_token is called with provider='microsoft'."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save as ms:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        call_args = ms.call_args
-        assert call_args is not None
-        token_file = call_args[0][1]
-        assert token_file.provider == "microsoft"
-
-
-# ---------------------------------------------------------------------------
-# 9. Microsoft user input handling
-# ---------------------------------------------------------------------------
-
-
-class TestMicrosoftUserInput:
-    """Edge cases for Microsoft authorization code input."""
-
-    async def test_empty_auth_code_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """Empty authorization code exits with code 1."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: "")
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "No authorization code" in captured.err
-
-    async def test_keyboard_interrupt_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """KeyboardInterrupt during input exits with cancellation."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr(
-            "builtins.input", lambda _prompt: (_ for _ in ()).throw(KeyboardInterrupt)
-        )
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "cancelled" in captured.err.lower()
-
-
-# ---------------------------------------------------------------------------
-# 10. Microsoft error handling
-# ---------------------------------------------------------------------------
-
-
-class TestMicrosoftErrorHandling:
-    """Each Microsoft OAuth step failure exits with code 1."""
-
-    async def test_build_consent_url_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """OAuthError from build_microsoft_consent_url exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps(
-            build_side_effect=OAuthError("MICROSOFT_CLIENT_ID not set"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "MICROSOFT_CLIENT_ID not set" in captured.err
-
-    async def test_exchange_code_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """OAuthError from exchange_microsoft_code exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps(
-            exchange_side_effect=OAuthError("Microsoft token exchange failed"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "Microsoft token exchange failed" in captured.err
-
-    async def test_encrypt_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """OAuthError from encrypt_refresh_token exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps(
-            encrypt_side_effect=OAuthError("Encryption key missing"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "Encryption key missing" in captured.err
-
-    async def test_save_token_error_exits(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """OAuthError from save_token exits."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps(
-            save_side_effect=OAuthError("Failed to write token file"),
-        )
-
-        with (
-            mock_build,
-            mock_exchange,
-            mock_encrypt,
-            mock_save,
-            pytest.raises(SystemExit) as exc_info,
-        ):
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        assert exc_info.value.code == 1
-        captured = capsys.readouterr()
-        assert "Failed to write token file" in captured.err
-
-
-# ---------------------------------------------------------------------------
-# 11. Microsoft security: tokens not leaked
-# ---------------------------------------------------------------------------
-
-
-class TestMicrosoftSecurityTokenLeakage:
-    """Verify plaintext tokens never appear in stdout for Microsoft flow."""
-
-    async def test_access_token_not_in_stdout(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """The access token must not appear in stdout."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        captured = capsys.readouterr()
-        assert _FAKE_ACCESS_TOKEN not in captured.out
-        assert _FAKE_ACCESS_TOKEN not in captured.err
-
-    async def test_refresh_token_not_in_stdout(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-        capsys: pytest.CaptureFixture[str],
-    ) -> None:
-        """The plaintext refresh token must not appear in stdout."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps()
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        captured = capsys.readouterr()
-        assert _FAKE_REFRESH_TOKEN not in captured.out
-        assert _FAKE_REFRESH_TOKEN not in captured.err
-
-
-# ---------------------------------------------------------------------------
-# 12. Microsoft scopes fallback
-# ---------------------------------------------------------------------------
-
-
-class TestMicrosoftScopesFallback:
-    """When exchange returns empty scopes, Microsoft defaults are used."""
-
-    async def test_empty_scopes_uses_microsoft_defaults(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        """Empty scopes from exchange triggers default Microsoft scopes."""
-        monkeypatch.setenv("TOKENS_DIR", str(tmp_path))
-        monkeypatch.setattr("builtins.input", lambda _prompt: _FAKE_AUTH_CODE)
-
-        mock_build, mock_exchange, mock_encrypt, mock_save = _patch_microsoft_setup_deps(
-            exchange_return=(_FAKE_ACCESS_TOKEN, _FAKE_REFRESH_TOKEN, []),
-        )
-
-        with mock_build, mock_exchange, mock_encrypt, mock_save as ms:
-            from admino.oauth_setup import _run_microsoft_setup
-
-            await _run_microsoft_setup()
-
-        call_args = ms.call_args
-        assert call_args is not None
-        token_file = call_args[0][1]
-        assert len(token_file.scopes) == 5
-        assert "Mail.ReadWrite" in token_file.scopes
-        assert "Mail.Send" in token_file.scopes
-
-
-# ---------------------------------------------------------------------------
-# 13. main() entry point for Microsoft
-# ---------------------------------------------------------------------------
-
-
-class TestMainEntryPointMicrosoft:
-    """The main() function dispatches to Microsoft setup."""
-
     def test_main_calls_microsoft_setup(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """main() delegates to asyncio.run with _run_microsoft_setup for 'microsoft' arg."""
+        """main() delegates to asyncio.run with _run_microsoft_setup."""
         from admino.oauth_setup import main
 
         async def fake_setup() -> None:

@@ -112,7 +112,7 @@ services:
       # kept outside the file tool's sandbox (/app/documents). The audit log in
       # particular must never be reachable by the files.* tool.
       - ./data/logs:/app/data/logs      # Append-only audit log (NDJSON)
-      - ./data/tokens:/app/data/tokens  # Encrypted OAuth refresh tokens (Fernet)
+      # OAuth refresh tokens live in PostgreSQL (Fernet-encrypted), not on disk.
       # Config is read-only — the agent reads but must never write config files
       - ./config:/app/config:ro
       # User workspace: ONLY ~/Downloads/admino is mounted.
