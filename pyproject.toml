@@ -6,6 +6,8 @@ build-backend = "hatchling.build"
 name = "admino"
 version = "0.1.0"
 description = "Local-only, security-first personal AI agent"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115.0,<1",
