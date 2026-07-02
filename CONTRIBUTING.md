@@ -131,7 +131,16 @@ Review these before every change; violations block the PR:
 - Keep commits clean and messages explanatory (what + why). The PR may be
   squash-merged at the maintainer's discretion.
 
+## Contributor License Agreement (CLA)
+
+Before any pull request can be merged, you must sign the
+[admino Individual Contributor License Agreement](CLA.md). Signing is electronic and
+takes seconds: the CLA Assistant bot comments on your first PR with instructions,
+and the check blocks the merge until you have signed. You sign once; it covers all
+your future contributions.
+
 ## License
 
 admino is licensed under the [Apache License 2.0](LICENSE). By contributing, you
-agree that your contributions are licensed under the same terms.
+agree that your contributions are licensed under the same terms and as described in
+the [CLA](CLA.md).
