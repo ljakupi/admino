@@ -314,6 +314,10 @@ The following intentional deviations from the original product specification imp
 - **Tests**: backend pytest suite with coverage reporting (coverage gate enforced in CI)
 - **Security**: CSP headers, egress whitelist, credential sanitization, TOCTOU-safe file writes, path confinement
 
+## Contributing
+
+Contributions are welcome. admino is issue-driven: every PR must correspond to an open, approved GitHub issue — see [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding standards, testing gates, and security rules before you start.
+
 ## License
 
-Private. All rights reserved.
+Licensed under the [Apache License, Version 2.0](LICENSE).
