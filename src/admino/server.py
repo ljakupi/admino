@@ -88,7 +88,7 @@ from admino.models import (
 from admino.oauth import (
     OAuthError,
     OAuthProvider,
-    TokenFile,
+    OAuthToken,
     build_google_consent_url,
     build_microsoft_consent_url,
     encrypt_refresh_token,
@@ -861,7 +861,7 @@ async def _build_settings_response() -> SettingsResponse:
     """Load settings from DB and construct the SettingsResponse.
 
     Masks sensitive fields (API keys replaced by boolean flags).
-    Checks OAuth token file existence for connected_accounts.
+    Reads OAuth connection status from the DB for connected_accounts.
 
     Returns:
         A fully populated SettingsResponse.
@@ -920,11 +920,21 @@ async def _build_settings_response() -> SettingsResponse:
 
     # Connected accounts — report connection AND health (a dead refresh token
     # is connected-but-unhealthy, which the UI renders as "Not connected").
-    # get_connection_status reads only local state, so it never blocks load.
+    # get_connection_status reads only the DB row, so it never blocks load.
+    # A connection-status lookup failure must never 500 the settings page —
+    # fall back to "disconnected" so the page still renders.
     connected = SettingsConnectedAccounts()
-    tokens_dir = _config.paths.tokens_dir
-    google_connected, google_healthy = get_connection_status(tokens_dir, "google")
-    microsoft_connected, microsoft_healthy = get_connection_status(tokens_dir, "microsoft")
+    try:
+        google_connected, google_healthy = await get_connection_status(get_pool(), "google")
+        microsoft_connected, microsoft_healthy = await get_connection_status(
+            get_pool(), "microsoft"
+        )
+    except (OAuthError, OSError, TypeError) as exc:
+        # A pool that is unavailable or misconfigured must not 500 the
+        # settings page — degrade to "disconnected" and log the failure.
+        logger.warning("Failed to read OAuth connection status: %s", type(exc).__name__)
+        google_connected = google_healthy = False
+        microsoft_connected = microsoft_healthy = False
     if google_connected:
         connected.google = OAuthConnectionStatus(
             connected=True,
@@ -1561,7 +1571,7 @@ async def oauth_callback(
 
     Validates the CSRF state, determines the provider from the stored state,
     exchanges the authorization code for tokens, encrypts the refresh token,
-    and persists it to disk.
+    and persists it to the database (oauth_tokens table).
 
     No auth required — this endpoint is called by the provider's redirect,
     not by the authenticated frontend.
@@ -1577,7 +1587,7 @@ async def oauth_callback(
     Security notes:
         - CSRF protection via state token validation.
         - Rate limited to prevent brute-force code replay.
-        - Tokens are encrypted before disk write.
+        - Tokens are Fernet-encrypted before being written to the database.
         - Never logs credentials, tokens, or authorization codes.
     """
     _check_rate_limit("/api/oauth/callback")
@@ -1623,19 +1633,27 @@ async def oauth_callback(
                 )
                 email = None
 
+            # Access token is only needed for the best-effort email lookup
+            # above; it is never persisted. Drop it before encrypting the
+            # refresh token to minimise in-memory exposure of plaintext tokens.
+            del access_token
+
             # Encrypt and persist the refresh token, then clear plaintext
             # from the local scope to minimise in-memory exposure.
             encrypted = encrypt_refresh_token(refresh_token)
             del refresh_token
             now_utc = datetime.now(UTC)
-            token_file = TokenFile(
+            token = OAuthToken(
                 provider=provider,
                 scopes=scopes,
                 encrypted_refresh_token=encrypted,
+                email=email,
                 created_at=now_utc,
                 last_refreshed_at=now_utc,
             )
-            save_token(_config.paths.tokens_dir, token_file)
+            from admino.database import get_pool
+
+            await save_token(get_pool(), token)
     except OAuthError:
         logger.error("%s OAuth token exchange or storage failed.", provider.capitalize())
         return RedirectResponse(url="/tools?oauth=error&reason=exchange_failed", status_code=307)
@@ -1653,22 +1671,24 @@ async def oauth_google_status(
 ) -> OAuthConnectionStatus:
     """Return the connection status for the Google OAuth account.
 
-    Checks whether an encrypted token file exists on disk for Google.
+    Reads the Google token row from the database.
 
     Returns:
         OAuthConnectionStatus indicating whether Google is connected.
 
     Security notes:
         - Requires Bearer auth.
-        - Never exposes token contents or file paths in the response.
+        - Never exposes token contents in the response.
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
     _check_rate_limit("/api/oauth/google/status")
 
-    token_path = _config.paths.tokens_dir / "google.json"
-    if token_path.is_file():
+    from admino.database import get_pool
+
+    connected, _healthy = await get_connection_status(get_pool(), "google")
+    if connected:
         return OAuthConnectionStatus(
             connected=True,
             services=["gmail", "google_calendar", "google_drive"],
@@ -1681,22 +1701,24 @@ async def oauth_microsoft_status(
 ) -> OAuthConnectionStatus:
     """Return the connection status for the Microsoft OAuth account.
 
-    Checks whether an encrypted token file exists on disk for Microsoft.
+    Reads the Microsoft token row from the database.
 
     Returns:
         OAuthConnectionStatus indicating whether Microsoft is connected.
 
     Security notes:
         - Requires Bearer auth.
-        - Never exposes token contents or file paths in the response.
+        - Never exposes token contents in the response.
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
     _check_rate_limit("/api/oauth/microsoft/status")
 
-    token_path = _config.paths.tokens_dir / "microsoft.json"
-    if token_path.is_file():
+    from admino.database import get_pool
+
+    connected, _healthy = await get_connection_status(get_pool(), "microsoft")
+    if connected:
         return OAuthConnectionStatus(
             connected=True,
             services=["outlook", "outlook_calendar", "onedrive"],
@@ -1707,9 +1729,9 @@ async def oauth_microsoft_status(
 async def oauth_google_disconnect(
     _auth: None = Depends(require_auth),
 ) -> dict[str, str]:
-    """Disconnect the Google OAuth account by deleting the token file.
+    """Disconnect the Google OAuth account by deleting its token row.
 
-    Removes the encrypted token file from disk. Returns 404 if no
+    Removes the encrypted token row from the database. Returns 404 if no
     Google account is connected.
 
     Returns:
@@ -1728,11 +1750,13 @@ async def oauth_google_disconnect(
 
     _check_rate_limit("/api/oauth/google/disconnect")
 
+    from admino.database import get_pool
+
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0),
         ) as client:
-            deleted = await revoke_and_delete_token(_config.paths.tokens_dir, "google", client)
+            deleted = await revoke_and_delete_token(get_pool(), "google", client)
     except OAuthError:
         logger.error("Failed to disconnect Google account.")
         raise HTTPException(status_code=500, detail="Failed to disconnect.")  # noqa: B904
@@ -1741,7 +1765,7 @@ async def oauth_google_disconnect(
         raise HTTPException(status_code=404, detail="Google account is not connected.")
 
     # Invalidate in-memory cached access tokens so tool modules stop
-    # reusing a stale token after the refresh token file is gone.
+    # reusing a stale token after the refresh token row is gone.
     await _clear_gmail_cache()
     await _clear_gcal_cache()
     await _clear_gdrive_cache()
@@ -1753,9 +1777,9 @@ async def oauth_google_disconnect(
 async def oauth_microsoft_disconnect(
     _auth: None = Depends(require_auth),
 ) -> dict[str, str]:
-    """Disconnect the Microsoft OAuth account by deleting the token file.
+    """Disconnect the Microsoft OAuth account by deleting its token row.
 
-    Removes the encrypted token file from disk and invalidates all
+    Removes the encrypted token row from the database and invalidates all
     in-memory cached access tokens for Microsoft tool modules.
     Returns 404 if no Microsoft account is connected.
 
@@ -1775,11 +1799,13 @@ async def oauth_microsoft_disconnect(
 
     _check_rate_limit("/api/oauth/microsoft/disconnect")
 
+    from admino.database import get_pool
+
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0),
         ) as client:
-            deleted = await revoke_and_delete_token(_config.paths.tokens_dir, "microsoft", client)
+            deleted = await revoke_and_delete_token(get_pool(), "microsoft", client)
     except OAuthError:
         logger.error("Failed to disconnect Microsoft account.")
         raise HTTPException(status_code=500, detail="Failed to disconnect.")  # noqa: B904
@@ -1788,7 +1814,7 @@ async def oauth_microsoft_disconnect(
         raise HTTPException(status_code=404, detail="Microsoft account is not connected.")
 
     # Invalidate in-memory cached access tokens so tool modules stop
-    # reusing a stale token after the refresh token file is gone.
+    # reusing a stale token after the refresh token row is gone.
     await _clear_outlook_cache()
     await _clear_outcal_cache()
     await _clear_onedrive_cache()

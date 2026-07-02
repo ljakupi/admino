@@ -297,10 +297,6 @@ class PathsConfig(BaseModel):
         default=Path("/app/data/logs/audit.ndjson"),
         description="Path to the append-only NDJSON audit log.",
     )
-    tokens_dir: Path = Field(
-        default=Path("/app/data/tokens"),
-        description="Directory for encrypted OAuth refresh tokens.",
-    )
 
 
 class LimitsConfig(BaseModel):
@@ -458,7 +454,6 @@ class AppConfig(BaseModel):
     def resolve_paths(self) -> AppConfig:
         """Ensure all path fields are absolute."""
         self.paths.audit_log = self.paths.audit_log.resolve()
-        self.paths.tokens_dir = self.paths.tokens_dir.resolve()
         return self
 
     @model_validator(mode="after")

@@ -18,7 +18,6 @@ Security notes:
 from __future__ import annotations
 
 import time
-from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,18 +45,16 @@ def _make_config(
     *,
     auth_mode: str = "token",
     token: str | None = _TEST_TOKEN,
-    tokens_dir: Path | None = None,
 ) -> MagicMock:
-    """Build a minimal mock AppConfig with configurable tokens_dir."""
+    """Build a minimal mock AppConfig.
+
+    GH-86: tokens live in PostgreSQL, so there is no ``paths.tokens_dir``.
+    """
     config = MagicMock()
     config.auth.mode = auth_mode
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    if tokens_dir is not None:
-        config.paths.tokens_dir = tokens_dir
-    else:
-        config.paths.tokens_dir = Path("/tmp/test-tokens-oauth")  # noqa: S108
     if token is not None:
         config.auth.token = SecretStr(token)
     else:
@@ -70,12 +67,11 @@ def _make_app(
     *,
     auth_mode: str = "token",
     token: str | None = _TEST_TOKEN,
-    tokens_dir: Path | None = None,
 ) -> Any:
     """Create a FastAPI app with mock agent and config."""
     if agent is None:
         agent = MagicMock()
-    config = _make_config(auth_mode=auth_mode, token=token, tokens_dir=tokens_dir)
+    config = _make_config(auth_mode=auth_mode, token=token)
     return create_app(agent=agent, config=config)
 
 
@@ -160,7 +156,8 @@ class TestOAuthCallback:
                 ),
             ),
             patch("admino.server.encrypt_refresh_token", return_value="encrypted-tok"),
-            patch("admino.server.save_token"),
+            patch("admino.server.save_token", new=AsyncMock()),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
             patch(
                 "admino.server.get_google_user_email",
                 new=AsyncMock(return_value="user@gmail.com"),
@@ -331,7 +328,8 @@ class TestOAuthCallback:
                 ),
             ),
             patch("admino.server.encrypt_refresh_token", return_value="encrypted"),
-            patch("admino.server.save_token"),
+            patch("admino.server.save_token", new=AsyncMock()),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app),
@@ -399,16 +397,16 @@ class TestOAuthStatus:
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_oauth_status_connected(self, tmp_path: Path) -> None:
-        """Returns connected=True with services when token file exists."""
-        # Create a fake google.json token file.
-        token_file = tmp_path / "google.json"
-        token_file.write_text("{}")
+    async def test_oauth_status_connected(self) -> None:
+        """Returns connected=True with services when a DB token row exists."""
+        app = _make_app()
 
-        app = _make_app(tokens_dir=tmp_path)
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch("admino.server.get_connection_status", new=AsyncMock(return_value=(True, True))),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
         data = resp.json()
@@ -417,12 +415,18 @@ class TestOAuthStatus:
         assert "google_calendar" in data["services"]
         assert "google_drive" in data["services"]
 
-    async def test_oauth_status_not_connected(self, tmp_path: Path) -> None:
-        """Returns connected=False with empty services when no token file."""
-        app = _make_app(tokens_dir=tmp_path)
+    async def test_oauth_status_not_connected(self) -> None:
+        """Returns connected=False with empty services when no DB token row."""
+        app = _make_app()
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch(
+                "admino.server.get_connection_status", new=AsyncMock(return_value=(False, False))
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
         data = resp.json()
@@ -457,6 +461,7 @@ class TestOAuthDisconnect:
         mock_gdrive = AsyncMock()
         with (
             patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
             patch("admino.server._clear_gmail_cache", mock_gmail),
             patch("admino.server._clear_gcal_cache", mock_gcal),
             patch("admino.server._clear_gdrive_cache", mock_gdrive),
@@ -473,7 +478,10 @@ class TestOAuthDisconnect:
         """Returns 404 when revoke_and_delete_token returns False (no token)."""
         app = _make_app()
         mock_revoke = AsyncMock(return_value=False)
-        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+        with (
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
 
@@ -491,7 +499,10 @@ class TestOAuthDisconnect:
         """Returns 500 when revoke_and_delete_token raises OAuthError."""
         app = _make_app()
         mock_revoke = AsyncMock(side_effect=OAuthError("fail"))
-        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+        with (
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
 
@@ -517,6 +528,7 @@ class TestMicrosoftOAuthDisconnect:
         mock_onedrive = AsyncMock()
         with (
             patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
             patch("admino.server._clear_outlook_cache", mock_outlook),
             patch("admino.server._clear_outcal_cache", mock_outcal),
             patch("admino.server._clear_onedrive_cache", mock_onedrive),
@@ -534,7 +546,10 @@ class TestMicrosoftOAuthDisconnect:
         """Returns 404 when revoke_and_delete_token returns False (no token)."""
         app = _make_app()
         mock_revoke = AsyncMock(return_value=False)
-        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+        with (
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
 
@@ -552,7 +567,10 @@ class TestMicrosoftOAuthDisconnect:
         """Returns 500 when revoke_and_delete_token raises OAuthError."""
         app = _make_app()
         mock_revoke = AsyncMock(side_effect=OAuthError("fail"))
-        with patch("admino.server.revoke_and_delete_token", mock_revoke):
+        with (
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
 
@@ -618,15 +636,16 @@ class TestMicrosoftOAuthStatus:
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_microsoft_status_connected(self, tmp_path: Path) -> None:
-        """Returns connected=True with services when token file exists."""
-        token_file = tmp_path / "microsoft.json"
-        token_file.write_text("{}")
+    async def test_microsoft_status_connected(self) -> None:
+        """Returns connected=True with services when a DB token row exists."""
+        app = _make_app()
 
-        app = _make_app(tokens_dir=tmp_path)
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch("admino.server.get_connection_status", new=AsyncMock(return_value=(True, True))),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
         data = resp.json()
@@ -635,12 +654,18 @@ class TestMicrosoftOAuthStatus:
         assert "outlook_calendar" in data["services"]
         assert "onedrive" in data["services"]
 
-    async def test_microsoft_status_not_connected(self, tmp_path: Path) -> None:
-        """Returns connected=False with empty services when no token file."""
-        app = _make_app(tokens_dir=tmp_path)
+    async def test_microsoft_status_not_connected(self) -> None:
+        """Returns connected=False with empty services when no DB token row."""
+        app = _make_app()
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch(
+                "admino.server.get_connection_status", new=AsyncMock(return_value=(False, False))
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
 
         assert resp.status_code == 200
         data = resp.json()
@@ -687,7 +712,8 @@ class TestMicrosoftOAuthCallback:
                 ),
             ),
             patch("admino.server.encrypt_refresh_token", return_value="encrypted-ms-tok"),
-            patch("admino.server.save_token"),
+            patch("admino.server.save_token", new=AsyncMock()),
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
         ):
             async with AsyncClient(
                 transport=ASGITransport(app=app),

@@ -1,69 +1,36 @@
-"""TDD tests for new oauth.py functions: delete_token() and get_google_user_email().
+"""Tests for oauth.py helpers: delete_token() and get_google_user_email().
 
-These tests are written BEFORE implementation (GitHub issue #18) and will fail
-with ImportError until the functions are added to admino.oauth.
+GH-86: delete_token is now async and DELETEs a row via the asyncpg pool
+(returning True/False based on the DELETE status tag). get_google_user_email
+is unchanged (network only, never raises).
 
 Covers:
-- delete_token: removes token file, returns False if missing, raises on permission error
-- get_google_user_email: fetches email from Google userinfo endpoint, never raises
+- delete_token: True when a row was removed, False when none existed,
+  parameterized DELETE.
+- get_google_user_email: fetches email from Google userinfo endpoint,
+  never raises.
 
 Security notes:
-- All tests use mocked HTTP clients — no real Google API calls.
-- Token file tests use tmp_path — no real filesystem pollution.
+- All HTTP clients are mocked — no real Google API calls.
+- The database pool is mocked (``mock_pool`` fixture) — no real DB.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-from cryptography.fernet import Fernet
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 from admino.oauth import (
-    GOOGLE_SCOPES,
-    OAuthError,
-    TokenFile,
     delete_token,
-    encrypt_refresh_token,
     get_google_user_email,
-    save_token,
 )
 
-# ---------------------------------------------------------------------------
-# Shared helpers and fixtures
-# ---------------------------------------------------------------------------
-
-_TEST_FERNET_KEY: str = Fernet.generate_key().decode()
-_PLAINTEXT_REFRESH_TOKEN: str = "1//0abc-REFRESH-TOKEN-plaintext"
-
-
-@pytest.fixture()
-def fernet_env(monkeypatch: pytest.MonkeyPatch) -> str:
-    """Set OAUTH_ENCRYPTION_KEY to a valid Fernet key. Returns the key."""
-    monkeypatch.setenv("OAUTH_ENCRYPTION_KEY", _TEST_FERNET_KEY)
-    return _TEST_FERNET_KEY
-
-
-@pytest.fixture()
-def sample_token_file(fernet_env: str) -> TokenFile:
-    """A valid TokenFile with an encrypted refresh token."""
-    _ = fernet_env
-    encrypted = encrypt_refresh_token(_PLAINTEXT_REFRESH_TOKEN)
-    now = datetime.now(UTC)
-    return TokenFile(
-        provider="google",
-        scopes=list(GOOGLE_SCOPES),
-        encrypted_refresh_token=encrypted,
-        created_at=now,
-        last_refreshed_at=now,
-    )
+if TYPE_CHECKING:
+    from unittest.mock import MagicMock
 
 
 def _make_httpx_response(
@@ -76,44 +43,46 @@ def _make_httpx_response(
 
 
 # ---------------------------------------------------------------------------
-# delete_token()
+# delete_token() — DB-backed
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.usefixtures("fernet_env")
 class TestDeleteToken:
-    """Tests for delete_token(tokens_dir, provider)."""
+    """Tests for delete_token(pool, provider)."""
 
-    def test_delete_token_removes_existing_file(
-        self, tmp_path: Path, sample_token_file: TokenFile
-    ) -> None:
-        """Deleting an existing token file returns True and removes the file."""
-        save_token(tmp_path, sample_token_file)
-        token_path = tmp_path / "google.json"
-        assert token_path.exists()
+    pytestmark = pytest.mark.asyncio
 
-        result = delete_token(tmp_path, "google")
+    def _prime_execute(self, mock_pool: MagicMock, status: str) -> None:
+        mock_pool.execute = AsyncMock(return_value=status)
+        mock_pool._mock_conn.execute = AsyncMock(return_value=status)
+
+    async def test_delete_token_returns_true_when_row_deleted(self, mock_pool: MagicMock) -> None:
+        """A 'DELETE 1' status tag returns True."""
+        self._prime_execute(mock_pool, "DELETE 1")
+
+        result = await delete_token(mock_pool, "google")
 
         assert result is True
-        assert not token_path.exists()
 
-    def test_delete_token_returns_false_when_no_file(self, tmp_path: Path) -> None:
-        """Returns False when no token file exists for the provider."""
-        result = delete_token(tmp_path, "google")
+    async def test_delete_token_returns_false_when_no_row(self, mock_pool: MagicMock) -> None:
+        """A 'DELETE 0' status tag returns False."""
+        self._prime_execute(mock_pool, "DELETE 0")
+
+        result = await delete_token(mock_pool, "google")
 
         assert result is False
 
-    def test_delete_token_raises_on_permission_error(
-        self, tmp_path: Path, sample_token_file: TokenFile
-    ) -> None:
-        """Raises OAuthError when the file exists but cannot be deleted."""
-        save_token(tmp_path, sample_token_file)
+    async def test_delete_token_is_parameterized(self, mock_pool: MagicMock) -> None:
+        """The DELETE binds the provider as a parameter, not interpolated."""
+        self._prime_execute(mock_pool, "DELETE 1")
 
-        with (
-            patch("os.unlink", side_effect=PermissionError("forbidden")),
-            pytest.raises(OAuthError),
-        ):
-            delete_token(tmp_path, "google")
+        await delete_token(mock_pool, "microsoft")
+
+        call = mock_pool.execute.call_args or mock_pool._mock_conn.execute.call_args
+        assert call is not None
+        assert "$1" in call.args[0]
+        assert "microsoft" in call.args[1:]
+        assert "microsoft" not in call.args[0]
 
 
 # ---------------------------------------------------------------------------

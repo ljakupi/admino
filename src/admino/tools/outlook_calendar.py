@@ -20,8 +20,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Final
 from urllib.parse import quote
 
@@ -52,7 +50,6 @@ _MAX_BODY_CHARS: Final[int] = 10_000
 # Module-level token cache
 # ---------------------------------------------------------------------------
 
-_TOKENS_DIR = Path(os.environ.get("TOKENS_DIR", "/app/data/tokens"))
 _http_client: httpx.AsyncClient | None = None
 _cached_token: str | None = None
 _cached_expires_at: datetime | None = None
@@ -68,12 +65,14 @@ async def _get_microsoft_token() -> str:
     Raises:
         OAuthError: If OAuth is not configured or refresh fails.
     """
+    from admino.database import get_pool
+
     async with _token_lock:
         global _http_client, _cached_token, _cached_expires_at
         if _http_client is None:
             _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
         _cached_token, _cached_expires_at = await get_valid_access_token(
-            _TOKENS_DIR, "microsoft", _cached_token, _cached_expires_at, _http_client
+            get_pool(), "microsoft", _cached_token, _cached_expires_at, _http_client
         )
         return _cached_token
 
