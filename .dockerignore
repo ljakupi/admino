@@ -2,9 +2,12 @@
 # Even without an explicit COPY, the entire context is sent to the Docker daemon.
 
 # Secrets
+# NOTE: .dockerignore patterns are anchored to the context root and are NOT
+# recursive like .gitignore — prefix with **/ to exclude at every depth.
 .env
 .env.*
 !.env.example
+.local/
 
 # Data directories (user data, tokens, logs)
 data/
@@ -52,5 +55,12 @@ Makefile
 *.p12
 *.pfx
 
-# Claude Code config (not needed in image)
-.claude/
+# Claude Code config (not needed in image), at any depth
+**/.claude/
+
+# Frontend build artifacts — the image compiles the PWA itself
+# (frontend-builder stage), so host-built output must never leak into the
+# build context and stale caches must not be reused.
+static/
+static-src/node_modules/
+static-src/*.tsbuildinfo
