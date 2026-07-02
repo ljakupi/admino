@@ -4,18 +4,21 @@ Handles encrypted storage of OAuth refresh tokens for Google and Microsoft
 using Fernet symmetric encryption, and manages token refresh via each
 provider's OAuth2 token endpoint.
 
-Storage format (on disk as ``{tokens_dir}/{provider}.json``):
-- ``provider``, ``scopes``, ``encrypted_refresh_token``, ``created_at``,
-  ``last_refreshed_at``.
-- Access tokens are NEVER written to disk — they are held in-memory only
-  by the caller.
+Storage (GH-86): refresh tokens live in the PostgreSQL ``oauth_tokens``
+table, one row per provider. Only the Fernet ciphertext is stored in the
+database — the plaintext refresh token never touches the DB, and the
+encryption key stays in the ``OAUTH_ENCRYPTION_KEY`` environment variable,
+never persisted. Access tokens are NEVER stored; they are held in-memory
+only by the caller.
+
+The load/save/delete/refresh functions are async and take an asyncpg
+``Pool`` as their first argument.
 
 Security notes:
 - The Fernet encryption key is read exclusively from the
   ``OAUTH_ENCRYPTION_KEY`` environment variable. It is never logged,
-  stored on disk in plaintext, or included in error messages.
-- Token files are created with mode 0o600 (owner read/write only).
-- The tokens directory is created with mode 0o700 if it does not exist.
+  stored in the database in plaintext, or included in error messages.
+- All SQL is parameterized ($1, $2, ...) — no string interpolation.
 - No credentials (access tokens, refresh tokens, client secrets, Fernet
   keys) appear in log output or raised exception messages.
 """
@@ -28,7 +31,7 @@ import os
 import secrets
 import unicodedata
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 from urllib.parse import urlencode
 
 import httpx
@@ -36,7 +39,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +92,10 @@ MICROSOFT_SCOPES: list[str] = [
 ]
 
 # ---------------------------------------------------------------------------
-# Token file names per provider
+# Known providers
 # ---------------------------------------------------------------------------
 
-_TOKEN_FILENAMES: dict[OAuthProvider, str] = {
-    "google": "google.json",
-    "microsoft": "microsoft.json",
-}
+_KNOWN_PROVIDERS: frozenset[str] = frozenset({"google", "microsoft"})
 
 # Refresh buffer: refresh if token expires within this many seconds
 _EXPIRY_BUFFER_SECONDS: int = 60
@@ -135,12 +135,13 @@ class OAuthRefreshError(OAuthError):
 _TERMINAL_REFRESH_ERRORS: frozenset[str] = frozenset({"invalid_grant"})
 
 
-class TokenFile(BaseModel):
-    """On-disk representation of an encrypted OAuth token file.
+class OAuthToken(BaseModel):
+    """Database-backed representation of an encrypted OAuth token.
 
-    Matches the storage format defined in Section 3.6 of the requirements.
-    The ``encrypted_refresh_token`` field holds the Fernet-encrypted refresh
-    token as a string. Access tokens are never stored in this model.
+    Mirrors a row of the ``oauth_tokens`` table. The
+    ``encrypted_refresh_token`` field holds the Fernet-encrypted refresh
+    token as a string (ciphertext only). Access tokens are never stored in
+    this model or in the database.
     """
 
     provider: str = Field(
@@ -148,13 +149,19 @@ class TokenFile(BaseModel):
         pattern=r"^[a-z][a-z0-9_]*$",
         description="OAuth provider identifier (google or microsoft).",
     )
-    scopes: list[str] = Field(
-        description="OAuth scopes granted by the user.",
+    scopes: list[Annotated[str, Field(max_length=512)]] = Field(
+        max_length=50,
+        description="OAuth scopes granted by the user (provider-controlled, bounded).",
     )
     encrypted_refresh_token: str = Field(
         min_length=1,
         max_length=4096,
         description="Fernet-encrypted refresh token (base64-encoded ciphertext).",
+    )
+    email: str | None = Field(
+        default=None,
+        max_length=254,
+        description="The connected account's email address, for display only.",
     )
     created_at: datetime = Field(
         description="UTC timestamp when the token was first created.",
@@ -162,12 +169,13 @@ class TokenFile(BaseModel):
     last_refreshed_at: datetime = Field(
         description="UTC timestamp of the most recent token refresh.",
     )
-    invalid: bool = Field(
-        default=False,
+    healthy: bool = Field(
+        default=True,
         description=(
-            "True if the refresh token is known to be dead (a terminal "
-            "invalid_grant refresh failure). Surfaced to the UI as a "
-            "reconnect-required state. Defaults to False for legacy files."
+            "True if the refresh token is believed valid. Flipped to False "
+            "on a terminal invalid_grant refresh failure (the saved "
+            "authorization was revoked or expired), which the UI surfaces "
+            "as a reconnect-required state."
         ),
     )
 
@@ -214,11 +222,11 @@ def encrypt_refresh_token(refresh_token: str) -> str:
     return fernet.encrypt(refresh_token.encode()).decode("utf-8")
 
 
-def decrypt_refresh_token(token_file: TokenFile) -> str:
-    """Decrypt the refresh token from a TokenFile.
+def decrypt_refresh_token(token: OAuthToken) -> str:
+    """Decrypt the refresh token from an OAuthToken.
 
     Args:
-        token_file: A loaded TokenFile with an encrypted refresh token.
+        token: A loaded OAuthToken with an encrypted refresh token.
 
     Returns:
         The decrypted refresh token string.
@@ -228,7 +236,7 @@ def decrypt_refresh_token(token_file: TokenFile) -> str:
     """
     fernet = _get_fernet()
     try:
-        decrypted = fernet.decrypt(token_file.encrypted_refresh_token.encode())
+        decrypted = fernet.decrypt(token.encrypted_refresh_token.encode())
         return decrypted.decode("utf-8")
     except InvalidToken as exc:
         msg = "Failed to decrypt refresh token. Check OAUTH_ENCRYPTION_KEY."
@@ -236,158 +244,175 @@ def decrypt_refresh_token(token_file: TokenFile) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Token file I/O (shared across providers)
+# Token persistence (PostgreSQL, shared across providers)
 # ---------------------------------------------------------------------------
 
 
-def _token_file_path(tokens_dir: Path, provider: OAuthProvider) -> Path:
-    """Return the path to the token file for a given provider.
-
-    Args:
-        tokens_dir: Directory where token files are stored.
-        provider: OAuth provider name.
-
-    Returns:
-        Path to the provider's token file within the tokens directory.
-    """
-    return tokens_dir / _TOKEN_FILENAMES[provider]
-
-
-def load_token(tokens_dir: Path, provider: OAuthProvider = "google") -> TokenFile | None:
-    """Read and parse the token file from disk.
+async def load_token(
+    pool: asyncpg.Pool,
+    provider: OAuthProvider = "google",
+) -> OAuthToken | None:
+    """Read a provider's token row from the database.
 
     The ``encrypted_refresh_token`` field remains encrypted in the returned
     model. Use ``decrypt_refresh_token`` to obtain the plaintext.
 
     Args:
-        tokens_dir: Directory containing token files.
+        pool: An asyncpg connection pool.
         provider: OAuth provider name.
 
     Returns:
-        A TokenFile instance, or None if no token file exists.
+        An OAuthToken instance, or None if no row exists for the provider.
 
     Raises:
-        OAuthError: If the file exists but cannot be parsed.
+        OAuthError: If a row exists but cannot be parsed.
     """
-    path = _token_file_path(tokens_dir, provider)
-    if not path.is_file():
+    row = await pool.fetchrow(
+        "SELECT provider, scopes, encrypted_refresh_token, email, healthy, "
+        "created_at, last_refreshed_at FROM oauth_tokens WHERE provider = $1",
+        provider,
+    )
+    if row is None:
         return None
     try:
-        raw = path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-        return TokenFile.model_validate(data)
-    except (json.JSONDecodeError, OSError, ValidationError) as exc:
-        msg = f"Failed to read or parse {provider} token file."
+        # asyncpg may return the JSONB scopes column as a JSON string or as
+        # an already-decoded list depending on codec configuration.
+        raw_scopes = row["scopes"]
+        scopes = json.loads(raw_scopes) if isinstance(raw_scopes, str) else raw_scopes
+        return OAuthToken(
+            provider=row["provider"],
+            scopes=scopes,
+            encrypted_refresh_token=row["encrypted_refresh_token"],
+            email=row["email"],
+            healthy=row["healthy"],
+            created_at=row["created_at"],
+            last_refreshed_at=row["last_refreshed_at"],
+        )
+    except (json.JSONDecodeError, ValueError, ValidationError) as exc:
+        msg = f"Failed to parse {provider} token row."
         raise OAuthError(msg) from exc
 
 
-def save_token(tokens_dir: Path, token: TokenFile) -> None:
-    """Write the token file to disk with restricted permissions.
-
-    Creates the tokens directory (mode 0o700) if it does not exist.
-    The token file is written with mode 0o600 (owner read/write only).
+async def save_token(pool: asyncpg.Pool, token: OAuthToken) -> None:
+    """Persist a token row via an UPSERT keyed on provider.
 
     Args:
-        tokens_dir: Directory for token files.
-        token: The TokenFile to persist. The ``encrypted_refresh_token``
+        pool: An asyncpg connection pool.
+        token: The OAuthToken to persist. The ``encrypted_refresh_token``
             field must already be encrypted.
 
     Raises:
-        OAuthError: If the file cannot be written.
-    """
-    try:
-        tokens_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Explicit chmod to override umask — mkdir's mode parameter is
-        # subject to the process umask, so the actual permissions may differ.
-        tokens_dir.chmod(0o700)
-    except OSError as exc:
-        msg = "Failed to create tokens directory."
-        raise OAuthError(msg) from exc
+        OAuthError: If the provider is unknown or the write fails.
 
-    if token.provider not in _TOKEN_FILENAMES:
+    Security notes:
+        Only the Fernet ciphertext is written — the plaintext refresh token
+        never reaches the database. All values are bound as parameters.
+    """
+    import asyncpg
+
+    if token.provider not in _KNOWN_PROVIDERS:
         msg = f"Unknown provider: {token.provider}"
         raise OAuthError(msg)
-    provider: OAuthProvider = token.provider  # type: ignore[assignment]
-    path = _token_file_path(tokens_dir, provider)
+
     try:
-        data = token.model_dump_json(indent=2)
-        # Atomic-permission write: open with 0o600 from the start to avoid
-        # a TOCTOU window where the file is briefly world-readable.
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(data)
-    except OSError as exc:
-        msg = "Failed to write token file."
+        await pool.execute(
+            "INSERT INTO oauth_tokens (provider, encrypted_refresh_token, email, "
+            "scopes, healthy, created_at, last_refreshed_at) "
+            "VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7) "
+            "ON CONFLICT (provider) DO UPDATE SET "
+            "encrypted_refresh_token = EXCLUDED.encrypted_refresh_token, "
+            "email = EXCLUDED.email, "
+            "scopes = EXCLUDED.scopes, "
+            "healthy = EXCLUDED.healthy, "
+            "last_refreshed_at = EXCLUDED.last_refreshed_at",
+            token.provider,
+            token.encrypted_refresh_token,
+            token.email,
+            json.dumps(token.scopes),
+            token.healthy,
+            token.created_at,
+            token.last_refreshed_at,
+        )
+    except asyncpg.PostgresError as exc:
+        msg = "Failed to persist token."
         raise OAuthError(msg) from exc
 
 
-def delete_token(tokens_dir: Path, provider: OAuthProvider = "google") -> bool:
-    """Delete the token file for a given provider.
-
-    Uses ``_token_file_path`` to resolve the file location and removes it
-    if it exists. This is used during account disconnection flows.
+async def delete_token(
+    pool: asyncpg.Pool,
+    provider: OAuthProvider = "google",
+) -> bool:
+    """Delete a provider's token row from the database.
 
     Args:
-        tokens_dir: Directory containing token files.
+        pool: An asyncpg connection pool.
         provider: OAuth provider name.
 
     Returns:
-        True if the file existed and was deleted, False if it did not exist.
+        True if a row existed and was deleted, False otherwise.
 
     Raises:
-        OAuthError: If the file exists but deletion fails.
+        OAuthError: If the DELETE fails.
 
     Security notes:
         No credentials are logged or included in error messages.
     """
-    path = _token_file_path(tokens_dir, provider)
-    if not path.is_file():
-        return False
+    import asyncpg
+
     try:
-        os.unlink(path)
-    except OSError as exc:
-        msg = "Failed to delete token file."
+        status = await pool.execute(
+            "DELETE FROM oauth_tokens WHERE provider = $1",
+            provider,
+        )
+    except asyncpg.PostgresError as exc:
+        msg = "Failed to delete token."
         raise OAuthError(msg) from exc
-    return True
+    # asyncpg returns a status tag like "DELETE 1"; the trailing integer is
+    # the number of rows removed.
+    try:
+        count = int(status.rsplit(" ", 1)[-1])
+    except (ValueError, AttributeError):  # pragma: no cover - defensive
+        return False
+    return count > 0
 
 
 async def revoke_and_delete_token(
-    tokens_dir: Path,
+    pool: asyncpg.Pool,
     provider: OAuthProvider,
     http_client: httpx.AsyncClient,
 ) -> bool:
-    """Revoke the refresh token at the provider, then delete the local file.
+    """Revoke the refresh token at the provider, then delete the DB row.
 
-    Decrypts the refresh token from the on-disk file, POSTs it to the
-    provider's revocation endpoint (best-effort), then deletes the file.
-    This ensures both the provider-side credential and the local copy are
-    invalidated during account disconnection.
+    Decrypts the refresh token from the DB row, POSTs it to the provider's
+    revocation endpoint (best-effort), then deletes the row. This ensures
+    both the provider-side credential and the local copy are invalidated
+    during account disconnection.
 
-    If revocation fails (network error, provider error), the local file
-    is still deleted and a warning is logged. The disconnect proceeds
-    regardless so the user is not stuck.
+    If revocation fails (network error, provider error), the row is still
+    deleted and a warning is logged. The disconnect proceeds regardless so
+    the user is not stuck.
 
     Args:
-        tokens_dir: Directory containing token files.
+        pool: An asyncpg connection pool.
         provider: OAuth provider name (``"google"`` or ``"microsoft"``).
         http_client: An httpx async client for the revocation request.
 
     Returns:
-        True if the file existed and was deleted, False if it did not exist.
+        True if a row existed and was deleted, False if none existed.
 
     Raises:
-        OAuthError: If the file exists but local deletion fails.
+        OAuthError: If the row exists but deletion fails.
 
     Security notes:
         No credentials are logged or included in error messages.
     """
-    token_file = load_token(tokens_dir, provider)
-    if token_file is None:
+    token = await load_token(pool, provider)
+    if token is None:
         return False
 
     # Best-effort revocation: decrypt and POST to provider endpoint.
     try:
-        refresh_tok = decrypt_refresh_token(token_file)
+        refresh_tok = decrypt_refresh_token(token)
         if provider == "google":
             await _revoke_google_token(refresh_tok, http_client)
         else:
@@ -398,8 +423,8 @@ async def revoke_and_delete_token(
             provider,
         )
 
-    # Always delete the local file regardless of revocation outcome.
-    return delete_token(tokens_dir, provider)
+    # Always delete the DB row regardless of revocation outcome.
+    return await delete_token(pool, provider)
 
 
 async def _revoke_google_token(
@@ -943,7 +968,7 @@ async def _refresh_microsoft_token(
 
 
 async def get_valid_access_token(
-    tokens_dir: Path,
+    pool: asyncpg.Pool,
     provider: OAuthProvider,
     cached_token: str | None,
     cached_expires_at: datetime | None,
@@ -952,12 +977,12 @@ async def get_valid_access_token(
     """Return a valid access token for the given provider, refreshing if needed.
 
     If ``cached_token`` is still valid (not expired within the 60-second
-    buffer), it is returned as-is. Otherwise, the refresh token is
-    decrypted from disk and used to obtain a new access token from
+    buffer), it is returned as-is. Otherwise, the refresh token is loaded
+    from the database, decrypted, and used to obtain a new access token from
     the provider's token endpoint.
 
     Args:
-        tokens_dir: Directory containing the encrypted token file.
+        pool: An asyncpg connection pool.
         provider: OAuth provider ("google" or "microsoft").
         cached_token: The currently cached access token, or None.
         cached_expires_at: Expiry time of the cached token, or None.
@@ -968,7 +993,7 @@ async def get_valid_access_token(
         and pass them back on the next call.
 
     Raises:
-        OAuthError: If no token file exists or refresh fails.
+        OAuthError: If no token row exists or refresh fails.
     """
     now = datetime.now(UTC)
 
@@ -981,60 +1006,64 @@ async def get_valid_access_token(
         return cached_token, cached_expires_at
 
     # Need to refresh — load and decrypt the refresh token
-    token_file = load_token(tokens_dir, provider)
-    if token_file is None:
+    token = await load_token(pool, provider)
+    if token is None:
         msg = f"No {provider} account is connected."
         raise OAuthError(msg)
 
-    refresh_tok = decrypt_refresh_token(token_file)
+    refresh_tok = decrypt_refresh_token(token)
 
     # Dispatch to provider-specific refresh. A terminal failure (the refresh
-    # token is dead) flags the token invalid on disk so the UI can surface a
-    # reconnect-required state; transient failures leave the flag untouched.
+    # token is dead) flags the token unhealthy in the DB so the UI can surface
+    # a reconnect-required state; transient failures leave the flag untouched.
     try:
         if provider == "google":
             access_token, expires_in = await _refresh_google_token(refresh_tok, http_client)
         else:
             access_token, expires_in = await _refresh_microsoft_token(refresh_tok, http_client)
     except OAuthRefreshError as exc:
-        if exc.terminal and not token_file.invalid:
-            token_file.invalid = True
+        if exc.terminal and token.healthy:
+            token.healthy = False
             try:
-                save_token(tokens_dir, token_file)
+                await save_token(pool, token)
             except OAuthError:
-                logger.warning("Failed to persist invalid flag in %s token file.", provider)
+                logger.warning("Failed to persist unhealthy flag for %s token.", provider)
         raise
 
     expires_at = now + timedelta(seconds=expires_in)
 
-    # Refresh succeeded — clear any stale invalid flag (recovery) and update
-    # last_refreshed_at in the token file on disk.
-    token_file.invalid = False
-    token_file.last_refreshed_at = now
+    # Refresh succeeded — clear any stale unhealthy flag (recovery) and update
+    # last_refreshed_at in the DB.
+    token.healthy = True
+    token.last_refreshed_at = now
     try:
-        save_token(tokens_dir, token_file)
+        await save_token(pool, token)
     except OAuthError:
         # Non-fatal: log but don't fail the refresh
-        logger.warning("Failed to update last_refreshed_at in %s token file.", provider)
+        logger.warning("Failed to update last_refreshed_at for %s token.", provider)
 
     logger.info("%s OAuth access token refreshed successfully.", provider.capitalize())
     return access_token, expires_at
 
 
-def get_connection_status(tokens_dir: Path, provider: OAuthProvider) -> tuple[bool, bool]:
-    """Return ``(connected, healthy)`` for a provider from local state only.
+async def get_connection_status(
+    pool: asyncpg.Pool,
+    provider: OAuthProvider,
+) -> tuple[bool, bool]:
+    """Return ``(connected, healthy)`` for a provider from DB state only.
 
-    ``connected`` is True when a token file exists on disk. ``healthy`` is
-    True when that token file exists and is not flagged invalid (its refresh
-    token is still believed valid). A dead/revoked refresh token — detected
-    at tool-call time and persisted via the ``invalid`` flag — yields
-    ``(True, False)``, which the UI renders as "Not connected".
+    ``connected`` is True when a token row exists for the provider.
+    ``healthy`` is True when that row exists and its ``healthy`` flag is set
+    (its refresh token is still believed valid). A dead/revoked refresh
+    token — detected at tool-call time and persisted via ``healthy=False`` —
+    or a row whose ciphertext cannot be decrypted yields ``(True, False)``,
+    which the UI renders as "Not connected".
 
-    This reads only the local token file and performs no network calls, so
-    it never blocks the settings page load.
+    This reads only the DB row and performs no network calls, so it never
+    blocks the settings page load.
 
     Args:
-        tokens_dir: Directory containing token files.
+        pool: An asyncpg connection pool.
         provider: OAuth provider name.
 
     Returns:
@@ -1044,14 +1073,22 @@ def get_connection_status(tokens_dir: Path, provider: OAuthProvider) -> tuple[bo
         No credentials are read into the response — only the boolean flags.
     """
     try:
-        token_file = load_token(tokens_dir, provider)
+        token = await load_token(pool, provider)
     except OAuthError:
-        # A corrupt/unparseable token file exists but cannot be trusted —
+        # A corrupt/unparseable token row exists but cannot be trusted —
         # report connected-but-unhealthy so the UI prompts a reconnect.
         return True, False
-    if token_file is None:
+    if token is None:
         return False, False
-    return True, not token_file.invalid
+    if not token.healthy:
+        return True, False
+    # A row that cannot be decrypted (e.g. rotated key) is connected but
+    # unhealthy — surface a reconnect prompt rather than a hard failure.
+    try:
+        decrypt_refresh_token(token)
+    except OAuthError:
+        return True, False
+    return True, True
 
 
 # ---------------------------------------------------------------------------

@@ -78,7 +78,6 @@ class TestValidConfigLoading:
               mode: "token"
             paths:
               audit_log: "/data/audit.jsonl"
-              tokens_dir: "/data/tokens"
             limits:
               max_tool_calls_per_message: 5
               max_pending_confirmations: 2
@@ -109,7 +108,6 @@ class TestValidConfigLoading:
         assert config.limits.max_context_messages == 10
         assert config.egress.allowed_hosts == ["example.com"]
         assert config.log_level == "DEBUG"
-        assert str(config.paths.tokens_dir).endswith("tokens")
 
 
 # ---------------------------------------------------------------------------
@@ -319,13 +317,11 @@ class TestPathResolution:
             """\
             paths:
               audit_log: "relative/audit.jsonl"
-              tokens_dir: "relative/tokens"
             """,
         )
         config = load_app_config(yaml_path)
 
         assert config.paths.audit_log.is_absolute()
-        assert config.paths.tokens_dir.is_absolute()
 
     def test_absolute_paths_stay_absolute(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
