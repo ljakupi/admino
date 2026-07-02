@@ -1,4 +1,24 @@
-# Stage 1: builder — install Python dependencies into a prefix
+# Stage 1: frontend-builder — compile the Vue PWA so a fresh clone (static/ is
+# gitignored) can be built into a runnable image with no host-side npm build.
+# Pin to a specific patch release to prevent silent supply-chain changes.
+# For maximum reproducibility, pin to a digest:
+#   FROM node:20.19.5-slim@sha256:<digest> AS frontend-builder
+# Obtain the current digest with: docker inspect --format='{{index .RepoDigests 0}}' node:20.19.5-slim
+FROM node:20.19.5-slim AS frontend-builder
+
+WORKDIR /build/static-src
+
+# Install dependencies first so this layer is cached unless package*.json changes
+COPY static-src/package.json static-src/package-lock.json ./
+RUN npm ci
+
+# Copy the rest of the frontend source and build the production PWA.
+# vite.config.ts sets outDir to ../static, so the build lands at /build/static.
+COPY static-src/ ./
+RUN npm run build
+
+# -------------------------------------------------------------------
+# Stage 2: builder — install Python dependencies into a prefix
 # Pin to a specific patch release to prevent silent supply-chain changes.
 # For maximum reproducibility, pin to a digest:
 #   FROM python:3.12.8-slim@sha256:<digest> AS builder
@@ -20,7 +40,7 @@ COPY src/ src/
 RUN pip install --no-cache-dir --prefix=/install ".[all-providers]"
 
 # -------------------------------------------------------------------
-# Stage 2: runtime — minimal image with a non-root user
+# Stage 3: runtime — minimal image with a non-root user
 # -------------------------------------------------------------------
 FROM python:3.12.8-slim AS runtime
 
@@ -46,9 +66,10 @@ COPY --from=builder /install /usr/local
 WORKDIR /app
 COPY --chown=admino:admino src/ src/
 
-# Copy PWA static files. server.py resolves the static directory from
-# /app/static when running inside the image (see server.py create_app).
-COPY --chown=admino:admino static/ /app/static/
+# Copy PWA static files built by the frontend-builder stage. server.py
+# resolves the static directory from /app/static when running inside the
+# image (see server.py create_app).
+COPY --from=frontend-builder --chown=admino:admino /build/static/ /app/static/
 
 # Create data and config directories; they will be volume-mounted at runtime
 # but must exist in the image so the container starts cleanly if volumes are empty
