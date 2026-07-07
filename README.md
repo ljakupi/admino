@@ -36,7 +36,7 @@ make run
 
 Open **http://localhost:8000** in your browser. Done.
 
-The config defaults in `config/config.yaml` currently target Anthropic (`llm.provider: "anthropic"`) since that's what's been exercised most recently in development. To switch to a local Ollama running on your laptop, change `llm.provider` to `"ollama"` and uncomment `ollama_url: "http://localhost:11434"`. VPN auth mode and relative data paths work out of the box either way.
+The config defaults in `config/config.yaml` are Ollama-first out of the box: with Ollama running (see step 2 above), a fresh clone works with `make run` and zero config edits. To switch to Anthropic or OpenAI, set the provider's API key in the environment, change `llm.provider` in `config/config.yaml`, and uncomment the provider's host under `egress.allowed_hosts` (see the comments in that file). VPN auth mode and relative data paths work out of the box either way.
 
 ### What happens at startup
 
@@ -63,7 +63,7 @@ admino uses a base + overlay compose layout. The base `docker-compose.yml` defin
 ollama serve &
 ollama pull gemma4:12b
 cp .env.example .env
-# Edit config/config.yaml: llm.provider: "ollama", ollama_url: "http://host.docker.internal:11434"
+# Edit .env: set OLLAMA_BASE_URL=http://host.docker.internal:11434 (no config.yaml edit needed — provider already defaults to ollama)
 mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build && make docker-up
 ```
@@ -72,7 +72,12 @@ make docker-build && make docker-up
 
 ```bash
 cp .env.example .env
-# Defaults already point at http://local-llm:11434 — no edits needed.
+# Defaults already point at http://local-llm:11434 — no edits needed for a
+# localhost-only run. On a VPS (or any setup reachable beyond this machine),
+# you MUST enable token auth BEFORE exposing the port: uncomment AUTH_MODE=token
+# in .env and set AUTH_TOKEN (generation command is in .env.example). The
+# default "vpn" auth mode trusts every connection and is only safe while the
+# API is published on 127.0.0.1.
 mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build BACKEND=ollama
 make docker-up BACKEND=ollama
@@ -95,12 +100,16 @@ make docker-up BACKEND=vllm
 cp .env.example .env
 # Set ANTHROPIC_API_KEY (or OPENAI_API_KEY) in .env.
 # Set llm.provider in config/config.yaml to "anthropic" or "openai".
+# Uncomment api.anthropic.com (or api.openai.com) in config.yaml's egress.allowed_hosts,
+# and append it to EGRESS_ALLOWED_HOSTS in .env.
 mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build
 make docker-up
 ```
 
 All four modes serve at **http://localhost:8000**. The agent inside the container always reaches the local LLM (when present) at the provider-agnostic hostname `http://local-llm:PORT` — swapping backends means swapping the `BACKEND` variable, not editing internal service names.
+
+All four modes publish the API on **127.0.0.1 only** (see `ports` in `docker-compose.yml`), which is what makes the default `auth.mode: "vpn"` safe. If you widen that publish (LAN, VPN, VPS, reverse proxy), first switch to token auth: uncomment `AUTH_MODE=token` in `.env` and set `AUTH_TOKEN` — the agent then refuses to start until a strong token is configured.
 
 ### Troubleshooting
 
