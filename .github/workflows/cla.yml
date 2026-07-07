@@ -43,4 +43,9 @@ jobs:
           # document link is valid as soon as this workflow itself is merged.
           path-to-document: 'https://github.com/ljakupi/admino/blob/develop/CLA.md'
           branch: 'cla-signatures'
-          allowlist: 'ljakupi,dependabot[bot]'
+          # "claude" is the GitHub account that the Co-Authored-By trailer
+          # (noreply@anthropic.com) on AI-assisted commits resolves to. The
+          # CLA action counts co-authors as committers, and that account
+          # cannot sign; the human committer's signature covers the
+          # contribution.
+          allowlist: 'ljakupi,dependabot[bot],claude'
