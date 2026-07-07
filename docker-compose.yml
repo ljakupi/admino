@@ -24,7 +24,10 @@
 services:
 
   # --------------------------------------------------------------------------
-  # postgres — Relational database. Internal only; no external network access.
+  # postgres — Relational database. Internal network only: no published ports,
+  # unreachable from the host or LAN. The agent reaches it at postgres:5432
+  # over the internal bridge. For native `make run` development, the
+  # docker-compose.dev.yml overlay publishes 127.0.0.1:5432 (see `make dev-db`).
   # Data persists via bind-mount at ./data/postgres on the host.
   # --------------------------------------------------------------------------
   postgres:
@@ -37,11 +40,8 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
-    ports:
-      - "127.0.0.1:5432:5432"
     networks:
       - internal
-      - host-bridge
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U admino -d admino"]
       interval: 10s
@@ -165,11 +165,4 @@ networks:
 
   egress:
     name: admino-egress
-    driver: bridge
-
-  # Plain bridge — no internal isolation. Attached to postgres only so that
-  # Docker Desktop on macOS can resolve host port forwarding (5432 → localhost).
-  # The agent is NOT on this network; postgres<->agent traffic stays on internal.
-  host-bridge:
-    name: admino-host-bridge
     driver: bridge
