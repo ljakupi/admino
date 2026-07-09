@@ -15,11 +15,12 @@
 #      the internal network so the agent can reach it at http://local-llm:11434.
 #        docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
 #
-#   3. Local OSS model via vLLM (GPU required)
-#      Overlay the vLLM backend. Same "local-llm" hostname; port 8000.
-#        docker compose -f docker-compose.yml -f docker-compose.vllm.yml up -d
+#   3. Other self-hosted OpenAI-compatible servers (vLLM, llama.cpp, LM Studio)
+#      No overlay needed: set llm.provider to "openai" in config.yaml and point
+#      the OPENAI_BASE_URL env var (see .env.example) at the server's endpoint.
+#      The server's host must be reachable per the egress whitelist.
 #
-# The Makefile wraps these with `make docker-up BACKEND=ollama|vllm` — see Makefile.
+# The Makefile wraps these with `make docker-up BACKEND=ollama` — see Makefile.
 
 services:
 

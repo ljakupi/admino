@@ -1,6 +1,6 @@
 # admino
 
-Local-only, security-first personal AI agent. Python 3.12+, FastAPI, Pydantic v2, Docker Compose deployment. LLM inference via **Ollama** (default, local), **vLLM** (local, GPU), **Anthropic Claude**, or **OpenAI** — provider is selected via `llm.provider` in `config.yaml`.
+Local-only, security-first personal AI agent. Python 3.12+, FastAPI, Pydantic v2, Docker Compose deployment. LLM inference via **Ollama** (default, local), **Anthropic Claude**, or **OpenAI** — provider is selected via `llm.provider` in `config.yaml`.
 
 ## How to Run
 
@@ -11,9 +11,10 @@ You're in your IDE terminal, the repo is cloned, and you want the app running. H
 You need **Python 3.12+** and one LLM backend:
 
 - **Ollama** (default, local, recommended for privacy) — `brew install ollama`
-- **vLLM** (local, GPU required) — runs as a Docker overlay
 - **Anthropic Claude** (opt-in, cloud) — `ANTHROPIC_API_KEY` env var
 - **OpenAI** (opt-in, cloud) — `OPENAI_API_KEY` env var
+
+Any self-hosted OpenAI-compatible server (vLLM, llama.cpp, LM Studio) also works: use the `openai` provider and point the `OPENAI_BASE_URL` env var at your server (`OPENAI_API_KEY` must still be set — any placeholder value works for servers that don't check it; in Docker mode the server's host must also be allowed by the egress whitelist).
 
 ### Quick start (local dev, recommended)
 
@@ -55,7 +56,7 @@ The config defaults in `config/config.yaml` are Ollama-first out of the box: wit
 
 ### Docker mode (optional)
 
-admino uses a base + overlay compose layout. The base `docker-compose.yml` defines the `agent` container only. Local LLM backends live in provider-specific overlay files (`docker-compose.ollama.yml`, `docker-compose.vllm.yml`) that are merged via `make docker-up BACKEND=<name>`.
+admino uses a base + overlay compose layout. The base `docker-compose.yml` defines the `agent` container only. Local LLM backends live in provider-specific overlay files (`docker-compose.ollama.yml`) that are merged via `make docker-up BACKEND=<name>`.
 
 **Agent in Docker + native Ollama** (keeps Metal GPU acceleration):
 
@@ -84,16 +85,6 @@ make docker-up BACKEND=ollama
 docker compose exec local-llm ollama pull gemma4:12b
 ```
 
-**Full Docker with vLLM** (agent + vLLM, GPU required):
-
-```bash
-cp .env.example .env
-# Edit config/config.yaml: set llm.provider: "openai" and openai_base_url: "http://local-llm:8000/v1"
-mkdir -p data/postgres data/logs data/hf-cache ~/Downloads/admino
-make docker-build BACKEND=vllm
-make docker-up BACKEND=vllm
-```
-
 **Full Docker with a proprietary provider** (Anthropic / OpenAI — no local LLM container):
 
 ```bash
@@ -107,9 +98,9 @@ make docker-build
 make docker-up
 ```
 
-All four modes serve at **http://localhost:8000**. The agent inside the container always reaches the local LLM (when present) at the provider-agnostic hostname `http://local-llm:PORT` — swapping backends means swapping the `BACKEND` variable, not editing internal service names.
+All three modes serve at **http://localhost:8000**. The agent inside the container always reaches the local LLM (when present) at the provider-agnostic hostname `http://local-llm:PORT` — swapping backends means swapping the `BACKEND` variable, not editing internal service names.
 
-All four modes publish the API on **127.0.0.1 only** (see `ports` in `docker-compose.yml`), which is what makes the default `auth.mode: "vpn"` safe. If you widen that publish (LAN, VPN, VPS, reverse proxy), first switch to token auth: uncomment `AUTH_MODE=token` in `.env` and set `AUTH_TOKEN` — the agent then refuses to start until a strong token is configured.
+All three modes publish the API on **127.0.0.1 only** (see `ports` in `docker-compose.yml`), which is what makes the default `auth.mode: "vpn"` safe. If you widen that publish (LAN, VPN, VPS, reverse proxy), first switch to token auth: uncomment `AUTH_MODE=token` in `.env` and set `AUTH_TOKEN` — the agent then refuses to start until a strong token is configured.
 
 ### Troubleshooting
 
@@ -244,9 +235,8 @@ This section documents key decisions about where we use proven third-party libra
 admino/
   docker-compose.yml         -- base: agent only (provider-agnostic)
   docker-compose.ollama.yml  -- overlay: adds `local-llm` via Ollama
-  docker-compose.vllm.yml    -- overlay: adds `local-llm` via vLLM (GPU)
   Dockerfile
-  Makefile                   -- docker-{build,up,down,logs} accept BACKEND={ollama,vllm}
+  Makefile                   -- docker-{build,up,down,logs} accept BACKEND=ollama
   entrypoint.sh              -- iptables egress whitelist + start server
   src/admino/
     main.py            -- entry point, load config, start uvicorn
@@ -288,7 +278,7 @@ The following intentional deviations from the original product specification imp
 | SSE event names | `thinking`, `confirmation_required`, `confirmation_resolved`, `tool_result` | `status`, `confirm`, `tool_call`, `message`, `done` | Functionally equivalent; the PWA uses these names. Will align naming in v2 if needed. |
 | Session ID generation | Server-generated UUID | Client-generated (timestamp + random hex) | Acceptable for single-user, local-only deployment. |
 | Default model | `qwen2.5-coder:14b` | `gemma4:12b` | Gemma 4 (April 2026) has native tool calling, better quality at similar size. |
-| Docker Compose Ollama | Always starts | Provider-agnostic `local-llm` service in `docker-compose.ollama.yml` overlay (opt-in via `make docker-up BACKEND=ollama`) | Laptop mode uses native Ollama for Metal GPU acceleration; the overlay pattern also accommodates vLLM and future backends without touching the base file. |
+| Docker Compose Ollama | Always starts | Provider-agnostic `local-llm` service in `docker-compose.ollama.yml` overlay (opt-in via `make docker-up BACKEND=ollama`) | Laptop mode uses native Ollama for Metal GPU acceleration; the overlay pattern also accommodates future backends without touching the base file. |
 | Health endpoint | Returns `model`, `ollama_reachable`, `uptime_s` | Returns `{"status": "ok"}` only | Enriched response planned for v1 completion. |
 
 ## Outstanding for Complete v1
@@ -319,7 +309,7 @@ The following intentional deviations from the original product specification imp
 - **Tool registry**: tools/registry.py (registration, dispatch, permission enforcement)
 - **Tool modules**: tools/memory.py (PostgreSQL key-value store), tools/files.py (path-validated file access), and the OAuth-backed tools/gmail.py, tools/google_calendar.py, tools/google_drive.py, tools/outlook.py, tools/outlook_calendar.py, tools/onedrive.py
 - **PWA**: Vue 3 + Vite app in `static-src/`, built to `static/` (`index.html`, hashed JS/CSS bundles under `assets/`, `manifest.webmanifest`, `service-worker.js`, fonts, icons)
-- **DevOps**: Dockerfile, docker-compose.yml (base), docker-compose.ollama.yml + docker-compose.vllm.yml (provider overlays), entrypoint.sh (iptables egress whitelist), Makefile (BACKEND variable for overlay selection), .env.example, .gitignore, .dockerignore
+- **DevOps**: Dockerfile, docker-compose.yml (base), docker-compose.ollama.yml (provider overlay), entrypoint.sh (iptables egress whitelist), Makefile (BACKEND variable for overlay selection), .env.example, .gitignore, .dockerignore
 - **Tests**: backend pytest suite with coverage reporting (coverage gate enforced in CI)
 - **Security**: CSP headers, egress whitelist, credential sanitization, TOCTOU-safe file writes, path confinement
 
