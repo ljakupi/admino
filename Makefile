@@ -17,16 +17,13 @@ UNAME := $(shell uname -s)
 #
 #   (unset)        Agent only. Use with proprietary providers (Anthropic, OpenAI).
 #   BACKEND=ollama Agent + Ollama.        make docker-up BACKEND=ollama
-#   BACKEND=vllm   Agent + vLLM (GPU).    make docker-up BACKEND=vllm
 # --------------------------------------------------------------------------
 BACKEND ?=
 COMPOSE_FILES := -f docker-compose.yml
 ifeq ($(BACKEND),ollama)
   COMPOSE_FILES += -f docker-compose.ollama.yml
-else ifeq ($(BACKEND),vllm)
-  COMPOSE_FILES += -f docker-compose.vllm.yml
 else ifneq ($(BACKEND),)
-  $(error Unknown BACKEND '$(BACKEND)' — use 'ollama', 'vllm', or leave unset)
+  $(error Unknown BACKEND '$(BACKEND)' — use 'ollama' or leave unset)
 endif
 
 lint:
