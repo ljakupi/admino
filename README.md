@@ -91,8 +91,8 @@ docker compose exec local-llm ollama pull gemma4:12b
 cp .env.example .env
 # Set ANTHROPIC_API_KEY (or OPENAI_API_KEY) in .env.
 # Set llm.provider in config/config.yaml to "anthropic" or "openai".
-# Uncomment api.anthropic.com (or api.openai.com) in config.yaml's egress.allowed_hosts,
-# and append it to EGRESS_ALLOWED_HOSTS in .env.
+# Uncomment api.anthropic.com (or api.openai.com) in config.yaml's egress.allowed_hosts —
+# the iptables whitelist is derived from that list, nothing to sync in .env.
 mkdir -p data/postgres data/logs ~/Downloads/admino
 make docker-build
 make docker-up
