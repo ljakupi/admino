@@ -75,12 +75,16 @@ limits:
   max_message_length: 4000
   max_context_messages: 20
 
+# Single source of truth for outbound network access: entrypoint.sh derives
+# the iptables egress whitelist from this list (Docker mode), and main.py
+# checks the configured LLM provider's API host is present at startup.
 egress:
   allowed_hosts:
     # Google APIs (Gmail, Calendar, Drive)
     - "oauth2.googleapis.com"
     - "accounts.google.com"
     - "www.googleapis.com"
+    - "gmail.googleapis.com"
     # Microsoft Graph API (Outlook, Calendar, OneDrive)
     - "login.microsoftonline.com"
     - "graph.microsoft.com"

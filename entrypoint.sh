@@ -19,7 +19,9 @@
 #   without Docker, or CI without privileges), the iptables block is skipped
 #   with a warning so the image still works for development purposes.
 #
-# Inputs:  EGRESS_ALLOWED_HOSTS      (space-separated, e.g. "googleapis.com newsapi.org")
+# Inputs:  CONFIG_DIR                (default: config — directory containing config.yaml;
+#                                     the whitelist is read from egress.allowed_hosts there,
+#                                     the single source of truth. Same default as main.py.)
 #          DOCKER_DNS_IP             (default: 127.0.0.11 — Docker embedded resolver)
 #          INTERNAL_NETWORK          (default: 172.16.0.0/12 — Docker bridge range)
 #          REQUIRE_EGRESS_WHITELIST  (default: true — set to "false" only for local dev without Docker)
@@ -28,6 +30,7 @@
 set -euo pipefail
 
 DOCKER_DNS_IP="${DOCKER_DNS_IP:-127.0.0.11}"
+CONFIG_FILE="${CONFIG_DIR:-config}/config.yaml"
 # Default covers Docker's full IPAM pool (172.16.0.0/12). User-defined bridge
 # networks are assigned from this range (172.17.x, 172.18.x, etc.) so we must
 # cover the full range to reliably reach Ollama regardless of subnet assignment.
@@ -36,9 +39,30 @@ DOCKER_DNS_IP="${DOCKER_DNS_IP:-127.0.0.11}"
 # bridge CIDR with: docker network inspect admino-internal --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'
 INTERNAL_NETWORK="${INTERNAL_NETWORK:-172.16.0.0/12}"
 
-# Sanitize EGRESS_ALLOWED_HOSTS: collapse newlines to spaces to prevent
-# embedded newlines from bypassing the per-host character validation.
-EGRESS_ALLOWED_HOSTS="$(printf '%s' "${EGRESS_ALLOWED_HOSTS:-}" | tr '\n' ' ')"
+# Read the egress whitelist from config.yaml (egress.allowed_hosts) — the
+# single source of truth, also validated by Pydantic at app startup and
+# checked against the LLM provider in main.py. The EGRESS_ALLOWED_HOSTS env
+# var is intentionally NOT consulted: a second, hand-synced list already
+# drifted once and silently broke provider egress.
+# Fails hard (set -e) if the config file is missing or unparseable.
+read_allowed_hosts() {
+    python -c '
+import sys
+import yaml
+
+with open(sys.argv[1]) as f:
+    config = yaml.safe_load(f)
+hosts = ((config or {}).get("egress") or {}).get("allowed_hosts") or []
+# Mirror the Pydantic contract (EgressConfig): a list of strings, each at
+# most 253 chars. Anything else (mapping, scalar, nested lists) fails closed
+# here just as config.py would reject it at app startup.
+if not isinstance(hosts, list) or not all(
+    isinstance(h, str) and 0 < len(h) <= 253 for h in hosts
+):
+    sys.exit("egress.allowed_hosts must be a list of hostname strings (max 253 chars each)")
+print(" ".join(hosts))
+' "${CONFIG_FILE}"
+}
 
 apply_iptables() {
     # Verify iptables is available and we have the required capability
@@ -74,9 +98,14 @@ apply_iptables() {
     # Allow all traffic on the internal Docker bridge network (local LLM backend access)
     iptables -A OUTPUT -d "${INTERNAL_NETWORK}" -j ACCEPT
 
-    # Allow egress to whitelisted external hosts (HTTPS only, port 443)
-    # EGRESS_ALLOWED_HOSTS is space-separated and set from config.yaml egress.allowed_hosts
-    # In the container this is populated via the EGRESS_ALLOWED_HOSTS env var.
+    # Allow egress to whitelisted external hosts (HTTPS only, port 443).
+    # The list is read from config.yaml egress.allowed_hosts (see
+    # read_allowed_hosts above). Sanitize by collapsing newlines to spaces to
+    # prevent embedded newlines from bypassing the per-host validation.
+    EGRESS_ALLOWED_HOSTS="$(read_allowed_hosts | tr '\n' ' ')"
+    # Strip non-printable characters before logging: entries are not yet
+    # validated here, and raw control chars from YAML could forge log lines.
+    echo "[entrypoint] Egress whitelist from ${CONFIG_FILE}: $(printf '%s' "${EGRESS_ALLOWED_HOSTS:-<empty>}" | tr -cd '[:print:]')"
     #
     # IMPORTANT — wildcard entries (e.g. *.googleapis.com) do NOT expand to subdomains.
     # The '*.' prefix is stripped and only the apex domain is resolved. Each subdomain
@@ -93,7 +122,7 @@ apply_iptables() {
             # Validate host entry against safe character set before any shell use.
             # Allowed: alphanumeric, dots, hyphens, and a leading '*.' wildcard.
             if ! echo "${host}" | grep -qE '^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9.\-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$'; then
-                echo "[entrypoint] ERROR: Unsafe or malformed host entry in EGRESS_ALLOWED_HOSTS — aborting." >&2
+                echo "[entrypoint] ERROR: Unsafe or malformed host entry in config.yaml egress.allowed_hosts — aborting." >&2
                 exit 1
             fi
             # Strip leading wildcard — resolves the apex only (see note above).
