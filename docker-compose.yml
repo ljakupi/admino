@@ -29,7 +29,9 @@ services:
   # unreachable from the host or LAN. The agent reaches it at postgres:5432
   # over the internal bridge. For native `make run` development, the
   # docker-compose.dev.yml overlay publishes 127.0.0.1:5432 (see `make dev-db`).
-  # Data persists via bind-mount at ./data/postgres on the host.
+  # Data persists in the named Docker volume "admino-pgdata" (survives
+  # `down`/`up`; not visible in the repo tree — avoids the uid-999 bind-mount
+  # permissions footgun on Linux). Reset with `docker volume rm admino-pgdata`.
   # --------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
@@ -40,7 +42,7 @@ services:
       POSTGRES_USER: admino
       POSTGRES_PASSWORD: ${PG_PASSWORD}
     volumes:
-      - ./data/postgres:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data
     networks:
       - internal
     healthcheck:
@@ -167,3 +169,14 @@ networks:
   egress:
     name: admino-egress
     driver: bridge
+
+# --------------------------------------------------------------------------
+# Volumes
+#
+# `pgdata`: named Docker volume for Postgres data, not a host bind-mount.
+#   Keeps the repo tree free of uid-999-owned files (Linux bind-mount
+#   permissions footgun) and requires no `mkdir` step before first run.
+# --------------------------------------------------------------------------
+volumes:
+  pgdata:
+    name: admino-pgdata

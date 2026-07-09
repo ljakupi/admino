@@ -29,7 +29,7 @@ ollama serve &               # skip if Ollama is already running
 ollama pull gemma4:12b
 
 # 3. Create data directories + the single sandboxed files dir
-mkdir -p data/postgres data/logs ~/Downloads/admino
+mkdir -p data/logs ~/Downloads/admino
 
 # 4. Start the agent
 make run
@@ -65,7 +65,7 @@ ollama serve &
 ollama pull gemma4:12b
 cp .env.example .env
 # Edit .env: set OLLAMA_BASE_URL=http://host.docker.internal:11434 (no config.yaml edit needed — provider already defaults to ollama)
-mkdir -p data/postgres data/logs ~/Downloads/admino
+mkdir -p data/logs ~/Downloads/admino
 make docker-build && make docker-up
 ```
 
@@ -79,7 +79,7 @@ cp .env.example .env
 # in .env and set AUTH_TOKEN (generation command is in .env.example). The
 # default "vpn" auth mode trusts every connection and is only safe while the
 # API is published on 127.0.0.1.
-mkdir -p data/postgres data/logs ~/Downloads/admino
+mkdir -p data/logs ~/Downloads/admino
 make docker-build BACKEND=ollama
 make docker-up BACKEND=ollama
 docker compose exec local-llm ollama pull gemma4:12b
@@ -93,7 +93,7 @@ cp .env.example .env
 # Set llm.provider in config/config.yaml to "anthropic" or "openai".
 # Uncomment api.anthropic.com (or api.openai.com) in config.yaml's egress.allowed_hosts —
 # the iptables whitelist is derived from that list, nothing to sync in .env.
-mkdir -p data/postgres data/logs ~/Downloads/admino
+mkdir -p data/logs ~/Downloads/admino
 make docker-build
 make docker-up
 ```
@@ -101,6 +101,12 @@ make docker-up
 All three modes serve at **http://localhost:8000**. The agent inside the container always reaches the local LLM (when present) at the provider-agnostic hostname `http://local-llm:PORT` — swapping backends means swapping the `BACKEND` variable, not editing internal service names.
 
 All three modes publish the API on **127.0.0.1 only** (see `ports` in `docker-compose.yml`), which is what makes the default `auth.mode: "vpn"` safe. If you widen that publish (LAN, VPN, VPS, reverse proxy), first switch to token auth: uncomment `AUTH_MODE=token` in `.env` and set `AUTH_TOKEN` — the agent then refuses to start until a strong token is configured.
+
+#### Postgres data & reset
+
+Postgres data lives in the named Docker volume `admino-pgdata`, not a bind-mount — it isn't visible in the repo tree and survives `docker compose down`/`up`. List it with `docker volume ls`, inspect it with `docker volume inspect admino-pgdata`, or wipe it for a clean reset with `docker compose down && docker volume rm admino-pgdata` (no `sudo` required, unlike the old bind-mount).
+
+**Migrating from a pre-OSS deployment** (bind-mount at `./data/postgres`): either dump and restore — while still on the old setup, run `docker compose exec postgres pg_dump -U admino --data-only admino > data/pg-backup.sql && chmod 600 data/pg-backup.sql` (keep the dump inside the gitignored `data/` directory — it contains plaintext memory notes), remove the old bind-mount directory (on Linux this one cleanup step may need `sudo rm -rf ./data/postgres`, since the files are owned by uid 999), start fresh with `make docker-up` (migrations create the schema in the new `admino-pgdata` volume), restore with `docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U admino admino < data/pg-backup.sql`, and delete the dump once verified — or simply accept a fresh database: settings and permissions re-seed automatically on first boot, but OAuth connections will need to be reconnected via `oauth_setup.py`.
 
 ### Troubleshooting
 
