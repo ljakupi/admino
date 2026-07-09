@@ -59,7 +59,7 @@ paths:
 
 files:
   allowed_paths:
-    # Docker: ~/Downloads/admino on the host is mounted at /app/files/personal.
+    # Docker: ~/Downloads/admino on the host is mounted at /app/documents.
     # The agent can read and write anything inside that directory.
     # Nothing outside it is accessible — Docker does not mount any other host path.
     # Local dev (make run): change this to an absolute path on your laptop.

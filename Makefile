@@ -5,9 +5,6 @@ SRC_DIR    := src
 TESTS_DIR  := tests
 PACKAGE    := admino
 
-# Detect OS for cross-platform compatibility
-UNAME := $(shell uname -s)
-
 # --------------------------------------------------------------------------
 # Local LLM backend selection.
 #
@@ -74,10 +71,5 @@ run:
 	python -m $(PACKAGE).main
 
 clean:
-ifeq ($(UNAME), Darwin)
 	find $(SRC_DIR) $(TESTS_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	rm -rf .mypy_cache .pytest_cache dist htmlcov .coverage
-else
-	find $(SRC_DIR) $(TESTS_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-	rm -rf .mypy_cache .pytest_cache dist htmlcov .coverage
-endif
