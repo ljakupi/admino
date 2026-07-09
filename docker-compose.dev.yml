@@ -4,12 +4,26 @@
 #   make dev-db          (starts Postgres with host port 5432)
 #   make dev-db-down     (stops it)
 #
-# This overlay adds a host port mapping so the Python process running
-# natively on the host can reach Postgres at localhost:5432.
-# It is NOT used in production — the base docker-compose.yml keeps
-# Postgres on the internal network only.
+# This overlay is the ONLY place Postgres is exposed to the host. It adds:
+#   - a 127.0.0.1:5432 port mapping so the Python process running natively
+#     on the host can reach Postgres at localhost:5432
+#   - a plain (non-internal) bridge network, because Docker cannot forward
+#     a published port to a container attached only to an `internal: true`
+#     network
+# It is NOT used in production — the base docker-compose.yml keeps Postgres
+# on the internal network with no published ports.
 
 services:
   postgres:
     ports:
       - "127.0.0.1:5432:5432"
+    networks:
+      - host-bridge
+
+networks:
+  # Plain bridge — no internal isolation. Attached to postgres only so that
+  # Docker Desktop on macOS can resolve host port forwarding (5432 → localhost).
+  # The agent is NOT on this network; postgres<->agent traffic stays on internal.
+  host-bridge:
+    name: admino-host-bridge
+    driver: bridge
