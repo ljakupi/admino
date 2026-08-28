@@ -13,7 +13,7 @@ import type {
 
 // Keep the old union type alias for backward compat with components
 // The API uses 'anthropic' but the UI labels it 'claude' — we map here.
-export type LLMProvider = 'ollama' | 'claude' | 'openai';
+export type LLMProvider = 'claude' | 'openai';
 
 const TOKEN_KEY = 'admino_auth_token';
 const SESSION_KEY = 'admino_session_id';
@@ -90,9 +90,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const error = ref<string | null>(null);
 
   // LLM
-  const llmProvider = ref<LLMProviderName>('ollama');
-  const llmModel = ref('');
-  const llmOllamaUrl = ref('http://localhost:11434');
+  const llmProvider = ref<LLMProviderName>('anthropic');
   const llmAnthropicModel = ref('');
   const llmOpenAiModel = ref('');
   const anthropicKeyConfigured = ref(false);
@@ -122,21 +120,11 @@ export const useSettingsStore = defineStore('settings', () => {
     memory: true,
   });
 
-  // Computed refs for backward compat with components that use provider/model/ollamaUrl
+  // Computed ref for backward compat with components that read `provider`.
   const provider = computed<LLMProvider>(() => apiToUiProvider(llmProvider.value));
-  const model = computed(() =>
-    llmProvider.value === 'anthropic'
-      ? llmAnthropicModel.value
-      : llmProvider.value === 'openai'
-        ? llmOpenAiModel.value
-        : llmModel.value,
-  );
-  const ollamaUrl = computed(() => llmOllamaUrl.value);
 
   function applyResponse(data: SettingsResponse) {
     llmProvider.value = data.llm.provider;
-    llmModel.value = data.llm.model;
-    llmOllamaUrl.value = data.llm.ollama_url;
     llmAnthropicModel.value = data.llm.anthropic_model;
     llmOpenAiModel.value = data.llm.openai_model;
     anthropicKeyConfigured.value = data.llm.anthropic_key_configured;
@@ -177,16 +165,6 @@ export const useSettingsStore = defineStore('settings', () => {
   async function setProvider(ui: LLMProvider) {
     llmProvider.value = uiToApiProvider(ui);
     await saveSetting({ llm: { provider: llmProvider.value } });
-  }
-
-  async function setOllamaModel(value: string) {
-    llmModel.value = value;
-    await saveSetting({ llm: { model: value } });
-  }
-
-  async function setOllamaUrl(value: string) {
-    llmOllamaUrl.value = value;
-    await saveSetting({ llm: { ollama_url: value } });
   }
 
   async function setAnthropicModel(value: string) {
@@ -283,12 +261,8 @@ export const useSettingsStore = defineStore('settings', () => {
     newSession,
     // Compat computed
     provider,
-    model,
-    ollamaUrl,
     // Raw LLM state
     llmProvider,
-    llmModel,
-    llmOllamaUrl,
     llmAnthropicModel,
     llmOpenAiModel,
     anthropicKeyConfigured,
@@ -309,8 +283,6 @@ export const useSettingsStore = defineStore('settings', () => {
     loadSettings,
     saveSetting,
     setProvider,
-    setOllamaModel,
-    setOllamaUrl,
     setAnthropicModel,
     setOpenAiModel,
     setNotificationsEnabled,

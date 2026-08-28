@@ -33,7 +33,7 @@ DOCKER_DNS_IP="${DOCKER_DNS_IP:-127.0.0.11}"
 CONFIG_FILE="${CONFIG_DIR:-config}/config.yaml"
 # Default covers Docker's full IPAM pool (172.16.0.0/12). User-defined bridge
 # networks are assigned from this range (172.17.x, 172.18.x, etc.) so we must
-# cover the full range to reliably reach Ollama regardless of subnet assignment.
+# cover the full range to reliably reach internal services regardless of subnet assignment.
 # Override via INTERNAL_NETWORK if your Docker daemon uses a custom IPAM config
 # (e.g. daemon.json "bip" or "default-address-pools"). Verify your Docker
 # bridge CIDR with: docker network inspect admino-internal --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}'

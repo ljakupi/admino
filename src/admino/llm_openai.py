@@ -10,7 +10,7 @@ translates between admino's tool format and OpenAI's native format.
 
 Security notes:
 - API key is read from OPENAI_API_KEY env var, never from config files.
-- No credentials are logged. LLM output is sanitized identically to Ollama.
+- No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -65,7 +65,7 @@ def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, An
 def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Convert admino tool definitions to OpenAI's format.
 
-    admino/Ollama format is already compatible with OpenAI::
+    The admino tool format is already compatible with OpenAI::
 
         {"type": "function", "function": {"name": "...", "description": "...",
          "parameters": {...}}}
@@ -193,7 +193,7 @@ class OpenAIClient:
     """Async client for OpenAI's Chat Completions API.
 
     Uses the official ``openai`` SDK. Implements the ``LLMClient``
-    protocol so it is interchangeable with OllamaClient.
+    protocol so it is interchangeable with the other LLMClient backends.
     """
 
     def __init__(self, config: LLMConfig) -> None:
@@ -242,7 +242,7 @@ class OpenAIClient:
 
         Args:
             messages: Conversation messages.
-            tools: Optional tool definitions (admino/Ollama format).
+            tools: Optional tool definitions (admino tool format).
             stream: Must be False for this method.
 
         Returns:

@@ -5,22 +5,17 @@
 #
 # Run modes:
 #
-#   1. Proprietary provider (Anthropic / OpenAI)
+#   1. Cloud provider (Anthropic / OpenAI)
 #      No local LLM container needed. The agent reaches the provider's API
 #      directly via the egress whitelist.
 #        docker compose up -d
 #
-#   2. Local OSS model via Ollama
-#      Overlay the Ollama backend. Exposes a service named "local-llm" on
-#      the internal network so the agent can reach it at http://local-llm:11434.
-#        docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
+#   2. Self-hosted OpenAI-compatible server (e.g. a local vLLM — coming soon)
+#      Set llm.provider to "openai" in config.yaml and point the OPENAI_BASE_URL
+#      env var (see .env.example) at the server's endpoint. The server's host
+#      must be reachable per the egress whitelist.
 #
-#   3. Other self-hosted OpenAI-compatible servers (vLLM, llama.cpp, LM Studio)
-#      No overlay needed: set llm.provider to "openai" in config.yaml and point
-#      the OPENAI_BASE_URL env var (see .env.example) at the server's endpoint.
-#      The server's host must be reachable per the egress whitelist.
-#
-# The Makefile wraps these with `make docker-up BACKEND=ollama` — see Makefile.
+# The Makefile wraps these with `make docker-up` — see Makefile.
 
 services:
 

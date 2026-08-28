@@ -974,7 +974,7 @@ class TestSystemPromptDynamicPermissionGuidance:
         """System prompt contains guidance about permissions changing mid-conversation."""
         import os
 
-        from admino.config import AppConfig
+        from admino.config import AppConfig, LLMConfig
         from admino.main import _build_system_prompt
         from admino.tools.registry import ToolDescription
 
@@ -994,7 +994,9 @@ class TestSystemPromptDynamicPermissionGuidance:
                 return_value=[fake_tool],
             ),
         ):
-            config = AppConfig()
+            config = AppConfig(
+                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+            )
             prompt = _build_system_prompt(config)
 
         assert "permissions can change during a conversation" in prompt.lower()
@@ -1010,7 +1012,7 @@ class TestSystemPromptDynamicPermissionGuidance:
         """
         import os
 
-        from admino.config import AppConfig
+        from admino.config import AppConfig, LLMConfig
         from admino.main import _build_system_prompt
         from admino.tools.registry import ToolDescription
 
@@ -1029,7 +1031,9 @@ class TestSystemPromptDynamicPermissionGuidance:
                 return_value=[fake_tool],
             ),
         ):
-            config = AppConfig()
+            config = AppConfig(
+                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+            )
             prompt = _build_system_prompt(config)
 
         lowered = prompt.lower()
@@ -1051,7 +1055,7 @@ class TestSystemPromptDynamicPermissionGuidance:
 
         from pydantic import BaseModel, Field
 
-        from admino.config import AppConfig
+        from admino.config import AppConfig, LLMConfig
         from admino.main import _build_system_prompt
         from admino.permissions import PermissionsConfig, ToolPermissions
         from admino.tools.registry import clear_registry, register_tool
@@ -1070,7 +1074,9 @@ class TestSystemPromptDynamicPermissionGuidance:
                 tools={"gmail": ToolPermissions(actions={"read": "allow"})}
             )
             with patch.dict(os.environ, {"AUTH_TOKEN": _TEST_TOKEN}):
-                config = AppConfig()
+                config = AppConfig(
+                    llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+                )
                 prompt = _build_system_prompt(config, permissions)
         finally:
             clear_registry()

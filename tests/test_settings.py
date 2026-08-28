@@ -35,9 +35,7 @@ _AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 # Default settings returned by mocked load_settings_from_db.
 _DEFAULT_DB_SETTINGS: dict[str, Any] = {
     "llm": {
-        "provider": "ollama",
-        "model": "gemma4:e2b",
-        "ollama_url": "http://local-llm:11434",
+        "provider": "anthropic",
         "anthropic_model": "claude-sonnet-4-6",
         "openai_model": "gpt-4o",
     },
@@ -131,36 +129,32 @@ class TestGetSettings:
 
         assert resp.status_code == 200
         body = resp.json()
-        assert body["llm"]["provider"] == "ollama"
-        assert body["llm"]["model"] == "gemma4:e2b"
+        assert body["llm"]["provider"] == "anthropic"
+        assert body["llm"]["anthropic_model"] == "claude-sonnet-4-6"
         assert body["appearance"]["theme"] == "light"
         assert body["notifications"]["enabled"] is True
         assert body["limits"]["max_tool_calls_per_message"] == 10
         assert body["server"]["host"] == "0.0.0.0"  # noqa: S104
         assert body["server"]["port"] == 8000
 
-    async def test_get_settings_anthropic_without_ollama_model_returns_200(self) -> None:
-        """GET must not 500 when inactive-provider models are unset.
+    async def test_get_settings_anthropic_without_openai_model_returns_200(self) -> None:
+        """GET must not 500 when an inactive-provider model is unset.
 
-        On an anthropic deployment the ollama/openai models are None (no
-        hardcoded default), so SettingsLLM receives blank values for them.
-        The response must still validate and return 200.
+        On an anthropic deployment the openai model is None (no hardcoded
+        default), so SettingsLLM receives a blank value for it. The response
+        must still validate and return 200.
         """
         from admino import server
 
         app = _make_app()
         assert server._config is not None
         server._config.llm.provider = "anthropic"
-        server._config.llm.model = None
-        server._config.llm.ollama_url = "http://local-llm:11434"
         server._config.llm.anthropic_model = "claude-sonnet-4-6"
         server._config.llm.openai_model = None
 
         db_settings = dict(_DEFAULT_DB_SETTINGS)
         db_settings["llm"] = {
             "provider": "anthropic",
-            "model": None,
-            "ollama_url": "http://local-llm:11434",
             "anthropic_model": "claude-sonnet-4-6",
             "openai_model": None,
         }
@@ -175,7 +169,6 @@ class TestGetSettings:
         body = resp.json()
         assert body["llm"]["provider"] == "anthropic"
         assert body["llm"]["anthropic_model"] == "claude-sonnet-4-6"
-        assert body["llm"]["model"] == ""
         assert body["llm"]["openai_model"] == ""
 
     async def test_get_settings_masks_api_keys_when_not_set(self) -> None:
@@ -311,7 +304,7 @@ class TestPatchSettings:
         assert len(llm_calls) == 1
         updated_llm = llm_calls[0][0][2]
         assert updated_llm["provider"] == "anthropic"
-        assert updated_llm["model"] == "gemma4:e2b"
+        assert updated_llm["anthropic_model"] == "claude-sonnet-4-6"
 
     async def test_patch_settings_partial_update_appearance(self) -> None:
         """Patching only appearance.theme should not affect other sections."""
@@ -883,7 +876,7 @@ class TestSettingsAdversarial:
                 resp = await c.patch(
                     "/api/settings",
                     headers=_AUTH_HEADER,
-                    json={"llm": {"model": "a" * 201}},
+                    json={"llm": {"anthropic_model": "a" * 201}},
                 )
         assert resp.status_code == 422
 
@@ -898,7 +891,7 @@ class TestSettingsAdversarial:
                 resp = await c.patch(
                     "/api/settings",
                     headers=_AUTH_HEADER,
-                    json={"llm": {"model": "'; DROP TABLE settings; --"}},
+                    json={"llm": {"anthropic_model": "'; DROP TABLE settings; --"}},
                 )
         assert resp.status_code == 422
 
@@ -945,7 +938,7 @@ class TestSettingsAdversarial:
                 resp = await c.patch(
                     "/api/settings",
                     headers=_AUTH_HEADER,
-                    json={"llm": {"model": model_name}},
+                    json={"llm": {"anthropic_model": model_name}},
                 )
         assert resp.status_code == 422
 
@@ -976,20 +969,5 @@ class TestSettingsAdversarial:
                     "/api/settings",
                     headers=_AUTH_HEADER,
                     json={"notifications": {"enabled": [1, 2, 3]}},
-                )
-        assert resp.status_code == 422
-
-    async def test_patch_settings_invalid_ollama_url_scheme(self) -> None:
-        """Ollama URL without http/https prefix is rejected."""
-        app = _make_app()
-        with (
-            patch("admino.database.get_pool", _mock_get_pool()),
-            patch("admino.database.load_settings_from_db", _mock_load_settings()),
-        ):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch(
-                    "/api/settings",
-                    headers=_AUTH_HEADER,
-                    json={"llm": {"ollama_url": "ftp://evil.com:11434"}},
                 )
         assert resp.status_code == 422

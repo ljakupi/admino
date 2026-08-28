@@ -5,8 +5,7 @@ shared sanitization/parsing utilities, and the ``create_llm_client()``
 factory that instantiates the correct backend based on config.
 
 Provider modules:
-- ``llm_ollama.py`` — Ollama backend (default, local)
-- ``llm_anthropic.py`` — Anthropic Claude backend (opt-in)
+- ``llm_anthropic.py`` — Anthropic Claude backend (default)
 - ``llm_openai.py`` — OpenAI backend (opt-in)
 
 Security notes:
@@ -61,10 +60,6 @@ class LLMError(Exception):
         self.message = message
         self.status_code = status_code
         super().__init__(message)
-
-
-# Keep OllamaError as an alias for backward compatibility with existing code/tests
-OllamaError = LLMError
 
 
 # ---------------------------------------------------------------------------
@@ -258,26 +253,6 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
     return parsed
 
 
-def serialize_messages(messages: list[LLMMessage]) -> list[dict[str, str]]:
-    """Serialize LLMMessage models to basic role/content dicts.
-
-    Used by Ollama directly. Anthropic and OpenAI clients have their
-    own converters that handle provider-specific fields (tool_call_id,
-    system prompt extraction, etc.).
-
-    Args:
-        messages: List of LLMMessage models.
-
-    Returns:
-        List of dicts with 'role' and 'content' keys.
-    """
-    serialized: list[dict[str, str]] = []
-    for msg in messages:
-        entry: dict[str, str] = {"role": msg.role, "content": msg.content}
-        serialized.append(entry)
-    return serialized
-
-
 def validate_tools_payload(tools: list[dict[str, Any]]) -> None:
     """Validate tool definitions against size limits.
 
@@ -304,7 +279,7 @@ def validate_tools_payload(tools: list[dict[str, Any]]) -> None:
 class LLMClient(Protocol):
     """Protocol defining the interface all LLM provider backends must implement.
 
-    Each provider (Ollama, Anthropic, OpenAI) implements this protocol.
+    Each provider (Anthropic, OpenAI) implements this protocol.
     The agent loop uses this interface exclusively — it is provider-agnostic.
     """
 
@@ -353,11 +328,6 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
         ValueError: If the provider is unknown.
         ImportError: If the provider's SDK is not installed.
     """
-    if config.provider == "ollama":
-        from admino.llm_ollama import OllamaClient
-
-        return OllamaClient(config.to_ollama_config())
-
     if config.provider == "anthropic":
         from admino.llm_anthropic import AnthropicClient
 

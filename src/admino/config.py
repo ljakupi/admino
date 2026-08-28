@@ -69,56 +69,28 @@ class ServerConfig(BaseModel):
         return v
 
 
-class OllamaConfig(BaseModel):
-    """Ollama-specific settings extracted from LLMConfig for OllamaClient.
-
-    This is a convenience model passed to OllamaClient. It is constructed
-    from LLMConfig fields, not parsed from YAML directly.
-    """
-
-    url: str = Field(default="http://local-llm:11434", max_length=500)
-    # No hardcoded model default — the model is always supplied from the
-    # validated LLMConfig (config.yaml) via ``to_ollama_config``.
-    model: str = Field(max_length=200)
-    timeout_s: int = Field(default=120, ge=1, le=600)
-
-
 class LLMConfig(BaseModel):
     """LLM provider configuration.
 
-    Supports three providers:
-    - "ollama" (default): Local inference via Ollama. No data leaves the machine.
-    - "anthropic" (opt-in): Anthropic Claude API. Messages sent to Anthropic servers.
+    Supported providers:
+    - "anthropic" (default): Anthropic Claude API. Messages sent to Anthropic servers.
     - "openai" (opt-in): OpenAI API. Messages sent to OpenAI servers.
+    - "vllm": local vLLM serving — not yet implemented. Selecting it fails
+      validation with a clear "coming soon" message.
 
-    Proprietary providers require their respective API key env vars
+    The active proprietary provider requires its API key env var
     (ANTHROPIC_API_KEY or OPENAI_API_KEY). The agent logs a clear warning
-    at startup when a proprietary provider is selected.
-
-    Security note: use http:// for ollama_url only with local/Docker networking
-    (local-llm, localhost, 127.0.0.1). For remote Ollama, use https://.
+    at startup because messages leave the machine.
     """
 
-    provider: Literal["ollama", "anthropic", "openai"] = Field(
-        default="ollama",
+    provider: Literal["anthropic", "openai", "vllm"] = Field(
+        default="anthropic",
         description=(
-            "LLM provider: 'ollama' (default, local), "
-            "'anthropic' (opt-in, cloud), 'openai' (opt-in, cloud)."
+            "LLM provider: 'anthropic' (default, cloud), 'openai' (opt-in, cloud), "
+            "'vllm' (local serving — coming soon)."
         ),
     )
 
-    # -- Ollama settings (used when provider=ollama) --
-    ollama_url: str = Field(
-        default="http://local-llm:11434",
-        max_length=500,
-        pattern=r"^https?://",
-        description="Base URL for the Ollama API.",
-    )
-    model: str | None = Field(
-        default=None,
-        max_length=200,
-        description="Model name to request from Ollama (required when provider=ollama).",
-    )
     timeout_s: int = Field(
         default=120,
         ge=1,
@@ -151,38 +123,7 @@ class LLMConfig(BaseModel):
         description="Maximum tokens in LLM response (Anthropic/OpenAI max_tokens).",
     )
 
-    @field_validator("ollama_url")
-    @classmethod
-    def warn_on_insecure_remote_url(cls, v: str) -> str:
-        """Warn when http:// is used with a non-local host."""
-        if any(c in v for c in "\r\n\x00"):
-            msg = "LLMConfig.ollama_url must not contain control characters."
-            raise ValueError(msg)
-
-        if v.startswith("http://"):
-            host_match = re.match(r"^http://([^/:]+)", v)
-            host = host_match.group(1) if host_match else ""
-            if not host:
-                msg = "LLMConfig.ollama_url must include a hostname."
-                raise ValueError(msg)
-            local_names = frozenset({"localhost", "ollama", "local-llm"})
-            is_local = host in local_names
-            if not is_local:
-                try:
-                    addr = ipaddress.ip_address(host)
-                    is_local = addr.is_loopback or addr.is_link_local
-                except ValueError:
-                    pass
-            if not is_local:
-                logger.warning(
-                    "LLMConfig.ollama_url uses http:// with non-local host '%s'. "
-                    "Conversation history will be transmitted in cleartext. "
-                    "Use https:// for remote Ollama instances.",
-                    host,
-                )
-        return v
-
-    @field_validator("model", "anthropic_model", "openai_model")
+    @field_validator("anthropic_model", "openai_model")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
         """Reject model names containing shell metacharacters or control chars.
@@ -202,12 +143,20 @@ class LLMConfig(BaseModel):
         """Validate provider-specific requirements at config load time.
 
         Proprietary providers require API key env vars and log a warning.
+        The 'vllm' provider is a not-yet-implemented placeholder and is
+        rejected with a clear "coming soon" message.
         """
+        if self.provider == "vllm":
+            msg = (
+                "llm.provider is 'vllm' — local vLLM serving is coming soon. "
+                "Use 'anthropic' or 'openai' for now."
+            )
+            raise ValueError(msg)
         if self.provider == "anthropic":
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 msg = (
                     "llm.provider is 'anthropic' but ANTHROPIC_API_KEY env var is not set. "
-                    "Set the API key or switch to llm.provider: 'ollama'."
+                    "Set the API key or switch to llm.provider: 'openai'."
                 )
                 raise ValueError(msg)
             if not self.anthropic_model:
@@ -224,7 +173,7 @@ class LLMConfig(BaseModel):
             if not os.environ.get("OPENAI_API_KEY"):
                 msg = (
                     "llm.provider is 'openai' but OPENAI_API_KEY env var is not set. "
-                    "Set the API key or switch to llm.provider: 'ollama'."
+                    "Set the API key or switch to llm.provider: 'anthropic'."
                 )
                 raise ValueError(msg)
             if not self.openai_model:
@@ -237,9 +186,6 @@ class LLMConfig(BaseModel):
                 "LLM provider is 'openai' — user messages and tool results "
                 "will be sent to OpenAI's servers. Ensure you accept this trade-off."
             )
-        # For ollama, the model is validated lazily: ``active_model_name`` (used
-        # when the client is built) raises a clear error if it is missing, so a
-        # config without an ollama model fails gracefully at client creation.
         return self
 
     @property
@@ -250,25 +196,11 @@ class LLMConfig(BaseModel):
         ``validate_provider_requirements``; this raises defensively if that
         invariant is ever violated.
         """
-        name = (
-            self.anthropic_model
-            if self.provider == "anthropic"
-            else self.openai_model
-            if self.provider == "openai"
-            else self.model
-        )
+        name = self.anthropic_model if self.provider == "anthropic" else self.openai_model
         if not name:
             msg = f"No model configured for llm.provider '{self.provider}'."
             raise ValueError(msg)
         return name
-
-    def to_ollama_config(self) -> OllamaConfig:
-        """Extract Ollama-specific settings for the OllamaClient."""
-        return OllamaConfig(
-            url=self.ollama_url,
-            model=self.active_model_name,
-            timeout_s=self.timeout_s,
-        )
 
 
 class AuthConfig(BaseModel):
@@ -431,8 +363,7 @@ class AppConfig(BaseModel):
     """Top-level application configuration validated from config.yaml.
 
     Environment variable overrides are applied after YAML loading:
-    - OLLAMA_BASE_URL -> ollama.url
-    - OLLAMA_MODEL -> ollama.model
+    - LLM_PROVIDER -> llm.provider
     - LOG_LEVEL -> log_level
     - AUDIT_LOG_PATH -> paths.audit_log
     """
@@ -518,8 +449,7 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     """Apply environment variable overrides to raw config data.
 
     Supported env vars:
-    - OLLAMA_BASE_URL  -> ollama.url
-    - OLLAMA_MODEL     -> ollama.model
+    - LLM_PROVIDER     -> llm.provider
     - LOG_LEVEL        -> log_level
     - AUDIT_LOG_PATH   -> paths.audit_log
 
@@ -529,26 +459,6 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     Returns:
         The config dict with env overrides applied in-place.
     """
-    ollama_url = os.environ.get("OLLAMA_BASE_URL")
-    if ollama_url:
-        llm_section = data.setdefault("llm", {})
-        if isinstance(llm_section, dict):
-            llm_section["ollama_url"] = ollama_url
-        else:
-            logger.warning(
-                "Cannot apply OLLAMA_BASE_URL override: 'llm' config section is not a mapping."
-            )
-
-    ollama_model = os.environ.get("OLLAMA_MODEL")
-    if ollama_model:
-        llm_section = data.setdefault("llm", {})
-        if isinstance(llm_section, dict):
-            llm_section["model"] = ollama_model
-        else:
-            logger.warning(
-                "Cannot apply OLLAMA_MODEL override: 'llm' config section is not a mapping."
-            )
-
     llm_provider = os.environ.get("LLM_PROVIDER")
     if llm_provider:
         llm_section = data.setdefault("llm", {})

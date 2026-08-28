@@ -7,12 +7,12 @@ Anthropic's servers — users must explicitly opt in via config.
 Tool calling: Anthropic's Messages API uses a ``tools`` array. Claude
 responds with ``tool_use`` content blocks containing the tool name and
 JSON input. This module translates between admino's tool format
-(Ollama-style ``{"type": "function", "function": {...}}``) and
+(``{"type": "function", "function": {...}}``) and
 Anthropic's native format.
 
 Security notes:
 - API key is read from ANTHROPIC_API_KEY env var, never from config files.
-- No credentials are logged. LLM output is sanitized identically to Ollama.
+- No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -61,9 +61,9 @@ def _anthropic_name_to_dot(name: str) -> str:
 
 
 def _convert_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert Ollama-style tool definitions to Anthropic's format.
+    """Convert admino tool definitions to Anthropic's format.
 
-    Ollama format::
+    admino tool format::
 
         {"type": "function", "function": {"name": "...", "description": "...",
          "parameters": {...}}}
@@ -78,7 +78,7 @@ def _convert_tools_to_anthropic(tools: list[dict[str, Any]]) -> list[dict[str, A
     the tool_use response.
 
     Args:
-        tools: Tool definitions in Ollama/admino format.
+        tools: Tool definitions in admino tool format.
 
     Returns:
         Tool definitions in Anthropic Messages API format.
@@ -263,7 +263,7 @@ class AnthropicClient:
     """Async client for Anthropic's Messages API.
 
     Uses the official ``anthropic`` SDK. Implements the ``LLMClient``
-    protocol so it is interchangeable with OllamaClient.
+    protocol so it is interchangeable with the other LLMClient backends.
     """
 
     def __init__(self, config: LLMConfig) -> None:
@@ -312,7 +312,7 @@ class AnthropicClient:
 
         Args:
             messages: Conversation messages.
-            tools: Optional tool definitions (admino/Ollama format).
+            tools: Optional tool definitions (admino tool format).
             stream: Must be False for this method.
 
         Returns:

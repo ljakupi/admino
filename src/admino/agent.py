@@ -1,7 +1,7 @@
 """Agent loop orchestrating LLM interaction, tool dispatch, and audit logging.
 
 This module defines the :class:`Agent` class — the single orchestrator that
-ties together the Ollama LLM client (``admino.llm``), the tool registry
+ties together the LLM client (``admino.llm``), the tool registry
 (``admino.tools.registry``), and the audit logger (``admino.audit``).
 
 Architecture & boundaries:
@@ -117,7 +117,7 @@ class Agent:
 
         Args:
             llm_client: LLM client implementing the LLMClient protocol.
-                Can be OllamaClient, AnthropicClient, or OpenAIClient.
+                Can be AnthropicClient or OpenAIClient.
             audit_logger: Append-only audit sink. Passed through to every
                 ``dispatch_tool_call`` invocation so tool-call audit entries
                 are written at the enforcement point.
@@ -337,7 +337,7 @@ class Agent:
             # Record the assistant's tool-call turn in history. Include the
             # tool_use_blocks so that providers requiring structured content in
             # the assistant message (Anthropic) can reconstruct the proper
-            # tool_use / tool_result pairing. Ollama and OpenAI ignore this field.
+            # tool_use / tool_result pairing. OpenAI ignores this field.
             working_history.append(
                 LLMMessage(
                     role="assistant",
@@ -766,9 +766,9 @@ def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:
 def _tool_descriptions_to_payload(
     descriptions: list[ToolDescription],
 ) -> list[dict[str, object]]:
-    """Convert registry tool descriptions to Ollama ``tools`` array format.
+    """Convert registry tool descriptions to the provider ``tools`` array format.
 
-    Ollama expects each tool as::
+    Each tool is described as::
 
         {
             "type": "function",

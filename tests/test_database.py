@@ -367,14 +367,14 @@ class TestLoadSettingsFromDb:
         conn.fetch = AsyncMock(
             return_value=[
                 {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
-                {"key": "llm", "value": {"provider": "ollama"}},
+                {"key": "llm", "value": {"provider": "anthropic"}},
             ]
         )
 
         result = await db_mod.load_settings_from_db(mock_pool)
 
         assert result["server"] == {"host": "127.0.0.1", "port": 8000}
-        assert result["llm"] == {"provider": "ollama"}
+        assert result["llm"] == {"provider": "anthropic"}
 
     async def test_unwraps_log_level(self, mock_pool: MagicMock) -> None:
         """load_settings_from_db() unwraps log_level from {"value": "X"} to "X"."""
@@ -416,7 +416,7 @@ class TestLoadSettingsFromDb:
         conn = mock_pool._mock_conn
         conn.fetch = AsyncMock(
             return_value=[
-                {"key": "llm", "value": {"provider": "ollama"}},
+                {"key": "llm", "value": {"provider": "anthropic"}},
                 {"key": "appearance", "value": None},
             ]
         )
@@ -424,7 +424,7 @@ class TestLoadSettingsFromDb:
         result = await db_mod.load_settings_from_db(mock_pool)
 
         assert "appearance" not in result
-        assert result["llm"] == {"provider": "ollama"}
+        assert result["llm"] == {"provider": "anthropic"}
 
     async def test_app_config_loads_when_openai_model_is_null(
         self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -445,7 +445,14 @@ class TestLoadSettingsFromDb:
         conn.fetch = AsyncMock(
             return_value=[
                 {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
-                {"key": "llm", "value": {"provider": "ollama", "openai_model": None}},
+                {
+                    "key": "llm",
+                    "value": {
+                        "provider": "anthropic",
+                        "anthropic_model": "claude-sonnet-4-6",
+                        "openai_model": None,
+                    },
+                },
                 {"key": "auth", "value": {"mode": "vpn"}},
                 {"key": "paths", "value": {}},
                 {"key": "files", "value": {}},
@@ -459,7 +466,7 @@ class TestLoadSettingsFromDb:
         config = await load_app_config_from_db(mock_pool)
 
         assert config.llm.openai_model == LLMConfig.model_fields["openai_model"].default
-        assert config.llm.provider == "ollama"
+        assert config.llm.provider == "anthropic"
 
 
 # ---------------------------------------------------------------------------

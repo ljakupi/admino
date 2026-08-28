@@ -602,7 +602,7 @@ class ToolCall(BaseModel):
         description=(
             "Provider-assigned ID linking this tool call to its result. "
             "Required by Anthropic (tool_use id) and OpenAI (tool_calls[].id) "
-            "for multi-turn tool calling. None for Ollama."
+            "for multi-turn tool calling."
         ),
     )
 
@@ -621,7 +621,7 @@ class ToolCall(BaseModel):
 class LLMMessage(BaseModel):
     """A message in the LLM context window.
 
-    Represents messages sent to and received from Ollama's /api/chat endpoint.
+    Represents messages sent to and received from the LLM provider's chat API.
 
     Note: content is NOT sanitised for control characters at this layer.
     Sanitisation is applied at the LLM client boundary (llm.py
@@ -649,7 +649,7 @@ class LLMMessage(BaseModel):
         description=(
             "Structured tool_use blocks for providers that require them in the assistant "
             "message (e.g. Anthropic). Each entry has type, id, name (dot notation), "
-            "and input. Ignored by Ollama and OpenAI serializers."
+            "and input. Ignored by the OpenAI serializer."
         ),
     )
 
@@ -1481,16 +1481,14 @@ _MODEL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$")
 class SettingsLLM(BaseModel):
     """LLM settings exposed via the Settings API."""
 
-    provider: Literal["ollama", "anthropic", "openai"]
-    model: str = Field(max_length=200)
-    ollama_url: str = Field(max_length=500, pattern=r"^https?://")
+    provider: Literal["anthropic", "openai"]
     anthropic_model: str = Field(max_length=200)
     openai_model: str = Field(max_length=200)
     # Boolean flags — never expose actual API key values.
     anthropic_key_configured: bool = False
     openai_key_configured: bool = False
 
-    @field_validator("model", "anthropic_model", "openai_model")
+    @field_validator("anthropic_model", "openai_model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
         """Reject model names containing shell metacharacters or control chars.
@@ -1606,13 +1604,11 @@ class SettingsResponse(BaseModel):
 class SettingsPatchLLM(BaseModel):
     """Partial LLM settings for PATCH."""
 
-    provider: Literal["ollama", "anthropic", "openai"] | None = None
-    model: str | None = Field(default=None, max_length=200)
-    ollama_url: str | None = Field(default=None, max_length=500, pattern=r"^https?://")
+    provider: Literal["anthropic", "openai"] | None = None
     anthropic_model: str | None = Field(default=None, max_length=200)
     openai_model: str | None = Field(default=None, max_length=200)
 
-    @field_validator("model", "anthropic_model", "openai_model", mode="before")
+    @field_validator("anthropic_model", "openai_model", mode="before")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
         """Reject model names containing shell metacharacters or control chars."""

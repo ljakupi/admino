@@ -13,7 +13,7 @@ Tests the FastAPI application created by ``create_app()``, covering:
 - Static file serving
 
 Security notes:
-- All tests use mocked Agent and config — no real Ollama or external calls.
+- All tests use mocked Agent and config — no real LLM or external calls.
 - Auth token is a known test value, never a real secret.
 """
 
