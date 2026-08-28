@@ -43,9 +43,22 @@ def auth_token() -> str:
 # ---------------------------------------------------------------------------
 
 
+# A minimal valid llm section. The anthropic default provider requires a model
+# (and ANTHROPIC_API_KEY, provided by the autouse conftest fixture), so configs
+# that omit an llm section would otherwise fail validation.
+_DEFAULT_TEST_LLM = 'llm:\n  provider: "anthropic"\n  anthropic_model: "claude-sonnet-4-6"\n'
+
+
 def _write_yaml(path: Path, content: str) -> Path:
-    """Write a YAML string to a file and return its path."""
-    path.write_text(textwrap.dedent(content), encoding="utf-8")
+    """Write a YAML string to a file and return its path.
+
+    Prepends a valid default llm section when the content omits one, so tests
+    that don't care about the LLM provider still produce a loadable config.
+    """
+    text = textwrap.dedent(content)
+    if "llm:" not in text:
+        text = _DEFAULT_TEST_LLM + text
+    path.write_text(text, encoding="utf-8")
     return path
 
 
@@ -70,9 +83,8 @@ class TestValidConfigLoading:
               host: "127.0.0.1"
               port: 9090
             llm:
-              provider: "ollama"
-              ollama_url: "http://localhost:11434"
-              model: "llama3"
+              provider: "anthropic"
+              anthropic_model: "claude-sonnet-4-6"
               timeout_s: 60
             auth:
               mode: "token"
@@ -94,10 +106,9 @@ class TestValidConfigLoading:
 
         assert config.server.host == "127.0.0.1"
         assert config.server.port == 9090
-        assert config.llm.ollama_url == "http://localhost:11434"
-        assert config.llm.model == "llama3"
+        assert config.llm.anthropic_model == "claude-sonnet-4-6"
         assert config.llm.timeout_s == 60
-        assert config.llm.provider == "ollama"
+        assert config.llm.provider == "anthropic"
         assert config.auth.mode == "token"
         assert config.paths.audit_log.is_absolute()
         assert str(config.paths.audit_log).endswith("audit.jsonl")
@@ -116,45 +127,52 @@ class TestValidConfigLoading:
 
 
 class TestDefaults:
-    """When config file does not exist, AppConfig uses defaults."""
+    """Defaults are applied to unset sections; an incomplete llm section fails."""
 
-    def test_defaults_with_missing_file(
+    def test_defaults_applied_for_unset_sections(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """load_app_config with a nonexistent path returns defaults."""
+        """With a valid llm section, all other sections fall back to defaults."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        config = load_app_config(tmp_path / "nonexistent.yaml")
+        # _write_yaml injects a valid llm section for the empty body.
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
 
         assert config.server.host == "0.0.0.0"  # noqa: S104
         assert config.server.port == 8000
-        assert config.llm.ollama_url == "http://local-llm:11434"
-        assert config.llm.model is None  # no hardcoded model default
+        assert config.llm.provider == "anthropic"
         assert config.llm.timeout_s == 120
-        assert config.llm.provider == "ollama"
         assert config.auth.mode == "vpn"  # explicitly set via AUTH_MODE env
         assert config.limits.max_tool_calls_per_message == 10
         assert config.limits.confirmation_timeout_s == 300
         assert config.log_level == "INFO"
 
-    def test_defaults_with_empty_yaml(
+    def test_missing_file_without_llm_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An empty YAML file (parses as None) uses defaults."""
+        """A missing file yields defaults with an incomplete anthropic llm — invalid."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
-        config = load_app_config(yaml_path)
-        assert config.server.port == 8000
-        assert config.log_level == "INFO"
+        with pytest.raises(ValueError, match="Invalid application config"):
+            load_app_config(tmp_path / "nonexistent.yaml")
 
-    def test_defaults_with_comment_only_yaml(
+    def test_empty_yaml_without_llm_raises(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A YAML file containing only comments (parses as None) uses defaults."""
+        """An empty YAML file (parses as None) has no llm section — invalid."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "# just a comment\n")
-        config = load_app_config(yaml_path)
-        assert config.server.port == 8000
-        assert config.log_level == "INFO"
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("", encoding="utf-8")
+        with pytest.raises(ValueError, match="Invalid application config"):
+            load_app_config(yaml_path)
+
+    def test_comment_only_yaml_without_llm_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A comment-only YAML file (parses as None) has no llm section — invalid."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("# just a comment\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="Invalid application config"):
+            load_app_config(yaml_path)
 
 
 # ---------------------------------------------------------------------------
@@ -165,35 +183,22 @@ class TestDefaults:
 class TestEnvVarOverrides:
     """Environment variables override YAML values for supported fields."""
 
-    def test_ollama_base_url_override(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """OLLAMA_BASE_URL env var overrides llm.ollama_url from YAML."""
+    def test_llm_provider_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """LLM_PROVIDER env var overrides llm.provider from YAML."""
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
             llm:
-              ollama_url: "http://yaml-value:11434"
+              provider: "anthropic"
+              anthropic_model: "claude-sonnet-4-6"
+              openai_model: "gpt-4o"
             """,
         )
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-value:11434")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
         config = load_app_config(yaml_path)
-        assert config.llm.ollama_url == "http://env-value:11434"
-
-    def test_ollama_model_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """OLLAMA_MODEL env var overrides llm.model from YAML."""
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
-            """\
-            llm:
-              model: "yaml-model"
-            """,
-        )
-        monkeypatch.setenv("AUTH_MODE", "vpn")
-        monkeypatch.setenv("OLLAMA_MODEL", "env-model")
-        config = load_app_config(yaml_path)
-        assert config.llm.model == "env-model"
+        assert config.llm.provider == "openai"
 
     def test_log_level_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """LOG_LEVEL env var overrides log_level from YAML."""
@@ -222,15 +227,14 @@ class TestEnvVarOverrides:
         config = load_app_config(yaml_path)
         assert config.paths.audit_log == Path("/env/audit.jsonl")
 
-    def test_env_overrides_on_missing_file(
+    def test_env_overrides_on_minimal_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Env vars work even when config file is missing (defaults + env)."""
+        """Env vars apply on top of a minimal (llm-only) config."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        monkeypatch.setenv("OLLAMA_BASE_URL", "http://env-only:11434")
         monkeypatch.setenv("LOG_LEVEL", "WARNING")
-        config = load_app_config(tmp_path / "nonexistent.yaml")
-        assert config.llm.ollama_url == "http://env-only:11434"
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.llm.provider == "anthropic"
         assert config.log_level == "WARNING"
 
 
@@ -244,19 +248,23 @@ class TestInvalidYaml:
 
     def test_non_mapping_root_list(self, tmp_path: Path) -> None:
         """A YAML list at root level raises ValueError."""
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "- item1\n- item2\n")
+        # Written raw (no llm injection) — this tests parse-level rejection.
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("- item1\n- item2\n", encoding="utf-8")
         with pytest.raises(ValueError, match="YAML mapping"):
             load_app_config(yaml_path)
 
     def test_non_mapping_root_string(self, tmp_path: Path) -> None:
         """A plain string YAML raises ValueError."""
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "just a string\n")
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("just a string\n", encoding="utf-8")
         with pytest.raises(ValueError, match="YAML mapping"):
             load_app_config(yaml_path)
 
     def test_non_mapping_root_integer(self, tmp_path: Path) -> None:
         """A bare integer YAML raises ValueError."""
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "42\n")
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text("42\n", encoding="utf-8")
         with pytest.raises(ValueError, match="YAML mapping"):
             load_app_config(yaml_path)
 
@@ -280,7 +288,7 @@ class TestInvalidFieldValues:
         [
             ("server:\n  port: 0", "port below minimum"),
             ("server:\n  port: 70000", "port above maximum"),
-            ("llm:\n  ollama_url: 'ftp://bad'", "bad URL scheme"),
+            ("llm:\n  timeout_s: 0", "llm timeout below minimum"),
             ("log_level: 'TRACE'", "invalid log level"),
             ("limits:\n  max_tool_calls_per_message: 0", "below min"),
             ("limits:\n  confirmation_timeout_s: 5", "below min timeout"),
@@ -288,7 +296,7 @@ class TestInvalidFieldValues:
         ids=[
             "port_too_low",
             "port_too_high",
-            "bad_url_scheme",
+            "llm_timeout_too_low",
             "invalid_log_level",
             "tool_calls_below_min",
             "timeout_below_min",
@@ -416,7 +424,7 @@ class TestSubModelsPresent:
     def test_all_submodels_present(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Default AppConfig contains all sub-model instances."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        config = load_app_config(tmp_path / "nonexistent.yaml")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
 
         assert isinstance(config.server, ServerConfig)
         assert isinstance(config.llm, LLMConfig)
@@ -648,18 +656,18 @@ class TestAuthConfigValidation:
         Production code must NEVER use model_construct for AppConfig.
         """
         monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        # model_construct skips all validators, including validate_auth_token_present
-        config = AppConfig.model_construct(auth=AuthConfig(mode="token"))
+        # model_construct skips all validators, including validate_auth_token_present.
+        # A valid llm is supplied so the llm default_factory (which does validate)
+        # is not invoked.
+        config = AppConfig.model_construct(
+            auth=AuthConfig(mode="token"),
+            llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6"),
+        )
         assert config.auth.mode == "token"
 
 
 class TestLLMConfigValidation:
     """LLMConfig URL pattern, timeout, and provider validation."""
-
-    def test_ftp_url_rejected(self) -> None:
-        """A URL not starting with http(s):// is rejected."""
-        with pytest.raises(ValidationError, match="ollama_url"):
-            LLMConfig(ollama_url="ftp://bad:11434")
 
     def test_timeout_below_min_raises(self) -> None:
         """Timeout below 1 raises ValidationError."""
@@ -671,15 +679,11 @@ class TestLLMConfigValidation:
         with pytest.raises(ValidationError):
             LLMConfig(timeout_s=601)
 
-    def test_crlf_in_url_rejected(self) -> None:
-        """A URL containing CRLF is rejected."""
-        with pytest.raises(ValidationError, match="control characters"):
-            LLMConfig(ollama_url="http://localhost:11434\r\nX-Injected: true")
-
-    def test_model_name_shell_chars_rejected(self) -> None:
+    def test_model_name_shell_chars_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Model name with shell metacharacters is rejected."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
         with pytest.raises(ValidationError, match="invalid characters"):
-            LLMConfig(model="evil; rm -rf /")
+            LLMConfig(provider="anthropic", anthropic_model="evil; rm -rf /")
 
     def test_anthropic_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Anthropic provider requires ANTHROPIC_API_KEY env var."""
@@ -707,17 +711,12 @@ class TestLLMConfigValidation:
         assert config.provider == "openai"
         assert config.active_model_name == "gpt-4o"
 
-    def test_active_model_name_ollama(self) -> None:
-        """active_model_name returns ollama model for ollama provider."""
-        config = LLMConfig(provider="ollama", model="test-model:7b")
-        assert config.active_model_name == "test-model:7b"
-
     # -- No hardcoded model defaults: the model must come from config --
 
-    def test_model_fields_have_no_hardcoded_default(self) -> None:
-        """Inactive-provider model fields default to None, not a baked-in ID."""
-        config = LLMConfig(provider="ollama", model="test-model:7b")
-        assert config.anthropic_model is None
+    def test_model_fields_have_no_hardcoded_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The inactive-provider model field defaults to None, not a baked-in ID."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+        config = LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
         assert config.openai_model is None
 
     def test_anthropic_missing_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -738,21 +737,17 @@ class TestLLMConfigValidation:
         with pytest.raises(ValidationError, match="openai_model"):
             LLMConfig(provider="openai")
 
-    def test_ollama_missing_model_active_name_raises(self) -> None:
-        """Ollama provider without a model has no default; active_model_name
-        fails gracefully (raised when the client is built)."""
-        config = LLMConfig(provider="ollama")
-        assert config.model is None
-        with pytest.raises(ValueError, match="No model configured"):
-            _ = config.active_model_name
+    def test_active_model_name_missing_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """active_model_name raises defensively if the active model is unset.
 
-    def test_to_ollama_config(self) -> None:
-        """to_ollama_config extracts ollama-specific settings."""
-        config = LLMConfig(ollama_url="http://localhost:11434", model="test:7b", timeout_s=60)
-        ollama = config.to_ollama_config()
-        assert ollama.url == "http://localhost:11434"
-        assert ollama.model == "test:7b"
-        assert ollama.timeout_s == 60
+        Validation normally guarantees a model, so the guard is only reachable
+        by bypassing it via model_copy.
+        """
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+        config = LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+        forced = config.model_copy(update={"anthropic_model": None})
+        with pytest.raises(ValueError, match="No model configured"):
+            _ = forced.active_model_name
 
 
 # ---------------------------------------------------------------------------
@@ -808,33 +803,6 @@ class TestVpnModeWarning:
 
 
 # ---------------------------------------------------------------------------
-# Environment variable injection attacks
-# ---------------------------------------------------------------------------
-
-
-class TestEnvVarInjection:
-    """Env var values containing injection payloads must be rejected."""
-
-    def test_ollama_url_env_crlf_rejected(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """OLLAMA_BASE_URL with CRLF injection is rejected."""
-        monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost\r\nX-Injected: true")
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-    def test_ollama_model_env_shell_chars_rejected(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """OLLAMA_MODEL with shell metacharacters is rejected."""
-        monkeypatch.setenv("OLLAMA_MODEL", "evil;rm -rf /")
-        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-
-# ---------------------------------------------------------------------------
 # DatabaseConfig validation
 # ---------------------------------------------------------------------------
 
@@ -853,7 +821,7 @@ class TestDatabaseConfig:
     ) -> None:
         """AppConfig includes DatabaseConfig with defaults."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        config = load_app_config(tmp_path / "nonexistent.yaml")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
         assert isinstance(config.database, DatabaseConfig)
         assert config.database.min_pool_size == 2
         assert config.database.max_pool_size == 5
@@ -877,7 +845,7 @@ class TestLoadAppConfigFromDb:
         mock_pool = MagicMock()
         mock_data: dict[str, object] = {
             "server": {"host": "127.0.0.1", "port": 8000},
-            "llm": {"provider": "ollama"},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
             "auth": {"mode": "vpn"},
             "paths": {},
             "files": {},
@@ -901,7 +869,7 @@ class TestLoadAppConfigFromDb:
         mock_pool = MagicMock()
         mock_data: dict[str, object] = {
             "server": {},
-            "llm": {},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
             "auth": {"mode": "vpn"},
             "paths": {},
             "files": {},
@@ -948,3 +916,29 @@ class TestLoadPermissionsConfigFromDb:
             result = await load_permissions_config_from_db(mock_pool)
 
         assert result.tools == {}
+
+
+class TestProviderCleanup:
+    """GH-111: Ollama removed; anthropic default; vLLM guarded 'coming soon'."""
+
+    def test_default_provider_is_anthropic(self) -> None:
+        """The shipped LLMConfig.provider default flips from ollama to anthropic."""
+        assert LLMConfig.model_fields["provider"].default == "anthropic"
+
+    def test_provider_ollama_is_rejected(self) -> None:
+        """'ollama' is no longer a valid provider value."""
+        with pytest.raises(ValidationError):
+            LLMConfig(provider="ollama")
+
+    def test_provider_vllm_raises_coming_soon(self) -> None:
+        """'vllm' is accepted by the enum but guarded with a clear coming-soon error."""
+        with pytest.raises(ValidationError, match="coming soon"):
+            LLMConfig(provider="vllm")
+
+    def test_no_ollama_url_field(self) -> None:
+        """The ollama_url field is gone from LLMConfig."""
+        assert "ollama_url" not in LLMConfig.model_fields
+
+    def test_no_to_ollama_config_method(self) -> None:
+        """The to_ollama_config helper is gone from LLMConfig."""
+        assert not hasattr(LLMConfig, "to_ollama_config")

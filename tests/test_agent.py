@@ -14,7 +14,7 @@ Covers:
 - Audit logger threading invariants.
 - Security invariants: no forbidden imports, no raw content in logs.
 
-All LLM and tool interactions are fully mocked; no real Ollama or Google
+All LLM and tool interactions are fully mocked; no real LLM or Google
 APIs are contacted.
 """
 
@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 
 class FakeLLM:
-    """Scripted stand-in for :class:`admino.llm.OllamaClient`.
+    """Scripted stand-in for an :class:`admino.llm.LLMClient` backend.
 
     Each call to :meth:`chat` pops the next ``LLMResponse`` off the queue and
     records the messages and tools payload it was called with.
@@ -1436,7 +1436,7 @@ class TestAgentHelperFunctions:
         pc = _build_pending_confirmation(tool_call=tc, session_id="s", timeout_s=30.0)
         assert pc.confirmation_id
 
-    def test_tool_descriptions_to_payload_formats_ollama_function_name(self) -> None:
+    def test_tool_descriptions_to_payload_formats_function_name(self) -> None:
         desc = ToolDescription(
             tool="gmail",
             action="read",

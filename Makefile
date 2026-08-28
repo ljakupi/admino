@@ -6,22 +6,11 @@ TESTS_DIR  := tests
 PACKAGE    := admino
 
 # --------------------------------------------------------------------------
-# Local LLM backend selection.
-#
-# BACKEND controls which (if any) OSS LLM overlay is merged with the base
-# docker-compose.yml. admino itself is provider-agnostic — set BACKEND only
-# when you want a local model running inside Docker.
-#
-#   (unset)        Agent only. Use with proprietary providers (Anthropic, OpenAI).
-#   BACKEND=ollama Agent + Ollama.        make docker-up BACKEND=ollama
+# Docker Compose file selection. admino runs a single `agent` container plus
+# Postgres — there is no bundled local LLM (cloud providers today; local vLLM
+# serving is coming soon).
 # --------------------------------------------------------------------------
-BACKEND ?=
 COMPOSE_FILES := -f docker-compose.yml
-ifeq ($(BACKEND),ollama)
-  COMPOSE_FILES += -f docker-compose.ollama.yml
-else ifneq ($(BACKEND),)
-  $(error Unknown BACKEND '$(BACKEND)' — use 'ollama' or leave unset)
-endif
 
 lint:
 	python -m ruff check $(SRC_DIR)/ $(TESTS_DIR)/

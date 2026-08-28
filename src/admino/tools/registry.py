@@ -79,7 +79,7 @@ ToolHandler = Callable[..., Awaitable[str]]
 class ToolDescription(BaseModel):
     """Metadata describing a registered tool for LLM tool-calling.
 
-    Serialised into the ``tools`` array of the Ollama ``/api/chat`` request
+    Serialised into the ``tools`` array of the LLM chat request
     so the LLM knows which tools are available and their argument schemas.
     """
 

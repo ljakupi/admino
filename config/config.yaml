@@ -16,29 +16,16 @@ database:
   max_pool_size: 5
 
 llm:
-  # Provider: "ollama" (default, local), "anthropic" (opt-in), "openai" (opt-in)
-  # Proprietary providers send messages to their servers — use only if you accept this trade-off.
-  provider: "ollama"
+  # Provider: "anthropic" (default, cloud) or "openai" (opt-in, cloud).
+  # Cloud providers send your messages to their servers.
+  # "vllm" (local model serving) is coming soon — selecting it fails at startup.
+  provider: "anthropic"
 
-  # Ollama settings (used when provider=ollama)
-  # Pick the URL that matches your setup:
-  #   Local dev (native Ollama):        "http://localhost:11434"
-  #   Docker agent + native Mac:        "http://host.docker.internal:11434"
-  #   Docker agent + native Linux:      "http://172.17.0.1:11434"
-  #   Full Docker (BACKEND=ollama):     "http://local-llm:11434"
-  # Note: in Docker, the .env OLLAMA_BASE_URL override takes precedence over this value.
-  ollama_url: "http://localhost:11434"
-  model: "gemma4:12b"
   timeout_s: 120
 
-  # Proprietary provider settings — inert while provider is "ollama" above.
-  # To opt in to a cloud provider: set ANTHROPIC_API_KEY or OPENAI_API_KEY in the
-  # environment (.env for Docker), change llm.provider above, and uncomment the
-  # provider's host under egress.allowed_hosts below.
-  # WARNING: opt-in means your messages leave your machine and are sent to the
-  # provider's servers.
-  # Model IDs stay set here (even when inactive) so switching provider later
-  # needs no model edit.
+  # Model IDs for the cloud providers. The active provider's API key must be set
+  # in the environment (ANTHROPIC_API_KEY or OPENAI_API_KEY) — never in this file.
+  # Both IDs stay set (even when inactive) so switching provider needs no model edit.
   anthropic_model: "claude-sonnet-4-6"
   openai_model: "gpt-4o"
 
@@ -88,6 +75,7 @@ egress:
     # Microsoft Graph API (Outlook, Calendar, OneDrive)
     - "login.microsoftonline.com"
     - "graph.microsoft.com"
-    # Uncomment the matching host when llm.provider is anthropic/openai:
-    # - "api.anthropic.com"
+    # LLM provider API — anthropic is the default provider.
+    - "api.anthropic.com"
+    # Uncomment when switching llm.provider to openai:
     # - "api.openai.com"

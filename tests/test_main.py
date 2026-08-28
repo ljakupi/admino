@@ -11,7 +11,7 @@ covering:
 - Security invariants: no eval/exec/compile/shell=True, no secrets in logs
 
 Security notes:
-- All external dependencies are mocked — no real Ollama, no real config files,
+- All external dependencies are mocked — no real LLM, no real config files,
   no real uvicorn startup.
 - Tests verify that error output goes to stderr, not stdout.
 """
@@ -50,10 +50,9 @@ def _make_mock_config() -> MagicMock:
     mock_audit_log.parent = Path("/tmp")  # noqa: S108
     config.paths.audit_log = mock_audit_log
 
-    config.llm.provider = "ollama"
-    config.llm.active_model_name = "test-model:7b"
-    config.llm.ollama_url = "http://localhost:11434"
-    config.llm.model = "test-model:7b"
+    config.llm.provider = "anthropic"
+    config.llm.active_model_name = "claude-sonnet-4-6"
+    config.llm.anthropic_model = "claude-sonnet-4-6"
     config.limits.max_tool_calls_per_message = 10
     config.limits.max_context_messages = 20
     config.limits.confirmation_timeout_s = 300
@@ -84,14 +83,14 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_perms = _make_mock_permissions()
     mock_tools_enabled = {"gmail": False, "memory": True}
     mock_audit_logger = MagicMock()
-    mock_ollama_client = MagicMock()
+    mock_llm_client = MagicMock()
     mock_agent = MagicMock()
     mock_app = MagicMock()
 
     mock_load_app_config = MagicMock(return_value=mock_config)
     mock_build_permissions = MagicMock(return_value=mock_perms)
     mock_audit_cls = MagicMock(return_value=mock_audit_logger)
-    mock_ollama_cls = MagicMock(return_value=mock_ollama_client)
+    mock_llm_cls = MagicMock(return_value=mock_llm_client)
     mock_agent_cls = MagicMock(return_value=mock_agent)
     mock_create_app = MagicMock(return_value=mock_app)
     mock_freeze = MagicMock()
@@ -121,7 +120,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     # These are imported lazily inside main(), so we patch the module paths
     monkeypatch.setattr("admino.audit.AuditLogger", mock_audit_cls)
-    monkeypatch.setattr("admino.llm.create_llm_client", mock_ollama_cls)
+    monkeypatch.setattr("admino.llm.create_llm_client", mock_llm_cls)
     monkeypatch.setattr("admino.agent.Agent", mock_agent_cls)
     monkeypatch.setattr("admino.server.create_app", mock_create_app)
     monkeypatch.setattr("admino.tools.registry.freeze_registry", mock_freeze)
@@ -132,13 +131,13 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "permissions": mock_perms,
         "tools_enabled": mock_tools_enabled,
         "audit_logger": mock_audit_logger,
-        "ollama_client": mock_ollama_client,
+        "llm_client": mock_llm_client,
         "agent": mock_agent,
         "app": mock_app,
         "load_app_config": mock_load_app_config,
         "build_default_permissions_config": mock_build_permissions,
         "AuditLogger": mock_audit_cls,
-        "create_llm_client": mock_ollama_cls,
+        "create_llm_client": mock_llm_cls,
         "Agent": mock_agent_cls,
         "create_app": mock_create_app,
         "freeze_registry": mock_freeze,
@@ -471,7 +470,7 @@ class TestAgentConfigWiring:
         main(config_path=Path("c.yaml"))
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
-        assert agent_call_kwargs["llm_client"] is mock_deps["ollama_client"]
+        assert agent_call_kwargs["llm_client"] is mock_deps["llm_client"]
 
     def test_agent_receives_audit_logger(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the AuditLogger instance."""

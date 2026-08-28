@@ -86,13 +86,11 @@ export type ThreadItem =
 
 // Settings types
 
-export type LLMProviderName = 'ollama' | 'anthropic' | 'openai';
+export type LLMProviderName = 'anthropic' | 'openai';
 export type AppTheme = 'light' | 'dark' | 'system';
 
 export interface LLMSettings {
   provider: LLMProviderName;
-  model: string;
-  ollama_url: string;
   anthropic_model: string;
   openai_model: string;
   anthropic_key_configured: boolean;
@@ -147,8 +145,6 @@ export interface SettingsResponse {
 
 export interface LLMSettingsPatch {
   provider?: LLMProviderName;
-  model?: string;
-  ollama_url?: string;
   anthropic_model?: string;
   openai_model?: string;
 }

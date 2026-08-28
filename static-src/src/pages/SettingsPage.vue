@@ -46,19 +46,15 @@ const NAV = [
 ];
 
 // --- LLM / Agent section ---
-const providers: { value: LLMProvider; label: string }[] = [
-  { value: 'ollama', label: 'Ollama' },
+const providers: { value: LLMProvider | 'vllm'; label: string; disabled?: boolean }[] = [
   { value: 'claude', label: 'Claude' },
   { value: 'openai', label: 'OpenAI' },
+  { value: 'vllm', label: 'vLLM (local) — coming soon', disabled: true },
 ];
 
-const draftOllamaModel = ref('');
-const draftOllamaUrl = ref('');
 const draftAnthropicModel = ref('');
 const draftOpenAiModel = ref('');
 
-const ollamaUrlError = ref<string | undefined>(undefined);
-const ollamaModelError = ref<string | undefined>(undefined);
 const anthropicModelError = ref<string | undefined>(undefined);
 const openAiModelError = ref<string | undefined>(undefined);
 
@@ -67,8 +63,6 @@ const draftToken = ref('');
 const draftSessionId = ref('');
 
 function syncDrafts() {
-  draftOllamaModel.value = settings.llmModel;
-  draftOllamaUrl.value = settings.llmOllamaUrl;
   draftAnthropicModel.value = settings.llmAnthropicModel;
   draftOpenAiModel.value = settings.llmOpenAiModel;
   draftToken.value = settings.token ?? '';
@@ -80,38 +74,16 @@ onMounted(async () => {
   syncDrafts();
 });
 
-async function onProviderChange(p: LLMProvider) {
+async function onProviderChange(p: LLMProvider | 'vllm') {
+  // vLLM is a coming-soon placeholder — its button is disabled, so this is
+  // just a defensive guard.
+  if (p === 'vllm') return;
   await settings.setProvider(p);
-}
-
-function validateOllamaUrl(value: string): string | undefined {
-  if (!value.startsWith('http://') && !value.startsWith('https://')) {
-    return 'URL must start with http:// or https://';
-  }
-  return undefined;
 }
 
 function validateModel(value: string): string | undefined {
   if (!value.trim()) return 'Model name must not be empty';
   return undefined;
-}
-
-async function onOllamaModelBlur() {
-  const err = validateModel(draftOllamaModel.value);
-  ollamaModelError.value = err;
-  if (err) return;
-  if (draftOllamaModel.value !== settings.llmModel) {
-    await settings.setOllamaModel(draftOllamaModel.value.trim());
-  }
-}
-
-async function onOllamaUrlBlur() {
-  const err = validateOllamaUrl(draftOllamaUrl.value);
-  ollamaUrlError.value = err;
-  if (err) return;
-  if (draftOllamaUrl.value !== settings.llmOllamaUrl) {
-    await settings.setOllamaUrl(draftOllamaUrl.value.trim());
-  }
 }
 
 async function onAnthropicModelBlur() {
@@ -263,14 +235,14 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
         <template v-if="activeSection === 'agent'">
           <div class="section-head">
             <h2 class="section-title">Agent</h2>
-            <p class="section-sub">Which LLM admino talks to. Local is default — cloud providers are opt-in.</p>
+            <p class="section-sub">Which LLM admino talks to. Cloud providers today; local vLLM serving is coming soon.</p>
           </div>
           <div class="s-card">
             <!-- Provider segmented control -->
             <div class="s-row">
               <div class="row-label">
                 Provider
-                <span class="row-hint">Ollama runs on your machine. Claude and OpenAI send data to their servers.</span>
+                <span class="row-hint">Claude and OpenAI send your messages to their servers. Local vLLM serving is coming soon.</span>
               </div>
               <div class="seg">
                 <button
@@ -278,6 +250,7 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                   :key="p.value"
                   class="seg-btn"
                   :class="{ active: settings.provider === p.value }"
+                  :disabled="p.disabled"
                   @click="onProviderChange(p.value)"
                 >
                   {{ p.label }}
@@ -288,17 +261,7 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
             <!-- Model field -->
             <div class="s-row stack">
               <div class="row-label">Model</div>
-              <template v-if="currentProvider === 'ollama'">
-                <input
-                  v-model="draftOllamaModel"
-                  class="s-input mono"
-                  type="text"
-                  placeholder="e.g. llama3.2:3b"
-                  @blur="onOllamaModelBlur"
-                />
-                <span v-if="ollamaModelError" class="input-error">{{ ollamaModelError }}</span>
-              </template>
-              <template v-else-if="currentProvider === 'anthropic'">
+              <template v-if="currentProvider === 'anthropic'">
                 <input
                   v-model="draftAnthropicModel"
                   class="s-input mono"
@@ -318,22 +281,6 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                 />
                 <span v-if="openAiModelError" class="input-error">{{ openAiModelError }}</span>
               </template>
-            </div>
-
-            <!-- Ollama: endpoint URL -->
-            <div v-if="currentProvider === 'ollama'" class="s-row stack">
-              <div class="row-label">
-                Endpoint URL
-                <span class="row-hint">Where the local Ollama server is reachable.</span>
-              </div>
-              <input
-                v-model="draftOllamaUrl"
-                class="s-input mono"
-                type="text"
-                placeholder="http://localhost:11434"
-                @blur="onOllamaUrlBlur"
-              />
-              <span v-if="ollamaUrlError" class="input-error">{{ ollamaUrlError }}</span>
             </div>
 
             <!-- Claude / OpenAI: API key indicator -->

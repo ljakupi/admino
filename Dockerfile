@@ -35,8 +35,8 @@ COPY src/ src/
 
 # Install the package and all runtime dependencies into /install prefix.
 # The `all-providers` extra bundles the Anthropic and OpenAI SDKs so the image
-# supports any provider chosen in config.yaml (ollama / anthropic / openai)
-# without rebuilding. Ollama uses only httpx and needs no extra.
+# supports either provider chosen in config.yaml (anthropic / openai)
+# without rebuilding.
 RUN pip install --no-cache-dir --prefix=/install ".[all-providers]"
 
 # -------------------------------------------------------------------

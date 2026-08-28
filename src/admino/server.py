@@ -167,7 +167,7 @@ class _TokenBucket:
     """Simple in-process token-bucket rate limiter.
 
     Designed for single-user local deployment. Limits requests per second
-    to prevent resource exhaustion (Ollama inference, memory). Not shared
+    to prevent resource exhaustion (LLM inference, memory). Not shared
     across workers — requires single-worker deployment (already required
     by the in-memory session store).
 
@@ -881,10 +881,11 @@ async def _build_settings_response() -> SettingsResponse:
     # (config.yaml-driven) rather than hardcoded literals so the displayed
     # values reflect the authoritative source.
     llm_data = settings.get("llm", {})
+    # vLLM is rejected at config load, so the effective provider is always a
+    # SettingsLLM-valid value ("anthropic"/"openai").
+    config_provider = _config.llm.provider if _config.llm.provider != "vllm" else "anthropic"
     llm_section = SettingsLLM(
-        provider=llm_data.get("provider") or _config.llm.provider,
-        model=llm_data.get("model") or _config.llm.model or "",
-        ollama_url=llm_data.get("ollama_url") or _config.llm.ollama_url,
+        provider=llm_data.get("provider") or config_provider,
         anthropic_model=llm_data.get("anthropic_model") or _config.llm.anthropic_model or "",
         openai_model=llm_data.get("openai_model") or _config.llm.openai_model or "",
         anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),

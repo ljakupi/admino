@@ -151,7 +151,7 @@ class TestConversationAuditEntry:
         with pytest.raises(ValidationError):
             _make_conversation_entry(model="m" * 129)
 
-    def test_model_pattern_accepts_ollama_names(self) -> None:
+    def test_model_pattern_accepts_versioned_names(self) -> None:
         for name in ("llama3", "llama3:8b", "mistral:7b-instruct", "qwen2.5-coder:7b", "phi3/mini"):
             entry = _make_conversation_entry(model=name)
             assert entry.model == name

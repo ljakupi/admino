@@ -9,9 +9,37 @@ Security notes:
 
 from __future__ import annotations
 
+import os
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+
+@pytest.fixture(autouse=True)
+def _default_anthropic_key() -> Generator[None, None, None]:
+    """Provide ANTHROPIC_API_KEY so default-provider (anthropic) configs validate.
+
+    admino now defaults to the anthropic provider, which requires this env var at
+    config-validation time. Tests that exercise the missing/empty-key path override
+    this with ``monkeypatch.delenv`` or ``patch.dict(..., clear=True)``.
+
+    Managed via os.environ directly (not monkeypatch) so this autouse fixture does
+    not pull ``monkeypatch`` into an early setup slot, which would reorder other
+    fixtures' teardown (e.g. the registry-clearing fixture in test_registry.py).
+    """
+    previous = os.environ.get("ANTHROPIC_API_KEY")
+    os.environ["ANTHROPIC_API_KEY"] = "sk-ant-test-suite-key"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("ANTHROPIC_API_KEY", None)
+        else:
+            os.environ["ANTHROPIC_API_KEY"] = previous
 
 
 @pytest.fixture()

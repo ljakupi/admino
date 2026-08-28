@@ -5,7 +5,7 @@ Startup sequence:
 2. Build the default permissions ruleset (seeds an empty DB on first run).
 3. Configure Python logging from config.log_level.
 4. Open the append-only audit logger.
-5. Create the Ollama LLM client.
+5. Create the LLM client.
 6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
 7. Instantiate the Agent with all dependencies.
 8. Create the FastAPI app via server.create_app().
@@ -372,7 +372,7 @@ def main(
     logger.debug("Audit log path: %s", config.paths.audit_log)
 
     # ------------------------------------------------------------------
-    # 5. Create the LLM client (Ollama, Anthropic, or OpenAI)
+    # 5. Create the LLM client (Anthropic or OpenAI)
     # ------------------------------------------------------------------
     from admino.llm import create_llm_client
 

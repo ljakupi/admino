@@ -9,7 +9,7 @@ const connection = useConnectionStore();
 <template>
   <div class="banner" role="alert">
     <AlertTriangle :size="16" :stroke-width="2" />
-    <span>admino cannot reach the LLM backend. Check Ollama is running.</span>
+    <span>admino cannot reach the LLM backend. Check your provider configuration.</span>
     <BaseButton variant="ghost" size="md" @click="connection.checkHealth()">
       Retry
     </BaseButton>
