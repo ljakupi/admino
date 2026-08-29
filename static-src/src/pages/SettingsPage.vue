@@ -272,10 +272,19 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                   v-model="draftAnthropicModel"
                   class="s-input mono"
                   type="text"
-                  placeholder="e.g. claude-3-5-sonnet-20241022"
+                  placeholder="e.g. claude-sonnet-4-6"
                   @blur="onAnthropicModelBlur"
                 />
                 <span v-if="anthropicModelError" class="input-error">{{ anthropicModelError }}</span>
+                <span class="row-hint model-hint">
+                  Exact model ID, e.g. <code class="inline-code">claude-sonnet-4-6</code>. See
+                  <a
+                    href="https://docs.claude.com/en/docs/about-claude/models/overview"
+                    class="hint-link"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >Anthropic's model list</a>.
+                </span>
               </template>
               <template v-else-if="currentProvider === 'openai'">
                 <input
@@ -286,6 +295,15 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                   @blur="onOpenAiModelBlur"
                 />
                 <span v-if="openAiModelError" class="input-error">{{ openAiModelError }}</span>
+                <span class="row-hint model-hint">
+                  Exact model ID, e.g. <code class="inline-code">gpt-4o</code>. See
+                  <a
+                    href="https://platform.openai.com/docs/models"
+                    class="hint-link"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >OpenAI's model list</a>.
+                </span>
               </template>
               <template v-else-if="currentProvider === 'vllm'">
                 <span class="row-hint">Local vLLM serving is coming soon. Select Claude or OpenAI above to chat now.</span>
@@ -687,6 +705,21 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
 .input-error {
   font-size: 12px;
   color: var(--color-error);
+}
+
+.model-hint {
+  line-height: var(--lh-relaxed);
+}
+
+.hint-link {
+  color: var(--color-primary-mid);
+  font-weight: var(--fw-medium);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.hint-link:hover {
+  color: var(--color-primary);
 }
 
 .inline-code {
