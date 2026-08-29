@@ -74,7 +74,12 @@ onMounted(async () => {
   syncDrafts();
 });
 
+function isProviderDisabled(value: LLMProvider): boolean {
+  return value === 'openai' && !openAiConfigured.value;
+}
+
 async function onProviderChange(p: LLMProvider) {
+  if (isProviderDisabled(p)) return;
   await settings.setProvider(p);
 }
 
@@ -240,6 +245,9 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
               <div class="row-label">
                 Provider
                 <span class="row-hint">Claude and OpenAI send your messages to their servers. Local vLLM serving is coming soon.</span>
+                <span v-if="!openAiConfigured" class="row-hint">
+                  OpenAI needs <code class="inline-code">OPENAI_API_KEY</code> set on the server to enable it.
+                </span>
               </div>
               <div class="seg">
                 <button
@@ -247,6 +255,8 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                   :key="p.value"
                   class="seg-btn"
                   :class="{ active: settings.provider === p.value }"
+                  :disabled="isProviderDisabled(p.value)"
+                  :title="isProviderDisabled(p.value) ? 'Set OPENAI_API_KEY on the server to enable OpenAI' : undefined"
                   @click="onProviderChange(p.value)"
                 >
                   {{ p.label }}<span v-if="p.badge" class="soon-badge">{{ p.badge }}</span>
