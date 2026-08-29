@@ -358,6 +358,85 @@ class TestPatchSettings:
         assert len(llm_calls) == 1
         assert llm_calls[0][0][2]["provider"] == "vllm"
 
+    async def test_patch_settings_provider_change_closes_old_client(self) -> None:
+        """Switching provider retires the old LLM client by awaiting its close()."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+
+        # DB currently on openai; the patch switches to anthropic → provider_changed.
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "openai",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+        }
+        mock_load = _mock_load_settings(db_settings)
+        new_client = MagicMock()
+        new_client.close = AsyncMock()
+        mock_create_llm = MagicMock(return_value=new_client)
+
+        env = {"ANTHROPIC_API_KEY": "sk-test-key"}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", AsyncMock()),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "anthropic"}},
+                )
+
+        assert resp.status_code == 200
+        # The retired client's connection pool is released, and the running
+        # agent now holds the freshly-built client.
+        old_client.close.assert_awaited_once()
+        assert agent._llm is new_client
+
+    async def test_patch_settings_provider_change_survives_old_client_close_error(self) -> None:
+        """A close() failure on the retired client must not fail the settings update."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock(side_effect=RuntimeError("teardown boom"))
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "openai",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+        }
+        mock_load = _mock_load_settings(db_settings)
+        new_client = MagicMock()
+        mock_create_llm = MagicMock(return_value=new_client)
+
+        env = {"ANTHROPIC_API_KEY": "sk-test-key"}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", AsyncMock()),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "anthropic"}},
+                )
+
+        # The teardown error is swallowed; the swap still completes with 200.
+        assert resp.status_code == 200
+        old_client.close.assert_awaited_once()
+        assert agent._llm is new_client
+
     async def test_patch_settings_partial_update_appearance(self) -> None:
         """Patching only appearance.theme should not affect other sections."""
         app = _make_app()

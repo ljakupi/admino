@@ -1124,9 +1124,17 @@ async def patch_settings(
                 detail="Failed to create LLM client for the selected provider",
             ) from None
         # Single-user, single-worker deployment: concurrent requests are
-        # serialised by the event loop, so this plain assignment is safe.
-        # The GIL guarantees the reference swap is atomic.
+        # serialised by the event loop, so this reference swap is atomic.
+        # Retire the previous client AFTER swapping so its HTTP connection pool
+        # is released instead of leaked across repeated provider switches.
+        # Teardown is best-effort: a close() failure on the now-unreferenced
+        # client must never fail the settings update.
+        old_client = _agent._llm
         _agent._llm = new_client
+        try:
+            await old_client.close()
+        except Exception:
+            logger.warning("Failed to close retired LLM client after provider switch")
         logger.info("LLM client re-initialised for provider: %s", new_llm_config.provider)
 
     return await _build_settings_response()

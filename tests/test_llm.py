@@ -11,7 +11,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from admino.llm_vllm import VLLM_GUIDANCE_MESSAGE, VLLMPlaceholderClient
 from pydantic import ValidationError
 
 from admino.config import LLMConfig
@@ -30,6 +29,7 @@ from admino.llm import (
 )
 from admino.llm_anthropic import AnthropicClient
 from admino.llm_openai import OpenAIClient
+from admino.llm_vllm import VLLM_GUIDANCE_MESSAGE, VLLMPlaceholderClient
 from admino.models import LLMMessage
 
 # ---------------------------------------------------------------------------

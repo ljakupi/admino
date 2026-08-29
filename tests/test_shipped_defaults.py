@@ -150,11 +150,18 @@ class TestShippedEnvExample:
         providers = _active_env_values(env_text, "LLM_PROVIDER")
         assert all(value == "vllm" for value in providers)
 
-    def test_env_example_has_anthropic_key_and_no_ollama_vars(self) -> None:
-        """.env.example prompts for ANTHROPIC_API_KEY and carries no ollama vars."""
+    def test_env_example_anthropic_key_is_optin_and_no_ollama_vars(self) -> None:
+        """.env.example documents ANTHROPIC_API_KEY as opt-in and carries no ollama vars.
+
+        With the vllm default (boots without any key), no cloud API key ships as
+        an active line — ANTHROPIC_API_KEY is documented but commented out, like
+        OPENAI_API_KEY, so a fresh clone starts with no secrets exported.
+        """
         env_text = SHIPPED_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
-        # ANTHROPIC_API_KEY is present as an active (empty) line to fill in.
-        assert _active_env_values(env_text, "ANTHROPIC_API_KEY") == [""]
+        # The key is documented for the anthropic cloud opt-in...
+        assert "ANTHROPIC_API_KEY" in env_text
+        # ...but must NOT be an active line — no empty secret is exported by default.
+        assert _active_env_values(env_text, "ANTHROPIC_API_KEY") == []
         # No leftover Ollama configuration.
         assert "OLLAMA_BASE_URL" not in env_text
         assert "OLLAMA_MODEL" not in env_text

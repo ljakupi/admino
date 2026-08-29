@@ -26,7 +26,6 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from admino.llm_vllm import VLLM_GUIDANCE_MESSAGE, VLLMPlaceholderClient
 from pydantic import BaseModel, Field
 
 from admino import agent as agent_module
@@ -38,6 +37,7 @@ from admino.agent import (
     _trim_context,
 )
 from admino.llm import LLMResponse
+from admino.llm_vllm import VLLM_GUIDANCE_MESSAGE, VLLMPlaceholderClient
 from admino.models import (
     AgentConfig,
     ConversationAuditEntry,
