@@ -1481,7 +1481,7 @@ _MODEL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$")
 class SettingsLLM(BaseModel):
     """LLM settings exposed via the Settings API."""
 
-    provider: Literal["anthropic", "openai"]
+    provider: Literal["anthropic", "openai", "vllm"]
     anthropic_model: str = Field(max_length=200)
     openai_model: str = Field(max_length=200)
     # Boolean flags — never expose actual API key values.
@@ -1604,7 +1604,7 @@ class SettingsResponse(BaseModel):
 class SettingsPatchLLM(BaseModel):
     """Partial LLM settings for PATCH."""
 
-    provider: Literal["anthropic", "openai"] | None = None
+    provider: Literal["anthropic", "openai", "vllm"] | None = None
     anthropic_model: str | None = Field(default=None, max_length=200)
     openai_model: str | None = Field(default=None, max_length=200)
 

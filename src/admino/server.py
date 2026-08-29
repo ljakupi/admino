@@ -881,9 +881,10 @@ async def _build_settings_response() -> SettingsResponse:
     # (config.yaml-driven) rather than hardcoded literals so the displayed
     # values reflect the authoritative source.
     llm_data = settings.get("llm", {})
-    # vLLM is rejected at config load, so the effective provider is always a
-    # SettingsLLM-valid value ("anthropic"/"openai").
-    config_provider = _config.llm.provider if _config.llm.provider != "vllm" else "anthropic"
+    # The SettingsLLM provider Literal now includes "vllm", so no coercion is
+    # needed — vllm must display as the selected provider, not be masked as
+    # anthropic.
+    config_provider = _config.llm.provider
     llm_section = SettingsLLM(
         provider=llm_data.get("provider") or config_provider,
         anthropic_model=llm_data.get("anthropic_model") or _config.llm.anthropic_model or "",
@@ -1027,6 +1028,10 @@ async def patch_settings(
     pool = get_pool()
     current_settings = await load_settings_from_db(pool)
     provider_changed = False
+    # The LLMConfig produced by validating the merged patch, captured so the
+    # re-init block below reuses it directly instead of re-reading the DB (which,
+    # right after update_setting, is the same authoritative value).
+    new_llm_config: LLMConfig | None = None
 
     # --- LLM section ---
     if body.llm is not None:
@@ -1045,7 +1050,9 @@ async def patch_settings(
         # from the live config (config.yaml) so model fields not stored in the
         # DB are sourced from the authoritative config rather than defaults.
         try:
-            LLMConfig.model_validate({**_config.llm.model_dump(mode="json"), **llm_current})
+            new_llm_config = LLMConfig.model_validate(
+                {**_config.llm.model_dump(mode="json"), **llm_current}
+            )
         except ValidationError as exc:
             safe_errors = []
             for err in exc.errors(include_input=False):
@@ -1107,19 +1114,7 @@ async def patch_settings(
             _agent._tools_enabled = validated_tools
 
     # --- Re-initialise LLM client if provider changed ---
-    if provider_changed:
-        refreshed_settings = await load_settings_from_db(pool)
-        llm_data = refreshed_settings.get("llm", {})
-        try:
-            new_llm_config = LLMConfig.model_validate(
-                {**_config.llm.model_dump(mode="json"), **llm_data}
-            )
-        except ValidationError:
-            logger.error("Failed to reconstruct LLMConfig after provider change")
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to re-initialise LLM client",
-            ) from None
+    if provider_changed and new_llm_config is not None:
         try:
             new_client = create_llm_client(new_llm_config)
         except (ValueError, ImportError) as exc:

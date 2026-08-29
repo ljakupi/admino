@@ -73,21 +73,22 @@ class LLMConfig(BaseModel):
     """LLM provider configuration.
 
     Supported providers:
-    - "anthropic" (default): Anthropic Claude API. Messages sent to Anthropic servers.
+    - "vllm" (default): local vLLM serving. Serving is not yet implemented, so
+      selecting it boots gracefully — validation logs a warning (does NOT raise)
+      and the agent replies asking the user to pick another provider to chat now.
+    - "anthropic" (opt-in): Anthropic Claude API. Messages sent to Anthropic servers.
     - "openai" (opt-in): OpenAI API. Messages sent to OpenAI servers.
-    - "vllm": local vLLM serving — not yet implemented. Selecting it fails
-      validation with a clear "coming soon" message.
 
-    The active proprietary provider requires its API key env var
-    (ANTHROPIC_API_KEY or OPENAI_API_KEY). The agent logs a clear warning
-    at startup because messages leave the machine.
+    Each opt-in proprietary provider requires its API key env var
+    (ANTHROPIC_API_KEY or OPENAI_API_KEY) and its model ID. The agent logs a
+    clear warning at startup because messages leave the machine.
     """
 
     provider: Literal["anthropic", "openai", "vllm"] = Field(
-        default="anthropic",
+        default="vllm",
         description=(
-            "LLM provider: 'anthropic' (default, cloud), 'openai' (opt-in, cloud), "
-            "'vllm' (local serving — coming soon)."
+            "LLM provider: 'vllm' (default, local — serving not yet implemented), "
+            "'anthropic' (opt-in, cloud), 'openai' (opt-in, cloud)."
         ),
     )
 
@@ -143,15 +144,17 @@ class LLMConfig(BaseModel):
         """Validate provider-specific requirements at config load time.
 
         Proprietary providers require API key env vars and log a warning.
-        The 'vllm' provider is a not-yet-implemented placeholder and is
-        rejected with a clear "coming soon" message.
+        The 'vllm' provider is a not-yet-implemented local placeholder: it boots
+        gracefully with a WARNING (no raise), so admino starts with no API key or
+        model and the agent tells the user to pick a working provider to chat now.
         """
         if self.provider == "vllm":
-            msg = (
-                "llm.provider is 'vllm' — local vLLM serving is coming soon. "
-                "Use 'anthropic' or 'openai' for now."
+            logger.warning(
+                "llm.provider is 'vllm' — local vLLM serving is not yet implemented. "
+                "admino will boot, but no local model is available yet; select "
+                "another provider (Claude or OpenAI) in Settings → Agent to chat now."
             )
-            raise ValueError(msg)
+            return self
         if self.provider == "anthropic":
             if not os.environ.get("ANTHROPIC_API_KEY"):
                 msg = (
@@ -192,10 +195,13 @@ class LLMConfig(BaseModel):
     def active_model_name(self) -> str:
         """Return the model name for the currently configured provider.
 
-        The active provider's model is guaranteed non-empty by
-        ``validate_provider_requirements``; this raises defensively if that
-        invariant is ever violated.
+        For 'vllm' (the local placeholder, no model required) this returns the
+        "vllm" placeholder. For the proprietary providers the model is
+        guaranteed non-empty by ``validate_provider_requirements``; this raises
+        defensively if that invariant is ever violated.
         """
+        if self.provider == "vllm":
+            return "vllm"
         name = self.anthropic_model if self.provider == "anthropic" else self.openai_model
         if not name:
             msg = f"No model configured for llm.provider '{self.provider}'."

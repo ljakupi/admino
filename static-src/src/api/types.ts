@@ -86,7 +86,7 @@ export type ThreadItem =
 
 // Settings types
 
-export type LLMProviderName = 'anthropic' | 'openai';
+export type LLMProviderName = 'anthropic' | 'openai' | 'vllm';
 export type AppTheme = 'light' | 'dark' | 'system';
 
 export interface LLMSettings {
