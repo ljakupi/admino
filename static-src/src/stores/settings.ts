@@ -163,8 +163,15 @@ export const useSettingsStore = defineStore('settings', () => {
 
   // Convenience setters that call saveSetting internally
   async function setProvider(ui: LLMProvider) {
+    const previous = llmProvider.value;
     llmProvider.value = uiToApiProvider(ui);
-    await saveSetting({ llm: { provider: llmProvider.value } });
+    try {
+      await saveSetting({ llm: { provider: llmProvider.value } });
+    } catch (e) {
+      // Revert the optimistic switch so the UI reflects the server's rejection.
+      llmProvider.value = previous;
+      throw e;
+    }
   }
 
   async function setAnthropicModel(value: string) {

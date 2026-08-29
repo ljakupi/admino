@@ -437,6 +437,144 @@ class TestPatchSettings:
         old_client.close.assert_awaited_once()
         assert agent._llm is new_client
 
+    async def test_patch_settings_to_openai_with_key_returns_200(self) -> None:
+        """PATCH to provider='openai' with a key set persists 'openai' + gpt-4o.
+
+        GH-115 regression lock: the backend key-guard is correct — when
+        OPENAI_API_KEY is present and openai_model is non-empty (gpt-4o), the
+        provider switch validates, persists, and returns 200.
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+        mock_load = _mock_load_settings()
+        mock_create_llm = MagicMock()
+
+        env = {"OPENAI_API_KEY": "sk-openai-test-key"}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "openai"}},
+                )
+
+        assert resp.status_code == 200
+        llm_calls = [c for c in mock_update.call_args_list if c[0][1] == "llm"]
+        assert len(llm_calls) == 1
+        updated_llm = llm_calls[0][0][2]
+        assert updated_llm["provider"] == "openai"
+        assert updated_llm["openai_model"] == "gpt-4o"
+
+    async def test_patch_settings_to_openai_without_key_returns_400_with_readable_detail(
+        self,
+    ) -> None:
+        """PATCH to 'openai' with no key returns 400 with a readable detail list.
+
+        GH-115 regression lock: the backend correctly rejects the switch and
+        returns a structured ``detail`` list whose message names OPENAI_API_KEY,
+        so the frontend has a human-readable reason to render (the real bug is
+        the frontend discarding this detail).
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+        mock_load = _mock_load_settings()
+        mock_create_llm = MagicMock()
+
+        # Empty string is falsy → treated as unset by validate_provider_requirements.
+        env = {"OPENAI_API_KEY": ""}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "openai"}},
+                )
+
+        assert resp.status_code == 400
+        detail = resp.json()["detail"]
+        assert isinstance(detail, list)
+        assert any("OPENAI_API_KEY" in item["msg"] for item in detail)
+
+    async def test_patch_settings_to_openai_without_key_does_not_persist(self) -> None:
+        """A rejected 'openai' switch must not persist the llm section.
+
+        GH-115 regression lock: validation fails before ``update_setting`` runs,
+        so no 'llm' write reaches the DB when the key is missing.
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+        mock_load = _mock_load_settings()
+        mock_create_llm = MagicMock()
+
+        env = {"OPENAI_API_KEY": ""}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "openai"}},
+                )
+
+        assert resp.status_code == 400
+        assert not any(call[0][1] == "llm" for call in mock_update.call_args_list)
+
+    async def test_patch_settings_to_anthropic_with_key_returns_200(self) -> None:
+        """Switching back to 'anthropic' with a key set still returns 200.
+
+        GH-115 no-regression guard: the fix for the openai path must not break
+        the anthropic path. DB is currently on openai; the patch switches to
+        anthropic and persists 'anthropic'.
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "openai",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+        }
+        mock_load = _mock_load_settings(db_settings)
+        mock_create_llm = MagicMock()
+
+        env = {"ANTHROPIC_API_KEY": "sk-ant-test-key"}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "anthropic"}},
+                )
+
+        assert resp.status_code == 200
+        llm_calls = [c for c in mock_update.call_args_list if c[0][1] == "llm"]
+        assert len(llm_calls) == 1
+        assert llm_calls[0][0][2]["provider"] == "anthropic"
+
     async def test_patch_settings_partial_update_appearance(self) -> None:
         """Patching only appearance.theme should not affect other sections."""
         app = _make_app()
