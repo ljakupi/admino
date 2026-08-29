@@ -13,7 +13,7 @@ import type {
 
 // Keep the old union type alias for backward compat with components
 // The API uses 'anthropic' but the UI labels it 'claude' — we map here.
-export type LLMProvider = 'claude' | 'openai';
+export type LLMProvider = 'claude' | 'openai' | 'vllm';
 
 const TOKEN_KEY = 'admino_auth_token';
 const SESSION_KEY = 'admino_session_id';
@@ -90,7 +90,7 @@ export const useSettingsStore = defineStore('settings', () => {
   const error = ref<string | null>(null);
 
   // LLM
-  const llmProvider = ref<LLMProviderName>('anthropic');
+  const llmProvider = ref<LLMProviderName>('vllm');
   const llmAnthropicModel = ref('');
   const llmOpenAiModel = ref('');
   const anthropicKeyConfigured = ref(false);

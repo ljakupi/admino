@@ -37,6 +37,7 @@ from admino.agent import (
     _trim_context,
 )
 from admino.llm import LLMResponse
+from admino.llm_vllm import VLLM_GUIDANCE_MESSAGE, VLLMPlaceholderClient
 from admino.models import (
     AgentConfig,
     ConversationAuditEntry,
@@ -1700,3 +1701,31 @@ class TestAgentToolsEnabledAllTrue:
 
         tool_entries = _filter_entries(_read_audit_entries(tmp_path), "tool_call")
         assert any(e.get("tool") == "gmail" and e.get("success") is True for e in tool_entries)
+
+
+# ===========================================================================
+# vLLM placeholder client (GH-114)
+# ===========================================================================
+
+
+class TestAgentVLLMPlaceholder:
+    """The agent yields the vLLM guidance message in-thread, not an error."""
+
+    async def test_agent_returns_vllm_guidance_when_provider_is_placeholder(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        agent = Agent(
+            llm_client=VLLMPlaceholderClient(),
+            audit_logger=audit_logger,
+            permissions_config=permissions_config,
+            agent_config=agent_config,
+            model_name="vllm",
+        )
+
+        result = await agent.run("hello", session_id="sess-1", history=[])
+
+        assert result.status == "final"
+        assert result.response == VLLM_GUIDANCE_MESSAGE

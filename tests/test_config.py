@@ -127,7 +127,12 @@ class TestValidConfigLoading:
 
 
 class TestDefaults:
-    """Defaults are applied to unset sections; an incomplete llm section fails."""
+    """Defaults are applied to unset sections; a missing llm section defaults to vllm.
+
+    Under GH-114 the default provider is ``vllm`` (local, serving not yet
+    implemented), which boots gracefully with no API key or model — so a
+    config that omits the llm section loads successfully instead of failing.
+    """
 
     def test_defaults_applied_for_unset_sections(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -146,33 +151,33 @@ class TestDefaults:
         assert config.limits.confirmation_timeout_s == 300
         assert config.log_level == "INFO"
 
-    def test_missing_file_without_llm_raises(
+    def test_missing_file_defaults_to_vllm(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A missing file yields defaults with an incomplete anthropic llm — invalid."""
+        """A missing file yields defaults with the vllm provider, which boots."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        with pytest.raises(ValueError, match="Invalid application config"):
-            load_app_config(tmp_path / "nonexistent.yaml")
+        config = load_app_config(tmp_path / "nonexistent.yaml")
+        assert config.llm.provider == "vllm"
 
-    def test_empty_yaml_without_llm_raises(
+    def test_empty_yaml_defaults_to_vllm(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An empty YAML file (parses as None) has no llm section — invalid."""
+        """An empty YAML file (parses as None) has no llm section — defaults to vllm."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("", encoding="utf-8")
-        with pytest.raises(ValueError, match="Invalid application config"):
-            load_app_config(yaml_path)
+        config = load_app_config(yaml_path)
+        assert config.llm.provider == "vllm"
 
-    def test_comment_only_yaml_without_llm_raises(
+    def test_comment_only_yaml_defaults_to_vllm(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A comment-only YAML file (parses as None) has no llm section — invalid."""
+        """A comment-only YAML file (parses as None) has no llm section — defaults to vllm."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("# just a comment\n", encoding="utf-8")
-        with pytest.raises(ValueError, match="Invalid application config"):
-            load_app_config(yaml_path)
+        config = load_app_config(yaml_path)
+        assert config.llm.provider == "vllm"
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +754,25 @@ class TestLLMConfigValidation:
         with pytest.raises(ValueError, match="No model configured"):
             _ = forced.active_model_name
 
+    # -- vLLM default provider (GH-114) --
+
+    def test_vllm_active_model_name_is_placeholder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """active_model_name for vllm returns the 'vllm' placeholder, no model needed."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm")
+        assert config.active_model_name == "vllm"
+
+    def test_vllm_logs_warning_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Constructing a vllm config logs a 'not yet implemented' WARNING (no raise)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with caplog.at_level(logging.WARNING):
+            LLMConfig(provider="vllm")
+        assert any("not yet implemented" in record.message for record in caplog.records)
+
 
 # ---------------------------------------------------------------------------
 # VPN mode + 0.0.0.0 warning
@@ -919,21 +943,30 @@ class TestLoadPermissionsConfigFromDb:
 
 
 class TestProviderCleanup:
-    """GH-111: Ollama removed; anthropic default; vLLM guarded 'coming soon'."""
+    """GH-114: vLLM is the default provider and boots gracefully.
 
-    def test_default_provider_is_anthropic(self) -> None:
-        """The shipped LLMConfig.provider default flips from ollama to anthropic."""
-        assert LLMConfig.model_fields["provider"].default == "anthropic"
+    The anthropic-first default introduced by GH-111/#112 is reversed: 'vllm'
+    is now the shipped default and constructing it must NOT raise (it logs a
+    warning and defers to a placeholder client). Ollama stays fully removed.
+    """
+
+    def test_default_provider_is_vllm(self) -> None:
+        """The shipped LLMConfig.provider default flips from anthropic to vllm."""
+        assert LLMConfig.model_fields["provider"].default == "vllm"
 
     def test_provider_ollama_is_rejected(self) -> None:
         """'ollama' is no longer a valid provider value."""
         with pytest.raises(ValidationError):
             LLMConfig(provider="ollama")
 
-    def test_provider_vllm_raises_coming_soon(self) -> None:
-        """'vllm' is accepted by the enum but guarded with a clear coming-soon error."""
-        with pytest.raises(ValidationError, match="coming soon"):
-            LLMConfig(provider="vllm")
+    def test_provider_vllm_boots_without_key_or_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """'vllm' validates with no API key and no model set — it does NOT raise."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm")
+        assert config.provider == "vllm"
 
     def test_no_ollama_url_field(self) -> None:
         """The ollama_url field is gone from LLMConfig."""

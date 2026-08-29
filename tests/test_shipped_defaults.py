@@ -8,8 +8,9 @@ in the repository:
 - ``.env.example`` — the template developers copy to ``.env``.
 
 The two files must tell one coherent story: a fresh clone defaults to the
-**anthropic** provider (cloud) and therefore requires ``ANTHROPIC_API_KEY`` to
-start, with the anthropic model pre-set. Local vLLM serving is coming soon.
+**vLLM** provider (local) and therefore boots with **no API key**. Claude
+(anthropic) and OpenAI stay opt-in — their model IDs stay pre-set so switching
+to a cloud provider only needs the API key, not a config edit.
 
 Hermeticity: ``load_app_config`` and the ``LLMConfig`` validators consult a
 number of environment variables (AUTH_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY,
@@ -51,13 +52,12 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture()
-def shipped_config(clean_env: None, monkeypatch: pytest.MonkeyPatch) -> AppConfig:
-    """Load the committed config/config.yaml with a clean env plus the required key.
+def shipped_config(clean_env: None) -> AppConfig:
+    """Load the committed config/config.yaml under a fully clean env.
 
-    The shipped anthropic provider requires ANTHROPIC_API_KEY at load time, so it
-    is set here (after clean_env clears it) to inspect the config's values.
+    The shipped vLLM provider needs no API key at load time, so the config
+    loads with every relevant env var cleared (see clean_env).
     """
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-suite-key")
     return load_app_config(SHIPPED_CONFIG_PATH)
 
 
@@ -84,21 +84,21 @@ def _active_env_values(env_text: str, key: str) -> list[str]:
 
 
 class TestShippedConfigDefaults:
-    """The committed config.yaml must default to a working anthropic setup."""
+    """The committed config.yaml must default to a working, keyless vLLM setup."""
 
-    def test_shipped_config_defaults_to_anthropic_provider(self, shipped_config: AppConfig) -> None:
-        """The shipped provider is 'anthropic' (cloud, the current default)."""
-        assert shipped_config.llm.provider == "anthropic"
+    def test_shipped_config_defaults_to_vllm_provider(self, shipped_config: AppConfig) -> None:
+        """The shipped provider is 'vllm' (local, the current default)."""
+        assert shipped_config.llm.provider == "vllm"
 
     def test_shipped_config_sets_anthropic_model(self, shipped_config: AppConfig) -> None:
-        """A model ID is pre-set so a fresh clone only needs the API key."""
+        """A model ID is pre-set so switching to Claude only needs the API key."""
         assert isinstance(shipped_config.llm.anthropic_model, str)
         assert shipped_config.llm.anthropic_model != ""
 
-    def test_shipped_config_requires_anthropic_api_key(self, clean_env: None) -> None:
-        """Loading the shipped config with no ANTHROPIC_API_KEY fails clearly."""
-        with pytest.raises(ValueError, match="Invalid application config"):
-            load_app_config(SHIPPED_CONFIG_PATH)
+    def test_shipped_config_boots_without_api_key(self, clean_env: None) -> None:
+        """Loading the shipped config with no API key succeeds and stays on vllm."""
+        config = load_app_config(SHIPPED_CONFIG_PATH)
+        assert config.llm.provider == "vllm"
 
     def test_shipped_config_keeps_proprietary_models_configured(
         self, shipped_config: AppConfig
@@ -116,7 +116,12 @@ class TestShippedConfigDefaults:
     def test_shipped_egress_includes_anthropic_excludes_openai(
         self, shipped_config: AppConfig
     ) -> None:
-        """The default provider's host is whitelisted; the opt-in one is not."""
+        """Anthropic's host stays whitelisted for the interim cloud opt-in; OpenAI's is not.
+
+        The default is now vllm (local), but api.anthropic.com remains in the
+        egress list so switching to Claude works without an egress edit, while
+        api.openai.com stays out until the user opts in.
+        """
         assert "api.anthropic.com" in shipped_config.egress.allowed_hosts
         assert "api.openai.com" not in shipped_config.egress.allowed_hosts
 
@@ -127,7 +132,7 @@ class TestShippedConfigDefaults:
 
 
 class TestShippedEnvExample:
-    """The committed .env.example must match the anthropic-first config story."""
+    """The committed .env.example must match the vLLM-default config story."""
 
     def test_env_example_does_not_override_auth_mode(self) -> None:
         """No active AUTH_MODE line, or it is 'vpn' — must not force 'token'."""
@@ -135,17 +140,28 @@ class TestShippedEnvExample:
         auth_modes = _active_env_values(env_text, "AUTH_MODE")
         assert all(value == "vpn" for value in auth_modes)
 
-    def test_env_example_provider_is_anthropic_or_unset(self) -> None:
-        """Any active LLM_PROVIDER line must be 'anthropic' (the default)."""
+    def test_env_example_provider_unset_or_vllm(self) -> None:
+        """Any active LLM_PROVIDER line must be 'vllm'.
+
+        LLM_PROVIDER is normally commented out so config.yaml's vllm default
+        wins; if it is ever active it must not override away from vllm.
+        """
         env_text = SHIPPED_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
         providers = _active_env_values(env_text, "LLM_PROVIDER")
-        assert all(value == "anthropic" for value in providers)
+        assert all(value == "vllm" for value in providers)
 
-    def test_env_example_has_anthropic_key_and_no_ollama_vars(self) -> None:
-        """.env.example prompts for ANTHROPIC_API_KEY and carries no ollama vars."""
+    def test_env_example_anthropic_key_is_optin_and_no_ollama_vars(self) -> None:
+        """.env.example documents ANTHROPIC_API_KEY as opt-in and carries no ollama vars.
+
+        With the vllm default (boots without any key), no cloud API key ships as
+        an active line — ANTHROPIC_API_KEY is documented but commented out, like
+        OPENAI_API_KEY, so a fresh clone starts with no secrets exported.
+        """
         env_text = SHIPPED_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
-        # ANTHROPIC_API_KEY is present as an active (empty) line to fill in.
-        assert _active_env_values(env_text, "ANTHROPIC_API_KEY") == [""]
+        # The key is documented for the anthropic cloud opt-in...
+        assert "ANTHROPIC_API_KEY" in env_text
+        # ...but must NOT be an active line — no empty secret is exported by default.
+        assert _active_env_values(env_text, "ANTHROPIC_API_KEY") == []
         # No leftover Ollama configuration.
         assert "OLLAMA_BASE_URL" not in env_text
         assert "OLLAMA_MODEL" not in env_text

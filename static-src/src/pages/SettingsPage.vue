@@ -46,10 +46,10 @@ const NAV = [
 ];
 
 // --- LLM / Agent section ---
-const providers: { value: LLMProvider | 'vllm'; label: string; disabled?: boolean }[] = [
+const providers: { value: LLMProvider; label: string; badge?: string }[] = [
+  { value: 'vllm', label: 'vLLM', badge: 'local · coming soon' },
   { value: 'claude', label: 'Claude' },
   { value: 'openai', label: 'OpenAI' },
-  { value: 'vllm', label: 'vLLM (local) — coming soon', disabled: true },
 ];
 
 const draftAnthropicModel = ref('');
@@ -74,10 +74,7 @@ onMounted(async () => {
   syncDrafts();
 });
 
-async function onProviderChange(p: LLMProvider | 'vllm') {
-  // vLLM is a coming-soon placeholder — its button is disabled, so this is
-  // just a defensive guard.
-  if (p === 'vllm') return;
+async function onProviderChange(p: LLMProvider) {
   await settings.setProvider(p);
 }
 
@@ -250,10 +247,9 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                   :key="p.value"
                   class="seg-btn"
                   :class="{ active: settings.provider === p.value }"
-                  :disabled="p.disabled"
                   @click="onProviderChange(p.value)"
                 >
-                  {{ p.label }}
+                  {{ p.label }}<span v-if="p.badge" class="soon-badge">{{ p.badge }}</span>
                 </button>
               </div>
             </div>
@@ -280,6 +276,9 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                   @blur="onOpenAiModelBlur"
                 />
                 <span v-if="openAiModelError" class="input-error">{{ openAiModelError }}</span>
+              </template>
+              <template v-else-if="currentProvider === 'vllm'">
+                <span class="row-hint">Local vLLM serving is coming soon. Select Claude or OpenAI above to chat now.</span>
               </template>
             </div>
 
