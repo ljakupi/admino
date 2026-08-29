@@ -10,9 +10,10 @@ This doc has **two dimensions**, tracked in separate columns:
   **verified from code** (`src/admino/permissions.py`, `DEFAULT_PERMISSIONS` +
   hardcoded denials) and is deterministic; no OAuth required.
 - **Runtime** — whether the action actually works end-to-end through chat, with the
-  relevant account connected. This requires a **hands-on run with live OAuth** and is
-  the maintainer's to confirm. Cells below are pre-filled with the **code-expected**
-  status and marked `⏳ pending hands-on` until verified against a running instance.
+  relevant account connected. **Verified hands-on with live Google + Microsoft OAuth on
+  2026-08-29.** Two actions are broken — `outlook.read` and `onedrive.download` — both
+  tracked in [#123](https://github.com/ljakupi/admino/issues/123) (over-strict Microsoft
+  Graph ID validation). Everything else works or is denied-by-design.
 
 Status legend (runtime): `✅ working` · `🟡 partial` · `🔴 broken` ·
 `⛔ denied-by-design` · `🔌 needs-OAuth` · `⏳ pending hands-on`.
@@ -34,71 +35,77 @@ the `@register_tool(..., action=...)` decorators in each module. `documents` and
 ### Google — Gmail (`gmail`)
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| read   | yes | `allow`            | 🔌 needs-OAuth ⏳ | Read a message by id. |
-| list   | yes | `allow`            | 🔌 needs-OAuth ⏳ | List recent messages. |
-| search | yes | `allow`            | 🔌 needs-OAuth ⏳ | Query-based search. |
+| read   | yes | `allow`            | ✅ working | Returns the email content. |
+| list   | yes | `allow`            | ✅ working | Lists recent messages. |
+| search | yes | `allow`            | ✅ working | Query search returns matching emails. |
 | send   | yes | `deny (promotable)` | ⛔ denied-by-design | Handler exists but the engine blocks dispatch. |
 
 ### Google — Calendar (`google_calendar`)
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| read   | yes | `allow`   | 🔌 needs-OAuth ⏳ | Read an event. |
-| list   | yes | `allow`   | 🔌 needs-OAuth ⏳ | List events. |
-| create | yes | `confirm` | 🔌 needs-OAuth ⏳ | Confirm-gated write — should prompt. |
+| read   | yes | `allow`   | ✅ working | Reads an event. |
+| list   | yes | `allow`   | ✅ working | Lists events. |
+| create | yes | `confirm` | ✅ working | Confirm prompt appeared; event created. |
 | update | yes | `deny (promotable)` | ⛔ denied-by-design | Handler exists but the engine blocks dispatch. |
 
 ### Google — Drive (`google_drive`)
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| read     | yes | `allow`   | 🔌 needs-OAuth ⏳ | Read file content. |
-| list     | yes | `allow`   | 🔌 needs-OAuth ⏳ | List recent files. |
-| search   | yes | `allow`   | 🔌 needs-OAuth ⏳ | Query-based search. |
-| download | yes | `confirm` | 🔌 needs-OAuth ⏳ | Confirm-gated — should prompt. |
+| read     | yes | `allow`   | ✅ working | Reads file content. |
+| list     | yes | `allow`   | ✅ working | Lists recent files. |
+| search   | yes | `allow`   | ✅ working | Query search returns matches. |
+| download | yes | `confirm` | ✅ working | Confirm prompt appeared; downloaded. |
 
 ### Microsoft — Outlook mail (`outlook`)
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| read   | yes | `allow`            | 🔌 needs-OAuth ⏳ | Read a message. |
-| list   | yes | `allow`            | 🔌 needs-OAuth ⏳ | List messages. |
-| search | yes | `allow`            | 🔌 needs-OAuth ⏳ | Query-based search. |
+| read   | yes | `allow`            | 🔴 broken | Rejects Graph message IDs containing `= + /`. Bug: [#123](https://github.com/ljakupi/admino/issues/123). |
+| list   | yes | `allow`            | ✅ working | Lists messages. |
+| search | yes | `allow`            | ✅ working | Query search returns matching emails. |
 | send   | yes | `deny (promotable)` | ⛔ denied-by-design | Handler exists but the engine blocks dispatch. |
 
 ### Microsoft — Outlook calendar (`outlook_calendar`)
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| read   | yes | `allow`   | 🔌 needs-OAuth ⏳ | Read an event. |
-| list   | yes | `allow`   | 🔌 needs-OAuth ⏳ | List events. |
-| create | yes | `confirm` | 🔌 needs-OAuth ⏳ | Confirm-gated write — should prompt. |
+| read   | yes | `allow`   | ✅ working | Reads an event. |
+| list   | yes | `allow`   | ✅ working | Lists events. |
+| create | yes | `confirm` | ✅ working | Confirm prompt appeared; event created. |
 | update | yes | `deny (promotable)` | ⛔ denied-by-design | Handler exists but the engine blocks dispatch. |
 
 ### Microsoft — OneDrive (`onedrive`)
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| read     | yes | `allow`   | 🔌 needs-OAuth ⏳ | Read file content. |
-| list     | yes | `allow`   | 🔌 needs-OAuth ⏳ | List files. |
-| search   | yes | `allow`   | 🔌 needs-OAuth ⏳ | Query-based search. |
-| download | yes | `confirm` | 🔌 needs-OAuth ⏳ | Confirm-gated — should prompt. |
+| read     | yes | `allow`   | ✅ working | Worked in QA. Shares the strict ID validation, so may fail on item IDs with special chars — latent, see [#123](https://github.com/ljakupi/admino/issues/123). |
+| list     | yes | `allow`   | ✅ working | Lists files. |
+| search   | yes | `allow`   | ✅ working | Query search returns matches. |
+| download | yes | `confirm` | 🔴 broken | Rejects item IDs containing special chars. Bug: [#123](https://github.com/ljakupi/admino/issues/123). |
 
 ### Local — Files (`files`)
 No OAuth required — runs against the sandboxed path. Verifiable without connecting any account.
 | Action    | Registered handler | Gating (from code) | Runtime | Notes |
 |-----------|:---:|--------------------|---------|-------|
-| read      | yes | `allow`   | ⏳ pending hands-on | Path-validated read within the sandbox. |
-| list      | yes | `allow`   | ⏳ pending hands-on | Path-validated listing. |
-| search    | yes | `allow`   | ⏳ pending hands-on | Path-validated search. |
-| write     | yes | `confirm` | ⏳ pending hands-on | Confirm-gated write — should prompt. |
-| move      | yes | `confirm` | ⏳ pending hands-on | Confirm-gated move — should prompt. |
-| overwrite | no  | `deny (immutable)` | ⛔ denied-by-design | No handler; modeled as a denial so an attempt yields a clear audit deny. |
-| delete    | no  | `deny (immutable)` | ⛔ denied-by-design | No handler; hardcoded denial. |
+| read      | yes | `allow`   | ✅ working | Path-validated read within the sandbox. |
+| list      | yes | `allow`   | ✅ working | Path-validated listing. |
+| search    | yes | `allow`   | ✅ working | Path-validated search. |
+| write     | yes | `confirm` | ✅ working | Confirm prompt appeared; file written. |
+| move      | yes | `confirm` | ✅ working | Confirm prompt appeared; file moved. |
+| overwrite | no  | `deny (immutable)` | ⛔ denied-by-design | No handler; denied — attempt yields a clear audit deny. |
+| delete    | no  | `deny (immutable)` | ⛔ denied-by-design | No handler; hardcoded denial — attempt is denied. |
 
 ### Local — Memory (`memory`)
 No OAuth required — runs against PostgreSQL. Verifiable without connecting any account.
 | Action | Registered handler | Gating (from code) | Runtime | Notes |
 |--------|:---:|--------------------|---------|-------|
-| store  | yes | `allow`            | ⏳ pending hands-on | Store a note. |
-| recall | yes | `allow`            | ⏳ pending hands-on | Recall a note. |
-| list   | yes | `allow`            | ⏳ pending hands-on | List notes. |
-| delete | no  | `deny (immutable)` | ⛔ denied-by-design | No handler; hardcoded denial. |
+| store  | yes | `allow`            | ✅ working | Stores a note. |
+| recall | yes | `allow`            | ✅ working | Recalls a note. |
+| list   | yes | `allow`            | ✅ working | Lists notes. |
+| delete | no  | `deny (immutable)` | ⛔ denied-by-design | No handler; hardcoded denial — attempt is denied. |
+
+**Summary:** of 26 registered tool/actions, **22 working ✅**, **2 broken 🔴**
+(`outlook.read`, `onedrive.download` → [#123](https://github.com/ljakupi/admino/issues/123)),
+**8 denied-by-design ⛔** (the `send`/`update`/`delete`/`overwrite` rows above; some
+tools count in more than one bucket). `onedrive.read` works today but carries the same
+latent validation bug (#123).
 
 ---
 
@@ -125,8 +132,11 @@ config/DB contains.
   `allow`.
 - **Default-deny:** any tool/action not listed resolves to `deny`.
 
-Runtime confirmation that the confirm prompts and denials actually fire in the running
-app is part of the hands-on checklist below.
+**Runtime-confirmed (2026-08-29, hands-on):** confirm prompts fire for `*.create`,
+`*.download`, and `files.write`/`files.move`; the hardcoded denials (`*.send`, calendar
+`update`, `*.delete`, `files.overwrite`, `memory.delete`) block in-app and cannot be
+overridden via Settings; promotion requires re-auth + cooldown and yields a confirm
+prompt, never silent execution.
 
 ---
 
@@ -138,35 +148,40 @@ through chat. Replace the runtime cell with the observed status
 separate linked bug issue referencing GH-117.
 
 **Mail** (`gmail`, `outlook`) — with account connected:
-- [ ] read — ask to read a specific message; confirm content returns.
-- [ ] list — ask for recent messages; confirm a list returns.
-- [ ] search — ask to search by a query; confirm results match.
+- [x] read — ask to read a specific message; confirm content returns. Feedback: for Gmail it is working fine, bringing back the email content. For outlook it is not working, it is giving this error "Unfortunately, I'm unable to read this specific email because the message ID contains special characters (like =, +, /) that aren't supported by the read tool's format requirements."
+- [x] list — ask for recent messages; confirm a list returns. Feedback: It is working for both gmail and outlook, it is listing emails.
+- [x] search — ask to search by a query; confirm results match. Feedback: It is working for both gmail and outlook, both are able to search emails based on the query.
 
 **Calendar** (`google_calendar`, `outlook_calendar`):
-- [ ] read — read a specific event.
-- [ ] list — list upcoming events.
-- [ ] create — ask to create an event; **confirm the approval prompt appears** before it's created.
+- [x] read — read a specific event. Feedback: it is working for both, Outlook Calendar and Google Calendar.
+- [x] list — list upcoming events. Feedback: it is working for both, Outlook Calendar and Google Calendar.
+- [x] create — ask to create an event; **confirm the approval prompt appears** before it's created. Feedback: it is working for both, Outlook Calendar and Google Calendar.
 
 **Drive / OneDrive** (`google_drive`, `onedrive`):
-- [ ] read — read a file's content.
-- [ ] list — list recent files.
-- [ ] search — search by a query.
-- [ ] download — ask to download; **confirm the approval prompt appears**.
+- [x] read — read a file's content. Feedback: it is working for both, Google Drive and OneDrive.
+- [x] list — list recent files. Feedback: it is working for both, Google Drive and OneDrive.
+- [x] search — search by a query. Feedback: works for both, Google Drive and OneDrive.
+- [x] download — ask to download; **confirm the approval prompt appears**. Feedback: it works for google drive. However, for onedrive there is an error "The download is failing because the OneDrive item ID contains special characters that the tool doesn't accept. I'm unable to download this file directly using the available tools.".
 
 **Files** (`files`) — sandboxed path, no OAuth:
-- [ ] read / list / search within the sandbox.
-- [ ] write — **confirm the approval prompt appears**; then confirm the file is written.
-- [ ] move — **confirm the approval prompt appears**; then confirm the move.
-- [ ] overwrite / delete — attempt and confirm the request is **denied** (hardcoded).
+- [x] read / list / search within the sandbox. Feedback: it is working.
+- [x] write — **confirm the approval prompt appears**; then confirm the file is written. Feedback: it is working.
+- [x] move — **confirm the approval prompt appears**; then confirm the move. Feedback: it is working.
+- [x] overwrite / delete — attempt and confirm the request is **denied** (hardcoded). Feedback: it is working, it can't delete or overwrite it because it is denied.
 
 **Memory** (`memory`) — no OAuth:
-- [ ] store / recall / list a note.
-- [ ] delete — attempt and confirm it is **denied** (hardcoded).
+- [x] store / recall / list a note. Feedback: working well.
+- [x] delete — attempt and confirm it is **denied** (hardcoded). Feedback: it is denied.
 
 **Denials & promotion** (any provider):
-- [ ] `*.send` (gmail/outlook), calendar `update` — confirm chat requests are **denied**.
-- [ ] Confirm a denied action **cannot** be overridden via Settings; promotion requires
-      re-auth + cooldown and yields a **confirm prompt**, never silent execution.
+- [x] `*.send` (gmail/outlook), calendar `update` — confirm chat requests are **denied**. Feedback: it is denied.
+- [x] Confirm a denied action **cannot** be overridden via Settings; promotion requires
+      re-auth + cooldown and yields a **confirm prompt**, never silent execution. Feedback: it works.
 
-Once the runtime column is filled and any bug issues are linked, this matrix is ready to
+## Open bugs from this QA
+- [#123](https://github.com/ljakupi/admino/issues/123) — Microsoft Graph ID validation
+  rejects valid Outlook message & OneDrive item IDs (`outlook.read`, `onedrive.download`
+  broken; `onedrive.read` latent). Fix in progress.
+
+The runtime column is filled and the one bug found is linked, so this matrix is ready to
 drop into the README overhaul.
