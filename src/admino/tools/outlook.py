@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TYPE_CHECKING, Final
+from urllib.parse import quote
 
 import httpx
 
@@ -163,8 +164,11 @@ async def outlook_read(args: OutlookReadArgs, **kwargs: object) -> str:
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
+    # URL-encode the ID: Graph message IDs are base64 (=, +, /) and must not
+    # alter the request path. safe="" encodes every reserved character.
+    message_id = quote(args.message_id, safe="")
     url = (
-        f"{_GRAPH_BASE}/me/messages/{args.message_id}"
+        f"{_GRAPH_BASE}/me/messages/{message_id}"
         "?$select=id,subject,from,receivedDateTime,bodyPreview,body"
     )
     try:

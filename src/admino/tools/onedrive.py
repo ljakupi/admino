@@ -185,8 +185,11 @@ async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
+    # URL-encode the ID: Graph item IDs contain =, +, /, ! and must not alter
+    # the request path. safe="" encodes every reserved character.
+    item_id = quote(args.item_id, safe="")
     url = (
-        f"{_GRAPH_BASE}/me/drive/items/{args.item_id}"
+        f"{_GRAPH_BASE}/me/drive/items/{item_id}"
         "?$select=id,name,size,createdDateTime,lastModifiedDateTime,webUrl,file,folder"
     )
     try:
@@ -417,7 +420,10 @@ async def onedrive_download(args: OneDriveDownloadArgs, **kwargs: object) -> str
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
-    url = f"{_GRAPH_BASE}/me/drive/items/{args.item_id}/content"
+    # URL-encode the ID: Graph item IDs contain =, +, /, ! and must not alter
+    # the request path. safe="" encodes every reserved character.
+    item_id = quote(args.item_id, safe="")
+    url = f"{_GRAPH_BASE}/me/drive/items/{item_id}/content"
     try:
         # Do NOT pass Authorization header with follow_redirects=True.
         # Microsoft Graph /content returns a 302 to Azure blob storage;
