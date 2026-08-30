@@ -46,11 +46,17 @@ logger = logging.getLogger(__name__)
 _GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
 _MAX_DOWNLOAD_SIZE: Final[int] = 100 * 1024 * 1024  # 100 MB
 # Safe redirect hosts for OneDrive /content 302 responses (Azure blob CDN).
+# ``.microsoftpersonalcontent.com`` is Microsoft's consumer (OneDrive personal)
+# content domain — personal accounts serve /content downloads from there since
+# the migration to SharePoint-based infrastructure. The leading-dot suffix match
+# only admits true subdomains of the Microsoft-owned apex, and the redirect is
+# followed without the Authorization header, so no credential reaches the CDN.
 _SAFE_REDIRECT_SUFFIXES: Final[tuple[str, ...]] = (
     ".windows.net",
     ".microsoftonline.com",
     ".azure.com",
     ".sharepoint.com",
+    ".microsoftpersonalcontent.com",
 )
 
 # ---------------------------------------------------------------------------

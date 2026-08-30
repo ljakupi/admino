@@ -514,6 +514,51 @@ class TestOneDriveDownload:
         assert "i%2B%2F%3Dd%21x" in called_url
         assert "items/i+/=d!x/content" not in called_url
 
+    async def test_download_follows_personal_content_redirect(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
+    ) -> None:
+        """Personal accounts redirect /content to *.microsoftpersonalcontent.com."""
+        redirect_url = "https://my.microsoftpersonalcontent.com/personal/download?t=abc"
+        resp_302 = httpx.Response(status_code=302, headers={"location": redirect_url})
+        resp_200 = _make_response(200, content=b"file-bytes")
+        mock_http_client.get.side_effect = [resp_302, resp_200]
+        dest = tmp_path / "personal.pdf"
+
+        with (
+            patch("admino.tools.onedrive._validate_path", return_value=dest),
+            patch("admino.tools.onedrive._revalidate_resolved"),
+        ):
+            from admino.tools.onedrive import onedrive_download
+
+            args = OneDriveDownloadArgs(item_id="AB91DF8D5821815F!s0d16a", destination=str(dest))
+            result = await onedrive_download(args)
+
+        assert "Downloaded" in result
+        assert dest.read_bytes() == b"file-bytes"
+        # The redirect is followed WITHOUT forwarding the Authorization header.
+        second_call = mock_http_client.get.call_args_list[1]
+        assert second_call.args[0] == redirect_url
+        assert "headers" not in second_call.kwargs
+
+    async def test_download_blocks_unsafe_redirect_host(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
+    ) -> None:
+        """Redirects to non-Microsoft hosts are blocked (SSRF defence)."""
+        resp_302 = httpx.Response(
+            status_code=302, headers={"location": "https://evil.example.com/x"}
+        )
+        mock_http_client.get.side_effect = [resp_302]
+        dest = tmp_path / "x.pdf"
+
+        with patch("admino.tools.onedrive._validate_path", return_value=dest):
+            from admino.tools.onedrive import onedrive_download
+
+            args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
+            result = await onedrive_download(args)
+
+        assert "unsafe redirect" in result
+        assert not dest.exists()
+
     async def test_download_path_validation_rejected(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
