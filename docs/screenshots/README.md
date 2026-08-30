@@ -10,7 +10,7 @@ Expected files (exact names — the README links to these paths):
 | `chat.png` | Chat | Default view at `localhost:8000` — show a message with a tool call. |
 | `settings-agent.png` | Settings → Agent | Settings → **Agent**; show the provider control (vLLM *coming soon* / Claude / OpenAI). |
 | `permissions.png` | Permissions | Permissions page — the allow / needs-approval / denied matrix. |
-| `activity.png` | Activity | Activity page — the audit trail of tool calls. |
+| `critical-permissions.png` | Critical permissions | Settings → **Danger zone** → the Critical permissions card (promotable denials). |
 
 Notes:
 

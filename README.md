@@ -16,9 +16,9 @@ influence, or bypass. Nothing happens on your accounts without your say-so.
 | --- | --- |
 | ![Chat](docs/screenshots/chat.png) | ![Settings → Agent](docs/screenshots/settings-agent.png) |
 
-| Permissions | Activity |
+| Permissions | Critical permissions |
 | --- | --- |
-| ![Permissions](docs/screenshots/permissions.png) | ![Activity](docs/screenshots/activity.png) |
+| ![Permissions](docs/screenshots/permissions.png) | ![Critical permissions](docs/screenshots/critical-permissions.png) |
 
 ## What works today
 
@@ -42,11 +42,6 @@ The Google and Microsoft tools need an OAuth connection — set one up with
 
 **Not yet implemented:** `documents` (document store) and `search` (web search) are
 planned and are **not** in this release — don't expect them to work yet.
-
-> Two Microsoft Graph bugs surfaced during hands-on QA — over-strict message/item ID
-> validation ([#123](https://github.com/ljakupi/admino/issues/123)) and a OneDrive
-> download redirect host ([#125](https://github.com/ljakupi/admino/issues/125)) — and
-> are both fixed on `develop`.
 
 ## The permission engine
 
@@ -76,16 +71,16 @@ critical permissions under **Settings → Danger zone**.
 
 ## LLM providers
 
-admino is designed to run fully local. **Local vLLM serving is the planned default —
-coming soon.** Until it lands, two cloud providers are supported as interim options:
+admino is designed to run fully local, so **vLLM is the default provider** — but local
+vLLM serving isn't implemented yet. On first launch admino boots on vLLM and can't chat
+until you switch to a working provider in **Settings → Agent**:
 
-- **Claude (Anthropic)** — the working default today.
-- **OpenAI** — opt-in; needs `OPENAI_API_KEY` set on the server to enable it.
+- **Claude (Anthropic)** — opt-in interim provider; needs `ANTHROPIC_API_KEY` on the server.
+- **OpenAI** — opt-in interim provider; needs `OPENAI_API_KEY` on the server.
 
-Switch providers in **Settings → Agent**. vLLM appears there marked *local · coming
-soon*; selecting it prompts you to pick Claude or OpenAI to chat right now. Cloud
-providers send your messages to their servers; everything else — audit log, memory,
-documents — stays on your machine.
+In Settings → Agent, vLLM appears marked *local · coming soon*; pick Claude or OpenAI to
+chat right now. Cloud providers send your messages to their servers; everything else —
+audit log, memory, documents — stays on your machine.
 
 ## Data & storage
 
@@ -96,8 +91,9 @@ persisted to the database. The audit log is **append-only NDJSON on disk**.
 
 ## Run it
 
-The minimal path uses Claude and ends at a live chat on `localhost:8000`. You need
-**Python 3.12+**, **Docker** (for Postgres), and an **Anthropic API key**.
+admino defaults to vLLM, which can't serve yet, so the quickest path to a live chat is to
+switch to Claude after launch. You need **Python 3.12+**, **Docker** (for Postgres), and
+an **Anthropic API key**.
 
 ```bash
 # 1. Install
@@ -116,8 +112,10 @@ Open **http://localhost:8000**, then:
 
 1. Click **Skip** on the token prompt — the default `vpn` auth mode needs no token when
    the API is bound to localhost.
-2. Type a message and press Enter.
-3. The agent responds and may call a tool. Read actions run immediately; write actions
+2. Open **Settings → Agent** and switch the provider from vLLM to **Claude** (vLLM can't
+   chat yet).
+3. Type a message and press Enter.
+4. The agent responds and may call a tool. Read actions run immediately; write actions
    ask you to confirm; destructive ones are denied.
 
 ## Roadmap
