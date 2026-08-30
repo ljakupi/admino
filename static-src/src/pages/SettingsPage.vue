@@ -392,18 +392,18 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
           <div class="s-card">
             <div class="s-row">
               <div class="row-label">Version</div>
-              <span class="mono-value">admino 1.0.0</span>
+              <span class="mono-value">admino 0.1.0 (Alpha)</span>
             </div>
             <div class="s-row">
               <div class="row-label">Source code</div>
-              <a href="https://github.com/admino/admino" class="source-link" target="_blank" rel="noopener noreferrer">
+              <a href="https://github.com/ljakupi/admino" class="source-link" target="_blank" rel="noopener noreferrer">
                 <Github :size="14" :stroke-width="1.75" />
-                github.com/admino/admino
+                github.com/ljakupi/admino
               </a>
             </div>
             <div class="s-row">
               <div class="row-label">License</div>
-              <span class="muted-value">MIT</span>
+              <span class="muted-value">Apache-2.0</span>
             </div>
           </div>
           <div class="trust-badge">
