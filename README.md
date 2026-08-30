@@ -1,30 +1,91 @@
 # admino
 
-**The AI that works for you and not on you.**
+**The AI that works for you, not on you.**
 
-**v0.1 (Alpha) — MVP**
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+&nbsp;·&nbsp; **v0.1 (Alpha)**
 
-## What admino is
+admino is a privacy- and security-first personal AI agent you run yourself. It chats,
+reads your mail, calendar, and files, and can take actions on your behalf — but every
+action is gated by an **isolated permission engine** that the model cannot see,
+influence, or bypass. Nothing happens on your accounts without your say-so.
 
-admino is a privacy- and security-first personal AI agent. Every tool action the
-agent wants to take is gated by an **isolated permission engine** — a pure function
-that receives only the `(tool, action)` pair and never sees the model's context, so
-the agent cannot see, influence, or bypass it.
+## Screenshots
 
-The engine is **default-deny**: anything not explicitly allowed is denied.
-**Hardcoded denials cannot be overridden** by config or by the agent, and write
-actions are never auto-allowed — they resolve to *confirm* or *deny* only. That is
-what "works for you, not on you" means: admino cannot take uncontrolled or
-un-permitted actions on your behalf.
+| Chat | Settings → Agent |
+| --- | --- |
+| ![Chat](docs/screenshots/chat.png) | ![Settings → Agent](docs/screenshots/settings-agent.png) |
 
-## What's available today
+| Permissions | Activity |
+| --- | --- |
+| ![Permissions](docs/screenshots/permissions.png) | ![Activity](docs/screenshots/activity.png) |
 
-- **Chat PWA** at `localhost:8000` — send a message, get a response that may call tools.
-- **LLM provider:** **Anthropic** (default). OpenAI also works (opt-in).
-- **Tools:** `memory`, `files`, `gmail`, `google_calendar`, `google_drive`,
-  `outlook`, `outlook_calendar`, `onedrive`. The Google/Microsoft tools require an
-  OAuth connection — set one up with `oauth_setup.py`.
-- **Permission engine** gating every action, plus an **append-only audit log**.
+## What works today
+
+A chat PWA at `localhost:8000`: send a message, get a response that can call tools.
+The tools below are implemented and verified end-to-end; write actions ask you to
+confirm first, and a handful of destructive actions are denied by design.
+
+| Tool | Actions | Notes |
+| --- | --- | --- |
+| **Gmail** | read · list · search | Google OAuth. `send`/`delete` denied by design. |
+| **Google Calendar** | read · list · create | `create` asks to confirm. `update`/`delete` denied. |
+| **Google Drive** | read · list · search · download | `download` asks to confirm. `delete` denied. |
+| **Outlook mail** | read · list · search | Microsoft OAuth. `send`/`delete` denied by design. |
+| **Outlook Calendar** | read · list · create | `create` asks to confirm. `update`/`delete` denied. |
+| **OneDrive** | read · list · search · download | `download` asks to confirm. `delete` denied. |
+| **Files** | read · list · search · write · move | Sandboxed path, no OAuth. `write`/`move` confirm; `overwrite`/`delete` denied. |
+| **Memory** | store · recall · list | Persistent notes in PostgreSQL. `delete` denied. |
+
+The Google and Microsoft tools need an OAuth connection — set one up with
+`oauth_setup.py`. `files` and `memory` work without connecting any account.
+
+**Not yet implemented:** `documents` (document store) and `search` (web search) are
+planned and are **not** in this release — don't expect them to work yet.
+
+> Two Microsoft Graph bugs surfaced during hands-on QA — over-strict message/item ID
+> validation ([#123](https://github.com/ljakupi/admino/issues/123)) and a OneDrive
+> download redirect host ([#125](https://github.com/ljakupi/admino/issues/125)) — and
+> are both fixed on `develop`.
+
+## The permission engine
+
+This is the heart of "works for you, not on you." Every tool call the agent wants to
+make is checked by a small, **isolated pure function** that receives only the
+`(tool, action)` pair — never the conversation, your messages, or the tool arguments.
+The agent cannot see the rules, argue with them, or route around them.
+
+- **Default-deny.** Anything not explicitly allowed is denied. Each action resolves to
+  one of three states: **allow** (runs immediately), **confirm** (you approve first), or
+  **deny** (blocked).
+- **Writes are never auto-allowed.** State-changing actions can only be `confirm` or
+  `deny` — never `allow`. If config tries to set a write action to `allow`, it is
+  downgraded to `confirm`.
+- **Critical denials are hardcoded** and cannot be overridden by config or by the agent:
+  - **Never** (immutable): every `*.delete` (`files`, `memory`, `google_drive`, both
+    calendars, `onedrive`, `documents`, Gmail, Outlook) plus `files.overwrite`.
+  - **Deny by default, at most promotable to _confirm_**: `gmail.send`, `outlook.send`,
+    and calendar `update`. These stay denied unless you deliberately promote them through
+    the Critical Permissions flow (re-authentication + a 5-minute cooldown) — and even
+    then they only reach `confirm`, never silent `allow`.
+- **Append-only audit log.** Every decision and tool call is written to an append-only
+  NDJSON log on disk.
+
+You can review the full matrix on the **Permissions** page and manage promotable
+critical permissions under **Settings → Danger zone**.
+
+## LLM providers
+
+admino is designed to run fully local. **Local vLLM serving is the planned default —
+coming soon.** Until it lands, two cloud providers are supported as interim options:
+
+- **Claude (Anthropic)** — the working default today.
+- **OpenAI** — opt-in; needs `OPENAI_API_KEY` set on the server to enable it.
+
+Switch providers in **Settings → Agent**. vLLM appears there marked *local · coming
+soon*; selecting it prompts you to pick Claude or OpenAI to chat right now. Cloud
+providers send your messages to their servers; everything else — audit log, memory,
+documents — stays on your machine.
 
 ## Data & storage
 
@@ -33,9 +94,9 @@ PostgreSQL holds four things: `settings`, `permissions`, `memory` notes, and
 encryption key lives in the `OAUTH_ENCRYPTION_KEY` environment variable and is never
 persisted to the database. The audit log is **append-only NDJSON on disk**.
 
-## How to run
+## Run it
 
-The minimal path uses Anthropic and ends at a live chat on `localhost:8000`. You need
+The minimal path uses Claude and ends at a live chat on `localhost:8000`. You need
 **Python 3.12+**, **Docker** (for Postgres), and an **Anthropic API key**.
 
 ```bash
@@ -51,28 +112,26 @@ make dev-db
 make run
 ```
 
-Open **http://localhost:8000**.
+Open **http://localhost:8000**, then:
 
-## What to expect
-
-1. The PWA loads — click **Skip** on the token prompt (the default `vpn` auth mode
-   needs no token when the API is bound to localhost).
+1. Click **Skip** on the token prompt — the default `vpn` auth mode needs no token when
+   the API is bound to localhost.
 2. Type a message and press Enter.
-3. The agent responds, and may call one of the tools above (gated by the permission
-   engine — write actions ask you to confirm first).
+3. The agent responds and may call a tool. Read actions run immediately; write actions
+   ask you to confirm; destructive ones are denied.
 
-## Upcoming
+## Roadmap
 
-- **Local SLM serving via vLLM** (Gemma / Qwen) — planned as the eventual **default**
-  provider, so admino can run fully local with no cloud calls.
-- Document store and web-search tools.
+- **Local vLLM serving** (Gemma / Qwen) as the default provider — run fully local, no
+  cloud calls.
+- **Documents** store and **web search** tools.
 - End-to-end SSE streaming and a richer health endpoint.
 
 ## Contributing
 
-admino is issue-driven: every PR must correspond to an open, approved GitHub issue.
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding standards, testing
-gates, and security rules.
+admino is issue-driven: every PR must correspond to an open, approved GitHub issue. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding standards, testing gates, and
+security rules.
 
 ## License
 
