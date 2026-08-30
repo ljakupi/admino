@@ -1211,13 +1211,29 @@ class OutlookSearchArgs(BaseModel):
     )
 
 
+# ---------------------------------------------------------------------------
+# Microsoft Graph resource ID validation
+# ---------------------------------------------------------------------------
+# Graph message/drive-item IDs are base64/base64url and contain '=', '+', '/';
+# OneDrive *personal* item IDs may also contain '!'. These IDs are URL-encoded
+# with quote(safe="") before being interpolated into the Graph request path
+# (see outlook.py / onedrive.py), so the characters cannot alter the URL path.
+# The bounded, anchored patterns below are defense-in-depth; the length cap
+# matches the calendar event-ID cap since Graph IDs can exceed 200 chars. The
+# first character is restricted to a non-slash so a value cannot begin with '/'
+# (real Graph IDs never do); '.' is excluded entirely to block '..' sequences.
+_GRAPH_ID_MAX_LEN: Final[int] = 512
+_GRAPH_MESSAGE_ID_PATTERN: Final[str] = r"^[A-Za-z0-9_\-][A-Za-z0-9_\-=+/]*$"
+_GRAPH_ITEM_ID_PATTERN: Final[str] = r"^[A-Za-z0-9_\-!][A-Za-z0-9_\-=+/!]*$"
+
+
 class OutlookReadArgs(BaseModel):
     """Arguments for the outlook.read action."""
 
     message_id: str = Field(
         min_length=1,
-        max_length=200,
-        pattern=r"^[A-Za-z0-9_\-]+$",
+        max_length=_GRAPH_ID_MAX_LEN,
+        pattern=_GRAPH_MESSAGE_ID_PATTERN,
         description="Outlook message ID.",
     )
 
@@ -1431,8 +1447,8 @@ class OneDriveReadArgs(BaseModel):
 
     item_id: str = Field(
         min_length=1,
-        max_length=200,
-        pattern=r"^[A-Za-z0-9_\-]+$",
+        max_length=_GRAPH_ID_MAX_LEN,
+        pattern=_GRAPH_ITEM_ID_PATTERN,
         description="OneDrive item ID.",
     )
 
@@ -1459,8 +1475,8 @@ class OneDriveDownloadArgs(BaseModel):
 
     item_id: str = Field(
         min_length=1,
-        max_length=200,
-        pattern=r"^[A-Za-z0-9_\-]+$",
+        max_length=_GRAPH_ID_MAX_LEN,
+        pattern=_GRAPH_ITEM_ID_PATTERN,
         description="OneDrive item ID to download.",
     )
     destination: str = Field(

@@ -46,11 +46,17 @@ logger = logging.getLogger(__name__)
 _GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
 _MAX_DOWNLOAD_SIZE: Final[int] = 100 * 1024 * 1024  # 100 MB
 # Safe redirect hosts for OneDrive /content 302 responses (Azure blob CDN).
+# ``.microsoftpersonalcontent.com`` is Microsoft's consumer (OneDrive personal)
+# content domain — personal accounts serve /content downloads from there since
+# the migration to SharePoint-based infrastructure. The leading-dot suffix match
+# only admits true subdomains of the Microsoft-owned apex, and the redirect is
+# followed without the Authorization header, so no credential reaches the CDN.
 _SAFE_REDIRECT_SUFFIXES: Final[tuple[str, ...]] = (
     ".windows.net",
     ".microsoftonline.com",
     ".azure.com",
     ".sharepoint.com",
+    ".microsoftpersonalcontent.com",
 )
 
 # ---------------------------------------------------------------------------
@@ -185,8 +191,11 @@ async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
+    # URL-encode the ID: Graph item IDs contain =, +, /, ! and must not alter
+    # the request path. safe="" encodes every reserved character.
+    item_id = quote(args.item_id, safe="")
     url = (
-        f"{_GRAPH_BASE}/me/drive/items/{args.item_id}"
+        f"{_GRAPH_BASE}/me/drive/items/{item_id}"
         "?$select=id,name,size,createdDateTime,lastModifiedDateTime,webUrl,file,folder"
     )
     try:
@@ -417,7 +426,10 @@ async def onedrive_download(args: OneDriveDownloadArgs, **kwargs: object) -> str
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
         )
 
-    url = f"{_GRAPH_BASE}/me/drive/items/{args.item_id}/content"
+    # URL-encode the ID: Graph item IDs contain =, +, /, ! and must not alter
+    # the request path. safe="" encodes every reserved character.
+    item_id = quote(args.item_id, safe="")
+    url = f"{_GRAPH_BASE}/me/drive/items/{item_id}/content"
     try:
         # Do NOT pass Authorization header with follow_redirects=True.
         # Microsoft Graph /content returns a 302 to Azure blob storage;

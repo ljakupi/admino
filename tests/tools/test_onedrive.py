@@ -174,6 +174,21 @@ class TestOneDriveRead:
 
         assert "Type: folder" in result
 
+    async def test_read_url_encodes_item_id(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Item IDs with special chars (= + / !) are percent-encoded into the path."""
+        mock_http_client.get.return_value = _make_response(200, _sample_item())
+
+        from admino.tools.onedrive import onedrive_read
+
+        args = OneDriveReadArgs(item_id="i+/=d!x")
+        await onedrive_read(args)
+
+        called_url = mock_http_client.get.call_args.args[0]
+        assert "i%2B%2F%3Dd%21x" in called_url
+        assert "items/i+/=d!x" not in called_url
+
     async def test_read_oauth_not_configured(self) -> None:
         """OAuth not configured returns setup instructions."""
         with patch(
@@ -479,6 +494,71 @@ class TestOneDriveDownload:
         assert dest.exists()
         assert dest.read_bytes() == file_content
 
+    async def test_download_url_encodes_item_id(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
+    ) -> None:
+        """Item IDs with special chars (= + / !) are percent-encoded into the path."""
+        mock_http_client.get.return_value = _make_response(200, content=b"data")
+        dest = tmp_path / "dl.pdf"
+
+        with (
+            patch("admino.tools.onedrive._validate_path", return_value=dest),
+            patch("admino.tools.onedrive._revalidate_resolved"),
+        ):
+            from admino.tools.onedrive import onedrive_download
+
+            args = OneDriveDownloadArgs(item_id="i+/=d!x", destination=str(dest))
+            await onedrive_download(args)
+
+        called_url = mock_http_client.get.call_args_list[0].args[0]
+        assert "i%2B%2F%3Dd%21x" in called_url
+        assert "items/i+/=d!x/content" not in called_url
+
+    async def test_download_follows_personal_content_redirect(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
+    ) -> None:
+        """Personal accounts redirect /content to *.microsoftpersonalcontent.com."""
+        redirect_url = "https://my.microsoftpersonalcontent.com/personal/download?t=abc"
+        resp_302 = httpx.Response(status_code=302, headers={"location": redirect_url})
+        resp_200 = _make_response(200, content=b"file-bytes")
+        mock_http_client.get.side_effect = [resp_302, resp_200]
+        dest = tmp_path / "personal.pdf"
+
+        with (
+            patch("admino.tools.onedrive._validate_path", return_value=dest),
+            patch("admino.tools.onedrive._revalidate_resolved"),
+        ):
+            from admino.tools.onedrive import onedrive_download
+
+            args = OneDriveDownloadArgs(item_id="AB91DF8D5821815F!s0d16a", destination=str(dest))
+            result = await onedrive_download(args)
+
+        assert "Downloaded" in result
+        assert dest.read_bytes() == b"file-bytes"
+        # The redirect is followed WITHOUT forwarding the Authorization header.
+        second_call = mock_http_client.get.call_args_list[1]
+        assert second_call.args[0] == redirect_url
+        assert "headers" not in second_call.kwargs
+
+    async def test_download_blocks_unsafe_redirect_host(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
+    ) -> None:
+        """Redirects to non-Microsoft hosts are blocked (SSRF defence)."""
+        resp_302 = httpx.Response(
+            status_code=302, headers={"location": "https://evil.example.com/x"}
+        )
+        mock_http_client.get.side_effect = [resp_302]
+        dest = tmp_path / "x.pdf"
+
+        with patch("admino.tools.onedrive._validate_path", return_value=dest):
+            from admino.tools.onedrive import onedrive_download
+
+            args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
+            result = await onedrive_download(args)
+
+        assert "unsafe redirect" in result
+        assert not dest.exists()
+
     async def test_download_path_validation_rejected(
         self, mock_token: AsyncMock, mock_http_client: AsyncMock
     ) -> None:
@@ -573,10 +653,32 @@ class TestOneDriveArgValidation:
         args = OneDriveReadArgs(item_id="abc123")
         assert args.item_id == "abc123"
 
-    def test_read_overly_long_item_id_rejected(self) -> None:
-        """item_id exceeding max_length is rejected."""
+    def test_read_graph_item_id_with_special_chars_accepted(self) -> None:
+        """OneDrive item IDs (base64 + '!') are accepted."""
+        iid = "01BYE5RZ=+/AAA!107"
+        args = OneDriveReadArgs(item_id=iid)
+        assert args.item_id == iid
+
+    def test_download_graph_item_id_with_special_chars_accepted(self) -> None:
+        """Download item IDs (base64 + '!') are accepted."""
+        iid = "01BYE5RZ=+/AAA!107"
+        args = OneDriveDownloadArgs(item_id=iid, destination="/data/f.pdf")
+        assert args.item_id == iid
+
+    def test_read_item_id_with_dot_or_traversal_rejected(self) -> None:
+        """IDs containing '.' (e.g. traversal sequences) are rejected."""
         with pytest.raises(ValidationError):
-            OneDriveReadArgs(item_id="x" * 201)
+            OneDriveReadArgs(item_id="../secret")
+
+    def test_read_item_id_leading_slash_rejected(self) -> None:
+        """IDs beginning with '/' are rejected (defense-in-depth)."""
+        with pytest.raises(ValidationError):
+            OneDriveReadArgs(item_id="/etc/passwd")
+
+    def test_read_overly_long_item_id_rejected(self) -> None:
+        """item_id exceeding max_length (512) is rejected."""
+        with pytest.raises(ValidationError):
+            OneDriveReadArgs(item_id="x" * 513)
 
     def test_list_max_results_zero_rejected(self) -> None:
         """max_results=0 is rejected (ge=1)."""

@@ -140,6 +140,21 @@ class TestOutlookRead:
         assert "From: sender@example.com" in result
         assert "Body:\nHello world" in result
 
+    async def test_read_url_encodes_message_id(
+        self, mock_token: AsyncMock, mock_http_client: AsyncMock
+    ) -> None:
+        """Graph message IDs (base64: = + /) are percent-encoded into the path."""
+        mock_http_client.get.return_value = _make_response(200, _sample_message())
+
+        from admino.tools.outlook import outlook_read
+
+        args = OutlookReadArgs(message_id="AA+/=BB")
+        await outlook_read(args)
+
+        called_url = mock_http_client.get.call_args.args[0]
+        assert "AA%2B%2F%3DBB" in called_url
+        assert "/messages/AA+/=BB" not in called_url
+
     async def test_read_oauth_not_configured(self) -> None:
         """When OAuth is not configured, returns setup instructions."""
         with patch(
@@ -435,10 +450,31 @@ class TestOutlookArgValidation:
         args = OutlookReadArgs(message_id="AAMkAGI2TG93")
         assert args.message_id == "AAMkAGI2TG93"
 
-    def test_read_overly_long_message_id_rejected(self) -> None:
-        """message_id exceeding max_length is rejected."""
+    def test_read_graph_message_id_with_special_chars_accepted(self) -> None:
+        """Base64 Graph message IDs (containing = + /) are accepted."""
+        mid = "AAMkAGI2TG93AAA=+/xYz"
+        args = OutlookReadArgs(message_id=mid)
+        assert args.message_id == mid
+
+    def test_read_message_id_with_dot_or_traversal_rejected(self) -> None:
+        """IDs containing '.' (e.g. traversal sequences) are rejected."""
         with pytest.raises(ValidationError):
-            OutlookReadArgs(message_id="x" * 201)
+            OutlookReadArgs(message_id="../secret")
+
+    def test_read_message_id_with_space_rejected(self) -> None:
+        """IDs containing spaces or control chars are rejected."""
+        with pytest.raises(ValidationError):
+            OutlookReadArgs(message_id="bad id")
+
+    def test_read_message_id_leading_slash_rejected(self) -> None:
+        """IDs beginning with '/' are rejected (defense-in-depth)."""
+        with pytest.raises(ValidationError):
+            OutlookReadArgs(message_id="/etc/passwd")
+
+    def test_read_overly_long_message_id_rejected(self) -> None:
+        """message_id exceeding max_length (512) is rejected."""
+        with pytest.raises(ValidationError):
+            OutlookReadArgs(message_id="x" * 513)
 
     def test_list_max_results_zero_rejected(self) -> None:
         """max_results=0 is rejected (ge=1)."""
