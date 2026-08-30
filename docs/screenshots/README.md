@@ -7,7 +7,8 @@ Expected files (exact names — the README links to these paths):
 
 | File | Page | How to reach it |
 | --- | --- | --- |
-| `chat.png` | Chat | Default view at `localhost:8000` — show a message with a tool call. |
+| `chat.png` | Chat | Landing view at `localhost:8000` — the empty "How can I help?" state. |
+| `confirm-chat.png` | Chat (approval) | A write action (e.g. `google_calendar.create`) paused on its Approve / Deny prompt. |
 | `settings-agent.png` | Settings → Agent | Settings → **Agent**; show the provider control (vLLM *coming soon* / Claude / OpenAI). |
 | `permissions.png` | Permissions | Permissions page — the allow / needs-approval / denied matrix. |
 | `critical-permissions.png` | Critical permissions | Settings → **Danger zone** → the Critical permissions card (promotable denials). |

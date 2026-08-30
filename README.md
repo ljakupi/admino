@@ -50,6 +50,10 @@ make is checked by a small, **isolated pure function** that receives only the
 `(tool, action)` pair — never the conversation, your messages, or the tool arguments.
 The agent cannot see the rules, argue with them, or route around them.
 
+![A write action pausing for approval](docs/screenshots/confirm-chat.png)
+
+*A `confirm` action — `google_calendar.create` — pausing for your approval before it runs.*
+
 - **Default-deny.** Anything not explicitly allowed is denied. Each action resolves to
   one of three states: **allow** (runs immediately), **confirm** (you approve first), or
   **deny** (blocked).
