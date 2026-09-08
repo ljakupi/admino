@@ -69,10 +69,21 @@ services:
     container_name: admino-agent
     restart: unless-stopped
 
-    # NET_ADMIN is required for the entrypoint.sh iptables egress whitelist.
-    # Without it the whitelist is skipped with a warning (acceptable for dev).
+    # Least-privilege capabilities. Drop everything, then add back only what the
+    # root entrypoint needs before it drops to the unprivileged admino user:
+    #   NET_ADMIN — apply the iptables egress whitelist (entrypoint.sh)
+    #   SETUID/SETGID — let `gosu admino` drop root → admino
+    # Without NET_ADMIN the whitelist is skipped with a warning (dev only).
+    # no-new-privileges blocks any setuid-binary privilege escalation; it does
+    # not affect gosu, which uses setuid(2) to DROP privileges, not gain them.
+    cap_drop:
+      - ALL
     cap_add:
       - NET_ADMIN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
 
     # Bind to localhost only. For LAN/VPN access, change to "0.0.0.0:8000:8000"
     # or use a reverse proxy. Never expose directly on a public interface.

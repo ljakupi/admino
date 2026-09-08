@@ -7,10 +7,13 @@
 #   - All outbound traffic is blocked by default (DROP policy on OUTPUT chain).
 #   - Loopback (127.0.0.1) is always allowed (required for internal IPC).
 #   - The internal Docker bridge network is allowed (local LLM backend communication).
-#   - DNS (UDP/TCP port 53) to the Docker embedded DNS resolver is allowed
-#     so that whitelisted hostnames can be resolved.
+#   - DNS (UDP/TCP port 53) is allowed so whitelisted hostnames can be resolved.
+#     Docker's embedded resolver forwards upstream from inside the container's
+#     netns, so port 53 egress (not just the resolver IP) must be permitted or
+#     resolution silently fails under the DROP policy.
 #   - Only whitelisted external destinations are opened by hostname. Docker's
-#     embedded DNS resolves these names; iptables rules use the resolved IPs.
+#     embedded DNS resolves these names (IPv4 only); iptables rules use the
+#     resolved IPs.
 #   - All other egress is DROPped.
 #   - IPv6 egress is blocked entirely (ip6tables OUTPUT DROP; loopback and
 #     established replies only). admino reaches every whitelisted host over IPv4,
@@ -145,9 +148,29 @@ apply_iptables() {
     # Allow established/related connections (required for response traffic)
     iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
-    # Allow DNS queries to the Docker embedded DNS resolver only
-    iptables -A OUTPUT -d "${DOCKER_DNS_IP}" -p udp --dport 53 -j ACCEPT
-    iptables -A OUTPUT -d "${DOCKER_DNS_IP}" -p tcp --dport 53 -j ACCEPT
+    # Allow DNS resolution. The app queries Docker's embedded resolver
+    # (DOCKER_DNS_IP), which then FORWARDS to a real upstream nameserver from
+    # inside the container's netns — that forwarded hop's destination is NOT
+    # DOCKER_DNS_IP (it is the Docker Desktop gateway, or the host's resolvers
+    # on Linux), so restricting to -d DOCKER_DNS_IP silently breaks resolution
+    # under the DROP policy. Allow the resolver directly, plus port 53 egress so
+    # the upstream forwarding works across Docker Desktop and Linux.
+    #
+    # DOCKER_DNS_IP is opened on all ports (not just 53) deliberately: on Linux,
+    # Docker DNATs 127.0.0.11:53 to an ephemeral port before the filter chain,
+    # so a --dport 53 match would miss it. This IP is Docker's internal resolver
+    # (loopback-adjacent, not externally routable, no other service listening),
+    # so the wider match is low risk.
+    #
+    # SECURITY TRADEOFF: allowing port 53 to any destination permits DNS
+    # tunneling as an exfiltration channel. It is required here (the upstream
+    # resolver IP is neither knowable nor portable) and matches issue #16's
+    # "DNS resolution allowed (port 53 UDP/TCP)". Accepted for the
+    # laptop/home-server threat model; bandwidth-limiting (e.g. hashlimit) is a
+    # candidate follow-up hardening.
+    iptables -A OUTPUT -d "${DOCKER_DNS_IP}" -j ACCEPT
+    iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+    iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
 
     # Allow all traffic on the internal Docker bridge network (local LLM backend access)
     iptables -A OUTPUT -d "${INTERNAL_NETWORK}" -j ACCEPT
@@ -182,10 +205,15 @@ apply_iptables() {
             # Strip leading wildcard — resolves the apex only (see note above).
             clean_host="${host#\*.}"
             echo "[entrypoint] Whitelisting egress to: ${clean_host} (port 443)"
-            # Resolve hostname to IP(s) and add rules for each.
+            # Resolve hostname to IPv4 address(es) and add a rule for each.
+            # Use `getent ahostsv4` (NOT `getent hosts`, which may return an
+            # AAAA/IPv6 address that iptables — an IPv4 tool — rejects, aborting
+            # under `set -e`). IPv6 egress is blocked wholesale by
+            # apply_ip6tables_lockdown, so IPv4 rules are all we need. ahostsv4
+            # prints one line per socktype, so sort -u collapses duplicates.
             # Fail hard if a required host cannot be resolved — a silent skip
             # would leave the container running without its intended egress rules.
-            resolved=$(getent hosts "${clean_host}" 2>/dev/null | awk '{print $1}' || true)
+            resolved=$(getent ahostsv4 "${clean_host}" 2>/dev/null | awk '{print $1}' | sort -u || true)
             if [ -n "$resolved" ]; then
                 for ip in $resolved; do
                     iptables -A OUTPUT -d "${ip}" -p tcp --dport 443 -j ACCEPT
@@ -206,5 +234,17 @@ apply_iptables() {
 
 apply_iptables
 
-echo "[entrypoint] Starting: $*"
-exec "$@"
+# Drop root privileges before running the application. The entrypoint runs as
+# root so it can apply the iptables egress whitelist above; the app itself must
+# not. gosu does a clean setuid to admino and exec's the command with no extra
+# process, so the app becomes PID 1 with correct signal handling. If the
+# container was started as a non-root user (e.g. a compose `user:` override)
+# there is nothing to drop, so exec directly — iptables was already gated by
+# REQUIRE_EGRESS_WHITELIST in that case.
+if [ "$(id -u)" = "0" ]; then
+    echo "[entrypoint] Dropping to admino and starting: $*"
+    exec gosu admino "$@"
+else
+    echo "[entrypoint] Already non-root; starting: $*"
+    exec "$@"
+fi
