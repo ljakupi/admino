@@ -12,6 +12,10 @@
 #   - Only whitelisted external destinations are opened by hostname. Docker's
 #     embedded DNS resolves these names; iptables rules use the resolved IPs.
 #   - All other egress is DROPped.
+#   - IPv6 egress is blocked entirely (ip6tables OUTPUT DROP; loopback and
+#     established replies only). admino reaches every whitelisted host over IPv4,
+#     so IPv6 stays fail-closed to prevent a silent whitelist bypass if IPv6 is
+#     ever enabled on the Docker network. See apply_ip6tables_lockdown.
 #
 # Note on iptables availability:
 #   iptables requires NET_ADMIN capability. In production the container is run
@@ -62,6 +66,56 @@ if not isinstance(hosts, list) or not all(
     sys.exit("egress.allowed_hosts must be a list of hostname strings (max 253 chars each)")
 print(" ".join(hosts))
 ' "${CONFIG_FILE}"
+}
+
+# Lock down IPv6 egress entirely (defense-in-depth). admino reaches every
+# whitelisted host over IPv4, and Docker disables IPv6 on the default bridge,
+# so IPv6 egress is never needed. Blocking it fail-closed prevents a silent
+# whitelist bypass if IPv6 is later enabled on the Docker network (or on an
+# IPv6-capable VPS): the IPv4 OUTPUT DROP policy would not cover the v6 stack.
+# Loopback and established/related replies stay open to mirror the IPv4 policy.
+# Reaching a whitelisted host over IPv6 is intentionally unsupported; a future
+# deployment that needs it would add per-host AAAA rules here.
+apply_ip6tables_lockdown() {
+    # Reaching here implies NET_ADMIN is present: apply_iptables aborts (or, in
+    # dev mode, returns) before calling this when the capability is missing. So
+    # a failing ip6tables query here is NOT a permission problem — the IPv6
+    # netfilter tables are unavailable. That is only safe to skip if IPv6 is
+    # genuinely disabled at the kernel level; if IPv6 is active but unfilterable,
+    # traffic would bypass the egress whitelist, so we must fail closed instead.
+    if ! ip6tables -L OUTPUT -n > /dev/null 2>&1; then
+        # disable_ipv6=1 (or the sysctl absent → IPv6 compiled out of the
+        # kernel) means no IPv6 egress is possible, so skipping is safe.
+        v6_disabled="$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)"
+        if [ "${v6_disabled}" = "1" ]; then
+            echo "[entrypoint] IPv6 disabled at kernel level — skipping ip6tables lockdown (no IPv6 egress possible)."
+            return 0
+        fi
+        echo "[entrypoint] WARNING: ip6tables unavailable but IPv6 is enabled — egress whitelist does NOT cover IPv6." >&2
+        if [ "${REQUIRE_EGRESS_WHITELIST:-true}" = "true" ]; then
+            echo "[entrypoint] ERROR: REQUIRE_EGRESS_WHITELIST=true but IPv6 egress cannot be locked down — aborting." >&2
+            exit 1
+        fi
+        return 0
+    fi
+
+    echo "[entrypoint] Locking down IPv6 egress (fail-closed)..."
+    # Set default-deny BEFORE flushing to avoid an open race window (same
+    # ordering rationale as the IPv4 OUTPUT chain below).
+    ip6tables -P OUTPUT DROP
+    ip6tables -F OUTPUT
+    ip6tables -A OUTPUT -o lo -j ACCEPT
+    # ESTABLISHED,RELATED mirrors the IPv4 OUTPUT policy for structural symmetry.
+    # With no NEW IPv6 egress permitted it matches nothing today; it would carry
+    # reply traffic only if a future change locks down IPv6 INPUT and allows a
+    # specific inbound service. INPUT/FORWARD are intentionally left at their
+    # defaults — this function's scope is egress (OUTPUT); inbound is already
+    # constrained by the 127.0.0.1 host port publish and the server's IPv4 bind.
+    # (Requires nf_conntrack; if the module is absent the rule fails and the
+    # container aborts under `set -e` — a fail-closed outcome matching the IPv4
+    # path.)
+    ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    echo "[entrypoint] IPv6 egress locked down."
 }
 
 apply_iptables() {
@@ -142,6 +196,10 @@ apply_iptables() {
             fi
         done
     fi
+
+    # Defense-in-depth: block all IPv6 egress now that the IPv4 whitelist is in
+    # place (only reached when NET_ADMIN is present and iptables succeeded).
+    apply_ip6tables_lockdown
 
     echo "[entrypoint] Egress whitelist applied."
 }
