@@ -46,10 +46,15 @@ FROM python:3.12.8-slim AS runtime
 
 # Install system runtime dependencies
 # iptables: egress whitelist enforcement in entrypoint.sh (requires NET_ADMIN cap)
-# curl: used by healthcheck only; not available to application code
+# gosu:     drop from root to the unprivileged admino user in entrypoint.sh
+#           AFTER the iptables rules are applied. iptables needs root/NET_ADMIN,
+#           which a non-root process does NOT hold in its effective set even
+#           with `cap_add: NET_ADMIN`, so the entrypoint must start as root.
+# curl:     used by healthcheck only; not available to application code
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         iptables \
+        gosu \
         curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
@@ -76,11 +81,21 @@ COPY --from=frontend-builder --chown=admino:admino /build/static/ /app/static/
 RUN mkdir -p /app/data/logs /app/config /app/documents \
     && chown -R admino:admino /app
 
-# Copy and enable the entrypoint script
-COPY --chown=admino:admino entrypoint.sh /entrypoint.sh
-RUN chmod 0755 /entrypoint.sh
+# Copy and enable the entrypoint script. Root-owned and execute-only for
+# non-root (0555): the app process (admino, after the gosu drop) can execute it
+# but NOT overwrite it. This closes a container-restart persistence vector where
+# a compromised app rewrites the entrypoint to bypass egress enforcement on the
+# next start. Nothing needs to modify it at runtime.
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod 0555 /entrypoint.sh
 
-USER admino
+# The container starts as root ON PURPOSE: entrypoint.sh applies the iptables
+# egress whitelist (which needs root/NET_ADMIN) and then drops to the
+# unprivileged admino user via `gosu admino` before exec'ing the app. The
+# application process therefore runs as admino (uid 1000), never as root.
+# Do NOT add `USER admino` here — it would run the entrypoint unprivileged and
+# iptables would fail with an empty effective capability set, aborting startup
+# (or silently skipping enforcement). Privilege drop happens in entrypoint.sh.
 
 EXPOSE 8000
 
