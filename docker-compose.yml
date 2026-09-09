@@ -104,10 +104,11 @@ services:
       # Docker embedded DNS resolver — used by entrypoint.sh to resolve
       # whitelisted hostnames before locking down egress.
       DOCKER_DNS_IP: "127.0.0.11"
-      # The internal Docker bridge CIDR — allow all traffic within this range
-      # so the agent can reach the local LLM backend without going through
-      # the iptables whitelist. Covers Docker's full IPAM pool (172.16.0.0/12).
-      # Override if your Docker daemon uses a custom "bip" or address pool.
+      # The internal Docker CIDR the agent may reach WITHOUT going through the
+      # iptables egress whitelist (so it can talk to postgres and any local LLM
+      # backend). Must COVER the admino-internal subnet, which is pinned to
+      # 172.20.0.0/16 (see networks.internal below). 172.16.0.0/12 covers that
+      # with room to spare; if you change the pinned subnet, keep it in this range.
       INTERNAL_NETWORK: "172.16.0.0/12"
       # Hard-fail if NET_ADMIN is absent and iptables whitelist cannot be applied.
       # Set to "false" ONLY for local development without Docker privileges.
@@ -167,10 +168,20 @@ services:
 #   reach api.anthropic.com, googleapis.com, etc. but nothing else.
 # --------------------------------------------------------------------------
 networks:
+  # Pinned to an explicit subnet INSIDE the egress-allowed range (INTERNAL_NETWORK,
+  # 172.16.0.0/12). Without this, Docker assigns the subnet from the daemon's
+  # default-address-pool — which on Docker Desktop is often 192.168.x, OUTSIDE
+  # 172.16.0.0/12 — so the agent's iptables egress whitelist DROPs traffic to
+  # postgres and the agent hangs ~60s then fails with "Database startup failed".
+  # Pinning makes the internal subnet deterministic on every host. Change it only
+  # if it collides with an existing network; keep it inside INTERNAL_NETWORK.
   internal:
     name: admino-internal
     driver: bridge
     internal: true
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 
   egress:
     name: admino-egress
