@@ -79,3 +79,6 @@ CLAUDE.md
 
 # Static files (built client)
 static
+
+# Local planning/scratch docs (not part of the codebase)
+.plan/
