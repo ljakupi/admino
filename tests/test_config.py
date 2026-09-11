@@ -947,17 +947,12 @@ class TestProviderCleanup:
 
     The anthropic-first default introduced by GH-111/#112 is reversed: 'vllm'
     is now the shipped default and constructing it must NOT raise (it logs a
-    warning and defers to a placeholder client). Ollama stays fully removed.
+    warning and defers to a placeholder client).
     """
 
     def test_default_provider_is_vllm(self) -> None:
         """The shipped LLMConfig.provider default flips from anthropic to vllm."""
         assert LLMConfig.model_fields["provider"].default == "vllm"
-
-    def test_provider_ollama_is_rejected(self) -> None:
-        """'ollama' is no longer a valid provider value."""
-        with pytest.raises(ValidationError):
-            LLMConfig(provider="ollama")
 
     def test_provider_vllm_boots_without_key_or_model(
         self, monkeypatch: pytest.MonkeyPatch
@@ -967,11 +962,3 @@ class TestProviderCleanup:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
         assert config.provider == "vllm"
-
-    def test_no_ollama_url_field(self) -> None:
-        """The ollama_url field is gone from LLMConfig."""
-        assert "ollama_url" not in LLMConfig.model_fields
-
-    def test_no_to_ollama_config_method(self) -> None:
-        """The to_ollama_config helper is gone from LLMConfig."""
-        assert not hasattr(LLMConfig, "to_ollama_config")
