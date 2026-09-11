@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="820" height="220" viewBox="0 0 820 220"
+     role="img" aria-labelledby="title desc">
+  <title id="title">admino logo</title>
+  <desc id="desc">Lowercase admino wordmark in Work Sans SemiBold, dark green, transparent background.</desc>
+  <text x="24" y="164"
+        fill="#0B5D45"
+        font-family="'Work Sans', Futura, 'Trebuchet MS', Arial, sans-serif"
+        font-size="176"
+        font-weight="600"
+        letter-spacing="-5">admino</text>
+</svg>

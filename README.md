@@ -1,140 +1,135 @@
-# admino
+<p align="center">
+  <img src="static-src/public/admino_avatar.png" alt="admino" width="120" height="120">
+</p>
 
-**The AI that works for you, not on you.**
+<p align="center">
+  <img src="static-src/public/admino_logo.svg" alt="admino" height="56">
+</p>
 
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-&nbsp;·&nbsp; **v0.1 (Alpha)**
+<p align="center">
+  <b>The AI that works for you, not on you.</b><br>
+  <sub>A privacy- and security-first personal AI agent you run yourself.</sub>
+</p>
 
-admino is a privacy- and security-first personal AI agent you run yourself. It chats,
-reads your mail, calendar, and files, and can take actions on your behalf — but every
-action is gated by an **isolated permission engine** that the model cannot see,
-influence, or bypass. Nothing happens on your accounts without your say-so.
+<p align="center">
+  <a href="LICENSE"><img alt="License: Apache 2.0" src="https://img.shields.io/badge/License-Apache_2.0-0B5D45.svg"></a>
+  <img alt="Python 3.12+" src="https://img.shields.io/badge/python-3.12%2B-0B5D45.svg?logo=python&logoColor=white">
+  <img alt="Status" src="https://img.shields.io/badge/status-v0.1_alpha-e08e0b.svg">
+  <a href="CONTRIBUTING.md"><img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen.svg"></a>
+</p>
 
-## Screenshots
+<p align="center">
+  <a href="docs/getting-started.md">Getting&nbsp;Started</a> ·
+  <a href="docs/permissions.md">Permissions</a> ·
+  <a href="docs/SECURITY.md">Security&nbsp;Model</a> ·
+  <a href="docs/tools.md">Tools</a> ·
+  <a href="docs/configuration.md">Configuration</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a>
+</p>
 
-| Chat | Settings → Agent |
-| --- | --- |
-| ![Chat](docs/screenshots/chat.png) | ![Settings → Agent](docs/screenshots/settings-agent.png) |
+---
 
-| Permissions | Critical permissions |
-| --- | --- |
-| ![Permissions](docs/screenshots/permissions.png) | ![Critical permissions](docs/screenshots/critical-permissions.png) |
+admino chats with you and can act on your behalf — reading your mail, calendar, and
+files — but **every action it takes is gated by an isolated permission engine the model
+can neither see nor bypass**. Read actions run freely; anything that changes state pauses
+for your approval; a handful of destructive actions are denied outright. You run it on
+your own machine, your data stays with you, and nothing happens on your accounts without
+your say-so.
 
-## What works today
+## ✨ Why admino
 
-A chat PWA at `localhost:8000`: send a message, get a response that can call tools.
-The tools below are implemented and verified end-to-end; write actions ask you to
-confirm first, and a handful of destructive actions are denied by design.
+- 🔐 **Isolated permission engine** — a pure `(tool, action)` function the LLM never sees, can't argue with, and can't route around. Default-deny; writes are never silently auto-allowed. → [Permissions](docs/permissions.md)
+- 🏠 **Runs on your machine** — local-first by design. Your audit log, memory, and documents never leave your computer.
+- 🧯 **Contained blast radius** — the agent container is whitelist-only egress, so even a hijacked agent can't phone home. → [Security Model](docs/SECURITY.md)
+- 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and an append-only audit log of every decision.
+- 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, local files, and memory — all permission-gated. → [Tools](docs/tools.md)
+- 🤖 **Your choice of model** — local-first vLLM (coming soon), with Claude and OpenAI as opt-in providers. → [Configuration](docs/configuration.md)
 
-| Tool | Actions | Notes |
-| --- | --- | --- |
-| **Gmail** | read · list · search | Google OAuth. `send`/`delete` denied by design. |
-| **Google Calendar** | read · list · create | `create` asks to confirm. `update`/`delete` denied. |
-| **Google Drive** | read · list · search · download | `download` asks to confirm. `delete` denied. |
-| **Outlook mail** | read · list · search | Microsoft OAuth. `send`/`delete` denied by design. |
-| **Outlook Calendar** | read · list · create | `create` asks to confirm. `update`/`delete` denied. |
-| **OneDrive** | read · list · search · download | `download` asks to confirm. `delete` denied. |
-| **Files** | read · list · search · write · move | Sandboxed path, no OAuth. `write`/`move` confirm; `overwrite`/`delete` denied. |
-| **Memory** | store · recall · list | Persistent notes in PostgreSQL. `delete` denied. |
+## 📸 Screenshots
 
-The Google and Microsoft tools need an OAuth connection — set one up with
-`oauth_setup.py`. `files` and `memory` work without connecting any account.
+| Chat | An action pausing for your approval |
+| :---: | :---: |
+| ![Chat](docs/screenshots/chat.png) | ![Approval prompt](docs/screenshots/confirm-chat.png) |
 
-**Not yet implemented:** `documents` (document store) and `search` (web search) are
-planned and are **not** in this release — don't expect them to work yet.
+<p align="center"><sub>A <code>confirm</code> action — <code>google_calendar.create</code> — waiting for approval before it runs.</sub></p>
 
-## The permission engine
+## 🚀 Quick start
 
-This is the heart of "works for you, not on you." Every tool call the agent wants to
-make is checked by a small, **isolated pure function** that receives only the
-`(tool, action)` pair — never the conversation, your messages, or the tool arguments.
-The agent cannot see the rules, argue with them, or route around them.
+### Requirements
 
-![A write action pausing for approval](docs/screenshots/confirm-chat.png)
+- **Python 3.12+**
+- **[uv](https://docs.astral.sh/uv/)** — the package & virtualenv manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
+- **Docker** + Docker Compose — runs PostgreSQL (and, optionally, the whole backend)
+- **An LLM provider key to chat today** — an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Local vLLM serving is coming; until it ships, pick a cloud provider to chat.
+- *Optional:* Google / Microsoft OAuth apps to enable the mail, calendar, and drive tools — see [Getting Started → Connect your accounts](docs/getting-started.md#connect-your-accounts).
 
-*A `confirm` action — `google_calendar.create` — pausing for your approval before it runs.*
-
-- **Default-deny.** Anything not explicitly allowed is denied. Each action resolves to
-  one of three states: **allow** (runs immediately), **confirm** (you approve first), or
-  **deny** (blocked).
-- **Writes are never auto-allowed.** State-changing actions can only be `confirm` or
-  `deny` — never `allow`. If config tries to set a write action to `allow`, it is
-  downgraded to `confirm`.
-- **Critical denials are hardcoded** and cannot be overridden by config or by the agent:
-  - **Never** (immutable): every `*.delete` (`files`, `memory`, `google_drive`, both
-    calendars, `onedrive`, `documents`, Gmail, Outlook) plus `files.overwrite`.
-  - **Deny by default, at most promotable to _confirm_**: `gmail.send`, `outlook.send`,
-    and calendar `update`. These stay denied unless you deliberately promote them through
-    the Critical Permissions flow (re-authentication + a 5-minute cooldown) — and even
-    then they only reach `confirm`, never silent `allow`.
-- **Append-only audit log.** Every decision and tool call is written to an append-only
-  NDJSON log on disk.
-
-You can review the full matrix on the **Permissions** page and manage promotable
-critical permissions under **Settings → Danger zone**.
-
-## LLM providers
-
-admino is designed to run fully local, so **vLLM is the default provider** — but local
-vLLM serving isn't implemented yet. On first launch admino boots on vLLM and can't chat
-until you switch to a working provider in **Settings → Agent**:
-
-- **Claude (Anthropic)** — opt-in interim provider; needs `ANTHROPIC_API_KEY` on the server.
-- **OpenAI** — opt-in interim provider; needs `OPENAI_API_KEY` on the server.
-
-In Settings → Agent, vLLM appears marked *local · coming soon*; pick Claude or OpenAI to
-chat right now. Cloud providers send your messages to their servers; everything else —
-audit log, memory, documents — stays on your machine.
-
-## Data & storage
-
-PostgreSQL holds four things: `settings`, `permissions`, `memory` notes, and
-`oauth_tokens`. OAuth tokens are stored as **encrypted ciphertext only** — the
-encryption key lives in the `OAUTH_ENCRYPTION_KEY` environment variable and is never
-persisted to the database. The audit log is **append-only NDJSON on disk**.
-
-## Run it
-
-admino defaults to vLLM, which can't serve yet, so the quickest path to a live chat is to
-switch to Claude after launch. You need **Python 3.12+**, **Docker** (for Postgres), and
-an **Anthropic API key**.
+### Run locally (with uv)
 
 ```bash
-# 1. Install
-pip install -e ".[dev]"
+# 1. Install dependencies — uv builds an isolated .venv from pyproject + uv.lock
+uv sync --extra anthropic          # Claude provider (use --extra openai for OpenAI)
+source .venv/bin/activate
 
-# 2. Configure — copy the sample env and set your Anthropic key
+# 2. Configure — copy the sample env and set your key
 cp .env.example .env
-#    edit .env: set ANTHROPIC_API_KEY=...   (PG_PASSWORD already has a dev default)
+#    edit .env: uncomment ANTHROPIC_API_KEY and paste your key
+#    (PG_PASSWORD is prefilled with the dev default: changeme)
 
-# 3. Start Postgres, then the agent
+# 3. Load .env into your shell — `make run` reads the shell environment, not .env
+set -a; source .env; set +a
+
+# 4. Start PostgreSQL (Docker), then the agent
 make dev-db
 make run
 ```
 
-Open **http://localhost:8000**, then:
+Open **http://localhost:8000**, click **Skip** on the token prompt, open
+**Settings → Agent** and switch the provider to **Claude**, then send a message.
 
-1. Click **Skip** on the token prompt — the default `vpn` auth mode needs no token when
-   the API is bound to localhost.
-2. Open **Settings → Agent** and switch the provider from vLLM to **Claude** (vLLM can't
-   chat yet).
-3. Type a message and press Enter.
-4. The agent responds and may call a tool. Read actions run immediately; write actions
-   ask you to confirm; destructive ones are denied.
+### Run the whole backend in Docker
 
-## Roadmap
+Starts the agent (behind its egress firewall) and PostgreSQL together — Docker reads
+`.env` directly, so no shell export needed:
 
-- **Local vLLM serving** (Gemma / Qwen) as the default provider — run fully local, no
-  cloud calls.
+```bash
+cp .env.example .env               # set ANTHROPIC_API_KEY and change PG_PASSWORD
+make docker-build
+make docker-up                     # → http://localhost:8000
+```
+
+> **New here?** The [Getting Started guide](docs/getting-started.md) walks through
+> configuration, connecting Google/Microsoft accounts, and your first chat in detail.
+
+## 📚 Documentation
+
+| Guide | What's inside |
+| --- | --- |
+| **[Getting Started](docs/getting-started.md)** | Install, configure, run (local & Docker), connect accounts, first chat |
+| **[Permissions](docs/permissions.md)** | The permission engine: allow / confirm / deny, hardcoded denials, promotion flow |
+| **[Tools](docs/tools.md)** | Every tool and action admino ships with today |
+| **[Configuration](docs/configuration.md)** | LLM providers, `config.yaml`, data & storage, auth modes |
+| **[Security Model](docs/SECURITY.md)** | Egress containment, the root→non-root privilege drop, threat model |
+
+## 🗺️ Roadmap
+
+- **Local vLLM serving** (Gemma / Qwen) as the default provider — run fully local, no cloud calls.
 - **Documents** store and **web search** tools.
 - End-to-end SSE streaming and a richer health endpoint.
 
-## Contributing
+_Planned and **not** in this alpha — don't expect them to work yet._
 
-admino is issue-driven: every PR must correspond to an open, approved GitHub issue. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, coding standards, testing gates, and
-security rules.
+## 🤝 Contributing
 
-## License
+admino is **issue-driven** and **test-first**: every PR maps to an approved issue and must
+pass the full quality gate (`make check`, ≥ 90 % coverage). Start with
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
-Licensed under the [Apache License, Version 2.0](LICENSE).
+Found a security issue? Please **don't** open a public issue — report it privately, as
+described in the [Security Model](docs/SECURITY.md#reporting-a-vulnerability).
+
+## 📄 License
+
+Licensed under the [Apache License 2.0](LICENSE). Contributions are covered by the
+[Contributor License Agreement](CLA.md).
+
+<p align="center"><sub>Built with FastAPI · Pydantic · PostgreSQL · Vue 3 — and no agent frameworks.</sub></p>
