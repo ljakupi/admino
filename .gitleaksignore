@@ -1,0 +1,6 @@
+# Known test fixtures, not real secrets. These are fake tokens that exist so the
+# tests can prove admino scrubs credentials from logs and audit entries.
+# Format: commit:file:rule:line (from `gitleaks detect`).
+2763469f7a27f992395c258d76d1561db0df35c7:tests/tools/test_registry.py:github-pat:809
+2763469f7a27f992395c258d76d1561db0df35c7:tests/tools/test_registry.py:generic-api-key:1615
+1cfd5fa9a25737576709ff8a0f9d0361ef9bd3b2:tests/test_audit.py:jwt:723
