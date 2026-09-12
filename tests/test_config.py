@@ -807,12 +807,12 @@ class TestLLMConfigValidation:
         """active_model_name for vllm returns vllm_model, NOT the 'vllm' sentinel.
 
         Issue #134: vllm is now a real provider whose served model is
-        ``vllm_model`` (default mlx-community/gemma-4-12B-it-4bit).
+        ``vllm_model`` (default Qwen/Qwen3-4B-Instruct-2507).
         """
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
-        assert config.active_model_name == "mlx-community/gemma-4-12B-it-4bit"
+        assert config.active_model_name == "Qwen/Qwen3-4B-Instruct-2507"
 
     def test_vllm_boots_without_not_yet_implemented_warning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -831,11 +831,11 @@ class TestLLMConfigValidation:
         assert not any("not implemented" in record.message for record in caplog.records)
 
     def test_vllm_model_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """vllm_model defaults to the shipped MLX Gemma model id."""
+        """vllm_model defaults to the shipped Qwen model id."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
-        assert config.vllm_model == "mlx-community/gemma-4-12B-it-4bit"
+        assert config.vllm_model == "Qwen/Qwen3-4B-Instruct-2507"
 
     def test_vllm_empty_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An explicitly empty vllm_model while provider=vllm fails validation."""
@@ -861,11 +861,11 @@ class TestLLMConfigValidation:
             LLMConfig(provider="vllm", vllm_model="evil; rm -rf /")
 
     def test_vllm_base_url_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """vllm_base_url defaults to the docker-host local endpoint."""
+        """vllm_base_url defaults to the internal Docker vllm service endpoint."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
-        assert config.vllm_base_url == "http://host.docker.internal:8000/v1"
+        assert config.vllm_base_url == "http://vllm:8000/v1"
 
     def test_vllm_base_url_accepts_https(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An https vllm_base_url is accepted."""
@@ -1104,10 +1104,10 @@ class TestProviderCleanup:
         """'vllm' validates with no API key set — vllm_model has a default, so it boots.
 
         Issue #134: no explicit model is required because ``vllm_model`` defaults
-        to the shipped MLX Gemma id; only a cloud API key is unnecessary.
+        to the shipped Qwen id; only a cloud API key is unnecessary.
         """
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
         assert config.provider == "vllm"
-        assert config.vllm_model == "mlx-community/gemma-4-12B-it-4bit"
+        assert config.vllm_model == "Qwen/Qwen3-4B-Instruct-2507"

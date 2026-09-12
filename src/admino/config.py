@@ -107,12 +107,12 @@ class LLMConfig(BaseModel):
     # The served model must be set; its default makes the provider boot without
     # a config edit. base_url points at the local endpoint (no API key needed).
     vllm_model: str | None = Field(
-        default="mlx-community/gemma-4-12B-it-4bit",
+        default="Qwen/Qwen3-4B-Instruct-2507",
         max_length=200,
         description="Served vLLM model ID (required for provider=vllm).",
     )
     vllm_base_url: str = Field(
-        default="http://host.docker.internal:8000/v1",
+        default="http://vllm:8000/v1",
         max_length=2048,
         description="Base URL of the local OpenAI-compatible vLLM endpoint.",
     )
@@ -195,7 +195,7 @@ class LLMConfig(BaseModel):
                 msg = (
                     "llm.provider is 'vllm' but llm.vllm_model is not set. "
                     "Set the served model ID in config.yaml "
-                    "(e.g. mlx-community/gemma-4-12B-it-4bit)."
+                    "(e.g. Qwen/Qwen3-4B-Instruct-2507)."
                 )
                 raise ValueError(msg)
             logger.info(
