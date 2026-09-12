@@ -1,3 +1,5 @@
+// Default request timeout. Fast endpoints (settings, health, session) use this.
+// Agent-loop calls (message/confirm) pass a longer per-call timeout — see messages.ts.
 const TIMEOUT_MS = 30_000;
 
 export class ApiError extends Error {
@@ -67,9 +69,10 @@ function getAuthHeader(): Record<string, string> {
 export async function fetchJson<T>(
   path: string,
   init: RequestInit = {},
+  timeoutMs: number = TIMEOUT_MS,
 ): Promise<T> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const res = await fetch(path, {

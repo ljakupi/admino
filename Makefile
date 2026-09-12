@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start vllm-pull vllm-up vllm-down
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start vllm-ensure vllm-pull vllm-up vllm-down
 
 # Source and package configuration
 SRC_DIR    := src
@@ -9,8 +9,8 @@ PACKAGE    := admino
 # Docker Compose file selection. admino runs an `agent` container plus
 # Postgres. Local vLLM serving runs as a CPU container (`vllm` service,
 # multi-arch, cross-platform) and is activated via the "vllm" profile.
-# Provision the model once with `make vllm-pull`, then use `make start`
-# or `make docker-up` to bring everything up.
+# `make docker-up` (or `make start`) auto-provisions the model weights on the
+# first run, then brings everything up — no separate `make vllm-pull` needed.
 # NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
 # reservation (tracked in issue #132).
 # --------------------------------------------------------------------------
@@ -19,9 +19,19 @@ COMPOSE_FILES := -f docker-compose.yml
 # --------------------------------------------------------------------------
 # Local vLLM container settings
 # --------------------------------------------------------------------------
-VLLM_MODEL         ?= Qwen/Qwen3-4B-Instruct-2507
+# VLLM_MODEL is shared with docker compose via .env, so `make` (which provisions
+# the weights) and the running container never disagree on which model to serve.
+# We read just this one key from .env — compose owns the rest — while a shell/CLI
+# override still wins and the shipped default applies when .env is silent.
+# A/B a different model by editing VLLM_MODEL in .env, then re-running `make docker-up`.
+VLLM_MODEL_ENV     := $(shell sed -n 's/^VLLM_MODEL=//p' .env 2>/dev/null | tail -1 | tr -d '"')
+VLLM_MODEL         ?= $(or $(VLLM_MODEL_ENV),Qwen/Qwen3-4B-Instruct-2507)
 VLLM_MODELS_VOLUME := admino-vllm-models
 VLLM_IMAGE         ?= vllm/vllm-openai-cpu:latest
+# HuggingFace cache directory name for the configured model, e.g.
+# "Qwen/Qwen3-4B-Instruct-2507" -> "models--Qwen--Qwen3-4B-Instruct-2507".
+# Used to detect whether the weights are already provisioned in the volume.
+VLLM_MODEL_CACHE   := models--$(subst /,--,$(VLLM_MODEL))
 
 lint:
 	python -m ruff check $(SRC_DIR)/ $(TESTS_DIR)/
@@ -52,7 +62,11 @@ check: lint format-check typecheck
 docker-build:
 	docker compose $(COMPOSE_FILES) build
 
-docker-up:
+# docker-up: bring up the full stack (postgres + agent + vllm), provisioning the
+# vLLM model weights first if they are not already cached (see vllm-ensure).
+# This is the single command to (re)start everything after a rebuild:
+#   make docker-down && make docker-build && make docker-up
+docker-up: vllm-ensure
 	docker compose $(COMPOSE_FILES) --profile vllm up -d
 
 docker-down:
@@ -81,9 +95,9 @@ clean:
 # a multi-arch image (linux/arm64 + linux/amd64). Docker auto-pulls the
 # correct arch — no host/OS detection required.
 #
-# Workflow:
-#   make vllm-pull   # one-time: download model weights into the Docker volume
-#   make start       # bring up postgres + agent + vllm together
+# Workflow (model weights are auto-provisioned on first `docker-up`/`start`):
+#   make docker-up   # provision model if needed, then bring up postgres+agent+vllm
+#   make vllm-pull   # (optional) pre-download / resume model weights explicitly
 #   make vllm-down   # stop just the vllm service (agent + postgres keep running)
 #
 # Memory note: a 4B FP16 model needs ~8 GB RAM + KV cache. Docker Desktop
@@ -97,29 +111,43 @@ clean:
 # HF_TOKEN is optional — Qwen/Qwen3-4B-Instruct-2507 is a public model.
 # Set HF_TOKEN in the environment only if you switch to a gated model.
 vllm-pull:
-	@echo "Downloading $(VLLM_MODEL) into volume $(VLLM_MODELS_VOLUME) (~8 GB one-time download)..."
+	@echo "Downloading $(VLLM_MODEL) into volume $(VLLM_MODELS_VOLUME) (one-time download; size depends on the model)..."
 	@echo "Note: HF_TOKEN is optional for public models. Set it if your model is gated."
 	docker run --rm \
 		-e HF_HOME=/models \
 		-e HF_TOKEN \
 		-v $(VLLM_MODELS_VOLUME):/models \
-		--entrypoint huggingface-cli \
+		--entrypoint hf \
 		$(VLLM_IMAGE) \
 		download "$(VLLM_MODEL)"
 	@echo "Model download complete: $(VLLM_MODEL)"
 
-# start: one-command startup — provision the model if needed, then bring up all services.
-# Checks whether the volume already exists as a best-effort proxy for "is the model
-# downloaded?". If the volume is missing, runs vllm-pull first.
-# Cross-platform: no host/OS detection, works on Apple Silicon and Linux alike.
-start:
-	@if ! docker volume inspect $(VLLM_MODELS_VOLUME) > /dev/null 2>&1; then \
-		echo "Volume $(VLLM_MODELS_VOLUME) not found — running vllm-pull first..."; \
-		$(MAKE) vllm-pull; \
+# vllm-ensure: guarantee the model weights are present AND complete before serving.
+# The vllm service runs offline (HF_HUB_OFFLINE=1) on the internal-only network,
+# so the weights MUST be fully in the volume or the container crash-loops:
+#   - empty volume             -> LocalEntryNotFoundError
+#   - partial/interrupted pull  -> FileNotFoundError: weight files ... missing
+# We therefore treat the model as cached only when BOTH hold:
+#   1. the snapshot's config.json exists, and
+#   2. there are no `*.incomplete` blobs (hf marks in-flight downloads this way).
+# Checking config.json alone is not enough: it downloads early, so an interrupted
+# pull leaves config.json + only some safetensors shards yet still looks "cached"
+# (this exact case crash-looped the container with missing shards 1 & 2 of 3).
+# The check reuses $(VLLM_IMAGE) (already required to serve), adds no new image
+# dependency, and is offline-safe once the model is fully cached. `vllm-pull` is
+# resumable, so a re-trigger completes a partial download rather than restarting it.
+vllm-ensure:
+	@if docker run --rm -v $(VLLM_MODELS_VOLUME):/models --entrypoint sh $(VLLM_IMAGE) \
+		-c 'ls /models/hub/$(VLLM_MODEL_CACHE)/snapshots/*/config.json >/dev/null 2>&1 && ! find /models/hub/$(VLLM_MODEL_CACHE) -name "*.incomplete" 2>/dev/null | grep -q .' > /dev/null 2>&1; then \
+		echo "vLLM weights for $(VLLM_MODEL) already cached — skipping download."; \
 	else \
-		echo "Volume $(VLLM_MODELS_VOLUME) found — skipping vllm-pull."; \
+		echo "vLLM weights for $(VLLM_MODEL) missing or incomplete — downloading (resumable)..."; \
+		$(MAKE) vllm-pull; \
 	fi
-	docker compose $(COMPOSE_FILES) --profile vllm up -d
+
+# start: alias for docker-up, kept for backwards compatibility / muscle memory.
+# Both provision the model on demand (via vllm-ensure) and bring the whole stack up.
+start: docker-up
 
 # vllm-up: bring up just the vllm service (useful to restart it independently).
 vllm-up:
