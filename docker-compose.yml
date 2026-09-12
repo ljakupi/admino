@@ -198,6 +198,12 @@ services:
     profiles:
       - vllm
     restart: unless-stopped
+    # Run tini as PID 1 so vLLM's multiprocessing workers (EngineCore, Worker
+    # procs) are reaped and SIGTERM is forwarded on shutdown. Without this the
+    # container leaves zombie processes and `docker stop` / `compose down` fail
+    # with "cannot stop container: ... did not receive an exit event", which
+    # otherwise forces a full Docker Desktop restart to clear.
+    init: true
 
     # The vllm-openai-cpu image entrypoint is `python -m vllm.entrypoints.openai.api_server`.
     # Pass model-serving arguments directly.
@@ -210,6 +216,13 @@ services:
       - "float16"
       - "--max-model-len"
       - "${VLLM_MAX_MODEL_LEN:-8192}"
+      # Enable OpenAI-style function calling — the agent sends tool_choice="auto",
+      # which vLLM rejects with HTTP 400 unless BOTH of these are set. The parser
+      # must match the model's tool-call format: "hermes" for Qwen3 / Qwen2.5.
+      # Override VLLM_TOOL_CALL_PARSER for other families (e.g. llama3_json, mistral).
+      - "--enable-auto-tool-choice"
+      - "--tool-call-parser"
+      - "${VLLM_TOOL_CALL_PARSER:-hermes}"
       - "--host"
       - "0.0.0.0"
       - "--port"
@@ -222,9 +235,14 @@ services:
       # The vllm container is on the internal network (no external access anyway),
       # but this ensures a fast fail rather than a silent hang if weights are missing.
       HF_HUB_OFFLINE: "1"
-      # CPU KV-cache space in GB. 4 GB is a reasonable baseline for a 4B model
-      # with 8 K context. Raise if you have headroom; lower if you see OOM errors.
-      VLLM_CPU_KVCACHE_SPACE: "4"
+      # CPU KV-cache space in GB, pre-allocated on top of the model weights.
+      # Budget for the ~16 GB Docker VM (the documented minimum): a 4B model is
+      # ~7.5 GB of weights plus ~1.5 GB torch/compile overhead, leaving only ~3 GB
+      # for the KV cache. The old default of 4 GB did not fit and the engine died
+      # at startup with "Available memory ... less than requested memory for kv".
+      # 2 GB fits and still holds a full 8K-token context for single-user serving.
+      # Raise it (e.g. 4) only after giving Docker Desktop more RAM (~20 GB+).
+      VLLM_CPU_KVCACHE_SPACE: "${VLLM_CPU_KVCACHE_SPACE:-2}"
 
     volumes:
       # HuggingFace model cache, provisioned by `make vllm-pull`.
