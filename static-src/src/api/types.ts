@@ -93,6 +93,8 @@ export interface LLMSettings {
   provider: LLMProviderName;
   anthropic_model: string;
   openai_model: string;
+  vllm_model: string;
+  vllm_available_models: string[];
   anthropic_key_configured: boolean;
   openai_key_configured: boolean;
 }
@@ -147,6 +149,7 @@ export interface LLMSettingsPatch {
   provider?: LLMProviderName;
   anthropic_model?: string;
   openai_model?: string;
+  vllm_model?: string;
 }
 
 export interface ToolsSettings {

@@ -93,6 +93,8 @@ export const useSettingsStore = defineStore('settings', () => {
   const llmProvider = ref<LLMProviderName>('vllm');
   const llmAnthropicModel = ref('');
   const llmOpenAiModel = ref('');
+  const llmVllmModel = ref('');
+  const vllmAvailableModels = ref<string[]>([]);
   const anthropicKeyConfigured = ref(false);
   const openAiKeyConfigured = ref(false);
 
@@ -127,6 +129,8 @@ export const useSettingsStore = defineStore('settings', () => {
     llmProvider.value = data.llm.provider;
     llmAnthropicModel.value = data.llm.anthropic_model;
     llmOpenAiModel.value = data.llm.openai_model;
+    llmVllmModel.value = data.llm.vllm_model;
+    vllmAvailableModels.value = data.llm.vllm_available_models;
     anthropicKeyConfigured.value = data.llm.anthropic_key_configured;
     openAiKeyConfigured.value = data.llm.openai_key_configured;
     theme.value = data.appearance.theme;
@@ -182,6 +186,11 @@ export const useSettingsStore = defineStore('settings', () => {
   async function setOpenAiModel(value: string) {
     llmOpenAiModel.value = value;
     await saveSetting({ llm: { openai_model: value } });
+  }
+
+  async function setVllmModel(value: string) {
+    llmVllmModel.value = value;
+    await saveSetting({ llm: { vllm_model: value } });
   }
 
   async function setNotificationsEnabled(value: boolean) {
@@ -272,6 +281,8 @@ export const useSettingsStore = defineStore('settings', () => {
     llmProvider,
     llmAnthropicModel,
     llmOpenAiModel,
+    llmVllmModel,
+    vllmAvailableModels,
     anthropicKeyConfigured,
     openAiKeyConfigured,
     // Appearance
@@ -292,6 +303,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setProvider,
     setAnthropicModel,
     setOpenAiModel,
+    setVllmModel,
     setNotificationsEnabled,
     connectGoogle,
     connectMicrosoft,

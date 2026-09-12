@@ -1500,11 +1500,14 @@ class SettingsLLM(BaseModel):
     provider: Literal["anthropic", "openai", "vllm"]
     anthropic_model: str = Field(max_length=200)
     openai_model: str = Field(max_length=200)
+    vllm_model: str = Field(default="", max_length=200)
+    # Model IDs the local vLLM endpoint reports as served (empty if unreachable).
+    vllm_available_models: list[str] = Field(default_factory=list)
     # Boolean flags — never expose actual API key values.
     anthropic_key_configured: bool = False
     openai_key_configured: bool = False
 
-    @field_validator("anthropic_model", "openai_model")
+    @field_validator("anthropic_model", "openai_model", "vllm_model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
         """Reject model names containing shell metacharacters or control chars.
@@ -1516,6 +1519,23 @@ class SettingsLLM(BaseModel):
             msg = "Model name contains invalid characters."
             raise ValueError(msg)
         return v
+
+    @field_validator("vllm_available_models")
+    @classmethod
+    def filter_available_models(cls, v: list[str]) -> list[str]:
+        """Drop served-model ids that are not well-formed model names.
+
+        ``vllm_available_models`` is populated from the local vLLM server's
+        ``/v1/models`` response — input from a process outside admino's trust
+        boundary. A rogue or compromised local server (or a MITM on the
+        non-TLS local connection) could return ids with unexpected characters.
+        Keep only ids matching the same allowlist enforced on user-supplied
+        model names, and bound the count, so a malicious server cannot spoof
+        the Settings UI or smuggle characters past downstream sanitisers.
+        """
+        return [m for m in v if isinstance(m, str) and len(m) <= 200 and _MODEL_NAME_RE.match(m)][
+            :64
+        ]
 
 
 class SettingsAppearance(BaseModel):
@@ -1623,8 +1643,9 @@ class SettingsPatchLLM(BaseModel):
     provider: Literal["anthropic", "openai", "vllm"] | None = None
     anthropic_model: str | None = Field(default=None, max_length=200)
     openai_model: str | None = Field(default=None, max_length=200)
+    vllm_model: str | None = Field(default=None, max_length=200)
 
-    @field_validator("anthropic_model", "openai_model", mode="before")
+    @field_validator("anthropic_model", "openai_model", "vllm_model", mode="before")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
         """Reject model names containing shell metacharacters or control chars."""

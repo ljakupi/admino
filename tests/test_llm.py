@@ -29,8 +29,7 @@ from admino.llm import (
 )
 from admino.llm_anthropic import AnthropicClient
 from admino.llm_openai import OpenAIClient
-from admino.llm_vllm import VLLM_GUIDANCE_MESSAGE, VLLMPlaceholderClient
-from admino.models import LLMMessage
+from admino.llm_vllm import VLLMClient
 
 # ---------------------------------------------------------------------------
 # parse_tool_calls
@@ -298,50 +297,16 @@ class TestCreateLLMClient:
         with pytest.raises(ValueError, match="Unknown LLM provider"):
             create_llm_client(forced)
 
-    def test_vllm_provider_builds_placeholder_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """provider='vllm' returns a VLLMPlaceholderClient (no key/model needed)."""
-        from admino.llm_vllm import VLLMPlaceholderClient
+    def test_vllm_provider_builds_vllm_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """provider='vllm' returns a real VLLMClient, constructed with no API key.
 
+        Issue #134 promotes vllm from a placeholder to a first-class client: the
+        factory now builds a ``VLLMClient`` (an OpenAI-compatible wrapper) rather
+        than the removed ``VLLMPlaceholderClient``, and must do so without any
+        ANTHROPIC_API_KEY/OPENAI_API_KEY set.
+        """
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
         client = create_llm_client(config)
-        assert isinstance(client, VLLMPlaceholderClient)
-
-
-# ---------------------------------------------------------------------------
-# VLLMPlaceholderClient (GH-114)
-# ---------------------------------------------------------------------------
-
-
-class TestVLLMPlaceholderClient:
-    """The vLLM placeholder returns a fixed guidance message and touches no network."""
-
-    async def test_chat_returns_guidance_message(self) -> None:
-        """chat() returns the guidance content, no tool calls, done=True."""
-        client = VLLMPlaceholderClient()
-        resp = await client.chat([LLMMessage(role="user", content="hi")])
-        assert resp.content == VLLM_GUIDANCE_MESSAGE
-        assert resp.tool_calls == []
-        assert resp.done is True
-
-    async def test_chat_ignores_tools_and_makes_no_network(self) -> None:
-        """chat() ignores any tools payload and still returns the guidance content.
-
-        No httpx client or network call is involved — the same guidance is
-        returned regardless of the tools passed in.
-        """
-        client = VLLMPlaceholderClient()
-        tools = [
-            {
-                "type": "function",
-                "function": {"name": "x.y", "description": "d", "parameters": {}},
-            }
-        ]
-        resp = await client.chat([LLMMessage(role="user", content="hi")], tools=tools)
-        assert resp.content == VLLM_GUIDANCE_MESSAGE
-
-    async def test_close_is_noop(self) -> None:
-        """close() returns None without raising."""
-        client = VLLMPlaceholderClient()
-        assert await client.close() is None
+        assert isinstance(client, VLLMClient)

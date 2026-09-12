@@ -163,31 +163,99 @@ def _make_pending_confirmation(
 # ---------------------------------------------------------------------------
 
 
+def _set_health_config(
+    *, provider: str = "vllm", model: str = "mlx-community/gemma-4-12B-it-4bit"
+) -> None:
+    """Give server._config real (JSON-serializable) LLM identity fields for /health.
+
+    The default _make_config returns a MagicMock, whose attributes are not
+    JSON-serializable. The /health payload now echoes the active provider and
+    model (issue #134), so these must be concrete strings.
+    """
+    from admino import server
+
+    assert server._config is not None
+    server._config.llm.provider = provider
+    server._config.llm.active_model_name = model
+
+
 class TestHealthCheck:
-    """GET /health — no auth required, returns status ok. Checks database connectivity."""
+    """GET /health — no auth required. Reports DB + active LLM provider/model/reachability."""
 
     pytestmark = pytest.mark.asyncio
 
     async def test_server_health_returns_200_ok(self) -> None:
+        """A healthy DB + reachable LLM returns 200 with status ok."""
         app = _make_app()
-        with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
+        _set_health_config()
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        assert resp.json()["status"] == "ok"
+
+    async def test_server_health_reports_active_provider_and_model(self) -> None:
+        """/health echoes the active provider and model (issue #134)."""
+        app = _make_app()
+        _set_health_config(provider="vllm", model="mlx-community/gemma-4-12B-it-4bit")
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/health")
+        body = resp.json()
+        assert body["provider"] == "vllm"
+        assert body["model"] == "mlx-community/gemma-4-12B-it-4bit"
+
+    async def test_server_health_reports_llm_reachable_true(self) -> None:
+        """llm_reachable is True (bool) when the LLM probe succeeds (issue #134)."""
+        app = _make_app()
+        _set_health_config()
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/health")
+        assert resp.json()["llm_reachable"] is True
+
+    async def test_server_health_reports_llm_reachable_false(self) -> None:
+        """llm_reachable is False when the LLM probe fails, but the DB is up → still 200."""
+        app = _make_app()
+        _set_health_config()
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=False)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["llm_reachable"] is False
 
     async def test_server_health_no_auth_required(self) -> None:
         """Health check must succeed even with token auth enabled and no header."""
         app = _make_app(auth_mode="token")
-        with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
+        _set_health_config()
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
 
     async def test_server_health_returns_503_when_db_unreachable(self) -> None:
-        """Health check returns 503 when check_health() returns False."""
+        """Health check returns 503 when check_health() returns False (unchanged)."""
         app = _make_app()
-        with patch("admino.database.check_health", new=AsyncMock(return_value=False)):
+        _set_health_config()
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=False)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 503
@@ -1085,11 +1153,17 @@ class TestStaticFiles:
         (static_dir / "index.html").write_text("<html>static</html>")
 
         app = _make_app()
-        with patch("admino.database.check_health", new=AsyncMock(return_value=True)):
+        _set_health_config()
+        with (
+            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
+            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
+        ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
-        assert resp.json() == {"status": "ok"}
+        # Route priority is what matters here: the JSON health payload wins over
+        # the static index.html. The full payload shape is asserted in TestHealthCheck.
+        assert resp.json()["status"] == "ok"
 
     async def test_server_api_routes_override_static(self) -> None:
         """/api/message still works even if static mount is present."""

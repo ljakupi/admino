@@ -25,6 +25,7 @@ from admino.models import (
     ConversationAuditEntry,
     LLMMessage,
     PendingConfirmation,
+    SettingsLLM,
     SSEEvent,
     ToolCall,
     ToolCallAuditEntry,
@@ -1334,3 +1335,42 @@ class TestPendingConfirmationExpiresAt:
         naive_dt = datetime(2026, 1, 1, 12, 0, 0)  # no tzinfo
         with pytest.raises(ValidationError):
             _make_pending_confirmation(expires_at=naive_dt)
+
+
+# ---------------------------------------------------------------------------
+# SettingsLLM — vllm_available_models is untrusted (local /v1/models probe)
+# ---------------------------------------------------------------------------
+
+
+class TestSettingsLLMAvailableModels:
+    """vllm_available_models comes from the local vLLM server's /v1/models
+    response — outside admino's trust boundary — so SettingsLLM must filter it
+    to the model-name allowlist and bound its length (security finding M-2)."""
+
+    @staticmethod
+    def _make(available: list[str]) -> SettingsLLM:
+        return SettingsLLM(
+            provider="vllm",
+            anthropic_model="",
+            openai_model="",
+            vllm_model="mlx-community/gemma-4-12B-it-4bit",
+            vllm_available_models=available,
+        )
+
+    def test_valid_model_ids_kept(self) -> None:
+        """Well-formed HF repo ids pass through unchanged."""
+        ids = ["mlx-community/gemma-4-12B-it-4bit", "org/model.name_v2"]
+        assert self._make(ids).vllm_available_models == ids
+
+    def test_ids_with_invalid_chars_dropped(self) -> None:
+        """Ids from a rogue server with spaces, shell metachars, bidi overrides,
+        or over-length are dropped; only allowlisted ids survive."""
+        result = self._make(
+            ["ok/model", "bad id; rm -rf /", "evil‮model", "x" * 201]
+        ).vllm_available_models
+        assert result == ["ok/model"]
+
+    def test_list_length_bounded(self) -> None:
+        """A flood of ids is capped so a malicious server can't bloat the response."""
+        result = self._make([f"org/model{i}" for i in range(100)]).vllm_available_models
+        assert len(result) == 64

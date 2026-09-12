@@ -21,7 +21,7 @@ your Google/Microsoft accounts so admino can use its mail, calendar, and drive t
 | **Python 3.12+** | admino targets the current CPython. |
 | **[uv](https://docs.astral.sh/uv/)** | Package & virtualenv manager. Install: `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
 | **Docker + Docker Compose** | Runs PostgreSQL (local dev) or the whole backend. |
-| **An LLM provider key** | An [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) key. admino defaults to local **vLLM**, which isn't implemented yet, so pick a cloud provider to chat today. |
+| **LLM backend (one of)** | **Local (Apple Silicon, macOS 15+):** install `vllm-metal`, then `make vllm-pull` + `make vllm-up` — no API key needed. **Cloud:** an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) key, set in `.env`. |
 | **Google / Microsoft OAuth apps** *(optional)* | Only needed to enable the mail, calendar, and drive tools. See [Connect your accounts](#connect-your-accounts). |
 
 admino is laptop-first (macOS / Linux). A VPS deployment is possible but out of scope for
@@ -54,13 +54,15 @@ Copy the sample environment file and fill in what you need:
 cp .env.example .env
 ```
 
-At minimum, to chat via a cloud provider:
+Key variables by use case:
 
 | Variable | Needed for | Notes |
 | --- | --- | --- |
+| `PG_PASSWORD` | Always | Prefilled with the dev default `changeme`. Change it for any non-local use. |
+| `HF_TOKEN` | `make vllm-pull` (gated models only) | Optional — only if the model repo is private/gated. Never used at runtime. |
+| `VLLM_MODEL` | Local vLLM (if overriding the default) | Defaults to `mlx-community/gemma-4-12B-it-4bit`. |
 | `ANTHROPIC_API_KEY` | Chatting via Claude | Uncomment and set it. Get one at <https://console.anthropic.com/>. |
 | `OPENAI_API_KEY` | Chatting via OpenAI | Alternative to Anthropic. |
-| `PG_PASSWORD` | PostgreSQL | Prefilled with the dev default `changeme`. Change it for any non-local use. |
 
 To also enable the mail/calendar/drive tools, set the OAuth and encryption variables
 described in [Connect your accounts](#connect-your-accounts). Every variable is documented
@@ -118,8 +120,9 @@ the container at `/app/documents`. Nothing outside that directory is reachable.
 1. Open **http://localhost:8000**.
 2. On the token prompt, click **Skip** — the default `vpn` auth mode needs no token when
    the API is bound to localhost. (See [auth modes](configuration.md#authentication-modes).)
-3. Open **Settings → Agent**. admino boots on **vLLM**, which is marked *local · coming
-   soon* and can't chat yet — switch the provider to **Claude** (or **OpenAI**).
+3. If you ran `make vllm-up`, the local model loads automatically — allow 1-2 minutes,
+   then type a message. If you haven't started vLLM yet, open **Settings → Agent** and
+   switch to **Claude** or **OpenAI** (set the matching API key in `.env` first).
 4. Type a message and press **Enter**.
 5. The agent responds and may call a tool. **Read** actions run immediately; **write**
    actions pause for your approval; **destructive** actions are denied. See
@@ -185,9 +188,10 @@ security rules.
 
 ## Troubleshooting
 
-- **"admino can't chat / asks me to pick a provider."** You're still on the default
-  **vLLM** provider (not implemented yet). Switch to Claude or OpenAI in
-  **Settings → Agent** and make sure the matching API key is set.
+- **"admino replies with 'model unavailable' or 'model starting'."** The local vLLM
+  server isn't running yet. Either run `make vllm-up` (Apple Silicon) and wait 1-2
+  minutes for the 12B model to load, or switch to a cloud provider in **Settings → Agent**
+  and set the matching API key in `.env`.
 - **`PG_PASSWORD environment variable is required but not set`.** For local dev, load
   `.env` into your shell first: `set -a; source .env; set +a`.
 - **A tool says the account isn't connected.** Run `python -m admino.oauth_setup <google|microsoft>`

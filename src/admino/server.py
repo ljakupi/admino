@@ -564,15 +564,83 @@ async def _stream_agent_result(result: AgentResult) -> AsyncIterator[str]:
 
 
 # ---------------------------------------------------------------------------
+# LLM (vLLM) endpoint probes
+# ---------------------------------------------------------------------------
+
+
+async def _get_vllm_available_models() -> list[str]:
+    """Probe the local vLLM endpoint for its served model IDs.
+
+    Only runs when the active provider is ``vllm``. Issues a short-timeout
+    ``GET {vllm_base_url}/models`` and returns the list of model ``id`` strings.
+    On ANY exception (unreachable, still loading, malformed payload) or a
+    non-vllm provider, returns an empty list. Never raises, never logs response
+    bodies.
+
+    Returns:
+        The served model IDs, or ``[]`` when the probe fails or vllm is inactive.
+    """
+    if _config is None or _config.llm.provider != "vllm":
+        return []
+
+    from admino.llm import strip_control_chars
+
+    base_url = _config.llm.vllm_base_url.rstrip("/")
+    url = f"{base_url}/models"
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0),
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            payload = resp.json()
+    except (httpx.HTTPError, ValueError, TypeError):
+        # Unreachable, still loading, non-2xx, or non-JSON body — degrade to [].
+        return []
+
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return []
+    models: list[str] = []
+    for entry in data:
+        if isinstance(entry, dict):
+            model_id = entry.get("id")
+            if isinstance(model_id, str) and model_id:
+                models.append(strip_control_chars(model_id)[:200])
+    return models
+
+
+async def _check_llm_reachable() -> bool:
+    """Return whether the active LLM provider looks reachable.
+
+    For ``vllm`` this is True iff the ``/models`` probe returns a non-empty
+    list within a short timeout. For cloud providers this returns True (API key
+    presence is validated elsewhere). Never raises.
+
+    Returns:
+        True if the provider is reachable (or is a cloud provider), else False.
+    """
+    if _config is None:
+        return False
+    if _config.llm.provider == "vllm":
+        return bool(await _get_vllm_available_models())
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
 
 
-async def health_check() -> dict[str, str]:
+async def health_check() -> dict[str, str | bool]:
     """Health check endpoint. No auth required. Checks database connectivity.
 
+    Reports the active LLM provider/model and whether it is reachable. The DB
+    check still gates the 503; an unreachable LLM does not fail the check (it is
+    reported via ``llm_reachable=False``).
+
     Returns:
-        Simple status dict.
+        A status dict with ``status``, ``provider``, ``model``, ``llm_reachable``.
 
     Raises:
         HTTPException: 503 if the database is unreachable.
@@ -582,7 +650,14 @@ async def health_check() -> dict[str, str]:
     db_ok = await check_health()
     if not db_ok:
         raise HTTPException(status_code=503, detail="Database unreachable")
-    return {"status": "ok"}
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    return {
+        "status": "ok",
+        "provider": _config.llm.provider,
+        "model": _config.llm.active_model_name,
+        "llm_reachable": await _check_llm_reachable(),
+    }
 
 
 async def post_message(
@@ -885,10 +960,15 @@ async def _build_settings_response() -> SettingsResponse:
     # needed — vllm must display as the selected provider, not be masked as
     # anthropic.
     config_provider = _config.llm.provider
+    config_vllm_model = _config.llm.vllm_model
     llm_section = SettingsLLM(
         provider=llm_data.get("provider") or config_provider,
         anthropic_model=llm_data.get("anthropic_model") or _config.llm.anthropic_model or "",
         openai_model=llm_data.get("openai_model") or _config.llm.openai_model or "",
+        vllm_model=llm_data.get("vllm_model")
+        or (config_vllm_model if isinstance(config_vllm_model, str) else "")
+        or "",
+        vllm_available_models=await _get_vllm_available_models(),
         anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
         openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
     )
@@ -1027,7 +1107,7 @@ async def patch_settings(
 
     pool = get_pool()
     current_settings = await load_settings_from_db(pool)
-    provider_changed = False
+    llm_reinit_needed = False
     # The LLMConfig produced by validating the merged patch, captured so the
     # re-init block below reuses it directly instead of re-reading the DB (which,
     # right after update_setting, is the same authoritative value).
@@ -1038,9 +1118,19 @@ async def patch_settings(
         llm_current: dict[str, Any] = dict(current_settings.get("llm", {}))
         patch_fields = body.llm.model_dump(exclude_none=True)
 
-        # Track whether provider changed before merging.
+        # Track whether the running LLM client must be rebuilt. A provider
+        # change always requires it. A changed vllm_model requires it too when
+        # the effective provider is (or becomes) vllm — the served model, and
+        # therefore the client, changed. A no-op (same value) must NOT re-init.
         if "provider" in patch_fields and patch_fields["provider"] != llm_current.get("provider"):
-            provider_changed = True
+            llm_reinit_needed = True
+        effective_provider = patch_fields.get("provider", llm_current.get("provider"))
+        if (
+            "vllm_model" in patch_fields
+            and patch_fields["vllm_model"] != llm_current.get("vllm_model")
+            and effective_provider == "vllm"
+        ):
+            llm_reinit_needed = True
 
         # Merge non-None patch fields into current values.
         for key, value in patch_fields.items():
@@ -1113,8 +1203,8 @@ async def patch_settings(
         if _agent is not None:
             _agent._tools_enabled = validated_tools
 
-    # --- Re-initialise LLM client if provider changed ---
-    if provider_changed and new_llm_config is not None:
+    # --- Re-initialise LLM client if the provider or served vllm_model changed ---
+    if llm_reinit_needed and new_llm_config is not None:
         try:
             new_client = create_llm_client(new_llm_config)
         except (ValueError, ImportError) as exc:
@@ -1134,7 +1224,7 @@ async def patch_settings(
         try:
             await old_client.close()
         except Exception:
-            logger.warning("Failed to close retired LLM client after provider switch")
+            logger.warning("Failed to close retired LLM client after LLM settings change")
         logger.info("LLM client re-initialised for provider: %s", new_llm_config.provider)
 
     return await _build_settings_response()

@@ -242,6 +242,53 @@ class TestEnvVarOverrides:
         assert config.llm.provider == "anthropic"
         assert config.log_level == "WARNING"
 
+    def test_vllm_model_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """VLLM_MODEL env var overrides llm.vllm_model from YAML."""
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            """\
+            llm:
+              provider: "vllm"
+              vllm_model: "org/from-yaml"
+            """,
+        )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.setenv("VLLM_MODEL", "org/from-env")
+        config = load_app_config(yaml_path)
+        assert config.llm.vllm_model == "org/from-env"
+
+    def test_vllm_base_url_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """VLLM_BASE_URL env var overrides llm.vllm_base_url from YAML."""
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            """\
+            llm:
+              provider: "vllm"
+              vllm_base_url: "http://from-yaml:8000/v1"
+            """,
+        )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.setenv("VLLM_BASE_URL", "http://from-env:9000/v1")
+        config = load_app_config(yaml_path)
+        assert config.llm.vllm_base_url == "http://from-env:9000/v1"
+
+    def test_vllm_max_model_len_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """VLLM_MAX_MODEL_LEN env var (string) overrides llm.vllm_max_model_len as int."""
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            """\
+            llm:
+              provider: "vllm"
+              vllm_max_model_len: 8192
+            """,
+        )
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.setenv("VLLM_MAX_MODEL_LEN", "16384")
+        config = load_app_config(yaml_path)
+        assert config.llm.vllm_max_model_len == 16384
+
 
 # ---------------------------------------------------------------------------
 # 4. Invalid YAML
@@ -754,24 +801,121 @@ class TestLLMConfigValidation:
         with pytest.raises(ValueError, match="No model configured"):
             _ = forced.active_model_name
 
-    # -- vLLM default provider (GH-114) --
+    # -- vLLM as a first-class local provider (issue #134) --
 
-    def test_vllm_active_model_name_is_placeholder(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """active_model_name for vllm returns the 'vllm' placeholder, no model needed."""
+    def test_vllm_active_model_name_is_vllm_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """active_model_name for vllm returns vllm_model, NOT the 'vllm' sentinel.
+
+        Issue #134: vllm is now a real provider whose served model is
+        ``vllm_model`` (default mlx-community/gemma-4-12B-it-4bit).
+        """
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
-        assert config.active_model_name == "vllm"
+        assert config.active_model_name == "mlx-community/gemma-4-12B-it-4bit"
 
-    def test_vllm_logs_warning_not_raise(
+    def test_vllm_boots_without_not_yet_implemented_warning(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Constructing a vllm config logs a 'not yet implemented' WARNING (no raise)."""
+        """Constructing a vllm config succeeds and no longer logs 'not yet implemented'.
+
+        Issue #134 removes the placeholder warning: vllm is a working local
+        provider now, so the old "not yet implemented" WARNING must be gone.
+        """
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with caplog.at_level(logging.WARNING):
-            LLMConfig(provider="vllm")
-        assert any("not yet implemented" in record.message for record in caplog.records)
+            config = LLMConfig(provider="vllm")
+        assert config.provider == "vllm"
+        assert not any("not yet implemented" in record.message for record in caplog.records)
+        assert not any("not implemented" in record.message for record in caplog.records)
+
+    def test_vllm_model_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """vllm_model defaults to the shipped MLX Gemma model id."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm")
+        assert config.vllm_model == "mlx-community/gemma-4-12B-it-4bit"
+
+    def test_vllm_empty_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicitly empty vllm_model while provider=vllm fails validation."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="vllm_model"):
+            LLMConfig(provider="vllm", vllm_model="")
+
+    def test_vllm_model_accepts_slashes_and_uppercase(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """vllm_model reuses the model-name validator, which accepts slashes/uppercase."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm", vllm_model="Org/Some-Model_v2:latest")
+        assert config.vllm_model == "Org/Some-Model_v2:latest"
+
+    def test_vllm_model_shell_chars_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """vllm_model with shell metacharacters is rejected by the shared validator."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError, match="invalid characters"):
+            LLMConfig(provider="vllm", vllm_model="evil; rm -rf /")
+
+    def test_vllm_base_url_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """vllm_base_url defaults to the docker-host local endpoint."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm")
+        assert config.vllm_base_url == "http://host.docker.internal:8000/v1"
+
+    def test_vllm_base_url_accepts_https(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An https vllm_base_url is accepted."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm", vllm_base_url="https://gpu.local:8443/v1")
+        assert config.vllm_base_url == "https://gpu.local:8443/v1"
+
+    def test_vllm_base_url_non_url_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A non-URL vllm_base_url raises ValidationError."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError):
+            LLMConfig(provider="vllm", vllm_base_url="not a url")
+
+    def test_vllm_base_url_rejects_control_chars(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A vllm_base_url containing whitespace/control chars is rejected."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError):
+            LLMConfig(provider="vllm", vllm_base_url="http://ok\x00/v1")
+
+    def test_vllm_base_url_rejects_oversized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A vllm_base_url longer than 2048 chars is rejected."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        oversized = "http://example.com/" + "a" * 2048
+        with pytest.raises(ValidationError):
+            LLMConfig(provider="vllm", vllm_base_url=oversized)
+
+    def test_vllm_max_model_len_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """vllm_max_model_len defaults to 32768."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        config = LLMConfig(provider="vllm")
+        assert config.vllm_max_model_len == 32768
+
+    def test_vllm_max_model_len_below_min_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """vllm_max_model_len below 512 raises ValidationError."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError):
+            LLMConfig(provider="vllm", vllm_max_model_len=511)
+
+    def test_vllm_max_model_len_above_max_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """vllm_max_model_len above 262144 raises ValidationError."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with pytest.raises(ValidationError):
+            LLMConfig(provider="vllm", vllm_max_model_len=262145)
 
 
 # ---------------------------------------------------------------------------
@@ -943,22 +1087,27 @@ class TestLoadPermissionsConfigFromDb:
 
 
 class TestProviderCleanup:
-    """GH-114: vLLM is the default provider and boots gracefully.
+    """vLLM is the default provider and boots without any cloud API key.
 
-    The anthropic-first default introduced by GH-111/#112 is reversed: 'vllm'
-    is now the shipped default and constructing it must NOT raise (it logs a
-    warning and defers to a placeholder client).
+    'vllm' is the shipped default. Under issue #134 it is a real local
+    provider: constructing it must NOT require an API key, and its model comes
+    from the ``vllm_model`` default (no explicit model needed to boot).
     """
 
     def test_default_provider_is_vllm(self) -> None:
-        """The shipped LLMConfig.provider default flips from anthropic to vllm."""
+        """The shipped LLMConfig.provider default is vllm."""
         assert LLMConfig.model_fields["provider"].default == "vllm"
 
     def test_provider_vllm_boots_without_key_or_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """'vllm' validates with no API key and no model set — it does NOT raise."""
+        """'vllm' validates with no API key set — vllm_model has a default, so it boots.
+
+        Issue #134: no explicit model is required because ``vllm_model`` defaults
+        to the shipped MLX Gemma id; only a cloud API key is unnecessary.
+        """
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         config = LLMConfig(provider="vllm")
         assert config.provider == "vllm"
+        assert config.vllm_model == "mlx-community/gemma-4-12B-it-4bit"
