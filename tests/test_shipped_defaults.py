@@ -134,9 +134,9 @@ class TestShippedConfigDefaults:
 class TestShippedVLLMDefaults:
     """The committed config.yaml pins the first-class vLLM provider defaults."""
 
-    def test_shipped_vllm_model_is_mlx_gemma(self, shipped_config: AppConfig) -> None:
-        """The shipped vllm_model is the MLX Gemma id."""
-        assert shipped_config.llm.vllm_model == "mlx-community/gemma-4-12B-it-4bit"
+    def test_shipped_vllm_model_is_qwen(self, shipped_config: AppConfig) -> None:
+        """The shipped vllm_model is the Qwen id."""
+        assert shipped_config.llm.vllm_model == "Qwen/Qwen3-4B-Instruct-2507"
 
     def test_shipped_vllm_base_url_is_http_url(self, shipped_config: AppConfig) -> None:
         """The shipped vllm_base_url is a non-empty http(s) URL."""

@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean vllm-pull vllm-up vllm-down
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start vllm-pull vllm-up vllm-down
 
 # Source and package configuration
 SRC_DIR    := src
@@ -6,13 +6,22 @@ TESTS_DIR  := tests
 PACKAGE    := admino
 
 # --------------------------------------------------------------------------
-# Docker Compose file selection. admino runs a single `agent` container plus
-# Postgres. Local vLLM serving on Apple Silicon (Metal) is available via the
-# host-native `vllm-metal` path — see `make vllm-pull` / `make vllm-up`.
-# The agent container reaches the host server at host.docker.internal:8000.
-# In-container NVIDIA/CUDA serving is tracked in issue #132.
+# Docker Compose file selection. admino runs an `agent` container plus
+# Postgres. Local vLLM serving runs as a CPU container (`vllm` service,
+# multi-arch, cross-platform) and is activated via the "vllm" profile.
+# Provision the model once with `make vllm-pull`, then use `make start`
+# or `make docker-up` to bring everything up.
+# NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
+# reservation (tracked in issue #132).
 # --------------------------------------------------------------------------
 COMPOSE_FILES := -f docker-compose.yml
+
+# --------------------------------------------------------------------------
+# Local vLLM container settings
+# --------------------------------------------------------------------------
+VLLM_MODEL         ?= Qwen/Qwen3-4B-Instruct-2507
+VLLM_MODELS_VOLUME := admino-vllm-models
+VLLM_IMAGE         ?= vllm/vllm-openai-cpu:latest
 
 lint:
 	python -m ruff check $(SRC_DIR)/ $(TESTS_DIR)/
@@ -44,10 +53,10 @@ docker-build:
 	docker compose $(COMPOSE_FILES) build
 
 docker-up:
-	docker compose $(COMPOSE_FILES) up -d
+	docker compose $(COMPOSE_FILES) --profile vllm up -d
 
 docker-down:
-	docker compose $(COMPOSE_FILES) down
+	docker compose $(COMPOSE_FILES) --profile vllm down
 
 docker-logs:
 	docker compose $(COMPOSE_FILES) logs -f
@@ -66,86 +75,56 @@ clean:
 	rm -rf .mypy_cache .pytest_cache dist htmlcov .coverage
 
 # --------------------------------------------------------------------------
-# Apple Silicon / macOS local vLLM serving (host-native, Metal GPU)
+# Local vLLM container — CPU-based, cross-platform (Apple Silicon + Linux)
 #
-# These targets manage a host-native vllm-metal process — Docker Desktop
-# cannot pass through the Metal GPU, so vLLM runs directly on the host and
-# the agent container reaches it at host.docker.internal:8000.
+# The vllm service in docker-compose.yml uses vllm/vllm-openai-cpu:latest,
+# a multi-arch image (linux/arm64 + linux/amd64). Docker auto-pulls the
+# correct arch — no host/OS detection required.
 #
-# Requirements: macOS 15 (Sequoia)+, Apple Silicon, arm64 Python 3.12.
-# Install vllm-metal once:
-#   curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-# That creates ~/.venv-vllm-metal. These targets activate it automatically.
+# Workflow:
+#   make vllm-pull   # one-time: download model weights into the Docker volume
+#   make start       # bring up postgres + agent + vllm together
+#   make vllm-down   # stop just the vllm service (agent + postgres keep running)
 #
-# These targets are macOS-only. On Linux, use issue #132 (NVIDIA in-container).
+# Memory note: a 4B FP16 model needs ~8 GB RAM + KV cache. Docker Desktop
+# must have ~12–16 GB allocated (Settings → Resources → Memory).
 # --------------------------------------------------------------------------
 
-# Default model (overridable via VLLM_MODEL env var, matching config.yaml)
-VLLM_MODEL ?= mlx-community/gemma-4-12B-it-4bit
-VLLM_MAX_MODEL_LEN ?= 32768
-VLLM_PID_FILE := .vllm-metal.pid
-VLLM_LOG_FILE := data/logs/vllm-metal.log
-VLLM_VENV := $(HOME)/.venv-vllm-metal
-
-# vllm-pull: download the MLX weights from HuggingFace (one-time, ~6.7 GB).
-# Set HF_TOKEN in the environment if the model repo is gated.
+# vllm-pull: download model weights into the named Docker volume.
+# Uses a temporary container that has internet access (default bridge network).
+# The vllm service itself runs on the internal-only network with HF_HUB_OFFLINE=1,
+# so this is the one step that touches the internet.
+# HF_TOKEN is optional — Qwen/Qwen3-4B-Instruct-2507 is a public model.
+# Set HF_TOKEN in the environment only if you switch to a gated model.
 vllm-pull:
-	@if [ "$$(uname -s)" != "Darwin" ]; then \
-		echo "vllm-pull is for Apple Silicon (macOS) only. See issue #132 for NVIDIA/Linux."; \
-		exit 1; \
-	fi
-	@echo "Downloading $(VLLM_MODEL) (~6.7 GB one-time download)..."
-	@if [ -n "$$HF_TOKEN" ]; then \
-		HF_TOKEN="$$HF_TOKEN" huggingface-cli download $(VLLM_MODEL); \
-	else \
-		huggingface-cli download $(VLLM_MODEL); \
-	fi
+	@echo "Downloading $(VLLM_MODEL) into volume $(VLLM_MODELS_VOLUME) (~8 GB one-time download)..."
+	@echo "Note: HF_TOKEN is optional for public models. Set it if your model is gated."
+	docker run --rm \
+		-e HF_HOME=/models \
+		-e HF_TOKEN \
+		-v $(VLLM_MODELS_VOLUME):/models \
+		--entrypoint huggingface-cli \
+		$(VLLM_IMAGE) \
+		download "$(VLLM_MODEL)"
 	@echo "Model download complete: $(VLLM_MODEL)"
 
-# vllm-up: start the vllm-metal server in the background (OpenAI-compatible, port 8000).
-# Logs go to data/logs/vllm-metal.log; PID stored in .vllm-metal.pid.
-# The 12B model takes a minute or two to load — watch logs with:
-#   tail -f data/logs/vllm-metal.log
-vllm-up:
-	@if [ "$$(uname -s)" != "Darwin" ]; then \
-		echo "vllm-up is for Apple Silicon (macOS) only. See issue #132 for NVIDIA/Linux."; \
-		exit 1; \
-	fi
-	@if [ -f "$(VLLM_PID_FILE)" ] && kill -0 "$$(cat $(VLLM_PID_FILE))" 2>/dev/null; then \
-		echo "vllm-metal is already running (PID $$(cat $(VLLM_PID_FILE)))."; \
-		exit 0; \
-	fi
-	@mkdir -p data/logs
-	@if [ -f "$(VLLM_VENV)/bin/activate" ]; then \
-		. "$(VLLM_VENV)/bin/activate" && \
-		nohup vllm serve $(VLLM_MODEL) \
-			--host 0.0.0.0 \
-			--port 8000 \
-			--max-model-len $(VLLM_MAX_MODEL_LEN) \
-			>> "$(VLLM_LOG_FILE)" 2>&1 & \
-		echo $$! > "$(VLLM_PID_FILE)"; \
+# start: one-command startup — provision the model if needed, then bring up all services.
+# Checks whether the volume already exists as a best-effort proxy for "is the model
+# downloaded?". If the volume is missing, runs vllm-pull first.
+# Cross-platform: no host/OS detection, works on Apple Silicon and Linux alike.
+start:
+	@if ! docker volume inspect $(VLLM_MODELS_VOLUME) > /dev/null 2>&1; then \
+		echo "Volume $(VLLM_MODELS_VOLUME) not found — running vllm-pull first..."; \
+		$(MAKE) vllm-pull; \
 	else \
-		echo "vllm-metal venv not found at $(VLLM_VENV)."; \
-		echo "Install it first: curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash"; \
-		exit 1; \
+		echo "Volume $(VLLM_MODELS_VOLUME) found — skipping vllm-pull."; \
 	fi
-	@echo "vllm-metal started (PID $$(cat $(VLLM_PID_FILE)))"
-	@echo "  Serving: http://localhost:8000/v1  (agent uses host.docker.internal:8000)"
-	@echo "  Model:   $(VLLM_MODEL)"
-	@echo "  Logs:    tail -f $(VLLM_LOG_FILE)"
-	@echo "  Note:    the 12B model takes 1-2 minutes to finish loading before it answers."
+	docker compose $(COMPOSE_FILES) --profile vllm up -d
 
-# vllm-down: stop the background vllm-metal server via the PID file.
-# No-ops cleanly if the server is not running.
+# vllm-up: bring up just the vllm service (useful to restart it independently).
+vllm-up:
+	docker compose $(COMPOSE_FILES) --profile vllm up -d vllm
+
+# vllm-down: stop just the vllm service; leaves postgres and agent running.
 vllm-down:
-	@if [ ! -f "$(VLLM_PID_FILE)" ]; then \
-		echo "vllm-metal is not running (no PID file found)."; \
-		exit 0; \
-	fi
-	@PID=$$(cat "$(VLLM_PID_FILE)"); \
-	if kill -0 "$$PID" 2>/dev/null; then \
-		kill "$$PID" && echo "vllm-metal stopped (PID $$PID)."; \
-	else \
-		echo "vllm-metal was not running (stale PID $$PID)."; \
-	fi; \
-	rm -f "$(VLLM_PID_FILE)"
+	docker compose $(COMPOSE_FILES) stop vllm

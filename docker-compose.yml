@@ -1,28 +1,32 @@
-# admino — Base Compose file (agent only)
+# admino — Base Compose file (agent + postgres + optional local vLLM)
 #
-# This file defines the agent container and the two Docker networks.
-# It does NOT define any LLM backend — admino is provider-agnostic.
+# This file defines the core services: agent, postgres, and the vllm service
+# (opt-in via the "vllm" profile). Networks and volumes are also defined here.
 #
 # Run modes:
 #
-#   1. Local vLLM — Apple Silicon (macOS 15+, Metal) — AVAILABLE
-#      Docker Desktop cannot pass through the Metal GPU, so vLLM runs as a
-#      host-native process (vllm-metal), NOT a container. The agent reaches it
-#      at host.docker.internal:8000 (configured in config.yaml / VLLM_BASE_URL).
-#      Provision and start it before `docker compose up`:
-#        make vllm-pull   # one-time ~6.7 GB download
-#        make vllm-up     # starts the host server (background + pidfile)
-#      Stop with: make vllm-down
-#      Alternative: Docker Model Runner (Docker Desktop 4.62+) — set VLLM_BASE_URL
-#      to http://model-runner.docker.internal/engines/v1 (see .env.example).
-#      In-container NVIDIA/CUDA serving is tracked in issue #132.
+#   1. Local vLLM — CPU container (cross-platform: Apple Silicon + Linux)
+#      The vllm service runs vllm/vllm-openai-cpu:latest, a multi-arch image
+#      (arm64 + amd64). Docker auto-pulls the correct arch. No Metal, no host
+#      process, nothing outside Docker.
+#        make vllm-pull   # one-time ~8 GB model download into the vllm-models volume
+#        make start       # brings up postgres + agent + vllm together
+#      Or individually:
+#        make docker-up   # postgres + agent + vllm (profile vllm activated)
+#        make vllm-up     # bring up just the vllm service
+#        make vllm-down   # stop just the vllm service
+#      Note: Docker Desktop must have ~12–16 GB RAM allocated (default 8 GB is
+#      not enough for a 4B FP16 model). Increase in Docker Desktop → Settings →
+#      Resources → Memory.
+#      NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
+#      reservation (tracked in issue #132).
 #
 #   2. Cloud provider (Anthropic / OpenAI)
 #      No local LLM needed. The agent reaches the provider's API directly via
 #      the egress whitelist. Switch in Settings → Agent (or set LLM_PROVIDER).
 #        docker compose up -d
 #
-# The Makefile wraps these with `make docker-up` — see Makefile.
+# The Makefile wraps these with `make docker-up` / `make start` — see Makefile.
 
 services:
 
@@ -63,10 +67,12 @@ services:
   # agent — Python ASGI app. Serves HTTP on port 8000.
   # External access: whitelist-only egress via iptables.
   #   The agent is connected to BOTH networks:
-  #     - internal: to reach the local LLM backend (when one is overlaid)
+  #     - internal: to reach the vllm service (same internal bridge)
   #     - egress:   for whitelisted external calls (googleapis.com,
   #                 api.anthropic.com, api.openai.com, etc.)
   #   iptables rules in entrypoint.sh enforce the whitelist on the egress interface.
+  #   The internal network (172.20.0.0/16) is always permitted by the INTERNAL_NETWORK
+  #   rule, so the agent reaches the vllm service without any extra egress rules.
   # --------------------------------------------------------------------------
   agent:
     build:
@@ -75,13 +81,6 @@ services:
     image: admino-agent:local
     container_name: admino-agent
     restart: unless-stopped
-
-    # Make host.docker.internal resolve to the host gateway on Linux (Docker
-    # Desktop provides it natively). The default vllm_base_url points here so the
-    # agent can reach the host-native vLLM server; entrypoint.sh adds a matching
-    # best-effort egress-whitelist rule for the resolved IP + configured vLLM port.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
 
     # Least-privilege capabilities. Drop everything, then add back only what the
     # root entrypoint needs before it drops to the unprivileged admino user:
@@ -119,10 +118,10 @@ services:
       # whitelisted hostnames before locking down egress.
       DOCKER_DNS_IP: "127.0.0.11"
       # The internal Docker CIDR the agent may reach WITHOUT going through the
-      # iptables egress whitelist (so it can talk to postgres and any local LLM
-      # backend). Must COVER the admino-internal subnet, which is pinned to
-      # 172.20.0.0/16 (see networks.internal below). 172.16.0.0/12 covers that
-      # with room to spare; if you change the pinned subnet, keep it in this range.
+      # iptables egress whitelist (so it can talk to postgres and the vllm service).
+      # Must COVER the admino-internal subnet, which is pinned to 172.20.0.0/16
+      # (see networks.internal below). 172.16.0.0/12 covers that with room to
+      # spare; if you change the pinned subnet, keep it in this range.
       INTERNAL_NETWORK: "172.16.0.0/12"
       # Hard-fail if NET_ADMIN is absent and iptables whitelist cannot be applied.
       # Set to "false" ONLY for local development without Docker privileges.
@@ -149,7 +148,7 @@ services:
       - "${HOME}/Downloads/admino:/app/documents:rw"
 
     networks:
-      # Internal bridge: communicates with the local LLM backend (if overlaid)
+      # Internal bridge: communicates with postgres and the vllm service
       - internal
       # Egress bridge: external calls, locked down by iptables in entrypoint.sh
       - egress
@@ -169,13 +168,95 @@ services:
       start_period: 20s
       retries: 3
 
+  # --------------------------------------------------------------------------
+  # vllm — Local LLM inference (CPU, cross-platform). Opt-in via profile "vllm".
+  #
+  # Image: vllm/vllm-openai-cpu:latest — multi-arch (linux/amd64 + linux/arm64).
+  # Docker auto-pulls the right arch on Apple Silicon and Linux.
+  # Exposes an OpenAI-compatible API on :8000 (/v1, /health).
+  #
+  # Network: internal ONLY. Zero external network access — Docker's `internal:
+  # true` bridge blocks all outbound routing at the daemon level, regardless of
+  # iptables. The agent reaches it at http://vllm:8000/v1 over the same bridge.
+  #
+  # Model weights: stored in the `vllm-models` named volume (HF cache layout).
+  # Provision once with `make vllm-pull`, then the container serves offline
+  # (HF_HUB_OFFLINE=1). No internet access at serve time.
+  #
+  # Memory: a 4B FP16 model needs ~8 GB of host RAM plus KV cache headroom.
+  # Docker Desktop must have ~12–16 GB allocated (Settings → Resources → Memory).
+  # No hard memory limit is set here — a Docker-enforced cap below ~10 GB would
+  # OOM-kill the container silently. Constrain at the host level instead.
+  #
+  # Activation: `profiles: ["vllm"]` means bare `docker compose up` (cloud mode)
+  # does NOT pull or start this service. The Makefile `docker-up` / `start`
+  # targets pass --profile vllm to opt in.
+  # --------------------------------------------------------------------------
+  vllm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai-cpu:latest}
+    container_name: admino-vllm
+    profiles:
+      - vllm
+    restart: unless-stopped
+
+    # The vllm-openai-cpu image entrypoint is `python -m vllm.entrypoints.openai.api_server`.
+    # Pass model-serving arguments directly.
+    command:
+      - "--model"
+      - "${VLLM_MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
+      - "--served-model-name"
+      - "${VLLM_MODEL:-Qwen/Qwen3-4B-Instruct-2507}"
+      - "--dtype"
+      - "float16"
+      - "--max-model-len"
+      - "${VLLM_MAX_MODEL_LEN:-8192}"
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "8000"
+
+    environment:
+      # HuggingFace cache directory — populated by `make vllm-pull`.
+      HF_HOME: /models
+      # Serve from the local cache only; never attempt internet downloads at runtime.
+      # The vllm container is on the internal network (no external access anyway),
+      # but this ensures a fast fail rather than a silent hang if weights are missing.
+      HF_HUB_OFFLINE: "1"
+      # CPU KV-cache space in GB. 4 GB is a reasonable baseline for a 4B model
+      # with 8 K context. Raise if you have headroom; lower if you see OOM errors.
+      VLLM_CPU_KVCACHE_SPACE: "4"
+
+    volumes:
+      # HuggingFace model cache, provisioned by `make vllm-pull`.
+      # Named volume keeps weights across `down`/`up` cycles.
+      - vllm-models:/models
+
+    # Shared memory — required by PyTorch for multiprocessing data loaders.
+    shm_size: "2g"
+
+    networks:
+      # Internal bridge only — zero external network access.
+      # The agent reaches this service at http://vllm:8000/v1.
+      - internal
+
+    # The healthcheck uses Python (always present in the image) to avoid a
+    # curl dependency. start_period is generous because loading a 4B FP16 model
+    # from disk into memory takes several minutes on first start.
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - "python -c \"import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)\""
+      interval: 30s
+      timeout: 10s
+      start_period: 300s
+      retries: 5
+
 # --------------------------------------------------------------------------
 # Networks
 #
 # `internal` (internal: true): Docker blocks all external routing from this
-#   bridge. Any local LLM backend overlaid from docker-compose.*.yml is
-#   attached ONLY here — guaranteed zero external access regardless of
-#   iptables state.
+#   bridge. The vllm service is attached ONLY here — guaranteed zero external
+#   access regardless of iptables state.
 #
 # `egress`: standard bridge with external routing. Only the agent is attached.
 #   iptables rules in entrypoint.sh enforce the whitelist so the agent can
@@ -207,7 +288,13 @@ networks:
 # `pgdata`: named Docker volume for Postgres data, not a host bind-mount.
 #   Keeps the repo tree free of uid-999-owned files (Linux bind-mount
 #   permissions footgun) and requires no `mkdir` step before first run.
+#
+# `vllm-models`: named Docker volume for the HuggingFace model cache.
+#   Populated once by `make vllm-pull`; survives `down`/`up` cycles.
+#   Reset with `docker volume rm admino-vllm-models` (forces re-download).
 # --------------------------------------------------------------------------
 volumes:
   pgdata:
     name: admino-pgdata
+  vllm-models:
+    name: admino-vllm-models

@@ -12,7 +12,7 @@ admino is configured by two things:
 > are never written to disk in plaintext.
 
 - [LLM providers](#llm-providers)
-- [Local vLLM (Apple Silicon)](#local-vllm-apple-silicon)
+- [Local vLLM (CPU container)](#local-vllm-cpu-container)
 - [`config.yaml` reference](#configyaml-reference)
 - [Authentication modes](#authentication-modes)
 - [Data & storage](#data--storage)
@@ -20,17 +20,18 @@ admino is configured by two things:
 
 ## LLM providers
 
-admino is local-first. **vLLM is the default provider**, served on Apple Silicon (macOS
-15+, Metal) by a host-native process — no cloud calls by default.
+admino is local-first. **vLLM is the default provider**, served as a Docker CPU container
+— cross-platform on Apple Silicon and Linux, no Metal, no host process, nothing outside
+Docker. No cloud calls by default.
 
 | Provider | Status | Needs |
 | --- | --- | --- |
-| **vLLM** | **local · available (Apple Silicon)** (default) | Install `vllm-metal`, then `make vllm-pull` + `make vllm-up`. See below. |
+| **vLLM** | **local · available (CPU container, cross-platform)** (default) | `make vllm-pull` once, then `make start`. See below. |
 | **Claude (Anthropic)** | opt-in cloud | `ANTHROPIC_API_KEY` in the environment. |
 | **OpenAI** | opt-in cloud | `OPENAI_API_KEY` in the environment. |
 
 Cloud providers send your messages to their servers; everything else — audit log, memory,
-documents — stays on your machine. Until the vLLM server is running, admino boots and
+documents — stays on your machine. Until the vLLM container is ready, admino boots and
 replies with a friendly "model unavailable" message rather than crashing.
 
 ![Settings → Agent provider control](screenshots/settings-agent.png)
@@ -45,56 +46,47 @@ replies with a friendly "model unavailable" message rather than crashing.
   stay set so switching needs no model edit. The API key still comes from the environment.
 - Point the OpenAI provider at any OpenAI-compatible server with `OPENAI_BASE_URL`.
 
-## Local vLLM (Apple Silicon)
+## Local vLLM (CPU container)
 
-On Apple Silicon (macOS 15+), vLLM uses the Metal GPU via
-[vllm-metal](https://github.com/vllm-project/vllm-metal). Docker Desktop cannot pass
-through the Metal GPU, so vLLM runs as a **host-native process** — the agent container
-reaches it at `host.docker.internal:8000` (set by `vllm_base_url` in `config.yaml`).
+admino ships `vllm/vllm-openai-cpu:latest` — a **multi-arch** image (`linux/arm64` +
+`linux/amd64`). Docker auto-pulls the right variant on Apple Silicon and x86-64 Linux.
+The container exposes an OpenAI-compatible API on port 8000 and is attached to the
+`internal` Docker bridge only — **zero external network access** at runtime.
 
-**Default model:** `mlx-community/gemma-4-12B-it-4bit` — Gemma 4 12B instruction-tuned,
-MLX 4-bit quantised (~6.7 GB, fits 24 GB unified memory, 32 K context). Linux + NVIDIA
-in-container serving is tracked in [#132](https://github.com/ljakupi/admino/issues/132).
+**Default model:** `Qwen/Qwen3-4B-Instruct-2507` — a small, strong tool-caller (~8 GB
+FP16). NVIDIA GPU serving is tracked in
+[#132](https://github.com/ljakupi/admino/issues/132) (swap the CPU image → CUDA image +
+add a GPU reservation).
 
-### Setup (one-time)
+**Trade-offs to be aware of:**
 
-```bash
-# Install vllm-metal — creates ~/.venv-vllm-metal
-curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-```
+- CPU inference is slow: expect a few tokens per second. `Qwen/Qwen3-1.7B-Instruct-2507`
+  is snappier if throughput matters.
+- Docker Desktop must have **~12–16 GB RAM allocated** (Settings → Resources → Memory).
+  The default 8 GB is not enough for a 4B FP16 model.
+- FP16 only (no 4-bit quant in the CPU image).
 
 ### Daily workflow
 
 ```bash
-make vllm-pull   # download the model weights (~6.7 GB, one-time per model)
+make vllm-pull   # one-time: download model weights (~8 GB) into the Docker volume
                  # Set HF_TOKEN in the environment first if the model repo is gated.
-make vllm-up     # start the server (background + pidfile)
-                 # Logs: tail -f data/logs/vllm-metal.log
-                 # Takes 1-2 minutes for the 12B model to fully load.
-make vllm-down   # stop the server
+make start       # provision + bring up postgres + agent + vllm together
+make vllm-down   # stop just the vllm container (agent + postgres keep running)
 ```
+
+`make start` is the one-command path: it checks for the volume first and skips the
+download if the model is already provisioned.
 
 ### Override the model or endpoint
 
 | Variable | Default (from `config.yaml`) | Notes |
 | --- | --- | --- |
-| `VLLM_MODEL` | `mlx-community/gemma-4-12B-it-4bit` | Any HuggingFace MLX model ID. `vllm-pull` and `vllm-up` both honor this. |
-| `VLLM_BASE_URL` | `http://host.docker.internal:8000/v1` | Change to `http://model-runner.docker.internal/engines/v1` for Docker Model Runner. |
-| `VLLM_MAX_MODEL_LEN` | `32768` | Maximum sequence length in tokens. |
-| `HF_TOKEN` | *(unset)* | Only for `make vllm-pull` when the model repo is gated. Never used at runtime. |
-
-### Docker Model Runner alternative
-
-Docker Desktop 4.62+ ships a built-in vLLM backend:
-
-```bash
-docker model install-runner --backend vllm
-docker model pull mlx-community/gemma-4-12B-it-4bit
-docker model run mlx-community/gemma-4-12B-it-4bit
-```
-
-Then set `VLLM_BASE_URL=http://model-runner.docker.internal/engines/v1` in `.env` (or as
-an environment variable). No `make vllm-up` needed — Docker manages the lifecycle.
+| `VLLM_MODEL` | `Qwen/Qwen3-4B-Instruct-2507` | Any HuggingFace model the CPU image supports. `vllm-pull` and the vllm container both honor this. |
+| `VLLM_BASE_URL` | `http://vllm:8000/v1` | The agent reaches the vllm service over the internal Docker bridge. Only change this if you run vllm outside of docker-compose. |
+| `VLLM_MAX_MODEL_LEN` | `8192` | Maximum sequence length in tokens. Raise for longer context if you have enough RAM. |
+| `VLLM_IMAGE` | `vllm/vllm-openai-cpu:latest` | Swap for the CUDA image to use NVIDIA GPU serving (see issue #132). |
+| `HF_TOKEN` | *(unset)* | Only for `make vllm-pull` when the model repo is gated. Never read at serve time. |
 
 ## `config.yaml` reference
 

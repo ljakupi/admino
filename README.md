@@ -43,7 +43,7 @@ your say-so.
 - 🧯 **Contained blast radius** — the agent container is whitelist-only egress, so even a hijacked agent can't phone home. → [Security Model](docs/SECURITY.md)
 - 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and an append-only audit log of every decision.
 - 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, local files, and memory — all permission-gated. → [Tools](docs/tools.md)
-- 🤖 **Your choice of model** — local-first vLLM on Apple Silicon (Metal, available now), with Claude and OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
+- 🤖 **Your choice of model** — local-first vLLM as a cross-platform CPU container (Apple Silicon + Linux, no Metal, no host process), with Claude and OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
 
 ## 📸 Screenshots
 
@@ -59,8 +59,8 @@ your say-so.
 
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — the package & virtualenv manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- **Docker** + Docker Compose — runs PostgreSQL (and, optionally, the whole backend)
-- **For local inference (Apple Silicon, macOS 15+):** run `make vllm-pull && make vllm-up` to download the default model (~6.7 GB) and start the host server — then `make docker-up` and you're chatting with no cloud calls. See [Configuration → Local vLLM](docs/configuration.md#local-vllm-apple-silicon).
+- **Docker** + Docker Compose — runs PostgreSQL and the vLLM container (and the whole backend, optionally)
+- **For local inference (any platform):** run `make vllm-pull` to download the default model (~8 GB, one-time) then `make start` — admino spins up postgres, agent, and the vLLM CPU container together, with no cloud calls. See [Configuration → Local vLLM](docs/configuration.md#local-vllm-cpu-container). Docker Desktop needs ~12–16 GB RAM allocated.
 - **For cloud providers:** an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Set it in `.env`, switch the provider in Settings → Agent, and start the backend — no local model required.
 - *Optional:* Google / Microsoft OAuth apps to enable the mail, calendar, and drive tools — see [Getting Started → Connect your accounts](docs/getting-started.md#connect-your-accounts).
 
@@ -84,32 +84,33 @@ make run
 ```
 
 Open **http://localhost:8000** and click **Skip** on the token prompt. If you started
-the vLLM server (see below), you're ready to chat. Otherwise open **Settings → Agent**
-and switch to **Claude** or **OpenAI** (set the matching API key in `.env` first).
+the vLLM container (see below), you're ready to chat once it loads. Otherwise open
+**Settings → Agent** and switch to **Claude** or **OpenAI** (set the matching API key
+in `.env` first).
 
-### Local vLLM serving — Apple Silicon (macOS 15+, Metal)
+### Local vLLM serving — CPU container (cross-platform)
 
-admino's local-first default is **Gemma 4 12B instruction-tuned, MLX 4-bit**
-(`mlx-community/gemma-4-12B-it-4bit`, ~6.7 GB). It runs as a host-native process via
-[vllm-metal](https://github.com/vllm-project/vllm-metal) (Docker cannot pass through
-the Metal GPU). Install vllm-metal once, then:
+admino's local-first default is **Qwen3 4B Instruct** (`Qwen/Qwen3-4B-Instruct-2507`).
+It runs as a Docker CPU container — cross-platform on Apple Silicon and Linux, nothing
+outside Docker, no Metal, no host process.
 
 ```bash
-make vllm-pull   # one-time download (~6.7 GB) — set HF_TOKEN if using a gated model
-make vllm-up     # start the server on :8000 in the background
-# Model takes 1-2 minutes to finish loading — tail -f data/logs/vllm-metal.log
-make vllm-down   # stop the server when done
+make vllm-pull   # one-time download (~8 GB) into a Docker volume — set HF_TOKEN if using a gated model
+make start       # brings up postgres + agent + vllm together
+make vllm-down   # stop just the vllm container when done
 ```
 
-The agent container reaches the server at `host.docker.internal:8000` (configured in
-`config.yaml`). Until the server is up, admino boots and replies with a friendly
+The agent reaches the vllm container at `http://vllm:8000/v1` over the shared internal
+Docker bridge. Until the container is ready, admino boots and replies with a friendly
 "model unavailable" message rather than crashing.
 
-**Alternative — Docker Model Runner** (Docker Desktop 4.62+):
-`docker model install-runner --backend vllm && docker model pull mlx-community/gemma-4-12B-it-4bit`
-then set `VLLM_BASE_URL=http://model-runner.docker.internal/engines/v1` in `.env`.
+**Trade-offs:** CPU inference is slow (a few tokens/sec); a smaller model like
+`Qwen/Qwen3-1.7B-Instruct-2507` is snappier. Docker Desktop needs **~12–16 GB RAM**
+allocated (Settings → Resources → Memory) — the default 8 GB is not enough for a 4B
+FP16 model. FP16 only (no 4-bit quant in the CPU image).
 
-Linux + NVIDIA in-container serving is tracked in **[#132](https://github.com/ljakupi/admino/issues/132)**.
+NVIDIA GPU serving is tracked in **[#132](https://github.com/ljakupi/admino/issues/132)**
+(swap the CPU image for the CUDA image + add a GPU reservation).
 
 ### Run the whole backend in Docker
 
@@ -118,9 +119,9 @@ Starts the agent (behind its egress firewall) and PostgreSQL together — Docker
 
 ```bash
 cp .env.example .env               # change PG_PASSWORD; set API key if using cloud
-make vllm-pull && make vllm-up     # Apple Silicon only — skip if using a cloud provider
+make vllm-pull                     # one-time model download — skip if using a cloud provider
 make docker-build
-make docker-up                     # → http://localhost:8000
+make docker-up                     # → http://localhost:8000 (includes vllm container)
 ```
 
 > **New here?** The [Getting Started guide](docs/getting-started.md) walks through
@@ -138,7 +139,7 @@ make docker-up                     # → http://localhost:8000
 
 ## 🗺️ Roadmap
 
-- **Local vLLM serving — Linux/NVIDIA** (in-container) — tracked in [#132](https://github.com/ljakupi/admino/issues/132). Apple Silicon (Metal) is available now.
+- **Local vLLM serving — NVIDIA GPU** (in-container CUDA) — tracked in [#132](https://github.com/ljakupi/admino/issues/132). CPU inference (cross-platform) is available now.
 - **Documents** store and **web search** tools.
 - End-to-end SSE streaming and a richer health endpoint.
 
