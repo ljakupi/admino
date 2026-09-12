@@ -47,7 +47,7 @@ const NAV = [
 
 // --- LLM / Agent section ---
 const providers: { value: LLMProvider; label: string; badge?: string }[] = [
-  { value: 'vllm', label: 'vLLM', badge: 'local · coming soon' },
+  { value: 'vllm', label: 'vLLM' },
   { value: 'claude', label: 'Claude' },
   { value: 'openai', label: 'OpenAI' },
 ];
@@ -153,6 +153,24 @@ const currentProvider = computed(() => settings.llmProvider);
 const anthropicConfigured = computed(() => settings.anthropicKeyConfigured);
 const openAiConfigured = computed(() => settings.openAiKeyConfigured);
 
+// vLLM: the dropdown options are the union of live served models + the configured
+// model (so it stays visible even when the server is unreachable and the list is []).
+const vllmModelOptions = computed<string[]>(() => {
+  const available = settings.vllmAvailableModels;
+  const configured = settings.llmVllmModel;
+  if (configured && !available.includes(configured)) {
+    return [configured, ...available];
+  }
+  return available;
+});
+
+async function onVllmModelChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (!value) return;
+  if (value === settings.llmVllmModel) return;
+  await settings.setVllmModel(value);
+}
+
 </script>
 
 <template>
@@ -237,14 +255,14 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
         <template v-if="activeSection === 'agent'">
           <div class="section-head">
             <h2 class="section-title">Agent</h2>
-            <p class="section-sub">Which LLM admino talks to. Cloud providers today; local vLLM serving is coming soon.</p>
+            <p class="section-sub">Which LLM admino talks to. Local vLLM (Apple Silicon) or a cloud provider.</p>
           </div>
           <div class="s-card">
             <!-- Provider segmented control -->
             <div class="s-row">
               <div class="row-label">
                 Provider
-                <span class="row-hint">Claude and OpenAI send your messages to their servers. Local vLLM serving is coming soon.</span>
+                <span class="row-hint">Claude and OpenAI send your messages to their servers. vLLM runs entirely on this machine.</span>
                 <span v-if="!openAiConfigured" class="row-hint">
                   OpenAI needs <code class="inline-code">OPENAI_API_KEY</code> set on the server to enable it.
                 </span>
@@ -306,7 +324,23 @@ const openAiConfigured = computed(() => settings.openAiKeyConfigured);
                 </span>
               </template>
               <template v-else-if="currentProvider === 'vllm'">
-                <span class="row-hint">Local vLLM serving is coming soon. Select Claude or OpenAI above to chat now.</span>
+                <select
+                  class="s-input"
+                  :value="settings.llmVllmModel"
+                  @change="onVllmModelChange"
+                >
+                  <option
+                    v-for="model in vllmModelOptions"
+                    :key="model"
+                    :value="model"
+                  >{{ model }}</option>
+                </select>
+                <span v-if="settings.vllmAvailableModels.length === 0" class="row-hint">
+                  No served model detected — start the local vLLM server (<code class="inline-code">make vllm-up</code>) to load Gemma 4 12B.
+                </span>
+                <span class="row-hint model-hint">
+                  The HuggingFace repo id of the model served locally on Apple Silicon (Metal).
+                </span>
               </template>
             </div>
 

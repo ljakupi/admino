@@ -43,7 +43,7 @@ your say-so.
 - 🧯 **Contained blast radius** — the agent container is whitelist-only egress, so even a hijacked agent can't phone home. → [Security Model](docs/SECURITY.md)
 - 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and an append-only audit log of every decision.
 - 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, local files, and memory — all permission-gated. → [Tools](docs/tools.md)
-- 🤖 **Your choice of model** — local-first vLLM (coming soon), with Claude and OpenAI as opt-in providers. → [Configuration](docs/configuration.md)
+- 🤖 **Your choice of model** — local-first vLLM on Apple Silicon (Metal, available now), with Claude and OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
 
 ## 📸 Screenshots
 
@@ -60,20 +60,20 @@ your say-so.
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — the package & virtualenv manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - **Docker** + Docker Compose — runs PostgreSQL (and, optionally, the whole backend)
-- **An LLM provider key to chat today** — an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Local vLLM serving is coming; until it ships, pick a cloud provider to chat.
+- **For local inference (Apple Silicon, macOS 15+):** run `make vllm-pull && make vllm-up` to download the default model (~6.7 GB) and start the host server — then `make docker-up` and you're chatting with no cloud calls. See [Configuration → Local vLLM](docs/configuration.md#local-vllm-apple-silicon).
+- **For cloud providers:** an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Set it in `.env`, switch the provider in Settings → Agent, and start the backend — no local model required.
 - *Optional:* Google / Microsoft OAuth apps to enable the mail, calendar, and drive tools — see [Getting Started → Connect your accounts](docs/getting-started.md#connect-your-accounts).
 
 ### Run locally (with uv)
 
 ```bash
 # 1. Install dependencies — uv builds an isolated .venv from pyproject + uv.lock
-uv sync --extra anthropic          # Claude provider (use --extra openai for OpenAI)
+uv sync --extra dev          # all providers + dev tooling
 source .venv/bin/activate
 
-# 2. Configure — copy the sample env and set your key
+# 2. Configure — copy the sample env
 cp .env.example .env
-#    edit .env: uncomment ANTHROPIC_API_KEY and paste your key
-#    (PG_PASSWORD is prefilled with the dev default: changeme)
+#    PG_PASSWORD is prefilled with the dev default: changeme
 
 # 3. Load .env into your shell — `make run` reads the shell environment, not .env
 set -a; source .env; set +a
@@ -83,8 +83,33 @@ make dev-db
 make run
 ```
 
-Open **http://localhost:8000**, click **Skip** on the token prompt, open
-**Settings → Agent** and switch the provider to **Claude**, then send a message.
+Open **http://localhost:8000** and click **Skip** on the token prompt. If you started
+the vLLM server (see below), you're ready to chat. Otherwise open **Settings → Agent**
+and switch to **Claude** or **OpenAI** (set the matching API key in `.env` first).
+
+### Local vLLM serving — Apple Silicon (macOS 15+, Metal)
+
+admino's local-first default is **Gemma 4 12B instruction-tuned, MLX 4-bit**
+(`mlx-community/gemma-4-12B-it-4bit`, ~6.7 GB). It runs as a host-native process via
+[vllm-metal](https://github.com/vllm-project/vllm-metal) (Docker cannot pass through
+the Metal GPU). Install vllm-metal once, then:
+
+```bash
+make vllm-pull   # one-time download (~6.7 GB) — set HF_TOKEN if using a gated model
+make vllm-up     # start the server on :8000 in the background
+# Model takes 1-2 minutes to finish loading — tail -f data/logs/vllm-metal.log
+make vllm-down   # stop the server when done
+```
+
+The agent container reaches the server at `host.docker.internal:8000` (configured in
+`config.yaml`). Until the server is up, admino boots and replies with a friendly
+"model unavailable" message rather than crashing.
+
+**Alternative — Docker Model Runner** (Docker Desktop 4.62+):
+`docker model install-runner --backend vllm && docker model pull mlx-community/gemma-4-12B-it-4bit`
+then set `VLLM_BASE_URL=http://model-runner.docker.internal/engines/v1` in `.env`.
+
+Linux + NVIDIA in-container serving is tracked in **[#132](https://github.com/ljakupi/admino/issues/132)**.
 
 ### Run the whole backend in Docker
 
@@ -92,7 +117,8 @@ Starts the agent (behind its egress firewall) and PostgreSQL together — Docker
 `.env` directly, so no shell export needed:
 
 ```bash
-cp .env.example .env               # set ANTHROPIC_API_KEY and change PG_PASSWORD
+cp .env.example .env               # change PG_PASSWORD; set API key if using cloud
+make vllm-pull && make vllm-up     # Apple Silicon only — skip if using a cloud provider
 make docker-build
 make docker-up                     # → http://localhost:8000
 ```
@@ -112,7 +138,7 @@ make docker-up                     # → http://localhost:8000
 
 ## 🗺️ Roadmap
 
-- **Local vLLM serving** (Gemma / Qwen) as the default provider — run fully local, no cloud calls.
+- **Local vLLM serving — Linux/NVIDIA** (in-container) — tracked in [#132](https://github.com/ljakupi/admino/issues/132). Apple Silicon (Metal) is available now.
 - **Documents** store and **web search** tools.
 - End-to-end SSE streaming and a richer health endpoint.
 

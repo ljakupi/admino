@@ -71,6 +71,37 @@ print(" ".join(hosts))
 ' "${CONFIG_FILE}"
 }
 
+# Read the local vLLM endpoint as "HOST PORT" from config.yaml, honoring the
+# LLM_PROVIDER / VLLM_BASE_URL env overrides. Prints nothing unless the active
+# provider is vllm and a host is present. Best-effort by design: callers guard
+# with `|| true` and this never aborts startup (unlike read_allowed_hosts,
+# which fails closed because a missing egress list is a hard misconfiguration).
+read_vllm_endpoint() {
+    python -c '
+import os
+import sys
+import yaml
+from urllib.parse import urlparse
+
+try:
+    with open(sys.argv[1]) as f:
+        config = yaml.safe_load(f) or {}
+except Exception:
+    config = {}
+llm = config.get("llm") or {}
+provider = os.environ.get("LLM_PROVIDER") or llm.get("provider") or "vllm"
+if provider != "vllm":
+    sys.exit(0)
+base = os.environ.get("VLLM_BASE_URL") or llm.get("vllm_base_url") or ""
+parsed = urlparse(base)
+host = parsed.hostname
+if not host:
+    sys.exit(0)
+port = parsed.port or (443 if parsed.scheme == "https" else 80)
+print(host, port)
+' "${CONFIG_FILE}"
+}
+
 # Lock down IPv6 egress entirely (defense-in-depth). admino reaches every
 # whitelisted host over IPv4, and Docker disables IPv6 on the default bridge,
 # so IPv6 egress is never needed. Blocking it fail-closed prevents a silent
@@ -174,6 +205,35 @@ apply_iptables() {
 
     # Allow all traffic on the internal Docker bridge network (local LLM backend access)
     iptables -A OUTPUT -d "${INTERNAL_NETWORK}" -j ACCEPT
+
+    # Allow egress to the local vLLM server when vllm is the active provider.
+    # On Apple Silicon vLLM runs as a HOST-NATIVE process (Docker Desktop cannot
+    # pass through Metal), reached via host.docker.internal — whose IP
+    # (e.g. 192.168.65.254 on Docker Desktop) is OUTSIDE INTERNAL_NETWORK, so the
+    # DROP policy would otherwise block it. The target is the operator's own
+    # machine on the single configured vLLM port — a deliberate, minimal, LOCAL
+    # exception, far narrower than the port-53-anywhere DNS rule above; it never
+    # widens internet access. Best-effort and fail-open-to-unreachable: if the
+    # host does not resolve (no extra_hosts mapping, or a native `make run`
+    # setup), the rule is skipped and the agent simply reports the model
+    # unavailable — never a hard boot failure.
+    VLLM_ENDPOINT="$(read_vllm_endpoint 2>/dev/null || true)"
+    if [ -n "${VLLM_ENDPOINT}" ]; then
+        vllm_host="${VLLM_ENDPOINT%% *}"
+        vllm_port="${VLLM_ENDPOINT##* }"
+        if printf '%s' "${vllm_port}" | grep -qE '^[0-9]{1,5}$'; then
+            vllm_ips="$(getent ahostsv4 "${vllm_host}" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+            if [ -n "${vllm_ips}" ]; then
+                for ip in ${vllm_ips}; do
+                    if iptables -A OUTPUT -d "${ip}" -p tcp --dport "${vllm_port}" -j ACCEPT 2>/dev/null; then
+                        echo "[entrypoint] Whitelisting local vLLM egress to: ${vllm_host} (${ip}:${vllm_port})"
+                    fi
+                done
+            else
+                echo "[entrypoint] NOTE: local vLLM host '${vllm_host}' did not resolve — the agent will report the model unavailable until it is reachable (run 'make vllm-up', set VLLM_BASE_URL, or use 'make run' natively)."
+            fi
+        fi
+    fi
 
     # Allow egress to whitelisted external hosts (HTTPS only, port 443).
     # The list is read from config.yaml egress.allowed_hosts (see

@@ -38,6 +38,7 @@ _DEFAULT_DB_SETTINGS: dict[str, Any] = {
         "provider": "anthropic",
         "anthropic_model": "claude-sonnet-4-6",
         "openai_model": "gpt-4o",
+        "vllm_model": "mlx-community/gemma-4-12B-it-4bit",
     },
     "appearance": {"theme": "light"},
     "notifications": {"enabled": True},
@@ -194,6 +195,58 @@ class TestGetSettings:
 
         assert resp.status_code == 200
         assert resp.json()["llm"]["provider"] == "vllm"
+
+    async def test_get_settings_includes_vllm_model(self) -> None:
+        """GET LLM payload surfaces vllm_model from config/db (issue #134)."""
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch(
+                "admino.server._get_vllm_available_models",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["vllm_model"] == "mlx-community/gemma-4-12B-it-4bit"
+
+    async def test_get_settings_surfaces_vllm_available_models(self) -> None:
+        """vllm_available_models reflects what the probe helper returns (issue #134)."""
+        app = _make_app()
+        probed = ["mlx-community/gemma-4-12B-it-4bit", "org/other-model"]
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch(
+                "admino.server._get_vllm_available_models",
+                AsyncMock(return_value=probed),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["vllm_available_models"] == probed
+
+    async def test_get_settings_vllm_available_models_degrades_to_empty(self) -> None:
+        """When the probe helper returns [] (unreachable), the list is empty, not an error."""
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch(
+                "admino.server._get_vllm_available_models",
+                AsyncMock(return_value=[]),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["vllm_available_models"] == []
 
     async def test_get_settings_masks_api_keys_when_not_set(self) -> None:
         """API key fields are boolean flags, not actual values. False when unset."""
@@ -357,6 +410,119 @@ class TestPatchSettings:
         llm_calls = [c for c in mock_update.call_args_list if c[0][1] == "llm"]
         assert len(llm_calls) == 1
         assert llm_calls[0][0][2]["provider"] == "vllm"
+
+    async def test_patch_settings_vllm_model_change_reinits_client(self) -> None:
+        """Changing vllm_model while provider is vllm re-inits the LLM client (issue #134).
+
+        The provider-change re-init path is extended: a vllm_model change (with
+        provider already vllm) must also rebuild the agent's LLM client.
+        """
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+
+        # DB is already on vllm with the shipped model; the patch changes only
+        # vllm_model (provider stays vllm) → must re-init.
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "vllm",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+            "vllm_model": "mlx-community/gemma-4-12B-it-4bit",
+        }
+        mock_load = _mock_load_settings(db_settings)
+        new_client = MagicMock()
+        new_client.close = AsyncMock()
+        mock_create_llm = MagicMock(return_value=new_client)
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", AsyncMock()),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch("admino.server._get_vllm_available_models", AsyncMock(return_value=[])),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"vllm_model": "org/new-served-model"}},
+                )
+
+        assert resp.status_code == 200
+        mock_create_llm.assert_called_once()
+        assert agent._llm is new_client
+
+    async def test_patch_settings_vllm_model_persisted(self) -> None:
+        """PATCH llm.vllm_model persists the new value under the 'llm' section."""
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "vllm",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+            "vllm_model": "mlx-community/gemma-4-12B-it-4bit",
+        }
+        mock_load = _mock_load_settings(db_settings)
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            patch("admino.llm.create_llm_client", MagicMock()),
+            patch("admino.server._get_vllm_available_models", AsyncMock(return_value=[])),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"vllm_model": "org/new-served-model"}},
+                )
+
+        assert resp.status_code == 200
+        llm_calls = [c for c in mock_update.call_args_list if c[0][1] == "llm"]
+        assert len(llm_calls) == 1
+        assert llm_calls[0][0][2]["vllm_model"] == "org/new-served-model"
+
+    async def test_patch_settings_vllm_model_noop_does_not_reinit(self) -> None:
+        """Re-sending the SAME vllm_model (a no-op) must NOT rebuild the client (issue #134)."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "vllm",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+            "vllm_model": "mlx-community/gemma-4-12B-it-4bit",
+        }
+        mock_load = _mock_load_settings(db_settings)
+        mock_create_llm = MagicMock()
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", AsyncMock()),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch("admino.server._get_vllm_available_models", AsyncMock(return_value=[])),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"vllm_model": "mlx-community/gemma-4-12B-it-4bit"}},
+                )
+
+        assert resp.status_code == 200
+        mock_create_llm.assert_not_called()
+        assert agent._llm is old_client
 
     async def test_patch_settings_provider_change_closes_old_client(self) -> None:
         """Switching provider retires the old LLM client by awaiting its close()."""

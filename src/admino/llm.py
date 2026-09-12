@@ -5,7 +5,7 @@ shared sanitization/parsing utilities, and the ``create_llm_client()``
 factory that instantiates the correct backend based on config.
 
 Provider modules:
-- ``llm_vllm.py`` — local vLLM placeholder backend (default; serving not yet implemented)
+- ``llm_vllm.py`` — local vLLM backend (default; first-class OpenAI-compatible client)
 - ``llm_anthropic.py`` — Anthropic Claude backend (opt-in)
 - ``llm_openai.py`` — OpenAI backend (opt-in)
 
@@ -324,9 +324,8 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
 
     Returns:
         An LLMClient implementation for the configured provider. For the default
-        'vllm' provider this is the ``VLLMPlaceholderClient`` sentinel (local
-        serving is not yet implemented), which makes no network calls and returns
-        a fixed guidance message.
+        'vllm' provider this is a first-class ``VLLMClient`` (an OpenAI-compatible
+        wrapper pointed at a local endpoint); it needs no API key.
 
     Raises:
         ValueError: If the provider is unknown.
@@ -343,9 +342,9 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
         return OpenAIClient(config)
 
     if config.provider == "vllm":
-        from admino.llm_vllm import VLLMPlaceholderClient
+        from admino.llm_vllm import VLLMClient
 
-        return VLLMPlaceholderClient()
+        return VLLMClient(config)
 
     msg = f"Unknown LLM provider: {config.provider!r}"
     raise ValueError(msg)

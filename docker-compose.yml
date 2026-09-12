@@ -5,15 +5,22 @@
 #
 # Run modes:
 #
-#   1. Cloud provider (Anthropic / OpenAI)
-#      No local LLM container needed. The agent reaches the provider's API
-#      directly via the egress whitelist.
-#        docker compose up -d
+#   1. Local vLLM — Apple Silicon (macOS 15+, Metal) — AVAILABLE
+#      Docker Desktop cannot pass through the Metal GPU, so vLLM runs as a
+#      host-native process (vllm-metal), NOT a container. The agent reaches it
+#      at host.docker.internal:8000 (configured in config.yaml / VLLM_BASE_URL).
+#      Provision and start it before `docker compose up`:
+#        make vllm-pull   # one-time ~6.7 GB download
+#        make vllm-up     # starts the host server (background + pidfile)
+#      Stop with: make vllm-down
+#      Alternative: Docker Model Runner (Docker Desktop 4.62+) — set VLLM_BASE_URL
+#      to http://model-runner.docker.internal/engines/v1 (see .env.example).
+#      In-container NVIDIA/CUDA serving is tracked in issue #132.
 #
-#   2. Self-hosted OpenAI-compatible server (e.g. a local vLLM — coming soon)
-#      Set llm.provider to "openai" in config.yaml and point the OPENAI_BASE_URL
-#      env var (see .env.example) at the server's endpoint. The server's host
-#      must be reachable per the egress whitelist.
+#   2. Cloud provider (Anthropic / OpenAI)
+#      No local LLM needed. The agent reaches the provider's API directly via
+#      the egress whitelist. Switch in Settings → Agent (or set LLM_PROVIDER).
+#        docker compose up -d
 #
 # The Makefile wraps these with `make docker-up` — see Makefile.
 
@@ -68,6 +75,13 @@ services:
     image: admino-agent:local
     container_name: admino-agent
     restart: unless-stopped
+
+    # Make host.docker.internal resolve to the host gateway on Linux (Docker
+    # Desktop provides it natively). The default vllm_base_url points here so the
+    # agent can reach the host-native vLLM server; entrypoint.sh adds a matching
+    # best-effort egress-whitelist rule for the resolved IP + configured vLLM port.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     # Least-privilege capabilities. Drop everything, then add back only what the
     # root entrypoint needs before it drops to the unprivileged admino user:

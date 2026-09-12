@@ -12,6 +12,7 @@ admino is configured by two things:
 > are never written to disk in plaintext.
 
 - [LLM providers](#llm-providers)
+- [Local vLLM (Apple Silicon)](#local-vllm-apple-silicon)
 - [`config.yaml` reference](#configyaml-reference)
 - [Authentication modes](#authentication-modes)
 - [Data & storage](#data--storage)
@@ -19,31 +20,81 @@ admino is configured by two things:
 
 ## LLM providers
 
-admino is designed to run fully local, so **vLLM is the default provider** — but local
-vLLM serving **isn't implemented yet**. On first launch admino boots on vLLM and can't
-chat until you switch to a working provider in **Settings → Agent**:
+admino is local-first. **vLLM is the default provider**, served on Apple Silicon (macOS
+15+, Metal) by a host-native process — no cloud calls by default.
 
 | Provider | Status | Needs |
 | --- | --- | --- |
-| **vLLM** | *local · coming soon* (default) | Nothing yet — local serving is on the roadmap. |
-| **Claude (Anthropic)** | opt-in interim | `ANTHROPIC_API_KEY` in the environment. |
-| **OpenAI** | opt-in interim | `OPENAI_API_KEY` in the environment. |
+| **vLLM** | **local · available (Apple Silicon)** (default) | Install `vllm-metal`, then `make vllm-pull` + `make vllm-up`. See below. |
+| **Claude (Anthropic)** | opt-in cloud | `ANTHROPIC_API_KEY` in the environment. |
+| **OpenAI** | opt-in cloud | `OPENAI_API_KEY` in the environment. |
 
 Cloud providers send your messages to their servers; everything else — audit log, memory,
-documents — stays on your machine.
+documents — stays on your machine. Until the vLLM server is running, admino boots and
+replies with a friendly "model unavailable" message rather than crashing.
 
 ![Settings → Agent provider control](screenshots/settings-agent.png)
 
-<sub>Settings → Agent — vLLM is marked <em>local · coming soon</em>; pick Claude or OpenAI to chat now.</sub>
+<sub>Settings → Agent — switch between vLLM (local) and the cloud opt-ins.</sub>
 
 **Switching providers:**
 
-- In the UI: **Settings → Agent**, pick Claude or OpenAI.
+- In the UI: **Settings → Agent**, pick the provider.
 - Or set `LLM_PROVIDER` in the environment (overrides `config.yaml`).
 - Model IDs live in `config.yaml` under `llm` (`anthropic_model`, `openai_model`); both
   stay set so switching needs no model edit. The API key still comes from the environment.
-- Point the OpenAI provider at a self-hosted OpenAI-compatible server (e.g. a local vLLM)
-  with `OPENAI_BASE_URL`.
+- Point the OpenAI provider at any OpenAI-compatible server with `OPENAI_BASE_URL`.
+
+## Local vLLM (Apple Silicon)
+
+On Apple Silicon (macOS 15+), vLLM uses the Metal GPU via
+[vllm-metal](https://github.com/vllm-project/vllm-metal). Docker Desktop cannot pass
+through the Metal GPU, so vLLM runs as a **host-native process** — the agent container
+reaches it at `host.docker.internal:8000` (set by `vllm_base_url` in `config.yaml`).
+
+**Default model:** `mlx-community/gemma-4-12B-it-4bit` — Gemma 4 12B instruction-tuned,
+MLX 4-bit quantised (~6.7 GB, fits 24 GB unified memory, 32 K context). Linux + NVIDIA
+in-container serving is tracked in [#132](https://github.com/ljakupi/admino/issues/132).
+
+### Setup (one-time)
+
+```bash
+# Install vllm-metal — creates ~/.venv-vllm-metal
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+```
+
+### Daily workflow
+
+```bash
+make vllm-pull   # download the model weights (~6.7 GB, one-time per model)
+                 # Set HF_TOKEN in the environment first if the model repo is gated.
+make vllm-up     # start the server (background + pidfile)
+                 # Logs: tail -f data/logs/vllm-metal.log
+                 # Takes 1-2 minutes for the 12B model to fully load.
+make vllm-down   # stop the server
+```
+
+### Override the model or endpoint
+
+| Variable | Default (from `config.yaml`) | Notes |
+| --- | --- | --- |
+| `VLLM_MODEL` | `mlx-community/gemma-4-12B-it-4bit` | Any HuggingFace MLX model ID. `vllm-pull` and `vllm-up` both honor this. |
+| `VLLM_BASE_URL` | `http://host.docker.internal:8000/v1` | Change to `http://model-runner.docker.internal/engines/v1` for Docker Model Runner. |
+| `VLLM_MAX_MODEL_LEN` | `32768` | Maximum sequence length in tokens. |
+| `HF_TOKEN` | *(unset)* | Only for `make vllm-pull` when the model repo is gated. Never used at runtime. |
+
+### Docker Model Runner alternative
+
+Docker Desktop 4.62+ ships a built-in vLLM backend:
+
+```bash
+docker model install-runner --backend vllm
+docker model pull mlx-community/gemma-4-12B-it-4bit
+docker model run mlx-community/gemma-4-12B-it-4bit
+```
+
+Then set `VLLM_BASE_URL=http://model-runner.docker.internal/engines/v1` in `.env` (or as
+an environment variable). No `make vllm-up` needed — Docker manages the lifecycle.
 
 ## `config.yaml` reference
 

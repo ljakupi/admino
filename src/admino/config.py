@@ -73,9 +73,12 @@ class LLMConfig(BaseModel):
     """LLM provider configuration.
 
     Supported providers:
-    - "vllm" (default): local vLLM serving. Serving is not yet implemented, so
-      selecting it boots gracefully — validation logs a warning (does NOT raise)
-      and the agent replies asking the user to pick another provider to chat now.
+    - "vllm" (default): a first-class local, OpenAI-compatible provider that
+      serves the configured ``vllm_model`` from a local endpoint
+      (``vllm_base_url``). It needs no API key. The server may still be starting
+      (loading a large model), so validation does NOT probe the network and boots
+      gracefully; chat requests surface a friendly "model starting/unavailable"
+      error until the endpoint is ready.
     - "anthropic" (opt-in): Anthropic Claude API. Messages sent to Anthropic servers.
     - "openai" (opt-in): OpenAI API. Messages sent to OpenAI servers.
 
@@ -87,7 +90,7 @@ class LLMConfig(BaseModel):
     provider: Literal["anthropic", "openai", "vllm"] = Field(
         default="vllm",
         description=(
-            "LLM provider: 'vllm' (default, local — serving not yet implemented), "
+            "LLM provider: 'vllm' (default, local OpenAI-compatible serving), "
             "'anthropic' (opt-in, cloud), 'openai' (opt-in, cloud)."
         ),
     )
@@ -97,6 +100,27 @@ class LLMConfig(BaseModel):
         ge=1,
         le=600,
         description="Request timeout in seconds for LLM API calls.",
+    )
+
+    # -- vLLM settings (used when provider=vllm) --
+    # vLLM is a first-class local provider serving an OpenAI-compatible API.
+    # The served model must be set; its default makes the provider boot without
+    # a config edit. base_url points at the local endpoint (no API key needed).
+    vllm_model: str | None = Field(
+        default="mlx-community/gemma-4-12B-it-4bit",
+        max_length=200,
+        description="Served vLLM model ID (required for provider=vllm).",
+    )
+    vllm_base_url: str = Field(
+        default="http://host.docker.internal:8000/v1",
+        max_length=2048,
+        description="Base URL of the local OpenAI-compatible vLLM endpoint.",
+    )
+    vllm_max_model_len: int = Field(
+        default=32768,
+        ge=512,
+        le=262144,
+        description="Maximum context length (tokens) the served vLLM model supports.",
     )
 
     # -- Anthropic settings (used when provider=anthropic) --
@@ -124,7 +148,7 @@ class LLMConfig(BaseModel):
         description="Maximum tokens in LLM response (Anthropic/OpenAI max_tokens).",
     )
 
-    @field_validator("anthropic_model", "openai_model")
+    @field_validator("anthropic_model", "openai_model", "vllm_model")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
         """Reject model names containing shell metacharacters or control chars.
@@ -139,20 +163,47 @@ class LLMConfig(BaseModel):
             raise ValueError(msg)
         return v
 
+    @field_validator("vllm_base_url")
+    @classmethod
+    def validate_vllm_base_url(cls, v: str) -> str:
+        """Require an http(s) URL free of whitespace and control characters.
+
+        A malformed base URL would send the local-serving requests to an
+        unexpected host, so reject anything that is not a plain http(s) URL.
+        """
+        if any(ord(ch) < 0x20 or ch.isspace() for ch in v):
+            msg = "LLMConfig.vllm_base_url must not contain whitespace or control characters."
+            raise ValueError(msg)
+        if not v.startswith(("http://", "https://")):
+            msg = "LLMConfig.vllm_base_url must start with 'http://' or 'https://'."
+            raise ValueError(msg)
+        return v
+
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> LLMConfig:
         """Validate provider-specific requirements at config load time.
 
         Proprietary providers require API key env vars and log a warning.
-        The 'vllm' provider is a not-yet-implemented local placeholder: it boots
-        gracefully with a WARNING (no raise), so admino starts with no API key or
-        model and the agent tells the user to pick a working provider to chat now.
+        The 'vllm' provider is a first-class local provider: it needs no API
+        key, but it does require ``vllm_model`` to be set. Validation does NOT
+        probe the network — the local server may still be loading a large model,
+        so admino boots gracefully and chat requests surface a friendly
+        "starting/unavailable" error until the endpoint is ready.
         """
         if self.provider == "vllm":
-            logger.warning(
-                "llm.provider is 'vllm' — local vLLM serving is not yet implemented. "
-                "admino will boot, but no local model is available yet; select "
-                "another provider (Claude or OpenAI) in Settings → Agent to chat now."
+            if not self.vllm_model:
+                msg = (
+                    "llm.provider is 'vllm' but llm.vllm_model is not set. "
+                    "Set the served model ID in config.yaml "
+                    "(e.g. mlx-community/gemma-4-12B-it-4bit)."
+                )
+                raise ValueError(msg)
+            logger.info(
+                "LLM provider is 'vllm' (local) — serving '%s' from %s. "
+                "If the endpoint is still starting, chat replies will report it "
+                "as unavailable until the model finishes loading.",
+                self.vllm_model,
+                self.vllm_base_url,
             )
             return self
         if self.provider == "anthropic":
@@ -195,14 +246,16 @@ class LLMConfig(BaseModel):
     def active_model_name(self) -> str:
         """Return the model name for the currently configured provider.
 
-        For 'vllm' (the local placeholder, no model required) this returns the
-        "vllm" placeholder. For the proprietary providers the model is
-        guaranteed non-empty by ``validate_provider_requirements``; this raises
-        defensively if that invariant is ever violated.
+        For every provider the model is guaranteed non-empty by
+        ``validate_provider_requirements`` (vllm_model has a default); this
+        raises defensively if that invariant is ever violated.
         """
         if self.provider == "vllm":
-            return "vllm"
-        name = self.anthropic_model if self.provider == "anthropic" else self.openai_model
+            name = self.vllm_model
+        elif self.provider == "anthropic":
+            name = self.anthropic_model
+        else:
+            name = self.openai_model
         if not name:
             msg = f"No model configured for llm.provider '{self.provider}'."
             raise ValueError(msg)
@@ -369,9 +422,12 @@ class AppConfig(BaseModel):
     """Top-level application configuration validated from config.yaml.
 
     Environment variable overrides are applied after YAML loading:
-    - LLM_PROVIDER -> llm.provider
-    - LOG_LEVEL -> log_level
-    - AUDIT_LOG_PATH -> paths.audit_log
+    - LLM_PROVIDER      -> llm.provider
+    - VLLM_MODEL        -> llm.vllm_model
+    - VLLM_BASE_URL     -> llm.vllm_base_url
+    - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len
+    - LOG_LEVEL         -> log_level
+    - AUDIT_LOG_PATH    -> paths.audit_log
     """
 
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -451,13 +507,51 @@ class AppConfig(BaseModel):
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
 
 
+def _apply_vllm_env_overrides(data: dict[str, object]) -> None:
+    """Apply the VLLM_* env overrides to the ``llm`` config section in-place.
+
+    Handles VLLM_MODEL, VLLM_BASE_URL, and VLLM_MAX_MODEL_LEN. A non-integer
+    VLLM_MAX_MODEL_LEN is logged and skipped (mirrors the LOG_LEVEL pattern) so
+    a bad value never crashes config loading.
+
+    Args:
+        data: Raw config dict parsed from YAML (mutated in place).
+    """
+    vllm_model = os.environ.get("VLLM_MODEL")
+    vllm_base_url = os.environ.get("VLLM_BASE_URL")
+    vllm_max_model_len = os.environ.get("VLLM_MAX_MODEL_LEN")
+    if not (vllm_model or vllm_base_url or vllm_max_model_len):
+        return
+
+    llm_section = data.setdefault("llm", {})
+    if not isinstance(llm_section, dict):
+        logger.warning("Cannot apply VLLM_* overrides: 'llm' config section is not a mapping.")
+        return
+
+    if vllm_model:
+        llm_section["vllm_model"] = vllm_model
+    if vllm_base_url:
+        llm_section["vllm_base_url"] = vllm_base_url
+    if vllm_max_model_len:
+        try:
+            llm_section["vllm_max_model_len"] = int(vllm_max_model_len)
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid VLLM_MAX_MODEL_LEN value %r (not an integer).",
+                vllm_max_model_len,
+            )
+
+
 def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     """Apply environment variable overrides to raw config data.
 
     Supported env vars:
-    - LLM_PROVIDER     -> llm.provider
-    - LOG_LEVEL        -> log_level
-    - AUDIT_LOG_PATH   -> paths.audit_log
+    - LLM_PROVIDER       -> llm.provider
+    - VLLM_MODEL         -> llm.vllm_model
+    - VLLM_BASE_URL      -> llm.vllm_base_url
+    - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len (parsed to int)
+    - LOG_LEVEL          -> log_level
+    - AUDIT_LOG_PATH     -> paths.audit_log
 
     Args:
         data: Raw config dict parsed from YAML.
@@ -474,6 +568,8 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
             logger.warning(
                 "Cannot apply LLM_PROVIDER override: 'llm' config section is not a mapping."
             )
+
+    _apply_vllm_env_overrides(data)
 
     log_level = os.environ.get("LOG_LEVEL")
     if log_level:

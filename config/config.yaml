@@ -16,15 +16,25 @@ database:
   max_pool_size: 5
 
 llm:
-  # Provider: "vllm" (default, local) is admino's local-first default. Local
-  # vLLM serving is not yet implemented, so admino boots with vllm but has no
-  # local model to talk to yet — sending a chat while vllm is active replies
-  # asking you to pick another provider in Settings → Agent.
+  # Provider: "vllm" (default, local) is admino's local-first default — a
+  # first-class, OpenAI-compatible local server running Gemma 4 12B on Apple
+  # Silicon (Metal) via vllm-metal + Docker Model Runner. It must be provisioned
+  # (`make vllm-pull`) and started (`make vllm-up`) before it can answer. Until
+  # then admino still boots, but a chat reply while the model is loading (or the
+  # server is down) surfaces a friendly "model starting/unavailable" error — it
+  # is NOT zero-setup.
   # "anthropic" and "openai" are cloud opt-ins that send your messages to their
   # servers. Switch to one in Settings → Agent (and set its API key) to chat now.
   provider: "vllm"
 
   timeout_s: 120
+
+  # vLLM (local) settings. vllm_model is the served model ID; vllm_base_url is
+  # the local OpenAI-compatible endpoint (no API key needed); vllm_max_model_len
+  # is the context length the served model supports.
+  vllm_model: "mlx-community/gemma-4-12B-it-4bit"
+  vllm_base_url: "http://host.docker.internal:8000/v1"
+  vllm_max_model_len: 32768
 
   # Model IDs for the cloud providers. The chosen provider's API key must be set
   # in the environment (ANTHROPIC_API_KEY or OPENAI_API_KEY) — never in this file.

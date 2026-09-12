@@ -127,6 +127,30 @@ class TestShippedConfigDefaults:
 
 
 # ---------------------------------------------------------------------------
+# Shipped vLLM defaults (issue #134)
+# ---------------------------------------------------------------------------
+
+
+class TestShippedVLLMDefaults:
+    """The committed config.yaml pins the first-class vLLM provider defaults."""
+
+    def test_shipped_vllm_model_is_mlx_gemma(self, shipped_config: AppConfig) -> None:
+        """The shipped vllm_model is the MLX Gemma id."""
+        assert shipped_config.llm.vllm_model == "mlx-community/gemma-4-12B-it-4bit"
+
+    def test_shipped_vllm_base_url_is_http_url(self, shipped_config: AppConfig) -> None:
+        """The shipped vllm_base_url is a non-empty http(s) URL."""
+        base_url = shipped_config.llm.vllm_base_url
+        assert isinstance(base_url, str)
+        assert base_url != ""
+        assert base_url.startswith(("http://", "https://"))
+
+    def test_shipped_vllm_max_model_len_is_32768(self, shipped_config: AppConfig) -> None:
+        """The shipped vllm_max_model_len is 32768."""
+        assert shipped_config.llm.vllm_max_model_len == 32768
+
+
+# ---------------------------------------------------------------------------
 # Shipped .env.example coherence with config.yaml
 # ---------------------------------------------------------------------------
 
