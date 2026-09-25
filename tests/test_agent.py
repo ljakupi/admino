@@ -10,6 +10,8 @@ Covers:
   carry-once semantics, identity mismatch, expired confirmation).
 - Hallucinated tool names and malformed identifiers from the LLM.
 - LLM exception handling (generic, MemoryError, RecursionError re-raise).
+- GH-142: a user-facing ``LLMError`` is shown verbatim as the error reply;
+  internal ``LLMError``s and other exceptions keep the generic reply.
 - Context trimming with preserved system prefix.
 - GH-140: the agent owns the system prompt — it is sent exactly once per LLM
   call, never returned in history, never duplicated across turns; the current
@@ -41,7 +43,7 @@ from admino.agent import (
     _trim_context,
 )
 from admino.audit import AuditWriteError
-from admino.llm import LLMResponse
+from admino.llm import LLMError, LLMResponse
 from admino.models import (
     AgentConfig,
     AgentResult,
@@ -1172,6 +1174,83 @@ class TestAgentErrorHandling:
         user_entries = [c for c in convs if c["role"] == "user"]
         assert len(user_entries) == 1
         assert user_entries[0]["content"] == "hello"
+
+    # -- GH-142: user-facing provider errors are shown verbatim --
+
+    async def test_agent_user_facing_llm_error_returns_message_verbatim(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """A user-facing LLMError ends the run with status "error" and its exact message."""
+        message = "Infomaniak isn't configured; set INFOMANIAK_API_TOKEN on the server."
+        fake = FakeLLM([])
+        fake.raise_on_call = LLMError(message, None, user_facing=True)
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        result = await agent.run("hi", session_id="s", history=[])
+
+        assert result.status == "error"
+        assert result.response == message
+
+    async def test_agent_user_facing_llm_error_recorded_as_assistant_turn(
+        self,
+        tmp_path: Path,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """The friendly message is the assistant turn in history and in the audit log."""
+        message = "No Infomaniak model is set; choose one in Settings → Agent."
+        fake = FakeLLM([])
+        fake.raise_on_call = LLMError(message, None, user_facing=True)
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        result = await agent.run("hello", session_id="s", history=[])
+
+        assert result.history[-1].role == "assistant"
+        assert result.history[-1].content == message
+        convs = _filter_entries(_read_audit_entries(tmp_path), "conversation")
+        assistant = [c for c in convs if c["role"] == "assistant"]
+        assert [c["content"] for c in assistant] == [message]
+
+    @pytest.mark.parametrize("status_code", [None, 429, 503])
+    async def test_agent_user_facing_llm_error_any_status_shown_verbatim(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+        status_code: int | None,
+    ) -> None:
+        """user_facing — not the status code — decides whether the message is shown."""
+        message = "Infomaniak is temporarily unavailable. Please try again in a moment."
+        fake = FakeLLM([])
+        fake.raise_on_call = LLMError(message, status_code, user_facing=True)
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        result = await agent.run("hi", session_id="s", history=[])
+
+        assert result.response == message
+
+    async def test_agent_internal_llm_error_uses_generic_message(
+        self,
+        audit_logger: AuditLogger,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """An LLMError(user_facing=False) keeps the generic reply; its message never leaks."""
+        fake = FakeLLM([])
+        fake.raise_on_call = LLMError(
+            "OpenAI API returned HTTP 400: INTERNAL-DETAIL-SECRET", 400, user_facing=False
+        )
+        agent = _build_agent(fake, audit_logger, permissions_config, agent_config)
+
+        result = await agent.run("hi", session_id="s", history=[])
+
+        assert result.status == "error"
+        assert result.response == agent_module._LLM_ERROR_MESSAGE
+        assert "INTERNAL-DETAIL-SECRET" not in result.response
 
     async def test_agent_memory_error_propagates(
         self,

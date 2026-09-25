@@ -5,28 +5,31 @@
 #
 # Run modes:
 #
-#   1. Local vLLM — CPU container (cross-platform: Apple Silicon + Linux)
+#   1. Default — Infomaniak AI Services (Swiss-hosted, OpenAI-compatible API)
+#      No local model container. Set INFOMANIAK_API_TOKEN in .env; the agent
+#      reaches api.infomaniak.com through the egress whitelist.
+#        make start       # postgres + agent (same as make docker-up)
+#      Anthropic / OpenAI are cloud opt-ins reached the same way: set the API
+#      key, whitelist the host, switch in Settings → Agent (or LLM_PROVIDER).
+#
+#   2. Opt-in local vLLM — CPU container (cross-platform: Apple Silicon + Linux)
 #      The vllm service runs vllm/vllm-openai-cpu:latest, a multi-arch image
 #      (arm64 + amd64). Docker auto-pulls the correct arch. No Metal, no host
 #      process, nothing outside Docker.
-#        make vllm-pull   # one-time ~8 GB model download into the vllm-models volume
-#        make start       # brings up postgres + agent + vllm together
+#        make start-local # provisions the model (one-time ~8 GB), then brings up
+#                         # postgres + agent + vllm (profile vllm activated)
 #      Or individually:
-#        make docker-up   # postgres + agent + vllm (profile vllm activated)
+#        make vllm-pull   # pre-download the model into the vllm-models volume
 #        make vllm-up     # bring up just the vllm service
 #        make vllm-down   # stop just the vllm service
+#      Then pick the vLLM provider in Settings → Agent.
 #      Note: Docker Desktop must have ~12–16 GB RAM allocated (default 8 GB is
 #      not enough for a 4B FP16 model). Increase in Docker Desktop → Settings →
 #      Resources → Memory.
 #      NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
 #      reservation (tracked in issue #132).
 #
-#   2. Cloud provider (Anthropic / OpenAI)
-#      No local LLM needed. The agent reaches the provider's API directly via
-#      the egress whitelist. Switch in Settings → Agent (or set LLM_PROVIDER).
-#        docker compose up -d
-#
-# The Makefile wraps these with `make docker-up` / `make start` — see Makefile.
+# The Makefile wraps these with `make start` / `make start-local` — see Makefile.
 
 services:
 
@@ -67,9 +70,9 @@ services:
   # agent — Python ASGI app. Serves HTTP on port 8000.
   # External access: whitelist-only egress via iptables.
   #   The agent is connected to BOTH networks:
-  #     - internal: to reach the vllm service (same internal bridge)
-  #     - egress:   for whitelisted external calls (googleapis.com,
-  #                 api.anthropic.com, api.openai.com, etc.)
+  #     - internal: to reach postgres and the opt-in vllm service
+  #     - egress:   for whitelisted external calls (api.infomaniak.com — the
+  #                 default LLM — googleapis.com, api.anthropic.com, etc.)
   #   iptables rules in entrypoint.sh enforce the whitelist on the egress interface.
   #   The internal network (172.20.0.0/16) is always permitted by the INTERNAL_NETWORK
   #   rule, so the agent reaches the vllm service without any extra egress rules.
@@ -188,9 +191,9 @@ services:
   # No hard memory limit is set here — a Docker-enforced cap below ~10 GB would
   # OOM-kill the container silently. Constrain at the host level instead.
   #
-  # Activation: `profiles: ["vllm"]` means bare `docker compose up` (cloud mode)
-  # does NOT pull or start this service. The Makefile `docker-up` / `start`
-  # targets pass --profile vllm to opt in.
+  # Activation: `profiles: ["vllm"]` means bare `docker compose up` — and
+  # `make start` / `make docker-up` (default Infomaniak provider) — does NOT pull
+  # or start this service. `make start-local` passes --profile vllm to opt in.
   # --------------------------------------------------------------------------
   vllm:
     image: ${VLLM_IMAGE:-vllm/vllm-openai-cpu:latest}

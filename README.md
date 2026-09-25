@@ -39,11 +39,11 @@ your say-so.
 ## ✨ Why admino
 
 - 🔐 **Isolated permission engine** — a pure `(tool, action)` function the LLM never sees, can't argue with, and can't route around. Default-deny; writes are never silently auto-allowed. → [Permissions](docs/permissions.md)
-- 🏠 **Runs on your machine** — local-first by design. Your audit log, memory, and documents never leave your computer.
+- 🏠 **Runs on your server** — your audit log, memory, and documents stay on the machine that runs admino. Only the active LLM provider sees the conversation.
 - 🧯 **Contained blast radius** — the agent container is whitelist-only egress, so even a hijacked agent can't phone home. → [Security Model](docs/SECURITY.md)
 - 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and an append-only audit log of every decision.
 - 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, local files, and memory — all permission-gated. → [Tools](docs/tools.md)
-- 🤖 **Your choice of model** — local-first vLLM as a cross-platform CPU container (Apple Silicon + Linux, no Metal, no host process), with Claude and OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
+- 🤖 **Your choice of model** — [Infomaniak AI Services](https://www.infomaniak.com/en/hosting/ai-services) by default (processed in Switzerland; queries aren't recorded or used for training), an opt-in local vLLM CPU container (Apple Silicon + Linux), and Claude or OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
 
 ## 📸 Screenshots
 
@@ -59,9 +59,10 @@ your say-so.
 
 - **Python 3.12+**
 - **[uv](https://docs.astral.sh/uv/)** — the package & virtualenv manager (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- **Docker** + Docker Compose — runs PostgreSQL and the vLLM container (and the whole backend, optionally)
-- **For local inference (any platform):** run `make vllm-pull` to download the default model (~8 GB, one-time) then `make start` — admino spins up postgres, agent, and the vLLM CPU container together, with no cloud calls. See [Configuration → Local vLLM](docs/configuration.md#local-vllm-cpu-container). Docker Desktop needs ~12–16 GB RAM allocated.
-- **For cloud providers:** an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Set it in `.env`, switch the provider in Settings → Agent, and start the backend — no local model required.
+- **Docker** + Docker Compose — runs PostgreSQL (and the whole backend, optionally)
+- **An Infomaniak AI Services API token** for the default model — create it in the Infomaniak Manager with the `ai-tools` scope and set `INFOMANIAK_API_TOKEN` in `.env`. See [Configuration → Infomaniak](docs/configuration.md#infomaniak-ai-services-default).
+- *Optional, local inference:* `make start-local` adds the vLLM CPU container (downloads the model, ~8 GB, on first run). See [Configuration → Local vLLM](docs/configuration.md#local-vllm-cpu-container). Docker Desktop needs ~12–16 GB RAM allocated.
+- *Optional, other cloud providers:* an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Set it in `.env` and switch the provider in Settings → Agent.
 - *Optional:* Google / Microsoft OAuth apps to enable the mail, calendar, and drive tools — see [Getting Started → Connect your accounts](docs/getting-started.md#connect-your-accounts).
 
 ### Run locally (with uv)
@@ -74,6 +75,7 @@ source .venv/bin/activate
 # 2. Configure — copy the sample env
 cp .env.example .env
 #    PG_PASSWORD is prefilled with the dev default: changeme
+#    Set INFOMANIAK_API_TOKEN (the default LLM provider)
 
 # 3. Load .env into your shell — `make run` reads the shell environment, not .env
 set -a; source .env; set +a
@@ -83,22 +85,23 @@ make dev-db
 make run
 ```
 
-Open **http://localhost:8000** and click **Skip** on the token prompt. If you started
-the vLLM container (see below), you're ready to chat once it loads. Otherwise open
-**Settings → Agent** and switch to **Claude** or **OpenAI** (set the matching API key
-in `.env` first).
+Open **http://localhost:8000** and click **Skip** on the token prompt. With
+`INFOMANIAK_API_TOKEN` set you're ready to chat on Qwen3.5 (Infomaniak). Without it,
+admino still boots and the chat tells you which variable to set. **Settings → Agent**
+switches to local **vLLM**, **Claude** or **OpenAI**.
 
-### Local vLLM serving — CPU container (cross-platform)
+### Local vLLM serving — CPU container (opt-in, cross-platform)
 
-admino's local-first default is **Qwen3 4B Instruct** (`Qwen/Qwen3-4B-Instruct-2507`).
+The optional local model is **Qwen3 4B Instruct** (`Qwen/Qwen3-4B-Instruct-2507`).
 It runs as a Docker CPU container — cross-platform on Apple Silicon and Linux, nothing
 outside Docker, no Metal, no host process.
 
 ```bash
-make vllm-pull   # one-time download (~8 GB) into a Docker volume — set HF_TOKEN if using a gated model
-make start       # brings up postgres + agent + vllm together
+make start-local # downloads the model on first run (~8 GB), then brings up postgres + agent + vllm
 make vllm-down   # stop just the vllm container when done
 ```
+
+Then pick **vLLM** in Settings → Agent.
 
 The agent reaches the vllm container at `http://vllm:8000/v1` over the shared internal
 Docker bridge. Until the container is ready, admino boots and replies with a friendly
@@ -118,10 +121,10 @@ Starts the agent (behind its egress firewall) and PostgreSQL together — Docker
 `.env` directly, so no shell export needed:
 
 ```bash
-cp .env.example .env               # change PG_PASSWORD; set API key if using cloud
-make vllm-pull                     # one-time model download — skip if using a cloud provider
+cp .env.example .env               # change PG_PASSWORD; set INFOMANIAK_API_TOKEN
 make docker-build
-make docker-up                     # → http://localhost:8000 (includes vllm container)
+make docker-up                     # → http://localhost:8000 (postgres + agent)
+# or: make start-local             # adds the opt-in local vllm container
 ```
 
 > **New here?** The [Getting Started guide](docs/getting-started.md) walks through

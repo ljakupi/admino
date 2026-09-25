@@ -34,9 +34,9 @@ COPY pyproject.toml .
 COPY src/ src/
 
 # Install the package and all runtime dependencies into /install prefix.
-# The `all-providers` extra bundles the Anthropic and OpenAI SDKs so the image
-# supports either provider chosen in config.yaml (anthropic / openai)
-# without rebuilding.
+# The OpenAI SDK is a core dependency (default Infomaniak provider, vLLM, OpenAI);
+# the `all-providers` extra adds the Anthropic SDK so the image supports every
+# provider selectable in config.yaml / Settings → Agent without rebuilding.
 RUN pip install --no-cache-dir --prefix=/install ".[all-providers]"
 
 # -------------------------------------------------------------------

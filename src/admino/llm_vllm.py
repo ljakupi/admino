@@ -1,15 +1,23 @@
-"""Local vLLM backend — the default provider (first-class, OpenAI-compatible).
+"""Local vLLM backend — opt-in local provider (first-class, OpenAI-compatible).
 
-vLLM is admino's default LLM provider. This module implements ``VLLMClient``,
-which wraps the official ``openai`` SDK pointed at a *local* OpenAI-compatible
-endpoint (``config.vllm_base_url``) serving ``config.vllm_model``. It reuses the
-OpenAI conversion/parse helpers and the shared ``admino.llm`` sanitizers so the
+vLLM is admino's optional local LLM provider (started with ``make start-local``;
+Infomaniak is the default). This module implements ``VLLMClient``, which wraps
+the official ``openai`` SDK pointed at a *local* OpenAI-compatible endpoint
+(``config.vllm_base_url``) serving ``config.vllm_model``. It reuses the OpenAI
+conversion/parse helpers and the shared ``admino.llm`` sanitizers so the
 request/response shape is identical to the OpenAI backend.
 
 Inputs/outputs:
 - ``VLLMClient.chat()`` sends messages/tools to the local endpoint and returns a
   sanitized ``LLMResponse`` (content, tool_calls, model, done).
 - ``VLLMClient.close()`` releases the underlying HTTP client.
+
+Errors (provider label "vLLM"): a missing/empty ``vllm_model`` does not fail
+construction; ``chat()`` raises the user-facing "No vLLM model is set …" error
+instead. Connection/timeout failures raise a user-facing "starting or
+unavailable" message pointing to ``make start-local``; 404, 429 and 5xx map to
+the shared catalogue in ``llm.py``. vLLM has no key, so every other status
+(including 401/403) stays internal (``user_facing=False``).
 
 Security notes:
 - Local-only: requests go to ``config.vllm_base_url`` (a local endpoint). No
@@ -18,6 +26,7 @@ Security notes:
   fixed non-empty dummy key is sent to satisfy the SDK.
 - Connection/timeout failures map to a FRIENDLY ``LLMError`` that never embeds
   the raw SDK cause/response body (the served model may still be loading).
+  User-facing messages are fixed strings.
 - LLM output is sanitized by the shared llm.py utilities.
 - Does not import from agent.py, server.py, or tools/.
 """
@@ -29,6 +38,8 @@ from typing import TYPE_CHECKING, Any
 from admino.llm import (
     LLMError,
     LLMResponse,
+    missing_model_error,
+    provider_status_error,
     sanitize_content,
     strip_control_chars,
     validate_tools_payload,
@@ -46,6 +57,9 @@ if TYPE_CHECKING:
     from admino.config import LLMConfig
     from admino.models import LLMMessage
 
+# Provider label shown in user-facing errors.
+_LABEL = "vLLM"
+
 # Placeholder API key sent to the SDK. The local vLLM server ignores it, but the
 # openai SDK requires a non-empty key. Never read a real key from the env here.
 _DUMMY_API_KEY = "sk-vllm-local"
@@ -53,9 +67,10 @@ _DUMMY_API_KEY = "sk-vllm-local"
 # Friendly, leak-free message for an unreachable/starting local endpoint. Must
 # contain both "starting" and "unavailable" so the user understands the 12B
 # model may still be loading — never embed the raw SDK cause or response body.
+# vLLM is opt-in, so point to the target that provisions and starts it.
 _VLLM_UNAVAILABLE_MESSAGE = (
     "The local vLLM model is starting or unavailable. "
-    "Check that the vLLM server is running (make vllm-up)."
+    "Check that the vLLM server is running (make start-local)."
 )
 
 
@@ -70,12 +85,14 @@ class VLLMClient:
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the vLLM client.
 
+        A missing/empty ``vllm_model`` does not raise here: ``chat()`` answers
+        with a user-facing error instead.
+
         Args:
             config: LLM configuration with vllm_model, vllm_base_url, timeout_s.
 
         Raises:
             ImportError: If the ``openai`` package is not installed.
-            ValueError: If vllm_model is empty/None.
         """
         try:
             import openai
@@ -86,10 +103,7 @@ class VLLMClient:
             )
             raise ImportError(msg) from exc
 
-        if not config.vllm_model:
-            msg = "VLLMClient requires llm.vllm_model to be set in config."
-            raise ValueError(msg)
-        self._model = config.vllm_model
+        self._model = config.vllm_model or ""
         self._timeout_s = config.timeout_s
         self._max_tokens = config.max_response_tokens
         self._base_url = config.vllm_base_url
@@ -118,12 +132,16 @@ class VLLMClient:
             Parsed LLMResponse.
 
         Raises:
-            LLMError: On API errors, connection failures, or timeouts.
+            LLMError: User-facing when the model is missing, the endpoint is
+                starting/unreachable, the model is unknown (404), the rate limit
+                is hit or the endpoint fails (5xx); internal otherwise.
             ValueError: If stream=True is passed.
         """
         if stream:
             msg = "Streaming not yet supported for vLLM provider"
             raise ValueError(msg)
+        if not self._model:
+            raise missing_model_error(_LABEL)
 
         import openai
 
@@ -143,26 +161,26 @@ class VLLMClient:
 
         try:
             response = await self._client.chat.completions.create(**kwargs)
-        except (openai.APIConnectionError, openai.APITimeoutError) as exc:
-            # The local server may still be loading the model, or be down. Surface
-            # a friendly message; never leak the SDK cause/body (exc is dropped).
+        except openai.APIConnectionError:
+            # Also covers APITimeoutError (a subclass). The local server may still
+            # be loading the model, or be down. Surface a friendly message; raised
+            # ``from None`` so the SDK cause/body never travels with the error.
             raise LLMError(
                 message=_VLLM_UNAVAILABLE_MESSAGE,
                 status_code=None,
-            ) from exc
-        except openai.RateLimitError as exc:
-            raise LLMError(
-                message="vLLM endpoint rate limit exceeded",
-                status_code=429,
-            ) from exc
+                user_facing=True,
+            ) from None
         except openai.APIStatusError as exc:
             # exc.message is the endpoint's own error description — not the request
-            # body and does not contain conversation content — safe to include.
+            # body and does not contain conversation content. It only reaches the
+            # internal (log-only) message; user-facing messages are fixed. No
+            # key_env: vLLM has no key, so 401/403 stay internal.
             api_error = strip_control_chars(str(exc.message))[:500]
-            raise LLMError(
-                message=f"vLLM endpoint returned HTTP {exc.status_code}: {api_error}",
-                status_code=exc.status_code,
-            ) from exc
+            raise provider_status_error(
+                _LABEL,
+                exc.status_code,
+                internal_message=f"vLLM endpoint returned HTTP {exc.status_code}: {api_error}",
+            ) from None
 
         # Extract the first choice
         if not response.choices:

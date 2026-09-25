@@ -9,6 +9,10 @@ covering:
 - Tool module imports: missing modules skipped, other errors re-raised
 - AgentConfig wiring from config.limits fields
 - Security invariants: no eval/exec/compile/shell=True, no secrets in logs
+- GH-142: the provider → egress-host map includes ``api.infomaniak.com``; the
+  Infomaniak startup check warns on a missing token and logs (never raises on)
+  a product-id resolution failure; the Agent's model_name falls back to the
+  provider name when no model is set.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -21,11 +25,16 @@ from __future__ import annotations
 import ast
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
+import admino.main as main_module
+from admino.config import LLMConfig
+from admino.llm import LLMError
 from admino.main import _async_startup, _configure_logging, _import_tool_modules, main
 
 # ---------------------------------------------------------------------------
@@ -464,6 +473,17 @@ class TestAgentConfigWiring:
 
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["model_name"] == "llama3:8b"
+
+    def test_agent_model_name_falls_back_to_provider_when_unset(
+        self, mock_deps: dict[str, Any]
+    ) -> None:
+        """With no model set, model_name is the provider name (audit needs a non-empty name)."""
+        mock_deps["config"].llm.active_model_name = ""
+        mock_deps["config"].llm.provider = "anthropic"
+
+        main(config_path=Path("c.yaml"))
+
+        assert mock_deps["Agent"].call_args.kwargs["model_name"] == "anthropic"
 
     def test_agent_receives_llm_client(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the LLM client instance from create_llm_client."""
@@ -926,3 +946,197 @@ def _get_attr_chain(node: ast.Attribute) -> str:
     if isinstance(current, ast.Name):
         parts.append(current.id)
     return ".".join(reversed(parts))
+
+
+# ---------------------------------------------------------------------------
+# GH-142: provider egress check
+# ---------------------------------------------------------------------------
+
+
+def _egress_config(provider: str, hosts: list[str]) -> Any:
+    """A minimal config exposing llm.provider and egress.allowed_hosts."""
+    return SimpleNamespace(
+        llm=SimpleNamespace(provider=provider),
+        egress=SimpleNamespace(allowed_hosts=hosts),
+    )
+
+
+class TestProviderEgressCheck:
+    """The startup check maps each cloud provider to the host it must reach."""
+
+    def test_provider_egress_hosts_include_infomaniak(self) -> None:
+        """infomaniak → api.infomaniak.com."""
+        assert main_module._PROVIDER_EGRESS_HOSTS["infomaniak"] == "api.infomaniak.com"
+
+    def test_provider_egress_hosts_keep_cloud_providers(self) -> None:
+        """anthropic / openai keep their API hosts."""
+        hosts = main_module._PROVIDER_EGRESS_HOSTS
+        assert hosts["anthropic"] == "api.anthropic.com"
+        assert hosts["openai"] == "api.openai.com"
+
+    @pytest.mark.parametrize(
+        ("provider", "host"),
+        [
+            ("infomaniak", "api.infomaniak.com"),
+            ("anthropic", "api.anthropic.com"),
+            ("openai", "api.openai.com"),
+        ],
+    )
+    def test_warn_missing_provider_egress_warns_when_host_missing(
+        self, caplog: pytest.LogCaptureFixture, provider: str, host: str
+    ) -> None:
+        """A provider whose host is not whitelisted logs a WARNING naming the host."""
+        config = _egress_config(provider, ["www.googleapis.com"])
+        with caplog.at_level(logging.WARNING):
+            main_module._warn_missing_provider_egress(config)
+        assert any(
+            host in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+
+    def test_warn_missing_provider_egress_silent_when_host_present(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No warning when api.infomaniak.com is whitelisted."""
+        config = _egress_config("infomaniak", ["www.googleapis.com", "api.infomaniak.com"])
+        with caplog.at_level(logging.WARNING):
+            main_module._warn_missing_provider_egress(config)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_warn_missing_provider_egress_silent_for_vllm(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """vLLM is internal to the Docker network — no egress warning."""
+        config = _egress_config("vllm", [])
+        with caplog.at_level(logging.WARNING):
+            main_module._warn_missing_provider_egress(config)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_main_runs_provider_egress_check(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """main() delegates the egress warning to _warn_missing_provider_egress(config)."""
+        spy = MagicMock()
+        monkeypatch.setattr("admino.main._warn_missing_provider_egress", spy)
+
+        main(config_path=Path("c.yaml"))
+
+        spy.assert_called_once_with(mock_deps["config"])
+
+
+# ---------------------------------------------------------------------------
+# GH-142: Infomaniak startup check
+# ---------------------------------------------------------------------------
+
+_IK_TOKEN = "ik-startup-token-SECRET-91ab"
+
+
+@pytest.fixture()
+def offline_infomaniak(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Import admino.llm_infomaniak with its HTTP seam failing on any request."""
+    from admino import llm_infomaniak
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail(f"unexpected network request to {request.url.host}")
+
+    def _factory(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+    monkeypatch.setattr(llm_infomaniak, "_new_http_client", _factory)
+    monkeypatch.delenv("INFOMANIAK_PRODUCT_ID", raising=False)
+    return llm_infomaniak
+
+
+class TestInfomaniakStartupCheck:
+    """_check_infomaniak_startup(client): warn/log only — never raise, never exit."""
+
+    async def test_check_missing_token_warns_and_skips_discovery(
+        self,
+        offline_infomaniak: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """No token → WARNING naming INFOMANIAK_API_TOKEN; no product discovery attempted."""
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        client = offline_infomaniak.InfomaniakClient(LLMConfig(provider="infomaniak"))
+        resolve = AsyncMock(return_value="7539")
+        monkeypatch.setattr(client, "resolve_product_id", resolve)
+
+        with caplog.at_level(logging.DEBUG):
+            await main_module._check_infomaniak_startup(client)
+
+        resolve.assert_not_awaited()
+        assert any(
+            "INFOMANIAK_API_TOKEN" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+
+    async def test_check_resolution_error_logged_not_raised(
+        self,
+        offline_infomaniak: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Several products → ERROR asking for INFOMANIAK_PRODUCT_ID; the app keeps booting."""
+        monkeypatch.setenv("INFOMANIAK_API_TOKEN", _IK_TOKEN)
+        client = offline_infomaniak.InfomaniakClient(LLMConfig(provider="infomaniak"))
+        message = (
+            "Several Infomaniak AI products were found; set INFOMANIAK_PRODUCT_ID on the server."
+        )
+        resolve = AsyncMock(side_effect=LLMError(message, None, user_facing=True))
+        monkeypatch.setattr(client, "resolve_product_id", resolve)
+
+        with caplog.at_level(logging.DEBUG):
+            await main_module._check_infomaniak_startup(client)
+
+        resolve.assert_awaited_once()
+        errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+        assert any("INFOMANIAK_PRODUCT_ID" in m for m in errors)
+        assert _IK_TOKEN not in caplog.text
+
+    async def test_check_success_logs_no_error(
+        self,
+        offline_infomaniak: Any,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A resolvable product id → no ERROR/WARNING about Infomaniak setup; token not logged."""
+        monkeypatch.setenv("INFOMANIAK_API_TOKEN", _IK_TOKEN)
+        client = offline_infomaniak.InfomaniakClient(LLMConfig(provider="infomaniak"))
+        resolve = AsyncMock(return_value="7539")
+        monkeypatch.setattr(client, "resolve_product_id", resolve)
+
+        with caplog.at_level(logging.DEBUG):
+            await main_module._check_infomaniak_startup(client)
+
+        resolve.assert_awaited_once()
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert _IK_TOKEN not in caplog.text
+
+
+class TestMainInfomaniakWiring:
+    """main() runs the Infomaniak startup check when that provider is active."""
+
+    @staticmethod
+    def _asyncio_run_targets(mock_deps: dict[str, Any]) -> list[str]:
+        """Names of the coroutines main() handed to asyncio.run()."""
+        return [
+            getattr(call.args[0], "__name__", "")
+            for call in mock_deps["asyncio"].run.call_args_list
+        ]
+
+    def test_main_runs_infomaniak_startup_check(
+        self, mock_deps: dict[str, Any], offline_infomaniak: Any
+    ) -> None:
+        """provider=infomaniak → asyncio.run(_check_infomaniak_startup(client)) after the client."""
+        mock_deps["config"].llm.provider = "infomaniak"
+        mock_deps["create_llm_client"].return_value = MagicMock(
+            spec=offline_infomaniak.InfomaniakClient
+        )
+
+        main(config_path=Path("c.yaml"))
+
+        assert "_check_infomaniak_startup" in self._asyncio_run_targets(mock_deps)
+        mock_deps["uvicorn_run"].assert_called_once()

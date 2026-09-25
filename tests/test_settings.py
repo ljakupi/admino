@@ -6,6 +6,9 @@ Covers:
 - Auth enforcement on both endpoints
 - Adversarial inputs: oversized values, SQL injection, wrong types
 - Immutable fields (server section) cannot be changed via PATCH
+- GH-142: the Infomaniak provider (model, token-configured flag, live model
+  list), re-init rules for infomaniak_model, and switching to a provider whose
+  key is missing now succeeds (chat explains what to set)
 
 Security notes:
 - All tests use mocked database and config — no real DB or API calls.
@@ -30,6 +33,7 @@ from admino.server import create_app
 # ---------------------------------------------------------------------------
 
 _TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"  # >48 chars, >20 unique
+_INFOMANIAK_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
 _AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 
 # Default settings returned by mocked load_settings_from_db.
@@ -59,6 +63,9 @@ _DEFAULT_DB_SETTINGS: dict[str, Any] = {
 def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> MagicMock:
     """Build a minimal mock AppConfig for settings tests."""
     config = MagicMock()
+    # Concrete (str) model so the live-config fallback for infomaniak_model is
+    # realistic rather than a MagicMock attribute.
+    config.llm.infomaniak_model = _INFOMANIAK_MODEL
     config.auth.mode = auth_mode
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
@@ -637,47 +644,11 @@ class TestPatchSettings:
         assert updated_llm["provider"] == "openai"
         assert updated_llm["openai_model"] == "gpt-4o"
 
-    async def test_patch_settings_to_openai_without_key_returns_400_with_readable_detail(
-        self,
-    ) -> None:
-        """PATCH to 'openai' with no key returns 400 with a readable detail list.
+    async def test_patch_settings_to_openai_without_key_returns_200(self) -> None:
+        """PATCH to 'openai' with no key now succeeds (GH-142 — chat explains what to set).
 
-        GH-115 regression lock: the backend correctly rejects the switch and
-        returns a structured ``detail`` list whose message names OPENAI_API_KEY,
-        so the frontend has a human-readable reason to render (the real bug is
-        the frontend discarding this detail).
-        """
-        app = _make_app()
-        mock_update = AsyncMock()
-        mock_load = _mock_load_settings()
-        mock_create_llm = MagicMock()
-
-        # Empty string is falsy → treated as unset by validate_provider_requirements.
-        env = {"OPENAI_API_KEY": ""}
-        with (
-            patch("admino.database.get_pool", _mock_get_pool()),
-            patch("admino.database.load_settings_from_db", mock_load),
-            patch("admino.database.update_setting", mock_update),
-            patch("admino.llm.create_llm_client", mock_create_llm),
-            patch.dict("os.environ", env, clear=False),
-        ):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch(
-                    "/api/settings",
-                    headers=_AUTH_HEADER,
-                    json={"llm": {"provider": "openai"}},
-                )
-
-        assert resp.status_code == 400
-        detail = resp.json()["detail"]
-        assert isinstance(detail, list)
-        assert any("OPENAI_API_KEY" in item["msg"] for item in detail)
-
-    async def test_patch_settings_to_openai_without_key_does_not_persist(self) -> None:
-        """A rejected 'openai' switch must not persist the llm section.
-
-        GH-115 regression lock: validation fails before ``update_setting`` runs,
-        so no 'llm' write reaches the DB when the key is missing.
+        Supersedes the GH-115 400 lock: a missing key no longer blocks a
+        provider switch for any provider.
         """
         app = _make_app()
         mock_update = AsyncMock()
@@ -699,8 +670,60 @@ class TestPatchSettings:
                     json={"llm": {"provider": "openai"}},
                 )
 
-        assert resp.status_code == 400
-        assert not any(call[0][1] == "llm" for call in mock_update.call_args_list)
+        assert resp.status_code == 200
+
+    async def test_patch_settings_to_openai_without_key_persists_and_reinits(self) -> None:
+        """The keyless 'openai' switch is persisted and the client is rebuilt (GH-142)."""
+        app = _make_app()
+        mock_update = AsyncMock()
+        mock_load = _mock_load_settings()
+        mock_create_llm = MagicMock()
+
+        env = {"OPENAI_API_KEY": ""}
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", mock_load),
+            patch("admino.database.update_setting", mock_update),
+            patch("admino.llm.create_llm_client", mock_create_llm),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "openai"}},
+                )
+
+        assert resp.status_code == 200
+        llm_calls = [call for call in mock_update.call_args_list if call[0][1] == "llm"]
+        assert len(llm_calls) == 1
+        assert llm_calls[0][0][2]["provider"] == "openai"
+        mock_create_llm.assert_called_once()
+
+    async def test_patch_settings_to_anthropic_without_key_returns_200(self) -> None:
+        """PATCH to 'anthropic' with no key also succeeds now (GH-142)."""
+        app = _make_app()
+        db_settings = dict(_DEFAULT_DB_SETTINGS)
+        db_settings["llm"] = {
+            "provider": "openai",
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+        }
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(db_settings)),
+            patch("admino.database.update_setting", AsyncMock()),
+            patch("admino.llm.create_llm_client", MagicMock()),
+            patch.dict("os.environ", {"ANTHROPIC_API_KEY": ""}, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"llm": {"provider": "anthropic"}},
+                )
+
+        assert resp.status_code == 200
 
     async def test_patch_settings_to_anthropic_with_key_returns_200(self) -> None:
         """Switching back to 'anthropic' with a key set still returns 200.
@@ -853,6 +876,319 @@ class TestPatchSettings:
 
         assert resp.status_code == 200
         mock_update.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# GH-142: Infomaniak provider in the Settings API
+# ---------------------------------------------------------------------------
+
+
+def _infomaniak_db_settings(**llm_overrides: Any) -> dict[str, Any]:
+    """DB settings whose llm section selects infomaniak."""
+    settings = dict(_DEFAULT_DB_SETTINGS)
+    llm: dict[str, Any] = {
+        "provider": "infomaniak",
+        "anthropic_model": "claude-sonnet-4-6",
+        "openai_model": "gpt-4o",
+        "vllm_model": "mlx-community/gemma-4-12B-it-4bit",
+        "infomaniak_model": _INFOMANIAK_MODEL,
+    }
+    llm.update(llm_overrides)
+    settings["llm"] = llm
+    return settings
+
+
+def _live_infomaniak_client(models: list[str]) -> MagicMock:
+    """A stand-in for a live InfomaniakClient whose list_models() returns ``models``."""
+    from admino.llm_infomaniak import InfomaniakClient
+
+    live = MagicMock(spec=InfomaniakClient)
+    live.list_models = AsyncMock(return_value=models)
+    live.close = AsyncMock()
+    return live
+
+
+class TestInfomaniakSettingsGet:
+    """GET /api/settings surfaces the Infomaniak provider state (never the token)."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def _get(self, app: Any, settings: dict[str, Any], env: dict[str, str]) -> Any:
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(settings)),
+            patch.dict("os.environ", env, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                return await c.get("/api/settings", headers=_AUTH_HEADER)
+
+    async def test_get_settings_reports_infomaniak_provider_and_model(self) -> None:
+        """provider='infomaniak' and infomaniak_model come back from the DB."""
+        from admino import server
+
+        agent = MagicMock()
+        agent._llm = _live_infomaniak_client([])
+        app = _make_app(agent=agent)
+        assert server._config is not None
+        server._config.llm.provider = "infomaniak"
+
+        settings = _infomaniak_db_settings(infomaniak_model="mistralai/Mistral-Small-3.2")
+        resp = await self._get(app, settings, {"INFOMANIAK_API_TOKEN": ""})
+
+        assert resp.status_code == 200
+        llm = resp.json()["llm"]
+        assert llm["provider"] == "infomaniak"
+        assert llm["infomaniak_model"] == "mistralai/Mistral-Small-3.2"
+
+    async def test_get_settings_infomaniak_model_falls_back_to_live_config(self) -> None:
+        """Without a DB value, infomaniak_model falls back to the live config."""
+        app = _make_app()
+        settings = dict(_DEFAULT_DB_SETTINGS)  # no infomaniak_model stored
+        resp = await self._get(app, settings, {})
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["infomaniak_model"] == _INFOMANIAK_MODEL
+
+    async def test_get_settings_infomaniak_token_configured_true(self) -> None:
+        """infomaniak_token_configured is True when INFOMANIAK_API_TOKEN is set."""
+        app = _make_app()
+        resp = await self._get(
+            app, _infomaniak_db_settings(), {"INFOMANIAK_API_TOKEN": "ik-get-token-marker"}
+        )
+        assert resp.json()["llm"]["infomaniak_token_configured"] is True
+
+    async def test_get_settings_infomaniak_token_configured_false(self) -> None:
+        """infomaniak_token_configured is False when INFOMANIAK_API_TOKEN is empty/unset."""
+        app = _make_app()
+        resp = await self._get(app, _infomaniak_db_settings(), {"INFOMANIAK_API_TOKEN": ""})
+        assert resp.json()["llm"]["infomaniak_token_configured"] is False
+
+    async def test_get_settings_never_returns_infomaniak_token(self) -> None:
+        """The token value never appears anywhere in the response."""
+        from admino import server
+
+        secret = "ik-SETTINGS-TOKEN-VALUE-MARKER-5e2f"
+        agent = MagicMock()
+        agent._llm = _live_infomaniak_client([_INFOMANIAK_MODEL])
+        app = _make_app(agent=agent)
+        assert server._config is not None
+        server._config.llm.provider = "infomaniak"
+
+        resp = await self._get(app, _infomaniak_db_settings(), {"INFOMANIAK_API_TOKEN": secret})
+
+        assert resp.status_code == 200
+        assert secret not in resp.text
+
+    async def test_get_settings_infomaniak_available_models_from_live_client(self) -> None:
+        """With infomaniak active, the list comes from the live client, allowlist-filtered."""
+        from admino import server
+
+        agent = MagicMock()
+        agent._llm = _live_infomaniak_client(
+            [_INFOMANIAK_MODEL, "bad id; rm -rf /", "mistralai/Mistral-Small-3.2"]
+        )
+        app = _make_app(agent=agent)
+        assert server._config is not None
+        server._config.llm.provider = "infomaniak"
+
+        resp = await self._get(app, _infomaniak_db_settings(), {"INFOMANIAK_API_TOKEN": "t"})
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["infomaniak_available_models"] == [
+            _INFOMANIAK_MODEL,
+            "mistralai/Mistral-Small-3.2",
+        ]
+        agent._llm.list_models.assert_awaited_once()
+
+    async def test_get_settings_infomaniak_available_models_empty_for_other_provider(
+        self,
+    ) -> None:
+        """When another provider is active, the list is [] and no listing is attempted."""
+        from admino import server
+
+        agent = MagicMock()
+        agent._llm = _live_infomaniak_client([_INFOMANIAK_MODEL])
+        app = _make_app(agent=agent)
+        assert server._config is not None
+        server._config.llm.provider = "anthropic"
+
+        settings = dict(_DEFAULT_DB_SETTINGS)  # provider: anthropic
+        resp = await self._get(app, settings, {})
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["infomaniak_available_models"] == []
+        agent._llm.list_models.assert_not_awaited()
+
+    async def test_get_settings_infomaniak_available_models_empty_without_live_client(
+        self,
+    ) -> None:
+        """infomaniak active but the live client is not an InfomaniakClient → []."""
+        from admino import server
+
+        agent = MagicMock()
+        agent._llm = MagicMock()
+        agent._llm.list_models = AsyncMock(return_value=[_INFOMANIAK_MODEL])
+        app = _make_app(agent=agent)
+        assert server._config is not None
+        server._config.llm.provider = "infomaniak"
+
+        resp = await self._get(app, _infomaniak_db_settings(), {})
+
+        assert resp.status_code == 200
+        assert resp.json()["llm"]["infomaniak_available_models"] == []
+
+
+class TestInfomaniakSettingsPatch:
+    """PATCH /api/settings accepts the Infomaniak provider and model."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def _patch(
+        self,
+        app: Any,
+        settings: dict[str, Any],
+        body: dict[str, Any],
+        *,
+        update: AsyncMock | None = None,
+        create_llm: MagicMock | None = None,
+    ) -> Any:
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(settings)),
+            patch("admino.database.update_setting", update or AsyncMock()),
+            patch("admino.llm.create_llm_client", create_llm or MagicMock()),
+            patch.dict("os.environ", {"INFOMANIAK_API_TOKEN": ""}, clear=False),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                return await c.patch("/api/settings", headers=_AUTH_HEADER, json=body)
+
+    async def test_patch_settings_to_infomaniak_returns_200_and_persists(self) -> None:
+        """Switching to 'infomaniak' (even without a token) succeeds and is persisted."""
+        app = _make_app()
+        update = AsyncMock()
+
+        resp = await self._patch(
+            app, dict(_DEFAULT_DB_SETTINGS), {"llm": {"provider": "infomaniak"}}, update=update
+        )
+
+        assert resp.status_code == 200
+        llm_calls = [call for call in update.call_args_list if call[0][1] == "llm"]
+        assert len(llm_calls) == 1
+        assert llm_calls[0][0][2]["provider"] == "infomaniak"
+
+    async def test_patch_settings_to_infomaniak_reinits_client(self) -> None:
+        """A provider change to infomaniak rebuilds the agent's LLM client."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+        new_client = MagicMock()
+        new_client.close = AsyncMock()
+        create_llm = MagicMock(return_value=new_client)
+
+        resp = await self._patch(
+            app,
+            dict(_DEFAULT_DB_SETTINGS),
+            {"llm": {"provider": "infomaniak"}},
+            create_llm=create_llm,
+        )
+
+        assert resp.status_code == 200
+        create_llm.assert_called_once()
+        assert create_llm.call_args.args[0].provider == "infomaniak"
+        assert agent._llm is new_client
+
+    async def test_patch_settings_infomaniak_model_change_reinits_client(self) -> None:
+        """Changing infomaniak_model while infomaniak is active rebuilds the client."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+        new_client = MagicMock()
+        new_client.close = AsyncMock()
+        create_llm = MagicMock(return_value=new_client)
+        update = AsyncMock()
+
+        resp = await self._patch(
+            app,
+            _infomaniak_db_settings(),
+            {"llm": {"infomaniak_model": "mistralai/Mistral-Small-3.2"}},
+            update=update,
+            create_llm=create_llm,
+        )
+
+        assert resp.status_code == 200
+        create_llm.assert_called_once()
+        assert create_llm.call_args.args[0].infomaniak_model == "mistralai/Mistral-Small-3.2"
+        assert agent._llm is new_client
+        llm_calls = [call for call in update.call_args_list if call[0][1] == "llm"]
+        assert llm_calls[0][0][2]["infomaniak_model"] == "mistralai/Mistral-Small-3.2"
+
+    async def test_patch_settings_infomaniak_model_noop_does_not_reinit(self) -> None:
+        """Re-sending the same infomaniak_model does not rebuild the client."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+        create_llm = MagicMock()
+
+        resp = await self._patch(
+            app,
+            _infomaniak_db_settings(),
+            {"llm": {"infomaniak_model": _INFOMANIAK_MODEL}},
+            create_llm=create_llm,
+        )
+
+        assert resp.status_code == 200
+        create_llm.assert_not_called()
+        assert agent._llm is old_client
+
+    async def test_patch_settings_infomaniak_model_change_other_provider_no_reinit(
+        self,
+    ) -> None:
+        """Changing infomaniak_model while another provider is active persists it only."""
+        old_client = MagicMock()
+        old_client.close = AsyncMock()
+        agent = MagicMock()
+        agent._llm = old_client
+        app = _make_app(agent=agent)
+        create_llm = MagicMock()
+        update = AsyncMock()
+
+        resp = await self._patch(
+            app,
+            dict(_DEFAULT_DB_SETTINGS),  # provider: anthropic
+            {"llm": {"infomaniak_model": "mistralai/Mistral-Small-3.2"}},
+            update=update,
+            create_llm=create_llm,
+        )
+
+        assert resp.status_code == 200
+        create_llm.assert_not_called()
+        assert agent._llm is old_client
+        llm_calls = [call for call in update.call_args_list if call[0][1] == "llm"]
+        assert llm_calls[0][0][2]["infomaniak_model"] == "mistralai/Mistral-Small-3.2"
+
+    @pytest.mark.parametrize(
+        "bad_model", ["evil; rm -rf /", "model$(id)", "../../etc/passwd", "a" * 201]
+    )
+    async def test_patch_settings_invalid_infomaniak_model_rejected(self, bad_model: str) -> None:
+        """An infomaniak_model with shell metacharacters / over-length is rejected (422)."""
+        app = _make_app()
+        update = AsyncMock()
+
+        resp = await self._patch(
+            app,
+            _infomaniak_db_settings(),
+            {"llm": {"infomaniak_model": bad_model}},
+            update=update,
+        )
+
+        assert resp.status_code == 422
+        assert not any(call[0][1] == "llm" for call in update.call_args_list)
 
 
 # ---------------------------------------------------------------------------

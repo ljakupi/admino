@@ -10,9 +10,18 @@ JSON input. This module translates between admino's tool format
 (``{"type": "function", "function": {...}}``) and
 Anthropic's native format.
 
+Errors (provider label "Claude"): a missing ANTHROPIC_API_KEY or model does not
+fail construction; ``chat()`` raises a user-facing ``LLMError`` ("Claude isn't
+configured; set ANTHROPIC_API_KEY", "No Claude model is set …") instead. SDK
+failures map to the shared catalogue in ``llm.py``: 401/403, 404, 429, any
+status >= 500 (including 529 "overloaded"), timeouts and connection errors
+become fixed user-facing messages; other statuses stay internal
+(``user_facing=False``).
+
 Security notes:
 - API key is read from ANTHROPIC_API_KEY env var, never from config files.
 - No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
+- User-facing error messages are fixed strings: no response body or SDK cause.
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -29,6 +38,9 @@ from admino.llm import (
     LLMError,
     LLMResponse,
     check_args_depth,
+    missing_model_error,
+    not_configured_error,
+    provider_status_error,
     sanitize_content,
     strip_control_chars,
     validate_tools_payload,
@@ -39,6 +51,10 @@ if TYPE_CHECKING:
     from admino.config import LLMConfig
 
 logger = logging.getLogger(__name__)
+
+# Provider label shown in user-facing errors and the env var holding the key.
+_LABEL = "Claude"
+_API_KEY_ENV = "ANTHROPIC_API_KEY"
 
 
 def _dot_to_anthropic_name(name: str) -> str:
@@ -269,6 +285,9 @@ class AnthropicClient:
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the Anthropic client.
 
+        A missing ANTHROPIC_API_KEY or model does not raise here: the state is
+        stored and ``chat()`` answers with a user-facing error instead.
+
         Args:
             config: LLM configuration with anthropic_model and timeout_s.
 
@@ -284,18 +303,12 @@ class AnthropicClient:
             )
             raise ImportError(msg) from exc
 
-        if not config.anthropic_model:
-            msg = "AnthropicClient requires llm.anthropic_model to be set in config."
-            raise ValueError(msg)
-        self._model = config.anthropic_model
-        self._timeout_s = config.timeout_s
+        self._model = config.anthropic_model or ""
         self._max_tokens = config.max_response_tokens
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            raise LLMError(
-                message="ANTHROPIC_API_KEY env var is not set or is empty.",
-                status_code=None,
-            )
+        api_key = os.environ.get(_API_KEY_ENV, "")
+        self._api_key_configured = bool(api_key)
+        # Built even without a key so close() stays uniform; chat() refuses to
+        # send a request until the key is configured.
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key,
             timeout=float(config.timeout_s),
@@ -319,12 +332,18 @@ class AnthropicClient:
             Parsed LLMResponse.
 
         Raises:
-            LLMError: On API errors, connection failures, or timeouts.
+            LLMError: User-facing when the key or model is missing, the key is
+                rejected, the model is unknown, the rate limit is hit, or Claude
+                is unavailable (5xx, timeout, connection); internal otherwise.
             ValueError: If stream=True is passed.
         """
         if stream:
             msg = "Streaming not yet supported for Anthropic provider"
             raise ValueError(msg)
+        if not self._api_key_configured:
+            raise not_configured_error(_LABEL, _API_KEY_ENV)
+        if not self._model:
+            raise missing_model_error(_LABEL)
 
         import anthropic
 
@@ -350,30 +369,24 @@ class AnthropicClient:
 
         try:
             response = await self._client.messages.create(**kwargs)
-        except anthropic.APITimeoutError as exc:
-            raise LLMError(
-                message=f"Anthropic API request timed out after {self._timeout_s}s",
-                status_code=None,
-            ) from exc
-        except anthropic.APIConnectionError as exc:
-            raise LLMError(
-                message="Failed to connect to Anthropic API",
-                status_code=None,
-            ) from exc
-        except anthropic.RateLimitError as exc:
-            raise LLMError(
-                message="Anthropic API rate limit exceeded",
-                status_code=429,
-            ) from exc
+        except anthropic.APIConnectionError:
+            # Also covers APITimeoutError (a subclass). Raised ``from None`` so the
+            # SDK exception (and any response body) never travels with the error.
+            raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
         except anthropic.APIStatusError as exc:
             # exc.message is Anthropic's own error description (e.g. validation
             # errors for invalid tool names). It is NOT the request body and
-            # does not contain conversation content — safe to include in logs.
+            # does not contain conversation content. It only reaches the
+            # internal (log-only) message; user-facing messages are fixed.
+            # Mapping goes by status code, so 529 "overloaded" (a plain
+            # APIStatusError) is treated like any other 5xx.
             api_error = strip_control_chars(str(exc.message))[:500]
-            raise LLMError(
-                message=f"Anthropic API returned HTTP {exc.status_code}: {api_error}",
-                status_code=exc.status_code,
-            ) from exc
+            raise provider_status_error(
+                _LABEL,
+                exc.status_code,
+                key_env=_API_KEY_ENV,
+                internal_message=f"Anthropic API returned HTTP {exc.status_code}: {api_error}",
+            ) from None
 
         # Extract text content
         text_parts: list[str] = []

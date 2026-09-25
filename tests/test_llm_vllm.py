@@ -12,6 +12,12 @@ Mirrors the mocking style of ``tests/test_llm_openai.py`` exactly:
 ``SimpleNamespace`` fake completions and an ``AsyncMock`` patched onto
 ``client._client.chat.completions.create``.
 
+GH-142: a missing/empty ``vllm_model`` no longer fails construction; chat()
+answers "No vLLM model is set … Settings → Agent" instead. Connection/timeout
+failures become user-facing (still "starting or unavailable", now pointing to
+``make start-local``), 404/429/5xx map to the user-facing catalogue, and other
+4xx (including 401/403 — vLLM has no key) stay internal.
+
 All API calls are mocked — no real OpenAI SDK network call is contacted.
 """
 
@@ -23,6 +29,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
 from admino.llm import LLMError, LLMResponse, check_args_depth
@@ -174,11 +182,12 @@ class TestVLLMClientConstructor:
         ):
             VLLMClient(config)
 
-    def test_empty_model_raises_value_error(self) -> None:
-        """An empty vllm_model raises ValueError (mirrors OpenAI's empty-model guard)."""
-        config = _make_llm_config(vllm_model="")
-        with pytest.raises(ValueError, match="model"):
-            VLLMClient(config)
+    @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
+    def test_missing_model_does_not_raise(self, model: str | None) -> None:
+        """An unset vllm_model no longer blocks construction (GH-142); chat() explains."""
+        config = _make_llm_config(vllm_model=model)  # type: ignore[arg-type]
+        client = VLLMClient(config)
+        assert isinstance(client, VLLMClient)
 
     def test_base_url_passed_to_sdk_client(self) -> None:
         """The configured vllm_base_url is passed to AsyncOpenAI(base_url=...)."""
@@ -526,3 +535,140 @@ class TestVLLMAdversarial:
         tc = [_make_openai_tool_call("memory.store", json.dumps(args), "call_01")]
         result = _parse_openai_tool_calls(tc)
         assert len(result) == 1
+
+
+# ---------------------------------------------------------------------------
+# GH-142: user-facing provider errors
+# ---------------------------------------------------------------------------
+
+_VLLM_REQUEST = httpx.Request("POST", "http://vllm:8000/v1/chat/completions")
+
+
+def _status_error(cls: type[Any], status: int, marker: str) -> Any:
+    """Build an openai SDK status error whose body carries a secret marker."""
+    body = {"error": {"message": f"upstream detail {marker}", "type": "BadRequestError"}}
+    response = httpx.Response(status, request=_VLLM_REQUEST, json=body)
+    return cls(f"Error code: {status} - {body}", response=response, body=body)
+
+
+class TestVLLMUserFacingErrors:
+    """Setup/availability problems become friendly chat replies (label "vLLM")."""
+
+    @pytest.fixture()
+    def client(self) -> VLLMClient:
+        with patch.dict("os.environ", {}, clear=True):
+            return _make_client()
+
+    @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
+    async def test_vllm_missing_model_chat_user_facing(self, model: str | None) -> None:
+        """No model → "No vLLM model is set … Settings → Agent", no API call."""
+        client = _make_client(_make_llm_config(vllm_model=model))  # type: ignore[arg-type]
+        create = AsyncMock(return_value=_make_completion())
+        client._client.chat.completions.create = create
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        message = exc_info.value.message
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "No vLLM model is set" in message
+        assert "Settings → Agent" in message
+        create.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        "make_exc",
+        [
+            lambda marker: openai.APITimeoutError(request=_VLLM_REQUEST),
+            lambda marker: openai.APIConnectionError(message=marker, request=_VLLM_REQUEST),
+        ],
+        ids=["timeout", "connection"],
+    )
+    async def test_vllm_unreachable_user_facing_points_to_start_local(
+        self, client: VLLMClient, make_exc: Any
+    ) -> None:
+        """Unreachable/starting vLLM → user-facing, "starting"/"unavailable", make start-local."""
+        marker = "VLLM-TRANSPORT-SECRET"
+        client._client.chat.completions.create = AsyncMock(side_effect=make_exc(marker))
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        message = exc_info.value.message
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "starting" in message.lower() or "unavailable" in message.lower()
+        assert "make start-local" in message
+        assert marker not in message
+
+    @pytest.mark.parametrize(
+        ("cls", "status", "phrases"),
+        [
+            (openai.NotFoundError, 404, ("vLLM", "Settings → Agent")),
+            (openai.RateLimitError, 429, ("vLLM", "rate limit")),
+            (openai.InternalServerError, 500, ("vLLM", "unavailable")),
+            (openai.InternalServerError, 503, ("vLLM", "unavailable")),
+        ],
+        ids=["404", "429", "500", "503"],
+    )
+    async def test_vllm_status_error_user_facing(
+        self,
+        client: VLLMClient,
+        caplog: pytest.LogCaptureFixture,
+        cls: type[Any],
+        status: int,
+        phrases: tuple[str, ...],
+    ) -> None:
+        """404/429/5xx → user-facing fixed message; the body never leaks."""
+        marker = f"VLLM-BODY-SECRET-{status}"
+        client._client.chat.completions.create = AsyncMock(
+            side_effect=_status_error(cls, status, marker)
+        )
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        exc = exc_info.value
+        assert exc.user_facing is True
+        assert exc.status_code == status
+        for phrase in phrases:
+            if phrase in ("rate limit", "unavailable"):
+                assert phrase in exc.message.lower()
+            else:
+                assert phrase in exc.message
+        assert marker not in exc.message
+        assert marker not in caplog.text
+
+    @pytest.mark.parametrize(
+        ("cls", "status"),
+        [
+            (openai.BadRequestError, 400),
+            (openai.AuthenticationError, 401),
+            (openai.PermissionDeniedError, 403),
+            (openai.UnprocessableEntityError, 422),
+        ],
+        ids=["400", "401", "403", "422"],
+    )
+    async def test_vllm_other_4xx_not_user_facing(
+        self, client: VLLMClient, cls: type[Any], status: int
+    ) -> None:
+        """vLLM has no key, so 401/403 are "other 4xx" too: internal, generic reply."""
+        client._client.chat.completions.create = AsyncMock(
+            side_effect=_status_error(cls, status, "detail")
+        )
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        assert exc_info.value.user_facing is False
+        assert exc_info.value.status_code == status
+
+    async def test_vllm_oversized_tools_not_user_facing(self, client: VLLMClient) -> None:
+        """An oversized tools payload is an internal error."""
+        tools = [
+            {"type": "function", "function": {"name": f"tool.action{i}", "parameters": {}}}
+            for i in range(65)
+        ]
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages(), tools=tools)
+        assert exc_info.value.user_facing is False

@@ -4,8 +4,9 @@
 # on invalid config with a clear error message.
 #
 # Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
-# MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, AUTH_TOKEN) are NEVER read
-# from this file — they come from env vars only.
+# MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, AUTH_TOKEN, INFOMANIAK_API_TOKEN,
+# ANTHROPIC_API_KEY, OPENAI_API_KEY) are NEVER read from this file — they come
+# from env vars only.
 
 server:
   host: "0.0.0.0"
@@ -16,24 +17,32 @@ database:
   max_pool_size: 5
 
 llm:
-  # Provider: "vllm" (default, local) is admino's local-first default — a
-  # first-class, OpenAI-compatible local server that runs as a docker-compose
-  # service (CPU, cross-platform: Apple Silicon + Linux). Provision the model
-  # once with `make vllm-pull`, then `make start` (or `make docker-up`) brings
-  # the vllm container up with the rest of the stack. Until the model finishes
-  # loading, admino still boots but a chat reply surfaces a friendly
-  # "model starting/unavailable" error — it is NOT zero-setup.
+  # Provider: "infomaniak" (default) is Infomaniak AI Services, an
+  # OpenAI-compatible API processed in Switzerland; queries are neither recorded
+  # nor used for training. Set INFOMANIAK_API_TOKEN (Infomaniak Manager → API
+  # tokens, scope `ai-tools`) in the environment; INFOMANIAK_PRODUCT_ID is
+  # optional and auto-discovered. Without the token admino still boots and chat
+  # replies explain what to set.
+  # "vllm" (opt-in, local) is a first-class, OpenAI-compatible local server that
+  # runs as a docker-compose CPU container (Apple Silicon + Linux). Start it with
+  # `make start-local` (provisions the model on first run), then select vLLM in
+  # Settings → Agent. Until the model finishes loading, chat replies say it is
+  # starting or unavailable.
   # "anthropic" and "openai" are cloud opt-ins that send your messages to their
-  # servers. Switch to one in Settings → Agent (and set its API key) to chat now.
-  provider: "vllm"
+  # servers. Switch to one in Settings → Agent and set its API key.
+  provider: "infomaniak"
 
   timeout_s: 120
 
-  # vLLM (local) settings. vllm_model is the served model ID; vllm_base_url is
-  # the in-cluster endpoint (the `vllm` compose service on the internal network,
-  # no API key needed). vllm_max_model_len is the model's supported context; the
-  # container is actually launched with VLLM_MAX_MODEL_LEN (default 8192) to
-  # bound CPU KV-cache RAM — raise it if you have the memory.
+  # Infomaniak model ID (choose another one in Settings → Agent).
+  infomaniak_model: "Qwen/Qwen3.5-397B-A17B-FP8"
+
+  # vLLM (local, opt-in) settings. vllm_model is the served model ID;
+  # vllm_base_url is the in-cluster endpoint (the `vllm` compose service on the
+  # internal network, no API key needed). vllm_max_model_len is the model's
+  # supported context; the container is actually launched with
+  # VLLM_MAX_MODEL_LEN (default 8192) to bound CPU KV-cache RAM — raise it if
+  # you have the memory.
   vllm_model: "Qwen/Qwen3-4B-Instruct-2507"
   vllm_base_url: "http://vllm:8000/v1"
   vllm_max_model_len: 32768
@@ -90,8 +99,11 @@ egress:
     # Microsoft Graph API (Outlook, Calendar, OneDrive)
     - "login.microsoftonline.com"
     - "graph.microsoft.com"
-    # LLM provider API — kept whitelisted so switching to the anthropic cloud
-    # opt-in works without an egress edit (the default provider is local vllm).
+    # LLM provider APIs. api.infomaniak.com serves the default provider
+    # (Infomaniak AI Services, incl. product-ID discovery). api.anthropic.com
+    # stays whitelisted so switching to the anthropic cloud opt-in works
+    # without an egress edit. The local vllm service needs no egress entry.
+    - "api.infomaniak.com"
     - "api.anthropic.com"
     # Uncomment when switching llm.provider to openai:
     # - "api.openai.com"

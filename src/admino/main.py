@@ -5,7 +5,10 @@ Startup sequence:
 2. Build the default permissions ruleset (seeds an empty DB on first run).
 3. Configure Python logging from config.log_level.
 4. Open the append-only audit logger.
-5. Create the LLM client.
+5. Create the LLM client, warn if the provider's API host is not in the egress
+   whitelist, and (Infomaniak only) check the token and resolve the product ID.
+   These checks only log: a missing key, model or product ID never stops startup
+   — chat replies explain what to set.
 6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
 7. Instantiate the Agent with all dependencies.
 8. Create the FastAPI app via server.create_app().
@@ -17,6 +20,8 @@ secrets are never included in error output.
 
 Security notes:
 - AUTH_TOKEN is validated at config load time; never logged.
+- Provider credentials (e.g. INFOMANIAK_API_TOKEN) are never logged; only the
+  env var name appears in startup warnings.
 - Audit logger uses base_dir confinement to prevent path traversal.
 - Registry is frozen after tool imports to block dynamic registration.
 - Single-worker uvicorn prevents split-brain session state.
@@ -37,11 +42,13 @@ import uvicorn
 from pydantic import ValidationError
 
 from admino.config import load_app_config
+from admino.llm import LLMError
 from admino.models import AgentConfig, ToolsSettings
 from admino.permissions import build_default_permissions_config
 
 if TYPE_CHECKING:
     from admino.config import AppConfig
+    from admino.llm_infomaniak import InfomaniakClient
     from admino.permissions import PermissionsConfig
 
 logger = logging.getLogger(__name__)
@@ -55,6 +62,14 @@ _DEFAULT_CONFIG_PATH: Final[Path] = _CONFIG_DIR / "config.yaml"
 _VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset(
     {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 )
+
+# API host each cloud LLM provider must reach through the egress whitelist.
+# vLLM is served locally (no egress needed), so it has no entry.
+_PROVIDER_EGRESS_HOSTS: Final[dict[str, str]] = {
+    "infomaniak": "api.infomaniak.com",
+    "anthropic": "api.anthropic.com",
+    "openai": "api.openai.com",
+}
 
 
 def _configure_logging(level_name: str) -> None:
@@ -77,6 +92,57 @@ def _configure_logging(level_name: str) -> None:
         datefmt="%Y-%m-%dT%H:%M:%S%z",
         force=True,
     )
+
+
+def _warn_missing_provider_egress(config: AppConfig) -> None:
+    """Warn when the active LLM provider's API host is not egress-whitelisted.
+
+    Outbound connections to a host missing from ``egress.allowed_hosts`` are
+    blocked by iptables in the Docker deployment, so every chat request would
+    fail. Local providers (vLLM) need no egress and never warn.
+
+    Args:
+        config: Validated application config.
+    """
+    required_host = _PROVIDER_EGRESS_HOSTS.get(config.llm.provider)
+    if required_host and required_host not in config.egress.allowed_hosts:
+        logger.warning(
+            "LLM provider '%s' requires egress to '%s', but it is not in "
+            "egress.allowed_hosts. Outbound connections will be blocked by "
+            "iptables. Add '%s' to egress.allowed_hosts in config.yaml.",
+            config.llm.provider,
+            required_host,
+            required_host,
+        )
+
+
+async def _check_infomaniak_startup(client: InfomaniakClient) -> None:
+    """Report Infomaniak setup problems at startup without blocking it.
+
+    A missing INFOMANIAK_API_TOKEN logs a WARNING (no product discovery is
+    attempted). Otherwise the product ID is resolved (INFOMANIAK_PRODUCT_ID or
+    discovery via the Infomaniak API) and any failure — e.g. several products
+    and no INFOMANIAK_PRODUCT_ID — is logged as an ERROR with the client's fixed
+    message. Never raises and never exits: chat replies explain the same
+    problem to the user. The token value is never logged.
+
+    Args:
+        client: The Infomaniak client created for the active provider.
+    """
+    if not os.environ.get("INFOMANIAK_API_TOKEN", "").strip():
+        logger.warning(
+            "INFOMANIAK_API_TOKEN is not set. admino starts anyway; chat replies "
+            "will ask for it. Create a token with the 'ai-tools' scope in the "
+            "Infomaniak Manager and set it on the server."
+        )
+        return
+    try:
+        await client.resolve_product_id()
+    except LLMError as exc:
+        # exc.message is a fixed catalogue string (never a body or the token).
+        logger.error("Infomaniak startup check failed: %s", exc.message)
+        return
+    logger.info("Infomaniak AI product resolved.")
 
 
 def _import_tool_modules() -> None:
@@ -372,28 +438,22 @@ def main(
     logger.debug("Audit log path: %s", config.paths.audit_log)
 
     # ------------------------------------------------------------------
-    # 5. Create the LLM client (Anthropic or OpenAI)
+    # 5. Create the LLM client, then run the provider setup checks
     # ------------------------------------------------------------------
+    # The factory never raises for a missing key or model; these checks only
+    # log (warnings/errors) so the app always boots and chat explains the fix.
     from admino.llm import create_llm_client
 
     llm_client = create_llm_client(config.llm)
     logger.info("LLM client configured (provider=%s).", config.llm.provider)
 
-    # Warn if proprietary provider's API host is missing from egress whitelist
-    provider_hosts: dict[str, str] = {
-        "anthropic": "api.anthropic.com",
-        "openai": "api.openai.com",
-    }
-    required_host = provider_hosts.get(config.llm.provider)
-    if required_host and required_host not in config.egress.allowed_hosts:
-        logger.warning(
-            "LLM provider '%s' requires egress to '%s', but it is not in "
-            "egress.allowed_hosts. Outbound connections will be blocked by "
-            "iptables. Add '%s' to egress.allowed_hosts in config.yaml.",
-            config.llm.provider,
-            required_host,
-            required_host,
-        )
+    _warn_missing_provider_egress(config)
+
+    if config.llm.provider == "infomaniak":
+        from admino.llm_infomaniak import InfomaniakClient
+
+        if isinstance(llm_client, InfomaniakClient):
+            asyncio.run(_check_infomaniak_startup(llm_client))
 
     # ------------------------------------------------------------------
     # 6. Configure and import tool modules, then freeze the registry
@@ -432,13 +492,16 @@ def main(
     from admino.agent import Agent
 
     system_prompt = _build_system_prompt(config, permissions_config)
+    # Audit entries need a non-empty model name; fall back to the provider
+    # name when no model is set (chat then asks the user to choose one).
+    model_name = config.llm.active_model_name or config.llm.provider
 
     agent = Agent(
         llm_client=llm_client,
         audit_logger=audit_logger,
         permissions_config=permissions_config,
         agent_config=agent_config,
-        model_name=config.llm.active_model_name,
+        model_name=model_name,
         system_prompt=system_prompt,
         # GH-80: seed the per-tool gate from persisted DB state so services
         # the user toggled off stay off immediately on boot.
@@ -448,7 +511,7 @@ def main(
 
     logger.info(
         "Agent initialized with model %s (provider=%s)",
-        strip_control_chars(config.llm.active_model_name),
+        strip_control_chars(model_name),
         config.llm.provider,
     )
 

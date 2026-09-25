@@ -4,6 +4,12 @@ Covers message conversion, tool format conversion, tool call parsing,
 client construction, chat method, error handling, context manager,
 and adversarial/security edge cases.
 
+GH-142: a missing ANTHROPIC_API_KEY or model no longer fails construction;
+chat() answers with a friendly, user-facing ``LLMError`` (label "Claude")
+instead, and SDK errors map to the fixed user-facing catalogue
+(401/403/404/429/5xx incl. 529 overloaded/timeout/connection) while other 4xx
+stay internal (``user_facing=False``).
+
 All API calls are mocked — no real Anthropic API is contacted.
 """
 
@@ -14,6 +20,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anthropic
+import httpx
 import pytest
 
 from admino.llm import LLMError, LLMResponse, check_args_depth
@@ -32,13 +40,23 @@ from admino.models import LLMMessage
 # ---------------------------------------------------------------------------
 
 
-def _make_llm_config() -> Any:
+def _make_llm_config(anthropic_model: str | None = "claude-sonnet-4-6") -> Any:
     """Create a fake LLMConfig for testing."""
     return SimpleNamespace(
-        anthropic_model="claude-sonnet-4-6",
+        anthropic_model=anthropic_model,
         timeout_s=30,
         max_response_tokens=4096,
     )
+
+
+_ANTHROPIC_REQUEST = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+
+
+def _status_error(cls: type[Any], status: int, marker: str) -> Any:
+    """Build an anthropic SDK status error whose body carries a secret marker."""
+    body = {"type": "error", "error": {"type": "api_error", "message": f"detail {marker}"}}
+    response = httpx.Response(status, request=_ANTHROPIC_REQUEST, json=body)
+    return cls(f"Error code: {status} - {body}", response=response, body=body)
 
 
 def _make_messages(content: str = "Hi") -> list[LLMMessage]:
@@ -539,23 +557,26 @@ class TestParseAnthropicToolCalls:
 class TestAnthropicClientConstructor:
     """Tests for AnthropicClient.__init__."""
 
-    def test_missing_api_key_raises_llm_error(self) -> None:
-        """Missing ANTHROPIC_API_KEY env var raises LLMError."""
-        config = _make_llm_config()
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            pytest.raises(LLMError, match="ANTHROPIC_API_KEY"),
-        ):
-            AnthropicClient(config)
+    def test_missing_api_key_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A missing ANTHROPIC_API_KEY no longer blocks construction (GH-142)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        client = AnthropicClient(_make_llm_config())
+        assert isinstance(client, AnthropicClient)
 
-    def test_empty_api_key_raises_llm_error(self) -> None:
-        """Empty ANTHROPIC_API_KEY env var raises LLMError."""
-        config = _make_llm_config()
-        with (
-            patch.dict("os.environ", {"ANTHROPIC_API_KEY": ""}),
-            pytest.raises(LLMError, match="ANTHROPIC_API_KEY"),
-        ):
-            AnthropicClient(config)
+    def test_empty_api_key_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty ANTHROPIC_API_KEY no longer blocks construction (GH-142)."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+        client = AnthropicClient(_make_llm_config())
+        assert isinstance(client, AnthropicClient)
+
+    @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
+    def test_missing_model_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, model: str | None
+    ) -> None:
+        """An unset anthropic_model no longer blocks construction (GH-142)."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        client = AnthropicClient(_make_llm_config(anthropic_model=model))
+        assert isinstance(client, AnthropicClient)
 
     def test_missing_sdk_raises_import_error(self) -> None:
         """Missing anthropic package raises ImportError with helpful message."""
@@ -689,35 +710,31 @@ class TestAnthropicClientChat:
         assert call_kwargs.kwargs.get("system") == "Be helpful"
 
     async def test_api_timeout_error(self, client: AnthropicClient) -> None:
-        """API timeout raises LLMError."""
-        import anthropic
-
+        """API timeout → user-facing "temporarily unavailable" (GH-142)."""
         client._client.messages.create = AsyncMock(
             side_effect=anthropic.APITimeoutError(request=MagicMock())
         )
 
         with pytest.raises(LLMError) as exc_info:
             await client.chat(_make_messages())
-        assert "timed out" in exc_info.value.message
+        assert "temporarily unavailable" in exc_info.value.message
         assert exc_info.value.status_code is None
+        assert exc_info.value.user_facing is True
 
     async def test_api_connection_error(self, client: AnthropicClient) -> None:
-        """Connection error raises LLMError."""
-        import anthropic
-
+        """Connection error → user-facing "temporarily unavailable" (GH-142)."""
         client._client.messages.create = AsyncMock(
             side_effect=anthropic.APIConnectionError(request=MagicMock())
         )
 
         with pytest.raises(LLMError) as exc_info:
             await client.chat(_make_messages())
-        assert "connect" in exc_info.value.message.lower()
+        assert "temporarily unavailable" in exc_info.value.message
         assert exc_info.value.status_code is None
+        assert exc_info.value.user_facing is True
 
     async def test_rate_limit_error(self, client: AnthropicClient) -> None:
         """Rate limit error raises LLMError with status_code=429."""
-        import anthropic
-
         mock_response = MagicMock()
         mock_response.status_code = 429
         mock_response.headers = {}
@@ -734,9 +751,7 @@ class TestAnthropicClientChat:
         assert exc_info.value.status_code == 429
 
     async def test_api_status_error(self, client: AnthropicClient) -> None:
-        """Generic API status error raises LLMError with status code."""
-        import anthropic
-
+        """A 500 → user-facing fixed message; the SDK detail is no longer embedded (GH-142)."""
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_response.headers = {}
@@ -751,8 +766,9 @@ class TestAnthropicClientChat:
         with pytest.raises(LLMError) as exc_info:
             await client.chat(_make_messages())
         assert exc_info.value.status_code == 500
-        assert "500" in exc_info.value.message
-        assert "Internal error" in exc_info.value.message  # SDK error detail included
+        assert exc_info.value.user_facing is True
+        assert "temporarily unavailable" in exc_info.value.message
+        assert "Internal error" not in exc_info.value.message
 
     async def test_done_true_when_no_tool_use(self, client: AnthropicClient) -> None:
         """done=True when stop_reason is not 'tool_use'."""
@@ -1015,3 +1031,179 @@ class TestAnthropicValidateToolsPayload:
 
         call_kwargs = client._client.messages.create.call_args
         assert call_kwargs.kwargs.get("max_tokens") == 4096
+
+
+# ---------------------------------------------------------------------------
+# GH-142: user-facing provider errors
+# ---------------------------------------------------------------------------
+
+
+def _mocked_client(
+    model: str | None = "claude-sonnet-4-6",
+) -> tuple[AnthropicClient, AsyncMock]:
+    """An AnthropicClient whose SDK messages.create() is an AsyncMock text reply."""
+    client = AnthropicClient(_make_llm_config(anthropic_model=model))
+    create = AsyncMock(return_value=_make_response())
+    client._client = MagicMock()
+    client._client.messages.create = create
+    client._client.close = AsyncMock()
+    return client, create
+
+
+class TestAnthropicUserFacingErrors:
+    """Setup/availability problems become friendly chat replies (label "Claude")."""
+
+    @pytest.mark.parametrize("key", [None, ""], ids=["unset", "empty"])
+    async def test_claude_missing_key_chat_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, key: str | None
+    ) -> None:
+        """No key → "Claude isn't configured; set ANTHROPIC_API_KEY", no API call."""
+        if key is None:
+            monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("ANTHROPIC_API_KEY", key)
+        client, create = _mocked_client()
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        message = exc_info.value.message
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "Claude" in message
+        assert "isn't configured" in message
+        assert "ANTHROPIC_API_KEY" in message
+        create.assert_not_awaited()
+
+    @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
+    async def test_claude_missing_model_chat_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, model: str | None
+    ) -> None:
+        """No model → "No Claude model is set … Settings → Agent", no API call."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        client, create = _mocked_client(model=model)
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        message = exc_info.value.message
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "No Claude model is set" in message
+        assert "Settings → Agent" in message
+        create.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("cls", "status", "phrases"),
+        [
+            (
+                anthropic.AuthenticationError,
+                401,
+                ("Claude", "rejected the API", "ANTHROPIC_API_KEY"),
+            ),
+            (
+                anthropic.PermissionDeniedError,
+                403,
+                ("Claude", "rejected the API", "ANTHROPIC_API_KEY"),
+            ),
+            (anthropic.NotFoundError, 404, ("Claude", "Settings → Agent")),
+            (anthropic.RateLimitError, 429, ("Claude", "rate limit")),
+            (anthropic.InternalServerError, 500, ("Claude", "temporarily unavailable")),
+            (anthropic.InternalServerError, 503, ("Claude", "temporarily unavailable")),
+            # 529 "overloaded" is raised as a plain APIStatusError subclass (not
+            # InternalServerError) by the SDK — mapping must go by status >= 500.
+            (anthropic.APIStatusError, 529, ("Claude", "temporarily unavailable")),
+        ],
+        ids=["401", "403", "404", "429", "500", "503", "529-overloaded"],
+    )
+    async def test_claude_status_error_user_facing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        cls: type[Any],
+        status: int,
+        phrases: tuple[str, ...],
+    ) -> None:
+        """401/403/404/429/5xx → user-facing fixed message; the body never leaks."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        client, create = _mocked_client()
+        marker = f"CLAUDE-BODY-SECRET-{status}"
+        create.side_effect = _status_error(cls, status, marker)
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        exc = exc_info.value
+        assert exc.user_facing is True
+        assert exc.status_code == status
+        for phrase in phrases:
+            if phrase == "rate limit":
+                assert phrase in exc.message.lower()
+            else:
+                assert phrase in exc.message
+        assert marker not in exc.message
+        assert marker not in str(exc)
+        assert marker not in caplog.text
+
+    @pytest.mark.parametrize(
+        "make_exc",
+        [
+            lambda marker: anthropic.APITimeoutError(request=_ANTHROPIC_REQUEST),
+            lambda marker: anthropic.APIConnectionError(message=marker, request=_ANTHROPIC_REQUEST),
+        ],
+        ids=["timeout", "connection"],
+    )
+    async def test_claude_transport_error_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, make_exc: Any
+    ) -> None:
+        """Timeout / connection failure → "Claude … temporarily unavailable", no cause detail."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        client, create = _mocked_client()
+        marker = "CLAUDE-TRANSPORT-SECRET"
+        create.side_effect = make_exc(marker)
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "Claude" in exc_info.value.message
+        assert "temporarily unavailable" in exc_info.value.message
+        assert marker not in exc_info.value.message
+
+    @pytest.mark.parametrize(
+        ("cls", "status"),
+        [
+            (anthropic.BadRequestError, 400),
+            (anthropic.APIStatusError, 413),
+            (anthropic.UnprocessableEntityError, 422),
+        ],
+        ids=["400", "413", "422"],
+    )
+    async def test_claude_other_4xx_not_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, cls: type[Any], status: int
+    ) -> None:
+        """Other 4xx stay internal (user_facing False) so the agent shows its generic reply."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        client, create = _mocked_client()
+        create.side_effect = _status_error(cls, status, "detail")
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        assert exc_info.value.user_facing is False
+        assert exc_info.value.status_code == status
+
+    async def test_claude_oversized_tools_not_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An oversized tools payload is an internal error."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
+        client, _create = _mocked_client()
+        tools = [
+            {"type": "function", "function": {"name": f"tool.action{i}", "parameters": {}}}
+            for i in range(65)
+        ]
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages(), tools=tools)
+        assert exc_info.value.user_facing is False

@@ -4,6 +4,11 @@ Covers message conversion, tool format conversion, tool call parsing,
 client construction, chat method, error handling, context manager,
 and adversarial/security edge cases.
 
+GH-142: a missing OPENAI_API_KEY or model no longer fails construction; chat()
+answers with a friendly, user-facing ``LLMError`` instead, and SDK errors map to
+the fixed user-facing catalogue (401/403/404/429/5xx/timeout/connection) while
+other 4xx stay internal (``user_facing=False``).
+
 All API calls are mocked — no real OpenAI API is contacted.
 """
 
@@ -15,6 +20,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
 from admino.llm import LLMError, LLMResponse, check_args_depth
@@ -31,13 +38,23 @@ from admino.models import LLMMessage
 # ---------------------------------------------------------------------------
 
 
-def _make_llm_config() -> Any:
+def _make_llm_config(openai_model: str | None = "gpt-4o") -> Any:
     """Create a fake LLMConfig for testing."""
     return SimpleNamespace(
-        openai_model="gpt-4o",
+        openai_model=openai_model,
         timeout_s=30,
         max_response_tokens=4096,
     )
+
+
+_OPENAI_REQUEST = httpx.Request("POST", "https://api.openai.com/v1/chat/completions")
+
+
+def _status_error(cls: type[Any], status: int, marker: str) -> Any:
+    """Build an openai SDK status error whose body carries a secret marker."""
+    body = {"error": {"message": f"upstream detail {marker}", "type": "invalid_request_error"}}
+    response = httpx.Response(status, request=_OPENAI_REQUEST, json=body)
+    return cls(f"Error code: {status} - {body}", response=response, body=body)
 
 
 def _make_messages(content: str = "Hi") -> list[LLMMessage]:
@@ -397,23 +414,26 @@ class TestParseOpenAIToolCalls:
 class TestOpenAIClientConstructor:
     """Tests for OpenAIClient.__init__."""
 
-    def test_missing_api_key_raises_llm_error(self) -> None:
-        """Missing OPENAI_API_KEY env var raises LLMError."""
-        config = _make_llm_config()
-        with (
-            patch.dict("os.environ", {}, clear=True),
-            pytest.raises(LLMError, match="OPENAI_API_KEY"),
-        ):
-            OpenAIClient(config)
+    def test_missing_api_key_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A missing OPENAI_API_KEY no longer blocks construction (GH-142)."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        client = OpenAIClient(_make_llm_config())
+        assert isinstance(client, OpenAIClient)
 
-    def test_empty_api_key_raises_llm_error(self) -> None:
-        """Empty OPENAI_API_KEY env var raises LLMError."""
-        config = _make_llm_config()
-        with (
-            patch.dict("os.environ", {"OPENAI_API_KEY": ""}),
-            pytest.raises(LLMError, match="OPENAI_API_KEY"),
-        ):
-            OpenAIClient(config)
+    def test_empty_api_key_does_not_raise(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An empty OPENAI_API_KEY no longer blocks construction (GH-142)."""
+        monkeypatch.setenv("OPENAI_API_KEY", "")
+        client = OpenAIClient(_make_llm_config())
+        assert isinstance(client, OpenAIClient)
+
+    @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
+    def test_missing_model_does_not_raise(
+        self, monkeypatch: pytest.MonkeyPatch, model: str | None
+    ) -> None:
+        """An unset openai_model no longer blocks construction (GH-142)."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
+        client = OpenAIClient(_make_llm_config(openai_model=model))
+        assert isinstance(client, OpenAIClient)
 
     def test_missing_sdk_raises_import_error(self) -> None:
         """Missing openai package raises ImportError with helpful message."""
@@ -538,35 +558,31 @@ class TestOpenAIClientChat:
         assert "tools" not in call_kwargs
 
     async def test_api_timeout_error(self, client: OpenAIClient) -> None:
-        """API timeout raises LLMError."""
-        import openai
-
+        """API timeout → user-facing "temporarily unavailable" (GH-142)."""
         client._client.chat.completions.create = AsyncMock(
             side_effect=openai.APITimeoutError(request=MagicMock())
         )
 
         with pytest.raises(LLMError) as exc_info:
             await client.chat(_make_messages())
-        assert "timed out" in exc_info.value.message
+        assert "temporarily unavailable" in exc_info.value.message
         assert exc_info.value.status_code is None
+        assert exc_info.value.user_facing is True
 
     async def test_api_connection_error(self, client: OpenAIClient) -> None:
-        """Connection error raises LLMError."""
-        import openai
-
+        """Connection error → user-facing "temporarily unavailable" (GH-142)."""
         client._client.chat.completions.create = AsyncMock(
             side_effect=openai.APIConnectionError(request=MagicMock())
         )
 
         with pytest.raises(LLMError) as exc_info:
             await client.chat(_make_messages())
-        assert "connect" in exc_info.value.message.lower()
+        assert "temporarily unavailable" in exc_info.value.message
         assert exc_info.value.status_code is None
+        assert exc_info.value.user_facing is True
 
     async def test_rate_limit_error(self, client: OpenAIClient) -> None:
         """Rate limit error raises LLMError with status_code=429."""
-        import openai
-
         mock_response = MagicMock()
         mock_response.status_code = 429
         mock_response.headers = {}
@@ -583,9 +599,7 @@ class TestOpenAIClientChat:
         assert exc_info.value.status_code == 429
 
     async def test_api_status_error(self, client: OpenAIClient) -> None:
-        """Generic API status error raises LLMError with status code."""
-        import openai
-
+        """A 500 → user-facing fixed message; the SDK detail is no longer embedded (GH-142)."""
         mock_response = MagicMock()
         mock_response.status_code = 500
         mock_response.headers = {}
@@ -600,8 +614,9 @@ class TestOpenAIClientChat:
         with pytest.raises(LLMError) as exc_info:
             await client.chat(_make_messages())
         assert exc_info.value.status_code == 500
-        assert "500" in exc_info.value.message
-        assert "Internal error" in exc_info.value.message  # SDK error detail included
+        assert exc_info.value.user_facing is True
+        assert "temporarily unavailable" in exc_info.value.message
+        assert "Internal error" not in exc_info.value.message
 
     async def test_done_true_when_stop(self, client: OpenAIClient) -> None:
         """done=True when finish_reason is 'stop'."""
@@ -892,3 +907,167 @@ class TestOpenAIValidateToolsPayload:
 
         call_kwargs = client._client.chat.completions.create.call_args
         assert call_kwargs.kwargs.get("max_tokens") == 4096
+
+
+# ---------------------------------------------------------------------------
+# GH-142: user-facing provider errors
+# ---------------------------------------------------------------------------
+
+
+def _mocked_client(model: str | None = "gpt-4o") -> tuple[OpenAIClient, AsyncMock]:
+    """An OpenAIClient whose SDK create() is an AsyncMock returning a text reply."""
+    client = OpenAIClient(_make_llm_config(openai_model=model))
+    create = AsyncMock(return_value=_make_completion())
+    client._client = MagicMock()
+    client._client.chat.completions.create = create
+    client._client.close = AsyncMock()
+    return client, create
+
+
+class TestOpenAIUserFacingErrors:
+    """Setup/availability problems become friendly chat replies (label "OpenAI")."""
+
+    @pytest.mark.parametrize("key", [None, ""], ids=["unset", "empty"])
+    async def test_openai_missing_key_chat_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, key: str | None
+    ) -> None:
+        """No key → "OpenAI isn't configured; set OPENAI_API_KEY", no API call."""
+        if key is None:
+            monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("OPENAI_API_KEY", key)
+        client, create = _mocked_client()
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        message = exc_info.value.message
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "OpenAI" in message
+        assert "isn't configured" in message
+        assert "OPENAI_API_KEY" in message
+        create.assert_not_awaited()
+
+    @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
+    async def test_openai_missing_model_chat_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, model: str | None
+    ) -> None:
+        """No model → "No OpenAI model is set … Settings → Agent", no API call."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
+        client, create = _mocked_client(model=model)
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        message = exc_info.value.message
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "No OpenAI model is set" in message
+        assert "Settings → Agent" in message
+        create.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("cls", "status", "phrases"),
+        [
+            (openai.AuthenticationError, 401, ("OpenAI", "rejected the API", "OPENAI_API_KEY")),
+            (openai.PermissionDeniedError, 403, ("OpenAI", "rejected the API", "OPENAI_API_KEY")),
+            (openai.NotFoundError, 404, ("OpenAI", "Settings → Agent")),
+            (openai.RateLimitError, 429, ("OpenAI", "rate limit")),
+            (openai.InternalServerError, 500, ("OpenAI", "temporarily unavailable")),
+            (openai.InternalServerError, 502, ("OpenAI", "temporarily unavailable")),
+            (openai.InternalServerError, 503, ("OpenAI", "temporarily unavailable")),
+        ],
+        ids=["401", "403", "404", "429", "500", "502", "503"],
+    )
+    async def test_openai_status_error_user_facing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        cls: type[Any],
+        status: int,
+        phrases: tuple[str, ...],
+    ) -> None:
+        """401/403/404/429/5xx → user-facing fixed message; the body never leaks."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
+        client, create = _mocked_client()
+        marker = f"OPENAI-BODY-SECRET-{status}"
+        create.side_effect = _status_error(cls, status, marker)
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        exc = exc_info.value
+        assert exc.user_facing is True
+        assert exc.status_code == status
+        for phrase in phrases:
+            if phrase == "rate limit":
+                assert phrase in exc.message.lower()
+            else:
+                assert phrase in exc.message
+        assert marker not in exc.message
+        assert marker not in str(exc)
+        assert marker not in caplog.text
+
+    @pytest.mark.parametrize(
+        "make_exc",
+        [
+            lambda marker: openai.APITimeoutError(request=_OPENAI_REQUEST),
+            lambda marker: openai.APIConnectionError(message=marker, request=_OPENAI_REQUEST),
+        ],
+        ids=["timeout", "connection"],
+    )
+    async def test_openai_transport_error_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, make_exc: Any
+    ) -> None:
+        """Timeout / connection failure → "OpenAI … temporarily unavailable", no cause detail."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
+        client, create = _mocked_client()
+        marker = "OPENAI-TRANSPORT-SECRET"
+        create.side_effect = make_exc(marker)
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        assert exc_info.value.user_facing is True
+        assert exc_info.value.status_code is None
+        assert "OpenAI" in exc_info.value.message
+        assert "temporarily unavailable" in exc_info.value.message
+        assert marker not in exc_info.value.message
+
+    @pytest.mark.parametrize(
+        ("cls", "status"),
+        [
+            (openai.BadRequestError, 400),
+            (openai.APIStatusError, 413),
+            (openai.UnprocessableEntityError, 422),
+        ],
+        ids=["400", "413", "422"],
+    )
+    async def test_openai_other_4xx_not_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch, cls: type[Any], status: int
+    ) -> None:
+        """Other 4xx stay internal (user_facing False) so the agent shows its generic reply."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
+        client, create = _mocked_client()
+        create.side_effect = _status_error(cls, status, "detail")
+
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages())
+
+        assert exc_info.value.user_facing is False
+        assert exc_info.value.status_code == status
+
+    async def test_openai_oversized_tools_not_user_facing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An oversized tools payload is an internal error."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
+        client, _create = _mocked_client()
+        tools = [
+            {"type": "function", "function": {"name": f"tool.action{i}", "parameters": {}}}
+            for i in range(65)
+        ]
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_make_messages(), tools=tools)
+        assert exc_info.value.user_facing is False

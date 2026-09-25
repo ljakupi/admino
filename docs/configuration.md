@@ -12,6 +12,7 @@ admino is configured by two things:
 > are never written to disk in plaintext.
 
 - [LLM providers](#llm-providers)
+- [Infomaniak AI Services (default)](#infomaniak-ai-services-default)
 - [Local vLLM (CPU container)](#local-vllm-cpu-container)
 - [`config.yaml` reference](#configyaml-reference)
 - [Authentication modes](#authentication-modes)
@@ -20,31 +21,71 @@ admino is configured by two things:
 
 ## LLM providers
 
-admino is local-first. **vLLM is the default provider**, served as a Docker CPU container
-— cross-platform on Apple Silicon and Linux, no Metal, no host process, nothing outside
-Docker. No cloud calls by default.
+**Infomaniak AI Services is the default provider**: an OpenAI-compatible API hosted in
+Switzerland. A local vLLM container and two cloud providers are opt-in.
 
 | Provider | Status | Needs |
 | --- | --- | --- |
-| **vLLM** | **local · available (CPU container, cross-platform)** (default) | `make vllm-pull` once, then `make start`. See below. |
+| **Infomaniak** | **default** · cloud, processed in Switzerland | `INFOMANIAK_API_TOKEN` (`ai-tools` scope). See below. |
+| **vLLM** | opt-in · local CPU container (cross-platform) | `make start-local`. See [Local vLLM](#local-vllm-cpu-container). |
 | **Claude (Anthropic)** | opt-in cloud | `ANTHROPIC_API_KEY` in the environment. |
-| **OpenAI** | opt-in cloud | `OPENAI_API_KEY` in the environment. |
+| **OpenAI** | opt-in cloud | `OPENAI_API_KEY` in the environment, and `api.openai.com` in the egress whitelist. |
 
-Cloud providers send your messages to their servers; everything else — audit log, memory,
-documents — stays on your machine. Until the vLLM container is ready, admino boots and
-replies with a friendly "model unavailable" message rather than crashing.
+The active provider processes your messages and tool results. Everything else (audit
+log, memory, documents) stays on the server that runs admino. API keys and tokens live in
+environment variables on the server only: they're never written to `config.yaml`, never
+logged, and never sent to the browser.
+
+**When something is missing, admino still boots.** A missing API key or model, a rejected
+key, a rate limit or an unreachable provider never stops startup or a provider switch.
+The chat replies with what's wrong and what to do (for example "Infomaniak isn't
+configured; set INFOMANIAK_API_TOKEN on the server"). Unexpected internal errors get a
+generic "try again" reply and are logged without message content.
 
 ![Settings → Agent provider control](screenshots/settings-agent.png)
 
-<sub>Settings → Agent — switch between vLLM (local) and the cloud opt-ins.</sub>
+<sub>Settings → Agent — pick the provider and its model.</sub>
 
 **Switching providers:**
 
 - In the UI: **Settings → Agent**, pick the provider.
 - Or set `LLM_PROVIDER` in the environment (overrides `config.yaml`).
-- Model IDs live in `config.yaml` under `llm` (`anthropic_model`, `openai_model`); both
-  stay set so switching needs no model edit. The API key still comes from the environment.
+- Model IDs live in `config.yaml` under `llm` (`infomaniak_model`, `vllm_model`,
+  `anthropic_model`, `openai_model`); all stay set so switching needs no model edit. The
+  API key still comes from the environment.
 - Point the OpenAI provider at any OpenAI-compatible server with `OPENAI_BASE_URL`.
+
+## Infomaniak AI Services (default)
+
+admino talks to Infomaniak's OpenAI-compatible endpoint
+`https://api.infomaniak.com/2/ai/{product_id}/openai/v1` (`/chat/completions`, `/models`).
+
+| Variable | Required | Notes |
+| --- | --- | --- |
+| `INFOMANIAK_API_TOKEN` | yes | Create it in the Infomaniak Manager → **API tokens** with the **`ai-tools`** scope. Sent as `Authorization: Bearer …` to `api.infomaniak.com` only. |
+| `INFOMANIAK_PRODUCT_ID` | no | Your AI Tools product ID (a number). When unset, admino discovers it at startup with `GET https://api.infomaniak.com/1/ai`. If the token sees several products, the startup log and the chat ask you to set it. |
+
+**Models.** The default is `Qwen/Qwen3.5-397B-A17B-FP8` (`llm.infomaniak_model`), with
+`Qwen/Qwen3.5-122B-A10B-FP8` as the smaller alternative. Both take text and images, accept
+up to 200,000 input tokens and support function calling. **Settings → Agent** lists the
+models your product offers (`GET …/openai/v1/models`) and shows whether the token is
+configured.
+
+**Privacy.** Processing happens in Infomaniak's data centers in Switzerland. Infomaniak
+states that queries are neither recorded nor used to train models or improve its
+services. admino sends no account identifiers: the OpenAI `user` field isn't set, and no
+names or email addresses are added to prompts.
+
+**Reasoning ("thinking").** Qwen3.5 thinks before answering by default. admino turns this
+off with `reasoning_effort: "none"`, the switch Infomaniak documents for its chat API. As a
+safety net it never reads the `reasoning_content` / `reasoning` fields and strips
+`<think>…</think>` blocks from answers, including across streamed chunks, so reasoning text
+never reaches the chat.
+
+**Errors.** A rejected token (401/403), a rate limit (429) and temporary failures (5xx,
+timeouts) come back as short chat messages. Response bodies are never logged. Retries are
+left to the upcoming LLM gateway. Billing is per token: set a spending limit on the
+product in the Infomaniak Manager.
 
 ## Local vLLM (CPU container)
 
@@ -69,14 +110,15 @@ add a GPU reservation).
 ### Daily workflow
 
 ```bash
-make vllm-pull   # one-time: download model weights (~8 GB) into the Docker volume
+make start-local # provision (first run) + bring up postgres + agent + vllm together
+make vllm-pull   # optional: pre-download model weights (~8 GB) into the Docker volume
                  # Set HF_TOKEN in the environment first if the model repo is gated.
-make start       # provision + bring up postgres + agent + vllm together
 make vllm-down   # stop just the vllm container (agent + postgres keep running)
 ```
 
-`make start` is the one-command path: it checks for the volume first and skips the
-download if the model is already provisioned.
+`make start` / `make docker-up` no longer start vllm. `make start-local` is the
+one-command path for the local model: it checks the volume first and skips the download
+if the model is already provisioned. Then pick **vLLM** in **Settings → Agent**.
 
 ### Override the model or endpoint
 
@@ -133,8 +175,8 @@ PostgreSQL holds four things: `settings`, `permissions`, `memory` notes, and
 `egress.allowed_hosts` in `config.yaml` is the **single source of truth** for outbound
 network access. In Docker mode, `entrypoint.sh` derives the container's `iptables` rules
 from this list at startup; `main.py` also checks that the configured LLM provider's API
-host is present. Using a cloud provider means its host must be on the list (Anthropic is
-included; uncomment `api.openai.com` for OpenAI).
+host is present. The provider hosts are `api.infomaniak.com` (default, included),
+`api.anthropic.com` (included) and `api.openai.com` (uncomment it for OpenAI).
 
 For the full picture of how egress containment works — the firewall, the root→non-root
 privilege drop, capabilities, and known limitations — read the

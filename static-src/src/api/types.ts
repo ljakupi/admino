@@ -86,7 +86,7 @@ export type ThreadItem =
 
 // Settings types
 
-export type LLMProviderName = 'anthropic' | 'openai' | 'vllm';
+export type LLMProviderName = 'infomaniak' | 'anthropic' | 'openai' | 'vllm';
 export type AppTheme = 'light' | 'dark' | 'system';
 
 export interface LLMSettings {
@@ -97,6 +97,9 @@ export interface LLMSettings {
   vllm_available_models: string[];
   anthropic_key_configured: boolean;
   openai_key_configured: boolean;
+  infomaniak_model: string;
+  infomaniak_available_models: string[];
+  infomaniak_token_configured: boolean;
 }
 
 export interface AppearanceSettings {
@@ -150,6 +153,7 @@ export interface LLMSettingsPatch {
   anthropic_model?: string;
   openai_model?: string;
   vllm_model?: string;
+  infomaniak_model?: string;
 }
 
 export interface ToolsSettings {
