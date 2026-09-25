@@ -54,8 +54,9 @@ export default defineConfig({
       '/health': 'http://127.0.0.1:8000',
     },
   },
-  // Frontend logic tests (`npm run test`). happy-dom supplies the DOM that
-  // component mounts and DOMPurify need; tests never touch the network.
+  // Frontend logic tests (`npm run test`): stores, composables, services and
+  // API clients, never UI. happy-dom supplies the DOM that DOMPurify needs;
+  // tests never touch the network.
   test: {
     environment: 'happy-dom',
     include: ['src/__tests__/**/*.test.ts'],

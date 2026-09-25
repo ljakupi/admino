@@ -83,6 +83,12 @@ admino is built test-first — this is a workflow requirement, not a suggestion:
    test to go green** — the tests are the spec.
 3. Mock all external services (LLM providers, Google/Microsoft APIs, network). Tests
    must never make real API calls.
+4. **Frontend tests cover logic and services only, never the UI.** Vitest tests target
+   Pinia stores, composables, `services/` modules and API clients: expected API
+   responses, state transitions, business rules, sanitization. Don't test whether an
+   element is visible, its color, size or layout, and don't mount components. Logic
+   that lives in a component moves to a store, composable or service so it can be
+   tested there.
 
 Quality gates (CI runs exactly these; run them locally before pushing):
 
@@ -95,7 +101,7 @@ make check              # lint + format-check + typecheck + tests
 
   ```bash
   npm run typecheck
-  npm run test        # Vitest: store, composable, and component logic
+  npm run test        # Vitest logic tests: stores, composables, services, API clients
   npm run build
   ```
 

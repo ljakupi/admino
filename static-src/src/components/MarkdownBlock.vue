@@ -1,26 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
+import { renderMarkdown } from '@/services/markdown';
 
 const props = defineProps<{
   content: string;
 }>();
 
-const rendered = computed(() => {
-  const raw = marked.parse(props.content, { async: false }) as string;
-  return DOMPurify.sanitize(raw, {
-    ALLOWED_TAGS: [
-      'p', 'br', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li',
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'blockquote',
-      'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'span',
-    ],
-    // No `target`: an LLM-authored link opening a new tab could reach
-    // window.opener (reverse tabnabbing). No `data-*`: unneeded attack surface.
-    ALLOWED_ATTR: ['href', 'rel', 'class'],
-    ALLOW_DATA_ATTR: false,
-  });
-});
+const rendered = computed(() => renderMarkdown(props.content));
 </script>
 
 <template>
