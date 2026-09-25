@@ -1,23 +1,12 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
+import { renderMarkdown } from '@/services/markdown';
 
 const props = defineProps<{
   content: string;
 }>();
 
-const rendered = computed(() => {
-  const raw = marked.parse(props.content, { async: false }) as string;
-  return DOMPurify.sanitize(raw, {
-    ALLOWED_TAGS: [
-      'p', 'br', 'strong', 'em', 'code', 'pre', 'ul', 'ol', 'li',
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'blockquote',
-      'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'span',
-    ],
-    ALLOWED_ATTR: ['href', 'target', 'rel', 'class'],
-  });
-});
+const rendered = computed(() => renderMarkdown(props.content));
 </script>
 
 <template>

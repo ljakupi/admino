@@ -189,6 +189,7 @@ For frontend changes, from `static-src/`:
 
 ```bash
 npm run typecheck
+npm run test
 npm run build
 ```
 
