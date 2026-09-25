@@ -33,13 +33,6 @@ export const useChatStore = defineStore('chat', () => {
     return null;
   });
 
-  /** All tool calls for the Activity page */
-  const toolCallHistory = computed(() =>
-    thread.value
-      .filter((i): i is Extract<ThreadItem, { type: 'tool_call' }> => i.type === 'tool_call')
-      .map((i) => i.data),
-  );
-
   function addUserMessage(content: string): ChatMessage {
     const msg: ChatMessage = {
       id: uid(),
@@ -257,7 +250,6 @@ export const useChatStore = defineStore('chat', () => {
     thread,
     sending,
     pendingConfirmation,
-    toolCallHistory,
     sendMessage,
     approve,
     deny,

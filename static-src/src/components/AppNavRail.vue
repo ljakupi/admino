@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { useRoute } from 'vue-router';
 import { computed } from 'vue';
-import { MessageCircle, Activity, Plug, Shield, Settings } from 'lucide-vue-next';
 import { useChatStore } from '@/stores/chat';
+import { NAV_ITEMS } from '@/services/navigation';
 
 const route = useRoute();
 const chatStore = useChatStore();
@@ -11,13 +11,7 @@ const pendingCount = computed(() =>
   chatStore.pendingConfirmation ? 1 : 0,
 );
 
-const navItems = [
-  { to: '/chat', icon: MessageCircle, label: 'Chat' },
-  { to: '/activity', icon: Activity, label: 'Activity' },
-  { to: '/tools', icon: Plug, label: 'Tools' },
-  { to: '/permissions', icon: Shield, label: 'Permissions' },
-  { to: '/settings', icon: Settings, label: 'Settings' },
-];
+const navItems = NAV_ITEMS;
 </script>
 
 <template>

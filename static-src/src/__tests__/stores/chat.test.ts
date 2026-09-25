@@ -5,8 +5,11 @@
  * tool-call confirmation state machine (pending → approved → completed/error,
  * pending → denied) and error handling. Also covers issue #141: clearing the
  * thread is a fresh start, so it rotates (and persists) the session id and
- * every later request uses the new one. The network layer (`@/api/messages`)
- * is mocked; error cases use the real `ApiError` class.
+ * every later request uses the new one. Issue #15 removes the Activity page,
+ * so the store no longer exposes the `toolCallHistory` getter that only that
+ * page used. The tests read tool calls straight from `thread` instead. The
+ * network layer (`@/api/messages`) is mocked; error cases use the real
+ * `ApiError` class.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
@@ -153,8 +156,13 @@ function toastKinds(): ToastKind[] {
   return useToastStore().toasts.map((t) => t.kind);
 }
 
+/** The thread's tool-call cards, in thread order (read straight from `thread`). */
+function toolCalls(): ToolCallUI[] {
+  return useChatStore().thread.flatMap((item) => (item.type === 'tool_call' ? [item.data] : []));
+}
+
 function findCard(id: string): ToolCallUI | undefined {
-  return useChatStore().toolCallHistory.find((tc) => tc.id === id);
+  return toolCalls().find((tc) => tc.id === id);
 }
 
 function indexOfCard(id: string): number {
@@ -302,7 +310,7 @@ describe('chatStore response handling', () => {
 
     await chat.sendMessage('What is on today?');
 
-    expect(chat.toolCallHistory[0]).toMatchObject({
+    expect(toolCalls()[0]).toMatchObject({
       tool: 'google_calendar',
       action: 'list',
       args: { date: '2026-09-25', max_results: 10 },
@@ -319,17 +327,15 @@ describe('chatStore response handling', () => {
 
     await chat.sendMessage('Search my mail');
 
-    expect(chat.toolCallHistory[0].state).toBe('error');
+    expect(toolCalls()[0].state).toBe('error');
   });
 
   it('adds a pending card carrying the confirmation id and expiry', async () => {
-    const chat = useChatStore();
-
     await seedPendingCard(
       makePending({ confirmation_id: 'c-42', expires_at: '2026-09-25T13:00:00Z' }),
     );
 
-    expect(chat.toolCallHistory[0]).toMatchObject({
+    expect(toolCalls()[0]).toMatchObject({
       tool: 'gmail',
       action: 'send',
       state: 'pending',
@@ -385,30 +391,13 @@ describe('chatStore response handling', () => {
       'agent:Found it.',
     ]);
   });
+});
 
-  it('toolCallHistory lists only tool calls, in thread order', async () => {
-    mockedPostMessage
-      .mockResolvedValueOnce(
-        makeResponse({
-          tool_calls: [
-            makeRecord({ tool: 'gmail', action: 'search' }),
-            makeRecord({ tool: 'gmail', action: 'read' }),
-          ],
-        }),
-      )
-      .mockResolvedValueOnce(
-        makeResponse({ tool_calls: [makeRecord({ tool: 'memory', action: 'list' })] }),
-      );
-    const chat = useChatStore();
+// --- Activity page removed (issue #15) ------------------------------------
 
-    await chat.sendMessage('Read the newest email');
-    await chat.sendMessage('List my notes');
-
-    expect(chat.toolCallHistory.map((tc) => `${tc.tool}.${tc.action}`)).toEqual([
-      'gmail.search',
-      'gmail.read',
-      'memory.list',
-    ]);
+describe('chatStore without the Activity page', () => {
+  it('no longer exposes toolCallHistory (its only consumer, the Activity page, is gone)', () => {
+    expect('toolCallHistory' in useChatStore()).toBe(false);
   });
 });
 
@@ -700,7 +689,7 @@ describe('chatStore approve', () => {
 
     await chat.approve(card.id);
 
-    expect(chat.toolCallHistory.map((tc) => ({ id: tc.id, state: tc.state }))).toEqual([
+    expect(toolCalls().map((tc) => ({ id: tc.id, state: tc.state }))).toEqual([
       { id: card.id, state: 'completed' },
     ]);
   });
@@ -712,7 +701,7 @@ describe('chatStore approve', () => {
 
     await chat.approve(card.id);
 
-    expect(chat.toolCallHistory.map((tc) => ({ id: tc.id, state: tc.state }))).toEqual([
+    expect(toolCalls().map((tc) => ({ id: tc.id, state: tc.state }))).toEqual([
       { id: card.id, state: 'error' },
     ]);
   });
