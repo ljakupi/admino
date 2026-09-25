@@ -17,6 +17,7 @@ dependencies = [
     { name = "google-api-python-client" },
     { name = "google-auth-oauthlib" },
     { name = "httpx" },
+    { name = "openai" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
@@ -26,7 +27,6 @@ dependencies = [
 [package.optional-dependencies]
 all-providers = [
     { name = "anthropic" },
-    { name = "openai" },
 ]
 anthropic = [
     { name = "anthropic" },
@@ -42,9 +42,6 @@ dev = [
     { name = "ruff" },
     { name = "types-pyyaml" },
 ]
-openai = [
-    { name = "openai" },
-]
 
 [package.metadata]
 requires-dist = [
@@ -59,9 +56,8 @@ requires-dist = [
     { name = "google-auth-oauthlib", specifier = "==1.2.1" },
     { name = "httpx", specifier = "==0.28.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = "==1.15.0" },
-    { name = "openai", marker = "extra == 'all-providers'", specifier = ">=1.50.0,<2" },
+    { name = "openai", specifier = ">=1.50.0,<2" },
     { name = "openai", marker = "extra == 'dev'", specifier = ">=1.50.0,<2" },
-    { name = "openai", marker = "extra == 'openai'", specifier = ">=1.50.0,<2" },
     { name = "pydantic", specifier = ">=2.10.6,<3" },
     { name = "pydantic-settings", specifier = ">=2.7.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==8.3.5" },
@@ -72,7 +68,7 @@ requires-dist = [
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = "==6.0.12.20241230" },
     { name = "uvicorn", extras = ["standard"], specifier = "==0.34.0" },
 ]
-provides-extras = ["anthropic", "openai", "all-providers", "dev"]
+provides-extras = ["anthropic", "all-providers", "dev"]
 
 [[package]]
 name = "annotated-doc"

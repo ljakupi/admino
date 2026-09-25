@@ -21,11 +21,12 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def _default_anthropic_key() -> Generator[None, None, None]:
-    """Provide ANTHROPIC_API_KEY so default-provider (anthropic) configs validate.
+    """Provide ANTHROPIC_API_KEY so anthropic-provider tests have a key by default.
 
-    admino now defaults to the anthropic provider, which requires this env var at
-    config-validation time. Tests that exercise the missing/empty-key path override
-    this with ``monkeypatch.delenv`` or ``patch.dict(..., clear=True)``.
+    Many tests build ``provider="anthropic"`` configs/clients. Since GH-142 a
+    missing key no longer fails validation (it logs a warning and chat explains),
+    but tests that exercise the missing/empty-key path still override this with
+    ``monkeypatch.delenv`` or ``patch.dict(..., clear=True)``.
 
     Managed via os.environ directly (not monkeypatch) so this autouse fixture does
     not pull ``monkeypatch`` into an early setup slot, which would reorder other

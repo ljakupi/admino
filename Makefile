@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start vllm-ensure vllm-pull vllm-up vllm-down
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local docker-up-local vllm-ensure vllm-pull vllm-up vllm-down
 
 # Source and package configuration
 SRC_DIR    := src
@@ -7,10 +7,12 @@ PACKAGE    := admino
 
 # --------------------------------------------------------------------------
 # Docker Compose file selection. admino runs an `agent` container plus
-# Postgres. Local vLLM serving runs as a CPU container (`vllm` service,
-# multi-arch, cross-platform) and is activated via the "vllm" profile.
-# `make docker-up` (or `make start`) auto-provisions the model weights on the
-# first run, then brings everything up — no separate `make vllm-pull` needed.
+# Postgres. The default LLM is Infomaniak AI Services (set INFOMANIAK_API_TOKEN
+# in .env), so `make start` / `make docker-up` start only postgres + agent.
+# Local vLLM serving is opt-in: a CPU container (`vllm` service, multi-arch,
+# cross-platform) behind the "vllm" compose profile. `make start-local`
+# provisions the model weights on the first run (vllm-ensure), then brings the
+# stack up together with vllm.
 # NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
 # reservation (tracked in issue #132).
 # --------------------------------------------------------------------------
@@ -62,13 +64,19 @@ check: lint format-check typecheck
 docker-build:
 	docker compose $(COMPOSE_FILES) build
 
-# docker-up: bring up the full stack (postgres + agent + vllm), provisioning the
-# vLLM model weights first if they are not already cached (see vllm-ensure).
-# This is the single command to (re)start everything after a rebuild:
+# docker-up: bring up postgres + agent. The default provider (Infomaniak) is a
+# cloud API, so no local model container is provisioned or started.
+# (Re)start everything after a rebuild:
 #   make docker-down && make docker-build && make docker-up
-docker-up: vllm-ensure
+docker-up:
+	docker compose $(COMPOSE_FILES) up -d
+
+# docker-up-local: postgres + agent + the opt-in local vllm container, provisioning
+# the vLLM model weights first if they are not already cached (see vllm-ensure).
+docker-up-local: vllm-ensure
 	docker compose $(COMPOSE_FILES) --profile vllm up -d
 
+# docker-down stops every service, including vllm when it was started.
 docker-down:
 	docker compose $(COMPOSE_FILES) --profile vllm down
 
@@ -95,8 +103,9 @@ clean:
 # a multi-arch image (linux/arm64 + linux/amd64). Docker auto-pulls the
 # correct arch — no host/OS detection required.
 #
-# Workflow (model weights are auto-provisioned on first `docker-up`/`start`):
-#   make docker-up   # provision model if needed, then bring up postgres+agent+vllm
+# Opt-in: the default provider is Infomaniak, so only these targets touch vllm.
+# Workflow (model weights are auto-provisioned on first `start-local`):
+#   make start-local # provision model if needed, then bring up postgres+agent+vllm
 #   make vllm-pull   # (optional) pre-download / resume model weights explicitly
 #   make vllm-down   # stop just the vllm service (agent + postgres keep running)
 #
@@ -145,9 +154,13 @@ vllm-ensure:
 		$(MAKE) vllm-pull; \
 	fi
 
-# start: alias for docker-up, kept for backwards compatibility / muscle memory.
-# Both provision the model on demand (via vllm-ensure) and bring the whole stack up.
+# start: alias for docker-up (postgres + agent, default Infomaniak provider).
 start: docker-up
+
+# start-local: alias for docker-up-local — adds the opt-in local vllm container
+# (provisions the model on demand via vllm-ensure). Select the "vLLM" provider in
+# Settings → Agent (or set llm.provider: "vllm") to chat with it.
+start-local: docker-up-local
 
 # vllm-up: bring up just the vllm service (useful to restart it independently).
 vllm-up:

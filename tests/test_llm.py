@@ -1,18 +1,27 @@
 """Tests for the shared llm.py utilities and the provider factory.
 
 Covers tool-call parsing, content sanitization, argument-depth and tools-payload
-guards, the LLMResponse and LLMError models, and create_llm_client provider
-selection. Provider-specific client behaviour lives in test_llm_anthropic.py and
-test_llm_openai.py.
+guards, the LLMResponse / LLMUsage / LLMStreamDelta models, LLMError (including
+the GH-142 ``user_facing`` flag), and create_llm_client provider selection —
+including the default ``infomaniak`` provider, which must build without any
+network I/O or credentials. Provider-specific client behaviour lives in
+test_llm_infomaniak.py, test_llm_anthropic.py, test_llm_openai.py and
+test_llm_vllm.py.
+
+The GH-142 symbols (``LLMUsage``, ``LLMStreamDelta``, ``admino.llm_infomaniak``)
+are reached through module attributes / local imports so this module keeps
+collecting before they exist (each such test fails on its own).
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+import httpx
 import pytest
 from pydantic import ValidationError
 
+import admino.llm as llm_mod
 from admino.config import LLMConfig
 from admino.llm import (
     _MAX_CONTENT_LENGTH,
@@ -231,6 +240,63 @@ class TestLLMResponse:
         with pytest.raises(ValidationError):
             LLMResponse(content="x" * (_MAX_CONTENT_LENGTH + 1))
 
+    def test_llm_response_usage_defaults_to_none(self) -> None:
+        """LLMResponse().usage is None when the provider reports no usage (GH-142)."""
+        assert LLMResponse().usage is None
+
+    def test_llm_response_accepts_usage(self) -> None:
+        """LLMResponse carries an LLMUsage with prompt/completion token counts."""
+        usage = llm_mod.LLMUsage(prompt_tokens=12, completion_tokens=34)
+        response = LLMResponse(content="hi", usage=usage)
+        assert response.usage is not None
+        assert (response.usage.prompt_tokens, response.usage.completion_tokens) == (12, 34)
+
+
+# ---------------------------------------------------------------------------
+# LLMUsage / LLMStreamDelta models (GH-142)
+# ---------------------------------------------------------------------------
+
+
+class TestLLMUsage:
+    """Token usage parsed from provider responses (ready for #178)."""
+
+    def test_llm_usage_valid_counts(self) -> None:
+        """Non-negative token counts are accepted."""
+        usage = llm_mod.LLMUsage(prompt_tokens=0, completion_tokens=7)
+        assert usage.prompt_tokens == 0
+        assert usage.completion_tokens == 7
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"prompt_tokens": -1, "completion_tokens": 0},
+            {"prompt_tokens": 0, "completion_tokens": -1},
+        ],
+        ids=["negative-prompt", "negative-completion"],
+    )
+    def test_llm_usage_negative_counts_rejected(self, kwargs: dict[str, int]) -> None:
+        """Token counts are bounded below by zero (ge=0)."""
+        with pytest.raises(ValidationError):
+            llm_mod.LLMUsage(**kwargs)
+
+    def test_llm_usage_requires_both_counts(self) -> None:
+        """Both counts are required fields."""
+        with pytest.raises(ValidationError):
+            llm_mod.LLMUsage(prompt_tokens=1)
+
+
+class TestLLMStreamDelta:
+    """One sanitized streamed text delta (reasoning excluded)."""
+
+    def test_llm_stream_delta_holds_content(self) -> None:
+        """LLMStreamDelta stores its content string."""
+        assert llm_mod.LLMStreamDelta(content="x").content == "x"
+
+    def test_llm_stream_delta_requires_content(self) -> None:
+        """content is a required field."""
+        with pytest.raises(ValidationError):
+            llm_mod.LLMStreamDelta()
+
 
 # ---------------------------------------------------------------------------
 # LLMError model
@@ -257,6 +323,31 @@ class TestLLMError:
         """LLMError defaults status_code to None when not provided."""
         err = LLMError("some error")
         assert err.status_code is None
+
+    def test_llm_error_user_facing_flag_set(self) -> None:
+        """LLMError(..., user_facing=True) marks a friendly, show-verbatim message (GH-142)."""
+        err = LLMError(
+            "Infomaniak isn't configured; set INFOMANIAK_API_TOKEN", None, user_facing=True
+        )
+        assert err.user_facing is True
+
+    def test_llm_error_user_facing_defaults_false(self) -> None:
+        """Without the flag an LLMError is internal (the agent shows its generic reply)."""
+        assert LLMError("boom").user_facing is False
+
+    def test_llm_error_existing_positional_args_still_work(self) -> None:
+        """The positional (message, status_code) form keeps working alongside the flag."""
+        err = LLMError("Service unavailable", 503)
+        assert (err.message, err.status_code, err.user_facing) == (
+            "Service unavailable",
+            503,
+            False,
+        )
+
+    def test_llm_error_user_facing_with_status_code(self) -> None:
+        """status_code and user_facing coexist (e.g. a 429 rate limit reply)."""
+        err = LLMError("Infomaniak rate limit reached", status_code=429, user_facing=True)
+        assert (err.status_code, err.user_facing) == (429, True)
 
 
 # ---------------------------------------------------------------------------
@@ -310,3 +401,83 @@ class TestCreateLLMClient:
         config = LLMConfig(provider="vllm")
         client = create_llm_client(config)
         assert isinstance(client, VLLMClient)
+
+    # -- GH-142: Infomaniak (default) + no raise for missing keys/models --
+
+    @staticmethod
+    def _forbid_network(monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Patch the Infomaniak HTTP seam with a transport that fails on any request."""
+        from admino import llm_infomaniak
+
+        def _handler(request: httpx.Request) -> httpx.Response:
+            pytest.fail(f"unexpected network request to {request.url.host}")
+
+        def _factory(*_args: Any, **_kwargs: Any) -> httpx.AsyncClient:
+            return httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+
+        monkeypatch.setattr(llm_infomaniak, "_new_http_client", _factory)
+        return llm_infomaniak
+
+    def test_infomaniak_provider_builds_infomaniak_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """provider='infomaniak' returns an InfomaniakClient — no env vars, no network."""
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        monkeypatch.delenv("INFOMANIAK_PRODUCT_ID", raising=False)
+        module = self._forbid_network(monkeypatch)
+        client = create_llm_client(LLMConfig(provider="infomaniak"))
+        assert isinstance(client, module.InfomaniakClient)
+
+    def test_default_config_builds_infomaniak_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The default LLMConfig selects Infomaniak and the factory builds it offline."""
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        monkeypatch.delenv("INFOMANIAK_PRODUCT_ID", raising=False)
+        module = self._forbid_network(monkeypatch)
+        client = create_llm_client(LLMConfig())
+        assert isinstance(client, module.InfomaniakClient)
+
+    def test_infomaniak_client_is_llm_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The factory's Infomaniak client satisfies the LLMClient protocol."""
+        monkeypatch.setenv("INFOMANIAK_API_TOKEN", "ik-test-token")
+        self._forbid_network(monkeypatch)
+        client = create_llm_client(LLMConfig(provider="infomaniak"))
+        assert isinstance(client, llm_mod.LLMClient)
+
+    def test_openai_provider_without_key_builds_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing OPENAI_API_KEY no longer stops the factory (chat explains instead)."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        client = create_llm_client(LLMConfig(provider="openai", openai_model="gpt-4o"))
+        assert isinstance(client, OpenAIClient)
+
+    def test_anthropic_provider_without_key_builds_client(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing ANTHROPIC_API_KEY no longer stops the factory (chat explains instead)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        client = create_llm_client(
+            LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+        )
+        assert isinstance(client, AnthropicClient)
+
+    @pytest.mark.parametrize(
+        ("provider", "field", "client_type"),
+        [
+            ("openai", "openai_model", OpenAIClient),
+            ("anthropic", "anthropic_model", AnthropicClient),
+            ("vllm", "vllm_model", VLLMClient),
+        ],
+    )
+    def test_provider_without_model_builds_client(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        provider: str,
+        field: str,
+        client_type: type[Any],
+    ) -> None:
+        """An unset model no longer stops the factory for any provider."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        config = LLMConfig(provider=provider, **{field: ""})  # type: ignore[arg-type]
+        assert isinstance(create_llm_client(config), client_type)

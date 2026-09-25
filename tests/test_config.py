@@ -4,6 +4,11 @@ Covers valid config loading, defaults, env var overrides, invalid YAML,
 invalid field values, path resolution, permissions loading, missing permissions,
 hardcoded denial overrides, invalid permission states, egress host validation,
 and sub-model presence.
+
+GH-142: ``infomaniak`` is a provider and the default. A missing API key/token or
+model never fails validation for any provider any more — it logs a WARNING that
+names the env var / model field (never a value) and chat explains what to set.
+``active_model_name`` returns ``""`` when the active provider's model is unset.
 """
 
 from __future__ import annotations
@@ -127,11 +132,11 @@ class TestValidConfigLoading:
 
 
 class TestDefaults:
-    """Defaults are applied to unset sections; a missing llm section defaults to vllm.
+    """Defaults are applied to unset sections; a missing llm section defaults to infomaniak.
 
-    Under GH-114 the default provider is ``vllm`` (local, serving not yet
-    implemented), which boots gracefully with no API key or model — so a
-    config that omits the llm section loads successfully instead of failing.
+    Under GH-142 the default provider is ``infomaniak``, which boots gracefully
+    with no INFOMANIAK_API_TOKEN (warning + friendly chat reply) — so a config
+    that omits the llm section loads successfully instead of failing.
     """
 
     def test_defaults_applied_for_unset_sections(
@@ -151,33 +156,36 @@ class TestDefaults:
         assert config.limits.confirmation_timeout_s == 300
         assert config.log_level == "INFO"
 
-    def test_missing_file_defaults_to_vllm(
+    def test_missing_file_defaults_to_infomaniak(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A missing file yields defaults with the vllm provider, which boots."""
+        """A missing file yields defaults with the infomaniak provider, which boots tokenless."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         config = load_app_config(tmp_path / "nonexistent.yaml")
-        assert config.llm.provider == "vllm"
+        assert config.llm.provider == "infomaniak"
 
-    def test_empty_yaml_defaults_to_vllm(
+    def test_empty_yaml_defaults_to_infomaniak(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An empty YAML file (parses as None) has no llm section — defaults to vllm."""
+        """An empty YAML file (parses as None) has no llm section — defaults to infomaniak."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("", encoding="utf-8")
         config = load_app_config(yaml_path)
-        assert config.llm.provider == "vllm"
+        assert config.llm.provider == "infomaniak"
 
-    def test_comment_only_yaml_defaults_to_vllm(
+    def test_comment_only_yaml_defaults_to_infomaniak(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A comment-only YAML file (parses as None) has no llm section — defaults to vllm."""
+        """A comment-only YAML file (parses as None) has no llm section — defaults to infomaniak."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("# just a comment\n", encoding="utf-8")
         config = load_app_config(yaml_path)
-        assert config.llm.provider == "vllm"
+        assert config.llm.provider == "infomaniak"
 
 
 # ---------------------------------------------------------------------------
@@ -737,17 +745,55 @@ class TestLLMConfigValidation:
         with pytest.raises(ValidationError, match="invalid characters"):
             LLMConfig(provider="anthropic", anthropic_model="evil; rm -rf /")
 
-    def test_anthropic_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Anthropic provider requires ANTHROPIC_API_KEY env var."""
-        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        with pytest.raises(ValidationError, match="ANTHROPIC_API_KEY"):
-            LLMConfig(provider="anthropic")
+    @pytest.mark.parametrize(
+        ("provider", "model_field", "env_var"),
+        [
+            ("anthropic", "anthropic_model", "ANTHROPIC_API_KEY"),
+            ("openai", "openai_model", "OPENAI_API_KEY"),
+        ],
+    )
+    def test_missing_api_key_warns_without_raising(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        provider: str,
+        model_field: str,
+        env_var: str,
+    ) -> None:
+        """A missing cloud API key no longer fails validation — it logs a WARNING (GH-142)."""
+        monkeypatch.delenv(env_var, raising=False)
+        with caplog.at_level(logging.DEBUG):
+            config = LLMConfig(provider=provider, **{model_field: "some-model"})  # type: ignore[arg-type]
+        assert config.provider == provider
+        assert any(
+            env_var in record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
 
-    def test_openai_requires_api_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """OpenAI provider requires OPENAI_API_KEY env var."""
-        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        with pytest.raises(ValidationError, match="OPENAI_API_KEY"):
-            LLMConfig(provider="openai")
+    @pytest.mark.parametrize(
+        ("provider", "model_field", "env_var"),
+        [
+            ("anthropic", "anthropic_model", "ANTHROPIC_API_KEY"),
+            ("openai", "openai_model", "OPENAI_API_KEY"),
+            ("infomaniak", "infomaniak_model", "INFOMANIAK_API_TOKEN"),
+        ],
+    )
+    def test_provider_credential_value_never_logged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        provider: str,
+        model_field: str,
+        env_var: str,
+    ) -> None:
+        """Validation never logs a credential value, whether it is set or not."""
+        secret = f"CREDENTIAL-VALUE-MARKER-{provider}"
+        monkeypatch.setenv(env_var, secret)
+        with caplog.at_level(logging.DEBUG):
+            LLMConfig(provider=provider, **{model_field: "some-model"})  # type: ignore[arg-type]
+            LLMConfig(provider=provider, **{model_field: ""})  # type: ignore[arg-type]
+        assert secret not in caplog.text
 
     def test_anthropic_with_api_key_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Anthropic provider with ANTHROPIC_API_KEY + model set passes validation."""
@@ -771,35 +817,66 @@ class TestLLMConfigValidation:
         config = LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
         assert config.openai_model is None
 
-    def test_anthropic_missing_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Anthropic provider without anthropic_model fails validation."""
+    @pytest.mark.parametrize(
+        ("provider", "model_field", "model_value"),
+        [
+            ("anthropic", "anthropic_model", None),
+            ("anthropic", "anthropic_model", ""),
+            ("openai", "openai_model", None),
+            ("openai", "openai_model", ""),
+            ("vllm", "vllm_model", None),
+            ("vllm", "vllm_model", ""),
+            ("infomaniak", "infomaniak_model", None),
+            ("infomaniak", "infomaniak_model", ""),
+        ],
+    )
+    def test_missing_model_warns_without_raising(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        provider: str,
+        model_field: str,
+        model_value: str | None,
+    ) -> None:
+        """An unset model no longer fails validation — it logs a WARNING naming the field."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
-        with pytest.raises(ValidationError, match="anthropic_model"):
-            LLMConfig(provider="anthropic")
-
-    def test_anthropic_empty_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Anthropic provider with an empty model string fails validation."""
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
-        with pytest.raises(ValidationError, match="anthropic_model"):
-            LLMConfig(provider="anthropic", anthropic_model="")
-
-    def test_openai_missing_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """OpenAI provider without openai_model fails validation."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
-        with pytest.raises(ValidationError, match="openai_model"):
-            LLMConfig(provider="openai")
+        monkeypatch.setenv("INFOMANIAK_API_TOKEN", "ik-test-token")
+        with caplog.at_level(logging.DEBUG):
+            config = LLMConfig(provider=provider, **{model_field: model_value})  # type: ignore[arg-type]
+        assert config.provider == provider
+        assert any(
+            model_field in record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
 
-    def test_active_model_name_missing_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """active_model_name raises defensively if the active model is unset.
+    @pytest.mark.parametrize(
+        ("provider", "model_field"),
+        [
+            ("anthropic", "anthropic_model"),
+            ("openai", "openai_model"),
+            ("vllm", "vllm_model"),
+            ("infomaniak", "infomaniak_model"),
+        ],
+    )
+    def test_active_model_name_empty_when_model_unset(
+        self, monkeypatch: pytest.MonkeyPatch, provider: str, model_field: str
+    ) -> None:
+        """active_model_name returns "" (never raises) when the active model is unset."""
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        config = LLMConfig(provider=provider, **{model_field: None})  # type: ignore[arg-type]
+        assert config.active_model_name == ""
 
-        Validation normally guarantees a model, so the guard is only reachable
-        by bypassing it via model_copy.
-        """
+    def test_active_model_name_empty_after_model_copy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Even when validation is bypassed via model_copy, the property returns ""."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test-key")
         config = LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
         forced = config.model_copy(update={"anthropic_model": None})
-        with pytest.raises(ValueError, match="No model configured"):
-            _ = forced.active_model_name
+        assert forced.active_model_name == ""
 
     # -- vLLM as a first-class local provider (issue #134) --
 
@@ -837,12 +914,13 @@ class TestLLMConfigValidation:
         config = LLMConfig(provider="vllm")
         assert config.vllm_model == "Qwen/Qwen3-4B-Instruct-2507"
 
-    def test_vllm_empty_model_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """An explicitly empty vllm_model while provider=vllm fails validation."""
+    def test_vllm_empty_model_boots(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An explicitly empty vllm_model while provider=vllm no longer fails (GH-142)."""
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        with pytest.raises(ValidationError, match="vllm_model"):
-            LLMConfig(provider="vllm", vllm_model="")
+        config = LLMConfig(provider="vllm", vllm_model="")
+        assert config.provider == "vllm"
+        assert config.active_model_name == ""
 
     def test_vllm_model_accepts_slashes_and_uppercase(
         self, monkeypatch: pytest.MonkeyPatch
@@ -916,6 +994,110 @@ class TestLLMConfigValidation:
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         with pytest.raises(ValidationError):
             LLMConfig(provider="vllm", vllm_max_model_len=262145)
+
+
+# ---------------------------------------------------------------------------
+# GH-142: Infomaniak provider (the default)
+# ---------------------------------------------------------------------------
+
+
+_INFOMANIAK_DEFAULT_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
+
+
+class TestInfomaniakConfig:
+    """``infomaniak`` is accepted, is the default, and boots without a token."""
+
+    @pytest.fixture(autouse=True)
+    def _no_infomaniak_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        monkeypatch.delenv("INFOMANIAK_PRODUCT_ID", raising=False)
+
+    def test_infomaniak_provider_accepted(self) -> None:
+        """provider='infomaniak' validates."""
+        assert LLMConfig(provider="infomaniak").provider == "infomaniak"
+
+    def test_llm_config_default_provider_is_infomaniak(self) -> None:
+        """LLMConfig() defaults to the infomaniak provider."""
+        assert LLMConfig().provider == "infomaniak"
+
+    def test_app_config_default_provider_is_infomaniak(self) -> None:
+        """AppConfig() (and therefore the settings seed) defaults to infomaniak."""
+        config = AppConfig(auth=AuthConfig(mode="vpn"))
+        assert config.llm.provider == "infomaniak"
+
+    def test_infomaniak_model_default(self) -> None:
+        """infomaniak_model defaults to Qwen/Qwen3.5-397B-A17B-FP8."""
+        assert LLMConfig().infomaniak_model == _INFOMANIAK_DEFAULT_MODEL
+
+    def test_infomaniak_active_model_name(self) -> None:
+        """active_model_name for infomaniak is infomaniak_model."""
+        config = LLMConfig(provider="infomaniak", infomaniak_model="org/Other-Model_v2:1")
+        assert config.active_model_name == "org/Other-Model_v2:1"
+
+    @pytest.mark.parametrize(
+        "bad_model",
+        ["evil; rm -rf /", "model$(id)", "a b", "../../etc/passwd", "-leading-dash", "x|y"],
+    )
+    def test_infomaniak_model_shell_chars_rejected(self, bad_model: str) -> None:
+        """infomaniak_model uses the shared model-name validator."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            LLMConfig(provider="infomaniak", infomaniak_model=bad_model)
+
+    def test_infomaniak_model_max_length_enforced(self) -> None:
+        """infomaniak_model is bounded to 200 characters."""
+        with pytest.raises(ValidationError, match="at most 200 characters"):
+            LLMConfig(provider="infomaniak", infomaniak_model="a" * 201)
+
+    def test_infomaniak_missing_token_warns_without_raising(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No INFOMANIAK_API_TOKEN → config still loads and a WARNING names the variable."""
+        with caplog.at_level(logging.DEBUG):
+            config = LLMConfig(provider="infomaniak")
+        assert config.provider == "infomaniak"
+        assert any(
+            "INFOMANIAK_API_TOKEN" in record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
+
+    def test_infomaniak_logs_swiss_processing_notice(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Selecting infomaniak logs that messages are processed by Infomaniak in Switzerland."""
+        monkeypatch.setenv("INFOMANIAK_API_TOKEN", "ik-test-token")
+        with caplog.at_level(logging.DEBUG):
+            LLMConfig(provider="infomaniak")
+        assert any(
+            "Switzerland" in record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.INFO
+        )
+
+    def test_infomaniak_llm_provider_env_override(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """LLM_PROVIDER=infomaniak overrides the YAML provider."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        monkeypatch.setenv("LLM_PROVIDER", "infomaniak")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.llm.provider == "infomaniak"
+
+    def test_infomaniak_yaml_model_loaded(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """infomaniak_model is read from config.yaml."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            """\
+            llm:
+              provider: "infomaniak"
+              infomaniak_model: "mistralai/Mistral-Small-3.2"
+            """,
+        )
+        config = load_app_config(yaml_path)
+        assert config.llm.infomaniak_model == "mistralai/Mistral-Small-3.2"
 
 
 # ---------------------------------------------------------------------------
@@ -1087,16 +1269,16 @@ class TestLoadPermissionsConfigFromDb:
 
 
 class TestProviderCleanup:
-    """vLLM is the default provider and boots without any cloud API key.
+    """Infomaniak is the default provider; vLLM stays a keyless opt-in.
 
-    'vllm' is the shipped default. Under issue #134 it is a real local
-    provider: constructing it must NOT require an API key, and its model comes
-    from the ``vllm_model`` default (no explicit model needed to boot).
+    GH-142 makes 'infomaniak' the default. vLLM remains a real local provider:
+    constructing it must NOT require an API key, and its model comes from the
+    ``vllm_model`` default (no explicit model needed to boot).
     """
 
-    def test_default_provider_is_vllm(self) -> None:
-        """The shipped LLMConfig.provider default is vllm."""
-        assert LLMConfig.model_fields["provider"].default == "vllm"
+    def test_default_provider_is_infomaniak(self) -> None:
+        """The LLMConfig.provider field default is infomaniak (GH-142)."""
+        assert LLMConfig.model_fields["provider"].default == "infomaniak"
 
     def test_provider_vllm_boots_without_key_or_model(
         self, monkeypatch: pytest.MonkeyPatch

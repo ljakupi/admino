@@ -8,9 +8,16 @@ Tool calling: OpenAI's Chat Completions API uses a ``tools`` array.
 GPT responds with ``tool_calls`` in the assistant message. This module
 translates between admino's tool format and OpenAI's native format.
 
+Errors: a missing OPENAI_API_KEY or model does not fail construction; ``chat()``
+raises a user-facing ``LLMError`` ("OpenAI isn't configured; set OPENAI_API_KEY",
+"No OpenAI model is set …") instead. SDK failures map to the shared catalogue in
+``llm.py``: 401/403, 404, 429, 5xx, timeouts and connection errors become fixed
+user-facing messages; other statuses stay internal (``user_facing=False``).
+
 Security notes:
 - API key is read from OPENAI_API_KEY env var, never from config files.
 - No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
+- User-facing error messages are fixed strings: no response body or SDK cause.
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -27,6 +34,9 @@ from admino.llm import (
     LLMError,
     LLMResponse,
     check_args_depth,
+    missing_model_error,
+    not_configured_error,
+    provider_status_error,
     sanitize_content,
     strip_control_chars,
     validate_tools_payload,
@@ -38,13 +48,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Provider label shown in user-facing errors and the env var holding the key.
+_LABEL = "OpenAI"
+_API_KEY_ENV = "OPENAI_API_KEY"
+
 
 def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, Any]]:
     """Convert LLMMessage list to OpenAI's Chat Completions format.
 
     OpenAI uses "system", "user", "assistant", and "tool" roles natively.
     Tool-role messages require a ``tool_call_id`` linking them to the
-    originating tool call.
+    originating tool call, and that call must appear in the preceding assistant
+    message's ``tool_calls``: the agent stores it in ``tool_use_blocks``, which
+    is replayed here as OpenAI ``tool_calls`` (JSON-string arguments).
 
     Args:
         messages: Conversation messages.
@@ -58,8 +74,43 @@ def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, An
         # OpenAI requires tool_call_id on tool-role messages
         if msg.role == "tool" and msg.tool_call_id:
             entry["tool_call_id"] = msg.tool_call_id
+        if msg.role == "assistant" and msg.tool_use_blocks:
+            tool_calls = _tool_use_blocks_to_openai(msg.tool_use_blocks)
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
         api_messages.append(entry)
     return api_messages
+
+
+def _tool_use_blocks_to_openai(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert the agent's stored tool_use blocks to OpenAI ``tool_calls`` entries.
+
+    Blocks without a string id, a non-empty string name, or a dict input are
+    skipped (a call that can't be linked to its result would be rejected).
+
+    Args:
+        blocks: ``{"type": "tool_use", "id", "name", "input"}`` dicts.
+
+    Returns:
+        OpenAI function tool calls with JSON-string arguments.
+    """
+    tool_calls: list[dict[str, Any]] = []
+    for block in blocks:
+        call_id = block.get("id")
+        name = block.get("name")
+        arguments = block.get("input")
+        if not (isinstance(call_id, str) and call_id and isinstance(name, str) and name):
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+        )
+    return tool_calls
 
 
 def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -199,6 +250,9 @@ class OpenAIClient:
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the OpenAI client.
 
+        A missing OPENAI_API_KEY or model does not raise here: the state is
+        stored and ``chat()`` answers with a user-facing error instead.
+
         Args:
             config: LLM configuration with openai_model and timeout_s.
 
@@ -214,18 +268,12 @@ class OpenAIClient:
             )
             raise ImportError(msg) from exc
 
-        if not config.openai_model:
-            msg = "OpenAIClient requires llm.openai_model to be set in config."
-            raise ValueError(msg)
-        self._model = config.openai_model
-        self._timeout_s = config.timeout_s
+        self._model = config.openai_model or ""
         self._max_tokens = config.max_response_tokens
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not api_key:
-            raise LLMError(
-                message="OPENAI_API_KEY env var is not set or is empty.",
-                status_code=None,
-            )
+        api_key = os.environ.get(_API_KEY_ENV, "")
+        self._api_key_configured = bool(api_key)
+        # Built even without a key so close() stays uniform; chat() refuses to
+        # send a request until the key is configured.
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
             timeout=float(config.timeout_s),
@@ -249,12 +297,18 @@ class OpenAIClient:
             Parsed LLMResponse.
 
         Raises:
-            LLMError: On API errors, connection failures, or timeouts.
+            LLMError: User-facing when the key or model is missing, the key is
+                rejected, the model is unknown, the rate limit is hit, or OpenAI
+                is unavailable (5xx, timeout, connection); internal otherwise.
             ValueError: If stream=True is passed.
         """
         if stream:
             msg = "Streaming not yet supported for OpenAI provider"
             raise ValueError(msg)
+        if not self._api_key_configured:
+            raise not_configured_error(_LABEL, _API_KEY_ENV)
+        if not self._model:
+            raise missing_model_error(_LABEL)
 
         import openai
 
@@ -274,29 +328,21 @@ class OpenAIClient:
 
         try:
             response = await self._client.chat.completions.create(**kwargs)
-        except openai.APITimeoutError as exc:
-            raise LLMError(
-                message=f"OpenAI API request timed out after {self._timeout_s}s",
-                status_code=None,
-            ) from exc
-        except openai.APIConnectionError as exc:
-            raise LLMError(
-                message="Failed to connect to OpenAI API",
-                status_code=None,
-            ) from exc
-        except openai.RateLimitError as exc:
-            raise LLMError(
-                message="OpenAI API rate limit exceeded",
-                status_code=429,
-            ) from exc
+        except openai.APIConnectionError:
+            # Also covers APITimeoutError (a subclass). Raised ``from None`` so the
+            # SDK exception (and any response body) never travels with the error.
+            raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
         except openai.APIStatusError as exc:
             # exc.message is OpenAI's own error description — not the request
-            # body, does not contain conversation content — safe to include.
+            # body, does not contain conversation content. It only reaches the
+            # internal (log-only) message; user-facing messages are fixed.
             api_error = strip_control_chars(str(exc.message))[:500]
-            raise LLMError(
-                message=f"OpenAI API returned HTTP {exc.status_code}: {api_error}",
-                status_code=exc.status_code,
-            ) from exc
+            raise provider_status_error(
+                _LABEL,
+                exc.status_code,
+                key_env=_API_KEY_ENV,
+                internal_message=f"OpenAI API returned HTTP {exc.status_code}: {api_error}",
+            ) from None
 
         # Extract the first choice
         if not response.choices:

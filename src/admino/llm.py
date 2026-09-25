@@ -5,9 +5,17 @@ shared sanitization/parsing utilities, and the ``create_llm_client()``
 factory that instantiates the correct backend based on config.
 
 Provider modules:
-- ``llm_vllm.py`` — local vLLM backend (default; first-class OpenAI-compatible client)
+- ``llm_infomaniak.py`` — Infomaniak AI Services backend (default; Swiss-hosted,
+  OpenAI-compatible)
+- ``llm_vllm.py`` — local vLLM backend (opt-in; OpenAI-compatible client)
 - ``llm_anthropic.py`` — Anthropic Claude backend (opt-in)
 - ``llm_openai.py`` — OpenAI backend (opt-in)
+
+User-facing errors: setup and availability problems (missing key or model,
+rejected key, unknown model, rate limit, provider unavailable) are raised as
+``LLMError(user_facing=True)`` with a fixed, actionable message that the agent
+shows in the chat verbatim. Every other failure stays ``user_facing=False`` and
+the chat shows a generic reply. The helpers below build the shared catalogue.
 
 Security notes:
 - No credentials are stored or logged by this module.
@@ -55,17 +63,115 @@ class LLMError(Exception):
     Attributes:
         message: Human-readable error description.
         status_code: HTTP status code if available, None for connection errors.
+        user_facing: True when ``message`` is a fixed, actionable text meant for
+            the chat (it never embeds a response body or SDK cause). False means
+            the agent replaces it with a generic reply.
     """
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        status_code: int | None = None,
+        *,
+        user_facing: bool = False,
+    ) -> None:
         self.message = message
         self.status_code = status_code
+        self.user_facing = user_facing
         super().__init__(message)
 
 
 # ---------------------------------------------------------------------------
-# Response model
+# User-facing error catalogue (shared by every provider client)
 # ---------------------------------------------------------------------------
+
+
+def not_configured_error(label: str, env_var: str) -> LLMError:
+    """Return the user-facing error for a missing API key or token.
+
+    Args:
+        label: Provider name shown to the user (e.g. "Infomaniak", "Claude").
+        env_var: Name of the environment variable to set (never its value).
+    """
+    return LLMError(
+        message=f"{label} isn't configured; set {env_var} on the server.",
+        user_facing=True,
+    )
+
+
+def missing_model_error(label: str) -> LLMError:
+    """Return the user-facing error for a provider without a model."""
+    return LLMError(
+        message=f"No {label} model is set; choose one in Settings → Agent.",
+        user_facing=True,
+    )
+
+
+def provider_status_error(
+    label: str,
+    status_code: int | None,
+    *,
+    key_env: str | None = None,
+    key_noun: str = "API key",
+    internal_message: str | None = None,
+) -> LLMError:
+    """Map a provider HTTP status (or a transport failure) to an LLMError.
+
+    401/403 (only when the provider uses a key), 404, 429, 5xx and transport
+    failures (``status_code=None``) become fixed user-facing messages. Any other
+    status is internal: ``internal_message`` (or a bare status line) with
+    ``user_facing=False``. Response bodies are never part of the message.
+
+    Args:
+        label: Provider name shown to the user.
+        status_code: HTTP status, or None for timeouts and connection errors.
+        key_env: Env var holding the credential; None for keyless providers.
+        key_noun: What the credential is called ("API key" or "API token").
+        internal_message: Log-only message for statuses outside the catalogue.
+    """
+    if status_code in (401, 403) and key_env:
+        return LLMError(
+            message=f"{label} rejected the {key_noun}; check {key_env} on the server.",
+            status_code=status_code,
+            user_facing=True,
+        )
+    if status_code == 404:
+        return LLMError(
+            message=(
+                f"{label} doesn't offer the configured model; "
+                "choose another one in Settings → Agent."
+            ),
+            status_code=status_code,
+            user_facing=True,
+        )
+    if status_code == 429:
+        return LLMError(
+            message=f"{label} rate limit reached; wait a moment and try again.",
+            status_code=status_code,
+            user_facing=True,
+        )
+    if status_code is None or status_code >= 500:
+        return LLMError(
+            message=f"{label} is temporarily unavailable. Please try again in a moment.",
+            status_code=status_code,
+            user_facing=True,
+        )
+    return LLMError(
+        message=internal_message or f"{label} API returned HTTP {status_code}",
+        status_code=status_code,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+
+class LLMUsage(BaseModel):
+    """Token usage reported by the provider for one request."""
+
+    prompt_tokens: int = Field(ge=0, description="Input tokens billed for the request.")
+    completion_tokens: int = Field(ge=0, description="Output tokens billed for the request.")
 
 
 class LLMResponse(BaseModel):
@@ -96,6 +202,16 @@ class LLMResponse(BaseModel):
         default=False,
         description="Whether generation is complete.",
     )
+    usage: LLMUsage | None = Field(
+        default=None,
+        description="Token usage, when the provider reports it.",
+    )
+
+
+class LLMStreamDelta(BaseModel):
+    """One streamed piece of answer text (sanitized, reasoning excluded)."""
+
+    content: str = Field(description="Text to append to the answer.")
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +440,18 @@ def create_llm_client(config: LLMConfig) -> LLMClient:
 
     Returns:
         An LLMClient implementation for the configured provider. For the default
-        'vllm' provider this is a first-class ``VLLMClient`` (an OpenAI-compatible
-        wrapper pointed at a local endpoint); it needs no API key.
+        'infomaniak' provider this is an ``InfomaniakClient``. No client does
+        network I/O here or raises for a missing key or model: those surface as
+        user-facing errors on the first chat request.
 
     Raises:
         ValueError: If the provider is unknown.
         ImportError: If the provider's SDK is not installed.
     """
+    if config.provider == "infomaniak":
+        from admino.llm_infomaniak import InfomaniakClient
+
+        return InfomaniakClient(config)
     if config.provider == "anthropic":
         from admino.llm_anthropic import AnthropicClient
 

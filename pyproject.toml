@@ -20,18 +20,18 @@ dependencies = [
     "google-api-python-client==2.166.0",
     "pyyaml==6.0.2",
     "asyncpg>=0.30.0,<1",
+    # OpenAI SDK: used by the default Infomaniak provider (OpenAI-compatible API)
+    # as well as the vLLM and OpenAI providers.
+    "openai>=1.50.0,<2",
 ]
 
 [project.optional-dependencies]
 anthropic = [
     "anthropic>=0.40.0,<1",
 ]
-openai = [
-    "openai>=1.50.0,<2",
-]
+# The OpenAI SDK is a core dependency, so only the Anthropic SDK is optional.
 all-providers = [
     "anthropic>=0.40.0,<1",
-    "openai>=1.50.0,<2",
 ]
 dev = [
     "pytest==8.3.5",

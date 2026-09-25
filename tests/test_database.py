@@ -271,6 +271,30 @@ class TestSeedSettings:
         ]
         assert len(insert_calls) == 9
 
+    async def test_seed_settings_default_llm_is_infomaniak(
+        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The settings seed from a default AppConfig selects Infomaniak (GH-142)."""
+        import json
+
+        from admino.config import AppConfig, AuthConfig
+
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        conn = mock_pool._mock_conn
+        conn.fetchval = AsyncMock(return_value=0)
+
+        await db_mod.seed_settings(mock_pool, AppConfig(auth=AuthConfig(mode="vpn")))
+
+        llm_rows = [
+            c.args[2]
+            for c in conn.execute.call_args_list
+            if len(c.args) > 2 and "INSERT INTO settings" in c.args[0] and c.args[1] == "llm"
+        ]
+        assert len(llm_rows) == 1
+        llm = json.loads(llm_rows[0])
+        assert llm["provider"] == "infomaniak"
+        assert llm["infomaniak_model"] == "Qwen/Qwen3.5-397B-A17B-FP8"
+
     async def test_skips_when_table_has_rows(self, mock_pool: MagicMock) -> None:
         """seed_settings() skips seeding when settings table already has rows."""
         conn = mock_pool._mock_conn

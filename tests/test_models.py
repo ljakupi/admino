@@ -26,6 +26,7 @@ from admino.models import (
     LLMMessage,
     PendingConfirmation,
     SettingsLLM,
+    SettingsPatchLLM,
     SSEEvent,
     ToolCall,
     ToolCallAuditEntry,
@@ -1374,3 +1375,106 @@ class TestSettingsLLMAvailableModels:
         """A flood of ids is capped so a malicious server can't bloat the response."""
         result = self._make([f"org/model{i}" for i in range(100)]).vllm_available_models
         assert len(result) == 64
+
+
+# ---------------------------------------------------------------------------
+# GH-142: Infomaniak in SettingsLLM / SettingsPatchLLM
+# ---------------------------------------------------------------------------
+
+_INFOMANIAK_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
+
+
+def _infomaniak_settings(**overrides: object) -> SettingsLLM:
+    """A SettingsLLM selecting infomaniak, with optional overrides."""
+    values: dict[str, object] = {
+        "provider": "infomaniak",
+        "anthropic_model": "",
+        "openai_model": "",
+        "infomaniak_model": _INFOMANIAK_MODEL,
+    }
+    values.update(overrides)
+    return SettingsLLM(**values)  # type: ignore[arg-type]
+
+
+class TestSettingsLLMInfomaniak:
+    """SettingsLLM exposes the Infomaniak provider state (never the token)."""
+
+    def test_settings_llm_accepts_infomaniak_provider(self) -> None:
+        """provider='infomaniak' validates and the model round-trips."""
+        settings = _infomaniak_settings()
+        assert settings.provider == "infomaniak"
+        assert settings.infomaniak_model == _INFOMANIAK_MODEL
+
+    def test_settings_llm_infomaniak_defaults(self) -> None:
+        """infomaniak_model defaults to "", the list to [], the token flag to False."""
+        settings = SettingsLLM(provider="anthropic", anthropic_model="", openai_model="")
+        assert settings.infomaniak_model == ""
+        assert settings.infomaniak_available_models == []
+        assert settings.infomaniak_token_configured is False
+
+    def test_settings_llm_infomaniak_token_flag_is_boolean(self) -> None:
+        """infomaniak_token_configured is a plain flag."""
+        assert _infomaniak_settings(infomaniak_token_configured=True).infomaniak_token_configured
+
+    @pytest.mark.parametrize("bad_model", ["evil; rm -rf /", "model$(id)", "a b", "-x"])
+    def test_settings_llm_infomaniak_model_invalid_chars_rejected(self, bad_model: str) -> None:
+        """infomaniak_model uses the shared model-name validator."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            _infomaniak_settings(infomaniak_model=bad_model)
+
+    def test_settings_llm_infomaniak_available_models_valid_kept(self) -> None:
+        """Well-formed model ids pass through unchanged, in order."""
+        ids = [_INFOMANIAK_MODEL, "mistralai/Mistral-Small-3.2"]
+        assert (
+            _infomaniak_settings(infomaniak_available_models=ids).infomaniak_available_models == ids
+        )
+
+    def test_settings_llm_infomaniak_available_models_filtered(self) -> None:
+        """Ids with spaces/shell metachars/bidi overrides or over-length are dropped."""
+        rlo = chr(0x202E)
+        result = _infomaniak_settings(
+            infomaniak_available_models=[
+                "ok/model",
+                "bad id; rm -rf /",
+                f"evil{rlo}model",
+                "x" * 201,
+            ]
+        ).infomaniak_available_models
+        assert result == ["ok/model"]
+
+    def test_settings_llm_infomaniak_available_models_capped(self) -> None:
+        """A flood of ids is capped at 64."""
+        result = _infomaniak_settings(
+            infomaniak_available_models=[f"org/model{i}" for i in range(100)]
+        ).infomaniak_available_models
+        assert len(result) == 64
+
+
+class TestSettingsPatchLLMInfomaniak:
+    """SettingsPatchLLM accepts the Infomaniak provider and a validated model."""
+
+    def test_settings_patch_llm_accepts_infomaniak_provider(self) -> None:
+        """provider='infomaniak' is a valid PATCH value."""
+        assert SettingsPatchLLM(provider="infomaniak").provider == "infomaniak"  # type: ignore[arg-type]
+
+    def test_settings_patch_llm_accepts_infomaniak_model(self) -> None:
+        """A well-formed infomaniak_model is accepted."""
+        patch_model = SettingsPatchLLM(infomaniak_model="mistralai/Mistral-Small-3.2")  # type: ignore[call-arg]
+        assert patch_model.infomaniak_model == "mistralai/Mistral-Small-3.2"
+
+    def test_settings_patch_llm_infomaniak_model_defaults_none(self) -> None:
+        """infomaniak_model is optional (None = unchanged)."""
+        assert SettingsPatchLLM().infomaniak_model is None
+
+    @pytest.mark.parametrize("bad_model", ["evil; rm -rf /", "model$(id)", "a b", "../x"])
+    def test_settings_patch_llm_infomaniak_model_invalid_chars_rejected(
+        self, bad_model: str
+    ) -> None:
+        """infomaniak_model with shell metacharacters is rejected."""
+        with pytest.raises(ValidationError, match="invalid characters"):
+            SettingsPatchLLM(infomaniak_model=bad_model)  # type: ignore[call-arg]
+
+    def test_settings_patch_llm_infomaniak_model_max_length(self) -> None:
+        """infomaniak_model is bounded to 200 characters."""
+        with pytest.raises(ValidationError, match="at most 200 characters"):
+            SettingsPatchLLM(infomaniak_model="a" * 201)  # type: ignore[call-arg]

@@ -11,6 +11,7 @@ import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
 import { useSettingsStore, type LLMProvider } from '@/stores/settings';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
+import { modelOptions, providerLabel, trustNote } from '@/services/llmProviders';
 
 const route = useRoute();
 const settings = useSettingsStore();
@@ -47,9 +48,10 @@ const NAV = [
 
 // --- LLM / Agent section ---
 const providers: { value: LLMProvider; label: string; badge?: string }[] = [
-  { value: 'vllm', label: 'vLLM' },
-  { value: 'claude', label: 'Claude' },
-  { value: 'openai', label: 'OpenAI' },
+  { value: 'infomaniak', label: providerLabel('infomaniak') },
+  { value: 'vllm', label: providerLabel('vllm') },
+  { value: 'claude', label: providerLabel('anthropic') },
+  { value: 'openai', label: providerLabel('openai') },
 ];
 
 const draftAnthropicModel = ref('');
@@ -74,12 +76,7 @@ onMounted(async () => {
   syncDrafts();
 });
 
-function isProviderDisabled(value: LLMProvider): boolean {
-  return value === 'openai' && !openAiConfigured.value;
-}
-
 async function onProviderChange(p: LLMProvider) {
-  if (isProviderDisabled(p)) return;
   await settings.setProvider(p);
 }
 
@@ -153,22 +150,37 @@ const currentProvider = computed(() => settings.llmProvider);
 const anthropicConfigured = computed(() => settings.anthropicKeyConfigured);
 const openAiConfigured = computed(() => settings.openAiKeyConfigured);
 
-// vLLM: the dropdown options are the union of live served models + the configured
-// model (so it stays visible even when the server is unreachable and the list is []).
-const vllmModelOptions = computed<string[]>(() => {
-  const available = settings.vllmAvailableModels;
-  const configured = settings.llmVllmModel;
-  if (configured && !available.includes(configured)) {
-    return [configured, ...available];
-  }
-  return available;
+// The env var whose absence the API-key/token status row for the active
+// provider points at.
+const apiKeyEnvVar = computed(() => {
+  if (currentProvider.value === 'anthropic') return 'ANTHROPIC_API_KEY';
+  if (currentProvider.value === 'openai') return 'OPENAI_API_KEY';
+  return 'INFOMANIAK_API_TOKEN';
 });
+
+// vLLM / Infomaniak: the dropdown options are the union of live served/listed
+// models + the configured model (so it stays visible even when the server is
+// unreachable and the list is []).
+const vllmModelOptions = computed<string[]>(() =>
+  modelOptions(settings.vllmAvailableModels, settings.llmVllmModel),
+);
+
+const infomaniakModelOptions = computed<string[]>(() =>
+  modelOptions(settings.infomaniakAvailableModels, settings.llmInfomaniakModel),
+);
 
 async function onVllmModelChange(event: Event) {
   const value = (event.target as HTMLSelectElement).value;
   if (!value) return;
   if (value === settings.llmVllmModel) return;
   await settings.setVllmModel(value);
+}
+
+async function onInfomaniakModelChange(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (!value) return;
+  if (value === settings.llmInfomaniakModel) return;
+  await settings.setInfomaniakModel(value);
 }
 
 </script>
@@ -255,17 +267,14 @@ async function onVllmModelChange(event: Event) {
         <template v-if="activeSection === 'agent'">
           <div class="section-head">
             <h2 class="section-title">Agent</h2>
-            <p class="section-sub">Which LLM admino talks to. Local vLLM (Apple Silicon) or a cloud provider.</p>
+            <p class="section-sub">Which LLM admino talks to. Infomaniak is the default; vLLM (Apple Silicon), Claude, and OpenAI are opt-in alternatives.</p>
           </div>
           <div class="s-card">
             <!-- Provider segmented control -->
             <div class="s-row">
               <div class="row-label">
                 Provider
-                <span class="row-hint">Claude and OpenAI send your messages to their servers. vLLM runs entirely on this machine.</span>
-                <span v-if="!openAiConfigured" class="row-hint">
-                  OpenAI needs <code class="inline-code">OPENAI_API_KEY</code> set on the server to enable it.
-                </span>
+                <span class="row-hint">Infomaniak, Claude, and OpenAI send your messages to their servers for processing. vLLM is a local, opt-in alternative you run yourself.</span>
               </div>
               <div class="seg">
                 <button
@@ -273,8 +282,6 @@ async function onVllmModelChange(event: Event) {
                   :key="p.value"
                   class="seg-btn"
                   :class="{ active: settings.provider === p.value }"
-                  :disabled="isProviderDisabled(p.value)"
-                  :title="isProviderDisabled(p.value) ? 'Set OPENAI_API_KEY on the server to enable OpenAI' : undefined"
                   @click="onProviderChange(p.value)"
                 >
                   {{ p.label }}<span v-if="p.badge" class="soon-badge">{{ p.badge }}</span>
@@ -285,7 +292,26 @@ async function onVllmModelChange(event: Event) {
             <!-- Model field -->
             <div class="s-row stack">
               <div class="row-label">Model</div>
-              <template v-if="currentProvider === 'anthropic'">
+              <template v-if="currentProvider === 'infomaniak'">
+                <select
+                  class="s-input"
+                  :value="settings.llmInfomaniakModel"
+                  @change="onInfomaniakModelChange"
+                >
+                  <option
+                    v-for="model in infomaniakModelOptions"
+                    :key="model"
+                    :value="model"
+                  >{{ model }}</option>
+                </select>
+                <span v-if="settings.infomaniakAvailableModels.length === 0" class="row-hint">
+                  No models listed — set <code class="inline-code">INFOMANIAK_API_TOKEN</code> on the server to load them.
+                </span>
+                <span class="row-hint model-hint">
+                  Processed in Switzerland; queries aren't recorded or used for training (Infomaniak).
+                </span>
+              </template>
+              <template v-else-if="currentProvider === 'anthropic'">
                 <input
                   v-model="draftAnthropicModel"
                   class="s-input mono"
@@ -336,7 +362,7 @@ async function onVllmModelChange(event: Event) {
                   >{{ model }}</option>
                 </select>
                 <span v-if="settings.vllmAvailableModels.length === 0" class="row-hint">
-                  No served model detected — start the local vLLM server (<code class="inline-code">make vllm-up</code>) to load Gemma 4 12B.
+                  No served model detected — the local vLLM container is opt-in: start it with <code class="inline-code">make start-local</code>.
                 </span>
                 <span class="row-hint model-hint">
                   The HuggingFace repo id of the model served locally on Apple Silicon (Metal).
@@ -344,11 +370,25 @@ async function onVllmModelChange(event: Event) {
               </template>
             </div>
 
+            <!-- Infomaniak: API token indicator -->
+            <div v-if="currentProvider === 'infomaniak'" class="s-row">
+              <div class="row-label">
+                API token
+                <span class="row-hint"><code class="inline-code">{{ apiKeyEnvVar }}</code> · Set on the server as an environment variable. Never sent to your browser.</span>
+              </div>
+              <span
+                class="api-key-status"
+                :class="settings.infomaniakTokenConfigured ? 'status-ok' : 'status-missing'"
+              >
+                {{ settings.infomaniakTokenConfigured ? 'Configured' : 'Not configured' }}
+              </span>
+            </div>
+
             <!-- Claude / OpenAI: API key indicator -->
             <div v-if="currentProvider === 'anthropic' || currentProvider === 'openai'" class="s-row">
               <div class="row-label">
                 API key
-                <span class="row-hint">Stored encrypted. Never written to logs or the audit trail.</span>
+                <span class="row-hint"><code class="inline-code">{{ apiKeyEnvVar }}</code> · Set on the server as an environment variable. Never sent to your browser.</span>
               </div>
               <span
                 class="api-key-status"
@@ -443,8 +483,8 @@ async function onVllmModelChange(event: Event) {
           <div class="trust-badge">
             <ShieldCheck :size="20" :stroke-width="1.75" class="trust-icon" />
             <div>
-              <div class="trust-title">Running locally</div>
-              <div class="trust-body">Your messages, documents, and audit log stay on this machine. Only your configured LLM provider sees the conversation.</div>
+              <div class="trust-title">Your admino server</div>
+              <div class="trust-body">{{ trustNote(settings.llmProvider) }}</div>
             </div>
           </div>
         </template>

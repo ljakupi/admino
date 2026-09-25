@@ -23,7 +23,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Final, Literal
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
@@ -34,6 +34,14 @@ if TYPE_CHECKING:
     import asyncpg
 
 logger = logging.getLogger(__name__)
+
+# Env var holding each provider's credential (vLLM is local and needs none).
+# Only the NAME is ever logged, never the value.
+_PROVIDER_KEY_ENV: Final[dict[str, str]] = {
+    "infomaniak": "INFOMANIAK_API_TOKEN",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
 
 # ---------------------------------------------------------------------------
 # Pydantic config models
@@ -73,25 +81,29 @@ class LLMConfig(BaseModel):
     """LLM provider configuration.
 
     Supported providers:
-    - "vllm" (default): a first-class local, OpenAI-compatible provider that
-      serves the configured ``vllm_model`` from a local endpoint
+    - "infomaniak" (default): Infomaniak AI Services, an OpenAI-compatible API
+      hosted in Switzerland (queries are not recorded or used for training).
+      Needs the INFOMANIAK_API_TOKEN env var; INFOMANIAK_PRODUCT_ID is optional
+      (auto-discovered). Serves ``infomaniak_model``.
+    - "vllm" (opt-in, local): a first-class local, OpenAI-compatible provider
+      that serves the configured ``vllm_model`` from a local endpoint
       (``vllm_base_url``). It needs no API key. The server may still be starting
-      (loading a large model), so validation does NOT probe the network and boots
-      gracefully; chat requests surface a friendly "model starting/unavailable"
-      error until the endpoint is ready.
+      (loading a large model), so validation does NOT probe the network.
     - "anthropic" (opt-in): Anthropic Claude API. Messages sent to Anthropic servers.
     - "openai" (opt-in): OpenAI API. Messages sent to OpenAI servers.
 
-    Each opt-in proprietary provider requires its API key env var
-    (ANTHROPIC_API_KEY or OPENAI_API_KEY) and its model ID. The agent logs a
-    clear warning at startup because messages leave the machine.
+    A missing API key/token or model never fails validation for any provider:
+    admino boots, logs a WARNING naming the env var or model field (never a
+    credential value), and chat replies explain what to set. Cloud providers
+    also log where messages are processed, because they leave the machine.
     """
 
-    provider: Literal["anthropic", "openai", "vllm"] = Field(
-        default="vllm",
+    provider: Literal["infomaniak", "anthropic", "openai", "vllm"] = Field(
+        default="infomaniak",
         description=(
-            "LLM provider: 'vllm' (default, local OpenAI-compatible serving), "
-            "'anthropic' (opt-in, cloud), 'openai' (opt-in, cloud)."
+            "LLM provider: 'infomaniak' (default, Swiss-hosted), 'vllm' (opt-in, "
+            "local OpenAI-compatible serving), 'anthropic' (opt-in, cloud), "
+            "'openai' (opt-in, cloud)."
         ),
     )
 
@@ -102,14 +114,23 @@ class LLMConfig(BaseModel):
         description="Request timeout in seconds for LLM API calls.",
     )
 
+    # -- Infomaniak settings (used when provider=infomaniak, the default) --
+    # Credentials come from env vars only (INFOMANIAK_API_TOKEN,
+    # INFOMANIAK_PRODUCT_ID), never from this config.
+    infomaniak_model: str | None = Field(
+        default="Qwen/Qwen3.5-397B-A17B-FP8",
+        max_length=200,
+        description="Infomaniak AI Services model ID (used when provider=infomaniak).",
+    )
+
     # -- vLLM settings (used when provider=vllm) --
     # vLLM is a first-class local provider serving an OpenAI-compatible API.
-    # The served model must be set; its default makes the provider boot without
-    # a config edit. base_url points at the local endpoint (no API key needed).
+    # The model default lets the provider boot without a config edit. base_url
+    # points at the local endpoint (no API key needed).
     vllm_model: str | None = Field(
         default="Qwen/Qwen3-4B-Instruct-2507",
         max_length=200,
-        description="Served vLLM model ID (required for provider=vllm).",
+        description="Served vLLM model ID (used when provider=vllm).",
     )
     vllm_base_url: str = Field(
         default="http://vllm:8000/v1",
@@ -124,37 +145,38 @@ class LLMConfig(BaseModel):
     )
 
     # -- Anthropic settings (used when provider=anthropic) --
-    # No hardcoded default: the model ID must come from config.yaml so that a
-    # stale or retired ID can never be silently substituted. Missing/empty
-    # values for the active provider fail validation (see below).
+    # No hardcoded default: the model ID must come from config.yaml (or
+    # Settings → Agent) so that a stale or retired ID can never be silently
+    # substituted. A missing value for the active provider logs a warning and
+    # chat asks the user to choose a model (see below).
     anthropic_model: str | None = Field(
         default=None,
         max_length=200,
-        description="Anthropic model ID, e.g. claude-sonnet-4-6 (required for provider=anthropic).",
+        description="Anthropic model ID, e.g. claude-sonnet-4-6 (used when provider=anthropic).",
     )
 
     # -- OpenAI settings (used when provider=openai) --
     openai_model: str | None = Field(
         default=None,
         max_length=200,
-        description="OpenAI model ID, e.g. gpt-4o (required when provider=openai).",
+        description="OpenAI model ID, e.g. gpt-4o (used when provider=openai).",
     )
 
-    # -- Shared settings for proprietary providers --
+    # -- Shared settings for every provider --
     max_response_tokens: int = Field(
         default=4096,
         ge=1,
         le=65536,
-        description="Maximum tokens in LLM response (Anthropic/OpenAI max_tokens).",
+        description="Maximum tokens in LLM response (sent as max_tokens to every provider).",
     )
 
-    @field_validator("anthropic_model", "openai_model", "vllm_model")
+    @field_validator("infomaniak_model", "anthropic_model", "openai_model", "vllm_model")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
         """Reject model names containing shell metacharacters or control chars.
 
-        ``None``/empty are allowed here (the field is unset); presence for the
-        active provider is enforced in ``validate_provider_requirements``.
+        ``None``/empty are allowed (the field is unset); a missing model for the
+        active provider only logs a warning in ``validate_provider_requirements``.
         """
         if not v:
             return v
@@ -181,23 +203,36 @@ class LLMConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_provider_requirements(self) -> LLMConfig:
-        """Validate provider-specific requirements at config load time.
+        """Log provider-specific setup problems and privacy notices at load time.
 
-        Proprietary providers require API key env vars and log a warning.
-        The 'vllm' provider is a first-class local provider: it needs no API
-        key, but it does require ``vllm_model`` to be set. Validation does NOT
-        probe the network — the local server may still be loading a large model,
-        so admino boots gracefully and chat requests surface a friendly
-        "starting/unavailable" error until the endpoint is ready.
+        Never raises for a missing API key/token or model on any provider: admino
+        boots, a WARNING names the env var or the model field (never a credential
+        value), and chat replies explain what to set. Validation does NOT probe
+        the network. Cloud providers also log where messages are processed.
         """
-        if self.provider == "vllm":
-            if not self.vllm_model:
-                msg = (
-                    "llm.provider is 'vllm' but llm.vllm_model is not set. "
-                    "Set the served model ID in config.yaml "
-                    "(e.g. Qwen/Qwen3-4B-Instruct-2507)."
-                )
-                raise ValueError(msg)
+        key_env = _PROVIDER_KEY_ENV.get(self.provider)
+        if key_env and not os.environ.get(key_env, "").strip():
+            logger.warning(
+                "llm.provider is '%s' but the %s env var is not set. admino starts "
+                "anyway; chat replies will ask for it until it is set on the server.",
+                self.provider,
+                key_env,
+            )
+        if not self.active_model_name:
+            logger.warning(
+                "llm.provider is '%s' but llm.%s_model is not set. admino starts "
+                "anyway; chat replies will ask to choose a model in Settings → Agent.",
+                self.provider,
+                self.provider,
+            )
+
+        if self.provider == "infomaniak":
+            logger.info(
+                "LLM provider is 'infomaniak' — user messages and tool results are "
+                "processed by Infomaniak in Switzerland (queries are not recorded or "
+                "used for training)."
+            )
+        elif self.provider == "vllm":
             logger.info(
                 "LLM provider is 'vllm' (local) — serving '%s' from %s. "
                 "If the endpoint is still starting, chat replies will report it "
@@ -205,37 +240,12 @@ class LLMConfig(BaseModel):
                 self.vllm_model,
                 self.vllm_base_url,
             )
-            return self
-        if self.provider == "anthropic":
-            if not os.environ.get("ANTHROPIC_API_KEY"):
-                msg = (
-                    "llm.provider is 'anthropic' but ANTHROPIC_API_KEY env var is not set. "
-                    "Set the API key or switch to llm.provider: 'openai'."
-                )
-                raise ValueError(msg)
-            if not self.anthropic_model:
-                msg = (
-                    "llm.provider is 'anthropic' but llm.anthropic_model is not set. "
-                    "Set the model ID in config.yaml (e.g. claude-sonnet-4-6)."
-                )
-                raise ValueError(msg)
+        elif self.provider == "anthropic":
             logger.warning(
                 "LLM provider is 'anthropic' — user messages and tool results "
                 "will be sent to Anthropic's servers. Ensure you accept this trade-off."
             )
-        elif self.provider == "openai":
-            if not os.environ.get("OPENAI_API_KEY"):
-                msg = (
-                    "llm.provider is 'openai' but OPENAI_API_KEY env var is not set. "
-                    "Set the API key or switch to llm.provider: 'anthropic'."
-                )
-                raise ValueError(msg)
-            if not self.openai_model:
-                msg = (
-                    "llm.provider is 'openai' but llm.openai_model is not set. "
-                    "Set the model ID in config.yaml (e.g. gpt-4o)."
-                )
-                raise ValueError(msg)
+        else:
             logger.warning(
                 "LLM provider is 'openai' — user messages and tool results "
                 "will be sent to OpenAI's servers. Ensure you accept this trade-off."
@@ -246,20 +256,18 @@ class LLMConfig(BaseModel):
     def active_model_name(self) -> str:
         """Return the model name for the currently configured provider.
 
-        For every provider the model is guaranteed non-empty by
-        ``validate_provider_requirements`` (vllm_model has a default); this
-        raises defensively if that invariant is ever violated.
+        Returns ``""`` (never raises) when the active provider's model is unset;
+        the provider client then answers chat with a "choose a model" message.
         """
-        if self.provider == "vllm":
+        if self.provider == "infomaniak":
+            name = self.infomaniak_model
+        elif self.provider == "vllm":
             name = self.vllm_model
         elif self.provider == "anthropic":
             name = self.anthropic_model
         else:
             name = self.openai_model
-        if not name:
-            msg = f"No model configured for llm.provider '{self.provider}'."
-            raise ValueError(msg)
-        return name
+        return name or ""
 
 
 class AuthConfig(BaseModel):

@@ -610,12 +610,39 @@ async def _get_vllm_available_models() -> list[str]:
     return models
 
 
+async def _get_infomaniak_available_models(provider: str) -> list[str]:
+    """List the models offered by the live Infomaniak client's product.
+
+    Only runs when ``provider`` (the effective provider shown in Settings) is
+    ``infomaniak`` AND the agent's live LLM client is an ``InfomaniakClient``
+    (imported lazily, so no other provider loads it). Otherwise returns ``[]``.
+    ``InfomaniakClient.list_models()`` never raises and returns ``[]`` on a
+    missing token or any failure; ids are allowlist-filtered again by
+    ``SettingsLLM``. The token is never part of the result.
+
+    Args:
+        provider: The effective LLM provider for the settings response.
+
+    Returns:
+        The listed model IDs, or ``[]``.
+    """
+    if provider != "infomaniak" or _agent is None:
+        return []
+
+    from admino.llm_infomaniak import InfomaniakClient
+
+    client = _agent._llm
+    if not isinstance(client, InfomaniakClient):
+        return []
+    return await client.list_models()
+
+
 async def _check_llm_reachable() -> bool:
     """Return whether the active LLM provider looks reachable.
 
     For ``vllm`` this is True iff the ``/models`` probe returns a non-empty
-    list within a short timeout. For cloud providers this returns True (API key
-    presence is validated elsewhere). Never raises.
+    list within a short timeout. For cloud providers this returns True (setup
+    problems such as a missing key surface as chat replies). Never raises.
 
     Returns:
         True if the provider is reachable (or is a cloud provider), else False.
@@ -956,21 +983,28 @@ async def _build_settings_response() -> SettingsResponse:
     # (config.yaml-driven) rather than hardcoded literals so the displayed
     # values reflect the authoritative source.
     llm_data = settings.get("llm", {})
-    # The SettingsLLM provider Literal now includes "vllm", so no coercion is
-    # needed — vllm must display as the selected provider, not be masked as
-    # anthropic.
-    config_provider = _config.llm.provider
+    # The SettingsLLM provider Literal includes every provider ("infomaniak",
+    # "anthropic", "openai", "vllm"), so no coercion is needed — the stored
+    # provider always displays as the selected one.
+    provider = llm_data.get("provider") or _config.llm.provider
     config_vllm_model = _config.llm.vllm_model
+    config_infomaniak_model = _config.llm.infomaniak_model
     llm_section = SettingsLLM(
-        provider=llm_data.get("provider") or config_provider,
+        provider=provider,
         anthropic_model=llm_data.get("anthropic_model") or _config.llm.anthropic_model or "",
         openai_model=llm_data.get("openai_model") or _config.llm.openai_model or "",
+        infomaniak_model=llm_data.get("infomaniak_model")
+        or (config_infomaniak_model if isinstance(config_infomaniak_model, str) else "")
+        or "",
+        infomaniak_available_models=await _get_infomaniak_available_models(provider),
         vllm_model=llm_data.get("vllm_model")
         or (config_vllm_model if isinstance(config_vllm_model, str) else "")
         or "",
         vllm_available_models=await _get_vllm_available_models(),
+        # Presence flags only — credential values never leave the server.
         anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
         openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
+        infomaniak_token_configured=bool(os.environ.get("INFOMANIAK_API_TOKEN")),
     )
 
     # Appearance section (default to light if missing).
@@ -1083,8 +1117,10 @@ async def patch_settings(
     """Handle PATCH /api/settings — partially update settings.
 
     Validates the patch, merges with current DB values, validates the merged
-    result against the full config model, persists, and optionally re-initialises
-    the LLM client if the provider changed.
+    result against the full config model, persists, and re-initialises the LLM
+    client when the provider changes, or when the active provider's model
+    (``vllm_model`` / ``infomaniak_model``) changes. A missing API key/token or
+    model never blocks the switch: chat replies explain what to set.
 
     Args:
         body: Validated SettingsPatch with optional sections.
@@ -1119,16 +1155,18 @@ async def patch_settings(
         patch_fields = body.llm.model_dump(exclude_none=True)
 
         # Track whether the running LLM client must be rebuilt. A provider
-        # change always requires it. A changed vllm_model requires it too when
-        # the effective provider is (or becomes) vllm — the served model, and
-        # therefore the client, changed. A no-op (same value) must NOT re-init.
+        # change always requires it. A changed vllm_model / infomaniak_model
+        # requires it too when the effective provider is (or becomes) that
+        # provider — the model, and therefore the client, changed. A no-op
+        # (same value) must NOT re-init.
         if "provider" in patch_fields and patch_fields["provider"] != llm_current.get("provider"):
             llm_reinit_needed = True
         effective_provider = patch_fields.get("provider", llm_current.get("provider"))
+        model_field = f"{effective_provider}_model"
         if (
-            "vllm_model" in patch_fields
-            and patch_fields["vllm_model"] != llm_current.get("vllm_model")
-            and effective_provider == "vllm"
+            effective_provider in ("vllm", "infomaniak")
+            and model_field in patch_fields
+            and patch_fields[model_field] != llm_current.get(model_field)
         ):
             llm_reinit_needed = True
 
@@ -1203,7 +1241,7 @@ async def patch_settings(
         if _agent is not None:
             _agent._tools_enabled = validated_tools
 
-    # --- Re-initialise LLM client if the provider or served vllm_model changed ---
+    # --- Re-initialise LLM client if the provider or the active model changed ---
     if llm_reinit_needed and new_llm_config is not None:
         try:
             new_client = create_llm_client(new_llm_config)

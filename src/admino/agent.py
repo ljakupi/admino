@@ -31,8 +31,11 @@ Security notes:
   mid-conversation) is dropped before use — it could be persisted prompt
   injection. Only a count is logged, never the content.
 - Exceptions from the LLM client are caught and converted into a safe
-  "error" AgentResult. ``MemoryError`` and ``RecursionError`` are
-  re-raised (mirroring the registry pattern).
+  "error" AgentResult. An ``LLMError`` with ``user_facing=True`` carries a
+  fixed, actionable provider message (no response body or SDK cause) and is
+  shown verbatim; every other exception gets the generic reply.
+  ``MemoryError`` and ``RecursionError`` are re-raised (mirroring the
+  registry pattern).
 - Malformed LLM output (e.g. validation errors on LLM responses) is
   converted to an assistant message with a generic note and returned —
   never crashes the loop.
@@ -320,15 +323,21 @@ class Agent:
             except Exception as exc:
                 # For LLMError, log .message (our own safe string, never an HTTP
                 # body or credential). For other exceptions, log only the type.
+                # A user-facing LLMError carries a fixed, actionable message
+                # (e.g. "set INFOMANIAK_API_TOKEN") that is shown verbatim; every
+                # other failure gets the generic reply.
+                reply = _LLM_ERROR_MESSAGE
                 if isinstance(exc, LLMError):
                     logger.error("LLM chat call failed: %s", exc.message)
+                    if exc.user_facing:
+                        reply = exc.message
                 else:
                     logger.error("LLM chat call failed: %s", type(exc).__name__)
                 return self._terminal_error(
                     session_id=session_id,
                     history=working_history,
                     tool_records=tool_records,
-                    message=_LLM_ERROR_MESSAGE,
+                    message=reply,
                 )
 
             # 2. Text-only response → we are done.
@@ -364,7 +373,8 @@ class Agent:
             # Record the assistant's tool-call turn in history. Include the
             # tool_use_blocks so that providers requiring structured content in
             # the assistant message (Anthropic) can reconstruct the proper
-            # tool_use / tool_result pairing. OpenAI ignores this field.
+            # tool_use / tool_result pairing; the OpenAI-compatible serializer
+            # replays them as tool_calls so each tool result answers its call.
             working_history.append(
                 LLMMessage(
                     role="assistant",

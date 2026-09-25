@@ -13,7 +13,7 @@ import type {
 
 // Keep the old union type alias for backward compat with components
 // The API uses 'anthropic' but the UI labels it 'claude' — we map here.
-export type LLMProvider = 'claude' | 'openai' | 'vllm';
+export type LLMProvider = 'infomaniak' | 'claude' | 'openai' | 'vllm';
 
 const TOKEN_KEY = 'admino_auth_token';
 const SESSION_KEY = 'admino_session_id';
@@ -90,13 +90,16 @@ export const useSettingsStore = defineStore('settings', () => {
   const error = ref<string | null>(null);
 
   // LLM
-  const llmProvider = ref<LLMProviderName>('vllm');
+  const llmProvider = ref<LLMProviderName>('infomaniak');
   const llmAnthropicModel = ref('');
   const llmOpenAiModel = ref('');
   const llmVllmModel = ref('');
   const vllmAvailableModels = ref<string[]>([]);
   const anthropicKeyConfigured = ref(false);
   const openAiKeyConfigured = ref(false);
+  const llmInfomaniakModel = ref('');
+  const infomaniakAvailableModels = ref<string[]>([]);
+  const infomaniakTokenConfigured = ref(false);
 
   // Appearance
   const theme = ref<AppTheme>('light');
@@ -133,6 +136,9 @@ export const useSettingsStore = defineStore('settings', () => {
     vllmAvailableModels.value = data.llm.vllm_available_models;
     anthropicKeyConfigured.value = data.llm.anthropic_key_configured;
     openAiKeyConfigured.value = data.llm.openai_key_configured;
+    llmInfomaniakModel.value = data.llm.infomaniak_model;
+    infomaniakAvailableModels.value = data.llm.infomaniak_available_models;
+    infomaniakTokenConfigured.value = data.llm.infomaniak_token_configured;
     theme.value = data.appearance.theme;
     notificationsEnabled.value = data.notifications.enabled;
     connectedAccounts.value = data.connected_accounts;
@@ -191,6 +197,11 @@ export const useSettingsStore = defineStore('settings', () => {
   async function setVllmModel(value: string) {
     llmVllmModel.value = value;
     await saveSetting({ llm: { vllm_model: value } });
+  }
+
+  async function setInfomaniakModel(value: string) {
+    llmInfomaniakModel.value = value;
+    await saveSetting({ llm: { infomaniak_model: value } });
   }
 
   async function setNotificationsEnabled(value: boolean) {
@@ -285,6 +296,9 @@ export const useSettingsStore = defineStore('settings', () => {
     vllmAvailableModels,
     anthropicKeyConfigured,
     openAiKeyConfigured,
+    llmInfomaniakModel,
+    infomaniakAvailableModels,
+    infomaniakTokenConfigured,
     // Appearance
     theme,
     // Notifications
@@ -304,6 +318,7 @@ export const useSettingsStore = defineStore('settings', () => {
     setAnthropicModel,
     setOpenAiModel,
     setVllmModel,
+    setInfomaniakModel,
     setNotificationsEnabled,
     connectGoogle,
     connectMicrosoft,

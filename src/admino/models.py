@@ -649,7 +649,7 @@ class LLMMessage(BaseModel):
         description=(
             "Structured tool_use blocks for providers that require them in the assistant "
             "message (e.g. Anthropic). Each entry has type, id, name (dot notation), "
-            "and input. Ignored by the OpenAI serializer."
+            "and input. The OpenAI-compatible serializer replays them as tool_calls."
         ),
     )
 
@@ -1503,19 +1503,27 @@ _MODEL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$")
 
 
 class SettingsLLM(BaseModel):
-    """LLM settings exposed via the Settings API."""
+    """LLM settings exposed via the Settings API.
 
-    provider: Literal["anthropic", "openai", "vllm"]
+    Credentials are never exposed: only ``*_configured`` boolean flags.
+    """
+
+    provider: Literal["infomaniak", "anthropic", "openai", "vllm"]
     anthropic_model: str = Field(max_length=200)
     openai_model: str = Field(max_length=200)
+    infomaniak_model: str = Field(default="", max_length=200)
+    # Model IDs the Infomaniak product lists (empty unless infomaniak is active
+    # and reachable).
+    infomaniak_available_models: list[str] = Field(default_factory=list)
     vllm_model: str = Field(default="", max_length=200)
     # Model IDs the local vLLM endpoint reports as served (empty if unreachable).
     vllm_available_models: list[str] = Field(default_factory=list)
-    # Boolean flags — never expose actual API key values.
+    # Boolean flags — never expose actual API key or token values.
     anthropic_key_configured: bool = False
     openai_key_configured: bool = False
+    infomaniak_token_configured: bool = False
 
-    @field_validator("anthropic_model", "openai_model", "vllm_model")
+    @field_validator("anthropic_model", "openai_model", "infomaniak_model", "vllm_model")
     @classmethod
     def validate_model_name(cls, v: str) -> str:
         """Reject model names containing shell metacharacters or control chars.
@@ -1528,15 +1536,16 @@ class SettingsLLM(BaseModel):
             raise ValueError(msg)
         return v
 
-    @field_validator("vllm_available_models")
+    @field_validator("vllm_available_models", "infomaniak_available_models")
     @classmethod
     def filter_available_models(cls, v: list[str]) -> list[str]:
         """Drop served-model ids that are not well-formed model names.
 
         ``vllm_available_models`` is populated from the local vLLM server's
-        ``/v1/models`` response — input from a process outside admino's trust
-        boundary. A rogue or compromised local server (or a MITM on the
-        non-TLS local connection) could return ids with unexpected characters.
+        ``/v1/models`` response and ``infomaniak_available_models`` from the
+        Infomaniak models endpoint — input from outside admino's trust
+        boundary. A rogue or compromised server (or a MITM on the non-TLS
+        local vLLM connection) could return ids with unexpected characters.
         Keep only ids matching the same allowlist enforced on user-supplied
         model names, and bound the count, so a malicious server cannot spoof
         the Settings UI or smuggle characters past downstream sanitisers.
@@ -1648,12 +1657,15 @@ class SettingsResponse(BaseModel):
 class SettingsPatchLLM(BaseModel):
     """Partial LLM settings for PATCH."""
 
-    provider: Literal["anthropic", "openai", "vllm"] | None = None
+    provider: Literal["infomaniak", "anthropic", "openai", "vllm"] | None = None
     anthropic_model: str | None = Field(default=None, max_length=200)
     openai_model: str | None = Field(default=None, max_length=200)
+    infomaniak_model: str | None = Field(default=None, max_length=200)
     vllm_model: str | None = Field(default=None, max_length=200)
 
-    @field_validator("anthropic_model", "openai_model", "vllm_model", mode="before")
+    @field_validator(
+        "anthropic_model", "openai_model", "infomaniak_model", "vllm_model", mode="before"
+    )
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
         """Reject model names containing shell metacharacters or control chars."""
