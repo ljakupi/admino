@@ -1392,12 +1392,12 @@ class TestConfirmationEdgeCases:
         pending = _make_pending_confirmation(
             session_id="sess1",
             confirmation_id="confirm-xyz-42",
-            tool="files",
-            action="write",
+            tool="google_calendar",
+            action="create",
         )
         awaiting_result = _make_agent_result(
             status="awaiting_confirmation",
-            response="Action files.write requires user confirmation.",
+            response="Action google_calendar.create requires user confirmation.",
             pending_confirmation=pending,
         )
         agent = FakeAgent([awaiting_result])
@@ -1406,7 +1406,7 @@ class TestConfirmationEdgeCases:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/message",
-                json={"message": "write a file", "session_id": "sess1"},
+                json={"message": "book the dentist", "session_id": "sess1"},
                 headers=_AUTH_HEADER,
             )
 
@@ -1416,8 +1416,8 @@ class TestConfirmationEdgeCases:
         assert data["pending_confirmation"] is not None
         pc = data["pending_confirmation"]
         assert pc["confirmation_id"] == "confirm-xyz-42"
-        assert pc["tool"] == "files"
-        assert pc["action"] == "write"
+        assert pc["tool"] == "google_calendar"
+        assert pc["action"] == "create"
         assert "expires_at" in pc
         # Args are now included (sanitized) for UI display in the confirmation card.
         assert "args" in pc
@@ -1456,23 +1456,23 @@ class TestConfirmationEdgeCases:
         # ends in an assistant message carrying a tool_use block — the exact
         # shape that produced the Anthropic 400 in production.
         awaiting_history = [
-            LLMMessage(role="user", content="write a file"),
+            LLMMessage(role="user", content="book the dentist"),
             LLMMessage(
                 role="assistant",
-                content="I'll write the file.",
+                content="I'll create the event.",
                 tool_use_blocks=[
                     {
                         "type": "tool_use",
                         "id": "toolu_abc123",
-                        "name": "files.write",
-                        "input": {"path": "/app/documents/x.txt", "content": "hi"},
+                        "name": "google_calendar.create",
+                        "input": {"summary": "Dentist", "start": "2026-10-01T09:00:00Z"},
                     }
                 ],
             ),
         ]
         awaiting_result = _make_agent_result(
             status="awaiting_confirmation",
-            response="Action files.write requires user confirmation.",
+            response="Action google_calendar.create requires user confirmation.",
             history=awaiting_history,
             pending_confirmation=pending,
         )
@@ -1487,7 +1487,7 @@ class TestConfirmationEdgeCases:
             # Turn 1: triggers the pending confirmation.
             await c.post(
                 "/api/message",
-                json={"message": "write a file", "session_id": "sess1"},
+                json={"message": "book the dentist", "session_id": "sess1"},
                 headers=_AUTH_HEADER,
             )
             assert "sess1" in srv._pending_confirmations
@@ -1530,12 +1530,12 @@ class TestConfirmationEdgeCases:
         from admino.server import _close_dangling_tool_use
 
         history = [
-            LLMMessage(role="user", content="list files"),
+            LLMMessage(role="user", content="list my notes"),
             LLMMessage(
                 role="assistant",
                 content="",
                 tool_use_blocks=[
-                    {"type": "tool_use", "id": "toolu_1", "name": "files.list", "input": {}},
+                    {"type": "tool_use", "id": "toolu_1", "name": "memory.list", "input": {}},
                 ],
             ),
             LLMMessage(role="tool", content="[]", tool_call_id="toolu_1"),

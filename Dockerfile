@@ -78,7 +78,7 @@ COPY --from=frontend-builder --chown=admino:admino /build/static/ /app/static/
 
 # Create data and config directories; they will be volume-mounted at runtime
 # but must exist in the image so the container starts cleanly if volumes are empty
-RUN mkdir -p /app/data/logs /app/config /app/documents \
+RUN mkdir -p /app/data/logs /app/config \
     && chown -R admino:admino /app
 
 # Copy and enable the entrypoint script. Root-owned and execute-only for

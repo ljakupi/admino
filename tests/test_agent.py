@@ -159,7 +159,7 @@ def permissions_config() -> PermissionsConfig:
 
     - ``echo.say``: allow (happy path)
     - ``echo.write``: confirm (confirmation flow)
-    - ``files.read``: allow
+    - ``memory.recall``: allow
     - ``gmail.send``: hardcoded-deny (attempted allow is ignored)
     """
     return PermissionsConfig(
@@ -167,7 +167,7 @@ def permissions_config() -> PermissionsConfig:
             "echo": ToolPermissions(
                 actions={"say": "allow", "write": "confirm"},
             ),
-            "files": ToolPermissions(actions={"read": "allow"}),
+            "memory": ToolPermissions(actions={"recall": "allow"}),
             "gmail": ToolPermissions(actions={"read": "allow"}),
         }
     )
@@ -1120,6 +1120,117 @@ class TestAgentHallucinatedTools:
 
 
 # ===========================================================================
+# 6b. The removed local files tool (GH-143)
+# ===========================================================================
+
+
+class TestAgentRejectsRemovedFilesTool:
+    """A files.* call from the LLM is an unknown tool; the agent recovers.
+
+    Runs against the shipped default permissions with no files handler
+    registered. ``read`` was allow, ``write`` was confirm and ``delete`` was
+    hardcoded-deny: all three must now fail as unknown tools instead of
+    executing, asking for confirmation or quoting a permission denial.
+    """
+
+    @staticmethod
+    def _files_call(action: str) -> ToolCall:
+        return ToolCall(
+            tool="files",
+            action=action,
+            args={"path": "/app/documents/notes.txt"},
+            tool_call_id=f"call_files_{action}",
+        )
+
+    @pytest.mark.parametrize("action", ["read", "write", "delete"])
+    async def test_agent_files_call_fails_as_unknown_tool_and_agent_recovers(
+        self,
+        audit_logger: AuditLogger,
+        agent_config: AgentConfig,
+        action: str,
+    ) -> None:
+        """The run finishes with the LLM's recovery answer; the files call failed."""
+        from admino.permissions import build_default_permissions_config
+
+        fake = FakeLLM(
+            [
+                _tool_response(self._files_call(action)),
+                _text_response("The local files tool is not available."),
+            ]
+        )
+        agent = _build_agent(fake, audit_logger, build_default_permissions_config(), agent_config)
+
+        result = await agent.run("open my notes", session_id="s", history=[])
+
+        assert result.status == "final"
+        assert result.response == "The local files tool is not available."
+        assert result.pending_confirmation is None
+        assert len(result.tool_calls) == 1
+        record = result.tool_calls[0]
+        assert (record.tool, record.action) == ("files", action)
+        assert record.success is False
+        assert record.permission == "deny"
+        tool_messages = [m for m in result.history if m.role == "tool"]
+        assert [m.content for m in tool_messages] == [f"Unknown tool: files.{action}"]
+
+    @pytest.mark.parametrize("action", ["read", "write", "delete"])
+    async def test_agent_files_call_result_fed_back_says_unknown_tool(
+        self,
+        audit_logger: AuditLogger,
+        agent_config: AgentConfig,
+        action: str,
+    ) -> None:
+        """The tool result handed back to the LLM names it an unknown tool."""
+        from admino.permissions import build_default_permissions_config
+
+        fake = FakeLLM(
+            [
+                _tool_response(self._files_call(action)),
+                _text_response("ok"),
+            ]
+        )
+        agent = _build_agent(fake, audit_logger, build_default_permissions_config(), agent_config)
+
+        result = await agent.run("open my notes", session_id="s", history=[])
+
+        assert result.tool_calls[0].permission == "deny"
+        assert fake.calls == 2
+        tool_messages = [m for m in fake.received_messages[1] if m.role == "tool"]
+        assert len(tool_messages) == 1
+        assert tool_messages[0].tool_call_id == f"call_files_{action}"
+        assert f"Unknown tool: files.{action}" in tool_messages[0].content
+
+    @pytest.mark.parametrize("action", ["read", "write", "delete"])
+    async def test_agent_files_call_audited_as_denied_unknown_tool(
+        self,
+        tmp_path: Path,
+        audit_logger: AuditLogger,
+        agent_config: AgentConfig,
+        action: str,
+    ) -> None:
+        """The tool_call audit entry for a files.* call is a failed deny."""
+        from admino.permissions import build_default_permissions_config
+
+        fake = FakeLLM(
+            [
+                _tool_response(self._files_call(action)),
+                _text_response("ok"),
+            ]
+        )
+        agent = _build_agent(fake, audit_logger, build_default_permissions_config(), agent_config)
+
+        await agent.run("open my notes", session_id="s", history=[])
+
+        tool_entries = _filter_entries(_read_audit_entries(tmp_path), "tool_call")
+        assert len(tool_entries) == 1
+        entry = tool_entries[0]
+        assert (entry["tool"], entry["action"]) == ("files", action)
+        assert entry["success"] is False
+        assert entry["permission"] == "deny"
+        assert "unknown" in str(entry["error"]).lower()
+
+
+# ===========================================================================
 # 7. LLM exception handling
 # ===========================================================================
 
@@ -1626,14 +1737,14 @@ async def test_agent_permission_state_parametrized(
     expected_success: bool,
 ) -> None:
     """Allow/deny states produce the expected tool-call success flag."""
-    register_tool("files", "read", "read file", EchoArgs)(echo_handler)
+    register_tool("memory", "recall", "recall a note", EchoArgs)(echo_handler)
     permissions = PermissionsConfig(
-        tools={"files": ToolPermissions(actions={"read": state})}  # type: ignore[dict-item]
+        tools={"memory": ToolPermissions(actions={"recall": state})}  # type: ignore[dict-item]
     )
     fake = FakeLLM(
         [
             _tool_response(
-                ToolCall(tool="files", action="read", args={"text": "x"}),
+                ToolCall(tool="memory", action="recall", args={"text": "x"}),
             ),
             _text_response("done"),
         ]
@@ -1816,7 +1927,7 @@ class TestAgentToolsEnabledAllTrue:
             permissions_config=permissions_config,
             agent_config=agent_config,
             model_name="test-model",
-            tools_enabled={"gmail": True, "files": True, "memory": True},
+            tools_enabled={"gmail": True, "google_drive": True, "memory": True},
         )
 
         await agent.run("hi", session_id="sess-1", history=[])
@@ -1847,7 +1958,7 @@ class TestAgentToolsEnabledAllTrue:
             permissions_config=permissions_config,
             agent_config=agent_config,
             model_name="test-model",
-            tools_enabled={"gmail": True, "files": True, "memory": True},
+            tools_enabled={"gmail": True, "google_drive": True, "memory": True},
         )
 
         await agent.run("hi", session_id="sess-1", history=[])

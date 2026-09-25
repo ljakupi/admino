@@ -121,7 +121,7 @@ Review these before every change; violations block the PR:
 - **Permission-engine isolation.** `permissions.py` is a pure function over
   `(tool, action)` and must never import from `agent.py`, `llm*.py`, or `server.py`,
   and must never see LLM-generated context. Hardcoded denials (e.g. `gmail.send`,
-  `files.delete`, `memory.delete`) cannot be made configurable.
+  `google_drive.delete`, `memory.delete`) cannot be made configurable.
 - **Network boundaries stay intact.** The agent container is whitelist-only egress;
   local LLM containers get zero external network access. Don't loosen either.
 - New tools or actions require permission entries and a security rationale in the

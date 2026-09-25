@@ -162,7 +162,6 @@ def _import_tool_modules() -> None:
         "admino.tools.outlook_calendar",
         "admino.tools.onedrive",
         # Other tools
-        "admino.tools.files",
         "admino.tools.memory",
     ]
 
@@ -171,7 +170,7 @@ def _import_tool_modules() -> None:
             # __import__ is a built-in (not importlib) and is the primitive
             # that the import statement itself compiles to. SEC-20 bans
             # importlib; __import__ with a hardcoded name list is equivalent
-            # to writing nine ``import admino.tools.X`` statements.
+            # to writing seven ``import admino.tools.X`` statements.
             __import__(module_name)
         except ModuleNotFoundError:
             logger.warning("Tool module %s not found, skipping.", module_name)
@@ -186,8 +185,9 @@ def _build_system_prompt(
 ) -> str:
     """Build a system prompt from the validated application config.
 
-    Tells the LLM which file paths it can access so it doesn't have to
-    guess and hit permission errors.
+    Tells the LLM which tools and actions it can use, that some actions need
+    user confirmation, and that it must never substitute a different action
+    for the one the user asked for.
 
     Args:
         config: Validated AppConfig instance.
@@ -236,24 +236,11 @@ def _build_system_prompt(
         "STOP and tell the user that action is not available and why — for example, "
         "that it needs to be enabled or promoted in Critical Permissions. Do NOT "
         "approximate the request with a different tool. This is absolute for "
-        "mutating actions: never turn an update into a create, a move into an "
-        "overwrite, or send to a different recipient/channel. A duplicate or wrong "
-        "write is worse than doing nothing.",
+        "mutating actions: never turn an update into a create, or send to a "
+        "different recipient/channel. A duplicate or wrong write is worse than "
+        "doing nothing.",
         "",
     ]
-
-    if config.files.allowed_paths:
-        lines.append("The following file paths are available to you:")
-        for entry in config.files.allowed_paths:
-            from pathlib import Path as _Path
-
-            resolved = _Path(entry.path).resolve()
-            access_desc = "read and write" if entry.access == "readwrite" else "read only"
-            lines.append(f"  - {entry.label}: {resolved}  ({access_desc})")
-        lines.append(
-            "When using file tools, always use the exact paths listed above "
-            "(or paths within those directories)."
-        )
 
     return "\n".join(lines)
 
@@ -456,22 +443,11 @@ def main(
             asyncio.run(_check_infomaniak_startup(llm_client))
 
     # ------------------------------------------------------------------
-    # 6. Configure and import tool modules, then freeze the registry
+    # 6. Import tool modules, then freeze the registry
     # ------------------------------------------------------------------
-
-    # Configure tool modules with paths from the validated config BEFORE
-    # importing them (import triggers @register_tool decorators, not config).
-    from admino.tools import files as files_tool
+    # Importing a tool module runs its @register_tool decorators; freezing
+    # afterwards blocks any late or dynamic registration.
     from admino.tools.registry import freeze_registry
-
-    files_tool.configure(
-        allowed_paths=[
-            {"path": entry.path, "label": entry.label, "access": entry.access}
-            for entry in config.files.allowed_paths
-        ],
-        max_read_chars=config.files.max_read_chars,
-    )
-    logger.info("Tool modules configured (files).")
 
     _import_tool_modules()
     freeze_registry()

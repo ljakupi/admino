@@ -397,17 +397,17 @@ describe('chatStore response handling', () => {
         }),
       )
       .mockResolvedValueOnce(
-        makeResponse({ tool_calls: [makeRecord({ tool: 'files', action: 'list' })] }),
+        makeResponse({ tool_calls: [makeRecord({ tool: 'memory', action: 'list' })] }),
       );
     const chat = useChatStore();
 
     await chat.sendMessage('Read the newest email');
-    await chat.sendMessage('List my files');
+    await chat.sendMessage('List my notes');
 
     expect(chat.toolCallHistory.map((tc) => `${tc.tool}.${tc.action}`)).toEqual([
       'gmail.search',
       'gmail.read',
-      'files.list',
+      'memory.list',
     ]);
   });
 });

@@ -1298,10 +1298,11 @@ class TestToolsSettings:
             "outlook",
             "outlook_calendar",
             "onedrive",
-            "files",
             "memory",
         ):
             assert tools[tool_name] is True, f"{tool_name} should default to True"
+        # GH-143: the local files tool is gone, so it has no toggle.
+        assert "files" not in tools
 
     async def test_get_settings_includes_tools_with_custom_state(self) -> None:
         """When DB settings have tools with gmail=False, response reflects that."""
@@ -1553,6 +1554,73 @@ class TestToolsSettings:
         if tools_calls:
             saved = tools_calls[0][0][2]
             assert "unknown_tool" not in saved
+
+    async def test_patch_settings_tools_ignores_removed_files_toggle(self) -> None:
+        """PATCH {"tools": {"files": false}} is silently ignored (GH-143).
+
+        The files tool no longer exists, so its toggle is an unknown field:
+        the request succeeds and nothing about 'files' is persisted.
+        """
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings()),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"files": False}},
+                )
+
+        assert resp.status_code == 200
+        saved_tools = [c[0][2] for c in mock_update.call_args_list if c[0][1] == "tools"]
+        assert all("files" not in saved for saved in saved_tools)
+
+    async def test_patch_settings_tools_drops_legacy_files_key_from_db(self) -> None:
+        """A legacy 'files' key already stored in the DB is not written back (GH-143)."""
+        settings = dict(_DEFAULT_DB_SETTINGS)
+        settings["tools"] = {"files": False}
+        app = _make_app()
+        mock_update = AsyncMock()
+
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(settings)),
+            patch("admino.database.update_setting", mock_update),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=_AUTH_HEADER,
+                    json={"tools": {"gmail": False}},
+                )
+
+        assert resp.status_code == 200
+        saved_tools = [c[0][2] for c in mock_update.call_args_list if c[0][1] == "tools"]
+        assert len(saved_tools) == 1
+        assert saved_tools[0]["gmail"] is False
+        assert "files" not in saved_tools[0]
+
+    async def test_get_settings_tools_omits_legacy_files_key_from_db(self) -> None:
+        """GET never reports a 'files' toggle, even if the DB still stores one."""
+        settings = dict(_DEFAULT_DB_SETTINGS)
+        settings["tools"] = {"files": False, "gmail": False}
+        app = _make_app()
+        with (
+            patch("admino.database.get_pool", _mock_get_pool()),
+            patch("admino.database.load_settings_from_db", _mock_load_settings(settings)),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+
+        assert resp.status_code == 200
+        tools = resp.json()["tools"]
+        assert "files" not in tools
+        assert tools["gmail"] is False
 
     async def test_get_settings_tools_fallback_on_corrupt_db(self) -> None:
         """GET with corrupt tools JSONB in DB falls back to all-enabled defaults."""

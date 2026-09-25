@@ -296,7 +296,13 @@ class TestDispatchPermissionDenied:
         assert result.permission.allowed == "deny"
 
     async def test_dispatch_hardcoded_denial_returns_failure(self, registered_tool: None) -> None:
-        """Hardcoded denials (e.g. gmail.send) return failure even if config says allow."""
+        """Hardcoded denials (e.g. gmail.send) return failure even if config says allow.
+
+        GH-143: unregistered pairs are now rejected as unknown tools before the
+        permission engine runs, so gmail.send must be registered for this test
+        to keep exercising the hardcoded-denial path.
+        """
+        register_tool("gmail", "send", "Send email", SampleArgs)(sample_handler)
         config_says_allow = PermissionsConfig(
             tools={"gmail": ToolPermissions(actions={"send": "allow"})}
         )
@@ -304,6 +310,7 @@ class TestDispatchPermissionDenied:
         result = await dispatch_tool_call(tc, config_says_allow, session_id="sess-1")
         assert result.success is False
         assert result.permission.allowed == "deny"
+        assert "hardcoded" in result.permission.reason.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -894,7 +901,6 @@ class TestDispatchPermissionAdditional:
             ("outlook_calendar", "update"),
             ("onedrive", "delete"),
             ("documents", "delete"),
-            ("files", "delete"),
             ("memory", "delete"),
         ],
         ids=[
@@ -909,7 +915,6 @@ class TestDispatchPermissionAdditional:
             "outlook_calendar.update",
             "onedrive.delete",
             "documents.delete",
-            "files.delete",
             "memory.delete",
         ],
     )
@@ -1285,7 +1290,7 @@ class TestPendingConfirmationEnforcement:
         """pending_confirmation for a different tool is rejected as deny."""
         register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
         # Confirmation was issued for a DIFFERENT tool.action
-        other_tc = ToolCall(tool="files", action="write", args={"query": "test"})
+        other_tc = ToolCall(tool="google_calendar", action="create", args={"query": "test"})
         pending = _make_pending_confirmation(other_tc)
         # Now dispatch gmail.read with that stale/wrong confirmation
         tc = _make_tool_call()
@@ -1320,7 +1325,7 @@ class TestPendingConfirmationEnforcement:
             return "run"
 
         register_tool("gmail", "read", "Read", SampleArgs)(spy_handler)
-        other_tc = ToolCall(tool="files", action="write", args={"query": "test"})
+        other_tc = ToolCall(tool="google_calendar", action="create", args={"query": "test"})
         pending = _make_pending_confirmation(other_tc)
         tc = _make_tool_call()
         await dispatch_tool_call(
@@ -1655,7 +1660,7 @@ class TestDispatchAuditLogging:
         """Mismatched pending_confirmation writes a deny audit entry."""
         spy = _SpyAuditLogger()
         register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
-        other_tc = ToolCall(tool="files", action="write", args={"query": "x"})
+        other_tc = ToolCall(tool="google_calendar", action="create", args={"query": "x"})
         pending = _make_pending_confirmation(other_tc)
         tc = _make_tool_call()
         await dispatch_tool_call(
@@ -2073,3 +2078,301 @@ class TestGetRegisteredToolsPermissionAware:
             ("google_calendar", "read"),
             ("google_calendar", "create"),
         }
+
+
+# ---------------------------------------------------------------------------
+# 35. Unknown tools are rejected BEFORE the permission engine (GH-143)
+# ---------------------------------------------------------------------------
+
+
+class _CheckPermissionSpy:
+    """Records every call made to ``check_permission`` from the registry."""
+
+    def __init__(self) -> None:
+        from admino.permissions import check_permission as real_check
+
+        self._real = real_check
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        tool, action = args[0], args[1]
+        self.calls.append((str(tool), str(action)))
+        return self._real(*args, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.fixture()
+def check_permission_spy(monkeypatch: pytest.MonkeyPatch) -> _CheckPermissionSpy:
+    """Replace ``admino.tools.registry.check_permission`` with a recording spy."""
+    from admino.tools import registry as reg
+
+    spy = _CheckPermissionSpy()
+    monkeypatch.setattr(reg, "check_permission", spy)
+    return spy
+
+
+class TestDispatchUnknownToolBeforePermission:
+    """An unregistered (tool, action) is rejected right after the identifier and
+    enabled checks — before ``check_permission`` runs and before any
+    confirmation request is issued (GH-143 decision).
+    """
+
+    async def test_unregistered_confirm_action_returns_unknown_tool_not_confirmation(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """A confirm-level action with no handler never asks the user to confirm."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1")
+        assert result.success is False
+        assert "Unknown tool: gmail.read" in result.result
+        assert "confirmation" not in result.result.lower()
+
+    async def test_unregistered_confirm_action_permission_is_deny(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """The unknown-tool rejection reports a deny decision, never 'confirm'."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1")
+        assert result.permission.allowed == "deny"
+        assert result.pending_confirmation is None
+
+    async def test_unregistered_deny_action_reports_unknown_tool(
+        self, deny_config: PermissionsConfig
+    ) -> None:
+        """An unregistered action configured 'deny' is reported as an unknown tool."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        assert result.success is False
+        assert "Unknown tool: gmail.read" in result.result
+        assert result.permission.allowed == "deny"
+
+    async def test_unregistered_default_deny_action_reports_unknown_tool(
+        self, empty_config: PermissionsConfig
+    ) -> None:
+        """An unregistered action absent from the config is reported as unknown."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1")
+        assert result.success is False
+        assert "Unknown tool: gmail.read" in result.result
+        assert "not listed" not in result.result.lower()
+
+    async def test_unregistered_hardcoded_denial_reports_unknown_tool(
+        self, registered_tool: None
+    ) -> None:
+        """An unregistered hardcoded-denied action (gmail.send) is reported as unknown."""
+        config = PermissionsConfig(tools={"gmail": ToolPermissions(actions={"send": "allow"})})
+        tc = _make_tool_call(tool="gmail", action="send", args={})
+        result = await dispatch_tool_call(tc, config, session_id="sess-1")
+        assert result.success is False
+        assert "Unknown tool: gmail.send" in result.result
+        assert result.permission.allowed == "deny"
+
+    async def test_unregistered_allowed_action_permission_is_deny(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Even when the engine would allow it, an unknown tool reports 'deny'."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        assert result.success is False
+        assert "Unknown tool: gmail.read" in result.result
+        assert result.permission.allowed == "deny"
+
+    @pytest.mark.parametrize(
+        "config_fixture",
+        ["allow_config", "confirm_config", "deny_config", "empty_config"],
+    )
+    async def test_check_permission_not_invoked_for_unregistered_pair(
+        self,
+        config_fixture: str,
+        check_permission_spy: _CheckPermissionSpy,
+        request: pytest.FixtureRequest,
+    ) -> None:
+        """The permission engine never sees a (tool, action) that has no handler."""
+        config: PermissionsConfig = request.getfixturevalue(config_fixture)
+        await dispatch_tool_call(_make_tool_call(), config, session_id="sess-1")
+        assert check_permission_spy.calls == []
+
+    async def test_check_permission_still_invoked_for_registered_pair(
+        self,
+        registered_tool: None,
+        allow_config: PermissionsConfig,
+        check_permission_spy: _CheckPermissionSpy,
+    ) -> None:
+        """Registered pairs still go through the permission engine exactly once."""
+        await dispatch_tool_call(_make_tool_call(), allow_config, session_id="sess-1")
+        assert check_permission_spy.calls == [("gmail", "read")]
+
+    async def test_unregistered_pair_with_forged_confirmation_is_unknown(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """A matching pending_confirmation cannot lend an unknown tool any standing."""
+        tc = _make_tool_call()
+        pending = _make_pending_confirmation(tc)
+        result = await dispatch_tool_call(
+            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+        )
+        assert result.success is False
+        assert "Unknown tool: gmail.read" in result.result
+        assert result.permission.allowed == "deny"
+
+    async def test_disabled_check_still_runs_before_unknown_tool_check(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Ordering: identifier check, then enabled check, then unknown-tool check."""
+        tc = _make_tool_call()
+        result = await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+        )
+        assert result.success is False
+        assert "Tool 'gmail' is disabled" in result.result
+
+    async def test_unknown_tool_audit_entry_permission_is_deny(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """The unknown-tool audit entry records permission 'deny' (not the config state)."""
+        spy = _SpyAuditLogger()
+        await dispatch_tool_call(
+            _make_tool_call(),
+            allow_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        entry = spy.entries[0]
+        assert entry.permission == "deny"
+        assert entry.success is False
+        assert entry.error is not None
+        assert "unknown" in entry.error.lower()
+
+    async def test_unknown_confirm_action_writes_single_unknown_audit_entry(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """A confirm-level unknown action is audited once, as an unknown-tool deny."""
+        spy = _SpyAuditLogger()
+        await dispatch_tool_call(
+            _make_tool_call(),
+            confirm_config,
+            session_id="sess-1",
+            audit_logger=spy,  # type: ignore[arg-type]
+        )
+        assert len(spy.entries) == 1
+        entry = spy.entries[0]
+        assert entry.permission == "deny"
+        assert entry.error is not None
+        assert "unknown" in entry.error.lower()
+
+
+# ---------------------------------------------------------------------------
+# 36. files.* calls from the LLM are unknown tools (GH-143)
+# ---------------------------------------------------------------------------
+
+_FILES_ACTIONS: list[str] = ["read", "list", "search", "write", "move", "delete", "overwrite"]
+
+
+class TestFilesToolCallsRejectedAsUnknown:
+    """The local files tool is gone: any files.* call is an unknown tool.
+
+    Dispatched against the shipped default permissions with no files handler
+    registered, every former files action — including the old confirm-level
+    write/move and the old hardcoded-denied delete/overwrite — must be rejected
+    as ``Unknown tool: files.<action>`` with a deny decision.
+    """
+
+    @pytest.mark.parametrize("action", _FILES_ACTIONS)
+    async def test_files_action_rejected_as_unknown_tool(self, action: str) -> None:
+        """files.<action> returns success=False with an 'Unknown tool' result."""
+        from admino.permissions import build_default_permissions_config
+
+        tc = ToolCall(tool="files", action=action, args={"path": "/app/documents/notes.txt"})
+        result = await dispatch_tool_call(
+            tc, build_default_permissions_config(), session_id="sess-1"
+        )
+        assert result.success is False
+        assert f"Unknown tool: files.{action}" in result.result
+        assert result.permission.allowed == "deny"
+
+    @pytest.mark.parametrize("action", _FILES_ACTIONS)
+    async def test_files_action_never_reaches_permission_engine(
+        self, action: str, check_permission_spy: _CheckPermissionSpy
+    ) -> None:
+        """No files.* call is ever evaluated by check_permission."""
+        from admino.permissions import build_default_permissions_config
+
+        tc = ToolCall(tool="files", action=action, args={})
+        await dispatch_tool_call(tc, build_default_permissions_config(), session_id="sess-1")
+        assert check_permission_spy.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 37. Real tool registry surface after startup (GH-143)
+# ---------------------------------------------------------------------------
+
+
+def _register_real_tool_modules() -> None:
+    """Import every real tool module into a clean registry, then freeze it.
+
+    ``admino.main._import_tool_modules`` is the production import list; it is
+    a no-op for modules already in ``sys.modules``, so every loaded
+    ``admino.tools.*`` module is reloaded afterwards to re-run its
+    ``@register_tool`` decorators against the cleared registry.
+    """
+    import importlib
+    import sys
+
+    from admino.main import _import_tool_modules
+    from admino.tools.registry import freeze_registry
+
+    _import_tool_modules()
+    clear_registry()
+    for name in sorted(sys.modules):
+        if name.startswith("admino.tools.") and name != "admino.tools.registry":
+            importlib.reload(sys.modules[name])
+    freeze_registry()
+
+
+class TestRealToolRegistrySurface:
+    """After startup, the files tool and the Drive/OneDrive downloads are gone."""
+
+    def test_no_files_tool_registered(self) -> None:
+        """No ("files", *) key is registered by the real tool modules."""
+        _register_real_tool_modules()
+        keys = {(t.tool, t.action) for t in get_registered_tools()}
+        assert {k for k in keys if k[0] == "files"} == set()
+
+    def test_google_drive_download_not_registered(self) -> None:
+        """google_drive.download is unregistered until attachments land (#192)."""
+        _register_real_tool_modules()
+        assert get_tool_entry("google_drive", "download") is None
+
+    def test_onedrive_download_not_registered(self) -> None:
+        """onedrive.download is unregistered until attachments land (#192)."""
+        _register_real_tool_modules()
+        assert get_tool_entry("onedrive", "download") is None
+
+    def test_llm_tool_list_has_no_files_or_download_actions(self) -> None:
+        """The permission-aware tool list offered to the LLM has no files.* / *.download."""
+        from admino.permissions import build_default_permissions_config
+
+        _register_real_tool_modules()
+        offered = get_registered_tools(permissions_config=build_default_permissions_config())
+        names = {f"{t.tool}.{t.action}" for t in offered}
+        assert {n for n in names if n.startswith("files.")} == set()
+        assert {n for n in names if n.endswith(".download")} == set()
+
+    @pytest.mark.parametrize(
+        ("tool", "action"),
+        [
+            ("google_drive", "read"),
+            ("google_drive", "list"),
+            ("google_drive", "search"),
+            ("onedrive", "read"),
+            ("onedrive", "list"),
+            ("onedrive", "search"),
+        ],
+    )
+    def test_drive_and_onedrive_read_actions_still_registered(self, tool: str, action: str) -> None:
+        """Drive/OneDrive read, list and search stay registered and offered to the LLM."""
+        from admino.permissions import build_default_permissions_config
+
+        _register_real_tool_modules()
+        offered = get_registered_tools(permissions_config=build_default_permissions_config())
+        assert (tool, action) in {(t.tool, t.action) for t in offered}

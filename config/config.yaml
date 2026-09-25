@@ -68,17 +68,6 @@ paths:
   # Docker: these are overridden by volume mounts at /app/data/*.
   audit_log: "data/logs/audit.ndjson"
 
-files:
-  allowed_paths:
-    # Docker: ~/Downloads/admino on the host is mounted at /app/documents.
-    # The agent can read and write anything inside that directory.
-    # Nothing outside it is accessible — Docker does not mount any other host path.
-    # Local dev (make run): change this to an absolute path on your laptop.
-    - path: "/app/documents"
-      label: "Documents (~/Downloads/admino)"
-      access: "readwrite"
-  max_read_chars: 10000
-
 limits:
   max_tool_calls_per_message: 10
   max_pending_confirmations: 3

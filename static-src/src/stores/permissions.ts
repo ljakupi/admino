@@ -14,7 +14,6 @@ const HARDCODED_DENIALS = new Set([
   'outlook_calendar.delete',
   'onedrive.delete',
   'documents.delete',
-  'files.delete', 'files.overwrite',
   'memory.delete',
 ]);
 
@@ -92,19 +91,6 @@ const TOOL_META: Record<string, { label: string; description: string; actions: R
       search: 'Search for files',
       download: 'Download a file',
       delete: 'Delete a file',
-    },
-  },
-  files: {
-    label: 'Files',
-    description: 'Local files under ~/Downloads/admino',
-    actions: {
-      read: 'Read file contents',
-      list: 'List files in directory',
-      search: 'Search for files',
-      write: 'Write a new file',
-      move: 'Move or rename a file',
-      delete: 'Delete a file',
-      overwrite: 'Overwrite an existing file',
     },
   },
   memory: {

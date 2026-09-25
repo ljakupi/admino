@@ -163,7 +163,6 @@ export interface ToolsSettings {
   outlook: boolean;
   outlook_calendar: boolean;
   onedrive: boolean;
-  files: boolean;
   memory: boolean;
 }
 

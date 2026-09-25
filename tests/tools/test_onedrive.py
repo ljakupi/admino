@@ -1,14 +1,15 @@
 """Tests for the OneDrive tool (admino.tools.onedrive).
 
 Covers tool registration, happy-path responses, OAuth error handling,
-API error handling, empty results, download with path validation,
-and argument validation. All HTTP calls are mocked.
+API error handling, empty results, and argument validation. All HTTP calls
+are mocked. GH-143: onedrive.download is unregistered (its handler, helpers
+and args model are deleted) until attachments restore it (#192).
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path  # noqa: TC003
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
 
@@ -20,14 +21,13 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
 from admino.models import (
-    OneDriveDownloadArgs,
     OneDriveListArgs,
     OneDriveReadArgs,
     OneDriveSearchArgs,
 )
 from admino.oauth import OAuthError
 from admino.tools import onedrive as onedrive_mod
-from admino.tools.registry import clear_registry, get_registered_tools
+from admino.tools.registry import clear_registry, get_registered_tools, get_tool_entry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -129,11 +129,42 @@ class TestOneDriveRegistration:
         keys = [(t.tool, t.action) for t in tools]
         assert ("onedrive", "search") in keys
 
-    def test_download_registered(self) -> None:
-        """onedrive.download is in the registry."""
+    def test_download_not_registered(self) -> None:
+        """onedrive.download is NOT registered until attachments land (GH-143, #192)."""
         tools = get_registered_tools()
         keys = [(t.tool, t.action) for t in tools]
-        assert ("onedrive", "download") in keys
+        assert ("onedrive", "download") not in keys
+        assert get_tool_entry("onedrive", "download") is None
+
+    def test_registers_exactly_read_list_search(self) -> None:
+        """The module registers only read, list and search."""
+        keys = {(t.tool, t.action) for t in get_registered_tools()}
+        assert keys == {("onedrive", "read"), ("onedrive", "list"), ("onedrive", "search")}
+
+    @pytest.mark.parametrize(
+        "symbol",
+        [
+            "onedrive_download",
+            "_sync_write_download",
+            "_MAX_DOWNLOAD_SIZE",
+            "_SAFE_REDIRECT_SUFFIXES",
+        ],
+    )
+    def test_download_code_removed(self, symbol: str) -> None:
+        """The download handler, its write helper and download-only constants are deleted."""
+        assert not hasattr(onedrive_mod, symbol)
+
+    def test_module_does_not_import_files_tool(self) -> None:
+        """onedrive no longer depends on the removed files tool module."""
+        import ast
+
+        source = Path(onedrive_mod.__file__).read_text(encoding="utf-8")
+        modules = {
+            node.module
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        assert "admino.tools.files" not in modules
 
 
 # ---------------------------------------------------------------------------
@@ -466,181 +497,6 @@ class TestOneDriveSearch:
 
 
 # ---------------------------------------------------------------------------
-# 5. onedrive.download
-# ---------------------------------------------------------------------------
-
-
-class TestOneDriveDownload:
-    """Tests for the onedrive.download action."""
-
-    async def test_download_happy_path(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Successful download writes file and returns size message."""
-        file_content = b"PDF content here"
-        mock_http_client.get.return_value = _make_response(200, content=file_content)
-        dest = tmp_path / "downloaded.pdf"
-
-        with (
-            patch("admino.tools.onedrive._validate_path", return_value=dest),
-            patch("admino.tools.onedrive._revalidate_resolved"),
-        ):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
-            result = await onedrive_download(args)
-
-        assert "Downloaded" in result
-        assert dest.exists()
-        assert dest.read_bytes() == file_content
-
-    async def test_download_url_encodes_item_id(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Item IDs with special chars (= + / !) are percent-encoded into the path."""
-        mock_http_client.get.return_value = _make_response(200, content=b"data")
-        dest = tmp_path / "dl.pdf"
-
-        with (
-            patch("admino.tools.onedrive._validate_path", return_value=dest),
-            patch("admino.tools.onedrive._revalidate_resolved"),
-        ):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="i+/=d!x", destination=str(dest))
-            await onedrive_download(args)
-
-        called_url = mock_http_client.get.call_args_list[0].args[0]
-        assert "i%2B%2F%3Dd%21x" in called_url
-        assert "items/i+/=d!x/content" not in called_url
-
-    async def test_download_follows_personal_content_redirect(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Personal accounts redirect /content to *.microsoftpersonalcontent.com."""
-        redirect_url = "https://my.microsoftpersonalcontent.com/personal/download?t=abc"
-        resp_302 = httpx.Response(status_code=302, headers={"location": redirect_url})
-        resp_200 = _make_response(200, content=b"file-bytes")
-        mock_http_client.get.side_effect = [resp_302, resp_200]
-        dest = tmp_path / "personal.pdf"
-
-        with (
-            patch("admino.tools.onedrive._validate_path", return_value=dest),
-            patch("admino.tools.onedrive._revalidate_resolved"),
-        ):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="AB91DF8D5821815F!s0d16a", destination=str(dest))
-            result = await onedrive_download(args)
-
-        assert "Downloaded" in result
-        assert dest.read_bytes() == b"file-bytes"
-        # The redirect is followed WITHOUT forwarding the Authorization header.
-        second_call = mock_http_client.get.call_args_list[1]
-        assert second_call.args[0] == redirect_url
-        assert "headers" not in second_call.kwargs
-
-    async def test_download_blocks_unsafe_redirect_host(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Redirects to non-Microsoft hosts are blocked (SSRF defence)."""
-        resp_302 = httpx.Response(
-            status_code=302, headers={"location": "https://evil.example.com/x"}
-        )
-        mock_http_client.get.side_effect = [resp_302]
-        dest = tmp_path / "x.pdf"
-
-        with patch("admino.tools.onedrive._validate_path", return_value=dest):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
-            result = await onedrive_download(args)
-
-        assert "unsafe redirect" in result
-        assert not dest.exists()
-
-    async def test_download_path_validation_rejected(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock
-    ) -> None:
-        """Invalid destination path is rejected."""
-        with patch(
-            "admino.tools.onedrive._validate_path",
-            side_effect=PermissionError("outside allowed paths"),
-        ):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="item-1", destination="/etc/passwd")
-            result = await onedrive_download(args)
-
-        assert "Destination path rejected" in result
-
-    async def test_download_existing_file_rejected(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Download to existing file path is rejected."""
-        existing = tmp_path / "existing.txt"
-        existing.write_text("already here")
-
-        with patch("admino.tools.onedrive._validate_path", return_value=existing):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="item-1", destination=str(existing))
-            result = await onedrive_download(args)
-
-        assert "already exists" in result
-
-    async def test_download_oauth_not_configured(self, tmp_path: Path) -> None:
-        """OAuth not configured returns setup instructions."""
-        dest = tmp_path / "new_file.pdf"
-        with (
-            patch("admino.tools.onedrive._validate_path", return_value=dest),
-            patch(
-                "admino.tools.onedrive._get_microsoft_token",
-                new_callable=AsyncMock,
-                side_effect=OAuthError("not configured"),
-            ),
-        ):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
-            result = await onedrive_download(args)
-
-        assert "OAuth error" in result
-
-    async def test_download_api_error(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Non-200 returns Graph error."""
-        dest = tmp_path / "fail.pdf"
-        mock_http_client.get.return_value = _make_response(
-            404, {"error": {"message": "Item not found"}}
-        )
-
-        with patch("admino.tools.onedrive._validate_path", return_value=dest):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="bad-id", destination=str(dest))
-            result = await onedrive_download(args)
-
-        assert "Microsoft Graph error" in result
-
-    async def test_download_http_error(
-        self, mock_token: AsyncMock, mock_http_client: AsyncMock, tmp_path: Path
-    ) -> None:
-        """httpx.HTTPError returns connection failure."""
-        dest = tmp_path / "fail.pdf"
-        mock_http_client.get.side_effect = httpx.ConnectError("fail")
-
-        with patch("admino.tools.onedrive._validate_path", return_value=dest):
-            from admino.tools.onedrive import onedrive_download
-
-            args = OneDriveDownloadArgs(item_id="item-1", destination=str(dest))
-            result = await onedrive_download(args)
-
-        assert "Failed to connect" in result
-
-
-# ---------------------------------------------------------------------------
 # 6. Argument validation
 # ---------------------------------------------------------------------------
 
@@ -657,12 +513,6 @@ class TestOneDriveArgValidation:
         """OneDrive item IDs (base64 + '!') are accepted."""
         iid = "01BYE5RZ=+/AAA!107"
         args = OneDriveReadArgs(item_id=iid)
-        assert args.item_id == iid
-
-    def test_download_graph_item_id_with_special_chars_accepted(self) -> None:
-        """Download item IDs (base64 + '!') are accepted."""
-        iid = "01BYE5RZ=+/AAA!107"
-        args = OneDriveDownloadArgs(item_id=iid, destination="/data/f.pdf")
         assert args.item_id == iid
 
     def test_read_item_id_with_dot_or_traversal_rejected(self) -> None:
@@ -704,17 +554,6 @@ class TestOneDriveArgValidation:
         """max_results=0 is rejected for search."""
         with pytest.raises(ValidationError):
             OneDriveSearchArgs(query="test", max_results=0)
-
-    def test_download_valid_args_accepted(self) -> None:
-        """Valid download args are accepted."""
-        args = OneDriveDownloadArgs(item_id="item-1", destination="/data/file.pdf")
-        assert args.item_id == "item-1"
-        assert args.destination == "/data/file.pdf"
-
-    def test_download_overly_long_destination_rejected(self) -> None:
-        """Destination exceeding max_length is rejected."""
-        with pytest.raises(ValidationError):
-            OneDriveDownloadArgs(item_id="item-1", destination="x" * 501)
 
     def test_list_default_max_results(self) -> None:
         """Default max_results is 20."""

@@ -141,7 +141,6 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. |
 | `auth` | `mode` — `vpn` or `token` (see below). |
 | `paths` | Location of the append-only `audit_log`. |
-| `files` | `allowed_paths` the `files` tool may touch, and `max_read_chars`. |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 

@@ -30,7 +30,7 @@
 ---
 
 admino chats with you and can act on your behalf — reading your mail, calendar, and
-files — but **every action it takes is gated by an isolated permission engine the model
+drive files — but **every action it takes is gated by an isolated permission engine the model
 can neither see nor bypass**. Read actions run freely; anything that changes state pauses
 for your approval; a handful of destructive actions are denied outright. You run it on
 your own machine, your data stays with you, and nothing happens on your accounts without
@@ -42,7 +42,7 @@ your say-so.
 - 🏠 **Runs on your server** — your audit log, memory, and documents stay on the machine that runs admino. Only the active LLM provider sees the conversation.
 - 🧯 **Contained blast radius** — the agent container is whitelist-only egress, so even a hijacked agent can't phone home. → [Security Model](docs/SECURITY.md)
 - 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and an append-only audit log of every decision.
-- 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, local files, and memory — all permission-gated. → [Tools](docs/tools.md)
+- 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, and memory — all permission-gated. → [Tools](docs/tools.md)
 - 🤖 **Your choice of model** — [Infomaniak AI Services](https://www.infomaniak.com/en/hosting/ai-services) by default (processed in Switzerland; queries aren't recorded or used for training), an opt-in local vLLM CPU container (Apple Silicon + Linux), and Claude or OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
 
 ## 📸 Screenshots

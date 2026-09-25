@@ -136,9 +136,8 @@ make docker-down              # stop everything
 first run it downloads the model weights (~8 GB) into a Docker volume, and it skips the
 download once they're cached. Then pick **vLLM** in **Settings → Agent**.
 
-The API is published on **http://localhost:8000** (bound to `127.0.0.1` only). The agent
-can read and write files under `~/Downloads/admino` on your host, which is mounted into
-the container at `/app/documents`. Nothing outside that directory is reachable.
+The API is published on **http://localhost:8000** (bound to `127.0.0.1` only). No host
+directory is mounted into the container, so the agent can't reach files on your machine.
 
 > **Docker Desktop memory (`make start-local` only):** the vLLM CPU container needs ~8 GB for the model plus KV
 > cache headroom. Allocate **~12–16 GB** in Docker Desktop → Settings → Resources →

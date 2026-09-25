@@ -395,42 +395,12 @@ class DatabaseConfig(BaseModel):
     max_pool_size: int = Field(default=5, ge=1, le=50)
 
 
-class FilePathEntry(BaseModel):
-    """A single allowed file path entry from config.yaml files.allowed_paths."""
-
-    path: str = Field(
-        min_length=1,
-        max_length=500,
-        description="Absolute path to an allowed directory.",
-    )
-    label: str = Field(
-        default="",
-        max_length=100,
-        description="Human-readable label for this path.",
-    )
-    access: Literal["read", "readwrite"] = Field(
-        default="read",
-        description="Access mode: 'read' for read-only, 'readwrite' for read-write.",
-    )
-
-
-class FilesConfig(BaseModel):
-    """Configuration for the files tool — allowed paths and read limits."""
-
-    allowed_paths: list[FilePathEntry] = Field(
-        default_factory=list,
-        description="List of allowed file system paths the agent can access.",
-    )
-    max_read_chars: int = Field(
-        default=10000,
-        ge=100,
-        le=1_000_000,
-        description="Maximum characters to return when reading a file.",
-    )
-
-
 class AppConfig(BaseModel):
     """Top-level application configuration validated from config.yaml.
+
+    Unknown top-level sections are ignored (Pydantic's default ``extra``
+    behaviour), so a legacy ``files`` section left in an existing config.yaml
+    or settings table from before GH-143 still validates and is dropped.
 
     Environment variable overrides are applied after YAML loading:
     - LLM_PROVIDER      -> llm.provider
@@ -445,7 +415,6 @@ class AppConfig(BaseModel):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     paths: PathsConfig = Field(default_factory=PathsConfig)
-    files: FilesConfig = Field(default_factory=FilesConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)

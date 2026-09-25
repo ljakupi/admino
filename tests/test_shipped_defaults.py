@@ -1,4 +1,4 @@
-"""Tests pinning the committed out-of-the-box default files (issues #95, #134, #142).
+"""Tests pinning the committed out-of-the-box default files (issues #95, #134, #142, #143).
 
 Unlike tests/test_config.py, which validates config *behavior* using tmp_path
 fixtures, this module asserts against the **committed default files** shipped
@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from admino.config import AppConfig, load_app_config
 
@@ -167,6 +168,39 @@ class TestShippedConfigDefaults:
         """
         assert "api.anthropic.com" in shipped_config.egress.allowed_hosts
         assert "api.openai.com" not in shipped_config.egress.allowed_hosts
+
+
+# ---------------------------------------------------------------------------
+# Shipped config/config.yaml has no local files tool (GH-143)
+# ---------------------------------------------------------------------------
+
+
+class TestShippedConfigHasNoFilesTool:
+    """The local files tool is removed, so the committed config.yaml drops its section.
+
+    Parsed as raw YAML: AppConfig would silently ignore a leftover section, so
+    loading it through Pydantic cannot prove the section is gone.
+    """
+
+    @pytest.fixture()
+    def raw_config(self) -> dict[str, Any]:
+        """The committed config.yaml parsed as a plain mapping."""
+        parsed = yaml.safe_load(SHIPPED_CONFIG_PATH.read_text(encoding="utf-8"))
+        assert isinstance(parsed, dict)
+        return parsed
+
+    def test_shipped_config_has_no_files_section(self, raw_config: dict[str, Any]) -> None:
+        """No top-level 'files' key in the shipped config.yaml."""
+        assert "files" not in raw_config
+
+    def test_shipped_config_does_not_expose_documents_dir(self) -> None:
+        """No active config line points the agent at /app/documents."""
+        active_lines = [
+            line
+            for line in SHIPPED_CONFIG_PATH.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert not any("/app/documents" in line for line in active_lines)
 
 
 # ---------------------------------------------------------------------------
