@@ -9,12 +9,17 @@ Architecture:
   handler metadata.  It is populated at import time via ``@register_tool`` and
   should be treated as immutable after startup.
 - ``dispatch_tool_call`` is the **only** entry point for executing tools.
-  Permission checks (via ``permissions.check_permission``) always run **before**
-  argument validation or handler execution.
+  Unregistered (tool, action) pairs are rejected as unknown tools right after
+  the identifier and enabled checks; the permission check (via
+  ``permissions.check_permission``) then runs **before** any confirmation
+  request, argument validation or handler execution.
 - Argument validation uses each tool's declared Pydantic ``args_schema``.
 
 Security notes:
-- Permission check is the FIRST operation in dispatch — before arg validation.
+- An unknown (unregistered) tool is denied before the permission engine runs,
+  so a call with no handler never produces a confirmation request (GH-143).
+- For registered tools the permission check runs before confirmation handling,
+  argument validation and execution.
 - Tool/action identifiers are validated against the same ``[a-z][a-z0-9_]{0,62}``
   pattern used by the permission engine.
 - Argument validation errors never leak raw input values; only field-level
@@ -284,19 +289,22 @@ async def dispatch_tool_call(
     promoted: frozenset[tuple[str, str]] = frozenset(),
     enabled_tools: dict[str, bool] | None = None,
 ) -> ToolCallResult:
-    """Dispatch a tool call: check enabled state, permissions, validate args, execute.
+    """Dispatch a tool call: check enabled state, registry, permissions, validate, execute.
 
     This is the single entry point for tool execution.  The sequence is:
     0. Reject malformed identifiers.
-    1. Check enabled state — disabled tools are rejected before permission check.
-    2. Check permission via the isolated permission engine.
-    3. If denied, return immediately with the denial reason.
+    1. Check enabled state — disabled tools are rejected before anything else.
+    2. Look up the tool in the registry — an unregistered (tool, action),
+       e.g. a hallucinated or removed tool, is rejected as an unknown tool
+       with a ``deny`` decision.  The permission engine never evaluates it
+       and no confirmation is ever requested for it.
+    3. Check permission via the isolated permission engine; if denied, return
+       immediately with the denial reason.
     4. If ``confirm`` and no pending_confirmation supplied, return a result
        indicating that user confirmation is required.  If pending_confirmation
        IS supplied, verify its tool/action identity and expiry.
-    5. Look up the tool in the registry (reject hallucinated tool names).
-    6. Reject unknown args keys, then validate against the Pydantic schema.
-    7. Execute the async handler.
+    5. Reject unknown args keys, then validate against the Pydantic schema.
+    6. Execute the async handler.
 
     Every terminal path writes a ``ToolCallAuditEntry`` via ``audit_logger``
     if one is supplied.  In production (``ADMINO_ENV=production``), an audit
@@ -315,8 +323,9 @@ async def dispatch_tool_call(
         audit_logger: Sink for ``ToolCallAuditEntry`` records.  Required in
             production; optional in dev/tests for ergonomic reasons.
         enabled_tools: Per-tool enabled state from settings.  When provided,
-            tools whose name maps to ``False`` are rejected before any
-            permission check.  Missing keys default to enabled.
+            tools whose name maps to ``False`` are rejected before the
+            registry lookup and permission check.  Missing keys default to
+            enabled.
 
     Returns:
         A ``ToolCallResult`` with the outcome of the dispatch.
@@ -358,7 +367,8 @@ async def dispatch_tool_call(
             permission=permission,
         )
 
-    # 1. Enabled check — reject disabled tools before the permission engine runs.
+    # 1. Enabled check — reject disabled tools before the registry lookup and
+    #    the permission engine run.
     if enabled_tools is not None and enabled_tools.get(raw_tool) is False:
         disabled_permission = PermissionResult(allowed="deny", reason="Tool is disabled.")
         _write_audit(
@@ -378,12 +388,41 @@ async def dispatch_tool_call(
             permission=disabled_permission,
         )
 
-    # 2. Permission check — before any arg parsing or execution.
+    # 2. Unknown-tool check — an unregistered (tool, action) has no handler, so
+    #    it is denied before the permission engine runs.  This way a call to a
+    #    hallucinated or removed tool can never trigger a confirmation request,
+    #    whatever its configured permission state.
+    entry = _REGISTRY.get((raw_tool, raw_action))
+    if entry is None:
+        logger.warning(
+            "Rejected unknown tool %s.%s (not in registry)",
+            raw_tool[:64],
+            raw_action[:64],
+        )
+        unknown = PermissionResult(allowed="deny", reason="Tool is not registered.")
+        _write_audit(
+            audit_logger,
+            session_id=session_id,
+            tool=raw_tool,
+            action=raw_action,
+            permission=unknown,
+            args_keys=args_keys,
+            success=False,
+            error="Unknown tool.",
+        )
+        return ToolCallResult(
+            success=False,
+            # defence-in-depth truncation on [:63] slices
+            result=f"Unknown tool: {raw_tool[:63]}.{raw_action[:63]}",
+            permission=unknown,
+        )
+
+    # 3. Permission check — before any confirmation, arg parsing or execution.
     #    SECURITY: check_permission receives ONLY (tool, action, config, promoted).
     #    It must never see LLM-supplied args, session state, or conversation.
     permission = check_permission(raw_tool, raw_action, permissions_config, promoted=promoted)
 
-    # 2. Denied — return immediately.
+    # 3a. Denied — return immediately.
     if permission.allowed == "deny":
         _write_audit(
             audit_logger,
@@ -401,9 +440,9 @@ async def dispatch_tool_call(
             permission=permission,
         )
 
-    # 3. Confirm required.
+    # 4. Confirm required.
     if permission.allowed == "confirm":
-        # 3a. No confirmation supplied — ask the user.
+        # 4a. No confirmation supplied — ask the user.
         if pending_confirmation is None:
             _write_audit(
                 audit_logger,
@@ -424,7 +463,7 @@ async def dispatch_tool_call(
                 permission=permission,
             )
 
-        # 3b. Confirmation supplied — enforce identity match.  The caller MUST
+        # 4b. Confirmation supplied — enforce identity match.  The caller MUST
         #     NOT be the sole line of defence: a stale or mismatched
         #     confirmation must not unlock a different action.
         #     M3 fix: also verify args deep equality to prevent a caller from
@@ -459,7 +498,7 @@ async def dispatch_tool_call(
                 permission=mismatched,
             )
 
-        # 3c. Confirmation supplied — enforce expiry.
+        # 4c. Confirmation supplied — enforce expiry.
         if datetime.now(UTC) >= pending_confirmation.expires_at:
             logger.warning(
                 "Rejected expired pending_confirmation for %s.%s",
@@ -485,32 +524,6 @@ async def dispatch_tool_call(
                 result="Pending confirmation has expired.",
                 permission=expired,
             )
-
-    # 4. Look up tool in the registry.
-    key = (raw_tool, raw_action)
-    entry = _REGISTRY.get(key)
-    if entry is None:
-        logger.warning(
-            "Rejected unknown tool %s.%s (not in registry)",
-            raw_tool[:64],
-            raw_action[:64],
-        )
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error="Unknown tool.",
-        )
-        return ToolCallResult(
-            success=False,
-            # defence-in-depth truncation on [:63] slices
-            result=f"Unknown tool: {raw_tool[:63]}.{raw_action[:63]}",
-            permission=permission,
-        )
 
     # 5a. Reject args containing fields not declared on the schema.  Pydantic's
     #     default ``extra='ignore'`` would silently discard them, giving the

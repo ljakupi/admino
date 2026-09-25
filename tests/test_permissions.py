@@ -46,7 +46,7 @@ def sample_config() -> PermissionsConfig:
         tools={
             "gmail": ToolPermissions(actions={"read": "allow", "list": "confirm"}),
             "google_calendar": ToolPermissions(actions={"list": "allow", "create": "confirm"}),
-            "files": ToolPermissions(actions={"read": "allow", "search": "deny"}),
+            "outlook": ToolPermissions(actions={"read": "allow", "search": "deny"}),
         }
     )
 
@@ -64,7 +64,9 @@ def _build_config_with_hardcoded_allow(tool: str, action: str) -> PermissionsCon
 # 0. Default permission ruleset (seed source)
 # ---------------------------------------------------------------------------
 
-# The exact tool/action rules the retired config/permissions.yaml shipped.
+# The exact tool/action rules the retired config/permissions.yaml shipped,
+# minus the local files tool removed in GH-143. The Drive/OneDrive download
+# rows stay at "confirm" so the behaviour returns unchanged with #192.
 # build_default_permissions_config() must seed an empty DB with precisely
 # these rows — this is the "same rows the YAML did" spec (GH-85).
 _LEGACY_YAML_PERMISSIONS: dict[str, dict[str, str]] = {
@@ -110,14 +112,6 @@ _LEGACY_YAML_PERMISSIONS: dict[str, dict[str, str]] = {
         "download": "confirm",
         "delete": "deny",
     },
-    "files": {
-        "read": "allow",
-        "list": "allow",
-        "search": "allow",
-        "write": "confirm",
-        "move": "confirm",
-        "delete": "deny",
-    },
     "memory": {"store": "allow", "recall": "allow", "list": "allow", "delete": "deny"},
 }
 
@@ -143,6 +137,100 @@ class TestDefaultPermissions:
         """The seed is built via validate_permissions_config (identical output)."""
         expected = validate_permissions_config(DEFAULT_PERMISSIONS)
         assert build_default_permissions_config().model_dump() == expected.model_dump()
+
+
+# ---------------------------------------------------------------------------
+# 0b. Local files tool removed (GH-143)
+# ---------------------------------------------------------------------------
+
+# _CONFIRM_ONLY_ACTIONS after GH-143: every files.* entry is gone; the
+# Drive/OneDrive download rows stay so #192 can restore them unchanged.
+_EXPECTED_CONFIRM_ONLY_ACTIONS: frozenset[tuple[str, str]] = frozenset(
+    {
+        # Google
+        ("gmail", "send"),
+        ("gmail", "delete"),
+        ("google_calendar", "create"),
+        ("google_calendar", "delete"),
+        ("google_calendar", "update"),
+        ("google_drive", "delete"),
+        ("google_drive", "download"),
+        # Microsoft
+        ("outlook", "send"),
+        ("outlook", "delete"),
+        ("outlook_calendar", "create"),
+        ("outlook_calendar", "delete"),
+        ("outlook_calendar", "update"),
+        ("onedrive", "delete"),
+        ("onedrive", "download"),
+        # Local
+        ("documents", "delete"),
+        ("memory", "delete"),
+        ("memory", "write"),
+    }
+)
+
+
+class TestFilesToolRemovedFromPermissions:
+    """The files tool leaves the default ruleset and every special action set."""
+
+    def test_default_permissions_has_no_files_tool(self) -> None:
+        """DEFAULT_PERMISSIONS no longer seeds any files.* row."""
+        assert "files" not in DEFAULT_PERMISSIONS
+
+    def test_seeded_config_has_no_files_tool(self) -> None:
+        """The built seed config has no files entry."""
+        assert "files" not in build_default_permissions_config().tools
+
+    @pytest.mark.parametrize("tool", ["google_drive", "onedrive"])
+    def test_download_permission_rows_stay_confirm(self, tool: str) -> None:
+        """Drive/OneDrive download rows stay 'confirm' although unregistered (#192)."""
+        assert DEFAULT_PERMISSIONS[tool]["download"] == "confirm"
+        assert build_default_permissions_config().tools[tool].actions["download"] == "confirm"
+
+    @pytest.mark.parametrize("tool", ["google_drive", "onedrive"])
+    def test_download_stays_confirm_only(self, tool: str) -> None:
+        """Drive/OneDrive download remain confirm-only actions."""
+        assert (tool, "download") in _CONFIRM_ONLY_ACTIONS
+
+    def test_confirm_only_actions_exact_set(self) -> None:
+        """_CONFIRM_ONLY_ACTIONS holds exactly the remaining write-mutating actions."""
+        assert _CONFIRM_ONLY_ACTIONS == _EXPECTED_CONFIRM_ONLY_ACTIONS
+
+    def test_no_files_entries_in_any_action_set(self) -> None:
+        """No files.* pair survives in the denial tiers or the confirm-only set."""
+        every_pair = IMMUTABLE_DENIALS | PROMOTABLE_DENIALS | _CONFIRM_ONLY_ACTIONS
+        assert {pair for pair in every_pair if pair[0] == "files"} == set()
+
+    def test_hardcoded_denials_still_subset_of_confirm_only(self) -> None:
+        """The HARDCODED_DENIALS <= _CONFIRM_ONLY_ACTIONS invariant still holds."""
+        assert HARDCODED_DENIALS <= _CONFIRM_ONLY_ACTIONS
+
+    @pytest.mark.parametrize("action", ["delete", "overwrite"])
+    def test_engine_no_longer_reports_files_as_hardcoded(self, action: str) -> None:
+        """files.delete / files.overwrite are plain default-deny, not hardcoded."""
+        result = check_permission("files", action, PermissionsConfig())
+        assert result.allowed == "deny"
+        assert "hardcoded" not in result.reason.lower()
+
+    @pytest.mark.parametrize("action", ["read", "list", "search", "write", "move"])
+    def test_default_config_denies_every_files_action(self, action: str) -> None:
+        """With the shipped defaults, every former files action is default-deny."""
+        result = check_permission("files", action, build_default_permissions_config())
+        assert result.allowed == "deny"
+        assert "not listed" in result.reason.lower()
+
+    def test_permissions_module_imports_unchanged(self) -> None:
+        """permissions.py gains no imports: its import set is pinned."""
+        source_path = Path(__file__).resolve().parent.parent / "src" / "admino" / "permissions.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        imported: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module is not None:
+                imported.add(node.module)
+        assert imported == {"__future__", "logging", "re", "unicodedata", "typing", "pydantic"}
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +303,8 @@ class TestConfigDeny:
     """A configured 'deny' action returns deny."""
 
     def test_deny_returns_deny(self, sample_config: PermissionsConfig) -> None:
-        """files.search configured as deny should return deny."""
-        result = check_permission("files", "search", sample_config)
+        """outlook.search configured as deny should return deny."""
+        result = check_permission("outlook", "search", sample_config)
         assert result.allowed == "deny"
         assert "deny" in result.reason
 
@@ -332,7 +420,7 @@ class TestValidateCleanConfig:
         """A config with no overridden hardcoded denials produces no warnings."""
         raw: dict[str, dict[str, str]] = {
             "gmail": {"read": "allow", "list": "confirm", "send": "deny"},
-            "files": {"read": "allow"},
+            "memory": {"recall": "allow"},
         }
         with caplog.at_level(logging.WARNING, logger="admino.permissions"):
             config = validate_permissions_config(raw)
@@ -479,13 +567,13 @@ class TestValidateInvalidState:
 
     def test_invalid_state_raises_validation_error(self) -> None:
         """An unrecognized state like 'maybe' should raise ValueError."""
-        raw: dict[str, dict[str, str]] = {"files": {"read": "maybe"}}
+        raw: dict[str, dict[str, str]] = {"memory": {"recall": "maybe"}}
         with pytest.raises(ValueError):
             validate_permissions_config(raw)
 
     def test_empty_state_raises_validation_error(self) -> None:
         """An empty string state should raise ValueError."""
-        raw: dict[str, dict[str, str]] = {"files": {"read": ""}}
+        raw: dict[str, dict[str, str]] = {"memory": {"recall": ""}}
         with pytest.raises(ValueError):
             validate_permissions_config(raw)
 
@@ -516,25 +604,25 @@ class TestHardcodedDenialsConstant:
                 ("onedrive", "delete"),
                 # Local
                 ("documents", "delete"),
-                ("files", "delete"),
-                # files.overwrite is modelled as a first-class denied action
-                # so any LLM attempt is rejected at the permission layer with
-                # a clear audit trail — see permissions.py.
-                ("files", "overwrite"),
                 ("memory", "delete"),
             }
         )
         assert expected == HARDCODED_DENIALS
 
-    def test_files_overwrite_is_hardcoded_denied(self) -> None:
-        """files.overwrite must be permanently denied, like files.delete.
+    @pytest.mark.parametrize("action", ["delete", "overwrite"])
+    def test_removed_files_tool_has_no_hardcoded_denials(self, action: str) -> None:
+        """GH-143: files.delete / files.overwrite are gone with the files tool.
 
-        Regression guard: overwriting a file is semantically a delete-then-
-        create, and since files.delete is hardcoded-denied, permitting
-        overwrite would be a bypass of that invariant. This test exists to
-        fail loudly if a future refactor removes the denial.
+        The files tool no longer exists, so its entries leave every denial
+        tier and the confirm-only set; a files.* call is now an unknown tool.
         """
-        assert ("files", "overwrite") in HARDCODED_DENIALS
+        assert ("files", action) not in IMMUTABLE_DENIALS
+        assert ("files", action) not in HARDCODED_DENIALS
+        assert ("files", action) not in _CONFIRM_ONLY_ACTIONS
+
+    def test_documents_delete_stays_immutable(self) -> None:
+        """documents.delete is unaffected by the files tool removal."""
+        assert ("documents", "delete") in IMMUTABLE_DENIALS
 
     def test_is_frozenset(self) -> None:
         """HARDCODED_DENIALS must be immutable (frozenset)."""
@@ -676,9 +764,9 @@ class TestPermissionPipeline:
 
     def test_confirm_only_downgrade_in_pipeline(self) -> None:
         """A confirm-only action set to 'allow' is downgraded to 'confirm'."""
-        raw: dict[str, dict[str, str]] = {"files": {"write": "allow"}}
+        raw: dict[str, dict[str, str]] = {"google_calendar": {"create": "allow"}}
         config = validate_permissions_config(raw)
-        result = check_permission("files", "write", config)
+        result = check_permission("google_calendar", "create", config)
         assert result.allowed == "confirm"
 
 
@@ -823,9 +911,9 @@ class TestPromotedParameter:
         """There are exactly 4 promotable denials."""
         assert len(PROMOTABLE_DENIALS) == 4
 
-    def test_immutable_denials_has_exactly_10_entries(self) -> None:
-        """There are exactly 10 immutable denials."""
-        assert len(IMMUTABLE_DENIALS) == 10
+    def test_immutable_denials_has_exactly_8_entries(self) -> None:
+        """There are exactly 8 immutable denials (GH-143 dropped the two files ones)."""
+        assert len(IMMUTABLE_DENIALS) == 8
 
     def test_promoted_empty_frozenset_is_default(self, empty_config: PermissionsConfig) -> None:
         """Calling without promoted kwarg behaves same as promoted=frozenset()."""

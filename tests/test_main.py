@@ -224,6 +224,104 @@ class TestMainHappyPath:
 
 
 # ---------------------------------------------------------------------------
+# GH-143: the local files tool is removed from startup
+# ---------------------------------------------------------------------------
+
+
+class TestMainWithoutFilesTool:
+    """Startup no longer configures the files tool or reads a files config."""
+
+    def test_main_starts_without_a_files_config_section(self, mock_deps: dict[str, Any]) -> None:
+        """main() never reads config.files (files_tool.configure is gone)."""
+        del mock_deps["config"].files
+
+        main(config_path=Path("c.yaml"))
+
+        mock_deps["create_app"].assert_called_once()
+        mock_deps["uvicorn_run"].assert_called_once()
+
+    def test_main_module_never_references_files_tool(self) -> None:
+        """main.py neither imports admino.tools.files nor lists it for import."""
+        tree = ast.parse(_MAIN_MODULE_PATH.read_text(encoding="utf-8"))
+        violations: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module == "admino.tools":
+                violations.extend(
+                    f"from admino.tools import {alias.name}"
+                    for alias in node.names
+                    if alias.name == "files"
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module == "admino.tools.files":
+                violations.append("from admino.tools.files import ...")
+            elif isinstance(node, ast.Import):
+                violations.extend(
+                    f"import {alias.name}"
+                    for alias in node.names
+                    if alias.name == "admino.tools.files"
+                )
+            elif isinstance(node, ast.Constant) and node.value == "admino.tools.files":
+                violations.append("'admino.tools.files' string literal")
+        assert violations == []
+
+
+class TestBuildSystemPromptWithoutFilesTool:
+    """The system prompt no longer advertises local file paths (GH-143)."""
+
+    @staticmethod
+    def _legacy_config() -> Any:
+        """An AppConfig validated from a dict that still carries a legacy files section."""
+        from admino.config import AppConfig
+
+        return AppConfig.model_validate(
+            {
+                "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+                "auth": {"mode": "vpn"},
+                "files": {
+                    "allowed_paths": [
+                        {
+                            "path": "/app/documents",
+                            "label": "Documents (~/Downloads/admino)",
+                            "access": "readwrite",
+                        }
+                    ],
+                    "max_read_chars": 10000,
+                },
+            }
+        )
+
+    def _prompt(self) -> str:
+        from admino.main import _build_system_prompt
+        from admino.tools.registry import ToolDescription
+
+        fake_tool = ToolDescription(
+            tool="memory",
+            action="recall",
+            description="Recall a note.",
+            parameters_schema={"type": "object", "properties": {}},
+        )
+        with patch("admino.tools.registry.get_registered_tools", return_value=[fake_tool]):
+            return _build_system_prompt(self._legacy_config())
+
+    def test_system_prompt_has_no_file_paths_block(self) -> None:
+        """The 'following file paths are available' block is gone."""
+        assert "file paths are available" not in self._prompt().lower()
+
+    def test_system_prompt_does_not_leak_legacy_path_or_label(self) -> None:
+        """A legacy files.allowed_paths entry never reaches the prompt."""
+        prompt = self._prompt()
+        assert "/app/documents" not in prompt
+        assert "Downloads/admino" not in prompt
+
+    def test_system_prompt_has_no_file_tool_instructions(self) -> None:
+        """The 'When using file tools' guidance is gone."""
+        assert "file tools" not in self._prompt().lower()
+
+    def test_system_prompt_still_lists_registered_tools(self) -> None:
+        """The dynamic tool summary is unaffected by the removal."""
+        assert "memory (recall)" in self._prompt()
+
+
+# ---------------------------------------------------------------------------
 # Config failure tests
 # ---------------------------------------------------------------------------
 
@@ -419,10 +517,23 @@ class TestImportToolModules:
             "admino.tools.outlook_calendar",
             "admino.tools.onedrive",
             # Other tools
-            "admino.tools.files",
             "admino.tools.memory",
         }
         assert top_level_modules.issubset(set(imported))
+
+    def test_import_tool_modules_does_not_attempt_files_tool(self) -> None:
+        """The removed local files tool is never imported (GH-143)."""
+        attempted: list[str] = []
+
+        def _side_effect(name: str, *args: Any, **kwargs: Any) -> MagicMock:
+            if name.startswith("admino.tools."):
+                attempted.append(name)
+            return MagicMock()
+
+        with patch("builtins.__import__", side_effect=_side_effect):
+            _import_tool_modules()
+
+        assert "admino.tools.files" not in attempted
 
     def test_import_tool_modules_continues_after_missing_module(self) -> None:
         """After a missing module, remaining modules are still imported."""
@@ -439,8 +550,8 @@ class TestImportToolModules:
         with patch("builtins.__import__", side_effect=_side_effect):
             _import_tool_modules()
 
-        # All 8 modules attempted despite first one failing
-        assert call_count == 8
+        # All 7 modules attempted despite first one failing (GH-143 removed files)
+        assert call_count == 7
 
 
 # ---------------------------------------------------------------------------

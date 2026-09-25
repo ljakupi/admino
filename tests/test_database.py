@@ -256,20 +256,50 @@ class TestSeedSettings:
         conn.fetchval = AsyncMock(return_value=0)
 
         mock_config = MagicMock()
-        for section in ("server", "llm", "paths", "files", "limits", "egress", "database"):
+        for section in ("server", "llm", "paths", "limits", "egress", "database"):
             getattr(mock_config, section).model_dump = MagicMock(return_value={"key": "val"})
         mock_config.auth.model_dump = MagicMock(return_value={"mode": "vpn"})
         mock_config.log_level = "INFO"
+        # GH-143: the files tool config is gone — seeding must never read it.
+        del mock_config.files
 
         await db_mod.seed_settings(mock_pool, mock_config)
 
-        # 9 sections: server, llm, auth, paths, files, limits, egress, database, log_level
+        # 8 sections: server, llm, auth, paths, limits, egress, database, log_level
         insert_calls = [
             c
             for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
         ]
-        assert len(insert_calls) == 9
+        assert len(insert_calls) == 8
+
+    async def test_seed_settings_does_not_seed_files_row(
+        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh install gets no 'files' settings row (GH-143)."""
+        from admino.config import AppConfig, AuthConfig
+
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        conn = mock_pool._mock_conn
+        conn.fetchval = AsyncMock(return_value=0)
+
+        await db_mod.seed_settings(mock_pool, AppConfig(auth=AuthConfig(mode="vpn")))
+
+        seeded_keys = {
+            c.args[1]
+            for c in conn.execute.call_args_list
+            if len(c.args) > 1 and "INSERT INTO settings" in c.args[0]
+        }
+        assert seeded_keys == {
+            "server",
+            "llm",
+            "auth",
+            "paths",
+            "limits",
+            "egress",
+            "database",
+            "log_level",
+        }
 
     async def test_seed_settings_default_llm_is_infomaniak(
         self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -479,7 +509,6 @@ class TestLoadSettingsFromDb:
                 },
                 {"key": "auth", "value": {"mode": "vpn"}},
                 {"key": "paths", "value": {}},
-                {"key": "files", "value": {}},
                 {"key": "limits", "value": {}},
                 {"key": "egress", "value": {}},
                 {"key": "database", "value": {}},
@@ -527,3 +556,84 @@ class TestLoadPermissionsFromDb:
         result = await db_mod.load_permissions_from_db(mock_pool)
 
         assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# TestRemoveFilesToolMigration (GH-143)
+# ---------------------------------------------------------------------------
+
+_FILES_MIGRATION_NAME = "0003_remove_files_tool.sql"
+
+
+def _files_migration_sql() -> str:
+    """Return the shipped 0003 migration, comments stripped, whitespace collapsed, lowercased."""
+    import re
+
+    raw = (db_mod._MIGRATIONS_DIR / _FILES_MIGRATION_NAME).read_text(encoding="utf-8")
+    without_comments = re.sub(r"--[^\n]*", " ", raw)
+    return re.sub(r"\s+", " ", without_comments).strip().lower()
+
+
+class TestRemoveFilesToolMigration:
+    """Existing installs are cleaned up by a numbered SQL migration (GH-143).
+
+    There is no real PostgreSQL in the suite, so the shipped SQL file itself is
+    the spec: it must exist, be discovered by run_migrations as version 3, and
+    delete the files permission rows, the files settings row, and the files key
+    of the tools settings JSONB — with no parameters or string interpolation.
+    """
+
+    def test_migration_file_is_shipped_as_version_3(self) -> None:
+        """0003_remove_files_tool.sql exists and matches the numbered-migration regex."""
+        assert (db_mod._MIGRATIONS_DIR / _FILES_MIGRATION_NAME).is_file()
+        match = db_mod._MIGRATION_FILE_RE.match(_FILES_MIGRATION_NAME)
+        assert match is not None
+        assert int(match.group(1)) == 3
+
+    async def test_run_migrations_applies_it_as_version_3(self, mock_pool: MagicMock) -> None:
+        """With 0001/0002 applied, run_migrations executes and records 0003."""
+        conn = mock_pool._mock_conn
+        conn.fetch = AsyncMock(return_value=[{"version": 1}, {"version": 2}])
+
+        await db_mod.run_migrations(mock_pool)
+
+        recorded = [
+            (c.args[1], c.args[2])
+            for c in conn.execute.call_args_list
+            if len(c.args) > 2 and "INSERT INTO _migrations" in c.args[0]
+        ]
+        assert (3, _FILES_MIGRATION_NAME) in recorded
+        assert all(version >= 3 for version, _ in recorded)
+
+    def test_migration_deletes_files_permission_rows(self) -> None:
+        """DELETE FROM permissions WHERE tool = 'files'."""
+        import re
+
+        sql = _files_migration_sql()
+        assert re.search(r"delete from permissions where tool\s*=\s*'files'", sql)
+
+    def test_migration_deletes_files_settings_row(self) -> None:
+        """DELETE FROM settings WHERE key = 'files'."""
+        import re
+
+        sql = _files_migration_sql()
+        assert re.search(r"delete from settings where key\s*=\s*'files'", sql)
+
+    def test_migration_removes_files_key_from_tools_settings(self) -> None:
+        """UPDATE settings SET value = value - 'files' WHERE key = 'tools'."""
+        import re
+
+        sql = _files_migration_sql()
+        assert re.search(
+            r"update settings set value\s*=\s*value\s*-\s*'files'[^;]*where key\s*=\s*'tools'",
+            sql,
+        )
+
+    def test_migration_is_parameter_free(self) -> None:
+        """No bind parameters or interpolation placeholders in the migration."""
+        import re
+
+        sql = _files_migration_sql()
+        assert re.search(r"\$\d", sql) is None
+        assert "%s" not in sql
+        assert "%(" not in sql

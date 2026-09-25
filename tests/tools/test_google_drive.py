@@ -1,8 +1,9 @@
 """Tests for the Google Drive tool module (admino.tools.google_drive).
 
 Covers tool registration, happy-path responses, OAuth errors, API errors,
-empty results, file download (binary and Google Workspace export), path
-validation, and argument validation.
+empty results, and argument validation. GH-143: google_drive.download is
+unregistered (its handler, helpers and args model are deleted) until
+attachments restore it (#192).
 All HTTP calls are mocked -- no real API requests are made.
 """
 
@@ -18,17 +19,15 @@ from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from pathlib import Path
 
 from admino.models import (
-    GoogleDriveDownloadArgs,
     GoogleDriveListArgs,
     GoogleDriveReadArgs,
     GoogleDriveSearchArgs,
 )
 from admino.oauth import OAuthError
 from admino.tools import google_drive
-from admino.tools.registry import clear_registry, get_registered_tools
+from admino.tools.registry import clear_registry, get_registered_tools, get_tool_entry
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -125,11 +124,47 @@ class TestDriveRegistration:
         keys = [(t.tool, t.action) for t in tools]
         assert ("google_drive", "search") in keys
 
-    def test_drive_download_registered(self) -> None:
-        """google_drive.download is in the registry."""
+    def test_drive_download_not_registered(self) -> None:
+        """google_drive.download is NOT registered until attachments land (GH-143, #192)."""
         tools = get_registered_tools()
         keys = [(t.tool, t.action) for t in tools]
-        assert ("google_drive", "download") in keys
+        assert ("google_drive", "download") not in keys
+        assert get_tool_entry("google_drive", "download") is None
+
+    def test_drive_registers_exactly_read_list_search(self) -> None:
+        """The module registers only read, list and search."""
+        keys = {(t.tool, t.action) for t in get_registered_tools()}
+        assert keys == {
+            ("google_drive", "read"),
+            ("google_drive", "list"),
+            ("google_drive", "search"),
+        }
+
+    @pytest.mark.parametrize(
+        "symbol",
+        [
+            "google_drive_download",
+            "_sync_write_download",
+            "_MAX_DOWNLOAD_SIZE",
+            "_EXPORT_MIME_TYPES",
+        ],
+    )
+    def test_drive_download_code_removed(self, symbol: str) -> None:
+        """The download handler, its write helper and download-only constants are deleted."""
+        assert not hasattr(google_drive, symbol)
+
+    def test_drive_module_does_not_import_files_tool(self) -> None:
+        """google_drive no longer depends on the removed files tool module."""
+        import ast
+        from pathlib import Path
+
+        source = Path(google_drive.__file__).read_text(encoding="utf-8")
+        modules = {
+            node.module
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.ImportFrom) and node.module is not None
+        }
+        assert "admino.tools.files" not in modules
 
 
 # ---------------------------------------------------------------------------
@@ -366,134 +401,6 @@ class TestDriveSearch:
 
 
 # ---------------------------------------------------------------------------
-# 5. google_drive.download
-# ---------------------------------------------------------------------------
-
-
-class TestDriveDownload:
-    """Tests for the google_drive.download handler."""
-
-    async def test_happy_path_binary(self, mock_http: AsyncMock, tmp_path: Path) -> None:
-        """Successful binary file download writes to destination."""
-        dest = tmp_path / "downloaded.pdf"
-        meta_resp = _make_response(
-            200, {"id": "f1", "name": "report.pdf", "mimeType": "application/pdf", "size": "100"}
-        )
-        content_resp = _make_response(200, content=b"PDF binary content here")
-        mock_http.get.side_effect = [meta_resp, content_resp]
-
-        with (
-            patch.object(google_drive, "_validate_path", return_value=dest),
-            patch.object(google_drive, "_revalidate_resolved"),
-        ):
-            args = GoogleDriveDownloadArgs(file_id="f1", destination=str(dest))
-            result = await google_drive.google_drive_download(args)
-
-        assert "Downloaded" in result
-        assert "report.pdf" in result
-        assert dest.exists()
-        assert dest.read_bytes() == b"PDF binary content here"
-
-    async def test_google_workspace_export_as_pdf(
-        self, mock_http: AsyncMock, tmp_path: Path
-    ) -> None:
-        """Google Docs files are exported as PDF."""
-        dest = tmp_path / "doc.pdf"
-        meta_resp = _make_response(
-            200,
-            {
-                "id": "d1",
-                "name": "My Doc",
-                "mimeType": "application/vnd.google-apps.document",
-                "size": "0",
-            },
-        )
-        export_resp = _make_response(200, content=b"PDF export content")
-        mock_http.get.side_effect = [meta_resp, export_resp]
-
-        with (
-            patch.object(google_drive, "_validate_path", return_value=dest),
-            patch.object(google_drive, "_revalidate_resolved"),
-        ):
-            args = GoogleDriveDownloadArgs(file_id="d1", destination=str(dest))
-            result = await google_drive.google_drive_download(args)
-
-        assert "exported as PDF" in result
-        assert dest.exists()
-
-    async def test_path_validation_failure(self, mock_http: AsyncMock) -> None:
-        """Invalid destination path returns error."""
-        with patch.object(
-            google_drive, "_validate_path", side_effect=PermissionError("outside allowed paths")
-        ):
-            args = GoogleDriveDownloadArgs(file_id="f1", destination="/etc/passwd")
-            result = await google_drive.google_drive_download(args)
-
-        assert "not allowed" in result
-
-    async def test_destination_already_exists(self, mock_http: AsyncMock, tmp_path: Path) -> None:
-        """Existing file at destination returns error (no overwrite)."""
-        dest = tmp_path / "existing.txt"
-        dest.write_text("existing content")
-
-        with patch.object(google_drive, "_validate_path", return_value=dest):
-            args = GoogleDriveDownloadArgs(file_id="f1", destination=str(dest))
-            result = await google_drive.google_drive_download(args)
-
-        assert "already exists" in result
-
-    async def test_file_too_large(self, mock_http: AsyncMock, tmp_path: Path) -> None:
-        """File exceeding 100 MB limit returns error."""
-        dest = tmp_path / "huge.bin"
-        meta_resp = _make_response(
-            200, {"id": "f1", "name": "huge.bin", "mimeType": "application/octet-stream"}
-        )
-        # Content larger than 100 MB -- we mock len(content) > limit
-        large_content = b"x" * (100 * 1024 * 1024 + 1)
-        content_resp = _make_response(200, content=large_content)
-        mock_http.get.side_effect = [meta_resp, content_resp]
-
-        with patch.object(google_drive, "_validate_path", return_value=dest):
-            args = GoogleDriveDownloadArgs(file_id="f1", destination=str(dest))
-            result = await google_drive.google_drive_download(args)
-
-        assert "too large" in result
-
-    async def test_oauth_not_configured_on_metadata(self, tmp_path: Path) -> None:
-        """OAuthError on metadata fetch returns setup instructions."""
-        dest = tmp_path / "test.pdf"
-        with (
-            patch.object(google_drive, "_validate_path", return_value=dest),
-            patch.object(
-                google_drive,
-                "_get_google_token",
-                new_callable=AsyncMock,
-                side_effect=OAuthError("no token"),
-            ),
-        ):
-            args = GoogleDriveDownloadArgs(file_id="f1", destination=str(dest))
-            result = await google_drive.google_drive_download(args)
-
-        assert "OAuth error" in result
-
-    async def test_api_error_on_metadata(self, mock_http: AsyncMock, tmp_path: Path) -> None:
-        """Non-200 on metadata fetch returns API error."""
-        dest = tmp_path / "test.pdf"
-        mock_http.get.return_value = _make_response(
-            404, {"error": {"code": 404, "message": "Not Found"}}
-        )
-
-        with (
-            patch.object(google_drive, "_validate_path", return_value=dest),
-            patch("os.path.lexists", return_value=False),
-        ):
-            args = GoogleDriveDownloadArgs(file_id="f1", destination=str(dest))
-            result = await google_drive.google_drive_download(args)
-
-        assert "Google API error 404" in result
-
-
-# ---------------------------------------------------------------------------
 # 6. Argument validation
 # ---------------------------------------------------------------------------
 
@@ -531,16 +438,6 @@ class TestDriveArgValidation:
         with pytest.raises(ValidationError):
             GoogleDriveSearchArgs(query="test", max_results=-1)
 
-    def test_download_file_id_too_long(self) -> None:
-        """file_id exceeding 200 chars in download args is rejected."""
-        with pytest.raises(ValidationError):
-            GoogleDriveDownloadArgs(file_id="x" * 201, destination="/data/test")
-
-    def test_download_destination_too_long(self) -> None:
-        """destination exceeding 500 chars is rejected."""
-        with pytest.raises(ValidationError):
-            GoogleDriveDownloadArgs(file_id="f1", destination="/" + "x" * 500)
-
     def test_valid_args_accepted(self) -> None:
         """Valid arguments pass validation."""
         read_args = GoogleDriveReadArgs(file_id="abc123")
@@ -551,9 +448,6 @@ class TestDriveArgValidation:
 
         search_args = GoogleDriveSearchArgs(query="budget", max_results=10)
         assert search_args.query == "budget"
-
-        download_args = GoogleDriveDownloadArgs(file_id="f1", destination="/data/file.pdf")
-        assert download_args.destination == "/data/file.pdf"
 
     def test_list_folder_id_optional(self) -> None:
         """folder_id defaults to None."""
@@ -589,9 +483,3 @@ class TestDriveHelpers:
         resp = httpx.Response(status_code=503, content=b"unavailable")
         result = google_drive._format_api_error(resp)
         assert "503" in result
-
-    def test_export_mime_types_defined(self) -> None:
-        """Google Workspace MIME types map to PDF export."""
-        for mime_type, export_type in google_drive._EXPORT_MIME_TYPES.items():
-            assert export_type == "application/pdf"
-            assert "google-apps" in mime_type

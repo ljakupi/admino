@@ -1478,3 +1478,93 @@ class TestSettingsPatchLLMInfomaniak:
         """infomaniak_model is bounded to 200 characters."""
         with pytest.raises(ValidationError, match="at most 200 characters"):
             SettingsPatchLLM(infomaniak_model="a" * 201)  # type: ignore[call-arg]
+
+
+# ===========================================================================
+# GH-143: the local files tool and the Drive/OneDrive downloads are removed
+# ===========================================================================
+
+_REMAINING_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "gmail",
+        "google_calendar",
+        "google_drive",
+        "outlook",
+        "outlook_calendar",
+        "onedrive",
+        "memory",
+    }
+)
+
+
+class TestFilesToolModelsRemoved:
+    """The files.* and *.download argument models are gone; toggles drop 'files'."""
+
+    @pytest.mark.parametrize(
+        "model_name",
+        [
+            "FileReadArgs",
+            "FileListArgs",
+            "FileSearchArgs",
+            "FileWriteArgs",
+            "FileMoveArgs",
+            "GoogleDriveDownloadArgs",
+            "OneDriveDownloadArgs",
+        ],
+    )
+    def test_removed_args_model_no_longer_exists(self, model_name: str) -> None:
+        """The removed tool-argument models are not exported by admino.models."""
+        import admino.models as models_module
+
+        assert not hasattr(models_module, model_name)
+
+    @pytest.mark.parametrize(
+        "model_name",
+        [
+            "GoogleDriveReadArgs",
+            "GoogleDriveListArgs",
+            "GoogleDriveSearchArgs",
+            "OneDriveReadArgs",
+            "OneDriveListArgs",
+            "OneDriveSearchArgs",
+        ],
+    )
+    def test_drive_and_onedrive_read_models_remain(self, model_name: str) -> None:
+        """Drive/OneDrive read, list and search argument models are kept."""
+        import admino.models as models_module
+
+        assert hasattr(models_module, model_name)
+
+    def test_tools_settings_fields_exclude_files(self) -> None:
+        """ToolsSettings toggles cover exactly the remaining tools."""
+        from admino.models import ToolsSettings
+
+        assert set(ToolsSettings.model_fields) == _REMAINING_TOOL_NAMES
+
+    def test_tools_settings_default_dump_has_no_files_key(self) -> None:
+        """The all-enabled default map has no 'files' entry."""
+        from admino.models import ToolsSettings
+
+        assert "files" not in ToolsSettings().model_dump()
+
+    def test_tools_settings_ignores_legacy_files_key(self) -> None:
+        """A legacy DB 'tools' value with files still validates, and files is dropped."""
+        from admino.models import ToolsSettings
+
+        loaded = ToolsSettings.model_validate({"gmail": False, "files": False})
+        dumped = loaded.model_dump()
+        assert "files" not in dumped
+        assert dumped["gmail"] is False
+
+    def test_settings_patch_tools_fields_exclude_files(self) -> None:
+        """SettingsPatchTools accepts toggles for exactly the remaining tools."""
+        from admino.models import SettingsPatchTools
+
+        assert set(SettingsPatchTools.model_fields) == _REMAINING_TOOL_NAMES
+
+    def test_settings_patch_tools_ignores_files_key(self) -> None:
+        """A PATCH body toggling files validates but carries no update."""
+        from admino.models import SettingsPatchTools
+
+        patch_body = SettingsPatchTools.model_validate({"files": False})
+        assert patch_body.model_dump(exclude_none=True) == {}

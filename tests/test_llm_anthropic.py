@@ -217,28 +217,28 @@ class TestConvertMessagesToAnthropic:
         msgs = [
             LLMMessage(
                 role="assistant",
-                content="I'll list the files.",
+                content="I'll list your notes.",
                 tool_use_blocks=[
                     {
                         "type": "tool_use",
                         "id": "toolu_01abc",
-                        "name": "files.list",  # dot notation; should be encoded to __
-                        "input": {"path": "/docs"},
+                        "name": "memory.list",  # dot notation; should be encoded to __
+                        "input": {"prefix": "work"},
                     }
                 ],
             ),
-            LLMMessage(role="tool", content="file1.txt", tool_call_id="toolu_01abc"),
+            LLMMessage(role="tool", content="work-note-1", tool_call_id="toolu_01abc"),
         ]
         _, api = _convert_messages_to_anthropic(msgs)
         # Assistant turn should have text + tool_use blocks
         assert api[0]["role"] == "assistant"
         asst_content = api[0]["content"]
         assert isinstance(asst_content, list)
-        assert asst_content[0] == {"type": "text", "text": "I'll list the files."}
+        assert asst_content[0] == {"type": "text", "text": "I'll list your notes."}
         assert asst_content[1]["type"] == "tool_use"
         assert asst_content[1]["id"] == "toolu_01abc"
-        assert asst_content[1]["name"] == "files__list"  # dot encoded to __
-        assert asst_content[1]["input"] == {"path": "/docs"}
+        assert asst_content[1]["name"] == "memory__list"  # dot encoded to __
+        assert asst_content[1]["input"] == {"prefix": "work"}
         # Tool result turn follows
         assert api[1]["role"] == "user"
         assert api[1]["content"][0]["type"] == "tool_result"
@@ -250,7 +250,7 @@ class TestConvertMessagesToAnthropic:
             LLMMessage(
                 role="assistant",
                 content="Calling tool",
-                tool_use_blocks=[{"type": "tool_use", "name": "files.list", "input": {}}],
+                tool_use_blocks=[{"type": "tool_use", "name": "memory.list", "input": {}}],
             )
         ]
         _, api = _convert_messages_to_anthropic(msgs)
@@ -354,7 +354,7 @@ class TestNameEncoding:
 
     def test_roundtrip(self) -> None:
         """Encoding then decoding is a no-op."""
-        original = "files.read"
+        original = "memory.recall"
         assert _anthropic_name_to_dot(_dot_to_anthropic_name(original)) == original
 
     def test_only_first_double_underscore_replaced(self) -> None:

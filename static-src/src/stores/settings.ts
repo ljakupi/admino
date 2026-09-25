@@ -121,7 +121,6 @@ export const useSettingsStore = defineStore('settings', () => {
     outlook: true,
     outlook_calendar: true,
     onedrive: true,
-    files: true,
     memory: true,
   });
 

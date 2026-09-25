@@ -67,7 +67,6 @@ function makeSettings(llm: Partial<LLMSettings> = {}): SettingsResponse {
       outlook: true,
       outlook_calendar: true,
       onedrive: true,
-      files: true,
       memory: true,
     },
   };
@@ -375,4 +374,23 @@ describe('settingsStore infomaniak token handling', () => {
       }).toEqual({ tokenConfigured: true, leakingKeys: [] });
     },
   );
+});
+
+// --- Tools toggles (issue #143: local files tool removed) -----------------
+
+describe('settingsStore tools toggles', () => {
+  it('default tools state covers exactly the remaining tools, with no files key', () => {
+    const store = useSettingsStore();
+
+    expect(Object.keys(store.tools).sort()).toEqual([
+      'gmail',
+      'google_calendar',
+      'google_drive',
+      'memory',
+      'onedrive',
+      'outlook',
+      'outlook_calendar',
+    ]);
+    expect('files' in store.tools).toBe(false);
+  });
 });

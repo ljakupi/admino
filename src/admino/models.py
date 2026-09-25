@@ -817,80 +817,6 @@ class MemoryListArgs(BaseModel):
     """Arguments for the memory.list action (list all stored keys)."""
 
 
-class FileReadArgs(BaseModel):
-    """Arguments for the files.read action."""
-
-    path: str = Field(
-        max_length=500,
-        description="Path to the file to read. Validated against allowed_paths at runtime.",
-    )
-
-
-class FileListArgs(BaseModel):
-    """Arguments for the files.list action."""
-
-    path: str = Field(
-        max_length=500,
-        description="Directory path to list. Validated against allowed_paths at runtime.",
-    )
-    max_depth: int = Field(
-        default=1,
-        ge=1,
-        le=3,
-        description="Maximum directory depth to recurse.",
-    )
-
-
-class FileSearchArgs(BaseModel):
-    """Arguments for the files.search action."""
-
-    path: str = Field(
-        max_length=500,
-        description="Root directory to search within. Validated against allowed_paths at runtime.",
-    )
-    pattern: str = Field(
-        min_length=1,
-        max_length=200,
-        description="Filename glob pattern or text query.",
-    )
-    content_search: bool = Field(
-        default=False,
-        description="If True, search file contents instead of filenames.",
-    )
-    max_results: int = Field(
-        default=20,
-        ge=1,
-        le=100,
-        description="Maximum number of results to return.",
-    )
-
-
-class FileWriteArgs(BaseModel):
-    """Arguments for the files.write action."""
-
-    path: str = Field(
-        max_length=500,
-        description="Path to the file to write. Must be in a readwrite-allowed path.",
-    )
-    content: str = Field(
-        max_length=50000,
-        description="Content to write to the file.",
-    )
-
-
-class FileMoveArgs(BaseModel):
-    """Arguments for the files.move action."""
-
-    source: str = Field(
-        max_length=500,
-        description="Source file path. Must be in a readwrite-allowed path.",
-    )
-    destination: str = Field(
-        max_length=500,
-        description="Destination file path. Must be in a readwrite-allowed path.",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Shared email validation helpers (used by GmailSendArgs, OutlookSendArgs)
 # ---------------------------------------------------------------------------
@@ -1181,22 +1107,6 @@ class GoogleDriveSearchArgs(BaseModel):
     )
 
 
-class GoogleDriveDownloadArgs(BaseModel):
-    """Arguments for the google_drive.download action (requires confirm)."""
-
-    file_id: str = Field(
-        min_length=1,
-        max_length=200,
-        pattern=r"^[a-zA-Z0-9_\-]+$",
-        description="Google Drive file ID to download.",
-    )
-    destination: str = Field(
-        min_length=1,
-        max_length=500,
-        description="Destination path. Validated against allowed_paths.",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Outlook (Microsoft Graph) tool argument models (tools/outlook.py imports these)
 # ---------------------------------------------------------------------------
@@ -1478,22 +1388,6 @@ class OneDriveSearchArgs(BaseModel):
     )
 
 
-class OneDriveDownloadArgs(BaseModel):
-    """Arguments for the onedrive.download action (requires confirm)."""
-
-    item_id: str = Field(
-        min_length=1,
-        max_length=_GRAPH_ID_MAX_LEN,
-        pattern=_GRAPH_ITEM_ID_PATTERN,
-        description="OneDrive item ID to download.",
-    )
-    destination: str = Field(
-        min_length=1,
-        max_length=500,
-        description="Destination path. Validated against allowed_paths.",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Settings API models (server.py Settings endpoints)
 # ---------------------------------------------------------------------------
@@ -1619,6 +1513,9 @@ class ToolsSettings(BaseModel):
     externally migrated ``"false"`` string — must raise ``ValidationError``
     and trip the explicit all-enabled fallback, NOT be silently coerced to
     ``True`` and re-enable a service the user disabled (GH-80 security gate).
+
+    Unknown keys are dropped, so a legacy ``files`` toggle still stored in the
+    DB from before GH-143 validates and is never reported or written back.
     """
 
     model_config = ConfigDict(strict=True)
@@ -1629,7 +1526,6 @@ class ToolsSettings(BaseModel):
     outlook: bool = True
     outlook_calendar: bool = True
     onedrive: bool = True
-    files: bool = True
     memory: bool = True
 
 
@@ -1693,7 +1589,8 @@ class SettingsPatchTools(BaseModel):
     """Partial tool enable/disable updates for PATCH.
 
     Only provided fields are updated; omitted tools keep their current state.
-    Unknown tool names are rejected at the API layer via registry validation.
+    Unknown tool names (e.g. the removed ``files`` toggle, GH-143) are ignored
+    and never persisted.
     strict=True rejects string coercion (e.g. "yes") — only JSON booleans accepted.
     """
 
@@ -1705,7 +1602,6 @@ class SettingsPatchTools(BaseModel):
     outlook: bool | None = None
     outlook_calendar: bool | None = None
     onedrive: bool | None = None
-    files: bool | None = None
     memory: bool | None = None
 
 

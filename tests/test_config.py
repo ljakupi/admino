@@ -536,6 +536,74 @@ class TestUnimplementedToolScaffoldingRemoved:
         assert not hasattr(config.paths, "images")
 
 
+class TestFilesToolConfigRemoved:
+    """The local files tool's config is gone; legacy sections are ignored (GH-143)."""
+
+    @pytest.mark.parametrize("symbol", ["FilesConfig", "FilePathEntry"])
+    def test_files_config_symbols_removed(self, symbol: str) -> None:
+        """FilesConfig / FilePathEntry no longer exist in admino.config."""
+        import admino.config as config_module
+
+        assert not hasattr(config_module, symbol)
+
+    def test_appconfig_has_no_files_field(self) -> None:
+        """AppConfig no longer carries a files section."""
+        assert "files" not in AppConfig.model_fields
+
+    def test_appconfig_dict_with_legacy_files_section_validates(self) -> None:
+        """A dict still carrying a files section validates and drops it."""
+        config = AppConfig.model_validate(
+            {
+                "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+                "auth": {"mode": "vpn"},
+                "files": {
+                    "allowed_paths": [
+                        {"path": "/app/documents", "label": "Docs", "access": "readwrite"}
+                    ],
+                    "max_read_chars": 10000,
+                },
+            }
+        )
+        assert not hasattr(config, "files")
+        assert "files" not in config.model_dump()
+
+    def test_legacy_files_section_in_yaml_is_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An existing config.yaml with a files section still loads."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            """\
+            files:
+              allowed_paths:
+                - path: "/app/documents"
+                  label: "Documents (~/Downloads/admino)"
+                  access: "readwrite"
+              max_read_chars: 10000
+            """,
+        )
+        config = load_app_config(yaml_path)
+        assert not hasattr(config, "files")
+
+    async def test_legacy_files_row_in_db_settings_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DB seeded before GH-143 (stale files row) still boots."""
+        monkeypatch.setenv("AUTH_MODE", "vpn")
+        mock_data: dict[str, object] = {
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+            "auth": {"mode": "vpn"},
+            "files": {
+                "allowed_paths": [{"path": "/app/documents", "label": "", "access": "read"}],
+                "max_read_chars": 10000,
+            },
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert not hasattr(config, "files")
+
+
 class TestServerConfigValidation:
     """ServerConfig field boundary validation."""
 
@@ -1198,7 +1266,6 @@ class TestLoadAppConfigFromDb:
             "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
             "auth": {"mode": "vpn"},
             "paths": {},
-            "files": {},
             "limits": {},
             "egress": {},
             "database": {},
@@ -1222,7 +1289,6 @@ class TestLoadAppConfigFromDb:
             "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
             "auth": {"mode": "vpn"},
             "paths": {},
-            "files": {},
             "limits": {},
             "egress": {},
             "database": {},

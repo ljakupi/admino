@@ -57,14 +57,6 @@ IMMUTABLE_DENIALS: frozenset[tuple[str, str]] = frozenset(
         ("outlook_calendar", "delete"),
         ("onedrive", "delete"),
         ("documents", "delete"),
-        ("files", "delete"),
-        # ``files.overwrite`` is modelled as a first-class action so an
-        # attempted overwrite by the LLM produces a permission-engine deny
-        # with a clear audit trail. Overwriting a file is semantically a
-        # delete-then-create, and since ``files.delete`` is hardcoded-denied,
-        # permitting overwrite would be a bypass. No handler is registered
-        # — the permission check rejects the call before dispatch.
-        ("files", "overwrite"),
         ("memory", "delete"),
     }
 )
@@ -108,12 +100,8 @@ _CONFIRM_ONLY_ACTIONS: frozenset[tuple[str, str]] = frozenset(
         ("outlook_calendar", "update"),
         ("onedrive", "delete"),
         ("onedrive", "download"),
-        # Local
+        # Local (admino's own stores)
         ("documents", "delete"),
-        ("files", "write"),
-        ("files", "move"),
-        ("files", "delete"),
-        ("files", "overwrite"),
         ("memory", "delete"),
         ("memory", "write"),
     }
@@ -299,6 +287,10 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
 # enforced by ``check_permission`` regardless of what appears here; this ruleset
 # still passes through ``validate_permissions_config`` when built, so the same
 # hardcoded-denial and write-mutating-action guarantees apply as with the YAML.
+#
+# The google_drive / onedrive ``download`` rows stay at ``confirm`` although no
+# handler is registered for them (GH-143): #192 restores download as chat
+# attachments, and until then dispatch rejects the calls as unknown tools.
 DEFAULT_PERMISSIONS: Final[dict[str, dict[str, str]]] = {
     # --- Google ---
     "gmail": {
@@ -345,14 +337,6 @@ DEFAULT_PERMISSIONS: Final[dict[str, dict[str, str]]] = {
         "delete": "deny",
     },
     # --- Other ---
-    "files": {
-        "read": "allow",
-        "list": "allow",
-        "search": "allow",
-        "write": "confirm",
-        "move": "confirm",
-        "delete": "deny",
-    },
     "memory": {"store": "allow", "recall": "allow", "list": "allow", "delete": "deny"},
 }
 

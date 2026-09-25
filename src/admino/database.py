@@ -167,9 +167,10 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
 async def seed_settings(pool: asyncpg.Pool, config: AppConfig) -> None:
     """Seed the settings table from AppConfig if the table is empty.
 
-    Each config section (server, llm, auth, paths, files, limits, egress,
-    database) becomes a row with key=section_name and value=JSONB of the
-    model dict. The log_level string is stored as ``{"value": "INFO"}``.
+    Each config section (server, llm, auth, paths, limits, egress, database)
+    becomes a row with key=section_name and value=JSONB of the model dict.
+    The log_level string is stored as ``{"value": "INFO"}``. No ``files`` row
+    is seeded: the local files tool was removed in GH-143.
 
     Args:
         pool: The asyncpg connection pool.
@@ -186,7 +187,6 @@ async def seed_settings(pool: asyncpg.Pool, config: AppConfig) -> None:
         "llm": config.llm.model_dump(mode="json"),
         "auth": config.auth.model_dump(mode="json", exclude={"token"}),
         "paths": config.paths.model_dump(mode="json"),
-        "files": config.files.model_dump(mode="json"),
         "limits": config.limits.model_dump(mode="json"),
         "egress": config.egress.model_dump(mode="json"),
         "database": config.database.model_dump(mode="json"),

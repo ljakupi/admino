@@ -36,9 +36,9 @@ a silent action: the engine, which never sees that text, holds the line.
 Some denials are **baked into the code** and cannot be overridden by config or by the
 agent:
 
-- **Never (immutable).** Every `*.delete` — across `files`, `memory`, `google_drive`,
-  both calendars, `onedrive`, `documents`, Gmail, and Outlook — plus `files.overwrite`.
-  These are always denied, full stop.
+- **Never (immutable).** Every `*.delete` — across `memory`, `google_drive`, both
+  calendars, `onedrive`, `documents`, Gmail, and Outlook. These are always denied, full
+  stop.
 - **Deny by default, at most promotable to _confirm_.** `gmail.send`, `outlook.send`, and
   calendar `update`. These stay denied unless you *deliberately* promote them through the
   Critical Permissions flow — and even then they only ever reach **confirm**, never silent

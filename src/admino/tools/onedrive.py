@@ -1,13 +1,17 @@
 """OneDrive tool using Microsoft Graph API.
 
-Provides read, list, search, and download actions for OneDrive files via
-the Microsoft Graph ``/me/drive`` endpoints. Authentication is handled
-via OAuth tokens managed by ``admino.oauth``.
+Provides read, list, and search actions for OneDrive files via the Microsoft
+Graph ``/me/drive`` endpoints. Authentication is handled via OAuth tokens
+managed by ``admino.oauth``.
+
+The download action is not registered: it wrote into the removed local files
+tool's host directories (GH-143) and returns as chat attachments with #192. Its
+``onedrive.download`` permission row stays at ``confirm`` for that reason;
+until then, dispatch rejects the call as an unknown tool.
 
 Security notes:
 - No delete capability. onedrive.delete is a hardcoded denial in permissions.py.
-- Download destination paths are validated against allowed_paths via the
-  files tool's ``_validate_path`` function.
+- Read-only: no action writes to the local filesystem or to OneDrive.
 - OAuth tokens are cached in-memory only; refresh tokens stay encrypted on disk.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
@@ -17,24 +21,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING, Final
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 import httpx
 
 if TYPE_CHECKING:
     from datetime import datetime
-    from pathlib import Path
 
 from admino.models import (
-    OneDriveDownloadArgs,
     OneDriveListArgs,
     OneDriveReadArgs,
     OneDriveSearchArgs,
 )
 from admino.oauth import OAuthError, get_valid_access_token
-from admino.tools.files import _revalidate_resolved, _validate_path
 from admino.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
@@ -44,20 +44,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
-_MAX_DOWNLOAD_SIZE: Final[int] = 100 * 1024 * 1024  # 100 MB
-# Safe redirect hosts for OneDrive /content 302 responses (Azure blob CDN).
-# ``.microsoftpersonalcontent.com`` is Microsoft's consumer (OneDrive personal)
-# content domain — personal accounts serve /content downloads from there since
-# the migration to SharePoint-based infrastructure. The leading-dot suffix match
-# only admits true subdomains of the Microsoft-owned apex, and the redirect is
-# followed without the Authorization header, so no credential reaches the CDN.
-_SAFE_REDIRECT_SUFFIXES: Final[tuple[str, ...]] = (
-    ".windows.net",
-    ".microsoftonline.com",
-    ".azure.com",
-    ".sharepoint.com",
-    ".microsoftpersonalcontent.com",
-)
 
 # ---------------------------------------------------------------------------
 # Module-level token cache
@@ -356,138 +342,3 @@ async def onedrive_search(args: OneDriveSearchArgs, **kwargs: object) -> str:
     if not parts:
         return "No files found matching the search query."
     return "\n---\n".join(parts)
-
-
-def _sync_write_download(destination: Path, content: bytes) -> None:
-    """Write downloaded content to a validated destination path.
-
-    Creates parent directories if needed. Uses O_EXCL to prevent
-    overwriting existing files (create-only, matching files.write behavior).
-
-    Args:
-        destination: The validated destination path.
-        content: The file content bytes.
-
-    Raises:
-        FileExistsError: If the destination file already exists.
-    """
-    # TOCTOU defence: re-validate path hasn't changed since async validation.
-    _revalidate_resolved(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        str(destination),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o644,
-    )
-    try:
-        os.write(fd, content)
-    finally:
-        os.close(fd)
-
-
-@register_tool(
-    tool="onedrive",
-    action="download",
-    description=(
-        "Download a OneDrive file to a local path. Destination must be in "
-        "an allowed writable directory. Requires user confirmation."
-    ),
-    args_schema=OneDriveDownloadArgs,
-)
-async def onedrive_download(args: OneDriveDownloadArgs, **kwargs: object) -> str:
-    """Download a OneDrive file to a local path.
-
-    The destination path is validated against the allowed_paths configuration
-    from the files tool to prevent writes outside approved directories.
-
-    Args:
-        args: Validated download arguments (item_id, destination).
-
-    Returns:
-        Confirmation message, or an error string.
-    """
-    # Validate destination path against allowed paths (requires write access)
-    try:
-        validated_dest = _validate_path(args.destination, require_write=True)
-    except (PermissionError, ValueError) as exc:
-        return f"Destination path rejected: {exc}"
-
-    # Refuse to overwrite existing files (consistent with files.write)
-    if os.path.lexists(str(validated_dest)):
-        return (
-            f"Cannot download to {validated_dest}: a file or directory already "
-            "exists at that path. Please choose a different destination."
-        )
-
-    try:
-        token = await _get_microsoft_token()
-    except OAuthError as exc:
-        return (
-            f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
-        )
-
-    # URL-encode the ID: Graph item IDs contain =, +, /, ! and must not alter
-    # the request path. safe="" encodes every reserved character.
-    item_id = quote(args.item_id, safe="")
-    url = f"{_GRAPH_BASE}/me/drive/items/{item_id}/content"
-    try:
-        # Do NOT pass Authorization header with follow_redirects=True.
-        # Microsoft Graph /content returns a 302 to Azure blob storage;
-        # forwarding the Bearer token to a third-party host leaks credentials.
-        initial = await _http_client.get(  # type: ignore[union-attr]
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        if initial.status_code in (301, 302, 303, 307, 308):
-            redirect_url = initial.headers.get("location", "")
-            if not redirect_url:
-                return "Microsoft Graph returned a redirect with no Location header."
-            # SSRF defence: only follow redirects to known Azure CDN hosts.
-            parsed_redirect = urlparse(redirect_url)
-            if parsed_redirect.scheme != "https" or not any(
-                parsed_redirect.netloc.endswith(suffix) for suffix in _SAFE_REDIRECT_SUFFIXES
-            ):
-                logger.warning("Blocked unsafe OneDrive redirect: %s", parsed_redirect.netloc)
-                return "OneDrive returned an unsafe redirect location."
-            # Follow the redirect WITHOUT the Authorization header
-            response = await _http_client.get(redirect_url)  # type: ignore[union-attr]
-        else:
-            response = initial
-    except httpx.HTTPError as exc:
-        logger.error("HTTP error downloading OneDrive file: %s", type(exc).__name__)
-        return "Failed to connect to Microsoft Graph API."
-
-    if response.status_code != 200:
-        return f"Microsoft Graph error: {_extract_graph_error(response)}"
-
-    # Check Content-Length header before reading body to avoid OOM
-    content_length = response.headers.get("content-length")
-    try:
-        cl_int = int(content_length) if content_length else None
-    except (ValueError, TypeError):
-        cl_int = None
-    if cl_int is not None and cl_int > _MAX_DOWNLOAD_SIZE:
-        return (
-            f"File is too large to download ({cl_int} bytes, limit is {_MAX_DOWNLOAD_SIZE} bytes)."
-        )
-
-    content = response.content
-    if len(content) > _MAX_DOWNLOAD_SIZE:
-        return (
-            f"File is too large to download "
-            f"({len(content)} bytes, limit is {_MAX_DOWNLOAD_SIZE} bytes)."
-        )
-
-    try:
-        await asyncio.to_thread(_sync_write_download, validated_dest, content)
-    except FileExistsError:
-        return (
-            f"Cannot download to {validated_dest}: a file was created at that "
-            "path concurrently. Please choose a different destination."
-        )
-    except OSError as exc:
-        logger.error("Failed to write downloaded file: %s", type(exc).__name__)
-        return f"Failed to write file to {validated_dest}."
-
-    size_str = _human_readable_size(len(content))
-    return f"Downloaded {size_str} to {validated_dest}"

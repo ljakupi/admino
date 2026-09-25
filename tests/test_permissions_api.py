@@ -35,10 +35,10 @@ _AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 # Mocked permission data from load_permissions_from_db.
 _DEFAULT_PERMISSIONS: dict[str, dict[str, str]] = {
     "gmail": {"read": "allow", "list": "allow", "send": "deny"},
-    "files": {"read": "allow", "delete": "deny"},
+    "memory": {"recall": "allow", "delete": "deny"},
 }
 
-# All hardcoded denials from the spec.
+# All hardcoded denials from the spec (GH-143 removed files.delete/overwrite).
 _HARDCODED_DENIALS: list[tuple[str, str]] = [
     ("gmail", "send"),
     ("gmail", "delete"),
@@ -51,8 +51,6 @@ _HARDCODED_DENIALS: list[tuple[str, str]] = [
     ("outlook_calendar", "update"),
     ("onedrive", "delete"),
     ("documents", "delete"),
-    ("files", "delete"),
-    ("files", "overwrite"),
     ("memory", "delete"),
 ]
 
@@ -150,7 +148,7 @@ class TestGetPermissions:
                 resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
 
         entries = resp.json()["permissions"]
-        # _DEFAULT_PERMISSIONS has 5 total entries (gmail:3, files:2)
+        # _DEFAULT_PERMISSIONS has 5 total entries (gmail:3, memory:2)
         assert len(entries) == 5
 
     async def test_get_permissions_entries_sorted_by_tool_then_action(self) -> None:
@@ -181,7 +179,7 @@ class TestGetPermissions:
         lookup = {(e["tool"], e["action"]): e["permission"] for e in entries}
         assert lookup[("gmail", "read")] == "allow"
         assert lookup[("gmail", "send")] == "deny"
-        assert lookup[("files", "delete")] == "deny"
+        assert lookup[("memory", "delete")] == "deny"
 
     async def test_get_permissions_requires_auth(self) -> None:
         """GET /api/permissions without Authorization header returns 401."""
@@ -274,7 +272,7 @@ class TestPatchPermissions:
                 await c.patch(
                     "/api/permissions",
                     headers=_AUTH_HEADER,
-                    json={"tool": "files", "action": "read", "permission": "confirm"},
+                    json={"tool": "memory", "action": "recall", "permission": "confirm"},
                 )
 
         assert agent._permissions == mock_load_config.return_value
@@ -439,6 +437,12 @@ class TestPatchPermissionsHardcodedDenials:
                     json={"tool": tool, "action": action, "permission": "deny"},
                 )
         assert resp.status_code == 200
+
+    async def test_hardcoded_denial_list_matches_permission_engine(self) -> None:
+        """The API test list mirrors the engine's HARDCODED_DENIALS exactly (GH-143)."""
+        from admino.permissions import HARDCODED_DENIALS
+
+        assert set(_HARDCODED_DENIALS) == HARDCODED_DENIALS
 
     async def test_patch_hardcoded_denial_error_message_includes_details(self) -> None:
         """Error response for hardcoded denial uses generic message (no input echo)."""

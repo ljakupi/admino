@@ -1,16 +1,17 @@
-"""Google Drive tool for reading, listing, searching, and downloading files via Drive API v3.
+"""Google Drive tool for reading, listing, and searching files via Drive API v3.
 
-Provides read (metadata), list, search, and download actions for Google Drive
-files using the authenticated user's account. OAuth tokens are managed by
-admino.oauth.
+Provides read (metadata), list, and search actions for Google Drive files using
+the authenticated user's account. OAuth tokens are managed by admino.oauth.
+
+The download action is not registered: it wrote into the removed local files
+tool's host directories (GH-143) and returns as chat attachments with #192. Its
+``google_drive.download`` permission row stays at ``confirm`` for that reason;
+until then, dispatch rejects the call as an unknown tool.
 
 Security notes:
 - No delete capability. google_drive.delete is a hardcoded denial in
   permissions.py.
-- Download destination paths are validated against operator-configured
-  allowed_paths via the files tool's path validation.
-- For Google Workspace documents (Docs, Sheets, Slides), export is used
-  with PDF mime type to avoid arbitrary code execution from native formats.
+- Read-only: no action writes to the local filesystem or to Drive.
 - OAuth tokens are cached in module-level state; refresh tokens never appear
   in memory outside oauth.py.
 - No eval, exec, shell=True, or importlib.
@@ -21,23 +22,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING
 
 import httpx
 
 if TYPE_CHECKING:
     from datetime import datetime
-    from pathlib import Path
 
 from admino.models import (
-    GoogleDriveDownloadArgs,
     GoogleDriveListArgs,
     GoogleDriveReadArgs,
     GoogleDriveSearchArgs,
 )
 from admino.oauth import OAuthError, get_valid_access_token
-from admino.tools.files import _revalidate_resolved, _validate_path
 from admino.tools.registry import register_tool
 
 logger = logging.getLogger(__name__)
@@ -52,17 +49,6 @@ _cached_expires_at: datetime | None = None
 _token_lock = asyncio.Lock()
 
 _DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
-
-# Google Workspace MIME types that require export instead of direct download.
-# Export as PDF to avoid executing arbitrary macros/scripts in native formats.
-_EXPORT_MIME_TYPES: dict[str, str] = {
-    "application/vnd.google-apps.document": "application/pdf",
-    "application/vnd.google-apps.spreadsheet": "application/pdf",
-    "application/vnd.google-apps.presentation": "application/pdf",
-    "application/vnd.google-apps.drawing": "application/pdf",
-}
-
-_MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024  # 100 MB
 
 
 async def _get_google_token() -> str:
@@ -148,33 +134,6 @@ def _format_file_entry(file: dict[str, object]) -> str:
         f"  Size: {size}\n"
         f"  Modified: {modified}"
     )
-
-
-def _sync_write_download(path: Path, content: bytes) -> None:
-    """Write downloaded content to a file, creating parent dirs if needed.
-
-    Refuses to overwrite existing files (create-only, matching files.py
-    security policy).
-
-    Args:
-        path: Validated destination path.
-        content: File content bytes.
-
-    Raises:
-        FileExistsError: If the destination already exists.
-    """
-    # TOCTOU defence: re-validate path hasn't changed since async validation.
-    _revalidate_resolved(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(
-        str(path),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-        0o644,
-    )
-    try:
-        os.write(fd, content)
-    finally:
-        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -344,128 +303,3 @@ async def google_drive_search(args: GoogleDriveSearchArgs, **kwargs: object) -> 
         lines.append("")  # blank line separator
 
     return "\n".join(lines).rstrip()
-
-
-@register_tool(
-    tool="google_drive",
-    action="download",
-    description=(
-        "Download a file from Google Drive to a local path. "
-        "Destination must be in an allowed writable directory."
-    ),
-    args_schema=GoogleDriveDownloadArgs,
-)
-async def google_drive_download(args: GoogleDriveDownloadArgs, **kwargs: object) -> str:
-    """Download a file from Google Drive to a local path.
-
-    For Google Workspace documents (Docs, Sheets, Slides), exports as PDF.
-    For binary files, downloads directly. The destination path is validated
-    against allowed_paths from the files tool.
-
-    Args:
-        args: Validated download arguments (file_id, destination).
-
-    Returns:
-        Confirmation message with destination path and file size.
-    """
-    # Validate destination path against allowed paths (require write access)
-    try:
-        validated_dest = _validate_path(args.destination, require_write=True)
-    except PermissionError as exc:
-        return f"Destination path not allowed: {exc}"
-    except ValueError as exc:
-        return f"Path validation error: {exc}"
-
-    # Refuse to overwrite existing files (matching files.py policy)
-    if os.path.lexists(str(validated_dest)):
-        return (
-            f"Cannot download to {validated_dest}: a file or directory already "
-            "exists at that path. Please choose a different destination."
-        )
-
-    # First, get file metadata to determine mime type
-    try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=60.0)
-        token = await _get_google_token()
-        meta_response = await _http_client.get(
-            f"{_DRIVE_API_BASE}/files/{args.file_id}",
-            params={"fields": "id,name,mimeType,size"},
-            headers=_auth_headers(token),
-        )
-    except OAuthError as exc:
-        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
-    except httpx.HTTPError as exc:
-        return f"HTTP request failed: {type(exc).__name__}"
-
-    if meta_response.status_code != 200:
-        return _format_api_error(meta_response)
-
-    meta = meta_response.json()
-    if not isinstance(meta, dict):
-        return "Unexpected response format from Google Drive API."
-
-    mime_type = str(meta.get("mimeType", ""))
-    file_name = str(meta.get("name", "unknown"))
-
-    # Determine download method
-    try:
-        token = await _get_google_token()
-
-        if mime_type in _EXPORT_MIME_TYPES:
-            # Google Workspace document: export as PDF
-            export_mime = _EXPORT_MIME_TYPES[mime_type]
-            response = await _http_client.get(
-                f"{_DRIVE_API_BASE}/files/{args.file_id}/export",
-                params={"mimeType": export_mime},
-                headers=_auth_headers(token),
-            )
-        else:
-            # Binary file: direct download
-            response = await _http_client.get(
-                f"{_DRIVE_API_BASE}/files/{args.file_id}",
-                params={"alt": "media"},
-                headers=_auth_headers(token),
-            )
-    except OAuthError as exc:
-        return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
-    except httpx.HTTPError as exc:
-        return f"HTTP request failed during download: {type(exc).__name__}"
-
-    if response.status_code != 200:
-        return _format_api_error(response)
-
-    # Check Content-Length header before buffering to prevent OOM on huge files
-    content_length = response.headers.get("content-length")
-    try:
-        cl_int = int(content_length) if content_length else None
-    except (ValueError, TypeError):
-        cl_int = None
-    if cl_int is not None and cl_int > _MAX_DOWNLOAD_SIZE:
-        return (
-            f"File '{file_name}' is too large to download "
-            f"({cl_int} bytes, limit is {_MAX_DOWNLOAD_SIZE} bytes)."
-        )
-
-    content = response.content
-    if len(content) > _MAX_DOWNLOAD_SIZE:
-        return (
-            f"File '{file_name}' is too large to download "
-            f"({len(content)} bytes, limit is {_MAX_DOWNLOAD_SIZE} bytes)."
-        )
-
-    # Write to destination
-    try:
-        await asyncio.to_thread(_sync_write_download, validated_dest, content)
-    except FileExistsError:
-        return (
-            f"Cannot download to {validated_dest}: a file was created at that "
-            "path concurrently. Please choose a different destination."
-        )
-    except OSError as exc:
-        return f"Failed to write downloaded file: {type(exc).__name__}"
-
-    size_str = f"{len(content)} bytes"
-    export_note = " (exported as PDF)" if mime_type in _EXPORT_MIME_TYPES else ""
-    return f"Downloaded '{file_name}'{export_note} to {validated_dest} ({size_str})"
