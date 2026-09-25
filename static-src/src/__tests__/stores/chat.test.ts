@@ -3,7 +3,9 @@
  *
  * Covers the send-message flow, response → thread mapping and ordering, the
  * tool-call confirmation state machine (pending → approved → completed/error,
- * pending → denied) and error handling. The network layer (`@/api/messages`)
+ * pending → denied) and error handling. Also covers issue #141: clearing the
+ * thread is a fresh start, so it rotates (and persists) the session id and
+ * every later request uses the new one. The network layer (`@/api/messages`)
  * is mocked; error cases use the real `ApiError` class.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -29,6 +31,11 @@ vi.mock('@/api/messages', () => ({
 
 const mockedPostMessage = vi.mocked(postMessage);
 const mockedConfirmDecision = vi.mocked(confirmDecision);
+
+/** localStorage key the settings store persists the session id under. */
+const SESSION_STORAGE_KEY = 'admino_session_id';
+/** Shape the backend accepts for a session id. */
+const SESSION_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
 // --- Fixtures -------------------------------------------------------------
 
@@ -403,7 +410,11 @@ describe('chatStore response handling', () => {
       'files.list',
     ]);
   });
+});
 
+// --- Clearing the thread starts a new session (issue #141) ----------------
+
+describe('chatStore clearThread', () => {
   it('clearThread empties the thread', async () => {
     mockedPostMessage.mockResolvedValueOnce(makeResponse({ tool_calls: [makeRecord()] }));
     const chat = useChatStore();
@@ -413,6 +424,174 @@ describe('chatStore response handling', () => {
 
     expect(chat.thread).toEqual([]);
   });
+
+  it('rotates the session id to a new, valid id', async () => {
+    mockedPostMessage.mockResolvedValueOnce(makeResponse());
+    const chat = useChatStore();
+    const settings = useSettingsStore();
+    const before = settings.sessionId;
+    await chat.sendMessage('Search my mail');
+
+    chat.clearThread();
+
+    expect(settings.sessionId).not.toBe(before);
+    expect(settings.sessionId).toMatch(SESSION_ID_RE);
+  });
+
+  it('persists the rotated session id to localStorage', async () => {
+    mockedPostMessage.mockResolvedValueOnce(makeResponse());
+    const chat = useChatStore();
+    const settings = useSettingsStore();
+    const before = settings.sessionId;
+    await chat.sendMessage('Search my mail');
+
+    chat.clearThread();
+
+    const stored = localStorage.getItem(SESSION_STORAGE_KEY);
+    expect(stored).not.toBe(before);
+    expect(stored).toBe(settings.sessionId);
+  });
+
+  it('does not bring the old session back after a reload', async () => {
+    mockedPostMessage.mockResolvedValueOnce(makeResponse());
+    const chat = useChatStore();
+    const before = useSettingsStore().sessionId;
+    await chat.sendMessage('Search my mail');
+    chat.clearThread();
+    const rotated = useSettingsStore().sessionId;
+
+    // A page reload re-creates every store from localStorage.
+    setActivePinia(createPinia());
+
+    expect(useSettingsStore().sessionId).not.toBe(before);
+    expect(useSettingsStore().sessionId).toBe(rotated);
+  });
+
+  it('sends the next message with the new session id, not the old one', async () => {
+    mockedPostMessage
+      .mockResolvedValueOnce(makeResponse({ response: 'You have 3 unread.' }))
+      .mockResolvedValueOnce(makeResponse({ response: 'Hello again.' }));
+    const chat = useChatStore();
+    const settings = useSettingsStore();
+    const sessionA = settings.sessionId;
+    await chat.sendMessage('Any unread mail?');
+
+    chat.clearThread();
+    await chat.sendMessage('Start over');
+
+    expect(mockedPostMessage).toHaveBeenCalledTimes(2);
+    expect(mockedPostMessage).toHaveBeenNthCalledWith(1, 'Any unread mail?', sessionA);
+    const [content, sessionUsed] = mockedPostMessage.mock.calls[1];
+    expect(content).toBe('Start over');
+    expect(sessionUsed).not.toBe(sessionA);
+    expect(sessionUsed).toBe(settings.sessionId);
+  });
+
+  it('produces a distinct session id on every clear', async () => {
+    mockedPostMessage.mockResolvedValueOnce(makeResponse());
+    const chat = useChatStore();
+    const settings = useSettingsStore();
+    const seen = [settings.sessionId];
+    await chat.sendMessage('Search my mail');
+
+    for (let i = 0; i < 3; i++) {
+      chat.clearThread();
+      seen.push(settings.sessionId);
+    }
+
+    expect(new Set(seen).size).toBe(seen.length);
+  });
+
+  it('rotates the session id even when the thread is already empty', () => {
+    const chat = useChatStore();
+    const settings = useSettingsStore();
+    const before = settings.sessionId;
+    expect(chat.thread).toEqual([]);
+
+    chat.clearThread();
+
+    expect(settings.sessionId).not.toBe(before);
+  });
+
+  it.each([
+    ['approve', true],
+    ['deny', false],
+  ] as const)(
+    '%s on a confirmation obtained after the clear uses the new session id',
+    async (decision, approved) => {
+      mockedPostMessage.mockResolvedValueOnce(makeResponse({ response: 'You have 3 unread.' }));
+      const chat = useChatStore();
+      const settings = useSettingsStore();
+      const sessionA = settings.sessionId;
+      await chat.sendMessage('Any unread mail?');
+      chat.clearThread();
+      const card = await seedPendingCard(makePending({ confirmation_id: 'c-after-clear' }));
+      mockedConfirmDecision.mockResolvedValueOnce(
+        approved ? confirmedResponse(true) : deniedResponse(),
+      );
+
+      await chat[decision](card.id);
+
+      expect(mockedConfirmDecision).toHaveBeenCalledTimes(1);
+      const [sessionUsed, confirmationId, approvedFlag] = mockedConfirmDecision.mock.calls[0];
+      expect(sessionUsed).not.toBe(sessionA);
+      expect(sessionUsed).toBe(settings.sessionId);
+      expect([confirmationId, approvedFlag]).toEqual(['c-after-clear', approved]);
+    },
+  );
+
+  it('drops the reply to a message that was in flight when the thread was cleared', async () => {
+    const request = deferred<ChatResponse>();
+    mockedPostMessage.mockReturnValueOnce(request.promise);
+    const chat = useChatStore();
+    const sent = chat.sendMessage('Any unread mail?');
+
+    chat.clearThread();
+    request.resolve(
+      makeResponse({ response: 'You have 3 unread.', tool_calls: [makeRecord()] }),
+    );
+    await sent;
+
+    expect(chat.thread).toEqual([]);
+    expect(chat.sending).toBe(false);
+    expect(useConnectionStore().state).toBe('idle');
+  });
+
+  it('drops a confirmation request that arrives after the thread was cleared', async () => {
+    const request = deferred<ChatResponse>();
+    mockedPostMessage.mockReturnValueOnce(request.promise);
+    const chat = useChatStore();
+    const sent = chat.sendMessage('Email the Q3 report to my boss');
+
+    chat.clearThread();
+    request.resolve(awaitingResponse());
+    await sent;
+
+    expect(chat.thread).toEqual([]);
+    expect(chat.pendingConfirmation).toBeNull();
+    expect(useConnectionStore().state).toBe('idle');
+  });
+
+  it.each([
+    ['approve', confirmedResponse(true)],
+    ['deny', deniedResponse()],
+  ] as const)(
+    'drops the %s result that was in flight when the thread was cleared',
+    async (decision, result) => {
+      const card = await seedPendingCard();
+      const confirm = deferred<ChatResponse>();
+      mockedConfirmDecision.mockReturnValueOnce(confirm.promise);
+      const chat = useChatStore();
+      const decided = chat[decision](card.id);
+
+      chat.clearThread();
+      confirm.resolve(result);
+      await decided;
+
+      expect(chat.thread).toEqual([]);
+      expect(useConnectionStore().state).toBe('idle');
+    },
+  );
 });
 
 // --- sendMessage errors ---------------------------------------------------

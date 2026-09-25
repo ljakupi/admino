@@ -121,14 +121,14 @@ async function onNotificationsChange(value: boolean) {
 // --- Data / Danger section ---
 function handleClearChat() {
   chatStore.clearThread();
+  draftSessionId.value = settings.sessionId;
   showClearConfirm.value = false;
   toasts.add('success', 'Chat cleared');
 }
 
 function handleNewSession() {
-  settings.newSession();
-  draftSessionId.value = settings.sessionId;
   chatStore.clearThread();
+  draftSessionId.value = settings.sessionId;
   toasts.add('success', 'New session started');
 }
 

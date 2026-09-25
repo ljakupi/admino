@@ -134,10 +134,16 @@ export const useChatStore = defineStore('chat', () => {
     sending.value = true;
     connection.setWorking();
     const thinkingId = addThinking();
+    const sessionId = settings.sessionId;
 
     try {
-      const res = await postMessage(content, settings.sessionId);
+      const res = await postMessage(content, sessionId);
       removeThinking(thinkingId);
+      // Cleared while in flight: the reply belongs to the old conversation.
+      if (settings.sessionId !== sessionId) {
+        connection.setIdle();
+        return;
+      }
       processResponse(res);
 
       if (res.status === 'awaiting_confirmation') {
@@ -182,9 +188,14 @@ export const useChatStore = defineStore('chat', () => {
 
     item.data.state = 'approved';
     connection.setWorking();
+    const sessionId = settings.sessionId;
 
     try {
-      const res = await confirmDecision(settings.sessionId, confirmId, true);
+      const res = await confirmDecision(sessionId, confirmId, true);
+      if (settings.sessionId !== sessionId) {
+        connection.setIdle();
+        return;
+      }
       processResponse(res);
 
       if (res.status === 'awaiting_confirmation') {
@@ -222,10 +233,11 @@ export const useChatStore = defineStore('chat', () => {
     if (!confirmId) return;
 
     item.data.state = 'denied';
+    const sessionId = settings.sessionId;
 
     try {
-      const res = await confirmDecision(settings.sessionId, confirmId, false);
-      processResponse(res);
+      const res = await confirmDecision(sessionId, confirmId, false);
+      if (settings.sessionId === sessionId) processResponse(res);
       connection.setIdle();
     } catch (err) {
       if (err instanceof ApiError && err.status === 410) {
@@ -236,6 +248,8 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function clearThread() {
+    // A clear is a fresh start: rotate the session id so the server never answers with the old context.
+    useSettingsStore().newSession();
     thread.value = [];
   }
 
