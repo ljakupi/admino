@@ -671,7 +671,10 @@ class AgentConfig(BaseModel):
         default=40,
         ge=1,
         le=200,
-        description="Maximum conversation messages sent as LLM context.",
+        description=(
+            "Maximum conversation messages sent as LLM context. The system"
+            " prompt and the current user message are always sent."
+        ),
     )
     confirmation_timeout_s: float = Field(
         default=30.0,
@@ -741,7 +744,9 @@ class AgentResult(BaseModel):
 
     The caller owns conversation history: the agent returns the full updated
     ``history`` (user turn + any assistant/tool turns added during the run) so
-    the caller can persist it. ``tool_calls`` is a summary for the HTTP
+    the caller can persist it. It never contains ``system`` messages — the
+    agent adds its system prompt to each LLM call itself, so feeding the
+    history back cannot duplicate it. ``tool_calls`` is a summary for the HTTP
     response layer; authoritative records live in the audit log.
     """
 
@@ -760,7 +765,10 @@ class AgentResult(BaseModel):
     history: list[LLMMessage] = Field(
         default_factory=list,
         max_length=1000,
-        description="Updated conversation history including this turn's additions.",
+        description=(
+            "Updated conversation history including this turn's additions."
+            " User/assistant/tool messages only; excludes the system prompt."
+        ),
     )
     tool_calls: list[ToolCallRecord] = Field(
         default_factory=list,

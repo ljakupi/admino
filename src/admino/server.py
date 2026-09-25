@@ -1355,7 +1355,8 @@ async def _resolve_pending_promotions() -> None:
     active sessions so the LLM is aware the permission changed and will not
     refuse based on stale denial messages in the conversation history. A
     ``user`` role (not ``system``) is required so the notice survives the
-    agent's ``_filter_mid_system`` prompt-injection defence (see GH-66).
+    agent's ``_drop_system_messages`` prompt-injection defence (see GH-66,
+    GH-140).
 
     Safety: builds a list of expired keys first, then mutates the dict in a
     separate loop to avoid ``RuntimeError`` from modifying a dict during
@@ -1393,9 +1394,9 @@ async def _resolve_pending_promotions() -> None:
     # permission changed and won't refuse based on stale denial messages in
     # the conversation history.
     #
-    # GH-66: this MUST use a non-system role. The agent's ``_filter_mid_system``
-    # prompt-injection defence drops every ``system``-role message that appears
-    # after the leading system block, so a ``system``-role notification would be
+    # GH-66: this MUST use a non-system role. The agent's ``_drop_system_messages``
+    # prompt-injection defence drops every ``system``-role message in
+    # caller-supplied history (GH-140), so a ``system``-role notification would be
     # silently discarded before reaching the LLM. A ``user``-role message is
     # informational (not a trusted directive) and survives the filter.
     promoted_names = ", ".join(f"{t}.{a}" for t, a in expired)
