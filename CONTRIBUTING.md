@@ -58,8 +58,8 @@ All of these are enforced by CI and are non-negotiable:
 - Every module has a docstring covering purpose, inputs, outputs, and security notes.
 - Keep modules small, focused, and single-responsibility. No dead code, no
   speculative abstractions.
-- **Frontend:** Vue 3 + TypeScript in `static-src/`; `npm run typecheck` and
-  `npm run build` must pass.
+- **Frontend:** Vue 3 + TypeScript in `static-src/`; `npm run typecheck`,
+  `npm run test`, and `npm run build` must pass.
 
 ### Banned dependencies
 
@@ -95,6 +95,7 @@ make check              # lint + format-check + typecheck + tests
 
   ```bash
   npm run typecheck
+  npm run test        # Vitest: store, composable, and component logic
   npm run build
   ```
 

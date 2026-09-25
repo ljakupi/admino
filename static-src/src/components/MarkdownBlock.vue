@@ -15,7 +15,10 @@ const rendered = computed(() => {
       'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'a', 'blockquote',
       'table', 'thead', 'tbody', 'tr', 'th', 'td', 'hr', 'span',
     ],
-    ALLOWED_ATTR: ['href', 'target', 'rel', 'class'],
+    // No `target`: an LLM-authored link opening a new tab could reach
+    // window.opener (reverse tabnabbing). No `data-*`: unneeded attack surface.
+    ALLOWED_ATTR: ['href', 'rel', 'class'],
+    ALLOW_DATA_ATTR: false,
   });
 });
 </script>

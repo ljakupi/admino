@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import { VitePWA } from 'vite-plugin-pwa';
@@ -52,5 +53,13 @@ export default defineConfig({
       '/api': 'http://127.0.0.1:8000',
       '/health': 'http://127.0.0.1:8000',
     },
+  },
+  // Frontend logic tests (`npm run test`). happy-dom supplies the DOM that
+  // component mounts and DOMPurify need; tests never touch the network.
+  test: {
+    environment: 'happy-dom',
+    include: ['src/__tests__/**/*.test.ts'],
+    restoreMocks: true,
+    unstubGlobals: true,
   },
 });

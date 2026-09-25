@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { ref, onUnmounted } from 'vue';
+import { ref } from 'vue';
 import type { HealthResponse } from '@/api/types';
 
 export type ConnectionState = 'idle' | 'working' | 'awaiting' | 'offline';
@@ -26,6 +26,7 @@ export const useConnectionStore = defineStore('connection', () => {
   }
 
   function startPolling() {
+    stopPolling();
     checkHealth();
     pollTimer = setInterval(checkHealth, 10_000);
   }

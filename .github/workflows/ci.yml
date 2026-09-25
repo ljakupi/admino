@@ -48,6 +48,9 @@ jobs:
       - name: Type check
         working-directory: static-src
         run: npm run typecheck
+      - name: Test
+        working-directory: static-src
+        run: npm run test
       - name: Build
         working-directory: static-src
         run: npm run build
