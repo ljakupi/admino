@@ -649,7 +649,7 @@ class LLMMessage(BaseModel):
         description=(
             "Structured tool_use blocks for providers that require them in the assistant "
             "message (e.g. Anthropic). Each entry has type, id, name (dot notation), "
-            "and input. Ignored by the OpenAI serializer."
+            "and input. The OpenAI-compatible serializer replays them as tool_calls."
         ),
     )
 

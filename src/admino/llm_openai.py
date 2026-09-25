@@ -58,7 +58,9 @@ def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, An
 
     OpenAI uses "system", "user", "assistant", and "tool" roles natively.
     Tool-role messages require a ``tool_call_id`` linking them to the
-    originating tool call.
+    originating tool call, and that call must appear in the preceding assistant
+    message's ``tool_calls``: the agent stores it in ``tool_use_blocks``, which
+    is replayed here as OpenAI ``tool_calls`` (JSON-string arguments).
 
     Args:
         messages: Conversation messages.
@@ -72,8 +74,43 @@ def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, An
         # OpenAI requires tool_call_id on tool-role messages
         if msg.role == "tool" and msg.tool_call_id:
             entry["tool_call_id"] = msg.tool_call_id
+        if msg.role == "assistant" and msg.tool_use_blocks:
+            tool_calls = _tool_use_blocks_to_openai(msg.tool_use_blocks)
+            if tool_calls:
+                entry["tool_calls"] = tool_calls
         api_messages.append(entry)
     return api_messages
+
+
+def _tool_use_blocks_to_openai(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert the agent's stored tool_use blocks to OpenAI ``tool_calls`` entries.
+
+    Blocks without a string id, a non-empty string name, or a dict input are
+    skipped (a call that can't be linked to its result would be rejected).
+
+    Args:
+        blocks: ``{"type": "tool_use", "id", "name", "input"}`` dicts.
+
+    Returns:
+        OpenAI function tool calls with JSON-string arguments.
+    """
+    tool_calls: list[dict[str, Any]] = []
+    for block in blocks:
+        call_id = block.get("id")
+        name = block.get("name")
+        arguments = block.get("input")
+        if not (isinstance(call_id, str) and call_id and isinstance(name, str) and name):
+            continue
+        if not isinstance(arguments, dict):
+            continue
+        tool_calls.append(
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
+            }
+        )
+    return tool_calls
 
 
 def _convert_tools_to_openai(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -23,6 +23,12 @@ client is built lazily on first use (``max_retries=0``; retries belong to the
 gateway). ``_new_http_client`` is the only place an ``httpx.AsyncClient`` is
 constructed (discovery, model listing and the SDK all go through it).
 
+Request shape follows Infomaniak's documented schema for
+``POST /2/ai/{product_id}/openai/v1/chat/completions``: the output cap is sent as
+``max_completion_tokens`` and ``chat()`` sends an explicit ``stream: false``
+(``stream`` defaults to true there). Tool-call turns are replayed with
+``tool_calls`` so every ``tool`` result answers its call.
+
 Reasoning: requests send ``reasoning_effort: "none"`` (thinking is on by
 default for most models). Reasoning never reaches the answer: the
 ``reasoning_content`` / ``reasoning`` fields that vLLM-style servers may add are
@@ -447,7 +453,8 @@ class InfomaniakClient:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": _convert_messages_to_openai(messages),
-            "max_tokens": self._max_tokens,
+            # Infomaniak documents max_completion_tokens (not the legacy max_tokens).
+            "max_completion_tokens": self._max_tokens,
             "reasoning_effort": "none",
         }
         if tools:
@@ -487,7 +494,9 @@ class InfomaniakClient:
 
         client, kwargs = await self._prepare(messages, tools)
         try:
-            response = await client.chat.completions.create(**kwargs)
+            # Infomaniak documents ``stream`` as defaulting to true and the SDK omits
+            # the key unless it is passed, so ask for a single JSON reply explicitly.
+            response = await client.chat.completions.create(**kwargs, stream=False)
         except openai.APIError as exc:
             raise _api_error(exc) from None
 

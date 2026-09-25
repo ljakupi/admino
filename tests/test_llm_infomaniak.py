@@ -622,12 +622,18 @@ class TestInfomaniakRequestShape:
         await client.chat(_msgs())
         assert fake.last_chat_body()["reasoning_effort"] == "none"
 
-    async def test_infomaniak_chat_sends_max_tokens(
+    async def test_infomaniak_chat_sends_max_completion_tokens(
         self, client: Any, fake: FakeInfomaniak
     ) -> None:
-        """max_tokens comes from config.max_response_tokens."""
+        """The output cap is sent as max_completion_tokens (config.max_response_tokens).
+
+        Infomaniak documents ``max_completion_tokens`` for this endpoint; the legacy
+        ``max_tokens`` is not part of its schema, so it must not be sent.
+        """
         await client.chat(_msgs())
-        assert fake.last_chat_body()["max_tokens"] == 1024
+        body = fake.last_chat_body()
+        assert body["max_completion_tokens"] == 1024
+        assert "max_tokens" not in body
 
     async def test_infomaniak_chat_messages_sent_verbatim(
         self, client: Any, fake: FakeInfomaniak
@@ -678,9 +684,48 @@ class TestInfomaniakRequestShape:
         assert key not in fake.last_chat_body()
 
     async def test_infomaniak_chat_is_not_streamed(self, client: Any, fake: FakeInfomaniak) -> None:
-        """chat() sends a non-streaming request."""
+        """chat() sends an explicit ``stream: false``.
+
+        Infomaniak documents ``stream`` as defaulting to true, and the SDK omits
+        the key when it isn't passed, so it must be sent explicitly.
+        """
         await client.chat(_msgs())
-        assert fake.last_chat_body().get("stream") in (None, False)
+        assert fake.last_chat_body()["stream"] is False
+
+    async def test_infomaniak_chat_tool_round_trip_links_call_and_result(
+        self, client: Any, fake: FakeInfomaniak
+    ) -> None:
+        """A tool-call turn is replayed with ``tool_calls`` before its ``tool`` result."""
+        messages = [
+            LLMMessage(role="user", content="Remember that I like tea"),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_use_blocks=[
+                    {
+                        "type": "tool_use",
+                        "id": "call_01",
+                        "name": "memory.store",
+                        "input": {"key": "drink", "value": "tea"},
+                    }
+                ],
+            ),
+            LLMMessage(role="tool", content="stored", tool_call_id="call_01"),
+        ]
+        await client.chat(messages, tools=[_MEMORY_TOOL])
+        sent = fake.last_chat_body()["messages"]
+        assert sent[1]["role"] == "assistant"
+        assert sent[1]["tool_calls"] == [
+            {
+                "id": "call_01",
+                "type": "function",
+                "function": {
+                    "name": "memory.store",
+                    "arguments": json.dumps({"key": "drink", "value": "tea"}),
+                },
+            }
+        ]
+        assert sent[2] == {"role": "tool", "content": "stored", "tool_call_id": "call_01"}
 
     async def test_infomaniak_chat_oversized_tools_is_internal_error(
         self, client: Any, fake: FakeInfomaniak
@@ -1038,6 +1083,8 @@ class TestInfomaniakStreaming:
         assert body["stream_options"] == {"include_usage": True}
         assert body["reasoning_effort"] == "none"
         assert body["model"] == _MODEL
+        assert body["max_completion_tokens"] == 1024
+        assert "max_tokens" not in body
         assert "user" not in body
 
     async def test_infomaniak_stream_content_capped(

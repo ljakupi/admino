@@ -373,7 +373,8 @@ class Agent:
             # Record the assistant's tool-call turn in history. Include the
             # tool_use_blocks so that providers requiring structured content in
             # the assistant message (Anthropic) can reconstruct the proper
-            # tool_use / tool_result pairing. OpenAI ignores this field.
+            # tool_use / tool_result pairing; the OpenAI-compatible serializer
+            # replays them as tool_calls so each tool result answers its call.
             working_history.append(
                 LLMMessage(
                     role="assistant",

@@ -136,6 +136,71 @@ class TestConvertMessagesToOpenAI:
         result = _convert_messages_to_openai(msgs)
         assert "tool_call_id" not in result[0]
 
+    def test_assistant_tool_use_blocks_become_tool_calls(self) -> None:
+        """An assistant tool-call turn carries OpenAI ``tool_calls`` (JSON-string args).
+
+        OpenAI-compatible servers require every ``tool`` message to answer a
+        preceding assistant ``tool_calls`` entry with the same id.
+        """
+        msgs = [
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_use_blocks=[
+                    {
+                        "type": "tool_use",
+                        "id": "call_1",
+                        "name": "memory.store",
+                        "input": {"key": "k", "value": "v"},
+                    },
+                    {"type": "tool_use", "id": "call_2", "name": "memory.list", "input": {}},
+                ],
+            )
+        ]
+        result = _convert_messages_to_openai(msgs)
+        assert result == [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "memory.store",
+                            "arguments": json.dumps({"key": "k", "value": "v"}),
+                        },
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"name": "memory.list", "arguments": "{}"},
+                    },
+                ],
+            }
+        ]
+
+    def test_assistant_without_tool_use_blocks_has_no_tool_calls(self) -> None:
+        """A plain assistant message gets no ``tool_calls`` key."""
+        result = _convert_messages_to_openai([LLMMessage(role="assistant", content="Hi")])
+        assert "tool_calls" not in result[0]
+
+    def test_malformed_tool_use_blocks_are_skipped(self) -> None:
+        """Blocks without a string id/name or a dict input are dropped."""
+        msgs = [
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_use_blocks=[
+                    {"type": "tool_use", "id": None, "name": "memory.store", "input": {}},
+                    {"type": "tool_use", "id": "call_1", "name": "", "input": {}},
+                    {"type": "tool_use", "id": "call_2", "name": "memory.store", "input": "x"},
+                ],
+            )
+        ]
+        result = _convert_messages_to_openai(msgs)
+        assert "tool_calls" not in result[0]
+
     def test_empty_messages(self) -> None:
         """Empty message list returns empty list."""
         assert _convert_messages_to_openai([]) == []
