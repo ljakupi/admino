@@ -13,9 +13,12 @@ Architecture & boundaries:
   never calls ``check_permission`` directly — dispatch is the single
   enforcement point, and passing ``audit_logger`` through ensures every
   decision is recorded at that point.
-- Conversation history is owned by the *caller*. The agent receives a copy,
-  mutates a local list, and returns the updated list as part of
-  :class:`admino.models.AgentResult`. There is no module-level state.
+- Conversation history is owned by the *caller*; the system prompt is owned
+  by the *agent*. The agent copies the caller's history, mutates the local
+  list, and returns it as part of :class:`admino.models.AgentResult` — it
+  only ever holds user/assistant/tool messages. The system prompt is added
+  to each LLM call's context and never returned in history, so it cannot
+  accumulate across turns (GH-140). There is no module-level state.
 
 Security notes:
 - No ``eval``, ``exec``, ``compile``, ``importlib``, ``shell=True``, or
@@ -24,6 +27,9 @@ Security notes:
   logged at INFO/DEBUG. Only counts, tool/action names, and status strings
   are emitted via the standard logger. Audit entries are the authoritative
   record.
+- Every ``system``-role message in caller-supplied history (leading or
+  mid-conversation) is dropped before use — it could be persisted prompt
+  injection. Only a count is logged, never the content.
 - Exceptions from the LLM client are caught and converted into a safe
   "error" AgentResult. ``MemoryError`` and ``RecursionError`` are
   re-raised (mirroring the registry pattern).
@@ -128,9 +134,10 @@ class Agent:
                 ``max_context_messages``).
             model_name: Name of the LLM model used — recorded on every
                 conversation audit entry.
-            system_prompt: Optional system message prepended to every run's
-                context window. Used to communicate available file paths,
+            system_prompt: Optional system message sent once, first, on every
+                LLM call. Used to communicate available file paths,
                 operator constraints, and other static context to the LLM.
+                It is never added to the history returned to the caller.
             tools_enabled: Per-tool enabled/disabled state from settings.
                 Tools whose name maps to ``False`` are excluded from the
                 LLM tool list and rejected at dispatch time.  Hot-reloaded
@@ -159,9 +166,11 @@ class Agent:
     ) -> AgentResult:
         """Run the agent loop for a single user message.
 
-        The method appends the user message to ``history``, then enters the
-        LLM/tool loop until the LLM produces plain text, a tool call needs
-        confirmation, ``max_tool_calls`` is exhausted, or an error occurs.
+        The method appends the user message to a copy of ``history``, then
+        enters the LLM/tool loop until the LLM produces plain text, a tool
+        call needs confirmation, ``max_tool_calls`` is exhausted, or an error
+        occurs. Each LLM call gets the system prompt plus a trimmed window
+        of the history in which the current user message is always kept.
 
         Args:
             user_message: The user's message text. Must already be validated
@@ -169,7 +178,8 @@ class Agent:
             session_id: Session identifier — propagated to audit entries and
                 tool handlers. Must match the audit entry pattern.
             history: Prior conversation history (caller-owned). The agent
-                copies this list; the original is not mutated.
+                copies this list; the original is not mutated. Any
+                ``system``-role messages in it are dropped.
             pending_confirmation: If set, a previously-issued confirmation is
                 being resumed. The first tool call in this turn is dispatched
                 with this value so ``registry.dispatch_tool_call`` can verify
@@ -177,15 +187,26 @@ class Agent:
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
-            history, and a summary of tool calls made during the run.
+            history (user/assistant/tool messages only — never the system
+            prompt), and a summary of tool calls made during the run.
         """
-        # Work on a local copy so we never mutate the caller's list.
-        # Prepend the system prompt if configured — it is always first so
-        # _trim_context preserves it as part of the leading system block.
-        working_history: list[LLMMessage] = []
-        if self._system_prompt:
-            working_history.append(LLMMessage(role="system", content=self._system_prompt))
-        working_history.extend(history)
+        # Work on a local copy so we never mutate the caller's list. The
+        # system prompt is NOT stored here: it is added per LLM call by
+        # _build_context, so the returned history never carries it and it
+        # cannot pile up when the caller feeds the history back (GH-140).
+        working_history: list[LLMMessage] = _drop_system_messages(history)
+        # Index of this turn's user message, pinned into every context window.
+        # On resume there is no new user message, so the request being resumed
+        # (the most recent user message) is pinned instead. None only when the
+        # history holds no user message at all.
+        current_idx: int | None = next(
+            (
+                i
+                for i in range(len(working_history) - 1, -1, -1)
+                if working_history[i].role == "user"
+            ),
+            None,
+        )
 
         # Resume mode: ``pending_confirmation`` is set, meaning the user just
         # approved a previously-issued confirmation via ``/api/confirm``. In
@@ -196,6 +217,7 @@ class Agent:
         # (b) pollute the LLM context with a meaningless empty turn.
         is_resume = pending_confirmation is not None
         if not is_resume:
+            current_idx = len(working_history)
             working_history.append(LLMMessage(role="user", content=user_message))
 
             # Audit the user turn before any LLM call so the trail is complete
@@ -274,10 +296,15 @@ class Agent:
         # Bounded loop. Each iteration = one LLM round trip, possibly followed
         # by a batch of tool dispatches.
         for _iteration in range(self._config.max_tool_calls + 1):
-            # 1. Call the LLM with a trimmed context window.
-            trimmed = _trim_context(working_history, self._config.max_context_messages)
+            # 1. Call the LLM with the system prompt + a trimmed context window.
+            context = _build_context(
+                working_history,
+                system_prompt=self._system_prompt,
+                current_idx=current_idx,
+                max_messages=self._config.max_context_messages,
+            )
             try:
-                response = await self._llm.chat(trimmed, tools=tools_payload)
+                response = await self._llm.chat(context, tools=tools_payload)
             except (MemoryError, RecursionError):
                 raise
             except AuditWriteError:
@@ -698,12 +725,72 @@ class Agent:
 # ---------------------------------------------------------------------------
 
 
+def _drop_system_messages(history: list[LLMMessage]) -> list[LLMMessage]:
+    """Return a copy of caller-supplied ``history`` without ``system`` messages.
+
+    The agent is the only source of system content (its configured prompt,
+    added per LLM call by :func:`_build_context`). A ``system`` message in
+    caller history — leading or mid-conversation — is either a stale copy of
+    that prompt or persisted prompt injection, so all of them are dropped.
+    When any are dropped, one WARNING with the count only is logged; message
+    content is never logged.
+    """
+    kept = [msg for msg in history if msg.role != "system"]
+    dropped = len(history) - len(kept)
+    if dropped:
+        logger.warning("Dropped %d system-role message(s) from caller-supplied history", dropped)
+    return kept
+
+
+def _build_context(
+    history: list[LLMMessage],
+    *,
+    system_prompt: str,
+    current_idx: int | None,
+    max_messages: int,
+) -> list[LLMMessage]:
+    """Build the message list for one LLM call.
+
+    ``history`` must hold no ``system`` messages (see
+    :func:`_drop_system_messages`). The result is:
+
+    - the agent's ``system_prompt`` once, at index 0 (omitted when empty);
+    - the current user message ``history[current_idx]``, exactly once — the
+      system prompt and this message are the floor and are always sent, even
+      when they alone exceed ``max_messages``;
+    - the most recent other messages, in chronological order, filling the
+      remaining budget via :func:`_trim_context` (which also drops leading
+      orphaned ``tool`` results).
+
+    ``current_idx`` is ``None`` only when the history holds no user message to
+    pin; the result is then the system prompt plus the trimmed history.
+
+    The pinned message goes back to its chronological position: a window that
+    reaches into the messages before it holds every message after it, and the
+    first message after it is the assistant turn answering it, so no orphaned
+    ``tool`` result can follow it.
+    """
+    system = [LLMMessage(role="system", content=system_prompt)] if system_prompt else []
+    if current_idx is None:
+        budget = max_messages - len(system)
+        # Guard budget <= 0 so _trim_context does not emit its L-5 warning.
+        return system + (_trim_context(history, budget) if budget > 0 else [])
+    pinned = history[current_idx]
+    after = history[current_idx + 1 :]
+    budget = max_messages - len(system) - 1
+    tail = _trim_context(history[:current_idx] + after, budget) if budget > 0 else []
+    insert_at = max(0, len(tail) - len(after))
+    return [*system, *tail[:insert_at], pinned, *tail[insert_at:]]
+
+
 def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessage]:
     """Return the tail of ``history`` bounded by ``max_messages``.
 
     System messages at the head of history are preserved; only non-system
-    messages are trimmed from the middle/front. This keeps any persistent
-    system prompt in the context window regardless of conversation length.
+    messages are trimmed from the middle/front. The agent calls this via
+    :func:`_build_context` on history that is already free of system
+    messages, so there it simply keeps the most recent messages; the
+    system-message handling here is defence in depth.
 
     M-1 defence: any ``system``-role message found AFTER the leading block
     is dropped with a warning. Mid-conversation ``system`` messages could
@@ -750,8 +837,8 @@ def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessa
 def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:
     """Remove any ``system``-role messages from a non-leading position.
 
-    The agent only trusts system messages at the very start of history.
-    Any system-role message that appears mid-conversation (e.g. from a
+    :func:`_trim_context` only keeps system messages at the very start of
+    its input. Any system-role message that appears mid-conversation (e.g. from a
     tainted persisted history) is silently dropped with a warning.
     """
     filtered: list[LLMMessage] = []

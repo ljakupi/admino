@@ -22,22 +22,34 @@ from __future__ import annotations
 import ast
 import json
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
+from pydantic import BaseModel, Field, SecretStr
 
+from admino.agent import Agent
+from admino.audit import open_audit_log
+from admino.llm import LLMResponse
 from admino.models import (
+    AgentConfig,
     AgentResult,
     LLMMessage,
     PendingConfirmation,
     ToolCall,
     ToolCallRecord,
 )
+from admino.permissions import PermissionsConfig, ToolPermissions
 from admino.server import create_app
+from admino.tools.registry import clear_registry, register_tool
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+    from pathlib import Path
+
+    from admino.audit import AuditLogger
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2025,3 +2037,201 @@ class TestSessionLocks:
         # Creating a new app clears locks
         _make_app()
         assert len(srv._session_locks) == 0
+
+
+# ---------------------------------------------------------------------------
+# GH-140: system prompt must not be duplicated across turns (real Agent)
+# ---------------------------------------------------------------------------
+
+_GH140_SESSION = "sess-gh140"
+_GH140_SYSTEM_PROMPT = "SYS"
+
+
+class _RecordingLLM:
+    """Scripted LLM stand-in that records every context window it receives."""
+
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self._responses: list[LLMResponse] = list(responses)
+        self.received_messages: list[list[LLMMessage]] = []
+
+    async def chat(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        stream: bool = False,
+    ) -> LLMResponse:
+        self.received_messages.append(list(messages))
+        if not self._responses:
+            msg = "_RecordingLLM exhausted"
+            raise AssertionError(msg)
+        return self._responses.pop(0)
+
+
+class _EchoArgs(BaseModel):
+    """Args schema for the confirm-gated echo tool used in the GH-140 tests."""
+
+    text: str = Field(min_length=1, max_length=100)
+
+
+async def _echo_handler(args: _EchoArgs, *, session_id: str) -> str:
+    return f"echo:{args.text}"
+
+
+def _system_pairs(messages: list[LLMMessage]) -> list[tuple[str, str]]:
+    """Return ``(role, content)`` for every system message in ``messages``."""
+    return [(m.role, m.content) for m in messages if m.role == "system"]
+
+
+class TestSystemPromptNotDuplicatedAcrossTurns:
+    """GH-140: the server round-trips history without duplicating the system prompt.
+
+    Uses a REAL ``admino.agent.Agent`` (only the LLM is faked) so the
+    server's store-and-replay of ``result.history`` through ``_sessions`` is
+    exercised end to end. Before the fix, every turn stored the agent's system
+    prompt in the session and the next turn prepended it again.
+    """
+
+    pytestmark = pytest.mark.asyncio
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        clear_registry()
+        yield
+        clear_registry()
+
+    @pytest.fixture()
+    def audit_logger(self, tmp_path: Path) -> Generator[AuditLogger, None, None]:
+        audit = open_audit_log(tmp_path / "audit.jsonl", base_dir=tmp_path)
+        try:
+            yield audit
+        finally:
+            audit.close()
+
+    @staticmethod
+    def _make_real_agent(llm: _RecordingLLM, audit_logger: AuditLogger) -> Agent:
+        return Agent(
+            llm_client=llm,  # type: ignore[arg-type]
+            audit_logger=audit_logger,
+            permissions_config=PermissionsConfig(
+                tools={"echo": ToolPermissions(actions={"write": "confirm"})}
+            ),
+            agent_config=AgentConfig(
+                max_tool_calls=5,
+                max_context_messages=20,
+                confirmation_timeout_s=60.0,
+            ),
+            model_name="test-model",
+            system_prompt=_GH140_SYSTEM_PROMPT,
+        )
+
+    async def _post_turns(
+        self, audit_logger: AuditLogger, *, turns: int = 25
+    ) -> tuple[_RecordingLLM, list[int]]:
+        """POST ``turns`` messages on one session; return the LLM recorder + statuses."""
+        llm = _RecordingLLM(
+            [
+                LLMResponse(content=f"reply-{i}", tool_calls=[], model="m", done=True)
+                for i in range(turns)
+            ]
+        )
+        app = create_app(agent=self._make_real_agent(llm, audit_logger), config=_make_config())
+        statuses: list[int] = []
+        # /api/message has a burst capacity of 5; the rate limiter is not
+        # under test here, so neutralise it for the 25-turn conversation.
+        with patch("admino.server._check_rate_limit"):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                for i in range(turns):
+                    resp = await c.post(
+                        "/api/message",
+                        json={"message": f"turn-{i}", "session_id": _GH140_SESSION},
+                        headers=_AUTH_HEADER,
+                    )
+                    statuses.append(resp.status_code)
+        return llm, statuses
+
+    async def test_server_message_25_turns_each_llm_call_has_one_system_prompt(
+        self, audit_logger: AuditLogger
+    ) -> None:
+        llm, statuses = await self._post_turns(audit_logger)
+
+        assert statuses == [200] * 25
+        assert len(llm.received_messages) == 25
+        for i, call in enumerate(llm.received_messages):
+            assert _system_pairs(call) == [("system", _GH140_SYSTEM_PROMPT)], f"turn {i}"
+            assert call[0].role == "system", f"turn {i}"
+
+    async def test_server_message_25_turns_each_llm_call_ends_with_posted_message(
+        self, audit_logger: AuditLogger
+    ) -> None:
+        llm, _ = await self._post_turns(audit_logger)
+
+        assert len(llm.received_messages) == 25
+        for i, call in enumerate(llm.received_messages):
+            assert (call[-1].role, call[-1].content) == ("user", f"turn-{i}"), f"turn {i}"
+
+    async def test_server_message_25_turns_session_history_has_no_system_messages(
+        self, audit_logger: AuditLogger
+    ) -> None:
+        from admino import server
+
+        await self._post_turns(audit_logger)
+
+        stored = server._sessions[_GH140_SESSION]
+        assert _system_pairs(stored) == []
+        assert len(stored) == 50
+
+    async def test_server_confirm_resume_llm_call_has_one_system_prompt(
+        self, audit_logger: AuditLogger
+    ) -> None:
+        """POST /api/message -> awaiting confirmation -> POST /api/confirm (approve)."""
+        from admino import server
+
+        register_tool("echo", "write", "Write echo", _EchoArgs)(_echo_handler)
+        llm = _RecordingLLM(
+            [
+                LLMResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            tool="echo",
+                            action="write",
+                            args={"text": "x"},
+                            tool_call_id="call_write_1",
+                        )
+                    ],
+                    model="m",
+                    done=True,
+                ),
+                LLMResponse(content="Written.", tool_calls=[], model="m", done=True),
+            ]
+        )
+        app = create_app(agent=self._make_real_agent(llm, audit_logger), config=_make_config())
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp1 = await c.post(
+                "/api/message",
+                json={"message": "please write x", "session_id": _GH140_SESSION},
+                headers=_AUTH_HEADER,
+            )
+            assert resp1.status_code == 200
+            assert resp1.json()["status"] == "awaiting_confirmation"
+            confirmation_id = resp1.json()["pending_confirmation"]["confirmation_id"]
+
+            resp2 = await c.post(
+                f"/api/confirm/{confirmation_id}",
+                json={
+                    "session_id": _GH140_SESSION,
+                    "confirmation_id": confirmation_id,
+                    "approved": True,
+                },
+                headers=_AUTH_HEADER,
+            )
+
+        assert resp2.status_code == 200
+        assert resp2.json()["status"] == "final"
+        assert len(llm.received_messages) == 2
+        resume_call = llm.received_messages[1]
+        assert _system_pairs(resume_call) == [("system", _GH140_SYSTEM_PROMPT)]
+        assert resume_call[0].role == "system"
+        assert _system_pairs(server._sessions[_GH140_SESSION]) == []

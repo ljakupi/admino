@@ -321,7 +321,10 @@ class LimitsConfig(BaseModel):
         default=20,
         ge=1,
         le=200,
-        description="Maximum conversation messages sent as context to the LLM.",
+        description=(
+            "Maximum conversation messages sent as context to the LLM. The"
+            " system prompt and the current user message are always sent."
+        ),
     )
 
 
