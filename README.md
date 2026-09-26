@@ -41,7 +41,7 @@ your say-so.
 - 🔐 **Isolated permission engine** — a pure `(tool, action)` function the LLM never sees, can't argue with, and can't route around. Default-deny; writes are never silently auto-allowed. → [Permissions](docs/permissions.md)
 - 🏠 **Runs on your server** — your audit log, memory, and documents stay on the machine that runs admino. Only the active LLM provider sees the conversation.
 - 🧯 **Contained blast radius** — the agent container is whitelist-only egress, so even a hijacked agent can't phone home. → [Security Model](docs/SECURITY.md)
-- 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and an append-only audit log of every decision.
+- 🔑 **You own your data** — PostgreSQL on your box, OAuth tokens encrypted at rest, and a content-free, append-only audit log of every tool decision.
 - 🧩 **Real tools** — Gmail, Google Calendar, Drive, Outlook, OneDrive, and memory — all permission-gated. → [Tools](docs/tools.md)
 - 🤖 **Your choice of model** — [Infomaniak AI Services](https://www.infomaniak.com/en/hosting/ai-services) by default (processed in Switzerland; queries aren't recorded or used for training), an opt-in local vLLM CPU container (Apple Silicon + Linux), and Claude or OpenAI as opt-in cloud providers. → [Configuration](docs/configuration.md)
 

@@ -140,7 +140,6 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
 | `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. |
 | `auth` | `mode` — `vpn` or `token` (see below). |
-| `paths` | Location of the append-only `audit_log`. |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 
@@ -159,15 +158,17 @@ Set under `auth.mode` in `config.yaml` (or `AUTH_MODE` in the environment):
 
 ## Data & storage
 
-PostgreSQL holds four things: `settings`, `permissions`, `memory` notes, and
-`oauth_tokens`.
+PostgreSQL holds `settings`, `permissions`, `memory` notes, `oauth_tokens`, and the
+`audit_events` audit trail.
 
 - **OAuth tokens** are stored as **encrypted ciphertext only**. The Fernet encryption key
   lives in the `OAUTH_ENCRYPTION_KEY` environment variable and is **never** persisted to
   the database. Lose the key and stored tokens are unrecoverable; rotating it requires
   re-running the [OAuth consent flow](getting-started.md#connect-your-accounts).
-- **The audit log** is **append-only NDJSON on disk** (`paths.audit_log`), recording every
-  decision and tool call. See [Permissions](permissions.md#append-only-audit-log).
+- **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
+  row with the tool, the action, the permission decision, success and duration. Arguments,
+  tool output and message text are never stored. Rows are kept for 12 months, and a daily
+  job purges older ones. See [Permissions](permissions.md#append-only-audit-log).
 
 ## Egress whitelist
 

@@ -9,8 +9,10 @@ table (migration 0005).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
-optional targets, the client IP and a small metadata dict. ``purge_expired()``
-and ``run_retention_job()`` take the pool and a retention in months.
+optional targets, the client IP and a small metadata dict.
+``record_tool_call()`` takes an executor, the org and chat IDs and one agent
+tool dispatch's outcome (GH-147). ``purge_expired()`` and
+``run_retention_job()`` take the pool and a retention in months.
 Outputs: one INSERT per event; the purge returns the number of rows removed.
 
 Security notes:
@@ -18,6 +20,8 @@ Security notes:
   #139 §5). ``AuditEvent`` refuses free text: targets are UUIDs, and metadata
   values are bools, safe-range ints, None, UUIDs or tokens from a closed
   vocabulary (member roles, permission decisions, tool names and actions).
+  A tool.call row stores a tool or action name the LLM chose only when it is
+  a vocabulary token; anything else is stored as None, never as text.
   Errors and log lines carry no IDs or values either: ``AuditRecordError`` is
   raised ``from None`` with a generic message, so neither Pydantic's error
   (which echoes input) nor the driver's (which echoes the failing row)
@@ -30,7 +34,7 @@ Security notes:
   own transaction, so a failed record rolls the change back.
 - Parameterized SQL only: values travel as bind parameters.
 - Pure apart from the executor it is given. Imports nothing from the server,
-  agent, LLM, tools, OAuth or NDJSON audit layers. It reads the tool vocabulary
+  agent, LLM, tools or OAuth layers. It reads the tool vocabulary
   from ``admino.permissions`` (pure); the permission engine never imports this
   module.
 """
@@ -192,6 +196,8 @@ METADATA_VOCABULARY: Final[frozenset[str]] = frozenset(
         *(token for denial in HARDCODED_DENIALS for token in denial),
     }
 )
+
+_DECISIONS: Final[frozenset[str]] = frozenset(get_args(PermissionState))
 
 DEFAULT_RETENTION_MONTHS: Final[int] = 12
 MIN_RETENTION_MONTHS: Final[int] = 6
@@ -421,6 +427,64 @@ async def record(
         # The class name only: the driver's message can contain the failing row.
         logger.error("Audit event write failed (%s).", type(exc).__name__)
         raise AuditRecordError from None
+
+
+async def record_tool_call(
+    executor: Executor,
+    *,
+    org_id: UUID,
+    chat_id: UUID,
+    tool: str,
+    action: str,
+    decision: str,
+    success: bool,
+    duration_ms: int,
+) -> None:
+    """Record one agent tool dispatch as a system ``tool.call`` event on its chat.
+
+    The metadata holds exactly ``tool``, ``action``, ``decision``, ``success``
+    and ``duration_ms`` — never argument values, tool output or error text.
+
+    Args:
+        executor: The pool or a connection to write through.
+        org_id: The org whose log the event belongs to.
+        chat_id: The chat the tool call ran in (the event's target).
+        tool: The tool name the LLM asked for; stored only if it is a
+            vocabulary token, otherwise as None.
+        action: The action name the LLM asked for; same rule as ``tool``.
+        decision: The final permission decision: allow, confirm or deny.
+        success: Whether the tool ran and returned a result.
+        duration_ms: How long the dispatch took, in milliseconds.
+
+    Raises:
+        AuditRecordError: If ``decision`` is not a permission decision or the
+            event is otherwise invalid (nothing is written), or the write fails.
+    """
+    # Explicit: the vocabulary also holds tool names and roles, which are no
+    # decision.
+    if type(decision) is not str or decision not in _DECISIONS:
+        raise AuditRecordError
+    await record(
+        executor,
+        action=AuditAction.TOOL_CALL,
+        actor_kind="system",
+        actor_user_id=None,
+        org_id=org_id,
+        target_type=TargetType.CHAT,
+        target_ids=(chat_id,),
+        metadata={
+            "tool": _vocabulary_token(tool),
+            "action": _vocabulary_token(action),
+            "decision": decision,
+            "success": success,
+            "duration_ms": duration_ms,
+        },
+    )
+
+
+def _vocabulary_token(value: str) -> str | None:
+    """Return ``value`` if it is an exact vocabulary token, else None (never free text)."""
+    return value if type(value) is str and value in METADATA_VOCABULARY else None
 
 
 async def purge_expired(

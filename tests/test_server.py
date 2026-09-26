@@ -31,7 +31,6 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, Field, SecretStr
 
 from admino.agent import Agent
-from admino.audit import open_audit_log
 from admino.llm import LLMResponse
 from admino.models import (
     AgentConfig,
@@ -47,9 +46,7 @@ from admino.tools.registry import clear_registry, register_tool
 
 if TYPE_CHECKING:
     from collections.abc import Generator
-    from pathlib import Path
 
-    from admino.audit import AuditLogger
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -2101,18 +2098,15 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         clear_registry()
 
     @pytest.fixture()
-    def audit_logger(self, tmp_path: Path) -> Generator[AuditLogger, None, None]:
-        audit = open_audit_log(tmp_path / "audit.jsonl", base_dir=tmp_path)
-        try:
-            yield audit
-        finally:
-            audit.close()
+    def tool_call_recorder(self) -> AsyncMock:
+        """GH-147: the injected tool-call recorder (no NDJSON audit log any more)."""
+        return AsyncMock(return_value=None)
 
     @staticmethod
-    def _make_real_agent(llm: _RecordingLLM, audit_logger: AuditLogger) -> Agent:
+    def _make_real_agent(llm: _RecordingLLM, tool_call_recorder: AsyncMock) -> Agent:
         return Agent(
             llm_client=llm,  # type: ignore[arg-type]
-            audit_logger=audit_logger,
+            tool_call_recorder=tool_call_recorder,
             permissions_config=PermissionsConfig(
                 tools={"echo": ToolPermissions(actions={"write": "confirm"})}
             ),
@@ -2121,12 +2115,11 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                 max_context_messages=20,
                 confirmation_timeout_s=60.0,
             ),
-            model_name="test-model",
             system_prompt=_GH140_SYSTEM_PROMPT,
         )
 
     async def _post_turns(
-        self, audit_logger: AuditLogger, *, turns: int = 25
+        self, tool_call_recorder: AsyncMock, *, turns: int = 25
     ) -> tuple[_RecordingLLM, list[int]]:
         """POST ``turns`` messages on one session; return the LLM recorder + statuses."""
         llm = _RecordingLLM(
@@ -2135,7 +2128,9 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                 for i in range(turns)
             ]
         )
-        app = create_app(agent=self._make_real_agent(llm, audit_logger), config=_make_config())
+        app = create_app(
+            agent=self._make_real_agent(llm, tool_call_recorder), config=_make_config()
+        )
         statuses: list[int] = []
         # /api/message has a burst capacity of 5; the rate limiter is not
         # under test here, so neutralise it for the 25-turn conversation.
@@ -2151,9 +2146,9 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         return llm, statuses
 
     async def test_server_message_25_turns_each_llm_call_has_one_system_prompt(
-        self, audit_logger: AuditLogger
+        self, tool_call_recorder: AsyncMock
     ) -> None:
-        llm, statuses = await self._post_turns(audit_logger)
+        llm, statuses = await self._post_turns(tool_call_recorder)
 
         assert statuses == [200] * 25
         assert len(llm.received_messages) == 25
@@ -2162,27 +2157,27 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
             assert call[0].role == "system", f"turn {i}"
 
     async def test_server_message_25_turns_each_llm_call_ends_with_posted_message(
-        self, audit_logger: AuditLogger
+        self, tool_call_recorder: AsyncMock
     ) -> None:
-        llm, _ = await self._post_turns(audit_logger)
+        llm, _ = await self._post_turns(tool_call_recorder)
 
         assert len(llm.received_messages) == 25
         for i, call in enumerate(llm.received_messages):
             assert (call[-1].role, call[-1].content) == ("user", f"turn-{i}"), f"turn {i}"
 
     async def test_server_message_25_turns_session_history_has_no_system_messages(
-        self, audit_logger: AuditLogger
+        self, tool_call_recorder: AsyncMock
     ) -> None:
         from admino import server
 
-        await self._post_turns(audit_logger)
+        await self._post_turns(tool_call_recorder)
 
         stored = server._sessions[_GH140_SESSION]
         assert _system_pairs(stored) == []
         assert len(stored) == 50
 
     async def test_server_confirm_resume_llm_call_has_one_system_prompt(
-        self, audit_logger: AuditLogger
+        self, tool_call_recorder: AsyncMock
     ) -> None:
         """POST /api/message -> awaiting confirmation -> POST /api/confirm (approve)."""
         from admino import server
@@ -2206,7 +2201,9 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                 LLMResponse(content="Written.", tool_calls=[], model="m", done=True),
             ]
         )
-        app = create_app(agent=self._make_real_agent(llm, audit_logger), config=_make_config())
+        app = create_app(
+            agent=self._make_real_agent(llm, tool_call_recorder), config=_make_config()
+        )
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp1 = await c.post(

@@ -203,6 +203,30 @@ class TestShippedConfigHasNoFilesTool:
         assert not any("/app/documents" in line for line in active_lines)
 
 
+class TestShippedFilesHaveNoAuditLog:
+    """GH-147: the NDJSON audit log is gone from the committed config and .env template.
+
+    Parsed as raw YAML: AppConfig ignores a leftover section, so loading it
+    through Pydantic cannot prove the section is gone.
+    """
+
+    def test_shipped_config_has_no_paths_section(self) -> None:
+        """No top-level 'paths' key (its only entry was the audit log path)."""
+        parsed = yaml.safe_load(SHIPPED_CONFIG_PATH.read_text(encoding="utf-8"))
+        assert isinstance(parsed, dict)
+        assert "paths" not in parsed
+
+    def test_shipped_config_mentions_no_ndjson_audit_log(self) -> None:
+        text = SHIPPED_CONFIG_PATH.read_text(encoding="utf-8")
+        assert "audit_log" not in text
+        assert "ndjson" not in text.lower()
+
+    def test_env_example_has_no_audit_log_path(self) -> None:
+        text = SHIPPED_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
+        assert "AUDIT_LOG_PATH" not in text
+        assert "ndjson" not in text.lower()
+
+
 # ---------------------------------------------------------------------------
 # Shipped vLLM defaults (issue #134) — vLLM is now the optional local model
 # ---------------------------------------------------------------------------

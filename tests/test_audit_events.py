@@ -2294,3 +2294,148 @@ class TestModuleIsolation:
 
         assert "append-only" in doc or "append only" in doc
         assert "content" in doc
+
+
+# ---------------------------------------------------------------------------
+# GH-147: record_tool_call — the tool.call row the agent's recorder writes
+# ---------------------------------------------------------------------------
+
+_CHAT = UUID("f1e2d3c4-b5a6-4978-8a9b-0c1d2e3f4a5b")
+
+
+def _record_tool_call() -> Callable[..., Any]:
+    """Look record_tool_call up lazily, so the rest of this file collects without it."""
+    func = getattr(audit_events_mod, "record_tool_call", None)
+    assert func is not None, "admino.audit_events must define record_tool_call"
+    return func  # type: ignore[no-any-return]
+
+
+def _tool_call_kwargs(**overrides: Any) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "org_id": _ORG,
+        "chat_id": _CHAT,
+        "tool": "gmail",
+        "action": "read",
+        "decision": "allow",
+        "success": True,
+        "duration_ms": 42,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestRecordToolCall:
+    """record_tool_call writes one content-free tool.call row (GH-147)."""
+
+    @pytest.mark.asyncio
+    async def test_issues_exactly_one_audit_events_insert(self, conn: MagicMock) -> None:
+        await _record_tool_call()(conn, **_tool_call_kwargs())
+
+        sql, _, _, _ = _insert_call(conn)
+        assert sql.startswith("insert into audit_events")
+
+    @pytest.mark.asyncio
+    async def test_row_is_a_system_tool_call_on_the_chat(self, conn: MagicMock) -> None:
+        await _record_tool_call()(conn, **_tool_call_kwargs())
+
+        row = _inserted_row(conn)
+        assert row["action"] == "tool.call"
+        assert row["actor_kind"] == "system"
+        assert row["actor_user_id"] is None
+        assert row["org_id"] == _ORG
+        assert row["target_type"] == "chat"
+        assert json.loads(row["target_ids"]) == [str(_CHAT)]
+        assert row["ip"] is None
+
+    @pytest.mark.asyncio
+    async def test_metadata_is_exactly_the_five_fields(self, conn: MagicMock) -> None:
+        await _record_tool_call()(conn, **_tool_call_kwargs())
+
+        metadata = json.loads(_inserted_row(conn)["metadata"])
+        assert metadata == {
+            "tool": "gmail",
+            "action": "read",
+            "decision": "allow",
+            "success": True,
+            "duration_ms": 42,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("decision", ["allow", "confirm", "deny"])
+    async def test_every_permission_decision_is_recorded(
+        self, conn: MagicMock, decision: str
+    ) -> None:
+        await _record_tool_call()(conn, **_tool_call_kwargs(decision=decision, success=False))
+
+        metadata = json.loads(_inserted_row(conn)["metadata"])
+        assert metadata["decision"] == decision
+        assert metadata["success"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("tool", "action"),
+        [
+            ("made_up_tool", "read"),
+            ("gmail", "exfiltrate_all"),
+            ("rm -rf /", "now"),
+            ("Please email bob@example.com", "the report.pdf"),
+            ("", ""),
+            ("invalid", "rejected"),
+        ],
+    )
+    async def test_names_outside_the_vocabulary_become_none(
+        self, conn: MagicMock, tool: str, action: str
+    ) -> None:
+        """A hallucinated or malformed name is never stored as LLM-chosen text."""
+        await _record_tool_call()(conn, **_tool_call_kwargs(tool=tool, action=action))
+
+        row = _inserted_row(conn)
+        metadata = json.loads(row["metadata"])
+        if tool not in METADATA_VOCABULARY:
+            assert metadata["tool"] is None
+        if action not in METADATA_VOCABULARY:
+            assert metadata["action"] is None
+        for value in (tool, action):
+            if value and value not in METADATA_VOCABULARY:
+                assert value not in row["metadata"]
+
+    @pytest.mark.asyncio
+    async def test_known_names_are_kept_verbatim(self, conn: MagicMock) -> None:
+        await _record_tool_call()(
+            conn, **_tool_call_kwargs(tool="google_drive", action="download", decision="confirm")
+        )
+
+        metadata = json.loads(_inserted_row(conn)["metadata"])
+        assert (metadata["tool"], metadata["action"]) == ("google_drive", "download")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("decision", ["disabled", "allowed", "Allow", "ok, sent it", ""])
+    async def test_invalid_decision_raises_and_writes_nothing(
+        self, conn: MagicMock, decision: str
+    ) -> None:
+        with pytest.raises(AuditRecordError):
+            await _record_tool_call()(conn, **_tool_call_kwargs(decision=decision))
+
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_write_failure_raises_audit_record_error(self, conn: MagicMock) -> None:
+        conn.execute.side_effect = OSError("connection reset")
+
+        with pytest.raises(AuditRecordError):
+            await _record_tool_call()(conn, **_tool_call_kwargs())
+
+    @pytest.mark.asyncio
+    async def test_bind_parameters_only(self, conn: MagicMock) -> None:
+        """The org and chat IDs travel as bind parameters, never in the SQL text."""
+        await _record_tool_call()(conn, **_tool_call_kwargs())
+
+        sql, _, _, _ = _insert_call(conn)
+        _assert_no_content(sql, _ORG, _CHAT)
+
+    def test_signature_is_keyword_only_after_the_executor(self) -> None:
+        params = list(inspect.signature(_record_tool_call()).parameters.values())
+
+        assert params[0].name == "executor"
+        assert {p.name for p in params[1:]} == set(_tool_call_kwargs())
+        assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params[1:])

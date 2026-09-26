@@ -76,9 +76,14 @@ This isolation is a coding standard enforced in review — see the security expe
 
 ## Append-only audit log
 
-Every decision and every tool call is written to an **append-only NDJSON log** on disk.
-Nothing is edited or deleted in place, so the log is a durable record of what the agent
-did and what was allowed, confirmed, or denied. See
+Every tool call the agent makes writes one row to the **`audit_events` table** in
+PostgreSQL: the tool, the action, the permission decision (allowed, confirmed or denied),
+whether it succeeded, and how long it took. The row never holds the arguments, the tool's
+output or any message text.
+
+The table is append-only: a database trigger refuses edits and deletions, except the daily
+retention purge of rows older than 12 months. If a row can't be written, the agent stops
+the run instead of carrying on unaudited. See
 [Configuration → Data & storage](configuration.md#data--storage).
 
 ---

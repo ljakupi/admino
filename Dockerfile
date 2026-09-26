@@ -76,9 +76,9 @@ COPY --chown=admino:admino src/ src/
 # image (see server.py create_app).
 COPY --from=frontend-builder --chown=admino:admino /build/static/ /app/static/
 
-# Create data and config directories; they will be volume-mounted at runtime
-# but must exist in the image so the container starts cleanly if volumes are empty
-RUN mkdir -p /app/data/logs /app/config \
+# Create the config directory; it is volume-mounted at runtime but must exist
+# in the image so the container starts cleanly if the volume is empty
+RUN mkdir -p /app/config \
     && chown -R admino:admino /app
 
 # Copy and enable the entrypoint script. Root-owned and execute-only for

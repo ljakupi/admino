@@ -300,7 +300,7 @@ export const de: Record<MessageKey, Message> = {
   'settings.session.id.label': 'Sitzungs-ID',
   'settings.session.id.hint': 'Buchstaben, Ziffern, Bindestriche, Unterstriche. Max. 64 Zeichen.',
   'settings.session.new.label': 'Neue Sitzung',
-  'settings.session.new.hint': 'Leert den Chatverlauf. Der Gesprächsverlauf bleibt im Audit-Log erhalten.',
+  'settings.session.new.hint': 'Leert den Chatverlauf.',
   'settings.agent.subtitle':
     'Mit welchem LLM admino arbeitet. Infomaniak ist der Standard; vLLM (lokaler CPU-Container), Claude und OpenAI sind optionale Alternativen.',
   'settings.agent.provider.label': 'Anbieter',

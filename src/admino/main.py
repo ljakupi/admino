@@ -2,17 +2,21 @@
 
 Startup sequence:
 1. Load and validate config.yaml (with env var overrides).
-2. Build the default permissions ruleset (seeds an empty DB on first run).
-3. Configure Python logging from config.log_level.
-4. Open the append-only audit logger.
+2. Configure Python logging from config.log_level.
+3. Build the default permissions ruleset (seeds an empty DB on first run).
+4. Initialise the database: run migrations, ensure the default organization
+   (the org ``tool.call`` audit events belong to), seed, then load config,
+   permissions and per-tool enabled state from the DB.
 5. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
    — chat replies explain what to set.
 6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
-7. Instantiate the Agent with all dependencies.
-8. Create the FastAPI app via server.create_app().
-9. Start uvicorn with single-worker constraint.
+7. Build the AgentConfig from the validated limits.
+8. Instantiate the Agent with all dependencies, including the tool-call
+   recorder that writes one ``tool.call`` audit event per dispatch.
+9. Create the FastAPI app via server.create_app().
+10. Start uvicorn with single-worker constraint.
 
 The module refuses to start on any configuration or validation error,
 printing a clear message and exiting with code 1. Internal paths and
@@ -22,7 +26,10 @@ Security notes:
 - AUTH_TOKEN is validated at config load time; never logged.
 - Provider credentials (e.g. INFOMANIAK_API_TOKEN) are never logged; only the
   env var name appears in startup warnings.
-- Audit logger uses base_dir confinement to prevent path traversal.
+- Tool calls are audited as content-free ``tool.call`` rows in
+  ``audit_events`` (tool, action, decision, success, duration — never
+  arguments or output) through the recorder injected into the Agent. A failed
+  write propagates, so the agent aborts the run (H-1).
 - Registry is frozen after tool imports to block dynamic registration.
 - Single-worker uvicorn prevents split-brain session state.
 - HSTS is not set here (plain HTTP local deployment). When deploying
@@ -35,23 +42,31 @@ import asyncio
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 import uvicorn
 from pydantic import ValidationError
 
+from admino.accounts import DEFAULT_ORG_ID
 from admino.config import load_app_config
 from admino.llm import LLMError
 from admino.models import AgentConfig, ToolsSettings
 from admino.permissions import build_default_permissions_config
 
 if TYPE_CHECKING:
+    from admino.agent import ToolCallRecorder
     from admino.config import AppConfig
     from admino.llm_infomaniak import InfomaniakClient
-    from admino.permissions import PermissionsConfig
+    from admino.permissions import PermissionsConfig, PermissionState
 
 logger = logging.getLogger(__name__)
+
+# Namespace of the per-session chat id that tool.call audit events target until
+# #176 gives chats server-generated UUIDs. Fixed, so a session maps to the same
+# chat id across restarts.
+_SESSION_CHAT_NAMESPACE: Final[uuid.UUID] = uuid.UUID("3b8f6e2a-9c4d-4e71-8a5f-0d2c7b9e1f43")
 
 # Config directory: CONFIG_DIR env var (set in .env / docker-compose), or
 # fall back to ./config (local dev from project root).
@@ -268,11 +283,61 @@ def _build_database_url() -> str | None:
     return f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
 
 
+def _session_chat_id(session_id: str) -> uuid.UUID:
+    """Return the chat id a session's ``tool.call`` audit events target.
+
+    ``uuid5(_SESSION_CHAT_NAMESPACE, session_id)``: deterministic per session,
+    and a UUID, so no session text reaches the audit store. The bridge until
+    persisted chats (#176) carry server-generated UUIDs.
+    """
+    return uuid.uuid5(_SESSION_CHAT_NAMESPACE, session_id)
+
+
+def _build_tool_call_recorder() -> ToolCallRecorder:
+    """Build the recorder the Agent awaits after every tool dispatch.
+
+    Each call writes one ``tool.call`` row through
+    ``audit_events.record_tool_call`` in the default org (until #149 passes
+    the principal's org), targeting the session's chat. The runtime pool is
+    resolved at call time: it only exists once the server lifespan has run,
+    after this recorder was built. Errors propagate so the agent aborts the
+    run (H-1).
+    """
+
+    async def record(
+        *,
+        session_id: str,
+        tool: str,
+        action: str,
+        decision: PermissionState,
+        success: bool,
+        duration_ms: int,
+    ) -> None:
+        from admino import audit_events, database
+
+        await audit_events.record_tool_call(
+            database.get_pool(),
+            org_id=DEFAULT_ORG_ID,
+            chat_id=_session_chat_id(session_id),
+            tool=tool,
+            action=action,
+            decision=decision,
+            success=success,
+            duration_ms=duration_ms,
+        )
+
+    return record
+
+
 async def _async_startup(
     config: AppConfig,
     permissions_config: PermissionsConfig,
 ) -> tuple[AppConfig, PermissionsConfig, dict[str, bool]]:
     """Initialise database, run migrations, seed data, and load config from DB.
+
+    Right after the migrations it ensures the default organization exists:
+    every ``tool.call`` audit event belongs to it, so a failure here stops
+    startup rather than letting every tool call fail its audit write.
 
     Returns the DB-loaded config and permissions (which become the runtime
     source of truth) plus the persisted per-tool enabled state.
@@ -298,6 +363,7 @@ async def _async_startup(
         ValueError: If PG_PASSWORD is not set.
         RuntimeError: If the database health check fails.
     """
+    from admino.accounts import ensure_default_org
     from admino.config import load_app_config_from_db, load_permissions_config_from_db
     from admino.database import (
         check_health,
@@ -327,6 +393,7 @@ async def _async_startup(
         raise RuntimeError(msg)
 
     await run_migrations(pool)
+    await ensure_default_org(pool)
     await seed_settings(pool, config)
     await seed_permissions(pool, permissions_config)
 
@@ -410,21 +477,6 @@ def main(
     logger.info("Database initialized, config loaded from DB.")
 
     # ------------------------------------------------------------------
-    # 5. Open the audit logger with path confinement
-    # ------------------------------------------------------------------
-    from admino.audit import AuditLogger
-
-    audit_base_dir = config.paths.audit_log.parent
-    try:
-        audit_logger = AuditLogger(config.paths.audit_log, base_dir=audit_base_dir)
-    except (ValueError, OSError) as exc:
-        logger.error("Failed to open audit log: %s", exc)
-        sys.exit(1)
-
-    logger.info("Audit logger opened.")
-    logger.debug("Audit log path: %s", config.paths.audit_log)
-
-    # ------------------------------------------------------------------
     # 5. Create the LLM client, then run the provider setup checks
     # ------------------------------------------------------------------
     # The factory never raises for a missing key or model; these checks only
@@ -468,16 +520,16 @@ def main(
     from admino.agent import Agent
 
     system_prompt = _build_system_prompt(config, permissions_config)
-    # Audit entries need a non-empty model name; fall back to the provider
-    # name when no model is set (chat then asks the user to choose one).
+    # Logged below; fall back to the provider name when no model is set (chat
+    # then asks the user to choose one).
     model_name = config.llm.active_model_name or config.llm.provider
 
     agent = Agent(
         llm_client=llm_client,
-        audit_logger=audit_logger,
+        # GH-147: every dispatch is recorded as a tool.call audit event.
+        tool_call_recorder=_build_tool_call_recorder(),
         permissions_config=permissions_config,
         agent_config=agent_config,
-        model_name=model_name,
         system_prompt=system_prompt,
         # GH-80: seed the per-tool gate from persisted DB state so services
         # the user toggled off stay off immediately on boot.
