@@ -2,7 +2,18 @@
 import { ref, computed } from 'vue';
 import { ChevronDown, ChevronUp } from 'lucide-vue-next';
 import ToolCallCard from './ToolCallCard.vue';
-import type { ToolCallUI } from '@/api/types';
+import type { ToolCallState, ToolCallUI } from '@/api/types';
+import { useI18n, type MessageKey } from '@/i18n';
+
+const { t } = useI18n();
+
+const stateKeys: Record<ToolCallState, MessageKey> = {
+  pending: 'toolCall.state.pending',
+  approved: 'toolCall.state.approved',
+  denied: 'toolCall.state.denied',
+  completed: 'toolCall.state.completed',
+  error: 'toolCall.state.error',
+};
 
 const props = defineProps<{
   toolCalls: ToolCallUI[];
@@ -36,7 +47,7 @@ const dotClass = computed(() => {
         <span class="sep">/</span>
         <span class="action">{{ toolCalls[0].action }}</span>
         <span class="sep">&middot;</span>
-        <span class="state-label">{{ toolCalls[0].state }}</span>
+        <span class="state-label">{{ t(stateKeys[toolCalls[0].state]) }}</span>
       </template>
       <template v-else>
         <span v-for="(name, i) in toolNames" :key="name">

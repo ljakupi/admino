@@ -3,6 +3,7 @@ import { useRoute } from 'vue-router';
 import { computed } from 'vue';
 import { useChatStore } from '@/stores/chat';
 import { NAV_ITEMS } from '@/services/navigation';
+import { t } from '@/i18n';
 
 const route = useRoute();
 const chatStore = useChatStore();
@@ -15,14 +16,14 @@ const tabs = NAV_ITEMS;
 </script>
 
 <template>
-  <nav class="tab-bar" aria-label="Main navigation">
+  <nav class="tab-bar" :aria-label="t('nav.mainNavigation')">
     <RouterLink
       v-for="tab in tabs"
       :key="tab.to"
       :to="tab.to"
       class="tab"
       :class="{ active: route.path === tab.to }"
-      :aria-label="tab.label"
+      :aria-label="t(tab.labelKey)"
     >
       <span class="tab-icon-wrap">
         <component :is="tab.icon" :size="20" :stroke-width="1.75" />
@@ -31,7 +32,7 @@ const tabs = NAV_ITEMS;
           class="badge"
         />
       </span>
-      <span class="tab-label">{{ tab.label }}</span>
+      <span class="tab-label">{{ t(tab.labelKey) }}</span>
     </RouterLink>
   </nav>
 </template>

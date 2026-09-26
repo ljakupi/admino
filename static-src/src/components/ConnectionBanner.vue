@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { AlertTriangle } from 'lucide-vue-next';
 import BaseButton from './BaseButton.vue';
+import { t } from '@/i18n';
 import { useConnectionStore } from '@/stores/connection';
 
 const connection = useConnectionStore();
@@ -9,9 +10,9 @@ const connection = useConnectionStore();
 <template>
   <div class="banner" role="alert">
     <AlertTriangle :size="16" :stroke-width="2" />
-    <span>admino cannot reach the LLM backend. Check your provider configuration.</span>
+    <span>{{ t('connection.offlineMessage') }}</span>
     <BaseButton variant="ghost" size="md" @click="connection.checkHealth()">
-      Retry
+      {{ t('common.retry') }}
     </BaseButton>
   </div>
 </template>

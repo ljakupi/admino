@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
 import ActionRow from './ActionRow.vue';
+import I18nT from './I18nT.vue';
 import { usePermissionsStore } from '@/stores/permissions';
 import type { PermissionEntry } from '@/api/types';
 
@@ -35,9 +36,15 @@ function toggleExpand() {
       <span class="desc">{{ meta.description }}</span>
     </span>
     <span class="summary">
-      <span v-if="counts.allow" class="chip al"><span class="n">{{ counts.allow }}</span> allowed</span>
-      <span v-if="counts.confirm" class="chip ap"><span class="n">{{ counts.confirm }}</span> approval</span>
-      <span v-if="counts.deny" class="chip dn"><span class="n">{{ counts.deny }}</span> denied</span>
+      <I18nT v-if="counts.allow" class="chip al" keypath="permissions.summary.allowed" :params="{ count: counts.allow }">
+        <template #n><span class="n">{{ counts.allow }}</span></template>
+      </I18nT>
+      <I18nT v-if="counts.confirm" class="chip ap" keypath="permissions.summary.approval" :params="{ count: counts.confirm }">
+        <template #n><span class="n">{{ counts.confirm }}</span></template>
+      </I18nT>
+      <I18nT v-if="counts.deny" class="chip dn" keypath="permissions.summary.denied" :params="{ count: counts.deny }">
+        <template #n><span class="n">{{ counts.deny }}</span></template>
+      </I18nT>
     </span>
     <span></span>
 

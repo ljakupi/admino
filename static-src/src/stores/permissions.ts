@@ -2,6 +2,8 @@ import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { getPermissions, patchPermission } from '@/api/permissions';
 import { useToastStore } from '@/stores/toasts';
+import { t } from '@/i18n';
+import type { MessageKey } from '@/i18n';
 import type { PermissionEntry, PermissionState } from '@/api/types';
 
 // Tier-1: truly immutable denials — cannot be overridden by any config.
@@ -26,88 +28,97 @@ export const PROMOTABLE_DENIALS = new Set([
   'outlook_calendar.update',
 ]);
 
-const TOOL_META: Record<string, { label: string; description: string; actions: Record<string, string> }> = {
+interface ToolMetaKeys {
+  labelKey: MessageKey;
+  descriptionKey: MessageKey;
+  actions: Record<string, MessageKey>;
+}
+
+// Catalog keys for each known tool's label, description and per-action
+// description (issue #144): resolved with `t()` in `getToolMeta` /
+// `getActionDescription` so they follow the active locale.
+const TOOL_META: Record<string, ToolMetaKeys> = {
   gmail: {
-    label: 'Gmail',
-    description: 'Read, search, and send from your inbox',
+    labelKey: 'tools.gmail.label',
+    descriptionKey: 'tools.gmail.description',
     actions: {
-      read: 'Read a message body',
-      list: 'List messages in inbox',
-      search: 'Find messages by query',
-      send: 'Send an email on your behalf',
-      delete: 'Permanently delete a thread',
+      read: 'tools.gmail.actions.read',
+      list: 'tools.gmail.actions.list',
+      search: 'tools.gmail.actions.search',
+      send: 'tools.gmail.actions.send',
+      delete: 'tools.gmail.actions.delete',
     },
   },
   google_calendar: {
-    label: 'Google Calendar',
-    description: 'Read events, create with approval',
+    labelKey: 'tools.googleCalendar.label',
+    descriptionKey: 'tools.googleCalendar.description',
     actions: {
-      read: 'View event details',
-      list: 'List upcoming events',
-      create: 'Create a new event',
-      update: 'Modify an existing event',
-      delete: 'Remove an event',
+      read: 'tools.googleCalendar.actions.read',
+      list: 'tools.googleCalendar.actions.list',
+      create: 'tools.googleCalendar.actions.create',
+      update: 'tools.googleCalendar.actions.update',
+      delete: 'tools.googleCalendar.actions.delete',
     },
   },
   google_drive: {
-    label: 'Google Drive',
-    description: 'Search and download your Drive files',
+    labelKey: 'tools.googleDrive.label',
+    descriptionKey: 'tools.googleDrive.description',
     actions: {
-      read: 'Read file contents',
-      list: 'List files and folders',
-      search: 'Search for files',
-      download: 'Download a file',
-      delete: 'Delete a file',
+      read: 'tools.googleDrive.actions.read',
+      list: 'tools.googleDrive.actions.list',
+      search: 'tools.googleDrive.actions.search',
+      download: 'tools.googleDrive.actions.download',
+      delete: 'tools.googleDrive.actions.delete',
     },
   },
   outlook: {
-    label: 'Outlook',
-    description: 'Read, search, and send from your mailbox',
+    labelKey: 'tools.outlook.label',
+    descriptionKey: 'tools.outlook.description',
     actions: {
-      read: 'Read a message body',
-      list: 'List messages in inbox',
-      search: 'Find messages by query',
-      send: 'Send an email on your behalf',
-      delete: 'Permanently delete a message',
+      read: 'tools.outlook.actions.read',
+      list: 'tools.outlook.actions.list',
+      search: 'tools.outlook.actions.search',
+      send: 'tools.outlook.actions.send',
+      delete: 'tools.outlook.actions.delete',
     },
   },
   outlook_calendar: {
-    label: 'Outlook Calendar',
-    description: 'Read events, create with approval',
+    labelKey: 'tools.outlookCalendar.label',
+    descriptionKey: 'tools.outlookCalendar.description',
     actions: {
-      read: 'View event details',
-      list: 'List upcoming events',
-      create: 'Create a new event',
-      update: 'Modify an existing event',
-      delete: 'Remove an event',
+      read: 'tools.outlookCalendar.actions.read',
+      list: 'tools.outlookCalendar.actions.list',
+      create: 'tools.outlookCalendar.actions.create',
+      update: 'tools.outlookCalendar.actions.update',
+      delete: 'tools.outlookCalendar.actions.delete',
     },
   },
   onedrive: {
-    label: 'OneDrive',
-    description: 'Search and download your OneDrive files',
+    labelKey: 'tools.onedrive.label',
+    descriptionKey: 'tools.onedrive.description',
     actions: {
-      read: 'Read file contents',
-      list: 'List files and folders',
-      search: 'Search for files',
-      download: 'Download a file',
-      delete: 'Delete a file',
+      read: 'tools.onedrive.actions.read',
+      list: 'tools.onedrive.actions.list',
+      search: 'tools.onedrive.actions.search',
+      download: 'tools.onedrive.actions.download',
+      delete: 'tools.onedrive.actions.delete',
     },
   },
   memory: {
-    label: 'Memory',
-    description: 'Long-term key-value store',
+    labelKey: 'tools.memory.label',
+    descriptionKey: 'tools.memory.description',
     actions: {
-      get: 'Retrieve a stored value',
-      set: 'Store a key-value pair',
-      list: 'List all stored keys',
-      delete: 'Delete a stored key',
+      get: 'tools.memory.actions.get',
+      set: 'tools.memory.actions.set',
+      list: 'tools.memory.actions.list',
+      delete: 'tools.memory.actions.delete',
     },
   },
   database: {
-    label: 'Database',
-    description: 'Application database access',
+    labelKey: 'tools.database.label',
+    descriptionKey: 'tools.database.description',
     actions: {
-      query: 'Run a read-only query',
+      query: 'tools.database.actions.query',
     },
   },
 };
@@ -161,12 +172,25 @@ export const usePermissionsStore = defineStore('permissions', () => {
     return PROMOTABLE_DENIALS.has(`${tool}.${action}`);
   }
 
+  // Tool/action names come from the server's permission table: look them up
+  // as own keys only, so a name like `constructor` never hits Object.prototype.
+  function toolMetaKeys(tool: string): ToolMetaKeys | undefined {
+    return Object.hasOwn(TOOL_META, tool) ? TOOL_META[tool] : undefined;
+  }
+
   function getToolMeta(tool: string): { label: string; description: string; actions: Record<string, string> } {
-    return TOOL_META[tool] ?? { label: tool, description: '', actions: {} };
+    const meta = toolMetaKeys(tool);
+    if (!meta) return { label: tool, description: '', actions: {} };
+    return {
+      label: t(meta.labelKey),
+      description: t(meta.descriptionKey),
+      actions: Object.fromEntries(Object.entries(meta.actions).map(([action, key]) => [action, t(key)])),
+    };
   }
 
   function getActionDescription(tool: string, action: string): string {
-    return TOOL_META[tool]?.actions[action] ?? '';
+    const actions = toolMetaKeys(tool)?.actions;
+    return actions && Object.hasOwn(actions, action) ? t(actions[action]) : '';
   }
 
   async function loadPermissions() {
@@ -176,7 +200,7 @@ export const usePermissionsStore = defineStore('permissions', () => {
       const data = await getPermissions();
       permissions.value = data.permissions;
     } catch (e) {
-      error.value = e instanceof Error ? e.message : 'Failed to load permissions';
+      error.value = e instanceof Error ? e.message : t('permissions.error.loadFailed');
     } finally {
       loading.value = false;
     }
@@ -188,10 +212,10 @@ export const usePermissionsStore = defineStore('permissions', () => {
     try {
       const data = await patchPermission({ tool, action, permission });
       permissions.value = data.permissions;
-      toasts.add('success', 'Saved');
+      toasts.add('success', t('toast.common.saved'));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to save permission';
-      toasts.add('error', 'Save failed', msg);
+      const msg = e instanceof Error ? e.message : t('permissions.error.saveFailed');
+      toasts.add('error', t('toast.common.saveFailed.title'), msg);
     } finally {
       savingKey.value = null;
     }

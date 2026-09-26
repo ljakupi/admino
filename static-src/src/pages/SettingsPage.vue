@@ -8,10 +8,14 @@ import {
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
 import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
+import I18nT from '@/components/I18nT.vue';
 import { useSettingsStore, type LLMProvider } from '@/stores/settings';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
 import { modelOptions, providerLabel, trustNote } from '@/services/llmProviders';
+import { useI18n, type MessageKey } from '@/i18n';
+
+const { t } = useI18n();
 
 const route = useRoute();
 const settings = useSettingsStore();
@@ -22,26 +26,29 @@ const showClearConfirm = ref(false);
 const activeSection = ref(route.hash === '#danger' ? 'danger' : 'agent');
 
 // --- Subnav definition ---
-const NAV = [
+const NAV: {
+  groupKey: MessageKey;
+  items: { id: string; labelKey: MessageKey; icon: typeof Key; danger?: boolean }[];
+}[] = [
   {
-    group: 'Account',
+    groupKey: 'settings.nav.group.account',
     items: [
-      { id: 'session', label: 'Session', icon: Key },
+      { id: 'session', labelKey: 'settings.nav.session', icon: Key },
     ],
   },
   {
-    group: 'App',
+    groupKey: 'settings.nav.group.app',
     items: [
-      { id: 'agent', label: 'Agent', icon: BrainCircuit },
-      { id: 'appearance', label: 'Appearance', icon: Palette },
-      { id: 'notifications', label: 'Notifications', icon: Bell },
+      { id: 'agent', labelKey: 'settings.nav.agent', icon: BrainCircuit },
+      { id: 'appearance', labelKey: 'settings.nav.appearance', icon: Palette },
+      { id: 'notifications', labelKey: 'settings.nav.notifications', icon: Bell },
     ],
   },
   {
-    group: 'System',
+    groupKey: 'settings.nav.group.system',
     items: [
-      { id: 'about', label: 'About', icon: Info },
-      { id: 'danger', label: 'Danger zone', icon: TriangleAlert, danger: true },
+      { id: 'about', labelKey: 'settings.nav.about', icon: Info },
+      { id: 'danger', labelKey: 'settings.nav.danger', icon: TriangleAlert, danger: true },
     ],
   },
 ];
@@ -57,8 +64,9 @@ const providers: { value: LLMProvider; label: string; badge?: string }[] = [
 const draftAnthropicModel = ref('');
 const draftOpenAiModel = ref('');
 
-const anthropicModelError = ref<string | undefined>(undefined);
-const openAiModelError = ref<string | undefined>(undefined);
+// Keys, not text, so a shown error follows a locale switch.
+const anthropicModelError = ref<MessageKey | undefined>(undefined);
+const openAiModelError = ref<MessageKey | undefined>(undefined);
 
 // --- Session section ---
 const draftToken = ref('');
@@ -80,8 +88,8 @@ async function onProviderChange(p: LLMProvider) {
   await settings.setProvider(p);
 }
 
-function validateModel(value: string): string | undefined {
-  if (!value.trim()) return 'Model name must not be empty';
+function validateModel(value: string): MessageKey | undefined {
+  if (!value.trim()) return 'settings.agent.model.emptyError';
   return undefined;
 }
 
@@ -106,7 +114,7 @@ async function onOpenAiModelBlur() {
 function onTokenBlur() {
   if (draftToken.value && draftToken.value !== settings.token) {
     settings.setToken(draftToken.value);
-    toasts.add('success', 'Token saved');
+    toasts.add('success', t('settings.toast.tokenSaved'));
   }
 }
 
@@ -120,13 +128,13 @@ function handleClearChat() {
   chatStore.clearThread();
   draftSessionId.value = settings.sessionId;
   showClearConfirm.value = false;
-  toasts.add('success', 'Chat cleared');
+  toasts.add('success', t('settings.toast.chatCleared'));
 }
 
 function handleNewSession() {
   chatStore.clearThread();
   draftSessionId.value = settings.sessionId;
-  toasts.add('success', 'New session started');
+  toasts.add('success', t('settings.toast.newSession'));
 }
 
 async function handleDisconnectAll() {
@@ -139,11 +147,15 @@ async function handleDisconnectAll() {
 }
 
 function handleResetSettings() {
-  toasts.add('info', 'Coming soon', 'Reset settings is not yet available.');
+  toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.resetSettings'));
 }
 
 function handleEraseAll() {
-  toasts.add('info', 'Coming soon', 'Erase all data is not yet available.');
+  toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.eraseAll'));
+}
+
+function handleComingSoonToggle() {
+  toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.toggle'));
 }
 
 const currentProvider = computed(() => settings.llmProvider);
@@ -189,9 +201,9 @@ async function onInfomaniakModelChange(event: Event) {
   <div class="settings-page">
     <!-- Subnav -->
     <nav class="settings-subnav">
-      <div class="subnav-title">Settings</div>
-      <div v-for="group in NAV" :key="group.group" class="subnav-group">
-        <div class="subnav-group-label">{{ group.group }}</div>
+      <div class="subnav-title">{{ t('nav.settings') }}</div>
+      <div v-for="group in NAV" :key="group.groupKey" class="subnav-group">
+        <div class="subnav-group-label">{{ t(group.groupKey) }}</div>
         <button
           v-for="item in group.items"
           :key="item.id"
@@ -200,7 +212,7 @@ async function onInfomaniakModelChange(event: Event) {
           @click="activeSection = item.id"
         >
           <component :is="item.icon" class="subnav-icon" :size="16" :stroke-width="1.75" />
-          <span>{{ item.label }}</span>
+          <span>{{ t(item.labelKey) }}</span>
         </button>
       </div>
     </nav>
@@ -209,39 +221,41 @@ async function onInfomaniakModelChange(event: Event) {
     <main class="settings-detail">
       <!-- Loading state -->
       <div v-if="settings.loading" class="loading-overlay">
-        <span class="loading-spinner" aria-label="Loading settings" />
+        <span class="loading-spinner" :aria-label="t('settings.loadingLabel')" />
       </div>
 
       <div v-else class="detail-inner">
         <!-- Error banner -->
         <div v-if="settings.error" class="error-banner">
-          Failed to load settings: {{ settings.error }}
+          {{ t('settings.error.loadBanner', { error: settings.error }) }}
         </div>
 
         <!-- ── SESSION ── -->
         <template v-if="activeSection === 'session'">
           <div class="section-head">
-            <h2 class="section-title">Session</h2>
-            <p class="section-sub">Identifies this conversation thread on the admino backend.</p>
+            <h2 class="section-title">{{ t('settings.nav.session') }}</h2>
+            <p class="section-sub">{{ t('settings.session.subtitle') }}</p>
           </div>
           <div class="s-card">
             <div class="s-row">
               <div class="row-label">
-                Bearer token
-                <span class="row-hint">Required only when the server runs in <code class="inline-code">auth.mode: token</code>.</span>
+                {{ t('settings.session.token.label') }}
+                <I18nT class="row-hint" keypath="settings.session.token.hint">
+                  <template #config><code class="inline-code">auth.mode: token</code></template>
+                </I18nT>
               </div>
               <input
                 v-model="draftToken"
                 class="s-input mono"
                 type="password"
-                placeholder="Enter bearer token"
+                :placeholder="t('settings.session.token.placeholder')"
                 @blur="onTokenBlur"
               />
             </div>
             <div class="s-row">
               <div class="row-label">
-                Session ID
-                <span class="row-hint">Alphanumeric, hyphens, underscores. Max 64 chars.</span>
+                {{ t('settings.session.id.label') }}
+                <span class="row-hint">{{ t('settings.session.id.hint') }}</span>
               </div>
               <input
                 v-model="draftSessionId"
@@ -252,12 +266,12 @@ async function onInfomaniakModelChange(event: Event) {
             </div>
             <div class="s-row">
               <div class="row-label">
-                New session
-                <span class="row-hint">Clears the chat thread. The conversation history stays in audit log.</span>
+                {{ t('settings.session.new.label') }}
+                <span class="row-hint">{{ t('settings.session.new.hint') }}</span>
               </div>
               <button class="s-btn secondary" @click="handleNewSession">
                 <Plus :size="14" :stroke-width="2" />
-                New session
+                {{ t('settings.session.new.label') }}
               </button>
             </div>
           </div>
@@ -266,15 +280,15 @@ async function onInfomaniakModelChange(event: Event) {
         <!-- ── AGENT ── -->
         <template v-if="activeSection === 'agent'">
           <div class="section-head">
-            <h2 class="section-title">Agent</h2>
-            <p class="section-sub">Which LLM admino talks to. Infomaniak is the default; vLLM (Apple Silicon), Claude, and OpenAI are opt-in alternatives.</p>
+            <h2 class="section-title">{{ t('settings.nav.agent') }}</h2>
+            <p class="section-sub">{{ t('settings.agent.subtitle') }}</p>
           </div>
           <div class="s-card">
             <!-- Provider segmented control -->
             <div class="s-row">
               <div class="row-label">
-                Provider
-                <span class="row-hint">Infomaniak, Claude, and OpenAI send your messages to their servers for processing. vLLM is a local, opt-in alternative you run yourself.</span>
+                {{ t('settings.agent.provider.label') }}
+                <span class="row-hint">{{ t('settings.agent.provider.hint') }}</span>
               </div>
               <div class="seg">
                 <button
@@ -291,7 +305,7 @@ async function onInfomaniakModelChange(event: Event) {
 
             <!-- Model field -->
             <div class="s-row stack">
-              <div class="row-label">Model</div>
+              <div class="row-label">{{ t('settings.agent.model.label') }}</div>
               <template v-if="currentProvider === 'infomaniak'">
                 <select
                   class="s-input"
@@ -304,11 +318,15 @@ async function onInfomaniakModelChange(event: Event) {
                     :value="model"
                   >{{ model }}</option>
                 </select>
-                <span v-if="settings.infomaniakAvailableModels.length === 0" class="row-hint">
-                  No models listed — set <code class="inline-code">INFOMANIAK_API_TOKEN</code> on the server to load them.
-                </span>
+                <I18nT
+                  v-if="settings.infomaniakAvailableModels.length === 0"
+                  class="row-hint"
+                  keypath="settings.agent.infomaniak.noModels"
+                >
+                  <template #env><code class="inline-code">INFOMANIAK_API_TOKEN</code></template>
+                </I18nT>
                 <span class="row-hint model-hint">
-                  Processed in Switzerland; queries aren't recorded or used for training (Infomaniak).
+                  {{ t('settings.agent.infomaniak.privacy') }}
                 </span>
               </template>
               <template v-else-if="currentProvider === 'anthropic'">
@@ -316,38 +334,42 @@ async function onInfomaniakModelChange(event: Event) {
                   v-model="draftAnthropicModel"
                   class="s-input mono"
                   type="text"
-                  placeholder="e.g. claude-sonnet-4-6"
+                  :placeholder="t('settings.agent.model.placeholder', { example: 'claude-sonnet-4-6' })"
                   @blur="onAnthropicModelBlur"
                 />
-                <span v-if="anthropicModelError" class="input-error">{{ anthropicModelError }}</span>
-                <span class="row-hint model-hint">
-                  Exact model ID, e.g. <code class="inline-code">claude-sonnet-4-6</code>. See
-                  <a
-                    href="https://docs.claude.com/en/docs/about-claude/models/overview"
-                    class="hint-link"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >Anthropic's model list</a>.
-                </span>
+                <span v-if="anthropicModelError" class="input-error">{{ t(anthropicModelError) }}</span>
+                <I18nT class="row-hint model-hint" keypath="settings.agent.model.exactIdHint">
+                  <template #example><code class="inline-code">claude-sonnet-4-6</code></template>
+                  <template #link>
+                    <a
+                      href="https://docs.claude.com/en/docs/about-claude/models/overview"
+                      class="hint-link"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >{{ t('settings.agent.anthropic.modelList') }}</a>
+                  </template>
+                </I18nT>
               </template>
               <template v-else-if="currentProvider === 'openai'">
                 <input
                   v-model="draftOpenAiModel"
                   class="s-input mono"
                   type="text"
-                  placeholder="e.g. gpt-4o"
+                  :placeholder="t('settings.agent.model.placeholder', { example: 'gpt-4o' })"
                   @blur="onOpenAiModelBlur"
                 />
-                <span v-if="openAiModelError" class="input-error">{{ openAiModelError }}</span>
-                <span class="row-hint model-hint">
-                  Exact model ID, e.g. <code class="inline-code">gpt-4o</code>. See
-                  <a
-                    href="https://platform.openai.com/docs/models"
-                    class="hint-link"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >OpenAI's model list</a>.
-                </span>
+                <span v-if="openAiModelError" class="input-error">{{ t(openAiModelError) }}</span>
+                <I18nT class="row-hint model-hint" keypath="settings.agent.model.exactIdHint">
+                  <template #example><code class="inline-code">gpt-4o</code></template>
+                  <template #link>
+                    <a
+                      href="https://platform.openai.com/docs/models"
+                      class="hint-link"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >{{ t('settings.agent.openai.modelList') }}</a>
+                  </template>
+                </I18nT>
               </template>
               <template v-else-if="currentProvider === 'vllm'">
                 <select
@@ -361,11 +383,15 @@ async function onInfomaniakModelChange(event: Event) {
                     :value="model"
                   >{{ model }}</option>
                 </select>
-                <span v-if="settings.vllmAvailableModels.length === 0" class="row-hint">
-                  No served model detected — the local vLLM container is opt-in: start it with <code class="inline-code">make start-local</code>.
-                </span>
+                <I18nT
+                  v-if="settings.vllmAvailableModels.length === 0"
+                  class="row-hint"
+                  keypath="settings.agent.vllm.noModels"
+                >
+                  <template #cmd><code class="inline-code">make start-local</code></template>
+                </I18nT>
                 <span class="row-hint model-hint">
-                  The HuggingFace repo id of the model served locally on Apple Silicon (Metal).
+                  {{ t('settings.agent.vllm.modelHint') }}
                 </span>
               </template>
             </div>
@@ -373,28 +399,32 @@ async function onInfomaniakModelChange(event: Event) {
             <!-- Infomaniak: API token indicator -->
             <div v-if="currentProvider === 'infomaniak'" class="s-row">
               <div class="row-label">
-                API token
-                <span class="row-hint"><code class="inline-code">{{ apiKeyEnvVar }}</code> · Set on the server as an environment variable. Never sent to your browser.</span>
+                {{ t('settings.agent.apiToken.label') }}
+                <I18nT class="row-hint" keypath="settings.agent.secretHint">
+                  <template #env><code class="inline-code">{{ apiKeyEnvVar }}</code></template>
+                </I18nT>
               </div>
               <span
                 class="api-key-status"
                 :class="settings.infomaniakTokenConfigured ? 'status-ok' : 'status-missing'"
               >
-                {{ settings.infomaniakTokenConfigured ? 'Configured' : 'Not configured' }}
+                {{ settings.infomaniakTokenConfigured ? t('settings.agent.secret.configured') : t('settings.agent.secret.notConfigured') }}
               </span>
             </div>
 
             <!-- Claude / OpenAI: API key indicator -->
             <div v-if="currentProvider === 'anthropic' || currentProvider === 'openai'" class="s-row">
               <div class="row-label">
-                API key
-                <span class="row-hint"><code class="inline-code">{{ apiKeyEnvVar }}</code> · Set on the server as an environment variable. Never sent to your browser.</span>
+                {{ t('settings.agent.apiKey.label') }}
+                <I18nT class="row-hint" keypath="settings.agent.secretHint">
+                  <template #env><code class="inline-code">{{ apiKeyEnvVar }}</code></template>
+                </I18nT>
               </div>
               <span
                 class="api-key-status"
                 :class="(currentProvider === 'anthropic' ? anthropicConfigured : openAiConfigured) ? 'status-ok' : 'status-missing'"
               >
-                {{ (currentProvider === 'anthropic' ? anthropicConfigured : openAiConfigured) ? 'Configured' : 'Not configured' }}
+                {{ (currentProvider === 'anthropic' ? anthropicConfigured : openAiConfigured) ? t('settings.agent.secret.configured') : t('settings.agent.secret.notConfigured') }}
               </span>
             </div>
           </div>
@@ -403,21 +433,21 @@ async function onInfomaniakModelChange(event: Event) {
         <!-- ── APPEARANCE ── -->
         <template v-if="activeSection === 'appearance'">
           <div class="section-head">
-            <h2 class="section-title">Appearance</h2>
-            <p class="section-sub">How the interface looks. Changes apply immediately.</p>
+            <h2 class="section-title">{{ t('settings.nav.appearance') }}</h2>
+            <p class="section-sub">{{ t('settings.appearance.subtitle') }}</p>
           </div>
           <div class="s-card">
             <div class="s-row">
               <div class="row-label">
-                Theme
-                <span class="row-hint">Dark mode is on the roadmap for v2.</span>
+                {{ t('settings.appearance.theme.label') }}
+                <span class="row-hint">{{ t('settings.appearance.theme.hint') }}</span>
               </div>
               <div class="seg">
-                <button class="seg-btn active">Light</button>
+                <button class="seg-btn active">{{ t('settings.appearance.theme.light') }}</button>
                 <button class="seg-btn" disabled>
-                  Dark <span class="soon-badge">Soon</span>
+                  {{ t('settings.appearance.theme.dark') }} <span class="soon-badge">{{ t('settings.soonBadge') }}</span>
                 </button>
-                <button class="seg-btn" disabled>System</button>
+                <button class="seg-btn" disabled>{{ t('settings.appearance.theme.system') }}</button>
               </div>
             </div>
           </div>
@@ -426,14 +456,14 @@ async function onInfomaniakModelChange(event: Event) {
         <!-- ── NOTIFICATIONS ── -->
         <template v-if="activeSection === 'notifications'">
           <div class="section-head">
-            <h2 class="section-title">Notifications</h2>
-            <p class="section-sub">In-app pings. Browser push is opt-in once per device.</p>
+            <h2 class="section-title">{{ t('settings.nav.notifications') }}</h2>
+            <p class="section-sub">{{ t('settings.notifications.subtitle') }}</p>
           </div>
           <div class="s-card">
             <div class="s-row">
               <div class="row-label">
-                Tool-approval pings
-                <span class="row-hint">Ping me when admino needs my approval to run a tool.</span>
+                {{ t('settings.notifications.approval.label') }}
+                <span class="row-hint">{{ t('settings.notifications.approval.hint') }}</span>
               </div>
               <BaseToggle
                 :model-value="settings.notificationsEnabled"
@@ -442,17 +472,17 @@ async function onInfomaniakModelChange(event: Event) {
             </div>
             <div class="s-row">
               <div class="row-label">
-                Task-done pings
-                <span class="row-hint">Ping me when a long-running response is ready.</span>
+                {{ t('settings.notifications.taskDone.label') }}
+                <span class="row-hint">{{ t('settings.notifications.taskDone.hint') }}</span>
               </div>
-              <BaseToggle :model-value="false" @update:model-value="() => toasts.add('info', 'Coming soon', 'This toggle is not yet available.')" />
+              <BaseToggle :model-value="false" @update:model-value="handleComingSoonToggle" />
             </div>
             <div class="s-row">
               <div class="row-label">
-                Sound
-                <span class="row-hint">Subtle chime on pings. Respects system Do Not Disturb.</span>
+                {{ t('settings.notifications.sound.label') }}
+                <span class="row-hint">{{ t('settings.notifications.sound.hint') }}</span>
               </div>
-              <BaseToggle :model-value="false" @update:model-value="() => toasts.add('info', 'Coming soon', 'This toggle is not yet available.')" />
+              <BaseToggle :model-value="false" @update:model-value="handleComingSoonToggle" />
             </div>
           </div>
         </template>
@@ -460,30 +490,30 @@ async function onInfomaniakModelChange(event: Event) {
         <!-- ── ABOUT ── -->
         <template v-if="activeSection === 'about'">
           <div class="section-head">
-            <h2 class="section-title">About</h2>
-            <p class="section-sub">Local-only, security-first personal AI agent.</p>
+            <h2 class="section-title">{{ t('settings.nav.about') }}</h2>
+            <p class="section-sub">{{ t('settings.about.subtitle') }}</p>
           </div>
           <div class="s-card">
             <div class="s-row">
-              <div class="row-label">Version</div>
-              <span class="mono-value">admino 0.1.0 (Alpha)</span>
+              <div class="row-label">{{ t('settings.about.version') }}</div>
+              <span class="mono-value">{{ t('settings.about.versionValue', { version: '0.1.0' }) }}</span>
             </div>
             <div class="s-row">
-              <div class="row-label">Source code</div>
+              <div class="row-label">{{ t('settings.about.sourceCode') }}</div>
               <a href="https://github.com/ljakupi/admino" class="source-link" target="_blank" rel="noopener noreferrer">
                 <Github :size="14" :stroke-width="1.75" />
                 github.com/ljakupi/admino
               </a>
             </div>
             <div class="s-row">
-              <div class="row-label">License</div>
+              <div class="row-label">{{ t('settings.about.license') }}</div>
               <span class="muted-value">Apache-2.0</span>
             </div>
           </div>
           <div class="trust-badge">
             <ShieldCheck :size="20" :stroke-width="1.75" class="trust-icon" />
             <div>
-              <div class="trust-title">Your admino server</div>
+              <div class="trust-title">{{ t('settings.about.trustTitle') }}</div>
               <div class="trust-body">{{ trustNote(settings.llmProvider) }}</div>
             </div>
           </div>
@@ -492,8 +522,8 @@ async function onInfomaniakModelChange(event: Event) {
         <!-- ── DANGER ZONE ── -->
         <template v-if="activeSection === 'danger'">
           <div class="section-head">
-            <h2 class="section-title danger-title">Danger zone</h2>
-            <p class="section-sub">These actions cannot be undone. Each one prompts for confirmation.</p>
+            <h2 class="section-title danger-title">{{ t('settings.nav.danger') }}</h2>
+            <p class="section-sub">{{ t('settings.danger.subtitle') }}</p>
           </div>
 
           <CriticalPermissionsCard />
@@ -501,31 +531,31 @@ async function onInfomaniakModelChange(event: Event) {
           <div class="danger-card">
             <div class="s-row">
               <div class="row-label">
-                Clear conversation
-                <span class="row-hint">Wipes the current chat thread. Audit log is preserved by design.</span>
+                {{ t('settings.danger.clear.label') }}
+                <span class="row-hint">{{ t('settings.danger.clear.hint') }}</span>
               </div>
-              <button class="s-btn danger" @click="showClearConfirm = true">Clear thread</button>
+              <button class="s-btn danger" @click="showClearConfirm = true">{{ t('settings.danger.clear.button') }}</button>
             </div>
             <div class="s-row">
               <div class="row-label">
-                Disconnect all accounts
-                <span class="row-hint">Revokes OAuth refresh tokens for Google and Microsoft.</span>
+                {{ t('settings.danger.disconnectAll.label') }}
+                <span class="row-hint">{{ t('settings.danger.disconnectAll.hint') }}</span>
               </div>
-              <button class="s-btn danger" @click="handleDisconnectAll">Disconnect all</button>
+              <button class="s-btn danger" @click="handleDisconnectAll">{{ t('settings.danger.disconnectAll.button') }}</button>
             </div>
             <div class="s-row">
               <div class="row-label">
-                Reset settings
-                <span class="row-hint">Resets all settings to defaults. Connected accounts stay connected.</span>
+                {{ t('settings.danger.reset.label') }}
+                <span class="row-hint">{{ t('settings.danger.reset.hint') }}</span>
               </div>
-              <button class="s-btn danger" @click="handleResetSettings">Reset to defaults</button>
+              <button class="s-btn danger" @click="handleResetSettings">{{ t('settings.danger.reset.button') }}</button>
             </div>
             <div class="s-row">
               <div class="row-label danger-label">
-                Erase all data
-                <span class="row-hint">Deletes the audit log, memory, and document store. Cannot be recovered.</span>
+                {{ t('settings.danger.erase.label') }}
+                <span class="row-hint">{{ t('settings.danger.erase.hint') }}</span>
               </div>
-              <button class="s-btn danger solid" @click="handleEraseAll">Erase everything</button>
+              <button class="s-btn danger solid" @click="handleEraseAll">{{ t('settings.danger.erase.button') }}</button>
             </div>
           </div>
         </template>
@@ -534,9 +564,9 @@ async function onInfomaniakModelChange(event: Event) {
 
     <ConfirmSheet
       v-if="showClearConfirm"
-      heading="Clear conversation?"
-      subtext="This will remove all messages and tool call history from the current session."
-      confirm-label="Clear"
+      :heading="t('settings.danger.clearConfirm.heading')"
+      :subtext="t('settings.danger.clearConfirm.subtext')"
+      :confirm-label="t('settings.danger.clearConfirm.confirm')"
       variant="destructive"
       @confirm="handleClearChat"
       @cancel="showClearConfirm = false"

@@ -7,36 +7,38 @@ import {
   cancelPendingPromotion,
 } from '@/api/critical-permissions';
 import { useToastStore } from '@/stores/toasts';
+import { t } from '@/i18n';
+import type { MessageKey } from '@/i18n';
 import { ApiError } from '@/api/client';
 
 export interface CritPermDef {
   tool: string;
   action: string;
   icon: string;
-  label: string;
-  description: string;
+  labelKey: MessageKey;
+  descriptionKey: MessageKey;
 }
 
 export const CRIT_PERMS: CritPermDef[] = [
   {
     tool: 'gmail', action: 'send',
-    icon: 'mail', label: 'Send email \u00b7 Gmail',
-    description: 'When enabled, the agent can draft emails and ask for your approval before sending.',
+    icon: 'mail', labelKey: 'permissions.critical.gmailSend.label',
+    descriptionKey: 'permissions.critical.sendEmail.description',
   },
   {
     tool: 'outlook', action: 'send',
-    icon: 'mail', label: 'Send email \u00b7 Outlook',
-    description: 'When enabled, the agent can draft emails and ask for your approval before sending.',
+    icon: 'mail', labelKey: 'permissions.critical.outlookSend.label',
+    descriptionKey: 'permissions.critical.sendEmail.description',
   },
   {
     tool: 'google_calendar', action: 'update',
-    icon: 'calendar', label: 'Update event \u00b7 Google Calendar',
-    description: 'When enabled, the agent can propose changes to existing events for your approval.',
+    icon: 'calendar', labelKey: 'permissions.critical.googleCalendarUpdate.label',
+    descriptionKey: 'permissions.critical.updateEvent.description',
   },
   {
     tool: 'outlook_calendar', action: 'update',
-    icon: 'calendar', label: 'Update event \u00b7 Outlook Calendar',
-    description: 'When enabled, the agent can propose changes to existing events for your approval.',
+    icon: 'calendar', labelKey: 'permissions.critical.outlookCalendarUpdate.label',
+    descriptionKey: 'permissions.critical.updateEvent.description',
   },
 ];
 
@@ -44,6 +46,13 @@ export const COOLDOWN_SEC = 300;
 
 function critKey(tool: string, action: string): string {
   return `${tool}.${action}`;
+}
+
+/** Formats a duration in seconds as `m:ss`, for the promotion-scheduled toast. */
+function formatCooldown(totalSeconds: number): string {
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
 }
 
 interface PermState {
@@ -75,7 +84,7 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
       }
       permissions.value = map;
     } catch (e) {
-      error.value = e instanceof Error ? e.message : 'Failed to load critical permissions';
+      error.value = e instanceof Error ? e.message : t('criticalPermissions.error.loadFailed');
     } finally {
       loading.value = false;
     }
@@ -91,12 +100,20 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
       });
       // Force reactivity
       permissions.value = new Map(permissions.value);
-      toasts.add('success', 'Promotion scheduled', 'Active in 5:00');
+      toasts.add(
+        'success',
+        t('toast.criticalPermissions.promotionScheduled.title'),
+        t('toast.criticalPermissions.promotionScheduled.body', { time: formatCooldown(COOLDOWN_SEC) }),
+      );
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) {
-        toasts.add('error', 'Authentication failed', 'The token you entered is invalid.');
+        toasts.add(
+          'error',
+          t('toast.criticalPermissions.authFailed.title'),
+          t('toast.criticalPermissions.authFailed.body'),
+        );
       } else {
-        toasts.add('error', 'Promotion failed');
+        toasts.add('error', t('toast.criticalPermissions.promotionFailed.title'));
       }
       throw e;
     }
@@ -108,23 +125,23 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
       await cancelPendingPromotion(tool, action);
       permissions.value.set(critKey(tool, action), { state: 'deny', pendingAt: null });
       permissions.value = new Map(permissions.value);
-      toasts.add('success', 'Pending promotion cancelled');
+      toasts.add('success', t('toast.criticalPermissions.cancelled.title'));
     } catch (e) {
-      toasts.add('error', 'Cancel failed');
+      toasts.add('error', t('toast.criticalPermissions.cancelFailed.title'));
     }
   }
 
   async function demote(tool: string, action: string) {
     const toasts = useToastStore();
     const perm = CRIT_PERMS.find(p => p.tool === tool && p.action === action);
-    const displayName = perm?.label ?? 'permission';
+    const displayName = perm ? t(perm.labelKey) : tool;
     try {
       await demoteCriticalPermission(tool, action);
       permissions.value.set(critKey(tool, action), { state: 'deny', pendingAt: null });
       permissions.value = new Map(permissions.value);
-      toasts.add('success', `Disabled: ${displayName}`);
+      toasts.add('success', t('toast.criticalPermissions.disabled', { permission: displayName }));
     } catch (e) {
-      toasts.add('error', 'Disable failed');
+      toasts.add('error', t('toast.criticalPermissions.disableFailed.title'));
     }
   }
 

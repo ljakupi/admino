@@ -1,5 +1,8 @@
 <script setup lang="ts">
 import BaseButton from './BaseButton.vue';
+import { useI18n } from '@/i18n';
+
+const { t } = useI18n();
 
 defineProps<{
   heading: string;
@@ -22,12 +25,12 @@ defineEmits<{
         <h3 class="sheet-heading">{{ heading }}</h3>
         <p v-if="subtext" class="sheet-subtext caption">{{ subtext }}</p>
         <div class="sheet-actions">
-          <BaseButton variant="secondary" @click="$emit('cancel')">Cancel</BaseButton>
+          <BaseButton variant="secondary" @click="$emit('cancel')">{{ t('common.cancel') }}</BaseButton>
           <BaseButton
             :variant="variant === 'destructive' ? 'destructive' : 'primary'"
             @click="$emit('confirm')"
           >
-            {{ confirmLabel ?? 'Confirm' }}
+            {{ confirmLabel ?? t('common.confirm') }}
           </BaseButton>
         </div>
       </div>

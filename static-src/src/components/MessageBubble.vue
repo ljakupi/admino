@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import MarkdownBlock from './MarkdownBlock.vue';
 import type { ChatMessage } from '@/api/types';
+import { useI18n } from '@/i18n';
+
+const { formatDate } = useI18n();
 
 const props = defineProps<{
   message: ChatMessage;
 }>();
 
 function formatTime(d: Date): string {
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return formatDate(d, { hour: '2-digit', minute: '2-digit' });
 }
 </script>
 

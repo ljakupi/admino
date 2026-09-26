@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { ShieldAlert, Mail, Calendar, Clock, Check, Info } from 'lucide-vue-next';
 import ReAuthDialog from './ReAuthDialog.vue';
+import { t } from '@/i18n';
 import {
   useCriticalPermissionsStore,
   CRIT_PERMS,
@@ -119,9 +120,9 @@ async function handleAuthConfirm(token: string) {
         <ShieldAlert :size="16" :stroke-width="1.75" />
       </div>
       <div>
-        <div class="crit-head-title">Critical Permissions</div>
+        <div class="crit-head-title">{{ t('criticalPermissions.title') }}</div>
         <div class="crit-head-sub">
-          Allow the agent to propose these actions. You will still approve each one individually before it executes.
+          {{ t('criticalPermissions.subtitle') }}
         </div>
       </div>
     </div>
@@ -137,19 +138,19 @@ async function handleAuthConfirm(token: string) {
         </div>
         <div class="crit-row-main">
           <div class="crit-row-head">
-            <span class="crit-row-label">{{ row.label }}</span>
+            <span class="crit-row-label">{{ t(row.labelKey) }}</span>
             <code class="crit-row-id">{{ row.tool }}.{{ row.action }}</code>
           </div>
-          <div class="crit-row-desc">{{ row.description }}</div>
+          <div class="crit-row-desc">{{ t(row.descriptionKey) }}</div>
 
           <!-- Pending state -->
           <div v-if="isPending(row.tool, row.action)" class="crit-pending-line">
             <span class="crit-pending-badge">
               <Clock :size="11" :stroke-width="2" />
-              Active in {{ formatTime(remaining(store.getState(row.tool, row.action).pendingAt)) }}
+              {{ t('criticalPermissions.activeIn', { time: formatTime(remaining(store.getState(row.tool, row.action).pendingAt)) }) }}
             </span>
             <button class="crit-pending-cancel" @click="store.cancelPending(row.tool, row.action)">
-              Cancel
+              {{ t('common.cancel') }}
             </button>
           </div>
 
@@ -157,9 +158,9 @@ async function handleAuthConfirm(token: string) {
           <div v-else-if="isOn(row.tool, row.action)" class="crit-active-line">
             <span class="crit-active-badge">
               <Check :size="10" :stroke-width="2" />
-              Active
+              {{ t('criticalPermissions.active') }}
             </span>
-            <span class="crit-active-aux">admino will ask you before each {{ row.action }}</span>
+            <span class="crit-active-aux">{{ t('criticalPermissions.askBeforeEach', { action: row.action }) }}</span>
           </div>
         </div>
 
@@ -168,7 +169,7 @@ async function handleAuthConfirm(token: string) {
             role="switch"
             :class="toggleClass(row.tool, row.action)"
             :aria-checked="isOn(row.tool, row.action) || isPending(row.tool, row.action)"
-            :aria-label="`Toggle ${row.label}`"
+            :aria-label="t('criticalPermissions.toggle', { permission: t(row.labelKey) })"
             @click="handleToggle(row)"
           >
             <span class="crit-toggle-thumb" />
@@ -179,7 +180,7 @@ async function handleAuthConfirm(token: string) {
 
     <div class="crit-foot">
       <Info :size="12" :stroke-width="2" />
-      <span>Disabling takes effect immediately. Enabling requires re-authentication and a 5-minute cooldown you can cancel.</span>
+      <span>{{ t('criticalPermissions.footer') }}</span>
     </div>
   </div>
 
@@ -187,7 +188,7 @@ async function handleAuthConfirm(token: string) {
     v-if="store.authRow"
     :tool="store.authRow.tool"
     :action="store.authRow.action"
-    :label="store.authRow.label"
+    :label="t(store.authRow.labelKey)"
     @confirm="handleAuthConfirm"
     @cancel="store.closeAuth()"
   />

@@ -1,22 +1,28 @@
 <script setup lang="ts">
+import { computed } from 'vue';
+import { t } from '@/i18n';
+import type { MessageKey } from '@/i18n';
 import type { ConnectionState } from '@/stores/connection';
 
 const props = defineProps<{
   state: ConnectionState;
 }>();
 
-const labels: Record<ConnectionState, string> = {
-  idle: 'Ready',
-  working: 'Working\u2026',
-  awaiting: 'Waiting for you',
-  offline: 'Offline',
+const LABEL_KEYS: Record<ConnectionState, MessageKey> = {
+  idle: 'status.idle',
+  working: 'status.working',
+  awaiting: 'status.awaiting',
+  offline: 'status.offline',
 };
+
+// Resolved in a computed (not a module-level constant) so it re-renders on locale switch.
+const label = computed(() => t(LABEL_KEYS[props.state]));
 </script>
 
 <template>
-  <span class="status-pill" :title="labels[props.state]">
+  <span class="status-pill" :title="label">
     <span class="dot" :class="props.state" />
-    <span class="label">{{ labels[props.state] }}</span>
+    <span class="label">{{ label }}</span>
   </span>
 </template>
 

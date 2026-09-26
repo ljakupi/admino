@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { X } from 'lucide-vue-next';
+import { t } from '@/i18n';
 import type { ToastKind } from '@/stores/toasts';
 
 defineProps<{
@@ -20,7 +21,7 @@ defineEmits<{
       <span class="toast-title">{{ title }}</span>
       <span v-if="body" class="toast-body">{{ body }}</span>
     </div>
-    <button class="toast-close" aria-label="Dismiss" @click="$emit('dismiss')">
+    <button class="toast-close" :aria-label="t('common.dismiss')" @click="$emit('dismiss')">
       <X :size="14" :stroke-width="2" />
     </button>
   </div>

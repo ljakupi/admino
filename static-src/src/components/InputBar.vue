@@ -2,6 +2,9 @@
 import { ref, computed, nextTick } from 'vue';
 import { Send, Paperclip } from 'lucide-vue-next';
 import IconButton from './IconButton.vue';
+import { useI18n } from '@/i18n';
+
+const { t } = useI18n();
 
 const emit = defineEmits<{
   send: [message: string];
@@ -42,14 +45,14 @@ function autoGrow() {
 
 <template>
   <div class="input-bar">
-    <IconButton aria-label="Attach file" :disabled="true" class="attach-btn">
+    <IconButton :aria-label="t('chat.input.attachFile')" :disabled="true" class="attach-btn">
       <Paperclip :size="20" :stroke-width="1.75" />
     </IconButton>
     <textarea
       ref="textareaRef"
       v-model="text"
       class="input-textarea"
-      placeholder="Ask admino anything&hellip;"
+      :placeholder="t('chat.input.placeholder')"
       rows="1"
       :disabled="disabled"
       @input="autoGrow"
@@ -58,11 +61,11 @@ function autoGrow() {
     <button
       class="send-btn"
       :disabled="!canSend"
-      aria-label="Send"
+      :aria-label="t('chat.input.send')"
       @click="handleSend"
     >
       <Send :size="20" :stroke-width="1.75" />
-      <span class="send-label">Send</span>
+      <span class="send-label">{{ t('chat.input.send') }}</span>
     </button>
   </div>
 </template>

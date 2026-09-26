@@ -18,3 +18,4 @@
 - [ ] Pydantic models used for all new data structures
 - [ ] Credential redaction patterns updated if new token types introduced
 - [ ] Permission entries added for new tools (if applicable)
+- [ ] New UI strings go through `t()` with EN/DE/FR entries; `npm run check:i18n` passes (if applicable)

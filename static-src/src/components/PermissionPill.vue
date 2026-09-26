@@ -3,6 +3,9 @@ import { ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { Lock, ShieldAlert } from 'lucide-vue-next';
 import type { PermissionState } from '@/api/types';
+import { useI18n, type MessageKey } from '@/i18n';
+
+const { t } = useI18n();
 
 const props = withDefaults(defineProps<{
   permission: PermissionState;
@@ -43,11 +46,16 @@ function closeDropdown() {
   open.value = false;
 }
 
-const options: { value: PermissionState; label: string }[] = [
-  { value: 'allow', label: 'Allowed' },
-  { value: 'confirm', label: 'Needs approval' },
-  { value: 'deny', label: 'Denied' },
+const options: { value: PermissionState; labelKey: MessageKey }[] = [
+  { value: 'allow', labelKey: 'permissionState.allow' },
+  { value: 'confirm', labelKey: 'permissionState.confirm' },
+  { value: 'deny', labelKey: 'permissionState.deny' },
 ];
+
+function labelFor(perm: PermissionState): string {
+  const key = options.find((o) => o.value === perm)?.labelKey;
+  return key ? t(key) : '';
+}
 </script>
 
 <template>
@@ -59,9 +67,9 @@ const options: { value: PermissionState; label: string }[] = [
       class="pill"
       :class="[permission, { hardcoded, promotable, saving }]"
       :title="promotable
-        ? 'This permission can be managed from Settings \u203a Danger Zone'
+        ? t('permissionPill.promotableHint')
         : hardcoded
-          ? 'This permission is enforced by security policy and cannot be changed'
+          ? t('permissionPill.hardcodedHint')
           : undefined"
       :style="saving ? 'opacity: 0.5; cursor: wait;' : undefined"
       @click="toggle"
@@ -69,7 +77,7 @@ const options: { value: PermissionState; label: string }[] = [
       <ShieldAlert v-if="promotable" :size="11" :stroke-width="2" />
       <Lock v-else-if="hardcoded" :size="11" :stroke-width="2" />
       <span class="dot" />
-      <span class="label">{{ (hardcoded || promotable) ? 'Denied' : options.find(o => o.value === permission)?.label }}</span>
+      <span class="label">{{ (hardcoded || promotable) ? t('permissionState.deny') : labelFor(permission) }}</span>
     </button>
 
     <div v-if="open" class="dropdown">
@@ -81,7 +89,7 @@ const options: { value: PermissionState; label: string }[] = [
         @click="select(opt.value)"
       >
         <span class="dot" />
-        {{ opt.label }}
+        {{ t(opt.labelKey) }}
       </button>
     </div>
   </div>

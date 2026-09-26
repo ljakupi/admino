@@ -209,10 +209,14 @@ make check      # lint + format-check + typecheck + tests (coverage ≥ 90%)
 For frontend changes, from `static-src/`:
 
 ```bash
+npm run check:i18n   # en/de/fr translation catalogs match
 npm run typecheck
 npm run test
 npm run build
 ```
+
+The PWA is translated into English, German and French; every UI string lives in
+`static-src/src/i18n/locales/`. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the rules.
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full workflow, coding standards, and
 security rules.

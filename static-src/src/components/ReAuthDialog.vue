@@ -1,7 +1,11 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { ShieldAlert } from 'lucide-vue-next';
 import BaseButton from './BaseButton.vue';
+import I18nT from './I18nT.vue';
+import { useI18n, type MessageKey } from '@/i18n';
+
+const { t } = useI18n();
 
 const props = defineProps<{
   tool: string;
@@ -21,20 +25,22 @@ onMounted(() => {
   inputRef.value?.focus();
 });
 
-const TOOL_LABELS: Record<string, string> = {
-  gmail: 'Gmail',
-  outlook: 'Outlook',
-  google_calendar: 'Google Calendar',
-  outlook_calendar: 'Outlook Calendar',
+const TOOL_LABEL_KEYS: Record<string, MessageKey> = {
+  gmail: 'tools.gmail.label',
+  outlook: 'tools.outlook.label',
+  google_calendar: 'tools.googleCalendar.label',
+  outlook_calendar: 'tools.outlookCalendar.label',
 };
 
-const toolLabel = TOOL_LABELS[props.tool] ?? props.tool;
+const toolLabel = computed(() =>
+  Object.hasOwn(TOOL_LABEL_KEYS, props.tool) ? t(TOOL_LABEL_KEYS[props.tool]) : props.tool,
+);
 
 function submit() {
   if (token.value) {
-    const t = token.value;
+    const value = token.value;
     token.value = '';
-    emit('confirm', t);
+    emit('confirm', value);
   }
 }
 </script>
@@ -47,29 +53,28 @@ function submit() {
           <ShieldAlert :size="20" :stroke-width="1.75" />
         </div>
         <div>
-          <div class="reauth-title">Re-authenticate to enable</div>
-          <div class="reauth-sub">
-            You're allowing admino to propose <b>{{ action }}</b> on <b>{{ toolLabel }}</b>.
-            Enter your auth token to confirm. The change will take effect after a 5-minute cooldown
-            that you can cancel.
-          </div>
+          <div class="reauth-title">{{ t('reauth.title') }}</div>
+          <I18nT tag="div" class="reauth-sub" keypath="reauth.body">
+            <template #action><b>{{ action }}</b></template>
+            <template #tool><b>{{ toolLabel }}</b></template>
+          </I18nT>
         </div>
         <div class="reauth-field">
-          <label class="reauth-field-label">Auth token</label>
+          <label class="reauth-field-label">{{ t('reauth.tokenLabel') }}</label>
           <input
             ref="inputRef"
             v-model="token"
             type="password"
             class="reauth-input"
-            placeholder="Re-enter your bearer token"
+            :placeholder="t('reauth.tokenPlaceholder')"
             @keydown.enter="submit"
           />
-          <div class="reauth-field-hint">Never logged. Verified against your active session.</div>
+          <div class="reauth-field-hint">{{ t('reauth.tokenHint') }}</div>
         </div>
         <div class="reauth-actions">
-          <BaseButton variant="secondary" @click="$emit('cancel')">Cancel</BaseButton>
+          <BaseButton variant="secondary" @click="$emit('cancel')">{{ t('common.cancel') }}</BaseButton>
           <BaseButton variant="warn" :disabled="!token" @click="submit">
-            Enable &amp; start cooldown
+            {{ t('reauth.submit') }}
           </BaseButton>
         </div>
       </div>

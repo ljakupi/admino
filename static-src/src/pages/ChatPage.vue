@@ -12,6 +12,7 @@ import SuggestionChip from '@/components/SuggestionChip.vue';
 import { useChatStore } from '@/stores/chat';
 import { useAutoScroll } from '@/composables/useAutoScroll';
 import { useKeyboardShortcuts } from '@/composables/useKeyboardShortcuts';
+import { useI18n, type MessageKey } from '@/i18n';
 import type { ThreadItem, ChatMessage, ToolCallUI } from '@/api/types';
 
 const chatStore = useChatStore();
@@ -20,11 +21,15 @@ const { onScroll, scrollToBottom } = useAutoScroll(threadRef);
 
 const isEmpty = computed(() => chatStore.thread.length === 0);
 
-const suggestions = [
-  'Search my emails',
-  "What's on my calendar today?",
-  'Find a file',
+const { t } = useI18n();
+
+// Suggestion text is also what gets sent, so it follows the active locale.
+const suggestionKeys: readonly MessageKey[] = [
+  'chat.suggestions.searchEmails',
+  'chat.suggestions.calendarToday',
+  'chat.suggestions.findFile',
 ];
+const suggestions = computed(() => suggestionKeys.map((key) => t(key)));
 
 /**
  * Group thread items for display:
@@ -136,8 +141,8 @@ useKeyboardShortcuts({
       <EmptyState
         v-if="isEmpty"
         :icon="MessageCircle"
-        heading="How can I help?"
-        subtext="Your messages stay on your machine."
+        :heading="t('chat.empty.heading')"
+        :subtext="t('chat.empty.subtext')"
       >
         <div class="suggestions">
           <SuggestionChip

@@ -5,6 +5,7 @@ import { useSettingsStore } from './settings';
 import { useConnectionStore } from './connection';
 import { useToastStore } from './toasts';
 import { ApiError } from '@/api/client';
+import { t } from '@/i18n';
 import type {
   ThreadItem,
   ChatMessage,
@@ -151,15 +152,15 @@ export const useChatStore = defineStore('chat', () => {
         connection.setIdle();
         if (err.status === 401) {
           settings.needsAuth = true;
-          toasts.add('error', 'Authentication required');
+          toasts.add('error', t('toast.chat.authRequired'));
         } else if (err.status === 429) {
-          toasts.add('warning', 'Slow down', 'admino is rate-limited.');
+          toasts.add('warning', t('toast.chat.slowDown.title'), t('toast.chat.slowDown.body'));
         } else {
-          toasts.add('error', 'Something went wrong', 'Check the server logs.');
+          toasts.add('error', t('toast.chat.genericError.title'), t('toast.chat.genericError.body'));
         }
       } else {
         connection.state = 'offline';
-        toasts.add('error', 'Connection lost', 'Cannot reach the server.');
+        toasts.add('error', t('toast.chat.connectionLost.title'), t('toast.chat.connectionLost.body'));
       }
     } finally {
       sending.value = false;
@@ -198,14 +199,14 @@ export const useChatStore = defineStore('chat', () => {
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 410) {
-        toasts.add('warning', 'Approval expired', 'Send the message again.');
+        toasts.add('warning', t('toast.chat.approvalExpired.title'), t('toast.chat.approvalExpired.body'));
         item.data.state = 'error';
-        item.data.error = 'Expired';
+        item.data.error = t('chat.toolCall.expired');
       } else if (err instanceof ApiError && err.status === 429) {
-        toasts.add('warning', 'Slow down', 'admino is rate-limited.');
+        toasts.add('warning', t('toast.chat.slowDown.title'), t('toast.chat.slowDown.body'));
         item.data.state = 'pending';
       } else {
-        toasts.add('error', 'Something went wrong');
+        toasts.add('error', t('toast.chat.genericError.title'));
         item.data.state = 'error';
       }
       connection.setIdle();
@@ -234,7 +235,7 @@ export const useChatStore = defineStore('chat', () => {
       connection.setIdle();
     } catch (err) {
       if (err instanceof ApiError && err.status === 410) {
-        toasts.add('info', 'Already expired');
+        toasts.add('info', t('toast.chat.alreadyExpired'));
       }
       connection.setIdle();
     }

@@ -3,26 +3,30 @@ import { ref } from 'vue';
 import BaseButton from './BaseButton.vue';
 import BaseInput from './BaseInput.vue';
 import { useSettingsStore } from '@/stores/settings';
+import { useI18n, type MessageKey } from '@/i18n';
+
+const { t } = useI18n();
 
 const settings = useSettingsStore();
 const tokenInput = ref('');
-const error = ref('');
+// A key, not text, so a shown error follows a locale switch.
+const errorKey = ref<MessageKey | null>(null);
 const checking = ref(false);
 
 const TOKEN_RE = /^[\x21-\x7E]{8,512}$/;
 
 async function submit() {
   if (!tokenInput.value) {
-    error.value = 'Token is required';
+    errorKey.value = 'auth.error.tokenRequired';
     return;
   }
   if (!TOKEN_RE.test(tokenInput.value)) {
-    error.value = 'Token must be 8-512 printable ASCII characters';
+    errorKey.value = 'auth.error.tokenFormat';
     return;
   }
   // Validate the token against the backend before accepting
   checking.value = true;
-  error.value = '';
+  errorKey.value = null;
   try {
     const res = await fetch('/api/message', {
       method: 'POST',
@@ -33,7 +37,7 @@ async function submit() {
       body: JSON.stringify({ message: 'ping', session_id: 'auth-check' }),
     });
     if (res.status === 401) {
-      error.value = 'Invalid token. Check and try again.';
+      errorKey.value = 'auth.error.invalidToken';
       return;
     }
   } catch {
@@ -46,7 +50,7 @@ async function submit() {
 
 async function skip() {
   checking.value = true;
-  error.value = '';
+  errorKey.value = null;
   try {
     // Try an API call without a token — if 401, token is required
     const res = await fetch('/api/message', {
@@ -55,7 +59,7 @@ async function skip() {
       body: JSON.stringify({ message: 'ping', session_id: 'auth-check' }),
     });
     if (res.status === 401) {
-      error.value = 'This server requires a token. Skipping is not available.';
+      errorKey.value = 'auth.error.tokenRequiredByServer';
       return;
     }
   } catch {
@@ -71,19 +75,19 @@ async function skip() {
   <div class="auth-backdrop">
     <div class="auth-dialog">
       <div class="auth-logo">admino</div>
-      <h2>Welcome</h2>
-      <p class="caption">Enter your access token to connect, or skip if you're on a private network.</p>
+      <h2>{{ t('auth.welcome') }}</h2>
+      <p class="caption">{{ t('auth.intro') }}</p>
       <form @submit.prevent="submit">
         <BaseInput
           v-model="tokenInput"
-          label="Access Token"
+          :label="t('auth.tokenLabel')"
           type="password"
-          placeholder="Paste your token"
-          :error="error"
+          :placeholder="t('auth.tokenPlaceholder')"
+          :error="errorKey ? t(errorKey) : ''"
         />
         <div class="auth-actions">
-          <BaseButton variant="ghost" type="button" :disabled="checking" @click="skip">Skip</BaseButton>
-          <BaseButton variant="primary" type="submit" :loading="checking">Connect</BaseButton>
+          <BaseButton variant="ghost" type="button" :disabled="checking" @click="skip">{{ t('auth.skip') }}</BaseButton>
+          <BaseButton variant="primary" type="submit" :loading="checking">{{ t('auth.connect') }}</BaseButton>
         </div>
       </form>
     </div>

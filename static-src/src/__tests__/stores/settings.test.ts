@@ -6,14 +6,19 @@
  * store state, the `setInfomaniakModel` / `setProvider('infomaniak')` actions
  * (request formation, applying the server response, reverting on rejection),
  * and that a response can never smuggle the API token into the store: only
- * the boolean "token configured" indicator is kept. The network layer
- * (`@/api/settings`) is mocked; nothing touches `fetch`.
+ * the boolean "token configured" indicator is kept. Issue #144 translates
+ * the UI: the save toast copy comes from the i18n catalogs and follows the
+ * active locale. The network layer (`@/api/settings`) is mocked; nothing
+ * touches `fetch`.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { getSettings, patchSettings } from '@/api/settings';
 import { ApiError } from '@/api/client';
+import { setLocale } from '@/i18n';
+import { fr } from '@/i18n/locales/fr';
 import { useSettingsStore, type LLMProvider } from '@/stores/settings';
+import { useToastStore } from '@/stores/toasts';
 import type { LLMProviderName, LLMSettings, SettingsResponse } from '@/api/types';
 
 vi.mock('@/api/settings', () => ({
@@ -114,6 +119,10 @@ beforeEach(() => {
   setActivePinia(createPinia());
   mockedGetSettings.mockReset();
   mockedPatchSettings.mockReset();
+});
+
+afterEach(() => {
+  setLocale('en');
 });
 
 // --- Initial state --------------------------------------------------------
@@ -392,5 +401,30 @@ describe('settingsStore tools toggles', () => {
       'outlook_calendar',
     ]);
     expect('files' in store.tools).toBe(false);
+  });
+});
+
+// --- Save toast copy follows the locale (issue #144) ---------------------
+
+describe('settingsStore save toast follows the locale', () => {
+  /** Title of the success toast a successful saveSetting produces under `locale`. */
+  async function savedToastTitle(locale: string): Promise<string | undefined> {
+    setLocale(locale);
+    mockedPatchSettings.mockResolvedValueOnce(makeSettings());
+
+    await useSettingsStore().saveSetting({ notifications: { enabled: true } });
+
+    return useToastStore().toasts.find((toast) => toast.kind === 'success')?.title;
+  }
+
+  it('titles the success toast "Saved" under en', async () => {
+    expect(await savedToastTitle('en')).toBe('Saved');
+  });
+
+  it('titles the success toast with the fr catalog string under fr', async () => {
+    const title = await savedToastTitle('fr');
+
+    expect(title).not.toBe('Saved');
+    expect(Object.values(fr)).toContain(title);
   });
 });
