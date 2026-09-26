@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { t } from '@/i18n';
 </script>
 
 <template>
@@ -7,7 +8,7 @@
       <span class="dot" />
       <span class="dot" />
       <span class="dot" />
-      <span class="thinking-label caption">admino is working&hellip;</span>
+      <span class="thinking-label caption">{{ t('chat.thinking') }}</span>
     </div>
   </div>
 </template>

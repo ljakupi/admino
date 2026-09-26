@@ -7,14 +7,19 @@
  * thread is a fresh start, so it rotates (and persists) the session id and
  * every later request uses the new one. Issue #15 removes the Activity page,
  * so the store no longer exposes the `toolCallHistory` getter that only that
- * page used. The tests read tool calls straight from `thread` instead. The
+ * page used. The tests read tool calls straight from `thread` instead. Issue
+ * #144 translates the UI: toast copy comes from the i18n catalogs, so it
+ * follows the active locale (asserted as "English under en, a different
+ * de-catalog string under de", without depending on the German wording). The
  * network layer (`@/api/messages`) is mocked; error cases use the real
  * `ApiError` class.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
 import { postMessage, confirmDecision } from '@/api/messages';
 import { ApiError } from '@/api/client';
+import { setLocale } from '@/i18n';
+import { de } from '@/i18n/locales/de';
 import { useChatStore } from '@/stores/chat';
 import { useConnectionStore } from '@/stores/connection';
 import { useSettingsStore } from '@/stores/settings';
@@ -186,6 +191,10 @@ beforeEach(() => {
   mockedConfirmDecision.mockReset();
   // The connection store starts 'offline' and ignores setters while offline.
   useConnectionStore().state = 'idle';
+});
+
+afterEach(() => {
+  setLocale('en');
 });
 
 // --- Send flow ------------------------------------------------------------
@@ -652,6 +661,31 @@ describe('chatStore sendMessage errors', () => {
 
     expect(useConnectionStore().state).toBe('offline');
     expect(toastKinds()).toContain('error');
+  });
+});
+
+// --- Toast copy follows the locale (issue #144) --------------------------
+
+describe('chatStore toast copy follows the locale', () => {
+  /** Title of the warning toast a rate-limited send produces under `locale`. */
+  async function rateLimitedToastTitle(locale: string): Promise<string | undefined> {
+    setLocale(locale);
+    mockedPostMessage.mockRejectedValueOnce(new ApiError(429, 'Too Many Requests'));
+
+    await useChatStore().sendMessage('Hello');
+
+    return useToastStore().toasts.find((toast) => toast.kind === 'warning')?.title;
+  }
+
+  it('titles the 429 toast "Slow down" under en', async () => {
+    expect(await rateLimitedToastTitle('en')).toBe('Slow down');
+  });
+
+  it('titles the 429 toast with the de catalog string under de', async () => {
+    const title = await rateLimitedToastTitle('de');
+
+    expect(title).not.toBe('Slow down');
+    expect(Object.values(de)).toContain(title);
   });
 });
 

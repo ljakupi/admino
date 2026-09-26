@@ -4,6 +4,7 @@ import StatusDot from './StatusDot.vue';
 import IconButton from './IconButton.vue';
 import { useConnectionStore } from '@/stores/connection';
 import { useChatStore } from '@/stores/chat';
+import { t } from '@/i18n';
 import { ref } from 'vue';
 
 const connection = useConnectionStore();
@@ -23,16 +24,16 @@ function clearChat() {
       <StatusDot :state="connection.state" />
     </div>
     <div class="header-actions desktop-only">
-      <IconButton aria-label="Clear chat" @click="clearChat">
+      <IconButton :aria-label="t('chat.header.clearChat')" @click="clearChat">
         <Trash2 :size="18" :stroke-width="1.75" />
       </IconButton>
     </div>
     <div class="header-actions mobile-only">
-      <IconButton aria-label="Menu" @click="showMobileMenu = !showMobileMenu">
+      <IconButton :aria-label="t('chat.header.menu')" @click="showMobileMenu = !showMobileMenu">
         <MoreVertical :size="18" :stroke-width="1.75" />
       </IconButton>
       <div v-if="showMobileMenu" class="dropdown" @click="showMobileMenu = false">
-        <button class="dropdown-item" @click="clearChat">Clear chat</button>
+        <button class="dropdown-item" @click="clearChat">{{ t('chat.header.clearChat') }}</button>
       </div>
     </div>
   </header>

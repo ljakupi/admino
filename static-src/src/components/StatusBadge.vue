@@ -1,17 +1,20 @@
 <script setup lang="ts">
 import { Lock } from 'lucide-vue-next';
+import { useI18n, type MessageKey } from '@/i18n';
+
+const { t } = useI18n();
 
 const props = defineProps<{
   status: 'approved' | 'denied' | 'pending' | 'hardcoded-deny' | 'allowed' | 'confirm';
 }>();
 
-const labelMap: Record<string, string> = {
-  approved: 'Approved',
-  denied: 'Denied',
-  pending: 'Awaiting approval',
-  'hardcoded-deny': 'Hardcoded deny',
-  allowed: 'Allowed',
-  confirm: 'Requires approval',
+const labelKeys: Record<typeof props.status, MessageKey> = {
+  approved: 'statusBadge.approved',
+  denied: 'statusBadge.denied',
+  pending: 'statusBadge.pending',
+  'hardcoded-deny': 'statusBadge.hardcodedDeny',
+  allowed: 'statusBadge.allowed',
+  confirm: 'statusBadge.confirm',
 };
 
 /** Map status to badge variant class */
@@ -29,7 +32,7 @@ const variantMap: Record<string, string> = {
   <span class="badge" :class="variantMap[props.status]">
     <Lock v-if="props.status === 'hardcoded-deny'" :size="12" :stroke-width="2" class="lock-icon" />
     <span v-else class="dot" />
-    {{ labelMap[props.status] }}
+    {{ t(labelKeys[props.status]) }}
   </span>
 </template>
 

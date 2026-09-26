@@ -3,6 +3,9 @@ import { ref, computed, onMounted } from 'vue';
 import { usePermissionsStore } from '@/stores/permissions';
 import ToolRow from '@/components/ToolRow.vue';
 import type { PermissionState } from '@/api/types';
+import { useI18n } from '@/i18n';
+
+const { t } = useI18n();
 
 const store = usePermissionsStore();
 
@@ -34,46 +37,48 @@ onMounted(() => store.loadPermissions());
     <div class="page-content">
       <div class="toolbar">
         <div>
-          <h2 class="title">Permissions</h2>
-          <div class="subtitle">{{ toolCount }} tools · {{ actionCount }} actions</div>
+          <h2 class="title">{{ t('nav.permissions') }}</h2>
+          <div class="subtitle">
+            {{ t('permissions.page.toolCount', { count: toolCount }) }} · {{ t('permissions.page.actionCount', { count: actionCount }) }}
+          </div>
         </div>
         <div class="filters" role="tablist">
           <button
             :class="['filter-btn', activeFilter === 'all' && 'on']"
             @click="activeFilter = 'all'"
           >
-            All <span class="count">{{ statusCounts.all }}</span>
+            {{ t('permissions.filter.all') }} <span class="count">{{ statusCounts.all }}</span>
           </button>
           <button
             :class="['filter-btn', activeFilter === 'allow' && 'on', 'is-allow']"
             @click="activeFilter = 'allow'"
           >
-            Allowed <span class="count">{{ statusCounts.allow }}</span>
+            {{ t('permissionState.allow') }} <span class="count">{{ statusCounts.allow }}</span>
           </button>
           <button
             :class="['filter-btn', activeFilter === 'confirm' && 'on', 'is-approve']"
             @click="activeFilter = 'confirm'"
           >
-            Needs approval <span class="count">{{ statusCounts.confirm }}</span>
+            {{ t('permissionState.confirm') }} <span class="count">{{ statusCounts.confirm }}</span>
           </button>
           <button
             :class="['filter-btn', activeFilter === 'deny' && 'on', 'is-deny']"
             @click="activeFilter = 'deny'"
           >
-            Denied <span class="count">{{ statusCounts.deny }}</span>
+            {{ t('permissionState.deny') }} <span class="count">{{ statusCounts.deny }}</span>
           </button>
         </div>
       </div>
 
       <!-- Loading state -->
       <div v-if="store.loading" class="loading-state">
-        Loading permissions...
+        {{ t('permissions.page.loading') }}
       </div>
 
       <!-- Error state -->
       <div v-else-if="store.error" class="error-state">
         <p>{{ store.error }}</p>
-        <button @click="store.loadPermissions()">Retry</button>
+        <button @click="store.loadPermissions()">{{ t('common.retry') }}</button>
       </div>
 
       <!-- Permissions list -->
@@ -134,6 +139,9 @@ onMounted(() => store.loadPermissions());
 
 .filters {
   display: inline-flex;
+  /* Longer DE/FR labels must wrap, not push filters off a phone screen. */
+  flex-wrap: wrap;
+  max-width: 100%;
   gap: 4px;
   padding: 3px;
   background: #FFFFFF;

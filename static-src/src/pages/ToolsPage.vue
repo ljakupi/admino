@@ -9,7 +9,9 @@ import ConfirmSheet from '@/components/ConfirmSheet.vue';
 import { useSettingsStore } from '@/stores/settings';
 import { useToastStore } from '@/stores/toasts';
 import type { ToolsSettings } from '@/api/types';
+import { useI18n, type MessageKey } from '@/i18n';
 
+const { t } = useI18n();
 const router = useRouter();
 const settings = useSettingsStore();
 const toasts = useToastStore();
@@ -26,18 +28,21 @@ onMounted(async () => {
     sessionStorage.removeItem('oauth_pending');
     if (oauthResult === 'success') {
       await router.replace({ path: '/tools' });
-      toasts.add('success', 'Account connected', 'Your account has been linked successfully.');
+      toasts.add('success', t('toolsPage.oauth.connected.title'), t('toolsPage.oauth.connected.body'));
     } else if (oauthResult === 'error') {
-      const REASON_MESSAGES: Record<string, string> = {
-        denied: 'You declined the consent screen.',
-        invalid_state: 'Session expired. Please try again.',
-        missing_code: 'No authorization code received.',
-        exchange_failed: 'Token exchange failed. Check OAuth credentials.',
+      const REASON_KEYS: Record<string, MessageKey> = {
+        denied: 'toolsPage.oauth.reason.denied',
+        invalid_state: 'toolsPage.oauth.reason.invalidState',
+        missing_code: 'toolsPage.oauth.reason.missingCode',
+        exchange_failed: 'toolsPage.oauth.reason.exchangeFailed',
       };
+      // `reason` comes from the URL: own keys only, never an inherited property.
       const reason = params.get('reason') || '';
-      const message = REASON_MESSAGES[reason] ?? 'An unexpected error occurred.';
+      const messageKey: MessageKey = Object.hasOwn(REASON_KEYS, reason)
+        ? REASON_KEYS[reason]
+        : 'toolsPage.oauth.reason.unexpected';
       await router.replace({ path: '/tools' });
-      toasts.add('error', 'Connection failed', message);
+      toasts.add('error', t('toast.settings.connectionFailed.title'), t(messageKey));
     }
   } else if (oauthResult) {
     // Strip stale or crafted oauth params without showing a toast
@@ -52,16 +57,23 @@ const serviceIconMap: Record<string, typeof Mail> = {
   folder: Folder,
 };
 
-const googleServices = [
-  { id: 'gmail', icon: 'mail', name: 'Gmail', toolKey: 'gmail' as keyof ToolsSettings },
-  { id: 'calendar', icon: 'calendar', name: 'Google Calendar', toolKey: 'google_calendar' as keyof ToolsSettings },
-  { id: 'drive', icon: 'folder', name: 'Google Drive', toolKey: 'google_drive' as keyof ToolsSettings },
+interface ServiceDef {
+  id: string;
+  icon: string;
+  nameKey: MessageKey;
+  toolKey: keyof ToolsSettings;
+}
+
+const googleServices: ServiceDef[] = [
+  { id: 'gmail', icon: 'mail', nameKey: 'tools.gmail.label', toolKey: 'gmail' },
+  { id: 'calendar', icon: 'calendar', nameKey: 'tools.googleCalendar.label', toolKey: 'google_calendar' },
+  { id: 'drive', icon: 'folder', nameKey: 'tools.googleDrive.label', toolKey: 'google_drive' },
 ];
 
-const microsoftServices = [
-  { id: 'outlook', icon: 'mail', name: 'Outlook Mail', toolKey: 'outlook' as keyof ToolsSettings },
-  { id: 'outlookc', icon: 'calendar', name: 'Outlook Calendar', toolKey: 'outlook_calendar' as keyof ToolsSettings },
-  { id: 'onedrive', icon: 'folder', name: 'OneDrive', toolKey: 'onedrive' as keyof ToolsSettings },
+const microsoftServices: ServiceDef[] = [
+  { id: 'outlook', icon: 'mail', nameKey: 'toolsPage.service.outlookMail', toolKey: 'outlook' },
+  { id: 'outlookc', icon: 'calendar', nameKey: 'tools.outlookCalendar.label', toolKey: 'outlook_calendar' },
+  { id: 'onedrive', icon: 'folder', nameKey: 'tools.onedrive.label', toolKey: 'onedrive' },
 ];
 
 // Derive toggle state from store
@@ -88,8 +100,8 @@ function onMicrosoftServiceToggle(serviceId: string, enabled: boolean) {
 }
 
 // --- Local tools metadata ---
-const LOCAL_TOOLS: { id: keyof ToolsSettings; name: string; description: string; icon: typeof Mail }[] = [
-  { id: 'memory', name: 'Memory', description: 'Persistent key-value notes', icon: Brain },
+const LOCAL_TOOLS: { id: keyof ToolsSettings; nameKey: MessageKey; descriptionKey: MessageKey; icon: typeof Mail }[] = [
+  { id: 'memory', nameKey: 'tools.memory.label', descriptionKey: 'toolsPage.memory.description', icon: Brain },
 ];
 
 function onLocalToolToggle(toolId: keyof ToolsSettings, enabled: boolean) {
@@ -132,20 +144,20 @@ async function confirmDisconnect() {
 <template>
   <div class="tools-page">
     <header class="page-header">
-      <h1>Tools</h1>
+      <h1>{{ t('nav.tools') }}</h1>
     </header>
 
     <div class="page-content">
       <div v-if="settings.loading" class="loading-overlay">
-        <span class="loading-spinner" aria-label="Loading" />
+        <span class="loading-spinner" :aria-label="t('common.loading')" />
       </div>
 
       <div v-else class="tools-inner">
         <!-- ── Connected accounts ── -->
         <section class="tools-section">
           <div class="section-head">
-            <h2 class="section-title">Connected accounts</h2>
-            <p class="section-sub">Connect a provider once. Toggle individual services any time.</p>
+            <h2 class="section-title">{{ t('toolsPage.accounts.title') }}</h2>
+            <p class="section-sub">{{ t('toolsPage.accounts.subtitle') }}</p>
           </div>
 
           <!-- Google card -->
@@ -157,7 +169,7 @@ async function confirmDisconnect() {
                   Google
                   <span class="pill" :class="googleConnected ? 'leaf' : 'amber'">
                     <span class="pill-dot" />
-                    {{ googleConnected ? 'Connected' : 'Not connected' }}
+                    {{ googleConnected ? t('toolsPage.status.connected') : t('toolsPage.status.notConnected') }}
                   </span>
                 </div>
                 <div class="provider-meta">
@@ -165,7 +177,7 @@ async function confirmDisconnect() {
                     {{ settings.connectedAccounts.google.email }}
                   </template>
                   <template v-else>
-                    Connect to use Gmail, Google Calendar, Google Drive.
+                    {{ t('toolsPage.google.connectHint') }}
                   </template>
                 </div>
               </div>
@@ -175,11 +187,11 @@ async function confirmDisconnect() {
                   class="s-btn danger small"
                   @click="disconnectTarget = 'google'"
                 >
-                  Disconnect
+                  {{ t('toolsPage.disconnect') }}
                 </button>
                 <button v-else class="s-btn primary small" @click="connectGoogle">
                   <Link :size="13" :stroke-width="2" />
-                  Connect
+                  {{ t('toolsPage.connect') }}
                 </button>
               </div>
             </div>
@@ -187,7 +199,7 @@ async function confirmDisconnect() {
               <div v-for="svc in googleServices" :key="svc.id" class="service-row">
                 <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
-                  <span class="service-name">{{ svc.name }}</span>
+                  <span class="service-name">{{ t(svc.nameKey) }}</span>
                 </div>
                 <BaseToggle
                   :model-value="googleServiceToggles[svc.id]"
@@ -206,7 +218,7 @@ async function confirmDisconnect() {
                   Microsoft
                   <span class="pill" :class="microsoftConnected ? 'leaf' : 'amber'">
                     <span class="pill-dot" />
-                    {{ microsoftConnected ? 'Connected' : 'Not connected' }}
+                    {{ microsoftConnected ? t('toolsPage.status.connected') : t('toolsPage.status.notConnected') }}
                   </span>
                 </div>
                 <div class="provider-meta">
@@ -214,7 +226,7 @@ async function confirmDisconnect() {
                     {{ settings.connectedAccounts.microsoft.email }}
                   </template>
                   <template v-else>
-                    Connect to use Outlook Mail, Outlook Calendar, OneDrive.
+                    {{ t('toolsPage.microsoft.connectHint') }}
                   </template>
                 </div>
               </div>
@@ -224,11 +236,11 @@ async function confirmDisconnect() {
                   class="s-btn danger small"
                   @click="disconnectTarget = 'microsoft'"
                 >
-                  Disconnect
+                  {{ t('toolsPage.disconnect') }}
                 </button>
                 <button v-else class="s-btn primary small" @click="connectMicrosoft">
                   <Link :size="13" :stroke-width="2" />
-                  Connect
+                  {{ t('toolsPage.connect') }}
                 </button>
               </div>
             </div>
@@ -236,7 +248,7 @@ async function confirmDisconnect() {
               <div v-for="svc in microsoftServices" :key="svc.id" class="service-row">
                 <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
-                  <span class="service-name">{{ svc.name }}</span>
+                  <span class="service-name">{{ t(svc.nameKey) }}</span>
                 </div>
                 <BaseToggle
                   :model-value="microsoftServiceToggles[svc.id]"
@@ -250,16 +262,16 @@ async function confirmDisconnect() {
         <!-- ── Local tools ── -->
         <section class="tools-section">
           <div class="section-head">
-            <h2 class="section-title">Local tools</h2>
-            <p class="section-sub">Tools that run entirely on your machine.</p>
+            <h2 class="section-title">{{ t('toolsPage.local.title') }}</h2>
+            <p class="section-sub">{{ t('toolsPage.local.subtitle') }}</p>
           </div>
 
           <div class="local-tools">
             <div v-for="tool in LOCAL_TOOLS" :key="tool.id" class="local-tool-row">
               <component :is="tool.icon" class="local-tool-icon" :size="20" :stroke-width="1.75" />
               <div class="local-tool-info">
-                <span class="local-tool-name">{{ tool.name }}</span>
-                <span class="local-tool-desc">{{ tool.description }}</span>
+                <span class="local-tool-name">{{ t(tool.nameKey) }}</span>
+                <span class="local-tool-desc">{{ t(tool.descriptionKey) }}</span>
               </div>
               <BaseToggle
                 :model-value="settings.tools[tool.id]"
@@ -273,9 +285,9 @@ async function confirmDisconnect() {
 
     <ConfirmSheet
       v-if="disconnectTarget"
-      :heading="`Disconnect ${disconnectTarget === 'google' ? 'Google' : 'Microsoft'}?`"
-      subtext="This will revoke the OAuth refresh token. You can reconnect at any time."
-      confirm-label="Disconnect"
+      :heading="t('toolsPage.disconnectConfirm.heading', { provider: disconnectTarget === 'google' ? 'Google' : 'Microsoft' })"
+      :subtext="t('toolsPage.disconnectConfirm.subtext')"
+      :confirm-label="t('toolsPage.disconnect')"
       variant="destructive"
       @confirm="confirmDisconnect"
       @cancel="disconnectTarget = null"

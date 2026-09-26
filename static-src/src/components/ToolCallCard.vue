@@ -4,6 +4,9 @@ import StatusBadge from './StatusBadge.vue';
 import BaseButton from './BaseButton.vue';
 import type { ToolCallUI } from '@/api/types';
 import { ref, computed } from 'vue';
+import { useI18n } from '@/i18n';
+
+const { t } = useI18n();
 
 const props = defineProps<{
   toolCall: ToolCallUI;
@@ -80,12 +83,12 @@ function formatValue(val: unknown): string {
     <div v-if="isPending" class="tool-actions">
       <button class="btn approve" @click="emit('approve')">
         <Check :size="16" :stroke-width="2" />
-        Approve
+        {{ t('toolCall.approve') }}
         <kbd class="shortcut">&#8984;&#9166;</kbd>
       </button>
       <button class="btn deny" @click="emit('deny')">
         <X :size="16" :stroke-width="2" />
-        Deny
+        {{ t('toolCall.deny') }}
         <kbd class="shortcut">Esc</kbd>
       </button>
     </div>
@@ -98,13 +101,13 @@ function formatValue(val: unknown): string {
 
     <!-- Result footer (completed/approved) -->
     <div v-if="isCompleted" class="result-footer">
-      <span v-if="props.toolCall.resultCount != null" class="result-ok">{{ props.toolCall.resultCount }} results</span>
+      <span v-if="props.toolCall.resultCount != null" class="result-ok">{{ t('toolCall.resultCount', { count: props.toolCall.resultCount }) }}</span>
       <span v-if="props.toolCall.resultCount != null && props.toolCall.durationMs != null" class="result-sep">&middot;</span>
       <span v-if="props.toolCall.durationMs != null">{{ props.toolCall.durationMs }} ms</span>
       <template v-if="props.toolCall.result">
         <button class="expand-toggle" @click="expanded = !expanded">
           <component :is="expanded ? ChevronUp : ChevronDown" :size="14" />
-          {{ expanded ? 'Hide' : 'Details' }}
+          {{ expanded ? t('toolCall.hideDetails') : t('toolCall.showDetails') }}
         </button>
       </template>
     </div>

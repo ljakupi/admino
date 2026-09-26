@@ -4,10 +4,15 @@
  * `@/services/llmProviders` holds the provider logic the Settings → Agent page
  * used to compute inline: the model dropdown options (served/listed models plus
  * the configured one), the user-facing provider labels, and the trust note that
- * replaces the no-longer-true "stay on this machine" copy. These tests assert
- * on the returned values only, never on how a component shows them.
+ * replaces the no-longer-true "stay on this machine" copy. Issue #144
+ * translates the UI: the trust note comes from the i18n catalogs and follows
+ * the active locale (still naming the provider), while provider labels are
+ * brand names and stay untranslated. These tests assert on the returned
+ * values only, never on how a component shows them.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { setLocale } from '@/i18n';
+import type { Locale } from '@/i18n/core';
 import { modelOptions, providerLabel, trustNote } from '@/services/llmProviders';
 import type { LLMProviderName } from '@/api/types';
 
@@ -23,6 +28,17 @@ const LABELS: ReadonlyArray<[LLMProviderName, string]> = [
 ];
 
 const PROVIDERS: readonly LLMProviderName[] = LABELS.map(([provider]) => provider);
+
+const TRANSLATIONS: readonly Locale[] = ['de', 'fr'];
+
+/** Every (locale, provider, label) combination for the translated locales. */
+const TRANSLATED_LABELS: ReadonlyArray<[Locale, LLMProviderName, string]> = TRANSLATIONS.flatMap(
+  (locale) => LABELS.map(([provider, label]): [Locale, LLMProviderName, string] => [locale, provider, label]),
+);
+
+afterEach(() => {
+  setLocale('en');
+});
 
 describe('llmProviders modelOptions', () => {
   it('prepends the configured model when the list does not contain it', () => {
@@ -85,5 +101,34 @@ describe('llmProviders trustNote', () => {
 
   it.each(PROVIDERS)('does not claim data stays on this machine for %s', (provider) => {
     expect(trustNote(provider)).not.toMatch(/stays? on this machine/i);
+  });
+});
+
+describe('llmProviders copy follows the locale (issue #144)', () => {
+  it.each(TRANSLATED_LABELS)(
+    'the %s trust note names %s by its label %s, with no raw placeholder',
+    (locale, provider, label) => {
+      setLocale(locale);
+
+      const note = trustNote(provider);
+
+      expect(note).toContain(label);
+      expect(note).not.toMatch(/\{[A-Za-z_][A-Za-z0-9_]*\}/);
+    },
+  );
+
+  it.each(PROVIDERS)('the de trust note for %s differs from the en one', (provider) => {
+    setLocale('en');
+    const english = trustNote(provider);
+
+    setLocale('de');
+
+    expect(trustNote(provider)).not.toBe(english);
+  });
+
+  it.each(TRANSLATED_LABELS)('keeps the %s label of %s as the brand name %s', (locale, provider, label) => {
+    setLocale(locale);
+
+    expect(providerLabel(provider)).toBe(label);
   });
 });

@@ -58,8 +58,27 @@ All of these are enforced by CI and are non-negotiable:
 - Every module has a docstring covering purpose, inputs, outputs, and security notes.
 - Keep modules small, focused, and single-responsibility. No dead code, no
   speculative abstractions.
-- **Frontend:** Vue 3 + TypeScript in `static-src/`; `npm run typecheck`,
-  `npm run test`, and `npm run build` must pass.
+- **Frontend:** Vue 3 + TypeScript in `static-src/`; `npm run check:i18n`,
+  `npm run typecheck`, `npm run test`, and `npm run build` must pass.
+- **UI strings (i18n):** the PWA ships in English, German and French through the
+  in-house module in `static-src/src/i18n/`. Every user-facing string — page and
+  component text, `aria-label`/`title`/`placeholder`/`alt`, toasts, empty states and
+  frontend error messages — goes through `t('key')` (or `useI18n()`), never a
+  hardcoded literal. There is no lint rule for this, so reviewers check it.
+  - Add the key to `src/i18n/locales/en.ts` (the source catalog) **and** to `de.ts`
+    and `fr.ts`, with the same `{placeholder}` names. Keys are flat and dotted,
+    grouped by area (`chat.*`, `settings.*`, …). Values are string literals or plural
+    objects (`{ one: '{count} tool', other: '{count} tools' }`, picked with
+    `t(key, { count })` via `Intl.PluralRules`) — no template literals or expressions.
+  - German is Swiss Standard German (no "ß", formal "Sie"); French uses the formal
+    "vous". New or changed translations get a native-speaker review before release.
+  - Sentences with inline markup stay one message with `{slot}` placeholders,
+    rendered through `<I18nT>` and named slots. Never use `v-html` for translations.
+  - Don't translate brand names, technical identifiers (tool/action ids, env vars,
+    model ids, commands) or backend/LLM content. Format dates, numbers and CHF with
+    `formatDate` / `formatNumber` / `formatChf` (Swiss `*-CH` locales).
+  - `npm run check:i18n` (run in CI) fails when the catalogs' keys or placeholders
+    differ.
 
 ### Banned dependencies
 
@@ -100,6 +119,7 @@ make check              # lint + format-check + typecheck + tests
 - For frontend changes, additionally from `static-src/`:
 
   ```bash
+  npm run check:i18n  # en/de/fr catalogs have identical keys and placeholders
   npm run typecheck
   npm run test        # Vitest logic tests: stores, composables, services, API clients
   npm run build

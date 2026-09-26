@@ -3,6 +3,7 @@ import { useRoute } from 'vue-router';
 import { computed } from 'vue';
 import { useChatStore } from '@/stores/chat';
 import { NAV_ITEMS } from '@/services/navigation';
+import { t } from '@/i18n';
 
 const route = useRoute();
 const chatStore = useChatStore();
@@ -15,7 +16,7 @@ const navItems = NAV_ITEMS;
 </script>
 
 <template>
-  <nav class="nav-rail" aria-label="Main navigation">
+  <nav class="nav-rail" :aria-label="t('nav.mainNavigation')">
     <div class="nav-logo">a</div>
     <div class="nav-items">
       <RouterLink
@@ -24,8 +25,8 @@ const navItems = NAV_ITEMS;
         :to="item.to"
         class="nav-item"
         :class="{ active: route.path === item.to }"
-        :aria-label="item.label"
-        :title="item.label"
+        :aria-label="t(item.labelKey)"
+        :title="t(item.labelKey)"
       >
         <span class="nav-icon-wrap">
           <component :is="item.icon" :size="20" :stroke-width="1.75" />

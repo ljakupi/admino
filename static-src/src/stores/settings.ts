@@ -2,6 +2,7 @@ import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
 import { getSettings, patchSettings, getOAuthAuthorizeUrl, disconnectOAuth } from '@/api/settings';
 import { useToastStore } from '@/stores/toasts';
+import { t } from '@/i18n';
 import type {
   SettingsResponse,
   SettingsPatch,
@@ -151,7 +152,7 @@ export const useSettingsStore = defineStore('settings', () => {
       const data = await getSettings();
       applyResponse(data);
     } catch (e) {
-      error.value = e instanceof Error ? e.message : 'Failed to load settings';
+      error.value = e instanceof Error ? e.message : t('settings.error.loadFailed');
     } finally {
       loading.value = false;
     }
@@ -162,10 +163,10 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       const data = await patchSettings(patch);
       applyResponse(data);
-      toasts.add('success', 'Saved');
+      toasts.add('success', t('toast.common.saved'));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to save settings';
-      toasts.add('error', 'Save failed', msg);
+      const msg = e instanceof Error ? e.message : t('settings.error.saveFailed');
+      toasts.add('error', t('toast.common.saveFailed.title'), msg);
       throw e;
     }
   }
@@ -214,14 +215,14 @@ export const useSettingsStore = defineStore('settings', () => {
       const { url } = await getOAuthAuthorizeUrl('google');
       const parsed = new URL(url);
       if (parsed.protocol !== 'https:') {
-        toasts.add('error', 'Connection failed', 'Unexpected OAuth redirect URL.');
+        toasts.add('error', t('toast.settings.connectionFailed.title'), t('settings.error.unexpectedRedirect'));
         return;
       }
       sessionStorage.setItem('oauth_pending', 'google');
       window.location.href = url;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
-      toasts.add('error', 'Connection failed', msg);
+      const msg = e instanceof Error ? e.message : t('settings.error.oauthStartFailed');
+      toasts.add('error', t('toast.settings.connectionFailed.title'), msg);
     }
   }
 
@@ -231,14 +232,14 @@ export const useSettingsStore = defineStore('settings', () => {
       const { url } = await getOAuthAuthorizeUrl('microsoft');
       const parsed = new URL(url);
       if (parsed.protocol !== 'https:') {
-        toasts.add('error', 'Connection failed', 'Unexpected OAuth redirect URL.');
+        toasts.add('error', t('toast.settings.connectionFailed.title'), t('settings.error.unexpectedRedirect'));
         return;
       }
       sessionStorage.setItem('oauth_pending', 'microsoft');
       window.location.href = url;
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to start OAuth flow';
-      toasts.add('error', 'Connection failed', msg);
+      const msg = e instanceof Error ? e.message : t('settings.error.oauthStartFailed');
+      toasts.add('error', t('toast.settings.connectionFailed.title'), msg);
     }
   }
 
@@ -247,10 +248,10 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       await disconnectOAuth('google');
       await loadSettings();
-      toasts.add('success', 'Google disconnected');
+      toasts.add('success', t('toast.settings.googleDisconnected'));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to disconnect';
-      toasts.add('error', 'Disconnect failed', msg);
+      const msg = e instanceof Error ? e.message : t('settings.error.disconnectFailed');
+      toasts.add('error', t('toast.settings.disconnectFailed.title'), msg);
     }
   }
 
@@ -259,10 +260,10 @@ export const useSettingsStore = defineStore('settings', () => {
     try {
       await disconnectOAuth('microsoft');
       await loadSettings();
-      toasts.add('success', 'Microsoft disconnected');
+      toasts.add('success', t('toast.settings.microsoftDisconnected'));
     } catch (e) {
-      const msg = e instanceof Error ? e.message : 'Failed to disconnect';
-      toasts.add('error', 'Disconnect failed', msg);
+      const msg = e instanceof Error ? e.message : t('settings.error.disconnectFailed');
+      toasts.add('error', t('toast.settings.disconnectFailed.title'), msg);
     }
   }
 

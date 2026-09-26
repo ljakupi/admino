@@ -45,6 +45,9 @@ jobs:
       - name: Install dependencies
         working-directory: static-src
         run: npm ci
+      - name: Check translations
+        working-directory: static-src
+        run: npm run check:i18n
       - name: Type check
         working-directory: static-src
         run: npm run typecheck

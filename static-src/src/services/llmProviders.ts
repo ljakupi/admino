@@ -1,10 +1,13 @@
 /**
- * LLM provider display/logic helpers for the Settings → Agent page (issue #142).
+ * LLM provider display/logic helpers for the Settings → Agent page (issue #142;
+ * issue #144: the trust note follows the active locale).
  *
  * Framework-free so it stays unit-testable: model dropdown options, the
  * user-facing provider label, and the trust note shown for the active
- * provider. Never mutates its inputs.
+ * provider. Never mutates its inputs. Provider labels are brand names and
+ * stay untranslated; the trust note comes from the i18n catalogs.
  */
+import { t } from '@/i18n';
 import type { LLMProviderName } from '@/api/types';
 
 /**
@@ -45,6 +48,5 @@ export function providerLabel(provider: LLMProviderName): string {
  * the only local option, and even it runs as a separate opt-in process.
  */
 export function trustNote(provider: LLMProviderName): string {
-  const label = providerLabel(provider);
-  return `Settings, audit log, and memory are stored on your admino server. Only ${label} processes the conversation content.`;
+  return t('settings.agent.trustNote', { provider: providerLabel(provider) });
 }
