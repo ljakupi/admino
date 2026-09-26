@@ -66,6 +66,25 @@ CREATE TABLE users (
         CHECK (email !~ '[[:space:]]' AND position('@' in email) > 1)
 );
 
+-- kind and org_id never change after insert: no UPDATE, buggy or injected, can
+-- turn a member into a Super Admin, strip a member's org, or move a user into
+-- another org. BEFORE UPDATE with no column list, so no UPDATE form skips it.
+-- The error message carries no row data.
+CREATE FUNCTION users_identity_is_immutable() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.kind IS DISTINCT FROM OLD.kind OR NEW.org_id IS DISTINCT FROM OLD.org_id THEN
+        RAISE EXCEPTION 'users.kind and users.org_id can''t change'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER users_identity_is_immutable
+    BEFORE UPDATE ON users
+    FOR EACH ROW EXECUTE FUNCTION users_identity_is_immutable();
+
 -- Email uniqueness is case-insensitive and platform-wide (across all orgs and
 -- Super Admins): Alice@Example.com and alice@example.com can't both exist.
 CREATE UNIQUE INDEX users_email_lower_key ON users (lower(email));

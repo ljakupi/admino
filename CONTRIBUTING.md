@@ -145,6 +145,10 @@ Review these before every change; violations block the PR:
 - **Access-policy isolation.** `access.py` encodes the role matrix as pure functions
   (`can(principal, capability)`): no I/O, and no imports from `agent.py`, `llm*.py`,
   `server.py` or the database layer. It stays separate from the tool permission engine.
+  A `Principal` is built only by trusted server code from the session's `users` row, never
+  from request data; `can()` denies any principal that isn't well formed, and
+  `model_construct()` / `model_copy(update=...)` are disabled. `users.kind` and
+  `users.org_id` can't change after insert (a database trigger enforces it).
 - **Tenant scoping.** Every repository function for organization content takes a
   `TenantContext` (`tenancy.py`) and filters by its `org_id`; there's no unscoped
   content query. Super Admins never get a `TenantContext`, so they can't reach content.

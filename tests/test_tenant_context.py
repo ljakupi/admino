@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
@@ -30,6 +30,9 @@ import admino.database as database_mod
 import admino.tenancy as tenancy_mod
 from admino.access import Principal
 from admino.tenancy import NoTenantContextError, TenantContext
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _MEMBER_ROLES: tuple[str, ...] = ("org_admin", "editor", "viewer")
 
@@ -157,6 +160,117 @@ class TestTenantContextFromPrincipal:
         """The SA refusal is its own error type, so routes can't mistake it for bad input."""
         assert issubclass(NoTenantContextError, Exception)
         assert not issubclass(NoTenantContextError, ValidationError)
+
+
+def _forge(principal: Principal, **fields: object) -> Principal:
+    """Overwrite fields of a validated Principal without validation (any bypass's result)."""
+    for name, value in fields.items():
+        object.__setattr__(principal, name, value)
+    return principal
+
+
+def _member(role: str = "editor") -> Principal:
+    """A valid member principal."""
+    return Principal(user_id=uuid4(), kind="member", org_id=uuid4(), role=role)
+
+
+class _PrincipalLookalike:
+    """Duck-typed object with a member's attributes, not a Principal."""
+
+    def __init__(self) -> None:
+        self.user_id = uuid4()
+        self.kind = "member"
+        self.org_id = uuid4()
+        self.role = "org_admin"
+
+
+_FORGED_PRINCIPALS: list[Any] = [
+    pytest.param(
+        lambda: _forge(_member("org_admin"), kind="super_admin"),
+        id="super_admin-kind-with-org-and-role",
+    ),
+    pytest.param(
+        lambda: _forge(Principal(user_id=uuid4(), kind="super_admin"), org_id=uuid4()),
+        id="super_admin-given-an-org",
+    ),
+    pytest.param(lambda: _forge(_member(), role="super_admin"), id="member-role-super_admin"),
+    pytest.param(lambda: _forge(_member(), role=None), id="member-without-role"),
+    pytest.param(lambda: _forge(_member(), org_id=None), id="member-without-org"),
+    pytest.param(lambda: _forge(_member(), kind="root"), id="unknown-kind"),
+    pytest.param(_PrincipalLookalike, id="lookalike-object"),
+]
+
+
+class TestTenantContextFromForgedPrincipal:
+    """from_principal fails closed: only a well-formed member Principal gets an org scope.
+
+    The worst case is a forged Super Admin that still carries an org_id and so
+    reaches that org's content.
+    """
+
+    @pytest.mark.parametrize("forged", _FORGED_PRINCIPALS)
+    def test_tenant_context_forged_principal_gets_no_context(
+        self, forged: Callable[[], Any]
+    ) -> None:
+        """An inconsistent or non-Principal object raises NoTenantContextError."""
+        with pytest.raises(NoTenantContextError):
+            TenantContext.from_principal(forged())
+
+
+class TestTenantContextBypassesBlocked:
+    """The Pydantic APIs that skip validation are disabled on TenantContext."""
+
+    def test_tenant_context_model_construct_is_disabled(self) -> None:
+        """TenantContext.model_construct() raises instead of building an unscoped context."""
+        with pytest.raises(TypeError):
+            TenantContext.model_construct(org_id=None, user_id=uuid4(), role="super_admin")
+
+    def test_tenant_context_model_copy_with_update_is_disabled(self) -> None:
+        """model_copy(update=...) raises: it would re-point the context at another org."""
+        context = TenantContext.from_principal(_member())
+
+        with pytest.raises(TypeError):
+            context.model_copy(update={"org_id": uuid4()})
+
+    def test_tenant_context_plain_copy_still_works(self) -> None:
+        """model_copy() without changes returns an equal context."""
+        context = TenantContext.from_principal(_member())
+
+        assert context.model_copy() == context
+        assert context.model_copy(deep=True) == context
+
+
+def _context_builders(path: Path) -> list[str]:
+    """Return the TenantContext constructions/validations in a source file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "TenantContext":
+            found.append(f"{path.name}:{node.lineno} TenantContext(...)")
+        elif (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "TenantContext"
+            and func.attr.startswith(("model_validate", "model_construct"))
+        ):
+            found.append(f"{path.name}:{node.lineno} TenantContext.{func.attr}(...)")
+    return found
+
+
+class TestTenantContextConstructionSites:
+    """A TenantContext only ever comes from TenantContext.from_principal."""
+
+    def test_tenant_context_is_built_only_by_from_principal(self) -> None:
+        """No src module builds a TenantContext directly (e.g. from a request's org_id)."""
+        src_dir = Path(tenancy_mod.__file__).resolve().parent
+        offenders = [
+            site for path in sorted(src_dir.rglob("*.py")) for site in _context_builders(path)
+        ]
+
+        assert offenders == []
 
 
 # ---------------------------------------------------------------------------

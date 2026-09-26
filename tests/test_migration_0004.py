@@ -469,3 +469,60 @@ class TestMigration0004Indexes:
             r"(?:using btree\s*)?\(\s*org_id\s*\)",
             _migration_sql(),
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Identity columns are immutable (no UPDATE can mint a Super Admin)
+# ---------------------------------------------------------------------------
+
+
+def _immutability_function() -> tuple[str, str]:
+    """Return (name, body) of the trigger function guarding users.kind / users.org_id."""
+    sql = _migration_sql()
+    for match in re.finditer(
+        r"create (?:or replace )?function (\w+)\s*\(\s*\)\s*returns trigger\b(.*?)\$\$\s*;", sql
+    ):
+        if "old.kind" in match.group(2):
+            return match.group(1), match.group(2)
+    pytest.fail(f"no trigger function comparing old.kind in {_MIGRATION_NAME}")
+
+
+class TestMigration0004IdentityImmutable:
+    """users.kind and users.org_id can never change after the row is inserted.
+
+    A BEFORE UPDATE trigger is the database's last line of defense: even a buggy
+    or injected UPDATE can't turn a member into a Super Admin (kind), move a user
+    into another org (org_id), or strip a member's org.
+    """
+
+    def test_migration_0004_kind_change_is_refused(self) -> None:
+        """The trigger function raises when kind changes."""
+        _, body = _immutability_function()
+
+        assert re.search(r"new\.kind is distinct from old\.kind", body)
+        assert "raise exception" in body
+
+    def test_migration_0004_org_id_change_is_refused(self) -> None:
+        """The trigger function raises when org_id changes (NULL to a value and back included)."""
+        _, body = _immutability_function()
+
+        assert re.search(r"new\.org_id is distinct from old\.org_id", body)
+
+    def test_migration_0004_trigger_runs_before_every_update_of_users(self) -> None:
+        """BEFORE UPDATE ON users FOR EACH ROW, with no column list to sidestep."""
+        name, _ = _immutability_function()
+
+        assert re.search(
+            rf"create trigger \w+ before update on users for each row "
+            rf"execute (?:function|procedure) {name}\s*\(\s*\)",
+            _migration_sql(),
+        )
+
+    def test_migration_0004_trigger_error_carries_no_row_data(self) -> None:
+        """No content in errors: the exception message doesn't interpolate NEW/OLD values."""
+        _, body = _immutability_function()
+        raise_stmt = re.search(r"raise exception ([^;]*);", body)
+
+        assert raise_stmt is not None
+        assert "new." not in raise_stmt.group(1)
+        assert "old." not in raise_stmt.group(1)

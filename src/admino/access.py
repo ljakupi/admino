@@ -16,10 +16,17 @@ Security notes:
 - Least privilege: a Viewer is read-only; member roles never get a
   platform-level capability.
 - ``Principal`` mirrors the users-table CHECKs: kind is 'super_admin' iff
-  org_id is None iff role is None. It is frozen, so a role can't be escalated
-  after it is built. Never build one with ``model_construct()`` (it skips the
-  validator; test_models.py forbids it in src/). ``can()`` re-checks kind and
-  role anyway, so a forged role grants nothing.
+  org_id is None iff role is None. It is a ``SealedModel``: frozen, and
+  ``model_construct()`` / ``model_copy(update=...)`` (which skip validation)
+  raise, so a role can't be forged or escalated through Pydantic.
+- Fail closed: ``can()`` doesn't trust that validation ran. ``principal_role``
+  grants a role only to an exact ``Principal`` that is a well-formed Super
+  Admin (no org, no role) or member (a UUID org and a member role). Anything a
+  low-level bypass could leave behind, e.g. kind 'super_admin' with an org,
+  gets nothing.
+- A well-formed Principal passes every check, so only trusted server-side
+  code may build one: #149 builds it from the session's users row, never from
+  request data. tests/test_access.py allowlists the modules that build one.
 - Pure and isolated: no I/O, no logging, and no imports from the server,
   agent, LLM, database, tools, OAuth, audit or permissions modules. The tool
   permission engine (permissions.py) is a separate layer.
@@ -29,23 +36,47 @@ from __future__ import annotations
 
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Final, Literal
-from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
+from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Self
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, model_validator
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 UserKind = Literal["super_admin", "member"]
 MemberRole = Literal["org_admin", "editor", "viewer"]
 
 
-class Principal(BaseModel):
+class SealedModel(BaseModel):
+    """A frozen model that only validation can create or change.
+
+    ``model_construct()`` and ``model_copy(update=...)`` skip validation, so
+    both are disabled: every instance went through its validators.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    @classmethod
+    def model_construct(cls, _fields_set: set[str] | None = None, **values: Any) -> NoReturn:
+        """Refuse to build an instance without validation."""
+        msg = f"{cls.__name__} can only be built through validation."
+        raise TypeError(msg)
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Copy the instance unchanged; changing fields on the way (update=...) is refused."""
+        if update is not None:
+            msg = f"{type(self).__name__} fields can't change; build a new instance."
+            raise TypeError(msg)
+        return super().model_copy(deep=deep)
+
+
+class Principal(SealedModel):
     """The authenticated account an access decision is made for.
 
     A Super Admin belongs to no organization and has no member role; a member
     always belongs to exactly one organization and has exactly one role.
     """
-
-    model_config = ConfigDict(frozen=True, extra="forbid")
 
     user_id: UUID
     kind: UserKind
@@ -159,12 +190,40 @@ _MATRIX: Final[MappingProxyType[Capability, frozenset[str]]] = MappingProxyType(
 )
 
 
+def principal_role(principal: object) -> str | None:
+    """Return the matrix role of a well-formed Principal, or None to deny.
+
+    Doesn't trust that validation ran: only an exact ``Principal`` (not a
+    subclass or lookalike) that is a Super Admin with no org and no role, or a
+    member with a UUID org and a member role, gets a role. Anything else, such
+    as kind 'super_admin' left next to an org or role, gets None.
+
+    Args:
+        principal: The object to classify.
+
+    Returns:
+        "super_admin", "org_admin", "editor" or "viewer"; None for anything else.
+    """
+    if type(principal) is not Principal:
+        return None
+    kind = getattr(principal, "kind", None)
+    org_id = getattr(principal, "org_id", None)
+    role = getattr(principal, "role", None)
+    if type(kind) is not str:
+        return None
+    if kind == "super_admin" and org_id is None and role is None:
+        return "super_admin"
+    if kind == "member" and type(org_id) is UUID and type(role) is str and role in _ALL_MEMBERS:
+        return role
+    return None
+
+
 def can(principal: Principal, capability: Capability) -> bool:
     """Return True when the principal's role is granted the capability.
 
-    Default-deny: a capability missing from the matrix (such as an unknown
-    string) returns False, and so does a principal whose kind or member role
-    isn't a real one (e.g. built with ``model_construct()``).
+    Default-deny, and never raises: only a ``Capability`` member can be granted
+    (a plain string gets False), and only to a well-formed Principal (see
+    ``principal_role``).
 
     Args:
         principal: The account the decision is made for.
@@ -173,10 +232,7 @@ def can(principal: Principal, capability: Capability) -> bool:
     Returns:
         True if the role matrix grants the capability to the principal's role.
     """
-    if principal.kind == "super_admin":
-        role = "super_admin"
-    elif principal.kind == "member" and principal.role in _ALL_MEMBERS:
-        role = principal.role
-    else:
+    if not isinstance(capability, Capability):
         return False
-    return role in _MATRIX.get(capability, frozenset())
+    role = principal_role(principal)
+    return role is not None and role in _MATRIX.get(capability, frozenset())

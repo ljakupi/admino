@@ -25,12 +25,16 @@ import ast
 import inspect
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
 from admino.access import Capability, Principal, can
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # ---------------------------------------------------------------------------
 # Expected role matrix (#139 §2.1), written independently of the implementation
@@ -313,50 +317,169 @@ class TestDefaultDeny:
         assert can(_principal(role), capability) is False  # type: ignore[arg-type]
 
 
-class TestForgedPrincipal:
-    """can() re-checks the member role instead of trusting Principal's validator.
+def _forge(principal: Principal, **fields: object) -> Principal:
+    """Overwrite fields of a validated Principal without validation.
 
-    model_construct() skips validation. Production code never calls it
-    (test_models.py enforces that), but can() must not turn a forged role into a grant.
+    This is the state every validator bypass produces (model_construct(),
+    model_copy(update=...), object.__setattr__, __dict__ writes).
+    """
+    for name, value in fields.items():
+        object.__setattr__(principal, name, value)
+    return principal
+
+
+def _member(role: str = _ED) -> Principal:
+    """A valid member principal."""
+    return Principal(user_id=uuid4(), kind="member", org_id=uuid4(), role=role)
+
+
+def _super_admin() -> Principal:
+    """A valid Super Admin principal."""
+    return Principal(user_id=uuid4(), kind="super_admin")
+
+
+class _PrincipalLookalike:
+    """Duck-typed object with a Super Admin's attributes, not a Principal."""
+
+    def __init__(self) -> None:
+        self.user_id = uuid4()
+        self.kind = "super_admin"
+        self.org_id = None
+        self.role = None
+
+
+class _PrincipalSubclass(Principal):
+    """A Principal subclass: can() only trusts Principal itself."""
+
+
+# Inconsistent principals a bypass can produce. can() must grant none of them anything.
+_FORGED_PRINCIPALS: list[Any] = [
+    pytest.param(
+        lambda: _forge(_member(), kind="super_admin"), id="member-kind-set-to-super_admin"
+    ),
+    pytest.param(
+        lambda: _forge(_member(_OA), kind="super_admin"), id="org_admin-kind-set-to-super_admin"
+    ),
+    pytest.param(
+        lambda: _forge(_member(), kind="super_admin", org_id=None),
+        id="super_admin-kind-with-leftover-role",
+    ),
+    pytest.param(
+        lambda: _forge(_member(), kind="super_admin", role=None),
+        id="super_admin-kind-with-leftover-org",
+    ),
+    pytest.param(lambda: _forge(_super_admin(), org_id=uuid4()), id="super_admin-given-an-org"),
+    pytest.param(lambda: _forge(_super_admin(), role=_OA), id="super_admin-given-a-role"),
+    pytest.param(lambda: _forge(_member(), role="super_admin"), id="member-role-super_admin"),
+    pytest.param(lambda: _forge(_member(), role=None), id="member-without-role"),
+    pytest.param(lambda: _forge(_member(), org_id=None), id="member-without-org"),
+    pytest.param(lambda: _forge(_member(), org_id=str(uuid4())), id="member-org-not-a-uuid"),
+    pytest.param(lambda: _forge(_member(), role="ORG_ADMIN"), id="member-role-wrong-case"),
+    pytest.param(lambda: _forge(_member(), role=["org_admin"]), id="member-role-unhashable"),
+    pytest.param(lambda: _forge(_member(_OA), kind="root"), id="unknown-kind"),
+    pytest.param(lambda: _forge(_super_admin(), kind=None), id="kind-none"),
+    pytest.param(_PrincipalLookalike, id="lookalike-object"),
+    pytest.param(
+        lambda: _PrincipalSubclass(user_id=uuid4(), kind="super_admin"), id="principal-subclass"
+    ),
+    pytest.param(lambda: None, id="none"),
+]
+
+
+class TestForgedPrincipal:
+    """can() fails closed: only an exact, well-formed Principal is granted anything.
+
+    Production code never skips Principal's validator, but if a bypass ever
+    produces an inconsistent principal, can() must deny it everything instead of
+    trusting kind or role. The worst case is a member turned into a Super Admin.
     """
 
+    @pytest.mark.parametrize("forged", _FORGED_PRINCIPALS)
     @pytest.mark.parametrize("capability", list(Capability), ids=lambda c: str(c))
-    def test_access_member_with_forged_super_admin_role_is_denied(
-        self, capability: Capability
+    def test_access_forged_principal_is_denied(
+        self, forged: Callable[[], Any], capability: Capability
     ) -> None:
-        """kind='member' with role='super_admin' gets nothing, not the Super Admin's grants."""
-        forged = Principal.model_construct(
-            user_id=uuid4(), kind="member", org_id=uuid4(), role="super_admin"
-        )
-
-        assert can(forged, capability) is False
+        """An inconsistent or non-Principal object gets no capability, and can() doesn't raise."""
+        assert can(forged(), capability) is False
 
     @pytest.mark.parametrize("capability", list(Capability), ids=lambda c: str(c))
-    def test_access_member_without_role_is_denied(self, capability: Capability) -> None:
-        """A member built without a role gets nothing."""
-        forged = Principal.model_construct(user_id=uuid4(), kind="member", org_id=uuid4())
+    def test_access_plain_string_capability_is_denied(self, capability: Capability) -> None:
+        """Only Capability members grant: the plain string "org.create" gets nothing, even
+        for a role that holds that capability."""
+        for role in _ROLES:
+            assert can(_principal(role), capability.value) is False  # type: ignore[arg-type]
 
-        assert can(forged, capability) is False
+    def test_access_unhashable_capability_is_denied(self) -> None:
+        """A non-string capability returns False instead of raising."""
+        assert can(_super_admin(), ["org.create"]) is False  # type: ignore[arg-type]
 
-    @pytest.mark.parametrize("capability", list(Capability), ids=lambda c: str(c))
-    def test_access_unknown_kind_is_denied(self, capability: Capability) -> None:
-        """An unknown kind gets nothing, even with a real member role."""
-        forged = Principal.model_construct(
-            user_id=uuid4(), kind="root", org_id=uuid4(), role="org_admin"
-        )
 
-        assert can(forged, capability) is False
+class TestPrincipalBypassesBlocked:
+    """The Pydantic APIs that skip validation are disabled on Principal."""
 
-    @pytest.mark.parametrize("capability", list(Capability), ids=lambda c: str(c))
-    def test_access_super_admin_with_forged_org_role_stays_a_super_admin(
-        self, capability: Capability
-    ) -> None:
-        """A Super Admin with a forged org and role still gets only the Super Admin's grants."""
-        forged = Principal.model_construct(
-            user_id=uuid4(), kind="super_admin", org_id=uuid4(), role="org_admin"
-        )
+    def test_access_principal_model_construct_is_disabled(self) -> None:
+        """Principal.model_construct() raises instead of building an unvalidated principal."""
+        with pytest.raises(TypeError):
+            Principal.model_construct(user_id=uuid4(), kind="super_admin")
 
-        assert can(forged, capability) is (_SA in _EXPECTED_MATRIX[capability.value])
+    def test_access_principal_model_copy_with_update_is_disabled(self) -> None:
+        """model_copy(update=...) raises: it would change fields without validation."""
+        with pytest.raises(TypeError):
+            _member().model_copy(update={"kind": "super_admin", "org_id": None, "role": None})
+
+    def test_access_principal_model_copy_role_update_is_disabled(self) -> None:
+        """An editor can't be copied into an Org Admin."""
+        with pytest.raises(TypeError):
+            _member(_ED).model_copy(update={"role": _OA})
+
+    def test_access_principal_plain_copy_still_works(self) -> None:
+        """model_copy() without changes returns an equal principal."""
+        principal = _member()
+
+        assert principal.model_copy() == principal
+        assert principal.model_copy(deep=True) == principal
+
+
+def _principal_builders(path: Path) -> list[str]:
+    """Return the Principal constructions/validations in a source file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "Principal":
+            found.append(f"{path.name}:{node.lineno} Principal(...)")
+        elif (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "Principal"
+            and func.attr.startswith(("model_validate", "model_construct"))
+        ):
+            found.append(f"{path.name}:{node.lineno} Principal.{func.attr}(...)")
+    return found
+
+
+# Modules allowed to build a Principal. A well-formed Principal passes every
+# check, so building one from request data (e.g. Principal(**body)) would mint
+# a Super Admin. #149 adds the single module that builds it from the session's
+# users row, and adding it here is a reviewed decision.
+_PRINCIPAL_BUILDERS: frozenset[str] = frozenset()
+
+
+class TestPrincipalConstructionSites:
+    """Principals come from one reviewed place, never from arbitrary modules."""
+
+    def test_access_principal_is_built_only_in_allowed_modules(self) -> None:
+        """No src module outside the allowlist constructs or validates a Principal."""
+        offenders = [
+            site
+            for path in sorted(_SRC_DIR.rglob("*.py"))
+            if str(path.relative_to(_SRC_DIR)) not in _PRINCIPAL_BUILDERS
+            for site in _principal_builders(path)
+        ]
+
+        assert offenders == []
 
 
 # ---------------------------------------------------------------------------
