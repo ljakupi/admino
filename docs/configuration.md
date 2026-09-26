@@ -16,6 +16,7 @@ admino is configured by two things:
 - [Local vLLM (CPU container)](#local-vllm-cpu-container)
 - [`config.yaml` reference](#configyaml-reference)
 - [Authentication modes](#authentication-modes)
+- [Email (SMTP)](#email-smtp)
 - [Data & storage](#data--storage)
 - [Egress whitelist](#egress-whitelist)
 
@@ -156,10 +157,55 @@ Set under `auth.mode` in `config.yaml` (or `AUTH_MODE` in the environment):
 > moment you widen the Docker `ports:` publish beyond `127.0.0.1`, switch to `token` mode
 > and set a strong `AUTH_TOKEN` (≥ 48 chars, high entropy) **first**.
 
+## Email (SMTP)
+
+admino sends transactional email through **one SMTP account for the whole platform**:
+invitations, password resets, account activated/deactivated notices, budget alerts,
+model deprecation notices and scheduled org deletion notices, for every organization.
+Organizations don't configure their own mail server.
+
+We recommend a **Swiss-based provider** so mail stays in Switzerland, for example
+**Infomaniak Mail** (`mail.infomaniak.com`, port 587 or 465). Dev and production use the
+same path, a real SMTP account, so use addresses you can receive when you test.
+
+| Variable | Notes |
+| --- | --- |
+| `SMTP_HOST` | The server's hostname, e.g. `mail.infomaniak.com`. IP addresses and single-label names are refused. |
+| `SMTP_PORT` | `587` (STARTTLS) or `465` (implicit TLS). Any other port is refused. |
+| `SMTP_USERNAME` | The SMTP login, usually the full mailbox address. |
+| `SMTP_PASSWORD` | Read from the environment only, never logged. |
+| `SMTP_FROM` | The sender address. Use the mailbox address or one of its aliases; providers usually reject other senders. |
+
+**TLS is required.** admino uses Python's standard `smtplib` with a verified default TLS
+context: it checks the certificate and the hostname, and never falls back to plaintext.
+If a server on 587 doesn't offer STARTTLS, the attempt fails and is retried.
+
+**Outbox and retries.** Emails are written to the `email_outbox` table and sent by a
+background task, so a slow or unreachable mail server never delays a request. A failed
+attempt is retried with exponential backoff (1 minute, doubling up to 6 hours), up to 10
+attempts, and then marked `failed`. Delivery is at-least-once: if admino stops right after
+the server accepted a message but before recording it as sent, that message goes out
+again.
+
+**Languages and content.** Each email comes in German, French and English, in the
+recipient's UI language, as plain text plus a minimal HTML part. Emails contain no org
+content: no project, chat or file names and no message text. The only values are the
+organization's display name, links and dates (UTC).
+
+**Data minimization.** The one-time links in invitation and password-reset emails are
+stored unencrypted in the outbox while a message waits for delivery, and they're cleared
+once it's sent or has finally failed. Sent and failed
+rows are deleted after 30 days. Application logs name outbox IDs only, never email
+addresses.
+
+**Without SMTP.** If any of the five variables is missing or invalid, admino still starts
+and logs which variables to fix (names only, never values). Emails stay queued and go out
+after SMTP is configured and admino restarts.
+
 ## Data & storage
 
-PostgreSQL holds `settings`, `permissions`, `memory` notes, `oauth_tokens`, and the
-`audit_events` audit trail.
+PostgreSQL holds `settings`, `permissions`, `memory` notes, `oauth_tokens`, the
+`audit_events` audit trail, and the `email_outbox` of queued transactional email.
 
 - **OAuth tokens** are stored as **encrypted ciphertext only**. The Fernet encryption key
   lives in the `OAUTH_ENCRYPTION_KEY` environment variable and is **never** persisted to
@@ -177,6 +223,10 @@ network access. In Docker mode, `entrypoint.sh` derives the container's `iptable
 from this list at startup; `main.py` also checks that the configured LLM provider's API
 host is present. The provider hosts are `api.infomaniak.com` (default, included),
 `api.anthropic.com` (included) and `api.openai.com` (uncomment it for OpenAI).
+
+Those hosts are opened on port 443 only. The one exception is email: when `SMTP_HOST` and
+`SMTP_PORT` are set, `entrypoint.sh` also opens exactly that host on that port (465 or
+587). See [Email (SMTP)](#email-smtp).
 
 For the full picture of how egress containment works — the firewall, the root→non-root
 privilege drop, capabilities, and known limitations — read the

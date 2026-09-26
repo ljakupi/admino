@@ -5,8 +5,9 @@
 #
 # Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,
 # MICROSOFT_CLIENT_ID, MICROSOFT_CLIENT_SECRET, AUTH_TOKEN, INFOMANIAK_API_TOKEN,
-# ANTHROPIC_API_KEY, OPENAI_API_KEY) are NEVER read from this file — they come
-# from env vars only.
+# ANTHROPIC_API_KEY, OPENAI_API_KEY, SMTP_PASSWORD) are NEVER read from this
+# file — they come from env vars only. Transactional email (SMTP_*) is
+# configured in the environment too; see .env.example.
 
 server:
   host: "0.0.0.0"
