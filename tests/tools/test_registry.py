@@ -7,8 +7,11 @@ no raw exception details).
 
 from __future__ import annotations
 
+import ast
+import inspect
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -1497,239 +1500,75 @@ class TestFreezeRegistry:
 
 
 # ---------------------------------------------------------------------------
-# 31. Audit log entries from dispatch
+# 31. The registry no longer audits (GH-147)
 # ---------------------------------------------------------------------------
 
-
-class _SpyAuditLogger:
-    """In-memory audit logger spy for dispatch tests.
-
-    Structurally compatible with admino.audit.AuditLogger — exposes only
-    log_tool_call() since that is all dispatch uses. No disk I/O.
-    """
-
-    def __init__(self) -> None:
-        from admino.models import ToolCallAuditEntry
-
-        self.entries: list[ToolCallAuditEntry] = []
-
-    def log_tool_call(self, entry: object) -> None:
-        self.entries.append(entry)  # type: ignore[arg-type]
+_REGISTRY_PATH = Path(__file__).resolve().parents[2] / "src" / "admino" / "tools" / "registry.py"
 
 
-class TestDispatchAuditLogging:
-    """Every dispatch path writes a ToolCallAuditEntry when audit_logger is set."""
+def _registry_imports() -> list[str]:
+    """Every module (and module.name) registry.py imports, TYPE_CHECKING blocks included."""
+    tree = ast.parse(_REGISTRY_PATH.read_text(encoding="utf-8"))
+    imported: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imported.append(node.module)
+            imported.extend(f"{node.module}.{alias.name}" for alias in node.names)
+    return imported
 
-    async def test_audit_entry_on_success(
+
+class TestDispatchWritesNoAudit:
+    """Tool-call audit moved to the agent's injected recorder: dispatch takes no audit
+    logger, writes no audit entry and runs the same in production."""
+
+    def test_dispatch_signature_has_no_audit_logger_parameter(self) -> None:
+        """dispatch_tool_call's parameters no longer include audit_logger."""
+        assert "audit_logger" not in inspect.signature(dispatch_tool_call).parameters
+
+    async def test_dispatch_rejects_audit_logger_keyword(
         self, registered_tool: None, allow_config: PermissionsConfig
     ) -> None:
-        """Successful dispatch writes an audit entry with success=True."""
-        spy = _SpyAuditLogger()
-        tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        e = spy.entries[0]
-        assert e.tool == "gmail"
-        assert e.action == "read"
-        assert e.permission == "allow"
-        assert e.success is True
-        assert e.error is None
+        """Passing audit_logger= is now an unexpected keyword (TypeError)."""
+        with pytest.raises(TypeError):
+            await dispatch_tool_call(
+                _make_tool_call(),
+                allow_config,
+                session_id="sess-1",
+                audit_logger=None,  # type: ignore[call-arg]
+            )
 
-    async def test_audit_entry_on_permission_deny(
-        self, registered_tool: None, deny_config: PermissionsConfig
-    ) -> None:
-        """Permission-denied dispatch writes an audit entry with success=False."""
-        spy = _SpyAuditLogger()
-        tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            deny_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        assert spy.entries[0].permission == "deny"
-        assert spy.entries[0].success is False
-
-    async def test_audit_entry_on_confirm_required(
-        self, registered_tool: None, confirm_config: PermissionsConfig
-    ) -> None:
-        """Confirmation-required dispatch writes an audit entry."""
-        spy = _SpyAuditLogger()
-        tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            confirm_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        assert spy.entries[0].permission == "confirm"
-        assert spy.entries[0].success is False
-
-    async def test_audit_entry_on_unknown_tool(self, allow_config: PermissionsConfig) -> None:
-        """Unknown tool dispatch writes an audit entry."""
-        spy = _SpyAuditLogger()
-        tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        assert spy.entries[0].success is False
-        assert spy.entries[0].error is not None
-        assert "unknown" in spy.entries[0].error.lower()
-
-    async def test_audit_entry_on_validation_failure(
-        self, registered_tool: None, allow_config: PermissionsConfig
-    ) -> None:
-        """Arg-validation failure writes an audit entry."""
-        spy = _SpyAuditLogger()
-        tc = _make_tool_call(args={"query": ""})  # violates min_length
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        assert spy.entries[0].success is False
-
-    async def test_audit_entry_on_handler_exception(self, allow_config: PermissionsConfig) -> None:
-        """Handler exception writes an audit entry (no raw exception details)."""
-        spy = _SpyAuditLogger()
-        register_tool("gmail", "read", "Read", SampleArgs)(failing_handler)
-        tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        entry = spy.entries[0]
-        assert entry.success is False
-        assert entry.error is not None
-        assert "secrets.json" not in entry.error
-        assert "RuntimeError" in entry.error
-
-    async def test_audit_entry_on_malformed_identifier(
-        self, allow_config: PermissionsConfig
-    ) -> None:
-        """Malformed tool identifier writes an audit entry with placeholder values."""
-        spy = _SpyAuditLogger()
-        tc = ToolCall.model_construct(tool="GMAIL", action="read", args={})
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        # Placeholder values because original identifier is not pattern-valid
-        assert spy.entries[0].tool == "invalid"
-        assert spy.entries[0].success is False
-
-    async def test_audit_entry_args_summary_contains_only_key_names(
-        self, registered_tool: None, allow_config: PermissionsConfig
-    ) -> None:
-        """args_summary records key names only — never raw values."""
-        spy = _SpyAuditLogger()
-        secret_value = "ghp_1234567890abcdefghijklmnop"
-        tc = _make_tool_call(args={"query": secret_value})
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        assert "query" in spy.entries[0].args_summary
-        assert secret_value not in spy.entries[0].args_summary
-
-    async def test_audit_entry_on_pending_confirmation_mismatch(
-        self, confirm_config: PermissionsConfig
-    ) -> None:
-        """Mismatched pending_confirmation writes a deny audit entry."""
-        spy = _SpyAuditLogger()
-        register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
-        other_tc = ToolCall(tool="google_calendar", action="create", args={"query": "x"})
-        pending = _make_pending_confirmation(other_tc)
-        tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            confirm_config,
-            session_id="sess-1",
-            pending_confirmation=pending,
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        assert spy.entries[0].permission == "deny"
-
-    async def test_no_audit_entry_when_logger_is_none(
-        self, registered_tool: None, allow_config: PermissionsConfig
-    ) -> None:
-        """audit_logger=None is allowed in dev/tests and writes nothing."""
-        # Sanity check — this is the default behaviour that all other tests rely on.
-        result = await dispatch_tool_call(
-            _make_tool_call(), allow_config, session_id="sess-1", audit_logger=None
-        )
-        assert result.success is True
-
-
-# ---------------------------------------------------------------------------
-# 32. Production enforcement: audit_logger required when ADMINO_ENV=production
-# ---------------------------------------------------------------------------
-
-
-class TestProductionAuditEnforcement:
-    """In production mode, dispatch must reject audit_logger=None."""
-
-    async def test_production_requires_audit_logger(
+    async def test_dispatch_in_production_needs_no_audit_logger(
         self,
         registered_tool: None,
         allow_config: PermissionsConfig,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """audit_logger=None in production raises ValueError.
+        """With ADMINO_ENV=production, dispatch runs without any audit sink.
 
-        ``_IS_PRODUCTION`` is cached at import time; monkey-patching the
-        module attribute simulates production without reloading.
+        ``_IS_PRODUCTION`` is cached at import time; monkey-patching the module
+        attribute simulates production without reloading.
         """
         from admino.tools import registry as reg
 
         monkeypatch.setattr(reg, "_IS_PRODUCTION", True)
-        tc = _make_tool_call()
-        with pytest.raises(ValueError, match="audit_logger is required"):
-            await dispatch_tool_call(tc, allow_config, session_id="sess-1", audit_logger=None)
-
-    async def test_production_accepts_audit_logger(
-        self,
-        registered_tool: None,
-        allow_config: PermissionsConfig,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """In production, dispatch proceeds normally when audit_logger is supplied."""
-        from admino.tools import registry as reg
-
-        monkeypatch.setattr(reg, "_IS_PRODUCTION", True)
-        spy = _SpyAuditLogger()
-        tc = _make_tool_call()
-        result = await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
+        result = await dispatch_tool_call(_make_tool_call(), allow_config, session_id="sess-1")
         assert result.success is True
-        assert len(spy.entries) == 1
+
+    @pytest.mark.parametrize(
+        "forbidden",
+        ["admino.audit", "admino.audit_events", "admino.models.ToolCallAuditEntry"],
+    )
+    def test_registry_imports_no_audit_writer(self, forbidden: str) -> None:
+        """registry.py imports neither the removed NDJSON audit module, the audit event
+        store, nor the removed ToolCallAuditEntry: the agent is the single recording point."""
+        offending = [
+            name
+            for name in _registry_imports()
+            if name == forbidden or name.startswith(f"{forbidden}.")
+        ]
+        assert offending == []
 
 
 # ---------------------------------------------------------------------------
@@ -1795,22 +1634,16 @@ class TestToolEnabledGating:
         assert result.success is False
         assert "Tool 'gmail' is disabled" in result.result
 
-    async def test_dispatch_disabled_tool_audit_entry(
+    async def test_dispatch_disabled_tool_permission_is_deny(
         self, registered_tool: None, allow_config: PermissionsConfig
     ) -> None:
-        """Dispatch of a disabled tool writes an audit entry with permission='disabled'."""
-        spy = _SpyAuditLogger()
+        """A disabled tool's result carries a deny decision (what the agent records)."""
         tc = _make_tool_call()
-        await dispatch_tool_call(
-            tc,
-            allow_config,
-            session_id="sess-1",
-            enabled_tools={"gmail": False},
-            audit_logger=spy,  # type: ignore[arg-type]
+        result = await dispatch_tool_call(
+            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
         )
-        assert len(spy.entries) == 1
-        assert spy.entries[0].permission == "disabled"
-        assert spy.entries[0].success is False
+        assert result.permission.allowed == "deny"
+        assert result.success is False
 
     async def test_dispatch_disabled_tool_before_permission_check(
         self, registered_tool: None, deny_config: PermissionsConfig
@@ -2224,41 +2057,6 @@ class TestDispatchUnknownToolBeforePermission:
         )
         assert result.success is False
         assert "Tool 'gmail' is disabled" in result.result
-
-    async def test_unknown_tool_audit_entry_permission_is_deny(
-        self, allow_config: PermissionsConfig
-    ) -> None:
-        """The unknown-tool audit entry records permission 'deny' (not the config state)."""
-        spy = _SpyAuditLogger()
-        await dispatch_tool_call(
-            _make_tool_call(),
-            allow_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        entry = spy.entries[0]
-        assert entry.permission == "deny"
-        assert entry.success is False
-        assert entry.error is not None
-        assert "unknown" in entry.error.lower()
-
-    async def test_unknown_confirm_action_writes_single_unknown_audit_entry(
-        self, confirm_config: PermissionsConfig
-    ) -> None:
-        """A confirm-level unknown action is audited once, as an unknown-tool deny."""
-        spy = _SpyAuditLogger()
-        await dispatch_tool_call(
-            _make_tool_call(),
-            confirm_config,
-            session_id="sess-1",
-            audit_logger=spy,  # type: ignore[arg-type]
-        )
-        assert len(spy.entries) == 1
-        entry = spy.entries[0]
-        assert entry.permission == "deny"
-        assert entry.error is not None
-        assert "unknown" in entry.error.lower()
 
 
 # ---------------------------------------------------------------------------

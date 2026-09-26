@@ -136,11 +136,9 @@ services:
       PG_DATABASE: admino
 
     volumes:
-      # Internal state — persists across container restarts. These directories
-      # are admino's own bookkeeping, NOT user-facing files. No host user
-      # directory is mounted: the container sees only these paths.
-      - ./data/logs:/app/data/logs      # Append-only audit log (NDJSON)
-      # OAuth refresh tokens live in PostgreSQL (Fernet-encrypted), not on disk.
+      # No host user directory is mounted: the container sees only these paths.
+      # Audit events and OAuth refresh tokens (Fernet-encrypted) live in
+      # PostgreSQL, not on disk.
       # Config is read-only — the agent reads but must never write config files
       - ./config:/app/config:ro
 

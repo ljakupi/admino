@@ -358,3 +358,66 @@ class TestAccountsModuleDocs:
 
         assert "last" in doc
         assert "admin" in doc
+
+
+# ---------------------------------------------------------------------------
+# GH-147: the default organization tool.call rows belong to until #149
+# ---------------------------------------------------------------------------
+
+
+def _ensure_default_org() -> Any:
+    """Look ensure_default_org up lazily, so the rest of this file collects without it."""
+    func = getattr(accounts_mod, "ensure_default_org", None)
+    assert func is not None, "admino.accounts must define ensure_default_org"
+    return func
+
+
+def _norm(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql).strip().lower()
+
+
+class TestDefaultOrg:
+    """startup creates one default organization with a fixed, well-known id."""
+
+    def test_default_org_id_is_a_fixed_uuid(self) -> None:
+        from uuid import UUID
+
+        default_org_id = getattr(accounts_mod, "DEFAULT_ORG_ID", None)
+        assert isinstance(default_org_id, UUID)
+
+    @pytest.mark.asyncio
+    async def test_one_idempotent_insert_into_organizations(self, conn: MagicMock) -> None:
+        await _ensure_default_org()(conn)
+
+        assert conn.execute.await_count == 1
+        sql = _norm(conn.execute.await_args.args[0])
+        assert sql.startswith("insert into organizations")
+        assert "on conflict (id) do nothing" in sql
+
+    @pytest.mark.asyncio
+    async def test_default_org_id_travels_as_a_bind_parameter(self, conn: MagicMock) -> None:
+        await _ensure_default_org()(conn)
+
+        default_org_id = accounts_mod.DEFAULT_ORG_ID  # type: ignore[attr-defined]
+        sql = conn.execute.await_args.args[0]
+        assert default_org_id in conn.execute.await_args.args[1:]
+        assert str(default_org_id) not in sql
+        assert default_org_id.hex not in sql
+        assert "$1" in sql
+
+    @pytest.mark.asyncio
+    async def test_calling_twice_repeats_the_same_idempotent_statement(
+        self, conn: MagicMock
+    ) -> None:
+        await _ensure_default_org()(conn)
+        await _ensure_default_org()(conn)
+
+        first, second = conn.execute.await_args_list
+        assert first.args == second.args
+
+    @pytest.mark.asyncio
+    async def test_errors_propagate(self, conn: MagicMock) -> None:
+        conn.execute.side_effect = asyncpg.PostgresError("boom")
+
+        with pytest.raises(asyncpg.PostgresError):
+            await _ensure_default_org()(conn)

@@ -1,13 +1,17 @@
-"""Shared Pydantic models for tool args, API types, and audit log entries.
+"""Shared Pydantic models for tool args, API types, and agent messages.
 
 This module defines all structured data types shared across admino modules:
-- Audit log entry models (used by audit.py)
 - API request/response models (used by server.py)
 - Agent and LLM message models (used by agent.py and llm.py)
 
+Tool-call audit events are not modelled here: they are content-free rows of
+the ``audit_events`` table, validated by ``admino.audit_events``.
+
 Security notes:
 - No secrets, tokens, passwords, or credentials are stored in any model field.
-- Audit entries strip credential patterns (OAuth tokens, JWTs, Bearer headers) via field validators.
+- Models that surface free text to users (ChatResponse, ToolCallRecord,
+  PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
+  Bearer headers) and dangerous Unicode via field validators.
 - All user-facing string fields have max_length constraints to prevent abuse.
 - ToolCall.args uses dict[str, Any] because LLM output is untyped JSON;
   individual tools validate args via their own Pydantic models before execution.
@@ -37,11 +41,10 @@ from typing import Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
-# Control characters to strip from free-text audit fields.
+# Control characters to strip from free text shown to users (chat responses,
+# tool-call records, confirmation summaries) and from tool output.
 # Keeps tab (0x09), newline (0x0A), carriage return (0x0D) because they are
-# legitimate in content. Newlines in audit entries are safe: Pydantic's
-# model_dump_json() JSON-escapes them (\n -> \\n) before writing to NDJSON,
-# so they never produce raw newline bytes in the log file.
+# legitimate in content.
 # Strips Unicode direction-override and zero-width characters that could
 # spoof displayed text in confirmation dialogs or log viewers.
 _CONTROL_CHAR_TABLE: MappingProxyType[int, None] = MappingProxyType(
@@ -84,7 +87,7 @@ _JWT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"ey[A-Za-z0-9_\-]{16,2048}\.[A-Za-z0-9_\-]{16,2048}\.[A-Za-z0-9_\-]{16,2048}"
 )
 
-# Patterns that must never appear in audit log entries
+# Credential patterns redacted from free text shown to users.
 # Immutable tuple prevents accidental mutation under concurrent access.
 _CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"1//[A-Za-z0-9_\-]{20,512}"),  # Google OAuth refresh tokens
@@ -134,181 +137,6 @@ def _strip_credentials(value: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Audit log models (audit.py imports these)
-# ---------------------------------------------------------------------------
-
-
-class ConversationAuditEntry(BaseModel):
-    """Records a single conversation turn in the audit log.
-
-    Logged once per user or assistant message. Used for security observability
-    and fine-tuning dataset extraction.
-    """
-
-    entry_type: Literal["conversation"] = Field(
-        default="conversation",
-        description="Discriminator for the audit log entry type.",
-    )
-    timestamp: datetime = Field(
-        default_factory=lambda: datetime.now(UTC),
-        description="UTC timestamp of when the entry was created.",
-    )
-    session_id: str = Field(
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-zA-Z0-9_-]+$",
-        description="Session identifier linking related conversation entries.",
-    )
-
-    @field_validator("session_id")
-    @classmethod
-    def redact_credentials_in_session_id(cls, v: str) -> str:
-        """Defence-in-depth: strip credentials from session_id.
-
-        The pattern constraint already restricts to alphanumeric/hyphen/underscore,
-        but some credential formats (AKIA, gh[ps]_) fit within that character set.
-        """
-        return _strip_credentials(v)
-
-    role: Literal["user", "assistant", "tool"] = Field(
-        description=(
-            "Role of this turn: 'user' (human input), 'assistant' (LLM output),"
-            " or 'tool' (tool-execution result fed back to the LLM)."
-        ),
-    )
-    content: str = Field(
-        min_length=1,
-        max_length=32768,
-        description="The message content for this conversation turn.",
-    )
-
-    # NOTE: Pydantic v2 runs max_length before field_validator, so a value at
-    # the length limit that contains a credential will be truncated first, then
-    # redacted. Truncated credential fragments won't match the regex (minimum
-    # match lengths prevent partial matches), so this ordering is safe.
-    @field_validator("content")
-    @classmethod
-    def redact_credentials_in_content(cls, v: str) -> str:
-        """Strip credentials and dangerous Unicode from content before storage."""
-        v = v.translate(_CONTROL_CHAR_TABLE)
-        v = _strip_credentials(v)
-        return v if v else _SANITIZED_PLACEHOLDER
-
-    model: str = Field(
-        min_length=1,
-        max_length=128,
-        pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.:/-]*$",
-        description="The LLM model name used for this interaction.",
-    )
-
-    @field_validator("model")
-    @classmethod
-    def redact_credentials_in_model(cls, v: str) -> str:
-        """Strip credentials and dangerous Unicode from model name."""
-        v = v.translate(_CONTROL_CHAR_TABLE)
-        v = _strip_credentials(v)
-        return v if v else _SANITIZED_PLACEHOLDER
-
-    tool_calls_count: int = Field(
-        ge=0,
-        le=50,
-        description="Number of tool calls made during this turn.",
-    )
-
-
-class ToolCallAuditEntry(BaseModel):
-    """Records a single tool invocation in the audit log.
-
-    Logged once per tool call. Captures permission decision, execution result,
-    and a sanitized summary of arguments (never raw credentials).
-    """
-
-    entry_type: Literal["tool_call"] = Field(
-        default="tool_call",
-        description="Discriminator for the audit log entry type.",
-    )
-    timestamp: datetime = Field(
-        default_factory=lambda: datetime.now(UTC),
-        description="UTC timestamp of when the tool call was logged.",
-    )
-    session_id: str = Field(
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-zA-Z0-9_-]+$",
-        description="Session identifier linking this entry to a conversation.",
-    )
-
-    @field_validator("session_id")
-    @classmethod
-    def redact_credentials_in_session_id(cls, v: str) -> str:
-        """Defence-in-depth: strip credentials from session_id."""
-        return _strip_credentials(v)
-
-    tool: str = Field(
-        max_length=63,
-        pattern=r"^[a-z][a-z0-9_]{0,62}$",
-        description="The tool name (e.g. 'gmail', 'calendar').",
-    )
-    action: str = Field(
-        max_length=63,
-        pattern=r"^[a-z][a-z0-9_]{0,62}$",
-        description="The action name (e.g. 'read', 'search', 'create').",
-    )
-    permission: Literal["allow", "confirm", "deny", "disabled"] = Field(
-        description="The permission engine's decision for this tool call.",
-    )
-    args_summary: str = Field(
-        min_length=1,
-        max_length=512,
-        description="Sanitized summary of arguments. No raw credentials.",
-    )
-    success: bool = Field(
-        description="Whether the tool call executed successfully.",
-    )
-    error: str | None = Field(
-        default=None,
-        min_length=1,
-        max_length=512,
-        description=(
-            "Error message if the tool call failed, None otherwise. "
-            "Credential patterns (OAuth tokens, JWTs, Fernet keys, Bearer headers) "
-            "are automatically stripped by the model validator before storage."
-        ),
-    )
-
-    # NOTE: Pydantic v2 runs max_length before field_validator, so credential
-    # redaction happens after length enforcement. See content validator note above.
-    @field_validator("args_summary")
-    @classmethod
-    def redact_credentials_in_args_summary(cls, v: str) -> str:
-        """Strip credentials and dangerous Unicode from args_summary.
-
-        In addition to credential redaction, strips Unicode direction-override
-        and zero-width characters that could spoof displayed text in UIs.
-
-        Callers should summarise only non-sensitive metadata (tool name,
-        action, IDs); never include file contents, email bodies, or token values.
-        """
-        v = v.translate(_CONTROL_CHAR_TABLE)
-        v = _strip_credentials(v)
-        return v if v else _SANITIZED_PLACEHOLDER
-
-    @field_validator("error")
-    @classmethod
-    def redact_credentials_in_error(cls, v: str | None) -> str | None:
-        """Strip credentials and dangerous Unicode from error messages."""
-        if v is None:
-            return v
-        v = v.translate(_CONTROL_CHAR_TABLE)
-        v = _strip_credentials(v)
-        return v if v else _SANITIZED_PLACEHOLDER
-
-
-AuditEntry = ConversationAuditEntry | ToolCallAuditEntry
-"""Union type for all audit log entry types. Used by audit.py for serialization."""
-
-
-# ---------------------------------------------------------------------------
 # API request/response models (server.py imports these)
 # ---------------------------------------------------------------------------
 
@@ -317,8 +145,7 @@ class ChatMessage(BaseModel):
     """A single message in a conversation history.
 
     Note: content is NOT sanitised for control characters here. Sanitisation
-    occurs at the audit boundary (ConversationAuditEntry) and at the display
-    boundary (server.py SSE rendering). This model is used in conversation
+    occurs at the display boundary (server.py SSE rendering). This model is used in conversation
     history and must preserve the original content for LLM context fidelity.
     """
 
@@ -625,8 +452,7 @@ class LLMMessage(BaseModel):
 
     Note: content is NOT sanitised for control characters at this layer.
     Sanitisation is applied at the LLM client boundary (llm.py
-    _strip_control_chars) and at the audit boundary (ConversationAuditEntry).
-    Raw content is preserved here for context-window fidelity.
+    _strip_control_chars). Raw content is preserved here for context-window fidelity.
     """
 
     role: Literal["user", "assistant", "system", "tool"] = Field(
@@ -747,7 +573,8 @@ class AgentResult(BaseModel):
     the caller can persist it. It never contains ``system`` messages — the
     agent adds its system prompt to each LLM call itself, so feeding the
     history back cannot duplicate it. ``tool_calls`` is a summary for the HTTP
-    response layer; authoritative records live in the audit log.
+    response layer; the authoritative, content-free record of each dispatch is
+    its ``tool.call`` audit event.
     """
 
     status: AgentStatus = Field(

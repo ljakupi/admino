@@ -297,7 +297,7 @@ export const en = {
   'settings.session.id.label': 'Session ID',
   'settings.session.id.hint': 'Alphanumeric, hyphens, underscores. Max 64 chars.',
   'settings.session.new.label': 'New session',
-  'settings.session.new.hint': 'Clears the chat thread. The conversation history stays in audit log.',
+  'settings.session.new.hint': 'Clears the chat thread.',
   'settings.agent.subtitle':
     'Which LLM admino talks to. Infomaniak is the default; vLLM (local CPU container), Claude, and OpenAI are opt-in alternatives.',
   'settings.agent.provider.label': 'Provider',

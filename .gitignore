@@ -60,11 +60,8 @@ htmlcov/
 *.log
 docker-compose.override.yml
 
-# Internal state directories (audit log, memory DB, encrypted OAuth tokens)
+# Local state directories
 data
-# data/db/
-# data/logs/
-# data/tokens/
 
 
 # Demo / scratch scripts

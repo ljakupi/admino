@@ -4,15 +4,19 @@ Tests the main() entry point, _configure_logging(), and _import_tool_modules(),
 covering:
 - Happy path: config loaded, dependencies wired, uvicorn.run called correctly
 - Config failure paths: ValueError, OSError → sys.exit(1)
-- Audit logger failure paths: ValueError, OSError → sys.exit(1)
 - Logging configuration: level mapping, invalid fallback
 - Tool module imports: missing modules skipped, other errors re-raised
 - AgentConfig wiring from config.limits fields
 - Security invariants: no eval/exec/compile/shell=True, no secrets in logs
 - GH-142: the provider → egress-host map includes ``api.infomaniak.com``; the
   Infomaniak startup check warns on a missing token and logs (never raises on)
-  a product-id resolution failure; the Agent's model_name falls back to the
-  provider name when no model is set.
+  a product-id resolution failure.
+- GH-147: the NDJSON audit logger is gone. main() never reads ``config.paths``
+  and wires ``Agent(tool_call_recorder=main._build_tool_call_recorder())``; the
+  recorder resolves the pool at call time and awaits
+  ``audit_events.record_tool_call`` with the default org and the session's chat
+  id (``uuid5(_SESSION_CHAT_NAMESPACE, session_id)``); errors propagate.
+  ``_async_startup`` runs ``ensure_default_org(pool)`` after the migrations.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -53,11 +57,9 @@ def _make_mock_config() -> MagicMock:
     """Build a minimal mock AppConfig with all fields main.py accesses."""
     config = MagicMock()
     config.log_level = "INFO"
-
-    # Use a MagicMock for audit_log so .parent is settable
-    mock_audit_log = MagicMock()
-    mock_audit_log.parent = Path("/tmp")  # noqa: S108
-    config.paths.audit_log = mock_audit_log
+    # GH-147: AppConfig has no paths section any more (the NDJSON audit log path
+    # was its last field), so main() must never read it.
+    del config.paths
 
     config.llm.provider = "anthropic"
     config.llm.active_model_name = "claude-sonnet-4-6"
@@ -91,14 +93,12 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_config = _make_mock_config()
     mock_perms = _make_mock_permissions()
     mock_tools_enabled = {"gmail": False, "memory": True}
-    mock_audit_logger = MagicMock()
     mock_llm_client = MagicMock()
     mock_agent = MagicMock()
     mock_app = MagicMock()
 
     mock_load_app_config = MagicMock(return_value=mock_config)
     mock_build_permissions = MagicMock(return_value=mock_perms)
-    mock_audit_cls = MagicMock(return_value=mock_audit_logger)
     mock_llm_cls = MagicMock(return_value=mock_llm_client)
     mock_agent_cls = MagicMock(return_value=mock_agent)
     mock_create_app = MagicMock(return_value=mock_app)
@@ -128,7 +128,6 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr("admino.main.asyncio", mock_asyncio)
 
     # These are imported lazily inside main(), so we patch the module paths
-    monkeypatch.setattr("admino.audit.AuditLogger", mock_audit_cls)
     monkeypatch.setattr("admino.llm.create_llm_client", mock_llm_cls)
     monkeypatch.setattr("admino.agent.Agent", mock_agent_cls)
     monkeypatch.setattr("admino.server.create_app", mock_create_app)
@@ -139,13 +138,11 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "config": mock_config,
         "permissions": mock_perms,
         "tools_enabled": mock_tools_enabled,
-        "audit_logger": mock_audit_logger,
         "llm_client": mock_llm_client,
         "agent": mock_agent,
         "app": mock_app,
         "load_app_config": mock_load_app_config,
         "build_default_permissions_config": mock_build_permissions,
-        "AuditLogger": mock_audit_cls,
         "create_llm_client": mock_llm_cls,
         "Agent": mock_agent_cls,
         "create_app": mock_create_app,
@@ -371,42 +368,6 @@ class TestMainConfigFailures:
 
 
 # ---------------------------------------------------------------------------
-# Audit logger failure tests
-# ---------------------------------------------------------------------------
-
-
-class TestMainAuditLoggerFailures:
-    """Tests for main() behavior when AuditLogger creation fails."""
-
-    def test_main_exits_1_on_audit_logger_value_error(self, mock_deps: dict[str, Any]) -> None:
-        """main() exits with code 1 when AuditLogger raises ValueError."""
-        mock_deps["AuditLogger"].side_effect = ValueError("bad path")
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"))
-
-        assert exc_info.value.code == 1
-
-    def test_main_exits_1_on_audit_logger_os_error(self, mock_deps: dict[str, Any]) -> None:
-        """main() exits with code 1 when AuditLogger raises OSError."""
-        mock_deps["AuditLogger"].side_effect = OSError("disk full")
-
-        with pytest.raises(SystemExit) as exc_info:
-            main(config_path=Path("c.yaml"))
-
-        assert exc_info.value.code == 1
-
-    def test_main_does_not_call_uvicorn_on_audit_failure(self, mock_deps: dict[str, Any]) -> None:
-        """uvicorn.run is never called when audit logger creation fails."""
-        mock_deps["AuditLogger"].side_effect = ValueError("fail")
-
-        with pytest.raises(SystemExit):
-            main(config_path=Path("c.yaml"))
-
-        mock_deps["uvicorn_run"].assert_not_called()
-
-
-# ---------------------------------------------------------------------------
 # Logging configuration tests
 # ---------------------------------------------------------------------------
 
@@ -576,25 +537,15 @@ class TestAgentConfigWiring:
         assert agent_config.max_context_messages == 25
         assert agent_config.confirmation_timeout_s == 200.0
 
-    def test_agent_receives_correct_model_name(self, mock_deps: dict[str, Any]) -> None:
-        """Agent is created with model_name from config.llm.active_model_name."""
-        mock_deps["config"].llm.active_model_name = "llama3:8b"
-
-        main(config_path=Path("c.yaml"))
-
-        agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
-        assert agent_call_kwargs["model_name"] == "llama3:8b"
-
-    def test_agent_model_name_falls_back_to_provider_when_unset(
-        self, mock_deps: dict[str, Any]
+    @pytest.mark.parametrize("removed", ["audit_logger", "model_name"])
+    def test_agent_receives_no_audit_logger_or_model_name(
+        self, mock_deps: dict[str, Any], removed: str
     ) -> None:
-        """With no model set, model_name is the provider name (audit needs a non-empty name)."""
-        mock_deps["config"].llm.active_model_name = ""
-        mock_deps["config"].llm.provider = "anthropic"
-
+        """GH-147: the audit logger and the model name (it only fed conversation audit
+        entries) are no longer passed to the Agent."""
         main(config_path=Path("c.yaml"))
 
-        assert mock_deps["Agent"].call_args.kwargs["model_name"] == "anthropic"
+        assert removed not in mock_deps["Agent"].call_args.kwargs
 
     def test_agent_receives_llm_client(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the LLM client instance from create_llm_client."""
@@ -603,12 +554,19 @@ class TestAgentConfigWiring:
         agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
         assert agent_call_kwargs["llm_client"] is mock_deps["llm_client"]
 
-    def test_agent_receives_audit_logger(self, mock_deps: dict[str, Any]) -> None:
-        """Agent is created with the AuditLogger instance."""
+    def test_agent_receives_tool_call_recorder_from_builder(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-147: Agent(tool_call_recorder=...) gets what _build_tool_call_recorder()
+        returns, built once."""
+        sentinel = AsyncMock()
+        builder = MagicMock(return_value=sentinel)
+        monkeypatch.setattr(main_module, "_build_tool_call_recorder", builder, raising=False)
+
         main(config_path=Path("c.yaml"))
 
-        agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
-        assert agent_call_kwargs["audit_logger"] is mock_deps["audit_logger"]
+        builder.assert_called_once_with()
+        assert mock_deps["Agent"].call_args.kwargs["tool_call_recorder"] is sentinel
 
     def test_agent_receives_permissions_config(self, mock_deps: dict[str, Any]) -> None:
         """Agent is created with the PermissionsConfig instance."""
@@ -761,25 +719,6 @@ class TestSecurityInvariants:
 
 class TestStartupOrdering:
     """Tests that verify correct ordering of startup steps."""
-
-    def test_audit_logger_created_before_agent(self, mock_deps: dict[str, Any]) -> None:
-        """AuditLogger is created before Agent (Agent depends on it)."""
-        call_order: list[str] = []
-
-        def track_audit(*a: Any, **kw: Any) -> MagicMock:
-            call_order.append("audit")
-            return mock_deps["audit_logger"]
-
-        def track_agent(*a: Any, **kw: Any) -> MagicMock:
-            call_order.append("agent")
-            return mock_deps["agent"]
-
-        mock_deps["AuditLogger"].side_effect = track_audit
-        mock_deps["Agent"].side_effect = track_agent
-
-        main(config_path=Path("c.yaml"))
-
-        assert call_order.index("audit") < call_order.index("agent")
 
     def test_freeze_registry_called_before_agent(self, mock_deps: dict[str, Any]) -> None:
         """freeze_registry is called before Agent is instantiated."""
@@ -1251,3 +1190,189 @@ class TestMainInfomaniakWiring:
 
         assert "_check_infomaniak_startup" in self._asyncio_run_targets(mock_deps)
         mock_deps["uvicorn_run"].assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# GH-147: default org at startup, tool-call recorder wiring
+# ---------------------------------------------------------------------------
+
+
+def _patch_startup_db(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> AsyncMock:
+    """Patch every DB step of _async_startup; record the order of the ones that matter."""
+    monkeypatch.setenv("PG_PASSWORD", "testpass")
+    pool = AsyncMock()
+
+    async def track_migrations(p: Any) -> None:
+        assert p is pool
+        calls.append("migrations")
+
+    async def track_default_org(p: Any) -> None:
+        assert p is pool
+        calls.append("default_org")
+
+    async def track_seed_settings(p: Any, _config: Any) -> None:
+        calls.append("seed_settings")
+
+    monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=pool))
+    monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+    monkeypatch.setattr("admino.database.run_migrations", track_migrations)
+    monkeypatch.setattr("admino.accounts.ensure_default_org", track_default_org, raising=False)
+    monkeypatch.setattr("admino.database.seed_settings", track_seed_settings)
+    monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
+    monkeypatch.setattr("admino.database.update_setting", AsyncMock())
+    monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
+    monkeypatch.setattr(
+        "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
+    )
+    monkeypatch.setattr(
+        "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
+    )
+    return pool
+
+
+class TestAsyncStartupDefaultOrg:
+    """GH-147: startup creates the default org that tool.call rows belong to."""
+
+    @pytest.mark.asyncio
+    async def test_ensure_default_org_runs_once_after_migrations(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The organizations table exists only after the migrations, so the default
+        org is ensured after run_migrations, exactly once, on the startup pool."""
+        calls: list[str] = []
+        _patch_startup_db(monkeypatch, calls)
+
+        await _async_startup(MagicMock(), MagicMock())
+
+        assert calls.count("default_org") == 1
+        assert calls.index("migrations") < calls.index("default_org")
+
+    @pytest.mark.asyncio
+    async def test_default_org_failure_aborts_startup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without the default org every tool.call write would fail, so a failure to
+        create it stops startup instead of being swallowed."""
+        _patch_startup_db(monkeypatch, [])
+        monkeypatch.setattr(
+            "admino.accounts.ensure_default_org",
+            AsyncMock(side_effect=RuntimeError("db down")),
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError):
+            await _async_startup(MagicMock(), MagicMock())
+
+
+class TestSessionChatId:
+    """GH-147: the audit target for a session until #176 adds chat UUIDs."""
+
+    def test_is_uuid5_of_the_session_in_the_fixed_namespace(self) -> None:
+        import uuid
+
+        chat_id = main_module._session_chat_id("s-lz3k-a1b2c3d4")
+
+        assert isinstance(chat_id, uuid.UUID)
+        assert chat_id.version == 5
+        assert chat_id == uuid.uuid5(main_module._SESSION_CHAT_NAMESPACE, "s-lz3k-a1b2c3d4")
+
+    def test_is_deterministic(self) -> None:
+        assert main_module._session_chat_id("s-1") == main_module._session_chat_id("s-1")
+
+    def test_differs_per_session(self) -> None:
+        assert main_module._session_chat_id("s-1") != main_module._session_chat_id("s-2")
+
+    def test_namespace_is_a_fixed_uuid(self) -> None:
+        import uuid
+
+        assert isinstance(main_module._SESSION_CHAT_NAMESPACE, uuid.UUID)
+
+
+class TestBuildToolCallRecorder:
+    """GH-147: the recorder main() injects into the Agent."""
+
+    @pytest.mark.asyncio
+    async def test_records_through_audit_events_with_default_org_and_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One call → one record_tool_call on the runtime pool, default org, chat target."""
+        from admino.accounts import DEFAULT_ORG_ID
+
+        pool = MagicMock(name="runtime-pool")
+        record = AsyncMock()
+        monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=pool))
+        monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
+
+        recorder = main_module._build_tool_call_recorder()
+        await recorder(
+            session_id="s-abc",
+            tool="memory",
+            action="read",
+            decision="allow",
+            success=True,
+            duration_ms=12,
+        )
+
+        record.assert_awaited_once_with(
+            pool,
+            org_id=DEFAULT_ORG_ID,
+            chat_id=main_module._session_chat_id("s-abc"),
+            tool="memory",
+            action="read",
+            decision="allow",
+            success=True,
+            duration_ms=12,
+        )
+
+    @pytest.mark.asyncio
+    async def test_resolves_the_pool_at_call_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The runtime pool only exists once uvicorn's lifespan ran, after main() built
+        the recorder, so building it must not touch the pool."""
+        get_pool = MagicMock(side_effect=RuntimeError("pool not initialised"))
+        monkeypatch.setattr("admino.database.get_pool", get_pool)
+
+        recorder = main_module._build_tool_call_recorder()
+
+        get_pool.assert_not_called()
+        with pytest.raises(RuntimeError):
+            await recorder(
+                session_id="s-abc",
+                tool="memory",
+                action="read",
+                decision="allow",
+                success=True,
+                duration_ms=1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_record_errors_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A failed audit write reaches the agent (which aborts the run), never swallowed."""
+        from admino.audit_events import AuditRecordError
+
+        monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(
+            "admino.audit_events.record_tool_call",
+            AsyncMock(side_effect=AuditRecordError()),
+            raising=False,
+        )
+
+        recorder = main_module._build_tool_call_recorder()
+        with pytest.raises(AuditRecordError):
+            await recorder(
+                session_id="s-abc",
+                tool="memory",
+                action="read",
+                decision="deny",
+                success=False,
+                duration_ms=0,
+            )
+
+
+class TestNoAuditLogFile:
+    """GH-147: main no longer opens an NDJSON audit log."""
+
+    def test_main_source_has_no_audit_logger(self) -> None:
+        source = _MAIN_MODULE_PATH.read_text()
+        assert "AuditLogger" not in source
+        assert "audit_log" not in source
+        assert "admino.audit import" not in source

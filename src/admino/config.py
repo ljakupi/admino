@@ -11,7 +11,6 @@ are NEVER read from YAML -- they come exclusively from environment variables.
 
 Security notes:
 - No secrets in config.yaml. Credentials come from env vars only.
-- Path fields are resolved to absolute paths relative to the config file location.
 - Invalid config causes the agent to refuse to start with a clear error message.
 - YAML parsing uses safe_load only (no arbitrary Python object deserialization).
 """
@@ -22,7 +21,6 @@ import ipaddress
 import logging
 import os
 import re
-from pathlib import Path
 from typing import TYPE_CHECKING, Final, Literal
 
 import yaml
@@ -31,6 +29,8 @@ from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validat
 from admino.permissions import PermissionsConfig, validate_permissions_config
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import asyncpg
 
 logger = logging.getLogger(__name__)
@@ -286,18 +286,6 @@ class AuthConfig(BaseModel):
     )
 
 
-class PathsConfig(BaseModel):
-    """Filesystem path configuration.
-
-    All paths are resolved to absolute paths during validation.
-    """
-
-    audit_log: Path = Field(
-        default=Path("/app/data/logs/audit.ndjson"),
-        description="Path to the append-only NDJSON audit log.",
-    )
-
-
 class LimitsConfig(BaseModel):
     """Rate and size limits for the agent."""
 
@@ -399,8 +387,9 @@ class AppConfig(BaseModel):
     """Top-level application configuration validated from config.yaml.
 
     Unknown top-level sections are ignored (Pydantic's default ``extra``
-    behaviour), so a legacy ``files`` section left in an existing config.yaml
-    or settings table from before GH-143 still validates and is dropped.
+    behaviour), so a legacy ``files`` section (from before GH-143) or
+    ``paths`` section (the removed NDJSON audit log path, GH-147) left in an
+    existing config.yaml or settings table still validates and is dropped.
 
     Environment variable overrides are applied after YAML loading:
     - LLM_PROVIDER      -> llm.provider
@@ -408,13 +397,11 @@ class AppConfig(BaseModel):
     - VLLM_BASE_URL     -> llm.vllm_base_url
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len
     - LOG_LEVEL         -> log_level
-    - AUDIT_LOG_PATH    -> paths.audit_log
     """
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
-    paths: PathsConfig = Field(default_factory=PathsConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -422,12 +409,6 @@ class AppConfig(BaseModel):
         default="INFO",
         description="Python logging level for the application.",
     )
-
-    @model_validator(mode="after")
-    def resolve_paths(self) -> AppConfig:
-        """Ensure all path fields are absolute."""
-        self.paths.audit_log = self.paths.audit_log.resolve()
-        return self
 
     @model_validator(mode="after")
     def warn_vpn_mode_on_all_interfaces(self) -> AppConfig:
@@ -531,7 +512,6 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     - VLLM_BASE_URL      -> llm.vllm_base_url
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len (parsed to int)
     - LOG_LEVEL          -> log_level
-    - AUDIT_LOG_PATH     -> paths.audit_log
 
     Args:
         data: Raw config dict parsed from YAML.
@@ -571,16 +551,6 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
         else:
             logger.warning(
                 "Cannot apply AUTH_MODE override: 'auth' config section is not a mapping."
-            )
-
-    audit_log_path = os.environ.get("AUDIT_LOG_PATH")
-    if audit_log_path:
-        paths_section = data.setdefault("paths", {})
-        if isinstance(paths_section, dict):
-            paths_section["audit_log"] = audit_log_path
-        else:
-            logger.warning(
-                "Cannot apply AUDIT_LOG_PATH override: 'paths' config section is not a mapping."
             )
 
     return data

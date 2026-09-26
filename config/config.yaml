@@ -63,11 +63,6 @@ auth:
   #           machine (LAN, VPN, VPS).
   mode: "vpn"
 
-paths:
-  # Local dev: relative to project root (where you run `make run`).
-  # Docker: these are overridden by volume mounts at /app/data/*.
-  audit_log: "data/logs/audit.ndjson"
-
 limits:
   max_tool_calls_per_message: 10
   max_pending_confirmations: 3

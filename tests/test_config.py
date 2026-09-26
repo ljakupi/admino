@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import secrets
 import textwrap
-from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -29,12 +29,14 @@ from admino.config import (
     EgressConfig,
     LimitsConfig,
     LLMConfig,
-    PathsConfig,
     ServerConfig,
     load_app_config,
     load_app_config_from_db,
     load_permissions_config_from_db,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture()
@@ -93,8 +95,6 @@ class TestValidConfigLoading:
               timeout_s: 60
             auth:
               mode: "token"
-            paths:
-              audit_log: "/data/audit.jsonl"
             limits:
               max_tool_calls_per_message: 5
               max_pending_confirmations: 2
@@ -115,8 +115,6 @@ class TestValidConfigLoading:
         assert config.llm.timeout_s == 60
         assert config.llm.provider == "anthropic"
         assert config.auth.mode == "token"
-        assert config.paths.audit_log.is_absolute()
-        assert str(config.paths.audit_log).endswith("audit.jsonl")
         assert config.limits.max_tool_calls_per_message == 5
         assert config.limits.max_pending_confirmations == 2
         assert config.limits.confirmation_timeout_s == 120
@@ -226,19 +224,16 @@ class TestEnvVarOverrides:
         config = load_app_config(yaml_path)
         assert config.log_level == "DEBUG"
 
-    def test_audit_log_path_override(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """AUDIT_LOG_PATH env var overrides paths.audit_log from YAML."""
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
-            """\
-            paths:
-              audit_log: "/yaml/audit.jsonl"
-            """,
-        )
+    def test_audit_log_path_env_is_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-147: AUDIT_LOG_PATH is no longer read; setting it changes nothing."""
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "")
         monkeypatch.setenv("AUTH_MODE", "vpn")
-        monkeypatch.setenv("AUDIT_LOG_PATH", "/env/audit.jsonl")
+        monkeypatch.setenv("AUDIT_LOG_PATH", "/env/audit.ndjson")
         config = load_app_config(yaml_path)
-        assert config.paths.audit_log == Path("/env/audit.jsonl")
+        assert not hasattr(config, "paths")
+        assert "/env/audit.ndjson" not in config.model_dump_json()
 
     def test_env_overrides_on_minimal_config(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -374,37 +369,32 @@ class TestInvalidFieldValues:
 # ---------------------------------------------------------------------------
 
 
-class TestPathResolution:
-    """Relative paths in YAML are resolved to absolute paths after loading."""
+class TestAuditLogPathRemoved:
+    """GH-147: the NDJSON audit log path is gone from the config."""
 
-    def test_relative_paths_resolved(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Relative path values become absolute after model validation."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
-            """\
-            paths:
-              audit_log: "relative/audit.jsonl"
-            """,
-        )
-        config = load_app_config(yaml_path)
+    def test_paths_config_is_removed(self) -> None:
+        """PathsConfig (its last field was the audit log path) no longer exists."""
+        import admino.config as config_module
 
-        assert config.paths.audit_log.is_absolute()
+        assert not hasattr(config_module, "PathsConfig")
 
-    def test_absolute_paths_stay_absolute(
+    def test_app_config_has_no_paths_field(self) -> None:
+        assert "paths" not in AppConfig.model_fields
+
+    def test_legacy_paths_section_still_loads(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Absolute paths remain unchanged after resolution."""
+        """An existing config.yaml or settings row with a paths section is ignored."""
         monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
             paths:
-              audit_log: "/absolute/audit.jsonl"
+              audit_log: "data/logs/audit.ndjson"
             """,
         )
         config = load_app_config(yaml_path)
-        assert config.paths.audit_log == Path("/absolute/audit.jsonl")
+        assert not hasattr(config, "paths")
 
 
 # ---------------------------------------------------------------------------
@@ -489,7 +479,7 @@ class TestSubModelsPresent:
         assert isinstance(config.server, ServerConfig)
         assert isinstance(config.llm, LLMConfig)
         assert isinstance(config.auth, AuthConfig)
-        assert isinstance(config.paths, PathsConfig)
+        assert not hasattr(config, "paths")
         assert isinstance(config.limits, LimitsConfig)
         assert isinstance(config.egress, EgressConfig)
 
@@ -507,10 +497,6 @@ class TestUnimplementedToolScaffoldingRemoved:
         """AppConfig no longer carries an ocr section."""
         assert "ocr" not in AppConfig.model_fields
 
-    def test_pathsconfig_has_no_images_field(self) -> None:
-        """PathsConfig no longer carries the document-images path."""
-        assert "images" not in PathsConfig.model_fields
-
     def test_leftover_ocr_and_images_db_settings_are_ignored(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -524,7 +510,6 @@ class TestUnimplementedToolScaffoldingRemoved:
             tmp_path / "config.yaml",
             """\
             paths:
-              audit_log: "/data/audit.jsonl"
               images: "/data/images"
             ocr:
               binary: "/usr/bin/tesseract"
@@ -533,7 +518,7 @@ class TestUnimplementedToolScaffoldingRemoved:
         )
         config = load_app_config(yaml_path)
         assert not hasattr(config, "ocr")
-        assert not hasattr(config.paths, "images")
+        assert not hasattr(config, "paths")
 
 
 class TestFilesToolConfigRemoved:
@@ -1243,11 +1228,6 @@ class TestDatabaseConfig:
         assert isinstance(config.database, DatabaseConfig)
         assert config.database.min_pool_size == 2
         assert config.database.max_pool_size == 5
-
-    def test_paths_config_no_database_field(self) -> None:
-        """PathsConfig no longer has a 'database' field."""
-        paths = PathsConfig()
-        assert not hasattr(paths, "database")
 
 
 # ---------------------------------------------------------------------------

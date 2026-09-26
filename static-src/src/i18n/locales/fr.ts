@@ -299,8 +299,7 @@ export const fr: Record<MessageKey, Message> = {
   'settings.session.id.label': 'ID de session',
   'settings.session.id.hint': 'Lettres, chiffres, tirets, traits de soulignement. 64 caractères max.',
   'settings.session.new.label': 'Nouvelle session',
-  'settings.session.new.hint':
-    "Vide le fil de discussion. L'historique de la conversation reste dans le journal d'audit.",
+  'settings.session.new.hint': 'Vide le fil de discussion.',
   'settings.agent.subtitle':
     'Le LLM avec lequel admino communique. Infomaniak est utilisé par défaut; vLLM (conteneur CPU local), Claude et OpenAI sont des alternatives optionnelles.',
   'settings.agent.provider.label': 'Fournisseur',

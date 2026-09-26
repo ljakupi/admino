@@ -1,11 +1,14 @@
 """Tests for admino.models — Pydantic model validation, constraints, and serialization.
 
 Covers every model in models.py:
-- Audit log models (ConversationAuditEntry, ToolCallAuditEntry, AuditEntry union)
 - API models (ChatMessage, ChatRequest, ChatResponse, ToolCallRecord, ConfirmRequest, SSEEvent)
 - Agent/LLM models (ToolCall, LLMMessage, AgentConfig, PendingConfirmation)
 - JSON round-trip serialization
 - Security: no secret-bearing field names
+- Credential redaction (``_strip_credentials``, ``_CONTROL_CHAR_TABLE``) on the models
+  that still use it: ChatResponse, ToolCallRecord, PendingConfirmationSummary
+- GH-147: the NDJSON audit entry models (ConversationAuditEntry, ToolCallAuditEntry and
+  the AuditEntry union) are gone
 """
 
 from __future__ import annotations
@@ -22,14 +25,13 @@ from admino.models import (
     ChatRequest,
     ChatResponse,
     ConfirmRequest,
-    ConversationAuditEntry,
     LLMMessage,
     PendingConfirmation,
+    PendingConfirmationSummary,
     SettingsLLM,
     SettingsPatchLLM,
     SSEEvent,
     ToolCall,
-    ToolCallAuditEntry,
     ToolCallRecord,
 )
 
@@ -41,33 +43,6 @@ _NOW: datetime = datetime.now(UTC)
 _EXPIRES: datetime = _NOW + timedelta(seconds=30)
 
 
-def _make_conversation_entry(**overrides: object) -> ConversationAuditEntry:
-    """Build a valid ConversationAuditEntry with optional overrides."""
-    defaults: dict[str, object] = {
-        "session_id": "sess-001",
-        "role": "user",
-        "content": "Hello",
-        "model": "llama3",
-        "tool_calls_count": 0,
-    }
-    defaults.update(overrides)
-    return ConversationAuditEntry(**defaults)  # type: ignore[arg-type]
-
-
-def _make_tool_call_entry(**overrides: object) -> ToolCallAuditEntry:
-    """Build a valid ToolCallAuditEntry with optional overrides."""
-    defaults: dict[str, object] = {
-        "session_id": "sess-001",
-        "tool": "gmail",
-        "action": "read",
-        "permission": "allow",
-        "args_summary": "message_id=123",
-        "success": True,
-    }
-    defaults.update(overrides)
-    return ToolCallAuditEntry(**defaults)  # type: ignore[arg-type]
-
-
 def _make_tool_call(**overrides: object) -> ToolCall:
     """Build a valid ToolCall with optional overrides."""
     defaults: dict[str, object] = {
@@ -77,209 +52,6 @@ def _make_tool_call(**overrides: object) -> ToolCall:
     }
     defaults.update(overrides)
     return ToolCall(**defaults)  # type: ignore[arg-type]
-
-
-# ===========================================================================
-# ConversationAuditEntry
-# ===========================================================================
-
-
-class TestConversationAuditEntry:
-    """Tests for the ConversationAuditEntry audit model."""
-
-    def test_valid_construction(self) -> None:
-        entry = _make_conversation_entry()
-        assert entry.entry_type == "conversation"
-        assert entry.role == "user"
-        assert entry.content == "Hello"
-        assert entry.model == "llama3"
-        assert entry.tool_calls_count == 0
-
-    def test_entry_type_fixed_to_conversation(self) -> None:
-        entry = _make_conversation_entry()
-        assert entry.entry_type == "conversation"
-
-    def test_entry_type_rejects_other_values(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(entry_type="tool_call")
-
-    def test_timestamp_auto_set_utc(self) -> None:
-        before = datetime.now(UTC)
-        entry = _make_conversation_entry()
-        after = datetime.now(UTC)
-        assert entry.timestamp.tzinfo is not None
-        assert before <= entry.timestamp <= after
-
-    @pytest.mark.parametrize("role", ["user", "assistant"])
-    def test_role_accepts_valid(self, role: str) -> None:
-        entry = _make_conversation_entry(role=role)
-        assert entry.role == role
-
-    @pytest.mark.parametrize("role", ["system", "admin", ""])
-    def test_role_rejects_invalid(self, role: str) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(role=role)
-
-    def test_role_accepts_tool(self) -> None:
-        """Tool-result turns are valid audit entries (H-3 fix)."""
-        entry = _make_conversation_entry(role="tool")
-        assert entry.role == "tool"
-
-    def test_content_max_length(self) -> None:
-        entry = _make_conversation_entry(content="x" * 32768)
-        assert len(entry.content) == 32768
-
-    def test_content_exceeds_max_length(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(content="x" * 32769)
-
-    def test_session_id_max_length(self) -> None:
-        entry = _make_conversation_entry(session_id="a" * 64)
-        assert len(entry.session_id) == 64
-
-    def test_session_id_exceeds_max_length(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(session_id="a" * 65)
-
-    def test_model_min_length_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(model="")
-
-    def test_model_max_length(self) -> None:
-        entry = _make_conversation_entry(model="m" * 128)
-        assert len(entry.model) == 128
-
-    def test_model_exceeds_max_length(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(model="m" * 129)
-
-    def test_model_pattern_accepts_versioned_names(self) -> None:
-        for name in ("llama3", "llama3:8b", "mistral:7b-instruct", "qwen2.5-coder:7b", "phi3/mini"):
-            entry = _make_conversation_entry(model=name)
-            assert entry.model == name
-
-    def test_model_pattern_rejects_invalid(self) -> None:
-        for name in ("has space", "has@char", "{json}", ""):
-            with pytest.raises(ValidationError):
-                _make_conversation_entry(model=name)
-
-    def test_tool_calls_count_ge_zero(self) -> None:
-        entry = _make_conversation_entry(tool_calls_count=0)
-        assert entry.tool_calls_count == 0
-
-    def test_tool_calls_count_positive(self) -> None:
-        entry = _make_conversation_entry(tool_calls_count=5)
-        assert entry.tool_calls_count == 5
-
-    def test_tool_calls_count_negative_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(tool_calls_count=-1)
-
-
-# ===========================================================================
-# ToolCallAuditEntry
-# ===========================================================================
-
-
-class TestToolCallAuditEntry:
-    """Tests for the ToolCallAuditEntry audit model."""
-
-    def test_valid_construction(self) -> None:
-        entry = _make_tool_call_entry()
-        assert entry.entry_type == "tool_call"
-        assert entry.tool == "gmail"
-        assert entry.action == "read"
-        assert entry.permission == "allow"
-        assert entry.success is True
-
-    def test_entry_type_fixed_to_tool_call(self) -> None:
-        entry = _make_tool_call_entry()
-        assert entry.entry_type == "tool_call"
-
-    def test_entry_type_rejects_other_values(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(entry_type="conversation")
-
-    def test_timestamp_auto_set_utc(self) -> None:
-        before = datetime.now(UTC)
-        entry = _make_tool_call_entry()
-        after = datetime.now(UTC)
-        assert entry.timestamp.tzinfo is not None
-        assert before <= entry.timestamp <= after
-
-    @pytest.mark.parametrize("perm", ["allow", "confirm", "deny"])
-    def test_permission_accepts_valid(self, perm: str) -> None:
-        entry = _make_tool_call_entry(permission=perm)
-        assert entry.permission == perm
-
-    @pytest.mark.parametrize("perm", ["reject", "block", ""])
-    def test_permission_rejects_invalid(self, perm: str) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(permission=perm)
-
-    def test_args_summary_max_length(self) -> None:
-        entry = _make_tool_call_entry(args_summary="x" * 512)
-        assert len(entry.args_summary) == 512
-
-    def test_args_summary_exceeds_max_length(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(args_summary="x" * 513)
-
-    def test_error_default_none(self) -> None:
-        entry = _make_tool_call_entry()
-        assert entry.error is None
-
-    def test_error_accepts_string(self) -> None:
-        entry = _make_tool_call_entry(error="Something broke")
-        assert entry.error == "Something broke"
-
-    def test_error_empty_string_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(error="")
-
-    def test_error_max_length(self) -> None:
-        # Use a string that won't match credential patterns (spaces break the 44-char base64 match)
-        error_msg = ("err " * 128)[:512]
-        entry = _make_tool_call_entry(error=error_msg)
-        assert len(entry.error) == 512  # type: ignore[arg-type]
-
-    def test_error_exceeds_max_length(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(error="e" * 513)
-
-    def test_tool_max_length_exceeded(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(tool="t" * 65)
-
-    def test_action_max_length_exceeded(self) -> None:
-        with pytest.raises(ValidationError):
-            _make_tool_call_entry(action="a" * 65)
-
-    def test_permission_accepts_disabled(self) -> None:
-        """ToolCallAuditEntry accepts 'disabled' as a valid permission value.
-
-        The 'disabled' literal is needed for audit entries when a tool is
-        rejected because it is toggled off via settings (enabled_tools filter).
-        """
-        entry = _make_tool_call_entry(permission="disabled")
-        assert entry.permission == "disabled"
-
-
-# ===========================================================================
-# AuditEntry union
-# ===========================================================================
-
-
-class TestAuditEntry:
-    """AuditEntry is a type alias union; both model types are valid members."""
-
-    def test_conversation_entry_is_audit_entry(self) -> None:
-        entry = _make_conversation_entry()
-        assert isinstance(entry, ConversationAuditEntry)
-
-    def test_tool_call_entry_is_audit_entry(self) -> None:
-        entry = _make_tool_call_entry()
-        assert isinstance(entry, ToolCallAuditEntry)
 
 
 # ===========================================================================
@@ -764,18 +536,6 @@ class TestPendingConfirmation:
 class TestJsonRoundTrip:
     """Every model must survive model_dump_json -> model_validate_json."""
 
-    def test_conversation_audit_entry(self) -> None:
-        original = _make_conversation_entry()
-        raw = original.model_dump_json()
-        restored = ConversationAuditEntry.model_validate_json(raw)
-        assert restored == original
-
-    def test_tool_call_audit_entry(self) -> None:
-        original = _make_tool_call_entry(error="oops")
-        raw = original.model_dump_json()
-        restored = ToolCallAuditEntry.model_validate_json(raw)
-        assert restored == original
-
     def test_chat_message(self) -> None:
         original = ChatMessage(role="user", content="hello")
         raw = original.model_dump_json()
@@ -851,21 +611,6 @@ class TestJsonRoundTrip:
 class TestDatetimeSerialization:
     """Datetime fields must serialize to ISO 8601 with UTC timezone info."""
 
-    def test_conversation_entry_timestamp_iso(self) -> None:
-        entry = _make_conversation_entry()
-        data = json.loads(entry.model_dump_json())
-        ts_str: str = data["timestamp"]
-        # Must parse back to a timezone-aware datetime
-        parsed = datetime.fromisoformat(ts_str)
-        assert parsed.tzinfo is not None
-
-    def test_tool_call_entry_timestamp_iso(self) -> None:
-        entry = _make_tool_call_entry()
-        data = json.loads(entry.model_dump_json())
-        ts_str: str = data["timestamp"]
-        parsed = datetime.fromisoformat(ts_str)
-        assert parsed.tzinfo is not None
-
     def test_pending_confirmation_timestamps_iso(self) -> None:
         pc = PendingConfirmation(
             confirmation_id="c1",
@@ -886,8 +631,6 @@ class TestDatetimeSerialization:
 _FORBIDDEN_FIELD_NAMES = {"token", "password", "secret", "key", "credential", "api_key"}
 
 _ALL_MODELS = [
-    ConversationAuditEntry,
-    ToolCallAuditEntry,
     ChatMessage,
     ChatRequest,
     ChatResponse,
@@ -898,6 +641,7 @@ _ALL_MODELS = [
     LLMMessage,
     AgentConfig,
     PendingConfirmation,
+    PendingConfirmationSummary,
 ]
 
 
@@ -910,175 +654,119 @@ def test_no_secret_field_names(model_cls: type) -> None:
 
 
 # ===========================================================================
-# Credential redaction in audit entries
+# Credential redaction (the helpers outlive the NDJSON audit models, GH-147)
 # ===========================================================================
+
+_RLO = chr(0x202E)  # RIGHT-TO-LEFT OVERRIDE
+_LRI = chr(0x2066)  # LEFT-TO-RIGHT ISOLATE
+_PDI = chr(0x2069)  # POP DIRECTIONAL ISOLATE
+_REDACTION_MARKER = "[CREDENTIAL_REDACTED]"
+
+
+def _chat_response(text: str) -> ChatResponse:
+    """A ChatResponse carrying ``text`` as the assistant response."""
+    return ChatResponse(session_id="s1", response=text)
+
+
+def _record_args(args: dict[str, object]) -> dict[str, object]:
+    """The args a ToolCallRecord keeps after its sanitizer ran."""
+    record = ToolCallRecord(
+        tool="gmail", action="read", args=args, permission="allow", success=True
+    )
+    return record.args
+
+
+def _summary_args(args: dict[str, object]) -> dict[str, object]:
+    """The args a PendingConfirmationSummary keeps after its sanitizer ran."""
+    summary = PendingConfirmationSummary(
+        confirmation_id="c1", tool="gmail", action="send", args=args, expires_at=_EXPIRES
+    )
+    return summary.args
 
 
 class TestCredentialRedaction:
-    """Credential patterns are stripped from audit entry fields."""
+    """_strip_credentials and _CONTROL_CHAR_TABLE still guard the models that use them."""
 
-    def test_google_oauth_token_redacted_in_content(self) -> None:
-        # Real Google tokens are 100+ chars; regex requires at least 64 after prefix
-        fake_token = "ya29." + "a1b2c3d4e5" * 8  # 80 chars after prefix
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="user",
-            content=f"token {fake_token}",
-            model="m",
-            tool_calls_count=0,
-        )
-        assert "ya29." not in entry.content
-        assert "[CREDENTIAL_REDACTED]" in entry.content
+    def test_google_oauth_token_redacted_in_chat_response(self) -> None:
+        fake_token = "ya29." + "a1b2c3d4e5" * 8
+        resp = _chat_response(f"token {fake_token}")
+        assert "ya29." not in resp.response
+        assert _REDACTION_MARKER in resp.response
 
-    def test_jwt_redacted_in_content(self) -> None:
+    def test_jwt_redacted_in_chat_response(self) -> None:
         jwt = (
             "eyJhbGciOiJSUzI1NiJ9."
             "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
             "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
         )
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="user",
-            content=f"got {jwt}",
-            model="m",
-            tool_calls_count=0,
-        )
-        assert "eyJ" not in entry.content
+        resp = _chat_response(f"got {jwt}")
+        assert "eyJ" not in resp.response
 
-    def test_bearer_redacted_in_content(self) -> None:
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="user",
-            content="header: Bearer sk-abc123",
-            model="m",
-            tool_calls_count=0,
-        )
-        assert "sk-abc123" not in entry.content
+    def test_bearer_redacted_in_chat_response(self) -> None:
+        resp = _chat_response("header: Bearer sk-abc123")
+        assert "sk-abc123" not in resp.response
 
-    def test_args_summary_redacted(self) -> None:
-        entry = ToolCallAuditEntry(
-            session_id="s1",
-            tool="gmail",
-            action="read",
-            permission="allow",
-            args_summary="Bearer secret-token-here",
-            success=True,
-        )
-        assert "secret-token-here" not in entry.args_summary
+    def test_bearer_redacted_in_tool_call_record_args(self) -> None:
+        args = _record_args({"auth": "Bearer secret-token-here"})
+        assert "secret-token-here" not in str(args["auth"])
 
-    def test_error_field_redacted(self) -> None:
-        entry = ToolCallAuditEntry(
-            session_id="s1",
-            tool="gmail",
-            action="read",
-            permission="allow",
-            args_summary="safe",
-            success=False,
-            error="failed with ya29." + "x1y2z3w4" * 10,
-        )
-        assert "ya29." not in (entry.error or "")
+    def test_oauth_token_redacted_in_pending_confirmation_summary_args(self) -> None:
+        args = _summary_args({"note": "failed with ya29." + "x1y2z3w4" * 10})
+        assert "ya29." not in str(args["note"])
 
-    def test_model_field_redacted(self) -> None:
-        """Model field validator strips credentials (Bearer pattern in valid model name)."""
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="assistant",
-            content="hello",
-            model="llama3:8b",
-            tool_calls_count=0,
-        )
-        assert entry.model == "llama3:8b"
-
-    def test_model_field_rejects_invalid_chars(self) -> None:
-        """Model field rejects characters outside the allowed pattern."""
-        with pytest.raises(ValidationError):
-            ConversationAuditEntry(
-                session_id="s1",
-                role="user",
-                content="hello",
-                model="Bearer leaked-token",
-                tool_calls_count=0,
-            )
+    def test_non_string_arg_values_are_kept(self) -> None:
+        """Only string values are scanned; numbers and booleans pass through unchanged."""
+        assert _record_args({"count": 5, "flag": True}) == {"count": 5, "flag": True}
 
     def test_fernet_key_not_false_positive(self) -> None:
         """44-char base64 strings should NOT be redacted (Fernet pattern removed)."""
         safe_hash = "A" * 44
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="user",
-            content=f"hash: {safe_hash}",
-            model="m",
-            tool_calls_count=0,
-        )
-        assert safe_hash in entry.content
+        resp = _chat_response(f"hash: {safe_hash}")
+        assert safe_hash in resp.response
 
     def test_gocspx_client_secret_redacted(self) -> None:
         """Google OAuth client secrets (GOCSPX-...) should be redacted."""
         secret = "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="user",
-            content=f"secret is {secret}",
-            model="m",
-            tool_calls_count=0,
-        )
-        assert "GOCSPX-" not in entry.content
+        resp = _chat_response(f"secret is {secret}")
+        assert "GOCSPX-" not in resp.response
 
-    def test_args_summary_strips_direction_override(self) -> None:
-        """args_summary should strip Unicode direction-override chars."""
-        entry = ToolCallAuditEntry(
-            session_id="s1",
-            tool="gmail",
-            action="read",
-            permission="allow",
-            args_summary="safe\u202eevil",
-            success=True,
-        )
-        assert "\u202e" not in entry.args_summary
-        assert "safeevil" in entry.args_summary
+    def test_chat_response_strips_direction_override(self) -> None:
+        """The control-character table removes Unicode direction overrides."""
+        resp = _chat_response(f"safe{_RLO}evil")
+        assert _RLO not in resp.response
+        assert "safeevil" in resp.response
 
-    def test_credential_at_truncation_boundary_partial_survives(self) -> None:
-        """A credential truncated below its minimum match length is not redacted.
+    def test_chat_response_strips_bidi_isolate_chars(self) -> None:
+        """BiDi Isolate characters (U+2066-U+2069) are stripped."""
+        resp = _chat_response(f"safe{_LRI}evil{_PDI}text")
+        assert _LRI not in resp.response
+        assert _PDI not in resp.response
+        assert "safeeviltext" in resp.response
 
-        This is accepted behaviour -- the regex minimum-length guards prevent
-        partial matches. This test documents the boundary explicitly.
+    def test_credential_below_pattern_minimum_is_not_redacted(self) -> None:
+        """A credential shorter than its pattern's minimum length is not redacted.
+
+        Accepted behaviour: the regex minimum-length guards prevent partial matches.
+        This test documents the boundary explicitly.
         """
-        # ya29. pattern requires 20+ chars after prefix. Build a string where
-        # the credential is truncated to 19 chars after prefix (total 24).
-        partial_cred = "ya29." + "a" * 19  # 24 chars total, below 25-char min
-        padding = "x" * (512 - len(partial_cred))
-        entry = _make_tool_call_entry(args_summary=padding + partial_cred)
-        # The partial credential survives because it's below the regex minimum
-        assert partial_cred in entry.args_summary
-
-    def test_content_strips_bidi_isolate_chars(self) -> None:
-        """BiDi Isolate characters (U+2066-U+2069) are stripped from content."""
-        entry = _make_conversation_entry(content="safe\u2066evil\u2069text")
-        assert "\u2066" not in entry.content
-        assert "\u2069" not in entry.content
-        assert "safeeviltext" in entry.content
-
-    def test_error_strips_direction_override(self) -> None:
-        """Error field strips direction-override characters."""
-        entry = _make_tool_call_entry(error="err\u202emsg")
-        assert "\u202e" not in (entry.error or "")
+        partial_cred = "ya29." + "a" * 19  # below the 20-char minimum after the prefix
+        resp = _chat_response("x" * 100 + partial_cred)
+        assert partial_cred in resp.response
 
     def test_model_construct_bypasses_redaction(self) -> None:
         """model_construct() skips validators -- documents the known unsafe path.
 
-        Production code must NEVER use model_construct() for audit entries.
+        Production code must NEVER use model_construct() on these models.
         """
         fake_token = "ya29." + "a1b2c3d4e5" * 8
-        entry = ConversationAuditEntry.model_construct(
-            entry_type="conversation",
-            session_id="s1",
-            role="user",
-            content=f"token {fake_token}",
-            model="m",
-            tool_calls_count=0,
+        record = ToolCallRecord.model_construct(
+            tool="gmail",
+            action="read",
+            args={"auth": f"token {fake_token}"},
+            permission="allow",
+            success=True,
         )
-        # model_construct bypasses the field_validator, so the token survives
-        assert "ya29." in entry.content
+        assert "ya29." in str(record.args["auth"])
 
 
 # ===========================================================================
@@ -1134,92 +822,53 @@ class TestSSEEventNewlineSanitization:
 # Comprehensive credential pattern coverage
 # ===========================================================================
 
+_CREDENTIAL_SAMPLES: list[tuple[str, str]] = [
+    ("google_refresh", "1//" + "a1b2c3d4e5" * 4),
+    ("google_access", "ya29." + "x1y2z3w4p5" * 4),
+    (
+        "jwt",
+        "eyJhbGciOiJSUzI1NiJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
+        "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+    ),
+    ("bearer", "Bearer sk-proj-abc123def456ghi789"),
+    ("gocspx", "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"),
+    ("sk_api_key", "sk-" + "a1b2c3d4e5f6g7h8i9j0"),
+    ("github_pat", "ghp_" + "A" * 36),
+    ("github_server", "ghs_" + "B" * 36),
+    ("aws_access_key", "AKIA" + "A" * 16),
+    ("slack_bot", "xoxb-" + "a1b2c3d4e5"),
+    ("slack_user", "xoxp-" + "a1b2c3d4e5"),
+    ("stripe_rk_live", "rk_live_" + "a" * 24),
+    ("stripe_rk_test", "rk_test_" + "b" * 24),
+]
+
 
 class TestCredentialRedactionAllPatterns:
-    """Parametrized tests covering ALL credential patterns in _CREDENTIAL_PATTERNS."""
+    """Every pattern in _CREDENTIAL_PATTERNS is redacted wherever _strip_credentials runs."""
 
-    @pytest.mark.parametrize(
-        ("label", "sample"),
-        [
-            ("google_refresh", "1//" + "a1b2c3d4e5" * 4),
-            ("google_access", "ya29." + "x1y2z3w4p5" * 4),
-            (
-                "jwt",
-                "eyJhbGciOiJSUzI1NiJ9."
-                "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
-                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
-            ),
-            ("bearer", "Bearer sk-proj-abc123def456ghi789"),
-            ("gocspx", "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"),
-            ("sk_api_key", "sk-" + "a1b2c3d4e5f6g7h8i9j0"),
-            ("github_pat", "ghp_" + "A" * 36),
-            ("github_server", "ghs_" + "B" * 36),
-            ("aws_access_key", "AKIA" + "A" * 16),
-            ("slack_bot", "xoxb-" + "a1b2c3d4e5"),
-            ("slack_user", "xoxp-" + "a1b2c3d4e5"),
-            ("stripe_rk_live", "rk_live_" + "a" * 24),
-            ("stripe_rk_test", "rk_test_" + "b" * 24),
-        ],
-        ids=lambda x: x if isinstance(x, str) else "",
-    )
-    def test_pattern_redacted_in_content(self, label: str, sample: str) -> None:
-        """Each credential pattern is redacted from ConversationAuditEntry.content."""
-        entry = ConversationAuditEntry(
-            session_id="s1",
-            role="user",
-            content=f"leaked: {sample}",
-            model="m",
-            tool_calls_count=0,
-        )
-        assert sample not in entry.content
-        assert "[CREDENTIAL_REDACTED]" in entry.content
+    @pytest.mark.parametrize(("label", "sample"), _CREDENTIAL_SAMPLES)
+    def test_pattern_redacted_in_chat_response(self, label: str, sample: str) -> None:
+        """Each credential pattern is redacted from ChatResponse.response."""
+        resp = _chat_response(f"leaked: {sample}")
+        assert sample not in resp.response
+        assert _REDACTION_MARKER in resp.response
 
-    @pytest.mark.parametrize(
-        ("label", "sample"),
-        [
-            ("google_access", "ya29." + "x1y2z3w4p5" * 4),
-            ("bearer", "Bearer sk-proj-abc123def456ghi789"),
-            ("github_pat", "ghp_" + "C" * 36),
-            ("aws_key", "AKIA" + "D" * 16),
-            ("slack_bot", "xoxb-" + "e1f2g3h4i5"),
-        ],
-        ids=lambda x: x if isinstance(x, str) else "",
-    )
-    def test_pattern_redacted_in_args_summary(self, label: str, sample: str) -> None:
-        """Each credential pattern is redacted from ToolCallAuditEntry.args_summary."""
-        entry = _make_tool_call_entry(args_summary=f"arg: {sample}")
-        assert sample not in entry.args_summary
-        assert "[CREDENTIAL_REDACTED]" in entry.args_summary
+    @pytest.mark.parametrize(("label", "sample"), _CREDENTIAL_SAMPLES)
+    def test_pattern_redacted_in_tool_call_record_args(self, label: str, sample: str) -> None:
+        """Each credential pattern is redacted from ToolCallRecord.args string values."""
+        value = str(_record_args({"arg": f"arg: {sample}"})["arg"])
+        assert sample not in value
+        assert _REDACTION_MARKER in value
 
-    @pytest.mark.parametrize(
-        ("label", "sample"),
-        [
-            ("google_refresh", "1//" + "a1b2c3d4e5" * 4),
-            ("google_access", "ya29." + "a1b2c3d4e5" * 4),
-            (
-                "jwt",
-                "eyJhbGciOiJSUzI1NiJ9."
-                "eyJzdWIiOiIxMjM0NTY3ODkwIn0."
-                "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
-            ),
-            ("bearer", "Bearer sk-proj-abc123def456ghi789"),
-            ("gocspx", "GOCSPX-" + "a1b2c3d4e5f6g7h8i9j0k1l2"),
-            ("sk_api_key", "sk-" + "a1b2c3d4e5f6g7h8i9j0"),
-            ("github_pat", "ghp_" + "A" * 36),
-            ("github_server", "ghs_" + "E" * 36),
-            ("aws_access_key", "AKIA" + "A" * 16),
-            ("slack_bot", "xoxb-" + "e1f2g3h4i5"),
-            ("slack_user", "xoxp-" + "a1b2c3d4e5"),
-            ("stripe_rk_live", "rk_live_" + "a" * 24),
-            ("stripe_rk_test", "rk_test_" + "b" * 24),
-        ],
-        ids=lambda x: x if isinstance(x, str) else "",
-    )
-    def test_pattern_redacted_in_error(self, label: str, sample: str) -> None:
-        """Each credential pattern is redacted from ToolCallAuditEntry.error."""
-        entry = _make_tool_call_entry(error=f"failed: {sample}")
-        assert sample not in (entry.error or "")
-        assert "[CREDENTIAL_REDACTED]" in (entry.error or "")
+    @pytest.mark.parametrize(("label", "sample"), _CREDENTIAL_SAMPLES)
+    def test_pattern_redacted_in_pending_confirmation_summary_args(
+        self, label: str, sample: str
+    ) -> None:
+        """Each credential pattern is redacted from PendingConfirmationSummary.args."""
+        value = str(_summary_args({"arg": f"failed: {sample}"})["arg"])
+        assert sample not in value
+        assert _REDACTION_MARKER in value
 
 
 # ===========================================================================
@@ -1228,7 +877,8 @@ class TestCredentialRedactionAllPatterns:
 
 
 class TestModelConstructEnforcement:
-    """Ensure model_construct is never called on audit models in production code."""
+    """Ensure model_construct (which skips redaction validators) is never called in
+    production code."""
 
     def test_no_model_construct_in_production_code(self) -> None:
         """Scan production source files to ensure model_construct is not used on audit models."""
@@ -1246,21 +896,19 @@ class TestModelConstructEnforcement:
 
 
 # ===========================================================================
-# ConversationAuditEntry — tool_calls_count upper bound (FINDING 18)
+# GH-147: the NDJSON audit entry models are removed
 # ===========================================================================
 
 
-class TestConversationAuditEntryToolCallsCountBound:
-    """Tests for tool_calls_count upper bound validation."""
+class TestNdjsonAuditModelsRemoved:
+    """ConversationAuditEntry held full message text; ToolCallAuditEntry held argument
+    keys and error text. Both went with the NDJSON audit log (GH-147)."""
 
-    def test_tool_calls_count_at_max_accepted(self) -> None:
-        entry = _make_conversation_entry(tool_calls_count=50)
-        assert entry.tool_calls_count == 50
+    @pytest.mark.parametrize("name", ["ConversationAuditEntry", "ToolCallAuditEntry", "AuditEntry"])
+    def test_models_ndjson_audit_model_removed(self, name: str) -> None:
+        import admino.models as models_module
 
-    def test_tool_calls_count_exceeds_max_rejected(self) -> None:
-        """tool_calls_count=51 exceeds le=50 and must raise ValidationError."""
-        with pytest.raises(ValidationError):
-            _make_conversation_entry(tool_calls_count=51)
+        assert not hasattr(models_module, name)
 
 
 # ===========================================================================

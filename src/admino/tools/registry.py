@@ -14,6 +14,9 @@ Architecture:
   ``permissions.check_permission``) then runs **before** any confirmation
   request, argument validation or handler execution.
 - Argument validation uses each tool's declared Pydantic ``args_schema``.
+- Dispatch does not audit.  The agent records every dispatch outcome (tool,
+  action, final decision, success, duration — never args or output) through
+  its injected tool-call recorder, so there is a single recording point.
 
 Security notes:
 - An unknown (unregistered) tool is denied before the permission engine runs,
@@ -35,7 +38,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Final, Literal
+from typing import Final
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -43,16 +46,13 @@ from admino.models import (
     _CONTROL_CHAR_TABLE,
     PendingConfirmation,
     ToolCall,
-    ToolCallAuditEntry,
 )
 from admino.permissions import PermissionResult, PermissionsConfig, check_permission
 
-if TYPE_CHECKING:
-    from admino.audit import AuditLogger
-
 logger = logging.getLogger(__name__)
 
-# Cached at import time so it cannot be mutated between import and dispatch.
+# Cached at import time so a later env change cannot re-enable the test-only
+# clear_registry() in production.
 _IS_PRODUCTION: Final[bool] = os.environ.get("ADMINO_ENV", "").lower() == "production"
 
 # ---------------------------------------------------------------------------
@@ -235,57 +235,12 @@ def register_tool(
 # ---------------------------------------------------------------------------
 
 
-def _write_audit(
-    audit_logger: AuditLogger | None,
-    *,
-    session_id: str,
-    tool: str,
-    action: str,
-    permission: PermissionResult,
-    args_keys: list[str],
-    success: bool,
-    error: str | None,
-    permission_override: Literal["disabled"] | None = None,
-) -> None:
-    """Write a ToolCallAuditEntry for a dispatch outcome, if a logger is set.
-
-    The audit entry records only argument *key names*, never values, to
-    avoid credential leakage.  Malformed tool/action identifiers are
-    replaced with fixed placeholders so the Pydantic model validates.
-
-    Args:
-        permission_override: When set, used instead of ``permission.allowed``
-            for the audit entry's permission field.  Used for the ``"disabled"``
-            state which is not part of the permission engine's vocabulary.
-    """
-    if audit_logger is None:
-        return
-    safe_tool = tool if _VALID_IDENTIFIER.fullmatch(tool) else "invalid"
-    safe_action = action if _VALID_IDENTIFIER.fullmatch(action) else "rejected"
-    # Sort for determinism; truncate to the audit-entry field limit.
-    args_summary = ",".join(sorted(args_keys))[:512] if args_keys else "[no args]"
-    perm_value: Literal["allow", "confirm", "deny", "disabled"] = (
-        permission_override if permission_override is not None else permission.allowed
-    )
-    entry = ToolCallAuditEntry(
-        session_id=session_id,
-        tool=safe_tool,
-        action=safe_action,
-        permission=perm_value,
-        args_summary=args_summary,
-        success=success,
-        error=error,
-    )
-    audit_logger.log_tool_call(entry)
-
-
 async def dispatch_tool_call(
     tool_call: ToolCall,
     permissions_config: PermissionsConfig,
     *,
     session_id: str,
     pending_confirmation: PendingConfirmation | None = None,
-    audit_logger: AuditLogger | None = None,
     promoted: frozenset[tuple[str, str]] = frozenset(),
     enabled_tools: dict[str, bool] | None = None,
 ) -> ToolCallResult:
@@ -306,9 +261,10 @@ async def dispatch_tool_call(
     5. Reject unknown args keys, then validate against the Pydantic schema.
     6. Execute the async handler.
 
-    Every terminal path writes a ``ToolCallAuditEntry`` via ``audit_logger``
-    if one is supplied.  In production (``ADMINO_ENV=production``), an audit
-    logger is REQUIRED — passing ``None`` raises ``ValueError``.
+    Dispatch writes no audit record itself: the agent records every returned
+    outcome (``result.permission.allowed`` and ``result.success``) through its
+    injected tool-call recorder, so a disabled or unknown tool surfaces here
+    as a ``deny`` decision.
 
     Args:
         tool_call: The LLM-requested tool call (tool, action, raw args).
@@ -320,8 +276,6 @@ async def dispatch_tool_call(
             the confirmation has not expired.  Mismatches (including args
             differences) and expiries are rejected — the caller is no longer
             the sole line of defence.
-        audit_logger: Sink for ``ToolCallAuditEntry`` records.  Required in
-            production; optional in dev/tests for ergonomic reasons.
         enabled_tools: Per-tool enabled state from settings.  When provided,
             tools whose name maps to ``False`` are rejected before the
             registry lookup and permission check.  Missing keys default to
@@ -329,38 +283,14 @@ async def dispatch_tool_call(
 
     Returns:
         A ``ToolCallResult`` with the outcome of the dispatch.
-
-    Raises:
-        ValueError: If ``audit_logger`` is None and ``ADMINO_ENV=production``.
     """
-    # Production enforcement: audit logger MUST be present.  This mirrors the
-    # pattern in audit.py (base_dir=None disallowed in production) and ensures
-    # the audit trail cannot be silently skipped.
-    if audit_logger is None and _IS_PRODUCTION:
-        msg = (
-            "audit_logger is required in production (ADMINO_ENV=production). "
-            "Pass a non-None AuditLogger to dispatch_tool_call."
-        )
-        raise ValueError(msg)
-
     raw_tool = tool_call.tool
     raw_action = tool_call.action
-    args_keys = list(tool_call.args.keys())
 
     # 0. Defensive identifier validation — reject malformed identifiers before
     #    any permission check or registry lookup.
     if not _VALID_IDENTIFIER.fullmatch(raw_tool) or not _VALID_IDENTIFIER.fullmatch(raw_action):
         permission = PermissionResult(allowed="deny", reason="Malformed identifier.")
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error="Malformed identifier.",
-        )
         return ToolCallResult(
             success=False,
             result="Invalid tool or action identifier.",
@@ -371,17 +301,6 @@ async def dispatch_tool_call(
     #    the permission engine run.
     if enabled_tools is not None and enabled_tools.get(raw_tool) is False:
         disabled_permission = PermissionResult(allowed="deny", reason="Tool is disabled.")
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=disabled_permission,
-            args_keys=args_keys,
-            success=False,
-            error="Tool is disabled.",
-            permission_override="disabled",
-        )
         return ToolCallResult(
             success=False,
             result=f"Tool '{raw_tool}' is disabled.",
@@ -400,16 +319,6 @@ async def dispatch_tool_call(
             raw_action[:64],
         )
         unknown = PermissionResult(allowed="deny", reason="Tool is not registered.")
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=unknown,
-            args_keys=args_keys,
-            success=False,
-            error="Unknown tool.",
-        )
         return ToolCallResult(
             success=False,
             # defence-in-depth truncation on [:63] slices
@@ -424,16 +333,6 @@ async def dispatch_tool_call(
 
     # 3a. Denied — return immediately.
     if permission.allowed == "deny":
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error=permission.reason,
-        )
         return ToolCallResult(
             success=False,
             result=permission.reason,
@@ -444,16 +343,6 @@ async def dispatch_tool_call(
     if permission.allowed == "confirm":
         # 4a. No confirmation supplied — ask the user.
         if pending_confirmation is None:
-            _write_audit(
-                audit_logger,
-                session_id=session_id,
-                tool=raw_tool,
-                action=raw_action,
-                permission=permission,
-                args_keys=args_keys,
-                success=False,
-                error="Confirmation required.",
-            )
             return ToolCallResult(
                 success=False,
                 result=(
@@ -482,16 +371,6 @@ async def dispatch_tool_call(
                 allowed="deny",
                 reason="Pending confirmation does not match tool call.",
             )
-            _write_audit(
-                audit_logger,
-                session_id=session_id,
-                tool=raw_tool,
-                action=raw_action,
-                permission=mismatched,
-                args_keys=args_keys,
-                success=False,
-                error="Pending confirmation mismatch.",
-            )
             return ToolCallResult(
                 success=False,
                 result="Pending confirmation does not match this tool call.",
@@ -509,16 +388,6 @@ async def dispatch_tool_call(
                 allowed="deny",
                 reason="Pending confirmation has expired.",
             )
-            _write_audit(
-                audit_logger,
-                session_id=session_id,
-                tool=raw_tool,
-                action=raw_action,
-                permission=expired,
-                args_keys=args_keys,
-                success=False,
-                error="Pending confirmation expired.",
-            )
             return ToolCallResult(
                 success=False,
                 result="Pending confirmation has expired.",
@@ -531,16 +400,6 @@ async def dispatch_tool_call(
     schema_fields = set(entry.args_schema.model_fields.keys())
     extra_keys = [k for k in tool_call.args if k not in schema_fields]
     if extra_keys:
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error="Unexpected argument fields.",
-        )
         return ToolCallResult(
             success=False,
             result="Argument validation failed: unexpected fields are not permitted.",
@@ -555,16 +414,6 @@ async def dispatch_tool_call(
         error_details = exc.errors(include_input=False)
         error_summary = "; ".join(
             f"{'.'.join(str(loc) for loc in e['loc'])}: {e['msg']}" for e in error_details
-        )
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error="Argument validation failed.",
         )
         return ToolCallResult(
             success=False,
@@ -589,16 +438,6 @@ async def dispatch_tool_call(
             raw_action[:64],
             error_type,
         )
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error=f"Handler raised {error_type}",
-        )
         return ToolCallResult(
             success=False,
             result=f"Tool execution failed: {error_type}",
@@ -612,16 +451,6 @@ async def dispatch_tool_call(
             raw_tool[:64],
             raw_action[:64],
             type(result).__name__,
-        )
-        _write_audit(
-            audit_logger,
-            session_id=session_id,
-            tool=raw_tool,
-            action=raw_action,
-            permission=permission,
-            args_keys=args_keys,
-            success=False,
-            error="Handler returned non-string.",
         )
         return ToolCallResult(
             success=False,
@@ -638,16 +467,6 @@ async def dispatch_tool_call(
     if len(sanitized_result) > _MAX_RESULT_LENGTH:
         sanitized_result = sanitized_result[:_MAX_RESULT_LENGTH]
 
-    _write_audit(
-        audit_logger,
-        session_id=session_id,
-        tool=raw_tool,
-        action=raw_action,
-        permission=permission,
-        args_keys=args_keys,
-        success=True,
-        error=None,
-    )
     return ToolCallResult(
         success=True,
         result=sanitized_result,

@@ -256,22 +256,24 @@ class TestSeedSettings:
         conn.fetchval = AsyncMock(return_value=0)
 
         mock_config = MagicMock()
-        for section in ("server", "llm", "paths", "limits", "egress", "database"):
+        for section in ("server", "llm", "limits", "egress", "database"):
             getattr(mock_config, section).model_dump = MagicMock(return_value={"key": "val"})
         mock_config.auth.model_dump = MagicMock(return_value={"mode": "vpn"})
         mock_config.log_level = "INFO"
         # GH-143: the files tool config is gone — seeding must never read it.
         del mock_config.files
+        # GH-147: so is the paths section (its last field was the audit log path).
+        del mock_config.paths
 
         await db_mod.seed_settings(mock_pool, mock_config)
 
-        # 8 sections: server, llm, auth, paths, limits, egress, database, log_level
+        # 7 sections: server, llm, auth, limits, egress, database, log_level
         insert_calls = [
             c
             for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
         ]
-        assert len(insert_calls) == 8
+        assert len(insert_calls) == 7
 
     async def test_seed_settings_does_not_seed_files_row(
         self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -294,7 +296,6 @@ class TestSeedSettings:
             "server",
             "llm",
             "auth",
-            "paths",
             "limits",
             "egress",
             "database",
