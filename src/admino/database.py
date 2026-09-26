@@ -7,6 +7,8 @@ executed in order on startup.
 Security notes:
 - DATABASE_URL is read from env var only, never from YAML or config files.
 - All SQL uses parameterized queries ($1, $2). No string interpolation.
+- Org-content repository functions take a TenantContext (admino.tenancy) as
+  their first argument and filter by its org_id; there is no unscoped path.
 - Does not import from agent.py, llm.py, or server.py.
 """
 

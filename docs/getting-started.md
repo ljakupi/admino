@@ -11,6 +11,7 @@ your Google/Microsoft accounts so admino can use its mail, calendar, and drive t
 - [5. Your first chat](#5-your-first-chat)
 - [Connect your accounts](#connect-your-accounts)
 - [How environment loading differs (local vs Docker)](#how-environment-loading-differs-local-vs-docker)
+- [Upgrading from the single-tenant version](#upgrading-from-the-single-tenant-version)
 - [Quality gates (for contributors)](#quality-gates-for-contributors)
 - [Troubleshooting](#troubleshooting)
 
@@ -197,6 +198,20 @@ This trips people up, so it's worth stating plainly:
 | Reads `.env`? | **No** — reads the shell environment + `config/config.yaml` | **Yes** — Compose loads it via `env_file` |
 | Getting secrets in | `set -a; source .env; set +a` (or `export` them) | Just edit `.env` |
 | PostgreSQL | Container via `make dev-db`, published on `127.0.0.1:5432` | Container on the internal network, not published |
+
+## Upgrading from the single-tenant version
+
+admino is becoming a multi-tenant platform, with organizations and user accounts in four
+roles: Super Admin, Org Admin, Editor and Viewer. **The upgrade starts from an empty
+platform.**
+
+- Migrations run on startup against your existing database. The first tenancy migration
+  only adds the (empty) `organizations` and `users` tables, so nothing changes until login
+  with user accounts arrives.
+- Later migrations move settings, tool permissions, memory notes and Google/Microsoft
+  connections from the single install to organizations and users. They **drop the existing
+  rows** instead of converting them. After that upgrade you set your settings and tool
+  permissions again and reconnect your accounts.
 
 ## Quality gates (for contributors)
 

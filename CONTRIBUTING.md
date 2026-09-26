@@ -142,6 +142,12 @@ Review these before every change; violations block the PR:
   `(tool, action)` and must never import from `agent.py`, `llm*.py`, or `server.py`,
   and must never see LLM-generated context. Hardcoded denials (e.g. `gmail.send`,
   `google_drive.delete`, `memory.delete`) cannot be made configurable.
+- **Access-policy isolation.** `access.py` encodes the role matrix as pure functions
+  (`can(principal, capability)`): no I/O, and no imports from `agent.py`, `llm*.py`,
+  `server.py` or the database layer. It stays separate from the tool permission engine.
+- **Tenant scoping.** Every repository function for organization content takes a
+  `TenantContext` (`tenancy.py`) and filters by its `org_id`; there's no unscoped
+  content query. Super Admins never get a `TenantContext`, so they can't reach content.
 - **Network boundaries stay intact.** The agent container is whitelist-only egress;
   local LLM containers get zero external network access. Don't loosen either.
 - New tools or actions require permission entries and a security rationale in the
