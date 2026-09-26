@@ -170,7 +170,7 @@ export const en = {
 
   // --- chat page (empty state, suggestions, input bar) -------------------
   'chat.empty.heading': 'How can I help?',
-  'chat.empty.subtext': 'Your messages stay on your machine.',
+  'chat.empty.subtext': "By default, answers come from Infomaniak's Swiss-hosted AI.",
   'chat.suggestions.searchEmails': 'Search my emails',
   'chat.suggestions.calendarToday': "What's on my calendar today?",
   'chat.suggestions.findFile': 'Find a file',
@@ -264,7 +264,7 @@ export const en = {
   'toolsPage.disconnect': 'Disconnect',
   'toolsPage.service.outlookMail': 'Outlook Mail',
   'toolsPage.local.title': 'Local tools',
-  'toolsPage.local.subtitle': 'Tools that run entirely on your machine.',
+  'toolsPage.local.subtitle': 'Tools that run on your admino server. No external account needed.',
   'toolsPage.memory.description': 'Persistent key-value notes',
   'toolsPage.disconnectConfirm.heading': 'Disconnect {provider}?',
   'toolsPage.disconnectConfirm.subtext':
@@ -299,7 +299,7 @@ export const en = {
   'settings.session.new.label': 'New session',
   'settings.session.new.hint': 'Clears the chat thread. The conversation history stays in audit log.',
   'settings.agent.subtitle':
-    'Which LLM admino talks to. Infomaniak is the default; vLLM (Apple Silicon), Claude, and OpenAI are opt-in alternatives.',
+    'Which LLM admino talks to. Infomaniak is the default; vLLM (local CPU container), Claude, and OpenAI are opt-in alternatives.',
   'settings.agent.provider.label': 'Provider',
   'settings.agent.provider.hint':
     'Infomaniak, Claude, and OpenAI send your messages to their servers for processing. vLLM is a local, opt-in alternative you run yourself.',
@@ -315,7 +315,7 @@ export const en = {
   'settings.agent.vllm.noModels':
     'No served model detected — the local vLLM container is opt-in: start it with {cmd}.',
   'settings.agent.vllm.modelHint':
-    'The HuggingFace repo id of the model served locally on Apple Silicon (Metal).',
+    'The HuggingFace repo id of the model served by the local vLLM CPU container.',
   'settings.agent.apiToken.label': 'API token',
   'settings.agent.apiKey.label': 'API key',
   'settings.agent.secretHint':
@@ -335,7 +335,8 @@ export const en = {
   'settings.notifications.taskDone.hint': 'Ping me when a long-running response is ready.',
   'settings.notifications.sound.label': 'Sound',
   'settings.notifications.sound.hint': 'Subtle chime on pings. Respects system Do Not Disturb.',
-  'settings.about.subtitle': 'Local-only, security-first personal AI agent.',
+  'settings.about.subtitle':
+    "A privacy- and security-first personal AI agent you run yourself, powered by Infomaniak's Swiss-hosted AI by default.",
   'settings.about.version': 'Version',
   'settings.about.versionValue': 'admino {version} (Alpha)',
   'settings.about.sourceCode': 'Source code',

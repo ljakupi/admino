@@ -168,7 +168,7 @@ export const de: Record<MessageKey, Message> = {
 
   // --- chat page (empty state, suggestions, input bar) -------------------
   'chat.empty.heading': 'Wie kann ich helfen?',
-  'chat.empty.subtext': 'Ihre Nachrichten bleiben auf Ihrem Gerät.',
+  'chat.empty.subtext': 'Standardmässig antwortet die in der Schweiz gehostete KI von Infomaniak.',
   'chat.suggestions.searchEmails': 'Meine E-Mails durchsuchen',
   'chat.suggestions.calendarToday': 'Was steht heute in meinem Kalender?',
   'chat.suggestions.findFile': 'Eine Datei finden',
@@ -266,7 +266,7 @@ export const de: Record<MessageKey, Message> = {
   'toolsPage.disconnect': 'Trennen',
   'toolsPage.service.outlookMail': 'Outlook Mail',
   'toolsPage.local.title': 'Lokale Tools',
-  'toolsPage.local.subtitle': 'Tools, die vollständig auf Ihrem Gerät laufen.',
+  'toolsPage.local.subtitle': 'Tools, die auf Ihrem admino-Server laufen. Kein externes Konto nötig.',
   'toolsPage.memory.description': 'Dauerhafte Schlüssel-Wert-Notizen',
   'toolsPage.disconnectConfirm.heading': '{provider} trennen?',
   'toolsPage.disconnectConfirm.subtext':
@@ -302,7 +302,7 @@ export const de: Record<MessageKey, Message> = {
   'settings.session.new.label': 'Neue Sitzung',
   'settings.session.new.hint': 'Leert den Chatverlauf. Der Gesprächsverlauf bleibt im Audit-Log erhalten.',
   'settings.agent.subtitle':
-    'Mit welchem LLM admino arbeitet. Infomaniak ist der Standard; vLLM (Apple Silicon), Claude und OpenAI sind optionale Alternativen.',
+    'Mit welchem LLM admino arbeitet. Infomaniak ist der Standard; vLLM (lokaler CPU-Container), Claude und OpenAI sind optionale Alternativen.',
   'settings.agent.provider.label': 'Anbieter',
   'settings.agent.provider.hint':
     'Infomaniak, Claude und OpenAI senden Ihre Nachrichten zur Verarbeitung an ihre Server. vLLM ist eine lokale, optionale Alternative, die Sie selbst betreiben.',
@@ -319,7 +319,7 @@ export const de: Record<MessageKey, Message> = {
   'settings.agent.vllm.noModels':
     'Kein bereitgestelltes Modell erkannt – der lokale vLLM-Container ist optional: Starten Sie ihn mit {cmd}.',
   'settings.agent.vllm.modelHint':
-    'Die HuggingFace-Repo-ID des lokal auf Apple Silicon (Metal) bereitgestellten Modells.',
+    'Die HuggingFace-Repo-ID des Modells, das der lokale vLLM-CPU-Container bereitstellt.',
   'settings.agent.apiToken.label': 'API-Token',
   'settings.agent.apiKey.label': 'API-Schlüssel',
   'settings.agent.secretHint':
@@ -341,7 +341,8 @@ export const de: Record<MessageKey, Message> = {
   'settings.notifications.sound.label': 'Ton',
   'settings.notifications.sound.hint':
     'Dezenter Ton bei Hinweisen. Beachtet den Modus «Nicht stören» des Systems.',
-  'settings.about.subtitle': 'Rein lokaler, sicherheitsorientierter persönlicher KI-Agent.',
+  'settings.about.subtitle':
+    'Ein datenschutz- und sicherheitsorientierter persönlicher KI-Agent, den Sie selbst betreiben – standardmässig mit der in der Schweiz gehosteten KI von Infomaniak.',
   'settings.about.version': 'Version',
   'settings.about.versionValue': 'admino {version} (Alpha)',
   'settings.about.sourceCode': 'Quellcode',

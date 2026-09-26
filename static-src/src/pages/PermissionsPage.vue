@@ -139,6 +139,9 @@ onMounted(() => store.loadPermissions());
 
 .filters {
   display: inline-flex;
+  /* Longer DE/FR labels must wrap, not push filters off a phone screen. */
+  flex-wrap: wrap;
+  max-width: 100%;
   gap: 4px;
   padding: 3px;
   background: #FFFFFF;

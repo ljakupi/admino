@@ -76,9 +76,14 @@ function render(message: Message, params?: Params): string {
   return createI18n({ messages: { en: { m: message } } }).t('m', params);
 }
 
-/** ICU uses (narrow) no-break spaces; compare them as plain spaces. */
+/**
+ * ICU output varies by version in two harmless ways: (narrow) no-break spaces
+ * vs plain spaces, and the Swiss grouping separator, which is U+2019 (’) in
+ * some ICU/CLDR versions and U+0027 (') in others (e.g. Node 20.18 vs 20.20).
+ * Normalize both so the assertions check the format, not the ICU build.
+ */
 function plain(text: string): string {
-  return text.replace(/[  ]/g, ' ');
+  return text.replace(/[\u00a0\u202f]/g, ' ').replace(/'/g, '\u2019');
 }
 
 /** Everything passed to console.warn, as one searchable string. */

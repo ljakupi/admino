@@ -71,9 +71,14 @@ function keyDiff(locale: Locale): { missing: string[]; extra: string[] } {
   };
 }
 
-/** ICU uses (narrow) no-break spaces; compare them as plain spaces. */
+/**
+ * ICU output varies by version in two harmless ways: (narrow) no-break spaces
+ * vs plain spaces, and the Swiss grouping separator, which is U+2019 (’) in
+ * some ICU/CLDR versions and U+0027 (') in others (e.g. Node 20.18 vs 20.20).
+ * Normalize both so the assertions check the format, not the ICU build.
+ */
 function plain(text: string): string {
-  return text.replace(/[  ]/g, ' ');
+  return text.replace(/[\u00a0\u202f]/g, ' ').replace(/'/g, '\u2019');
 }
 
 const EN_KEYS = Object.keys(en) as MessageKey[];
@@ -208,5 +213,52 @@ describe('i18n catalogs', () => {
     );
 
     expect(translated.length).toBeGreaterThan(0);
+  });
+});
+
+// --- Product claims -------------------------------------------------------
+//
+// With Infomaniak AI Services as the default provider (#142), messages leave
+// the user's machine for Infomaniak's Swiss servers, and admino itself may
+// run on a VPS. No locale may claim that data stays local, the copy that
+// introduces admino (Settings → About, the empty chat) names Infomaniak as
+// the default, and vLLM is described as today's local CPU container, not
+// the old Apple Silicon / Metal setup.
+
+const LOCAL_ONLY_CLAIMS: Record<Locale, RegExp> = {
+  en: /on your machine|local-only|stays? local/i,
+  de: /auf Ihrem Gerät|rein lokal/i,
+  fr: /sur votre appareil|uniquement local/i,
+};
+
+describe('i18n catalog product claims', () => {
+  it.each<Locale>(['en', 'de', 'fr'])('%s never claims that data stays local', (target) => {
+    const claims = EN_KEYS.filter((key) =>
+      formsOf(CATALOGS[target][key]).some((form) => LOCAL_ONLY_CLAIMS[target].test(form)),
+    );
+
+    expect(claims).toEqual([]);
+  });
+
+  it.each<Locale>(['en', 'de', 'fr'])('%s names Infomaniak in the About text and the empty chat', (target) => {
+    const catalog = CATALOGS[target];
+
+    expect([
+      /Infomaniak/.test(String(catalog['settings.about.subtitle'])),
+      /Infomaniak/.test(String(catalog['chat.empty.subtext'])),
+    ]).toEqual([true, true]);
+  });
+
+  it.each<Locale>(['en', 'de', 'fr'])('%s describes vLLM as the local CPU container', (target) => {
+    const catalog = CATALOGS[target];
+    const outdated = EN_KEYS.filter((key) =>
+      formsOf(catalog[key]).some((form) => /Apple Silicon|\bMetal\b/.test(form)),
+    );
+
+    expect([
+      outdated,
+      /\bCPU\b/.test(String(catalog['settings.agent.subtitle'])),
+      /\bCPU\b/.test(String(catalog['settings.agent.vllm.modelHint'])),
+    ]).toEqual([[], true, true]);
   });
 });
