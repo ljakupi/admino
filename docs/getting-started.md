@@ -147,8 +147,8 @@ directory is mounted into the container, so the agent can't reach files on your 
 ## 5. Your first chat
 
 1. Open **http://localhost:8000**.
-2. On the token prompt, click **Skip** — the default `vpn` auth mode needs no token when
-   the API is bound to localhost. (See [auth modes](configuration.md#authentication-modes).)
+2. Log in with your email address and password. See
+   [Accounts and sessions](configuration.md#accounts-and-sessions).
 3. With `INFOMANIAK_API_TOKEN` set, the default Infomaniak model answers right away.
    If the token is missing, admino still starts and the chat replies that Infomaniak
    isn't configured. **Settings → Agent** switches to local **vLLM** (after

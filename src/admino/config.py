@@ -6,13 +6,16 @@ once the DB is seeded. Tool permission rules live in permissions.py; their
 in-code defaults (DEFAULT_PERMISSIONS) seed an empty DB on first run.
 
 Environment variable overrides are supported for deployment flexibility.
-Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, AUTH_TOKEN)
+Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
 are NEVER read from YAML -- they come exclusively from environment variables.
 
 Security notes:
 - No secrets in config.yaml. Credentials come from env vars only.
 - Invalid config causes the agent to refuse to start with a clear error message.
 - YAML parsing uses safe_load only (no arbitrary Python object deserialization).
+- The session cookie is ``Secure`` by default (``server.cookie_secure``); only
+  a recognised false value of COOKIE_SECURE turns it off, and an unrecognised
+  value is ignored with a warning, so a typo can't weaken it.
 """
 
 from __future__ import annotations
@@ -24,7 +27,7 @@ import re
 from typing import TYPE_CHECKING, Final, Literal
 
 import yaml
-from pydantic import BaseModel, Field, SecretStr, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 
 from admino.permissions import PermissionsConfig, validate_permissions_config
 
@@ -61,6 +64,13 @@ class ServerConfig(BaseModel):
         ge=1,
         le=65535,
         description="Listen port for the ASGI server.",
+    )
+    cookie_secure: bool = Field(
+        default=True,
+        description=(
+            "Set the Secure flag on the session cookie. Turn it off (COOKIE_SECURE=false) "
+            "only for plain-HTTP access from another address, e.g. a phone on the LAN."
+        ),
     )
 
     @field_validator("host")
@@ -270,22 +280,6 @@ class LLMConfig(BaseModel):
         return name or ""
 
 
-class AuthConfig(BaseModel):
-    """Authentication configuration.
-
-    The actual token value is read from the AUTH_TOKEN env var, never from YAML.
-    """
-
-    mode: Literal["vpn", "token"] = Field(
-        default="token",
-        description="Auth mode: 'vpn' trusts all connections, 'token' requires Bearer token.",
-    )
-    token: SecretStr | None = Field(
-        default=None,
-        description="Bearer token for 'token' auth mode. Populated from AUTH_TOKEN env var.",
-    )
-
-
 class LimitsConfig(BaseModel):
     """Rate and size limits for the agent."""
 
@@ -387,21 +381,22 @@ class AppConfig(BaseModel):
     """Top-level application configuration validated from config.yaml.
 
     Unknown top-level sections are ignored (Pydantic's default ``extra``
-    behaviour), so a legacy ``files`` section (from before GH-143) or
-    ``paths`` section (the removed NDJSON audit log path, GH-147) left in an
-    existing config.yaml or settings table still validates and is dropped.
+    behaviour), so a legacy ``files`` section (from before GH-143), ``paths``
+    section (the removed NDJSON audit log path, GH-147) or ``auth`` section
+    (the removed auth modes, GH-149) left in an existing config.yaml or
+    settings table still validates and is dropped.
 
     Environment variable overrides are applied after YAML loading:
     - LLM_PROVIDER      -> llm.provider
     - VLLM_MODEL        -> llm.vllm_model
     - VLLM_BASE_URL     -> llm.vllm_base_url
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len
+    - COOKIE_SECURE     -> server.cookie_secure
     - LOG_LEVEL         -> log_level
     """
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
-    auth: AuthConfig = Field(default_factory=AuthConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
@@ -410,62 +405,16 @@ class AppConfig(BaseModel):
         description="Python logging level for the application.",
     )
 
-    @model_validator(mode="after")
-    def warn_vpn_mode_on_all_interfaces(self) -> AppConfig:
-        """Warn when binding to all interfaces with no application-layer auth.
-
-        If server.host is 0.0.0.0 (all interfaces) and auth.mode is 'vpn'
-        (trust-the-network), the API is unauthenticated on every interface.
-        This is dangerous on a VPS with a public IP.
-        """
-        if self.server.host == "0.0.0.0" and self.auth.mode == "vpn":  # noqa: S104
-            logger.warning(
-                "server.host is '0.0.0.0' with auth.mode='vpn' — the API is "
-                "unauthenticated on ALL network interfaces. Ensure VPN/firewall "
-                "controls are in place, or switch to auth.mode='token'."
-            )
-        return self
-
-    @model_validator(mode="after")
-    def validate_auth_token_present(self) -> AppConfig:
-        """Fail fast if token auth is configured but AUTH_TOKEN is unset or weak.
-
-        Prevents an empty-string AUTH_TOKEN from creating an authentication
-        bypass where any request without an Authorization header would match.
-        """
-        if self.auth.mode == "token":
-            token = os.environ.get("AUTH_TOKEN", "")
-            if len(token) < 48:
-                msg = (
-                    "auth.mode is 'token' but AUTH_TOKEN env var is missing or "
-                    "shorter than 48 characters. Set a strong AUTH_TOKEN or use "
-                    "auth.mode: vpn."
-                )
-                raise ValueError(msg)
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", token):
-                msg = (
-                    "AUTH_TOKEN contains invalid characters. "
-                    "Only base64-URL-safe characters [A-Za-z0-9_-] are allowed."
-                )
-                raise ValueError(msg)
-            # Floor check only — not a substitute for cryptographically random generation.
-            # Recommended: python -c "import secrets; print(secrets.token_urlsafe(48))"
-            if len(set(token)) < 20:
-                msg = (
-                    "AUTH_TOKEN has insufficient entropy (fewer than 20 unique "
-                    "characters). Generate with: "
-                    'python -c "import secrets; print(secrets.token_urlsafe(48))"'
-                )
-                raise ValueError(msg)
-            self.auth.token = SecretStr(token)
-        return self
-
 
 # ---------------------------------------------------------------------------
 # Config loading functions
 # ---------------------------------------------------------------------------
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+# COOKIE_SECURE values, compared case-insensitively.
+_TRUE_VALUES: Final = frozenset({"true", "1", "yes", "on"})
+_FALSE_VALUES: Final = frozenset({"false", "0", "no", "off"})
 
 
 def _apply_vllm_env_overrides(data: dict[str, object]) -> None:
@@ -503,6 +452,34 @@ def _apply_vllm_env_overrides(data: dict[str, object]) -> None:
             )
 
 
+def _apply_cookie_secure_override(data: dict[str, object]) -> None:
+    """Apply the COOKIE_SECURE env override to ``server.cookie_secure`` in-place.
+
+    true/1/yes/on and false/0/no/off (any case) set the flag; unset or empty
+    changes nothing. Any other value is ignored with a warning (the value
+    itself isn't logged), so the YAML value or the secure default stays.
+
+    Args:
+        data: Raw config dict parsed from YAML (mutated in place).
+    """
+    value = os.environ.get("COOKIE_SECURE", "").strip().lower()
+    if not value:
+        return
+    if value not in _TRUE_VALUES | _FALSE_VALUES:
+        logger.warning(
+            "Ignoring invalid COOKIE_SECURE value (use true or false); "
+            "the session cookie setting is unchanged."
+        )
+        return
+    server_section = data.setdefault("server", {})
+    if not isinstance(server_section, dict):
+        logger.warning(
+            "Cannot apply COOKIE_SECURE override: 'server' config section is not a mapping."
+        )
+        return
+    server_section["cookie_secure"] = value in _TRUE_VALUES
+
+
 def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     """Apply environment variable overrides to raw config data.
 
@@ -511,6 +488,7 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     - VLLM_MODEL         -> llm.vllm_model
     - VLLM_BASE_URL      -> llm.vllm_base_url
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len (parsed to int)
+    - COOKIE_SECURE      -> server.cookie_secure (true/false/1/0/yes/no/on/off)
     - LOG_LEVEL          -> log_level
 
     Args:
@@ -530,6 +508,7 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
             )
 
     _apply_vllm_env_overrides(data)
+    _apply_cookie_secure_override(data)
 
     log_level = os.environ.get("LOG_LEVEL")
     if log_level:
@@ -541,16 +520,6 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
                 "Ignoring invalid LOG_LEVEL value %r. Valid: %s",
                 log_level,
                 ", ".join(sorted(_VALID_LOG_LEVELS)),
-            )
-
-    auth_mode = os.environ.get("AUTH_MODE")
-    if auth_mode:
-        auth_section = data.setdefault("auth", {})
-        if isinstance(auth_section, dict):
-            auth_section["mode"] = auth_mode
-        else:
-            logger.warning(
-                "Cannot apply AUTH_MODE override: 'auth' config section is not a mapping."
             )
 
     return data

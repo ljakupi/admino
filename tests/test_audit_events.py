@@ -2297,7 +2297,9 @@ class TestModuleIsolation:
 
 
 # ---------------------------------------------------------------------------
-# GH-147: record_tool_call — the tool.call row the agent's recorder writes
+# GH-147: record_tool_call — the tool.call row the agent's recorder writes.
+# GH-149: the row names the acting member (actor_kind member, their user id and
+# org) instead of a system actor in the default org.
 # ---------------------------------------------------------------------------
 
 _CHAT = UUID("f1e2d3c4-b5a6-4978-8a9b-0c1d2e3f4a5b")
@@ -2313,6 +2315,7 @@ def _record_tool_call() -> Callable[..., Any]:
 def _tool_call_kwargs(**overrides: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {
         "org_id": _ORG,
+        "actor_user_id": _USER,
         "chat_id": _CHAT,
         "tool": "gmail",
         "action": "read",
@@ -2335,13 +2338,15 @@ class TestRecordToolCall:
         assert sql.startswith("insert into audit_events")
 
     @pytest.mark.asyncio
-    async def test_row_is_a_system_tool_call_on_the_chat(self, conn: MagicMock) -> None:
+    async def test_row_is_a_member_tool_call_on_the_chat(self, conn: MagicMock) -> None:
+        """GH-149: the acting member, not a system actor: actor_kind member, their user id
+        and their org."""
         await _record_tool_call()(conn, **_tool_call_kwargs())
 
         row = _inserted_row(conn)
         assert row["action"] == "tool.call"
-        assert row["actor_kind"] == "system"
-        assert row["actor_user_id"] is None
+        assert row["actor_kind"] == "member"
+        assert row["actor_user_id"] == _USER
         assert row["org_id"] == _ORG
         assert row["target_type"] == "chat"
         assert json.loads(row["target_ids"]) == [str(_CHAT)]
@@ -2427,11 +2432,43 @@ class TestRecordToolCall:
 
     @pytest.mark.asyncio
     async def test_bind_parameters_only(self, conn: MagicMock) -> None:
-        """The org and chat IDs travel as bind parameters, never in the SQL text."""
+        """The org, user and chat IDs travel as bind parameters, never in the SQL text."""
         await _record_tool_call()(conn, **_tool_call_kwargs())
 
         sql, _, _, _ = _insert_call(conn)
-        _assert_no_content(sql, _ORG, _CHAT)
+        _assert_no_content(sql, _ORG, _USER, _CHAT)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({"actor_user_id": None}, id="no-user"),
+            pytest.param({"org_id": None}, id="no-org"),
+        ],
+    )
+    async def test_member_row_without_user_or_org_raises_and_writes_nothing(
+        self, conn: MagicMock, overrides: dict[str, Any]
+    ) -> None:
+        """A member always names their user id and acts inside an org: a missing one is
+        refused (AuditRecordError) before anything is written."""
+        with pytest.raises(AuditRecordError):
+            await _record_tool_call()(conn, **_tool_call_kwargs(**overrides))
+
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_member_ids_from_asyncpg_are_stored_as_plain_uuids(self, conn: MagicMock) -> None:
+        """IDs read from a users row (asyncpg's UUID subclass) are stored canonically."""
+        from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
+
+        await _record_tool_call()(
+            conn,
+            **_tool_call_kwargs(org_id=PgUUID(str(_ORG)), actor_user_id=PgUUID(str(_USER))),
+        )
+
+        row = _inserted_row(conn)
+        assert (type(row["org_id"]), type(row["actor_user_id"])) == (UUID, UUID)
+        assert (row["org_id"], row["actor_user_id"]) == (_ORG, _USER)
 
     def test_signature_is_keyword_only_after_the_executor(self) -> None:
         params = list(inspect.signature(_record_tool_call()).parameters.values())

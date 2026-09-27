@@ -69,13 +69,11 @@ const anthropicModelError = ref<MessageKey | undefined>(undefined);
 const openAiModelError = ref<MessageKey | undefined>(undefined);
 
 // --- Session section ---
-const draftToken = ref('');
 const draftSessionId = ref('');
 
 function syncDrafts() {
   draftAnthropicModel.value = settings.llmAnthropicModel;
   draftOpenAiModel.value = settings.llmOpenAiModel;
-  draftToken.value = settings.token ?? '';
   draftSessionId.value = settings.sessionId;
 }
 
@@ -108,13 +106,6 @@ async function onOpenAiModelBlur() {
   if (err) return;
   if (draftOpenAiModel.value !== settings.llmOpenAiModel) {
     await settings.setOpenAiModel(draftOpenAiModel.value.trim());
-  }
-}
-
-function onTokenBlur() {
-  if (draftToken.value && draftToken.value !== settings.token) {
-    settings.setToken(draftToken.value);
-    toasts.add('success', t('settings.toast.tokenSaved'));
   }
 }
 
@@ -237,21 +228,6 @@ async function onInfomaniakModelChange(event: Event) {
             <p class="section-sub">{{ t('settings.session.subtitle') }}</p>
           </div>
           <div class="s-card">
-            <div class="s-row">
-              <div class="row-label">
-                {{ t('settings.session.token.label') }}
-                <I18nT class="row-hint" keypath="settings.session.token.hint">
-                  <template #config><code class="inline-code">auth.mode: token</code></template>
-                </I18nT>
-              </div>
-              <input
-                v-model="draftToken"
-                class="s-input mono"
-                type="password"
-                :placeholder="t('settings.session.token.placeholder')"
-                @blur="onTokenBlur"
-              />
-            </div>
             <div class="s-row">
               <div class="row-label">
                 {{ t('settings.session.id.label') }}

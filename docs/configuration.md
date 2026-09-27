@@ -15,7 +15,7 @@ admino is configured by two things:
 - [Infomaniak AI Services (default)](#infomaniak-ai-services-default)
 - [Local vLLM (CPU container)](#local-vllm-cpu-container)
 - [`config.yaml` reference](#configyaml-reference)
-- [Authentication modes](#authentication-modes)
+- [Accounts and sessions](#accounts-and-sessions)
 - [Email (SMTP)](#email-smtp)
 - [Data & storage](#data--storage)
 - [Egress whitelist](#egress-whitelist)
@@ -140,22 +140,37 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | `server` | Bind `host` / `port` for the ASGI server. |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
 | `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. |
-| `auth` | `mode` — `vpn` or `token` (see below). |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 
-## Authentication modes
+## Accounts and sessions
 
-Set under `auth.mode` in `config.yaml` (or `AUTH_MODE` in the environment):
+admino has user accounts: you log in with your email address and password, and the
+server keeps your session.
 
-| Mode | Behavior | When to use |
+- **Passwords** are hashed with **Argon2id** (19 MiB of memory, 2 iterations, 1 lane). When
+  these settings change, your hash is upgraded at your next login. A password has 12 to 128
+  characters, isn't your email address, and isn't one of the 100,000 most common passwords.
+  That list is bundled with admino, so nothing is sent anywhere to check a password.
+- **Sessions** last 12 hours. Your browser only holds a random token in the
+  `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database only
+  stores its SHA-256 hash. Logging out ends the session at once.
+- **Every API route needs a session**, except `/health`, the login endpoint and the OAuth
+  callback. A deactivated account, or an account whose organization is deactivated or
+  pending deletion, is refused on its next request, even with a session that's still open.
+- **A failed login** always answers "Invalid email or password", whatever the reason.
+  Successful and failed logins are recorded in the audit log, without the email address.
+- **Cross-site requests** that change something (`POST`, `PATCH`, `DELETE`) are refused
+  with `403`.
+- **Rate limits** apply per user, and per IP address for the login. An IP address that keeps
+  sending unknown session cookies is refused with `429` for a while.
+
+| Variable | Default | Notes |
 | --- | --- | --- |
-| **`vpn`** *(default)* | Trusts all connections — no token required. | The out-of-the-box localhost setup: Docker publishes the API on `127.0.0.1` only, and `make run` serves on your own machine. |
-| **`token`** | Requires a Bearer token on every request (`AUTH_TOKEN`). | **Required** the moment the API is reachable beyond this machine (LAN, VPN, VPS). |
+| `COOKIE_SECURE` | `true` | Marks the session cookie `Secure`, so browsers only send it over HTTPS (and to `http://localhost`). Set it to `false` only when you open admino over plain HTTP from another address, such as a phone on your LAN. |
 
-> ⚠️ **`vpn` mode serves an unauthenticated API to anything that can reach the port.** The
-> moment you widen the Docker `ports:` publish beyond `127.0.0.1`, switch to `token` mode
-> and set a strong `AUTH_TOKEN` (≥ 48 chars, high entropy) **first**.
+> The login page and the command that creates the first account are still being added.
+> Until they ship, the API answers `401` to every call that has no session.
 
 ## Email (SMTP)
 

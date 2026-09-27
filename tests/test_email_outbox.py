@@ -65,7 +65,6 @@ from uuid import UUID
 
 import asyncpg
 import pytest
-from pydantic import SecretStr
 
 import admino.email_outbox as outbox_mod
 from admino.access import SealedModel
@@ -127,8 +126,6 @@ _SRC_DIR = Path(outbox_mod.__file__).resolve().parent
 
 # The real asyncio.sleep, kept before any test patches the module attribute.
 _REAL_SLEEP = asyncio.sleep
-
-_TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"
 
 # Formatting-tolerant SQL fragments (normalized SQL is lowercase, single-spaced).
 _NOW = (
@@ -1625,13 +1622,11 @@ class TestRunOutboxSender:
 
 
 def _make_app_config() -> MagicMock:
-    """Build a minimal mock AppConfig for create_app."""
+    """Build a minimal mock AppConfig for create_app (GH-149: no ``auth`` section)."""
     config = MagicMock()
-    config.auth.mode = "token"
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    config.auth.token = SecretStr(_TEST_TOKEN)
     return config
 
 

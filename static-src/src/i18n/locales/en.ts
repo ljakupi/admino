@@ -67,8 +67,6 @@ export const en = {
   // --- toast (critical permissions store) ---------------------------------
   'toast.criticalPermissions.promotionScheduled.title': 'Promotion scheduled',
   'toast.criticalPermissions.promotionScheduled.body': 'Active in {time}',
-  'toast.criticalPermissions.authFailed.title': 'Authentication failed',
-  'toast.criticalPermissions.authFailed.body': 'The token you entered is invalid.',
   'toast.criticalPermissions.promotionFailed.title': 'Promotion failed',
   'toast.criticalPermissions.cancelled.title': 'Pending promotion cancelled',
   'toast.criticalPermissions.cancelFailed.title': 'Cancel failed',
@@ -232,27 +230,6 @@ export const en = {
     other: '{n} denied',
   },
 
-  // --- auth (access-token dialog) ----------------------------------------
-  'auth.welcome': 'Welcome',
-  'auth.intro': "Enter your access token to connect, or skip if you're on a private network.",
-  'auth.tokenLabel': 'Access Token',
-  'auth.tokenPlaceholder': 'Paste your token',
-  'auth.skip': 'Skip',
-  'auth.connect': 'Connect',
-  'auth.error.tokenRequired': 'Token is required',
-  'auth.error.tokenFormat': 'Token must be 8-512 printable ASCII characters',
-  'auth.error.invalidToken': 'Invalid token. Check and try again.',
-  'auth.error.tokenRequiredByServer': 'This server requires a token. Skipping is not available.',
-
-  // --- reauth (re-authentication dialog for critical permissions) --------
-  'reauth.title': 'Re-authenticate to enable',
-  'reauth.body':
-    "You're allowing admino to propose {action} on {tool}. Enter your auth token to confirm. The change will take effect after a 5-minute cooldown that you can cancel.",
-  'reauth.tokenLabel': 'Auth token',
-  'reauth.tokenPlaceholder': 'Re-enter your bearer token',
-  'reauth.tokenHint': 'Never logged. Verified against your active session.',
-  'reauth.submit': 'Enable & start cooldown',
-
   // --- toolsPage (connected accounts, local tools, OAuth callback) -------
   'toolsPage.accounts.title': 'Connected accounts',
   'toolsPage.accounts.subtitle': 'Connect a provider once. Toggle individual services any time.',
@@ -291,9 +268,6 @@ export const en = {
   'settings.nav.about': 'About',
   'settings.nav.danger': 'Danger zone',
   'settings.session.subtitle': 'Identifies this conversation thread on the admino backend.',
-  'settings.session.token.label': 'Bearer token',
-  'settings.session.token.hint': 'Required only when the server runs in {config}.',
-  'settings.session.token.placeholder': 'Enter bearer token',
   'settings.session.id.label': 'Session ID',
   'settings.session.id.hint': 'Alphanumeric, hyphens, underscores. Max 64 chars.',
   'settings.session.new.label': 'New session',
@@ -359,7 +333,6 @@ export const en = {
   'settings.danger.clearConfirm.subtext':
     'This will remove all messages and tool call history from the current session.',
   'settings.danger.clearConfirm.confirm': 'Clear',
-  'settings.toast.tokenSaved': 'Token saved',
   'settings.toast.chatCleared': 'Chat cleared',
   'settings.toast.newSession': 'New session started',
   'settings.comingSoon.title': 'Coming soon',

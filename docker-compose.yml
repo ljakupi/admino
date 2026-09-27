@@ -103,9 +103,9 @@ services:
 
     # Bind to localhost only. For LAN/VPN access, change to "0.0.0.0:8000:8000"
     # or use a reverse proxy. Never expose directly on a public interface.
-    # BEFORE widening this publish, enable token auth: uncomment AUTH_MODE=token
-    # in .env and set AUTH_TOKEN — the default "vpn" auth mode trusts every
-    # connection and is only safe while this stays on 127.0.0.1.
+    # Every API call needs a login session. The session cookie is Secure by
+    # default, so plain-HTTP access from another address (e.g. a phone on your
+    # LAN) also needs COOKIE_SECURE=false in .env.
     ports:
       - "127.0.0.1:8000:8000"
 

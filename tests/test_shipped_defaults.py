@@ -16,9 +16,14 @@ model stays available as an opt-in with its defaults pinned, and Claude
 (anthropic) / OpenAI stay opt-in with their model IDs pre-set. Because the
 default provider talks through the OpenAI SDK, ``openai`` is a core dependency.
 
+GH-149 removes the old auth: the shipped config.yaml has no ``auth`` section
+(and no AUTH_TOKEN note), ``.env.example`` has no AUTH_TOKEN / AUTH_MODE line
+and documents ``COOKIE_SECURE`` (the session cookie's Secure flag, on by
+default), and the shipped config keeps ``server.cookie_secure`` on.
+
 Hermeticity: ``load_app_config`` and the ``LLMConfig`` validators consult a
-number of environment variables (AUTH_TOKEN, provider keys/tokens, LLM_PROVIDER,
-VLLM_* overrides, AUTH_MODE, LOG_LEVEL, AUDIT_LOG_PATH). A fixture clears all of
+number of environment variables (provider keys/tokens, LLM_PROVIDER, VLLM_*
+overrides, COOKIE_SECURE, LOG_LEVEL, AUDIT_LOG_PATH). A fixture clears all of
 them so these tests are independent of the developer's shell environment.
 """
 
@@ -45,7 +50,6 @@ _INFOMANIAK_DEFAULT_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
 # Env vars that load_app_config / LLMConfig validators read. Cleared per test
 # so results reflect only the committed files, not the developer's environment.
 _ENV_VARS_TO_CLEAR = (
-    "AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
     "INFOMANIAK_API_TOKEN",
@@ -54,7 +58,7 @@ _ENV_VARS_TO_CLEAR = (
     "VLLM_MODEL",
     "VLLM_BASE_URL",
     "VLLM_MAX_MODEL_LEN",
-    "AUTH_MODE",
+    "COOKIE_SECURE",
     "LOG_LEVEL",
     "AUDIT_LOG_PATH",
 )
@@ -149,9 +153,19 @@ class TestShippedConfigDefaults:
         assert isinstance(shipped_config.llm.openai_model, str)
         assert shipped_config.llm.openai_model != ""
 
-    def test_shipped_config_auth_mode_is_vpn(self, shipped_config: AppConfig) -> None:
-        """Shipped auth mode is 'vpn' — the localhost-first default."""
-        assert shipped_config.auth.mode == "vpn"
+    def test_shipped_config_yaml_has_no_auth_section(self) -> None:
+        """GH-149: auth.mode is gone, so config.yaml ships no auth section."""
+        raw = yaml.safe_load(SHIPPED_CONFIG_PATH.read_text(encoding="utf-8"))
+        assert isinstance(raw, dict)
+        assert "auth" not in raw
+
+    def test_shipped_config_yaml_does_not_mention_auth_token(self) -> None:
+        """No stale AUTH_TOKEN note is left in the shipped config.yaml."""
+        assert "AUTH_TOKEN" not in SHIPPED_CONFIG_PATH.read_text(encoding="utf-8")
+
+    def test_shipped_config_cookie_secure_is_on(self, shipped_config: AppConfig) -> None:
+        """The shipped config keeps the session cookie's Secure flag on."""
+        assert shipped_config.server.cookie_secure is True
 
     def test_shipped_egress_includes_infomaniak(self, shipped_config: AppConfig) -> None:
         """The default provider's API host is whitelisted (GH-142)."""
@@ -264,10 +278,17 @@ class TestShippedEnvExample:
         """The committed .env.example."""
         return SHIPPED_ENV_EXAMPLE_PATH.read_text(encoding="utf-8")
 
-    def test_env_example_does_not_override_auth_mode(self, env_text: str) -> None:
-        """No active AUTH_MODE line, or it is 'vpn' — must not force 'token'."""
-        auth_modes = _active_env_values(env_text, "AUTH_MODE")
-        assert all(value == "vpn" for value in auth_modes)
+    @pytest.mark.parametrize("removed", ["AUTH_TOKEN", "AUTH_MODE"])
+    def test_env_example_has_no_removed_auth_variable(self, env_text: str, removed: str) -> None:
+        """GH-149: no AUTH_TOKEN / AUTH_MODE line, active or commented out."""
+        pattern = re.compile(rf"^\s*#?\s*{removed}\s*=", re.MULTILINE)
+        assert pattern.search(env_text) is None
+
+    def test_env_example_documents_cookie_secure_without_disabling_it(self, env_text: str) -> None:
+        """COOKIE_SECURE is documented, and no active line turns the Secure flag off."""
+        assert "COOKIE_SECURE" in env_text
+        values = _active_env_values(env_text, "COOKIE_SECURE")
+        assert all(value.lower() in {"true", "1", "yes", "on"} for value in values)
 
     def test_env_example_provider_unset_or_infomaniak(self, env_text: str) -> None:
         """Any active LLM_PROVIDER line must be 'infomaniak'.

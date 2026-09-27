@@ -10,8 +10,8 @@ table (migration 0005).
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
 optional targets, the client IP and a small metadata dict.
-``record_tool_call()`` takes an executor, the org and chat IDs and one agent
-tool dispatch's outcome (GH-147). ``purge_expired()`` and
+``record_tool_call()`` takes an executor, the acting member's org and user
+IDs, the chat ID and one agent tool dispatch's outcome (GH-147, GH-149). ``purge_expired()`` and
 ``run_retention_job()`` take the pool and a retention in months.
 Outputs: one INSERT per event; the purge returns the number of rows removed.
 
@@ -433,6 +433,7 @@ async def record_tool_call(
     executor: Executor,
     *,
     org_id: UUID,
+    actor_user_id: UUID,
     chat_id: UUID,
     tool: str,
     action: str,
@@ -440,14 +441,15 @@ async def record_tool_call(
     success: bool,
     duration_ms: int,
 ) -> None:
-    """Record one agent tool dispatch as a system ``tool.call`` event on its chat.
+    """Record one agent tool dispatch as the acting member's ``tool.call`` event on its chat.
 
     The metadata holds exactly ``tool``, ``action``, ``decision``, ``success``
     and ``duration_ms`` — never argument values, tool output or error text.
 
     Args:
         executor: The pool or a connection to write through.
-        org_id: The org whose log the event belongs to.
+        org_id: The acting member's org (the log the event belongs to).
+        actor_user_id: The acting member's user id.
         chat_id: The chat the tool call ran in (the event's target).
         tool: The tool name the LLM asked for; stored only if it is a
             vocabulary token, otherwise as None.
@@ -458,7 +460,8 @@ async def record_tool_call(
 
     Raises:
         AuditRecordError: If ``decision`` is not a permission decision or the
-            event is otherwise invalid (nothing is written), or the write fails.
+            event is otherwise invalid, e.g. a missing org or user id (nothing
+            is written), or the write fails.
     """
     # Explicit: the vocabulary also holds tool names and roles, which are no
     # decision.
@@ -467,8 +470,8 @@ async def record_tool_call(
     await record(
         executor,
         action=AuditAction.TOOL_CALL,
-        actor_kind="system",
-        actor_user_id=None,
+        actor_kind="member",
+        actor_user_id=actor_user_id,
         org_id=org_id,
         target_type=TargetType.CHAT,
         target_ids=(chat_id,),

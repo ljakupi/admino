@@ -65,8 +65,6 @@ export const de: Record<MessageKey, Message> = {
   // --- toast (critical permissions store) ---------------------------------
   'toast.criticalPermissions.promotionScheduled.title': 'Aktivierung geplant',
   'toast.criticalPermissions.promotionScheduled.body': 'Aktiv in {time}',
-  'toast.criticalPermissions.authFailed.title': 'Authentifizierung fehlgeschlagen',
-  'toast.criticalPermissions.authFailed.body': 'Das eingegebene Token ist ungültig.',
   'toast.criticalPermissions.promotionFailed.title': 'Aktivierung fehlgeschlagen',
   'toast.criticalPermissions.cancelled.title': 'Geplante Aktivierung abgebrochen',
   'toast.criticalPermissions.cancelFailed.title': 'Abbrechen fehlgeschlagen',
@@ -232,28 +230,6 @@ export const de: Record<MessageKey, Message> = {
     other: '{n} abgelehnt',
   },
 
-  // --- auth (access-token dialog) ----------------------------------------
-  'auth.welcome': 'Willkommen',
-  'auth.intro':
-    'Geben Sie Ihr Zugriffstoken ein, um sich zu verbinden, oder überspringen Sie diesen Schritt in einem privaten Netzwerk.',
-  'auth.tokenLabel': 'Zugriffstoken',
-  'auth.tokenPlaceholder': 'Token einfügen',
-  'auth.skip': 'Überspringen',
-  'auth.connect': 'Verbinden',
-  'auth.error.tokenRequired': 'Token ist erforderlich',
-  'auth.error.tokenFormat': 'Das Token muss aus 8–512 druckbaren ASCII-Zeichen bestehen',
-  'auth.error.invalidToken': 'Ungültiges Token. Bitte prüfen und erneut versuchen.',
-  'auth.error.tokenRequiredByServer': 'Dieser Server erfordert ein Token. Überspringen ist nicht möglich.',
-
-  // --- reauth (re-authentication dialog for critical permissions) --------
-  'reauth.title': 'Zum Aktivieren erneut anmelden',
-  'reauth.body':
-    'Sie erlauben admino, {action} für {tool} vorzuschlagen. Geben Sie zur Bestätigung Ihr Auth-Token ein. Die Änderung wird nach einer Wartezeit von 5 Minuten wirksam, die Sie abbrechen können.',
-  'reauth.tokenLabel': 'Auth-Token',
-  'reauth.tokenPlaceholder': 'Bearer-Token erneut eingeben',
-  'reauth.tokenHint': 'Wird nie protokolliert. Wird gegen Ihre aktive Sitzung geprüft.',
-  'reauth.submit': 'Aktivieren & Wartezeit starten',
-
   // --- toolsPage (connected accounts, local tools, OAuth callback) -------
   'toolsPage.accounts.title': 'Verbundene Konten',
   'toolsPage.accounts.subtitle':
@@ -294,9 +270,6 @@ export const de: Record<MessageKey, Message> = {
   'settings.nav.about': 'Über',
   'settings.nav.danger': 'Gefahrenzone',
   'settings.session.subtitle': 'Identifiziert diesen Gesprächsverlauf im admino-Backend.',
-  'settings.session.token.label': 'Bearer-Token',
-  'settings.session.token.hint': 'Nur erforderlich, wenn der Server mit {config} läuft.',
-  'settings.session.token.placeholder': 'Bearer-Token eingeben',
   'settings.session.id.label': 'Sitzungs-ID',
   'settings.session.id.hint': 'Buchstaben, Ziffern, Bindestriche, Unterstriche. Max. 64 Zeichen.',
   'settings.session.new.label': 'Neue Sitzung',
@@ -368,7 +341,6 @@ export const de: Record<MessageKey, Message> = {
   'settings.danger.clearConfirm.subtext':
     'Dadurch werden alle Nachrichten und der Tool-Aufrufverlauf der aktuellen Sitzung entfernt.',
   'settings.danger.clearConfirm.confirm': 'Leeren',
-  'settings.toast.tokenSaved': 'Token gespeichert',
   'settings.toast.chatCleared': 'Chat geleert',
   'settings.toast.newSession': 'Neue Sitzung gestartet',
   'settings.comingSoon.title': 'Demnächst verfügbar',

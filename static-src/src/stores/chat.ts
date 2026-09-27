@@ -151,7 +151,6 @@ export const useChatStore = defineStore('chat', () => {
         // The server answered, so it is reachable: end the run instead of leaving it 'working'.
         connection.setIdle();
         if (err.status === 401) {
-          settings.needsAuth = true;
           toasts.add('error', t('toast.chat.authRequired'));
         } else if (err.status === 429) {
           toasts.add('warning', t('toast.chat.slowDown.title'), t('toast.chat.slowDown.body'));

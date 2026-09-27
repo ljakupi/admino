@@ -9,12 +9,20 @@ GH-142: ``infomaniak`` is a provider and the default. A missing API key/token or
 model never fails validation for any provider any more — it logs a WARNING that
 names the env var / model field (never a value) and chat explains what to set.
 ``active_model_name`` returns ``""`` when the active provider's model is unset.
+
+GH-149: the old auth is gone. ``AuthConfig`` / ``AppConfig.auth``, the
+``AUTH_MODE`` override, the ``AUTH_TOKEN`` startup validation and the vpn
+warning no longer exist; an old ``auth:`` section (YAML or DB row) is ignored
+without error and the ``AUTH_TOKEN`` / ``AUTH_MODE`` env vars have no effect.
+``ServerConfig.cookie_secure`` (default True) controls the session cookie's
+``Secure`` flag; the ``COOKIE_SECURE`` env var overrides it
+(true/1/yes/on -> True, false/0/no/off -> False, case-insensitive; any other
+value logs a warning and is ignored).
 """
 
 from __future__ import annotations
 
 import logging
-import secrets
 import textwrap
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,7 +32,6 @@ from pydantic import ValidationError
 
 from admino.config import (
     AppConfig,
-    AuthConfig,
     DatabaseConfig,
     EgressConfig,
     LimitsConfig,
@@ -39,10 +46,14 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-@pytest.fixture()
-def auth_token() -> str:
-    """Generate a fresh high-entropy auth token for each test (min 48 chars, base64url)."""
-    return secrets.token_urlsafe(48)
+@pytest.fixture(autouse=True)
+def _no_cookie_secure_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test without a COOKIE_SECURE override from the developer's shell."""
+    monkeypatch.delenv("COOKIE_SECURE", raising=False)
+
+
+# A strong value of the removed AUTH_TOKEN env var (it must have no effect now).
+_OLD_AUTH_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"
 
 
 # ---------------------------------------------------------------------------
@@ -77,24 +88,19 @@ def _write_yaml(path: Path, content: str) -> Path:
 class TestValidConfigLoading:
     """A well-formed config.yaml is parsed into the correct AppConfig fields."""
 
-    def test_all_fields_parsed(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_token: str
-    ) -> None:
+    def test_all_fields_parsed(self, tmp_path: Path) -> None:
         """All explicitly set fields in YAML should be reflected in AppConfig."""
-        # AUTH_TOKEN must be set when mode=token to pass the startup validator
-        monkeypatch.setenv("AUTH_TOKEN", auth_token)
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
             server:
               host: "127.0.0.1"
               port: 9090
+              cookie_secure: false
             llm:
               provider: "anthropic"
               anthropic_model: "claude-sonnet-4-6"
               timeout_s: 60
-            auth:
-              mode: "token"
             limits:
               max_tool_calls_per_message: 5
               max_pending_confirmations: 2
@@ -111,10 +117,10 @@ class TestValidConfigLoading:
 
         assert config.server.host == "127.0.0.1"
         assert config.server.port == 9090
+        assert config.server.cookie_secure is False
         assert config.llm.anthropic_model == "claude-sonnet-4-6"
         assert config.llm.timeout_s == 60
         assert config.llm.provider == "anthropic"
-        assert config.auth.mode == "token"
         assert config.limits.max_tool_calls_per_message == 5
         assert config.limits.max_pending_confirmations == 2
         assert config.limits.confirmation_timeout_s == 120
@@ -141,7 +147,6 @@ class TestDefaults:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """With a valid llm section, all other sections fall back to defaults."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         # _write_yaml injects a valid llm section for the empty body.
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
 
@@ -149,7 +154,7 @@ class TestDefaults:
         assert config.server.port == 8000
         assert config.llm.provider == "anthropic"
         assert config.llm.timeout_s == 120
-        assert config.auth.mode == "vpn"  # explicitly set via AUTH_MODE env
+        assert config.server.cookie_secure is True
         assert config.limits.max_tool_calls_per_message == 10
         assert config.limits.confirmation_timeout_s == 300
         assert config.log_level == "INFO"
@@ -158,7 +163,6 @@ class TestDefaults:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A missing file yields defaults with the infomaniak provider, which boots tokenless."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         config = load_app_config(tmp_path / "nonexistent.yaml")
         assert config.llm.provider == "infomaniak"
@@ -167,7 +171,6 @@ class TestDefaults:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An empty YAML file (parses as None) has no llm section — defaults to infomaniak."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("", encoding="utf-8")
@@ -178,7 +181,6 @@ class TestDefaults:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A comment-only YAML file (parses as None) has no llm section — defaults to infomaniak."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         yaml_path = tmp_path / "config.yaml"
         yaml_path.write_text("# just a comment\n", encoding="utf-8")
@@ -205,7 +207,6 @@ class TestEnvVarOverrides:
               openai_model: "gpt-4o"
             """,
         )
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
         monkeypatch.setenv("LLM_PROVIDER", "openai")
         config = load_app_config(yaml_path)
@@ -219,7 +220,6 @@ class TestEnvVarOverrides:
             log_level: "INFO"
             """,
         )
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("LOG_LEVEL", "debug")
         config = load_app_config(yaml_path)
         assert config.log_level == "DEBUG"
@@ -229,7 +229,6 @@ class TestEnvVarOverrides:
     ) -> None:
         """GH-147: AUDIT_LOG_PATH is no longer read; setting it changes nothing."""
         yaml_path = _write_yaml(tmp_path / "config.yaml", "")
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("AUDIT_LOG_PATH", "/env/audit.ndjson")
         config = load_app_config(yaml_path)
         assert not hasattr(config, "paths")
@@ -239,7 +238,6 @@ class TestEnvVarOverrides:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Env vars apply on top of a minimal (llm-only) config."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("LOG_LEVEL", "WARNING")
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
         assert config.llm.provider == "anthropic"
@@ -255,7 +253,6 @@ class TestEnvVarOverrides:
               vllm_model: "org/from-yaml"
             """,
         )
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("VLLM_MODEL", "org/from-env")
         config = load_app_config(yaml_path)
         assert config.llm.vllm_model == "org/from-env"
@@ -270,7 +267,6 @@ class TestEnvVarOverrides:
               vllm_base_url: "http://from-yaml:8000/v1"
             """,
         )
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("VLLM_BASE_URL", "http://from-env:9000/v1")
         config = load_app_config(yaml_path)
         assert config.llm.vllm_base_url == "http://from-env:9000/v1"
@@ -287,7 +283,6 @@ class TestEnvVarOverrides:
               vllm_max_model_len: 8192
             """,
         )
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("VLLM_MAX_MODEL_LEN", "16384")
         config = load_app_config(yaml_path)
         assert config.llm.vllm_max_model_len == 16384
@@ -385,7 +380,6 @@ class TestAuditLogPathRemoved:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An existing config.yaml or settings row with a paths section is ignored."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -473,12 +467,11 @@ class TestSubModelsPresent:
 
     def test_all_submodels_present(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Default AppConfig contains all sub-model instances."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
 
         assert isinstance(config.server, ServerConfig)
         assert isinstance(config.llm, LLMConfig)
-        assert isinstance(config.auth, AuthConfig)
+        assert not hasattr(config, "auth")
         assert not hasattr(config, "paths")
         assert isinstance(config.limits, LimitsConfig)
         assert isinstance(config.egress, EgressConfig)
@@ -505,7 +498,6 @@ class TestUnimplementedToolScaffoldingRemoved:
         Pydantic ignores unknown keys, so an existing deployment with leftover
         ``ocr``/``images`` settings must not fail config validation.
         """
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -540,7 +532,6 @@ class TestFilesToolConfigRemoved:
         config = AppConfig.model_validate(
             {
                 "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-                "auth": {"mode": "vpn"},
                 "files": {
                     "allowed_paths": [
                         {"path": "/app/documents", "label": "Docs", "access": "readwrite"}
@@ -556,7 +547,6 @@ class TestFilesToolConfigRemoved:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """An existing config.yaml with a files section still loads."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -575,10 +565,8 @@ class TestFilesToolConfigRemoved:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A DB seeded before GH-143 (stale files row) still boots."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         mock_data: dict[str, object] = {
             "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-            "auth": {"mode": "vpn"},
             "files": {
                 "allowed_paths": [{"path": "/app/documents", "label": "", "access": "read"}],
                 "max_read_chars": 10000,
@@ -639,144 +627,110 @@ class TestServerHostValidation:
             ServerConfig(host="myserver.example.com")
 
 
-class TestAuthConfigValidation:
-    """AuthConfig token-mode startup validation."""
+class TestAuthConfigRemoved:
+    """GH-149: auth.mode / AUTH_TOKEN / AUTH_MODE are gone; old sections are ignored."""
 
-    def test_token_mode_requires_auth_token(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """mode=token fails if AUTH_TOKEN is absent."""
+    def test_auth_config_symbol_removed(self) -> None:
+        import admino.config as config_module
+
+        assert not hasattr(config_module, "AuthConfig")
+
+    def test_app_config_has_no_auth_field(self) -> None:
+        assert "auth" not in AppConfig.model_fields
+
+    @pytest.mark.parametrize(
+        "removed", ["validate_auth_token_present", "warn_vpn_mode_on_all_interfaces"]
+    )
+    def test_app_config_auth_validators_removed(self, removed: str) -> None:
+        assert not hasattr(AppConfig, removed)
+
+    def test_app_config_builds_without_auth_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AppConfig() no longer needs AUTH_TOKEN (the old default mode was 'token')."""
         monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-    def test_token_mode_requires_min_48_chars(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """mode=token fails if AUTH_TOKEN is shorter than 48 chars."""
-        monkeypatch.setenv("AUTH_TOKEN", "tooshort")
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-    def test_token_mode_accepts_strong_token(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_token: str
-    ) -> None:
-        """mode=token succeeds when AUTH_TOKEN is at least 48 chars with sufficient entropy."""
-        monkeypatch.setenv("AUTH_TOKEN", auth_token)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        config = load_app_config(yaml_path)
-        assert config.auth.mode == "token"
-
-    def test_token_mode_rejects_low_entropy(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """mode=token fails if AUTH_TOKEN has fewer than 20 unique chars.
-
-        Uses a 48+ char token to isolate the entropy check from the length check.
-        """
-        # 19 unique chars repeated to reach 57 chars — passes length but fails entropy
-        token = "abcdefghijklmnopqrs" * 3
-        assert len(token) >= 48
-        assert len(set(token)) == 19
-        monkeypatch.setenv("AUTH_TOKEN", token)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        with pytest.raises(ValueError, match="Invalid application config"):
-            load_app_config(yaml_path)
-
-    def test_token_with_exactly_19_unique_chars_rejected(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A 48+ char token with only 19 unique characters should fail entropy check."""
-        # Build a token from exactly 19 distinct base64url chars, repeated to reach 48
-        chars_19 = "abcdefghijklmnopqrs"
-        assert len(set(chars_19)) == 19
-        token = (chars_19 * 3)[:48]  # 48 chars, 19 unique
-        assert len(token) >= 48
-        assert len(set(token)) == 19
-        monkeypatch.setenv("AUTH_TOKEN", token)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-    def test_token_with_exactly_20_unique_chars_accepted(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A 48+ char token with exactly 20 unique characters should pass."""
-        chars_20 = "abcdefghijklmnopqrst"
-        assert len(set(chars_20)) == 20
-        token = (chars_20 * 3)[:48]  # 48 chars, 20 unique
-        assert len(token) >= 48
-        assert len(set(token)) == 20
-        monkeypatch.setenv("AUTH_TOKEN", token)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        config = load_app_config(yaml_path)
-        assert config.auth.mode == "token"
-
-    def test_token_length_47_rejected(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A 47-char token with high entropy should fail due to length."""
-        # Use a high-entropy token but truncate to 47 chars
-        token = secrets.token_urlsafe(48)[:47]
-        monkeypatch.setenv("AUTH_TOKEN", token)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-    def test_token_with_non_base64url_chars_rejected(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A 48+ char token containing non-base64url characters should fail."""
-        # Start with a valid token and inject invalid chars
-        token = secrets.token_urlsafe(48)
-        bad_token = token[:46] + "!@"
-        assert len(bad_token) >= 48
-        monkeypatch.setenv("AUTH_TOKEN", bad_token)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "token"')
-        with pytest.raises(ValueError):
-            load_app_config(yaml_path)
-
-    def test_vpn_mode_does_not_require_auth_token(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """mode=vpn succeeds even when AUTH_TOKEN is absent."""
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        yaml_path = _write_yaml(tmp_path / "config.yaml", 'auth:\n  mode: "vpn"')
-        config = load_app_config(yaml_path)
-        assert config.auth.mode == "vpn"
-
-    def test_auth_token_not_leaked_in_exception(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The AUTH_TOKEN value must not appear in exception messages."""
-        token = secrets.token_urlsafe(48)
-        monkeypatch.setenv("AUTH_TOKEN", token)
-        # Use an invalid port to trigger a validation error
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
-            "server:\n  port: 0\nauth:\n  mode: token",
-        )
-        with pytest.raises(ValueError) as exc_info:
-            load_app_config(yaml_path)
-        assert token not in str(exc_info.value)
-        assert token not in str(exc_info.value.__cause__)
-
-    def test_model_construct_bypasses_auth_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Documents that model_construct bypasses security validators.
-
-        Production code must NEVER use model_construct for AppConfig.
-        """
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        # model_construct skips all validators, including validate_auth_token_present.
-        # A valid llm is supplied so the llm default_factory (which does validate)
-        # is not invoked.
-        config = AppConfig.model_construct(
-            auth=AuthConfig(mode="token"),
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        config = AppConfig(
             llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6"),
         )
-        assert config.auth.mode == "token"
+        assert not hasattr(config, "auth")
+
+    @pytest.mark.parametrize("mode", ["token", "vpn"])
+    def test_legacy_auth_section_in_yaml_is_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+    ) -> None:
+        """An existing config.yaml with an auth section still loads (and drops it)."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", f'auth:\n  mode: "{mode}"')
+        config = load_app_config(yaml_path)
+        assert not hasattr(config, "auth")
+        assert "auth" not in config.model_dump()
+
+    def test_legacy_auth_section_in_dict_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        config = AppConfig.model_validate(
+            {
+                "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+                "auth": {"mode": "token", "token": "should-not-matter"},
+            }
+        )
+        assert "auth" not in config.model_dump()
+
+    async def test_legacy_auth_row_in_db_settings_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A DB seeded before GH-149 (auth row, until migration 0007 deletes it) still boots."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("AUTH_MODE", raising=False)
+        mock_data: dict[str, object] = {
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+            "auth": {"mode": "token"},
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert not hasattr(config, "auth")
+
+    @pytest.mark.parametrize("value", ["tooshort", _OLD_AUTH_TOKEN, "not base64!@#" * 5])
+    def test_auth_token_env_has_no_effect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """AUTH_TOKEN is not read: any value (weak, strong, invalid) loads the same config."""
+        monkeypatch.setenv("AUTH_TOKEN", value)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert not hasattr(config, "auth")
+        assert value not in config.model_dump_json()
+
+    @pytest.mark.parametrize("value", ["token", "vpn", "garbage"])
+    def test_auth_mode_env_has_no_effect(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """AUTH_MODE is not read: even 'token' with no AUTH_TOKEN loads fine."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("AUTH_MODE", value)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert not hasattr(config, "auth")
+
+    async def test_auth_mode_env_has_no_effect_on_db_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DB loader applies no AUTH_MODE override either (no token demanded)."""
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("AUTH_MODE", "token")
+        mock_data: dict[str, object] = {
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert not hasattr(config, "auth")
+
+    def test_config_module_never_reads_auth_env_vars(self) -> None:
+        """No AUTH_TOKEN / AUTH_MODE string is left in admino.config's source."""
+        import inspect
+
+        import admino.config as config_module
+
+        source = inspect.getsource(config_module)
+        assert "AUTH_TOKEN" not in source
+        assert "AUTH_MODE" not in source
 
 
 class TestLLMConfigValidation:
@@ -1075,7 +1029,7 @@ class TestInfomaniakConfig:
 
     def test_app_config_default_provider_is_infomaniak(self) -> None:
         """AppConfig() (and therefore the settings seed) defaults to infomaniak."""
-        config = AppConfig(auth=AuthConfig(mode="vpn"))
+        config = AppConfig()
         assert config.llm.provider == "infomaniak"
 
     def test_infomaniak_model_default(self) -> None:
@@ -1131,7 +1085,6 @@ class TestInfomaniakConfig:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """LLM_PROVIDER=infomaniak overrides the YAML provider."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("LLM_PROVIDER", "infomaniak")
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
         assert config.llm.provider == "infomaniak"
@@ -1140,7 +1093,6 @@ class TestInfomaniakConfig:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """infomaniak_model is read from config.yaml."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         yaml_path = _write_yaml(
             tmp_path / "config.yaml",
             """\
@@ -1154,55 +1106,119 @@ class TestInfomaniakConfig:
 
 
 # ---------------------------------------------------------------------------
-# VPN mode + 0.0.0.0 warning
+# GH-149: no vpn warning any more (every route needs a session)
 # ---------------------------------------------------------------------------
 
 
-class TestVpnModeWarning:
-    """Warn when binding to all interfaces with vpn auth (no app-layer auth)."""
+class TestNoVpnModeWarning:
+    """Binding to all interfaces no longer warns about an unauthenticated API."""
 
-    def test_vpn_on_all_interfaces_warns(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """vpn mode + 0.0.0.0 should produce a warning."""
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
+    @pytest.mark.parametrize(
+        "yaml_text",
+        [
+            'server:\n  host: "0.0.0.0"',
             'server:\n  host: "0.0.0.0"\nauth:\n  mode: vpn',
-        )
-        with caplog.at_level(logging.WARNING):
-            load_app_config(yaml_path)
-        assert "unauthenticated on ALL network interfaces" in caplog.text
-
-    def test_token_mode_no_warning(
+        ],
+        ids=["plain", "legacy-vpn-section"],
+    )
+    def test_all_interfaces_logs_no_unauthenticated_warning(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
-        auth_token: str,
+        yaml_text: str,
     ) -> None:
-        """token mode + 0.0.0.0 should NOT produce the vpn warning."""
-        monkeypatch.setenv("AUTH_TOKEN", auth_token)
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
-            'server:\n  host: "0.0.0.0"\nauth:\n  mode: token',
-        )
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", yaml_text)
         with caplog.at_level(logging.WARNING):
             load_app_config(yaml_path)
         assert "unauthenticated on ALL" not in caplog.text
 
-    def test_localhost_vpn_no_warning(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+
+# ---------------------------------------------------------------------------
+# GH-149: ServerConfig.cookie_secure + COOKIE_SECURE env override
+# ---------------------------------------------------------------------------
+
+_COOKIE_SECURE_FALSE = ["false", "0", "no", "off", "FALSE", "False", "Off", "NO"]
+_COOKIE_SECURE_TRUE = ["true", "1", "yes", "on", "TRUE", "True", "On", "YES"]
+_COOKIE_SECURE_JUNK = ["maybe", "2", "enabled", "-1", "yes please"]
+
+
+class TestCookieSecure:
+    """The session cookie's Secure flag: on by default, COOKIE_SECURE overrides it."""
+
+    def test_server_config_cookie_secure_defaults_true(self) -> None:
+        assert ServerConfig().cookie_secure is True
+
+    def test_server_config_cookie_secure_can_be_disabled(self) -> None:
+        assert ServerConfig(cookie_secure=False).cookie_secure is False
+
+    def test_loaded_config_cookie_secure_defaults_true(self, tmp_path: Path) -> None:
+        """No YAML value and no env var: the secure default applies."""
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.cookie_secure is True
+
+    def test_yaml_cookie_secure_false_is_read(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "server:\n  cookie_secure: false")
+        assert load_app_config(yaml_path).server.cookie_secure is False
+
+    @pytest.mark.parametrize("value", _COOKIE_SECURE_FALSE)
+    def test_cookie_secure_env_false_values(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
     ) -> None:
-        """vpn mode + localhost should NOT produce the warning."""
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        yaml_path = _write_yaml(
-            tmp_path / "config.yaml",
-            'server:\n  host: "localhost"\nauth:\n  mode: vpn',
-        )
+        """false/0/no/off (any case) turn the Secure flag off."""
+        monkeypatch.setenv("COOKIE_SECURE", value)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.cookie_secure is False
+
+    @pytest.mark.parametrize("value", _COOKIE_SECURE_TRUE)
+    def test_cookie_secure_env_true_values_override_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """true/1/yes/on (any case) turn it on, even over a YAML ``false``."""
+        monkeypatch.setenv("COOKIE_SECURE", value)
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "server:\n  cookie_secure: false")
+        assert load_app_config(yaml_path).server.cookie_secure is True
+
+    @pytest.mark.parametrize("value", _COOKIE_SECURE_JUNK)
+    def test_cookie_secure_env_junk_keeps_secure_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Any other value is ignored, so the Secure default stays on."""
+        monkeypatch.setenv("COOKIE_SECURE", value)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.cookie_secure is True
+
+    @pytest.mark.parametrize("value", _COOKIE_SECURE_JUNK)
+    def test_cookie_secure_env_junk_logs_warning(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+    ) -> None:
+        """An unrecognised COOKIE_SECURE value logs a WARNING that names the variable."""
+        monkeypatch.setenv("COOKIE_SECURE", value)
         with caplog.at_level(logging.WARNING):
-            load_app_config(yaml_path)
-        assert "unauthenticated on ALL" not in caplog.text
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert any(
+            "COOKIE_SECURE" in record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
+
+    async def test_cookie_secure_env_applies_to_db_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DB-backed loader applies the same COOKIE_SECURE override."""
+        monkeypatch.setenv("COOKIE_SECURE", "false")
+        mock_data: dict[str, object] = {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert config.server.cookie_secure is False
 
 
 # ---------------------------------------------------------------------------
@@ -1223,7 +1239,6 @@ class TestDatabaseConfig:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """AppConfig includes DatabaseConfig with defaults."""
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
         assert isinstance(config.database, DatabaseConfig)
         assert config.database.min_pool_size == 2
@@ -1244,6 +1259,7 @@ class TestLoadAppConfigFromDb:
         mock_data: dict[str, object] = {
             "server": {"host": "127.0.0.1", "port": 8000},
             "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+            # A legacy row (migration 0007 deletes it); the loader ignores it.
             "auth": {"mode": "vpn"},
             "paths": {},
             "limits": {},
@@ -1252,7 +1268,6 @@ class TestLoadAppConfigFromDb:
             "log_level": "INFO",
         }
         mock_load = AsyncMock(return_value=mock_data)
-        monkeypatch.setenv("AUTH_MODE", "vpn")
 
         with patch("admino.database.load_settings_from_db", new=mock_load):
             result = await load_app_config_from_db(mock_pool)
@@ -1267,6 +1282,7 @@ class TestLoadAppConfigFromDb:
         mock_data: dict[str, object] = {
             "server": {},
             "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+            # A legacy row (migration 0007 deletes it); the loader ignores it.
             "auth": {"mode": "vpn"},
             "paths": {},
             "limits": {},
@@ -1275,7 +1291,6 @@ class TestLoadAppConfigFromDb:
             "log_level": "INFO",
         }
         mock_load = AsyncMock(return_value=mock_data)
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         monkeypatch.setenv("LOG_LEVEL", "DEBUG")
 
         with patch("admino.database.load_settings_from_db", new=mock_load):

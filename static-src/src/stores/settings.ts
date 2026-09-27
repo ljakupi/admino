@@ -16,10 +16,8 @@ import type {
 // The API uses 'anthropic' but the UI labels it 'claude' — we map here.
 export type LLMProvider = 'infomaniak' | 'claude' | 'openai' | 'vllm';
 
-const TOKEN_KEY = 'admino_auth_token';
 const SESSION_KEY = 'admino_session_id';
 
-const TOKEN_RE = /^[\x21-\x7E]{8,512}$/;
 const SESSION_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 
 function generateSessionId(): string {
@@ -41,34 +39,6 @@ function uiToApiProvider(ui: LLMProvider): LLMProviderName {
 }
 
 export const useSettingsStore = defineStore('settings', () => {
-  // Auth token — stays in localStorage
-  const token = ref<string | null>(loadToken());
-  const needsAuth = ref(!token.value);
-
-  function loadToken(): string | null {
-    const stored = localStorage.getItem(TOKEN_KEY);
-    if (stored && TOKEN_RE.test(stored)) return stored;
-    return null;
-  }
-
-  function setToken(value: string | null) {
-    if (value && TOKEN_RE.test(value)) {
-      localStorage.setItem(TOKEN_KEY, value);
-      token.value = value;
-      needsAuth.value = false;
-    } else if (value === null) {
-      localStorage.removeItem(TOKEN_KEY);
-      token.value = null;
-      needsAuth.value = false;
-    }
-  }
-
-  function skipAuth() {
-    localStorage.removeItem(TOKEN_KEY);
-    token.value = null;
-    needsAuth.value = false;
-  }
-
   // Session ID — stays in localStorage
   const sessionId = ref(loadSessionId());
 
@@ -278,11 +248,6 @@ export const useSettingsStore = defineStore('settings', () => {
   }
 
   return {
-    // Auth
-    token,
-    needsAuth,
-    setToken,
-    skipAuth,
     // Session
     sessionId,
     newSession,

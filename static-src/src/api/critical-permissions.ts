@@ -15,11 +15,9 @@ function critPath(tool: string, action: string): string {
 export function promoteCriticalPermission(
   tool: string,
   action: string,
-  bearerToken: string,
 ): Promise<CriticalPermissionPatchResponse> {
   return fetchJson(critPath(tool, action), {
     method: 'PATCH',
-    body: JSON.stringify({ bearer_token: bearerToken }),
   });
 }
 

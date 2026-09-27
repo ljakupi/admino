@@ -1,34 +1,54 @@
 """Comprehensive test suite for admino.server — HTTP layer, auth, SSE, confirmations.
 
 Tests the FastAPI application created by ``create_app()``, covering:
-- Health check (no auth required)
-- Bearer token authentication (constant-time comparison)
+- Health check (no session required)
+- Session-cookie authentication (GH-149): every chat route answers 401
+  ``{"detail": "Unauthorized"}`` without a valid ``admino_session`` cookie; the
+  old bearer token / vpn mode is gone (an ``Authorization`` header authenticates
+  nothing, ``config.auth`` is never read, no VPN warning).
+- The ``chat.send`` role gate: Org Admins and Editors may chat; Viewers and
+  Super Admins get 403 ``{"detail": "Forbidden"}`` on POST /api/message,
+  POST /api/confirm/{id} and GET /api/events.
+- POST /api/message and POST /api/confirm/{id} pass the logged-in principal to
+  ``agent.run(principal=...)`` (and, through a real Agent, to the tool-call
+  recorder).
 - POST /api/message (happy path, agent status variants, input validation)
 - SSE streaming via GET /api/events
 - Confirmation flow via POST /api/confirm/{confirmation_id}
 - Session management and isolation
-- CORS middleware
+- CORS middleware (``Authorization`` is no longer an allowed header)
+- Per-caller rate limits (GH-149): ``_check_rate_limit(route, caller)`` keeps
+  one token bucket per (route, caller) in ``_rate_buckets``; one user (or IP)
+  exhausting a bucket never throttles another; idle buckets are evicted and
+  the map is capped (LRU).
 - Error handling (validation errors, agent exceptions, malformed JSON)
 - Security invariants (AST scans, no forbidden imports)
 - Static file serving
 
+Callers are logged in through ``tests.auth_helpers.login`` (a dependency
+override of ``server.require_session``); ``resolved_session`` drives the real
+cookie dependency with a patched ``admino.sessions.resolve_session``.
+
 Security notes:
-- All tests use mocked Agent and config — no real LLM or external calls.
-- Auth token is a known test value, never a real secret.
+- All tests use mocked Agent and config — no real LLM, database or external calls.
+- The session token is a known fake value, never a real secret.
 """
 
 from __future__ import annotations
 
 import ast
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field
 
 from admino.agent import Agent
 from admino.llm import LLMResponse
@@ -43,17 +63,32 @@ from admino.models import (
 from admino.permissions import PermissionsConfig, ToolPermissions
 from admino.server import create_app
 from admino.tools.registry import clear_registry, register_tool
+from tests.auth_helpers import (
+    TEST_MEMBER_ID,
+    TEST_SESSION_TOKEN,
+    login,
+    member_session,
+    resolved_session,
+    session_cookie,
+    super_admin_session,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+    from admino.access import MemberRole, Principal
+    from admino.sessions import AuthenticatedSession
 
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"  # >48 chars, >20 unique
-_AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+# A second member of the same organization, for per-user isolation tests.
+_OTHER_USER_ID = UUID("22222222-3333-4444-8555-666666666666")
+
+_UNAUTHORIZED = {"detail": "Unauthorized"}
+_FORBIDDEN = {"detail": "Forbidden"}
 
 
 # ---------------------------------------------------------------------------
@@ -61,15 +96,15 @@ _AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 # ---------------------------------------------------------------------------
 
 
-def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> Any:
-    """Build a minimal mock AppConfig."""
+def _make_config() -> Any:
+    """Build a minimal mock AppConfig.
+
+    It has no ``auth`` attribute at all (GH-149): the server must never read
+    ``config.auth`` again, so touching it raises AttributeError.
+    """
     config = MagicMock()
-    config.auth.mode = auth_mode
+    del config.auth
     config.limits.max_message_length = 4000
-    if token is not None:
-        config.auth.token = SecretStr(token)
-    else:
-        config.auth.token = None
     return config
 
 
@@ -112,13 +147,16 @@ class FakeAgent:
         session_id: str,
         *,
         history: list[LLMMessage],
+        principal: Principal,
         pending_confirmation: PendingConfirmation | None = None,
     ) -> AgentResult:
+        """Record the call (GH-149: ``principal`` is a required keyword) and reply."""
         self.run_calls.append(
             {
                 "user_message": user_message,
                 "session_id": session_id,
                 "history": history,
+                "principal": principal,
                 "pending_confirmation": pending_confirmation,
             }
         )
@@ -132,14 +170,21 @@ class FakeAgent:
 def _make_app(
     agent: Any = None,
     *,
-    auth_mode: str = "token",
-    token: str | None = _TEST_TOKEN,
+    session: AuthenticatedSession | None = None,
+    anonymous: bool = False,
+    config: Any = None,
 ) -> Any:
-    """Create a FastAPI app with the given agent and config."""
+    """Create a FastAPI app with the given agent and config, and log a caller in.
+
+    The caller is ``session`` (default: an Editor member, who may chat). With
+    ``anonymous=True`` nobody is logged in, so the real cookie dependency runs.
+    """
     if agent is None:
         agent = FakeAgent([_make_agent_result()])
-    config = _make_config(auth_mode=auth_mode, token=token)
-    return create_app(agent=agent, config=config)
+    app = create_app(agent=agent, config=config if config is not None else _make_config())
+    if not anonymous:
+        login(app, session if session is not None else member_session("editor"))
+    return app
 
 
 def _make_pending_confirmation(
@@ -246,8 +291,8 @@ class TestHealthCheck:
         assert resp.json()["llm_reachable"] is False
 
     async def test_server_health_no_auth_required(self) -> None:
-        """Health check must succeed even with token auth enabled and no header."""
-        app = _make_app(auth_mode="token")
+        """Health check is public: it succeeds with no session cookie."""
+        app = _make_app(anonymous=True)
         _set_health_config()
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=True)),
@@ -271,13 +316,33 @@ class TestHealthCheck:
         assert resp.json()["detail"] == "Database unreachable"
 
 
+_MESSAGE_BODY: dict[str, Any] = {"message": "hello", "session_id": "sess1"}
+_CONFIRM_BODY: dict[str, Any] = {
+    "session_id": "sess1",
+    "confirmation_id": "some-id",
+    "approved": True,
+}
+
+
+async def _call_chat_route(client: AsyncClient, route: str, **kwargs: Any) -> Any:
+    """Send a well-formed request to one of the three chat routes."""
+    if route == "message":
+        return await client.post("/api/message", json=_MESSAGE_BODY, **kwargs)
+    if route == "confirm":
+        return await client.post("/api/confirm/some-id", json=_CONFIRM_BODY, **kwargs)
+    return await client.get("/api/events", params={"session_id": "sess1"}, **kwargs)
+
+
+_CHAT_ROUTES = ["message", "confirm", "events"]
+
+
 class TestAuth:
-    """Bearer token authentication enforcement."""
+    """Session-cookie authentication (GH-149): no valid admino_session cookie -> 401."""
 
     pytestmark = pytest.mark.asyncio
 
     async def test_server_post_message_no_auth_returns_401(self) -> None:
-        app = _make_app()
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/message",
@@ -286,35 +351,84 @@ class TestAuth:
         assert resp.status_code == 401
         assert resp.json()["detail"] == "Unauthorized"
 
-    async def test_server_post_message_wrong_token_returns_401(self) -> None:
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.post(
-                "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
-                headers={"Authorization": "Bearer wrong-token-value"},
-            )
+    async def test_server_post_message_unknown_session_cookie_returns_401(self) -> None:
+        """A cookie that resolves to no session (unknown, revoked, expired) -> 401."""
+        agent = FakeAgent([_make_agent_result()])
+        app = _make_app(agent, anonymous=True)
+        with resolved_session(None):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.post(
+                    "/api/message",
+                    json={"message": "hello", "session_id": "sess1"},
+                    headers=session_cookie(),
+                )
         assert resp.status_code == 401
         assert resp.json()["detail"] == "Unauthorized"
+        assert agent.run_calls == []
 
-    async def test_server_post_message_valid_token_succeeds(self) -> None:
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.post(
-                "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
-            )
+    async def test_server_post_message_valid_session_cookie_succeeds(self) -> None:
+        """A cookie that resolves to an Editor's session is let through."""
+        app = _make_app(anonymous=True)
+        with resolved_session(member_session("editor")):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.post(
+                    "/api/message",
+                    json={"message": "hello", "session_id": "sess1"},
+                    headers=session_cookie(),
+                )
         assert resp.status_code == 200
 
+    async def test_server_session_cookie_value_is_what_gets_resolved(self) -> None:
+        """require_session looks up exactly the admino_session cookie's token."""
+        app = _make_app(anonymous=True)
+        with resolved_session(member_session("editor")) as resolve:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                await c.post(
+                    "/api/message",
+                    json={"message": "hello", "session_id": "sess1"},
+                    headers=session_cookie(),
+                )
+        resolve.assert_awaited_once()
+        call = resolve.await_args
+        assert call is not None
+        assert TEST_SESSION_TOKEN in (*call.args, *call.kwargs.values())
+
+    async def test_server_session_cookie_principal_reaches_agent(self) -> None:
+        """The principal comes from the resolved session, never from the request."""
+        agent = FakeAgent([_make_agent_result()])
+        app = _make_app(agent, anonymous=True)
+        session = member_session("org_admin", user_id=_OTHER_USER_ID)
+        with resolved_session(session):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                await c.post(
+                    "/api/message",
+                    json={"message": "hello", "session_id": "sess1"},
+                    headers=session_cookie(),
+                )
+        assert [call["principal"] for call in agent.run_calls] == [session.principal]
+
+    async def test_server_cookie_with_another_name_returns_401(self) -> None:
+        """Only the admino_session cookie counts; another cookie name is no session."""
+        app = _make_app(anonymous=True)
+        with resolved_session(member_session("editor")) as resolve:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.post(
+                    "/api/message",
+                    json={"message": "hello", "session_id": "sess1"},
+                    headers={"Cookie": f"session={TEST_SESSION_TOKEN}"},
+                )
+        assert resp.status_code == 401
+        resolve.assert_not_awaited()
+
     async def test_server_get_events_no_auth_returns_401(self) -> None:
-        app = _make_app()
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/events", params={"session_id": "sess1"})
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_server_post_confirm_no_auth_returns_401(self) -> None:
-        app = _make_app()
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/confirm/some-id",
@@ -325,39 +439,151 @@ class TestAuth:
                 },
             )
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_server_auth_401_body_no_internal_details(self) -> None:
         """401 response body must be exactly {"detail": "Unauthorized"}."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.post(
-                "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
-                headers={"Authorization": "Bearer bad"},
-            )
+        app = _make_app(anonymous=True)
+        with resolved_session(None):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.post(
+                    "/api/message",
+                    json={"message": "hello", "session_id": "sess1"},
+                    headers=session_cookie("bad-token"),
+                )
         body = resp.json()
         assert body == {"detail": "Unauthorized"}
 
-    async def test_server_auth_vpn_mode_no_token_needed(self) -> None:
-        """VPN mode skips auth entirely."""
-        app = _make_app(auth_mode="vpn")
+    @pytest.mark.parametrize(
+        "authorization",
+        [
+            "Bearer " + "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ",
+            f"Bearer {TEST_SESSION_TOKEN}",
+        ],
+        ids=["old-auth-token", "session-token-as-bearer"],
+    )
+    async def test_server_bearer_authorization_header_does_not_authenticate(
+        self, authorization: str
+    ) -> None:
+        """The bearer token auth is gone: an Authorization header alone gets a 401."""
+        agent = FakeAgent([_make_agent_result()])
+        app = _make_app(agent, anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-            )
-        assert resp.status_code == 200
-
-    async def test_server_auth_malformed_header_returns_401(self) -> None:
-        """Authorization header without 'Bearer ' prefix returns 401."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.post(
-                "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
-                headers={"Authorization": f"Token {_TEST_TOKEN}"},
+                headers={"Authorization": authorization},
             )
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+        assert agent.run_calls == []
+
+
+class TestChatRoleGate:
+    """The chat routes additionally need chat.send (Org Admin / Editor), GH-149."""
+
+    pytestmark = pytest.mark.asyncio
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
+    async def test_server_post_message_chat_sender_role_succeeds(self, role: MemberRole) -> None:
+        app = _make_app(session=member_session(role))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/message", json=_MESSAGE_BODY)
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
+    async def test_server_get_events_chat_sender_role_succeeds(self, role: MemberRole) -> None:
+        app = _make_app(session=member_session(role))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.get("/api/events", params={"session_id": "sess1"})
+        assert resp.status_code == 200
+
+    @pytest.mark.parametrize("route", _CHAT_ROUTES)
+    async def test_server_chat_route_viewer_returns_403(self, route: str) -> None:
+        """A Viewer is read-only: no chat."""
+        agent = FakeAgent([_make_agent_result()])
+        app = _make_app(agent, session=member_session("viewer"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await _call_chat_route(c, route)
+        assert resp.status_code == 403
+        assert resp.json() == _FORBIDDEN
+        assert agent.run_calls == []
+
+    @pytest.mark.parametrize("route", _CHAT_ROUTES)
+    async def test_server_chat_route_super_admin_returns_403(self, route: str) -> None:
+        """Operator blindness: the Super Admin has no chat capability."""
+        agent = FakeAgent([_make_agent_result()])
+        app = _make_app(agent, session=super_admin_session())
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await _call_chat_route(c, route)
+        assert resp.status_code == 403
+        assert resp.json() == _FORBIDDEN
+        assert agent.run_calls == []
+
+    @pytest.mark.parametrize("route", _CHAT_ROUTES)
+    async def test_server_chat_route_without_session_returns_401_not_403(self, route: str) -> None:
+        """Authentication comes before the role check."""
+        app = _make_app(anonymous=True)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await _call_chat_route(c, route)
+        assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+
+
+class TestAgentReceivesPrincipal:
+    """post_message / post_confirm pass the logged-in principal to agent.run (GH-149)."""
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_server_post_message_passes_logged_in_principal(self) -> None:
+        agent = FakeAgent([_make_agent_result()])
+        session = member_session("editor", user_id=_OTHER_USER_ID)
+        app = _make_app(agent, session=session)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/message", json=_MESSAGE_BODY)
+        assert resp.status_code == 200
+        assert len(agent.run_calls) == 1
+        assert agent.run_calls[0]["principal"] == session.principal
+
+    async def test_server_post_confirm_passes_logged_in_principal(self) -> None:
+        pending = _make_pending_confirmation(session_id="sess1")
+        awaiting = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Requires confirmation.",
+            pending_confirmation=pending,
+        )
+        agent = FakeAgent([awaiting, _make_agent_result(response="Done.")])
+        session = member_session("org_admin", user_id=_OTHER_USER_ID)
+        app = _make_app(agent, session=session)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "create", "session_id": "sess1"})
+            resp = await c.post(
+                f"/api/confirm/{pending.confirmation_id}",
+                json={
+                    "session_id": "sess1",
+                    "confirmation_id": pending.confirmation_id,
+                    "approved": True,
+                },
+            )
+        assert resp.status_code == 200
+        assert len(agent.run_calls) == 2
+        assert agent.run_calls[1]["pending_confirmation"] is not None
+        assert agent.run_calls[1]["principal"] == session.principal
+
+    async def test_server_each_request_passes_its_own_principal(self) -> None:
+        """Two users on one app: each agent run gets the principal of its own request."""
+        agent = FakeAgent([_make_agent_result(), _make_agent_result()])
+        first = member_session("editor")
+        second = member_session("org_admin", user_id=_OTHER_USER_ID)
+        app = _make_app(agent, session=first)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "a", "session_id": "sess-a"})
+            login(app, second)
+            await c.post("/api/message", json={"message": "b", "session_id": "sess-b"})
+        assert [call["principal"] for call in agent.run_calls] == [
+            first.principal,
+            second.principal,
+        ]
 
 
 class TestPostMessage:
@@ -371,7 +597,6 @@ class TestPostMessage:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         data = resp.json()
@@ -392,7 +617,6 @@ class TestPostMessage:
             resp = await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         data = resp.json()
@@ -409,7 +633,6 @@ class TestPostMessage:
             resp = await c.post(
                 "/api/message",
                 json={"message": "do many things", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         assert "limit" in resp.json()["response"].lower()
@@ -425,7 +648,6 @@ class TestPostMessage:
             resp = await c.post(
                 "/api/message",
                 json={"message": "fail", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
 
@@ -438,7 +660,6 @@ class TestPostMessage:
             resp = await c.post(
                 "/api/message",
                 json={"message": "fail", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 500
         data = resp.json()
@@ -458,7 +679,6 @@ class TestPostMessage:
             resp = await c.post(
                 "/api/message",
                 json={"message": "read emails", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         data = resp.json()
@@ -477,7 +697,6 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 json={"session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -487,7 +706,6 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -497,7 +715,6 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 json={"message": "", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -517,7 +734,6 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": session_id},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -528,7 +744,6 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 json={"message": oversized, "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -540,7 +755,6 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": bad_session},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
         body_text = resp.text
@@ -552,7 +766,7 @@ class TestInputValidation:
             resp = await c.post(
                 "/api/message",
                 content=b"not valid json{{{",
-                headers={**_AUTH_HEADER, "Content-Type": "application/json"},
+                headers={"Content-Type": "application/json"},
             )
         assert resp.status_code == 422
 
@@ -568,7 +782,6 @@ class TestSSE:
             resp = await c.get(
                 "/api/events",
                 params={"session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         assert "text/event-stream" in resp.headers["content-type"]
@@ -580,7 +793,6 @@ class TestSSE:
             resp = await c.get(
                 "/api/events",
                 params={"session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         body = resp.text
@@ -595,13 +807,11 @@ class TestSSE:
             await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             # Now get events for that session
             resp = await c.get(
                 "/api/events",
                 params={"session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         body = resp.text
@@ -615,7 +825,6 @@ class TestSSE:
             resp = await c.get(
                 "/api/events",
                 params={"session_id": "empty-sess"},
-                headers=_AUTH_HEADER,
             )
         body = resp.text
         # Split into frames by double newline
@@ -632,7 +841,6 @@ class TestSSE:
             resp = await c.get(
                 "/api/events",
                 params={"session_id": "x" * 65},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -643,7 +851,6 @@ class TestSSE:
             resp = await c.get(
                 "/api/events",
                 params={"session_id": ""},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -664,7 +871,6 @@ class TestSSE:
             resp = await c.get(
                 "/api/events",
                 params={"session_id": session_id},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
 
@@ -684,7 +890,6 @@ class TestConfirmation:
                     "confirmation_id": "some-id",
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 404
 
@@ -708,7 +913,6 @@ class TestConfirmation:
             resp1 = await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             assert resp1.status_code == 200
 
@@ -720,7 +924,6 @@ class TestConfirmation:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp2.status_code == 200
         data = resp2.json()
@@ -741,7 +944,6 @@ class TestConfirmation:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             resp = await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
@@ -750,7 +952,6 @@ class TestConfirmation:
                     "confirmation_id": pending.confirmation_id,
                     "approved": False,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         data = resp.json()
@@ -771,7 +972,6 @@ class TestConfirmation:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             resp = await c.post(
                 "/api/confirm/wrong-id",
@@ -780,7 +980,6 @@ class TestConfirmation:
                     "confirmation_id": "wrong-id",
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 404
 
@@ -799,7 +998,6 @@ class TestConfirmation:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             resp = await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
@@ -808,7 +1006,6 @@ class TestConfirmation:
                     "confirmation_id": "different-id-in-body",
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 400
 
@@ -831,7 +1028,6 @@ class TestConfirmation:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             # First confirm
             resp1 = await c.post(
@@ -841,7 +1037,6 @@ class TestConfirmation:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
             assert resp1.status_code == 200
 
@@ -853,7 +1048,6 @@ class TestConfirmation:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp2.status_code == 404
 
@@ -872,7 +1066,6 @@ class TestConfirmation:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             resp = await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
@@ -881,7 +1074,6 @@ class TestConfirmation:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 404
 
@@ -901,7 +1093,6 @@ class TestConfirmation:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             resp = await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
@@ -910,7 +1101,6 @@ class TestConfirmation:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 500
         assert resp.json()["detail"] == "Internal error"
@@ -929,7 +1119,6 @@ class TestSessionManagement:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "new-sess"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         # Agent was called with empty history (new session)
@@ -951,12 +1140,10 @@ class TestSessionManagement:
             await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             await c.post(
                 "/api/message",
                 json={"message": "help me", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         # Second call should receive the history from the first result
         assert len(agent.run_calls) == 2
@@ -974,12 +1161,10 @@ class TestSessionManagement:
             await c.post(
                 "/api/message",
                 json={"message": "msg-a", "session_id": "sessA"},
-                headers=_AUTH_HEADER,
             )
             await c.post(
                 "/api/message",
                 json={"message": "msg-b", "session_id": "sessB"},
-                headers=_AUTH_HEADER,
             )
         # Session B should receive empty history (new session)
         assert agent.run_calls[1]["history"] == []
@@ -993,15 +1178,125 @@ class TestSessionManagement:
             await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess2"},
-                headers=_AUTH_HEADER,
             )
         assert agent.run_calls[0]["history"] == []
         assert agent.run_calls[1]["history"] == []
+
+
+class TestChatSessionsArePerUser:
+    """In-memory chat state is keyed per user, so a session_id never crosses users (GH-149).
+
+    Chat session ids are client-generated until #176. With several users logged
+    in, user B reusing user A's session_id must neither read A's history nor
+    confirm A's pending tool call.
+    """
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_server_chat_key_pairs_user_and_session(self) -> None:
+        """The key is the (user_id, session_id) pair."""
+        import admino.server as srv
+
+        assert srv._chat_key(TEST_MEMBER_ID, "sess1") == (TEST_MEMBER_ID, "sess1")
+        assert srv._chat_key(TEST_MEMBER_ID, "sess1") != srv._chat_key(_OTHER_USER_ID, "sess1")
+
+    async def test_server_other_user_with_same_session_id_gets_empty_history(self) -> None:
+        """User B posting with A's session_id starts from an empty history."""
+        history_a = [
+            LLMMessage(role="user", content="a-secret"),
+            LLMMessage(role="assistant", content="a-reply"),
+        ]
+        agent = FakeAgent(
+            [
+                _make_agent_result(response="a-reply", history=history_a),
+                _make_agent_result(response="b-reply"),
+            ]
+        )
+        app = _make_app(agent, session=member_session("editor"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "a", "session_id": "shared"})
+            login(app, member_session("editor", user_id=_OTHER_USER_ID))
+            await c.post("/api/message", json={"message": "b", "session_id": "shared"})
+
+        assert agent.run_calls[1]["history"] == []
+
+    async def test_server_other_user_does_not_overwrite_history(self) -> None:
+        """B's turn on the same session_id leaves A's stored history intact."""
+        import admino.server as srv
+
+        history_a = [LLMMessage(role="user", content="a-secret")]
+        history_b = [LLMMessage(role="user", content="b-msg")]
+        agent = FakeAgent(
+            [
+                _make_agent_result(response="a", history=history_a),
+                _make_agent_result(response="b", history=history_b),
+                _make_agent_result(response="a2"),
+            ]
+        )
+        app = _make_app(agent, session=member_session("editor"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "a", "session_id": "shared"})
+            login(app, member_session("editor", user_id=_OTHER_USER_ID))
+            await c.post("/api/message", json={"message": "b", "session_id": "shared"})
+            login(app, member_session("editor"))
+            await c.post("/api/message", json={"message": "a2", "session_id": "shared"})
+
+        assert agent.run_calls[2]["history"] == history_a
+        assert srv._sessions[srv._chat_key(_OTHER_USER_ID, "shared")] == history_b
+
+    async def test_server_other_user_cannot_confirm_a_pending_call(self) -> None:
+        """B can't resolve A's pending confirmation: 404, and A's stays pending."""
+        import admino.server as srv
+
+        pending = _make_pending_confirmation(session_id="shared")
+        awaiting = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Requires confirmation.",
+            pending_confirmation=pending,
+        )
+        agent = FakeAgent([awaiting, _make_agent_result(response="Done.")])
+        app = _make_app(agent, session=member_session("editor"))
+        confirm_body = {
+            "session_id": "shared",
+            "confirmation_id": pending.confirmation_id,
+            "approved": True,
+        }
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "create", "session_id": "shared"})
+            login(app, member_session("editor", user_id=_OTHER_USER_ID))
+            stolen = await c.post(f"/api/confirm/{pending.confirmation_id}", json=confirm_body)
+            assert stolen.status_code == 404
+            assert len(agent.run_calls) == 1
+            assert srv._chat_key(TEST_MEMBER_ID, "shared") in srv._pending_confirmations
+
+            login(app, member_session("editor"))
+            own = await c.post(f"/api/confirm/{pending.confirmation_id}", json=confirm_body)
+
+        assert own.status_code == 200
+        assert agent.run_calls[1]["pending_confirmation"] is not None
+
+    async def test_server_other_users_message_does_not_cancel_a_pending_call(self) -> None:
+        """B's message on the same session_id doesn't drop A's pending confirmation."""
+        import admino.server as srv
+
+        pending = _make_pending_confirmation(session_id="shared")
+        awaiting = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Requires confirmation.",
+            pending_confirmation=pending,
+        )
+        agent = FakeAgent([awaiting, _make_agent_result()])
+        app = _make_app(agent, session=member_session("editor"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "create", "session_id": "shared"})
+            login(app, member_session("editor", user_id=_OTHER_USER_ID))
+            await c.post("/api/message", json={"message": "hi", "session_id": "shared"})
+
+        assert srv._chat_key(TEST_MEMBER_ID, "shared") in srv._pending_confirmations
 
 
 class TestCORS:
@@ -1017,7 +1312,7 @@ class TestCORS:
                 headers={
                     "Origin": "http://localhost:8000",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Authorization,Content-Type",
+                    "Access-Control-Request-Headers": "Content-Type",
                 },
             )
         assert resp.status_code == 200
@@ -1031,12 +1326,27 @@ class TestCORS:
                 headers={
                     "Origin": "http://evil.com",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Authorization",
+                    "Access-Control-Request-Headers": "Content-Type",
                 },
             )
         # CORSMiddleware returns 400 or omits the allow-origin header
         allow_origin = resp.headers.get("access-control-allow-origin", "")
         assert "evil.com" not in allow_origin
+
+    async def test_server_cors_no_longer_allows_authorization_header(self) -> None:
+        """GH-149: no bearer auth any more, so CORS stops allowing Authorization."""
+        app = _make_app()
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.options(
+                "/api/message",
+                headers={
+                    "Origin": "http://localhost:8000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": "Authorization",
+                },
+            )
+        allowed = resp.headers.get("access-control-allow-headers", "").lower()
+        assert "authorization" not in allowed
 
 
 class TestErrorHandling:
@@ -1052,7 +1362,6 @@ class TestErrorHandling:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 500
         body = resp.json()
@@ -1065,7 +1374,7 @@ class TestErrorHandling:
             resp = await c.post(
                 "/api/message",
                 content=b"{invalid json",
-                headers={**_AUTH_HEADER, "Content-Type": "application/json"},
+                headers={"Content-Type": "application/json"},
             )
         assert resp.status_code == 422
 
@@ -1075,7 +1384,7 @@ class TestErrorHandling:
             resp = await c.post(
                 "/api/message",
                 content=b"message=hello&session_id=sess1",
-                headers={**_AUTH_HEADER, "Content-Type": "application/x-www-form-urlencoded"},
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
             )
         assert resp.status_code == 422
 
@@ -1122,31 +1431,43 @@ class TestSecurityInvariants:
         source = inspect.getsource(server_module)
         assert "shell=True" not in source
 
-    def test_server_imports_hmac(self) -> None:
-        """server.py must import hmac for constant-time token comparison."""
+    def test_server_does_not_import_hmac(self) -> None:
+        """GH-149: the bearer-token compare is gone, and with it the hmac import."""
         tree = self._get_server_ast()
-        found_hmac = False
+        imported: set[str] = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.name == "hmac":
-                        found_hmac = True
-        assert found_hmac, "server.py must import hmac"
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module)
+        assert "hmac" not in imported
 
-    def test_server_auth_uses_constant_time_comparison(self) -> None:
-        """Verify server.py uses hmac.compare_digest for token comparison."""
+    @pytest.mark.parametrize("removed", ["require_auth", "_get_bearer_token"])
+    def test_server_bearer_auth_helpers_removed(self, removed: str) -> None:
+        """The bearer-token dependency and its header parser no longer exist."""
+        import admino.server as server_module
+
+        assert not hasattr(server_module, removed)
+
+    @pytest.mark.parametrize("dependency", ["require_session", "require_principal"])
+    def test_server_exposes_session_dependencies(self, dependency: str) -> None:
+        """GH-149: routes depend on require_session / require_principal."""
+        import admino.server as server_module
+
+        assert callable(getattr(server_module, dependency, None))
+
+    def test_server_never_reads_config_auth(self) -> None:
+        """No ``<something>.auth`` attribute read on the config any more (auth.mode is gone)."""
         tree = self._get_server_ast()
-        found = False
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Attribute)
-                and isinstance(node.value, ast.Name)
-                and node.value.id == "hmac"
-                and node.attr == "compare_digest"
-            ):
-                found = True
-                break
-        assert found, "server.py must use hmac.compare_digest for token comparison"
+        offenders = [
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Attribute)
+            and node.attr == "auth"
+            and isinstance(node.value, ast.Name)
+            and node.value.id in {"_config", "config"}
+        ]
+        assert offenders == []
 
 
 class TestStaticFiles:
@@ -1181,7 +1502,6 @@ class TestStaticFiles:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
 
@@ -1279,15 +1599,15 @@ class TestAppFactory:
 
         agent = FakeAgent([_make_agent_result(), _make_agent_result()])
         config = _make_config()
-        app1 = create_app(agent=agent, config=config)
+        app1 = _make_app(agent, config=config)
 
         # Post a message to populate session state
         async with AsyncClient(transport=ASGITransport(app=app1), base_url="http://test") as c:
             await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
+        assert srv._chat_key(TEST_MEMBER_ID, "sess1") in srv._sessions
 
         # Create a new app — sessions should be cleared
         create_app(agent=agent, config=config)
@@ -1329,7 +1649,6 @@ class TestConfirmationEdgeCases:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
@@ -1338,10 +1657,9 @@ class TestConfirmationEdgeCases:
                     "confirmation_id": pending.confirmation_id,
                     "approved": False,
                 },
-                headers=_AUTH_HEADER,
             )
         # Pending should be cleared
-        assert "sess1" not in srv._pending_confirmations
+        assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._pending_confirmations
 
     async def test_server_confirm_passes_pending_to_agent(self) -> None:
         """On approval, agent.run is called with pending_confirmation."""
@@ -1362,7 +1680,6 @@ class TestConfirmationEdgeCases:
             await c.post(
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
             await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
@@ -1371,7 +1688,6 @@ class TestConfirmationEdgeCases:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         # The second run call should include the pending_confirmation
         assert len(agent.run_calls) == 2
@@ -1404,7 +1720,6 @@ class TestConfirmationEdgeCases:
             resp = await c.post(
                 "/api/message",
                 json={"message": "book the dentist", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
 
         assert resp.status_code == 200
@@ -1431,7 +1746,6 @@ class TestConfirmationEdgeCases:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hi", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
 
         assert resp.status_code == 200
@@ -1485,9 +1799,8 @@ class TestConfirmationEdgeCases:
             await c.post(
                 "/api/message",
                 json={"message": "book the dentist", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
-            assert "sess1" in srv._pending_confirmations
+            assert srv._chat_key(TEST_MEMBER_ID, "sess1") in srv._pending_confirmations
 
             # Turn 2: user sends a new chat message instead of calling
             # /api/confirm/{id}. Must succeed (no 500) and the pending
@@ -1495,11 +1808,10 @@ class TestConfirmationEdgeCases:
             resp = await c.post(
                 "/api/message",
                 json={"message": "I confirm it!", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
 
         assert resp.status_code == 200
-        assert "sess1" not in srv._pending_confirmations
+        assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._pending_confirmations
 
         # Inspect the history passed to agent.run() on the second call: the
         # dangling tool_use must have been closed with a synthetic tool
@@ -1561,13 +1873,12 @@ class TestSessionCap:
                     await c.post(
                         "/api/message",
                         json={"message": "hi", "session_id": f"sess{i}"},
-                        headers=_AUTH_HEADER,
                     )
             # Only the 3 most recent sessions should remain.
             assert len(srv._sessions) == 3
-            assert "sess0" not in srv._sessions
-            assert "sess1" not in srv._sessions
-            assert "sess4" in srv._sessions
+            assert srv._chat_key(TEST_MEMBER_ID, "sess0") not in srv._sessions
+            assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._sessions
+            assert srv._chat_key(TEST_MEMBER_ID, "sess4") in srv._sessions
         finally:
             srv._MAX_SESSIONS = original_max
 
@@ -1588,22 +1899,19 @@ class TestSessionCap:
                     await c.post(
                         "/api/message",
                         json={"message": "hi", "session_id": f"sess{i}"},
-                        headers=_AUTH_HEADER,
                     )
                 # Reuse sess0 (moves to end)
                 await c.post(
                     "/api/message",
                     json={"message": "hi again", "session_id": "sess0"},
-                    headers=_AUTH_HEADER,
                 )
                 # Add sess3 — should evict sess1 (oldest unreused)
                 await c.post(
                     "/api/message",
                     json={"message": "hi", "session_id": "sess3"},
-                    headers=_AUTH_HEADER,
                 )
-            assert "sess0" in srv._sessions  # reused, so not evicted
-            assert "sess1" not in srv._sessions  # oldest, evicted
+            assert srv._chat_key(TEST_MEMBER_ID, "sess0") in srv._sessions  # reused, not evicted
+            assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._sessions  # oldest, evicted
         finally:
             srv._MAX_SESSIONS = original_max
 
@@ -1633,8 +1941,10 @@ class TestConfirmationExpiry:
         # Manually inject the expired pending (bypassing normal flow)
         import admino.server as srv
 
-        srv._pending_confirmations["sess1"] = pending
-        srv._sessions["sess1"] = [LLMMessage(role="user", content="hi")]
+        srv._pending_confirmations[srv._chat_key(TEST_MEMBER_ID, "sess1")] = pending
+        srv._sessions[srv._chat_key(TEST_MEMBER_ID, "sess1")] = [
+            LLMMessage(role="user", content="hi")
+        ]
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
@@ -1644,7 +1954,6 @@ class TestConfirmationExpiry:
                     "confirmation_id": pending.confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         # Expired entry is reaped before lookup, so 404 (not 410).
         assert resp.status_code == 404
@@ -1657,7 +1966,7 @@ class TestConfirmationExpiry:
         agent = FakeAgent([_make_agent_result()])
         app = _make_app(agent)
 
-        srv._pending_confirmations["sess-expired"] = expired_pending
+        srv._pending_confirmations[srv._chat_key(TEST_MEMBER_ID, "sess-expired")] = expired_pending
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             # Query for a different session — the expired one should be reaped
@@ -1668,10 +1977,9 @@ class TestConfirmationExpiry:
                     "confirmation_id": "some-id",
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 404
-        assert "sess-expired" not in srv._pending_confirmations
+        assert srv._chat_key(TEST_MEMBER_ID, "sess-expired") not in srv._pending_confirmations
 
 
 class TestMaxMessageLength:
@@ -1684,13 +1992,12 @@ class TestMaxMessageLength:
         agent = FakeAgent([_make_agent_result()])
         config = _make_config()
         config.limits.max_message_length = 100
-        app = create_app(agent=agent, config=config)
+        app = _make_app(agent, config=config)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/message",
                 json={"message": "x" * 101, "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 422
         assert "maximum length" in resp.json()["detail"].lower()
@@ -1700,13 +2007,12 @@ class TestMaxMessageLength:
         agent = FakeAgent([_make_agent_result()])
         config = _make_config()
         config.limits.max_message_length = 100
-        app = create_app(agent=agent, config=config)
+        app = _make_app(agent, config=config)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/message",
                 json={"message": "x" * 100, "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
 
@@ -1725,7 +2031,7 @@ class TestCORSCredentials:
                 headers={
                     "Origin": "http://localhost:8000",
                     "Access-Control-Request-Method": "POST",
-                    "Access-Control-Request-Headers": "Authorization,Content-Type",
+                    "Access-Control-Request-Headers": "Content-Type",
                 },
             )
         # allow-credentials header should not be present or should be "false"
@@ -1757,7 +2063,6 @@ class TestConfirmationPathValidation:
                     "confirmation_id": bad_id or "x",
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         # Empty string would result in 404/405 since route won't match
         if bad_id == "":
@@ -1766,16 +2071,13 @@ class TestConfirmationPathValidation:
             assert resp.status_code == 422
 
 
-class TestVPNModeWarning:
-    """L-1: VPN mode logs a warning at startup."""
+class TestNoVPNModeWarning:
+    """GH-149: vpn mode is gone, so create_app logs no VPN warning."""
 
-    def test_server_vpn_mode_logs_warning(self, caplog: Any) -> None:
-        """create_app in VPN mode logs a warning."""
-        import logging
-
+    def test_server_create_app_logs_no_vpn_warning(self, caplog: Any) -> None:
         with caplog.at_level(logging.WARNING, logger="admino.server"):
-            _make_app(auth_mode="vpn")
-        assert any("VPN mode" in record.message for record in caplog.records)
+            _make_app()
+        assert not any("VPN" in record.getMessage() for record in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1869,7 +2171,6 @@ class TestConfirmationPathInjection:
                     "confirmation_id": "valid-id",
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
         # Path traversal/special chars may result in 404 (route mismatch),
         # 422 (Pydantic validation), or 405 (caught by static file mount).
@@ -1960,7 +2261,6 @@ class TestSecurityHeaders:
             resp = await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 200
         assert resp.headers["x-content-type-options"] == "nosniff"
@@ -1968,7 +2268,7 @@ class TestSecurityHeaders:
 
     async def test_server_401_includes_security_headers(self) -> None:
         """Even 401 responses include security headers."""
-        app = _make_app()
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
                 "/api/message",
@@ -1999,12 +2299,240 @@ class TestRateLimiting:
                 resp = await c.post(
                     "/api/message",
                     json={"message": "hello", "session_id": f"sess-rl-{i}"},
-                    headers=_AUTH_HEADER,
                 )
                 statuses.append(resp.status_code)
         # First 5 should succeed (burst capacity), rest should be 429
         assert 429 in statuses, "Rate limiter should return 429 after burst capacity"
         assert statuses[0] == 200, "First request should succeed"
+
+    async def test_server_rate_limit_429_body_is_generic(self) -> None:
+        """The 429 body is exactly {"detail": "Rate limit exceeded"}."""
+        agent = FakeAgent([_make_agent_result() for _ in range(6)])
+        app = _make_app(agent)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            responses = [
+                await c.post("/api/message", json={"message": "hi", "session_id": f"s{i}"})
+                for i in range(6)
+            ]
+        assert responses[-1].status_code == 429
+        assert responses[-1].json() == {"detail": "Rate limit exceeded"}
+
+    async def test_server_rate_limit_one_user_does_not_throttle_another(self) -> None:
+        """GH-149: buckets are per user; user A exhausting /api/message leaves user B alone."""
+        agent = FakeAgent([_make_agent_result() for _ in range(8)])
+        app = _make_app(agent, session=member_session("editor"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            first_user = [
+                (
+                    await c.post("/api/message", json={"message": "hi", "session_id": f"a{i}"})
+                ).status_code
+                for i in range(6)
+            ]
+            login(app, member_session("editor", user_id=_OTHER_USER_ID))
+            second_user = await c.post("/api/message", json={"message": "hi", "session_id": "b"})
+        assert first_user[-1] == 429
+        assert second_user.status_code == 200
+
+    async def test_server_rate_limit_session_route_is_keyed_by_user_id(self) -> None:
+        """A session route's caller key is ``user:<principal.user_id>``."""
+        from admino import server
+
+        app = _make_app(session=member_session("editor", user_id=_OTHER_USER_ID))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json=_MESSAGE_BODY)
+        assert ("/api/message", f"user:{_OTHER_USER_ID}") in server._rate_buckets
+
+    async def test_server_rate_limit_public_route_is_keyed_by_client_ip(self) -> None:
+        """A public route's caller key is ``ip:<client host>`` (here: the OAuth callback)."""
+        from admino import server
+
+        app = _make_app(anonymous=True)
+        transport = ASGITransport(app=app, client=("203.0.113.7", 50000))
+        async with AsyncClient(transport=transport, base_url="http://test") as c:
+            await c.get("/api/oauth/callback")
+        assert ("/api/oauth/callback", "ip:203.0.113.7") in server._rate_buckets
+
+    async def test_server_rate_limit_one_ip_does_not_throttle_another(self) -> None:
+        """On a public route, one client IP exhausting its bucket leaves another IP alone."""
+        app = _make_app(anonymous=True)
+        first_ip = ASGITransport(app=app, client=("203.0.113.7", 50000))
+        second_ip = ASGITransport(app=app, client=("198.51.100.9", 50000))
+        async with AsyncClient(transport=first_ip, base_url="http://test") as c:
+            first = [(await c.get("/api/oauth/callback")).status_code for _ in range(3)]
+        async with AsyncClient(transport=second_ip, base_url="http://test") as c:
+            second = await c.get("/api/oauth/callback")
+        assert first[-1] == 429
+        assert second.status_code != 429
+
+
+class _Clock:
+    """A settable stand-in for ``time.monotonic()``."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+# The per-route (tokens/s, burst) the server keeps (GH-149 keeps today's rates
+# and adds the three auth routes).
+_EXPECTED_RATE_LIMITS: list[tuple[str, float, int]] = [
+    ("/api/message", 0.5, 5),
+    ("/api/confirm", 0.5, 5),
+    ("/api/events", 0.17, 3),
+    ("/api/settings/get", 1.0, 5),
+    ("/api/settings/patch", 0.2, 2),
+    ("/api/permissions/get", 1.0, 5),
+    ("/api/permissions/patch", 0.2, 2),
+    ("/api/oauth/google/authorize", 0.2, 2),
+    ("/api/oauth/microsoft/authorize", 0.2, 2),
+    ("/api/oauth/callback", 0.2, 2),
+    ("/api/oauth/google/status", 1.0, 5),
+    ("/api/oauth/microsoft/status", 1.0, 5),
+    ("/api/oauth/google/disconnect", 0.2, 2),
+    ("/api/oauth/microsoft/disconnect", 0.2, 2),
+    ("/api/critical-permissions/get", 1.0, 5),
+    ("/api/critical-permissions/promote", 5 / 60, 5),
+    ("/api/critical-permissions/cancel", 0.5, 5),
+    ("/api/auth/login", 0.2, 5),
+    ("/api/auth/logout", 0.5, 5),
+    ("/api/auth/me", 1.0, 10),
+]
+
+
+class TestPerCallerRateLimit:
+    """GH-149: ``_check_rate_limit(route, caller)`` with one bucket per (route, caller)."""
+
+    @pytest.fixture()
+    def clock(self, monkeypatch: pytest.MonkeyPatch) -> _Clock:
+        """Freeze the server's monotonic clock and start from a fresh app (empty buckets)."""
+        fake = _Clock()
+        monkeypatch.setattr("admino.server.time.monotonic", fake)
+        _make_app()
+        return fake
+
+    @staticmethod
+    def _exhaust(route: str, caller: str, burst: int) -> None:
+        """Use up ``caller``'s whole burst on ``route``."""
+        from admino import server
+
+        for _ in range(burst):
+            server._check_rate_limit(route, caller)
+
+    def test_server_check_rate_limit_raises_429_after_burst(self, clock: _Clock) -> None:
+        from admino import server
+
+        self._exhaust("/api/message", "user:a", 5)
+        with pytest.raises(HTTPException) as exc_info:
+            server._check_rate_limit("/api/message", "user:a")
+        assert (exc_info.value.status_code, exc_info.value.detail) == (429, "Rate limit exceeded")
+
+    def test_server_check_rate_limit_other_user_keeps_full_burst(self, clock: _Clock) -> None:
+        self._exhaust("/api/message", "user:a", 5)
+        self._exhaust("/api/message", "user:b", 5)  # must not raise
+
+    def test_server_check_rate_limit_other_ip_keeps_full_burst(self, clock: _Clock) -> None:
+        self._exhaust("/api/auth/login", "ip:203.0.113.7", 5)
+        self._exhaust("/api/auth/login", "ip:198.51.100.9", 5)  # must not raise
+
+    def test_server_check_rate_limit_same_user_other_route_unaffected(self, clock: _Clock) -> None:
+        self._exhaust("/api/message", "user:a", 5)
+        self._exhaust("/api/confirm", "user:a", 5)  # must not raise
+
+    def test_server_check_rate_limit_refills_over_time(self, clock: _Clock) -> None:
+        """0.5 tokens/s on /api/message: two seconds later one more request passes."""
+        from admino import server
+
+        self._exhaust("/api/message", "user:a", 5)
+        clock.now += 2.0
+        server._check_rate_limit("/api/message", "user:a")
+        with pytest.raises(HTTPException):
+            server._check_rate_limit("/api/message", "user:a")
+
+    def test_server_check_rate_limit_stores_bucket_per_route_and_caller(
+        self, clock: _Clock
+    ) -> None:
+        from admino import server
+
+        server._check_rate_limit("/api/message", "user:a")
+        assert list(server._rate_buckets) == [("/api/message", "user:a")]
+
+    @pytest.mark.parametrize(("route", "rate", "burst"), _EXPECTED_RATE_LIMITS)
+    def test_server_rate_limits_per_route(self, route: str, rate: float, burst: int) -> None:
+        from admino import server
+
+        assert server._RATE_LIMITS[route] == pytest.approx((rate, burst))
+
+    def test_server_default_rate_limit_is_one_per_second_burst_ten(self) -> None:
+        from admino import server
+
+        assert tuple(server._DEFAULT_RATE_LIMIT) == (1.0, 10)
+
+    def test_server_unlisted_route_uses_default_limit(self, clock: _Clock) -> None:
+        """A route without its own entry still gets a (default) bucket per caller."""
+        from admino import server
+
+        self._exhaust("/api/not-listed", "user:a", 10)
+        with pytest.raises(HTTPException):
+            server._check_rate_limit("/api/not-listed", "user:a")
+
+    def test_server_create_app_clears_rate_buckets(self, clock: _Clock) -> None:
+        from admino import server
+
+        server._check_rate_limit("/api/message", "user:a")
+        _make_app()
+        assert len(server._rate_buckets) == 0
+
+    def test_server_bucket_eviction_constants(self) -> None:
+        from admino import server
+
+        assert (server._BUCKET_IDLE_TTL_S, server._MAX_RATE_BUCKETS) == (900.0, 10_000)
+
+    def test_server_idle_bucket_is_evicted_on_a_later_call(self, clock: _Clock) -> None:
+        """A bucket unused for the idle TTL is dropped when any caller is checked later."""
+        from admino import server
+
+        server._check_rate_limit("/api/message", "user:a")
+        clock.now += server._BUCKET_IDLE_TTL_S + 1.0
+        server._check_rate_limit("/api/message", "user:b")
+        assert ("/api/message", "user:a") not in server._rate_buckets
+        assert ("/api/message", "user:b") in server._rate_buckets
+
+    def test_server_recent_bucket_is_not_evicted(self, clock: _Clock) -> None:
+        """A bucket used within the idle TTL survives (its caller stays throttled)."""
+        from admino import server
+
+        self._exhaust("/api/message", "user:a", 5)
+        clock.now += server._BUCKET_IDLE_TTL_S - 1.0
+        server._check_rate_limit("/api/message", "user:b")
+        assert ("/api/message", "user:a") in server._rate_buckets
+
+    def test_server_bucket_map_never_exceeds_cap(
+        self, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from admino import server
+
+        monkeypatch.setattr(server, "_MAX_RATE_BUCKETS", 3)
+        for i in range(5):
+            server._check_rate_limit("/api/message", f"user:{i}")
+        assert len(server._rate_buckets) == 3
+
+    def test_server_bucket_cap_drops_least_recently_used_first(
+        self, clock: _Clock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from admino import server
+
+        monkeypatch.setattr(server, "_MAX_RATE_BUCKETS", 3)
+        for caller in ("user:0", "user:1", "user:2"):
+            server._check_rate_limit("/api/message", caller)
+        server._check_rate_limit("/api/message", "user:0")  # user:0 is now most recent
+        server._check_rate_limit("/api/message", "user:3")
+        assert set(server._rate_buckets) == {
+            ("/api/message", "user:0"),
+            ("/api/message", "user:2"),
+            ("/api/message", "user:3"),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -2027,9 +2555,8 @@ class TestSessionLocks:
             await c.post(
                 "/api/message",
                 json={"message": "hello", "session_id": "sess1"},
-                headers=_AUTH_HEADER,
             )
-        assert "sess1" in srv._session_locks
+        assert srv._chat_key(TEST_MEMBER_ID, "sess1") in srv._session_locks
 
         # Creating a new app clears locks
         _make_app()
@@ -2128,9 +2655,7 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                 for i in range(turns)
             ]
         )
-        app = create_app(
-            agent=self._make_real_agent(llm, tool_call_recorder), config=_make_config()
-        )
+        app = _make_app(self._make_real_agent(llm, tool_call_recorder))
         statuses: list[int] = []
         # /api/message has a burst capacity of 5; the rate limiter is not
         # under test here, so neutralise it for the 25-turn conversation.
@@ -2140,7 +2665,6 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                     resp = await c.post(
                         "/api/message",
                         json={"message": f"turn-{i}", "session_id": _GH140_SESSION},
-                        headers=_AUTH_HEADER,
                     )
                     statuses.append(resp.status_code)
         return llm, statuses
@@ -2172,7 +2696,7 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
 
         await self._post_turns(tool_call_recorder)
 
-        stored = server._sessions[_GH140_SESSION]
+        stored = server._sessions[server._chat_key(TEST_MEMBER_ID, _GH140_SESSION)]
         assert _system_pairs(stored) == []
         assert len(stored) == 50
 
@@ -2201,15 +2725,12 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                 LLMResponse(content="Written.", tool_calls=[], model="m", done=True),
             ]
         )
-        app = create_app(
-            agent=self._make_real_agent(llm, tool_call_recorder), config=_make_config()
-        )
+        app = _make_app(self._make_real_agent(llm, tool_call_recorder))
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp1 = await c.post(
                 "/api/message",
                 json={"message": "please write x", "session_id": _GH140_SESSION},
-                headers=_AUTH_HEADER,
             )
             assert resp1.status_code == 200
             assert resp1.json()["status"] == "awaiting_confirmation"
@@ -2222,7 +2743,6 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                     "confirmation_id": confirmation_id,
                     "approved": True,
                 },
-                headers=_AUTH_HEADER,
             )
 
         assert resp2.status_code == 200
@@ -2231,4 +2751,50 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         resume_call = llm.received_messages[1]
         assert _system_pairs(resume_call) == [("system", _GH140_SYSTEM_PROMPT)]
         assert resume_call[0].role == "system"
-        assert _system_pairs(server._sessions[_GH140_SESSION]) == []
+        assert (
+            _system_pairs(server._sessions[server._chat_key(TEST_MEMBER_ID, _GH140_SESSION)]) == []
+        )
+
+    async def test_server_tool_call_recorder_receives_logged_in_principal(
+        self, tool_call_recorder: AsyncMock
+    ) -> None:
+        """GH-149 end to end: each tool-call record carries the requesting principal."""
+        register_tool("echo", "write", "Write echo", _EchoArgs)(_echo_handler)
+        llm = _RecordingLLM(
+            [
+                LLMResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            tool="echo",
+                            action="write",
+                            args={"text": "x"},
+                            tool_call_id="call_write_1",
+                        )
+                    ],
+                    model="m",
+                    done=True,
+                ),
+                LLMResponse(content="Written.", tool_calls=[], model="m", done=True),
+            ]
+        )
+        session = member_session("editor", user_id=_OTHER_USER_ID)
+        app = _make_app(self._make_real_agent(llm, tool_call_recorder), session=session)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp1 = await c.post(
+                "/api/message",
+                json={"message": "please write x", "session_id": _GH140_SESSION},
+            )
+            confirmation_id = resp1.json()["pending_confirmation"]["confirmation_id"]
+            await c.post(
+                f"/api/confirm/{confirmation_id}",
+                json={
+                    "session_id": _GH140_SESSION,
+                    "confirmation_id": confirmation_id,
+                    "approved": True,
+                },
+            )
+
+        principals = [call.kwargs["principal"] for call in tool_call_recorder.await_args_list]
+        assert principals == [session.principal, session.principal]

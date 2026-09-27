@@ -3,7 +3,8 @@
 Covers:
 - GET /api/settings: returns current settings with masked API keys
 - PATCH /api/settings: partial updates, validation, LLM re-init
-- Auth enforcement on both endpoints
+- Session enforcement on both endpoints (GH-149): 401 without a session
+  cookie or with one that resolves to no session
 - Adversarial inputs: oversized values, SQL injection, wrong types
 - Immutable fields (server section) cannot be changed via PATCH
 - GH-142: the Infomaniak provider (model, token-configured flag, live model
@@ -12,7 +13,8 @@ Covers:
 
 Security notes:
 - All tests use mocked database and config — no real DB or API calls.
-- Auth token is a known test value, never a real secret.
+- Callers are logged in with tests.auth_helpers (an Org Admin by default); the
+  session token is a known fake value, never a real secret.
 """
 
 from __future__ import annotations
@@ -24,17 +26,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
 
 from admino.server import create_app
+from tests.auth_helpers import login, member_session, resolved_session, session_cookie
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"  # >48 chars, >20 unique
 _INFOMANIAK_MODEL = "Qwen/Qwen3.5-397B-A17B-FP8"
-_AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+_UNAUTHORIZED = {"detail": "Unauthorized"}
 
 # Default settings returned by mocked load_settings_from_db.
 _DEFAULT_DB_SETTINGS: dict[str, Any] = {
@@ -60,31 +61,27 @@ _DEFAULT_DB_SETTINGS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> MagicMock:
-    """Build a minimal mock AppConfig for settings tests."""
+def _make_config() -> MagicMock:
+    """Build a minimal mock AppConfig for settings tests (no ``auth``: GH-149 removed it)."""
     config = MagicMock()
+    del config.auth
     # Concrete (str) model so the live-config fallback for infomaniak_model is
     # realistic rather than a MagicMock attribute.
     config.llm.infomaniak_model = _INFOMANIAK_MODEL
-    config.auth.mode = auth_mode
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    if token is not None:
-        config.auth.token = SecretStr(token)
-    else:
-        config.auth.token = None
     return config
 
 
-def _make_app(
-    agent: Any = None, *, auth_mode: str = "token", token: str | None = _TEST_TOKEN
-) -> Any:
-    """Create a FastAPI app with mock agent and config."""
+def _make_app(agent: Any = None, *, anonymous: bool = False) -> Any:
+    """Create a FastAPI app with mock agent and config; log an Org Admin in unless anonymous."""
     if agent is None:
         agent = MagicMock()
-    config = _make_config(auth_mode=auth_mode, token=token)
-    return create_app(agent=agent, config=config)
+    app = create_app(agent=agent, config=_make_config())
+    if not anonymous:
+        login(app, member_session("org_admin"))
+    return app
 
 
 def _mock_load_settings(settings: dict[str, Any] | None = None) -> AsyncMock:
@@ -133,7 +130,7 @@ class TestGetSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         body = resp.json()
@@ -171,7 +168,7 @@ class TestGetSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings(db_settings)),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         body = resp.json()
@@ -198,7 +195,7 @@ class TestGetSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings(db_settings)),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         assert resp.json()["llm"]["provider"] == "vllm"
@@ -215,7 +212,7 @@ class TestGetSettings:
             ),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         assert resp.json()["llm"]["vllm_model"] == "mlx-community/gemma-4-12B-it-4bit"
@@ -233,7 +230,7 @@ class TestGetSettings:
             ),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         assert resp.json()["llm"]["vllm_available_models"] == probed
@@ -250,7 +247,7 @@ class TestGetSettings:
             ),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         assert resp.json()["llm"]["vllm_available_models"] == []
@@ -265,7 +262,7 @@ class TestGetSettings:
             patch.dict("os.environ", env, clear=False),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         body = resp.json()
         assert body["llm"]["anthropic_key_configured"] is False
@@ -283,7 +280,7 @@ class TestGetSettings:
             patch.dict("os.environ", env, clear=False),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         body = resp.json()
         assert body["llm"]["anthropic_key_configured"] is True
@@ -293,11 +290,12 @@ class TestGetSettings:
         assert "sk-openai-456" not in raw
 
     async def test_get_settings_requires_auth(self) -> None:
-        """GET /api/settings without Authorization header returns 401."""
-        app = _make_app()
+        """GET /api/settings without a session cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/settings")
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_get_settings_connected_accounts_no_tokens(self) -> None:
         """When no token files exist, connected_accounts shows disconnected."""
@@ -308,7 +306,7 @@ class TestGetSettings:
             patch("admino.server.get_connection_status", _conn_status()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         body = resp.json()
         assert body["connected_accounts"]["google"]["connected"] is False
@@ -325,7 +323,7 @@ class TestGetSettings:
             patch("admino.server.get_connection_status", _conn_status(google=(True, True))),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         body = resp.json()
         assert body["connected_accounts"]["google"]["connected"] is True
@@ -341,7 +339,7 @@ class TestGetSettings:
             patch("admino.server.get_connection_status", _conn_status(google=(True, False))),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         body = resp.json()
         assert body["connected_accounts"]["google"]["connected"] is True
@@ -376,7 +374,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "anthropic"}},
                 )
 
@@ -408,7 +405,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "vllm"}},
                 )
 
@@ -454,7 +450,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"vllm_model": "org/new-served-model"}},
                 )
 
@@ -486,7 +481,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"vllm_model": "org/new-served-model"}},
                 )
 
@@ -523,7 +517,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"vllm_model": "mlx-community/gemma-4-12B-it-4bit"}},
                 )
 
@@ -562,7 +555,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "anthropic"}},
                 )
 
@@ -601,7 +593,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "anthropic"}},
                 )
 
@@ -633,7 +624,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "openai"}},
                 )
 
@@ -666,7 +656,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "openai"}},
                 )
 
@@ -690,7 +679,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "openai"}},
                 )
 
@@ -719,7 +707,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "anthropic"}},
                 )
 
@@ -755,7 +742,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "anthropic"}},
                 )
 
@@ -777,7 +763,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"appearance": {"theme": "dark"}},
                 )
 
@@ -810,7 +795,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"appearance": {"theme": "dark"}},
                 )
 
@@ -818,11 +802,12 @@ class TestPatchSettings:
         assert resp.json()["appearance"]["theme"] == "dark"
 
     async def test_patch_settings_requires_auth(self) -> None:
-        """PATCH /api/settings without Authorization header returns 401."""
-        app = _make_app()
+        """PATCH /api/settings without a session cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch("/api/settings", json={"appearance": {"theme": "dark"}})
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_patch_settings_invalid_provider_returns_400(self) -> None:
         """Setting an invalid provider value should return 422 from Pydantic."""
@@ -834,7 +819,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": "invalid_provider"}},
                 )
         assert resp.status_code == 422
@@ -852,7 +836,6 @@ class TestPatchSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"notifications": {"enabled": False}},
                 )
 
@@ -872,7 +855,7 @@ class TestPatchSettings:
             patch("admino.database.update_setting", mock_update),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch("/api/settings", headers=_AUTH_HEADER, json={})
+                resp = await c.patch("/api/settings", json={})
 
         assert resp.status_code == 200
         mock_update.assert_not_called()
@@ -920,7 +903,7 @@ class TestInfomaniakSettingsGet:
             patch.dict("os.environ", env, clear=False),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                return await c.get("/api/settings", headers=_AUTH_HEADER)
+                return await c.get("/api/settings")
 
     async def test_get_settings_reports_infomaniak_provider_and_model(self) -> None:
         """provider='infomaniak' and infomaniak_model come back from the DB."""
@@ -1060,7 +1043,7 @@ class TestInfomaniakSettingsPatch:
             patch.dict("os.environ", {"INFOMANIAK_API_TOKEN": ""}, clear=False),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                return await c.patch("/api/settings", headers=_AUTH_HEADER, json=body)
+                return await c.patch("/api/settings", json=body)
 
     async def test_patch_settings_to_infomaniak_returns_200_and_persists(self) -> None:
         """Switching to 'infomaniak' (even without a token) succeeds and is persisted."""
@@ -1214,7 +1197,6 @@ class TestSettingsImmutableFields:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"server": {"host": "evil.example.com", "port": 9999}},
                 )
 
@@ -1229,44 +1211,60 @@ class TestSettingsImmutableFields:
 
 
 class TestSettingsAuth:
-    """Both settings endpoints require authentication."""
+    """Both settings endpoints require a session (GH-149)."""
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_get_settings_401_without_token(self) -> None:
-        """GET /api/settings without any header returns 401."""
-        app = _make_app()
+    async def test_get_settings_401_without_session_cookie(self) -> None:
+        """GET /api/settings without any cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/settings")
         assert resp.status_code == 401
 
-    async def test_patch_settings_401_without_token(self) -> None:
-        """PATCH /api/settings without any header returns 401."""
-        app = _make_app()
+    async def test_patch_settings_401_without_session_cookie(self) -> None:
+        """PATCH /api/settings without any cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch("/api/settings", json={"appearance": {"theme": "dark"}})
         assert resp.status_code == 401
 
-    async def test_get_settings_401_wrong_token(self) -> None:
-        """GET /api/settings with wrong token returns 401."""
-        app = _make_app()
+    async def test_get_settings_401_unknown_session(self) -> None:
+        """GET /api/settings with a cookie that resolves to no session returns 401."""
+        app = _make_app(anonymous=True)
+        load = _mock_load_settings()
+        with resolved_session(None), patch("admino.database.load_settings_from_db", load):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/settings", headers=session_cookie())
+        assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+        load.assert_not_awaited()
+
+    async def test_patch_settings_401_unknown_session(self) -> None:
+        """PATCH /api/settings with a cookie that resolves to no session returns 401."""
+        app = _make_app(anonymous=True)
+        mock_update = AsyncMock()
+        with resolved_session(None), patch("admino.database.update_setting", mock_update):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/settings",
+                    headers=session_cookie(),
+                    json={"appearance": {"theme": "dark"}},
+                )
+        assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+        mock_update.assert_not_awaited()
+
+    async def test_get_settings_bearer_header_does_not_authenticate(self) -> None:
+        """The old bearer token is gone: an Authorization header alone gets a 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get(
                 "/api/settings",
-                headers={"Authorization": "Bearer wrong-token-value"},
+                headers={"Authorization": "Bearer " + "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"},
             )
         assert resp.status_code == 401
-
-    async def test_patch_settings_401_wrong_token(self) -> None:
-        """PATCH /api/settings with wrong token returns 401."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                "/api/settings",
-                headers={"Authorization": "Bearer wrong-token-value"},
-                json={"appearance": {"theme": "dark"}},
-            )
-        assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
 
 # ---------------------------------------------------------------------------
@@ -1287,7 +1285,7 @@ class TestToolsSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         tools = resp.json()["tools"]
@@ -1317,7 +1315,7 @@ class TestToolsSettings:
             ),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         tools = resp.json()["tools"]
@@ -1349,7 +1347,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": False}},
                 )
 
@@ -1386,7 +1383,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": False}},
                 )
 
@@ -1417,7 +1413,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": True}},
                 )
 
@@ -1445,7 +1440,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": True}},
                 )
 
@@ -1478,7 +1472,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": True}},
                 )
 
@@ -1504,7 +1497,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": "notabool"}},
                 )
 
@@ -1520,7 +1512,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": "true"}},
                 )
 
@@ -1539,7 +1530,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"unknown_tool": True}},
                 )
 
@@ -1572,7 +1562,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"files": False}},
                 )
 
@@ -1595,7 +1584,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": False}},
                 )
 
@@ -1615,7 +1603,7 @@ class TestToolsSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings(settings)),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         tools = resp.json()["tools"]
@@ -1633,7 +1621,7 @@ class TestToolsSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings(corrupt_settings)),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         tools = resp.json()["tools"]
@@ -1659,7 +1647,7 @@ class TestToolsSettings:
             patch("admino.database.load_settings_from_db", _mock_load_settings(corrupt_settings)),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/settings", headers=_AUTH_HEADER)
+                resp = await c.get("/api/settings")
 
         assert resp.status_code == 200
         # Strict validation rejected the string and the whole section fell back
@@ -1686,7 +1674,6 @@ class TestToolsSettings:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"tools": {"gmail": False}},
                 )
 
@@ -1714,7 +1701,6 @@ class TestSettingsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"anthropic_model": "a" * 201}},
                 )
         assert resp.status_code == 422
@@ -1729,7 +1715,6 @@ class TestSettingsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"anthropic_model": "'; DROP TABLE settings; --"}},
                 )
         assert resp.status_code == 422
@@ -1744,7 +1729,6 @@ class TestSettingsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"provider": 123}},
                 )
         assert resp.status_code == 422
@@ -1776,7 +1760,6 @@ class TestSettingsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"llm": {"anthropic_model": model_name}},
                 )
         assert resp.status_code == 422
@@ -1791,7 +1774,6 @@ class TestSettingsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"appearance": {"theme": "invalid_theme_value"}},
                 )
         assert resp.status_code == 422
@@ -1806,7 +1788,6 @@ class TestSettingsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/settings",
-                    headers=_AUTH_HEADER,
                     json={"notifications": {"enabled": [1, 2, 3]}},
                 )
         assert resp.status_code == 422

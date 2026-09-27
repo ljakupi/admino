@@ -2,16 +2,23 @@
 
 Covers:
 - GET /api/critical-permissions: returns 4 promotable permissions with state
-- PATCH /api/critical-permissions/{tool}/{action}: promote/demote permissions
+- PATCH /api/critical-permissions/{tool}/{action}:
+  - GH-149 (decision 1): promotions are disabled until #161 brings password
+    re-auth. PATCH on a promotable permission that is NOT currently promoted
+    answers 403 ``{"detail": "Critical permission promotions are temporarily
+    unavailable."}`` and starts no cooldown. The ``bearer_token`` request body
+    (``CriticalPermissionPromote``) is gone.
+  - demote (PATCH on a promoted permission) keeps working, with no body
 - DELETE /api/critical-permissions/{tool}/{action}/pending: cancel cooldown
-- Auth enforcement on all endpoints (401 without/wrong token)
-- Rate limiting on promotion attempts (429 after burst)
+- Session enforcement on all endpoints (401 without a valid session cookie)
+- Rate limiting on promotion attempts (429 after burst, per caller)
 - Lazy cooldown resolution (pending -> confirm after 5 min)
 - Adversarial inputs: invalid tool names, immutable denials, unknown pairs
 
 Security notes:
 - All tests use mocked database -- no real DB or API calls.
-- Auth token is a known test value, never a real secret.
+- Callers are logged in with tests.auth_helpers (an Org Admin by default); the
+  session token is a known fake value, never a real secret.
 - Only 4 defined promotable pairs are accepted; all others return 404.
 """
 
@@ -23,16 +30,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
 
 from admino.server import create_app
+from tests.auth_helpers import login, member_session, resolved_session, session_cookie
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"
-_AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+_UNAUTHORIZED = {"detail": "Unauthorized"}
+_PROMOTIONS_UNAVAILABLE = {"detail": "Critical permission promotions are temporarily unavailable."}
 
 _PROMOTABLE_PAIRS: list[tuple[str, str]] = [
     ("gmail", "send"),
@@ -47,28 +54,24 @@ _PROMOTABLE_PAIRS: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> MagicMock:
-    """Build a minimal mock AppConfig."""
+def _make_config() -> MagicMock:
+    """Build a minimal mock AppConfig (no ``auth`` section: GH-149 removed it)."""
     config = MagicMock()
-    config.auth.mode = auth_mode
+    del config.auth
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    if token is not None:
-        config.auth.token = SecretStr(token)
-    else:
-        config.auth.token = None
     return config
 
 
-def _make_app(
-    agent: Any = None, *, auth_mode: str = "token", token: str | None = _TEST_TOKEN
-) -> Any:
-    """Create a FastAPI app with mock agent and config."""
+def _make_app(agent: Any = None, *, anonymous: bool = False) -> Any:
+    """Create a FastAPI app with mock agent and config; log an Org Admin in unless anonymous."""
     if agent is None:
         agent = MagicMock()
-    config = _make_config(auth_mode=auth_mode, token=token)
-    return create_app(agent=agent, config=config)
+    app = create_app(agent=agent, config=_make_config())
+    if not anonymous:
+        login(app, member_session("org_admin"))
+    return app
 
 
 def _mock_get_pool() -> MagicMock:
@@ -104,7 +107,7 @@ class TestGetCriticalPermissions:
         app = _make_app()
         _clear_critical_state()
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+            resp = await c.get("/api/critical-permissions")
 
         assert resp.status_code == 200
         body = resp.json()
@@ -115,7 +118,7 @@ class TestGetCriticalPermissions:
         app = _make_app()
         _clear_critical_state()
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+            resp = await c.get("/api/critical-permissions")
 
         for entry in resp.json()["permissions"]:
             assert entry["state"] == "deny"
@@ -126,7 +129,7 @@ class TestGetCriticalPermissions:
         app = _make_app()
         _clear_critical_state()
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+            resp = await c.get("/api/critical-permissions")
 
         for entry in resp.json()["permissions"]:
             assert "tool" in entry
@@ -139,27 +142,27 @@ class TestGetCriticalPermissions:
         app = _make_app()
         _clear_critical_state()
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+            resp = await c.get("/api/critical-permissions")
 
         pairs = {(e["tool"], e["action"]) for e in resp.json()["permissions"]}
         assert pairs == set(_PROMOTABLE_PAIRS)
 
     async def test_get_critical_permissions_requires_auth(self) -> None:
-        """GET without Authorization header returns 401."""
-        app = _make_app()
+        """GET without a session cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/critical-permissions")
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
-    async def test_get_critical_permissions_wrong_token_returns_401(self) -> None:
-        """GET with incorrect token returns 401."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/critical-permissions",
-                headers={"Authorization": "Bearer wrong-token-value"},
-            )
+    async def test_get_critical_permissions_unknown_session_returns_401(self) -> None:
+        """GET with a cookie that resolves to no session returns 401."""
+        app = _make_app(anonymous=True)
+        with resolved_session(None):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/critical-permissions", headers=session_cookie())
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_get_critical_permissions_shows_pending_promotion(self) -> None:
         """After setting a pending promotion, GET shows pending_at timestamp."""
@@ -172,7 +175,7 @@ class TestGetCriticalPermissions:
 
         try:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/critical-permissions")
 
             entries = resp.json()["permissions"]
             gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
@@ -191,7 +194,7 @@ class TestGetCriticalPermissions:
 
         try:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/critical-permissions")
 
             entries = resp.json()["permissions"]
             gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
@@ -217,7 +220,7 @@ class TestGetCriticalPermissions:
                 async with AsyncClient(
                     transport=ASGITransport(app=app), base_url="http://test"
                 ) as c:
-                    resp = await c.get("/api/critical-permissions", headers=_AUTH_HEADER)
+                    resp = await c.get("/api/critical-permissions")
 
             entries = resp.json()["permissions"]
             gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
@@ -234,12 +237,79 @@ class TestGetCriticalPermissions:
 
 
 class TestPromoteCriticalPermission:
-    """PATCH /api/critical-permissions/{tool}/{action} -- promote (deny -> confirm)."""
+    """PATCH /api/critical-permissions/{tool}/{action} -- promotion is disabled (GH-149).
+
+    Until #161 adds password re-auth, a PATCH on a promotable permission that is
+    not currently promoted answers 403 and starts no cooldown.
+    """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_promote_starts_cooldown_with_valid_token(self) -> None:
-        """PATCH with valid bearer_token returns state='deny' with pending_at set."""
+    @pytest.mark.parametrize(("tool", "action"), _PROMOTABLE_PAIRS)
+    async def test_promote_returns_403_temporarily_unavailable(
+        self, tool: str, action: str
+    ) -> None:
+        """PATCH on a non-promoted promotable permission -> 403 with the fixed message."""
+        app = _make_app()
+        _clear_critical_state()
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(f"/api/critical-permissions/{tool}/{action}")
+
+            assert resp.status_code == 403
+            assert resp.json() == _PROMOTIONS_UNAVAILABLE
+        finally:
+            _clear_critical_state()
+
+    async def test_promote_starts_no_cooldown(self) -> None:
+        """A refused promotion leaves no pending cooldown behind."""
+        from admino import server
+
+        app = _make_app()
+        _clear_critical_state()
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                await c.patch("/api/critical-permissions/gmail/send")
+                listing = await c.get("/api/critical-permissions")
+
+            assert server._pending_promotions == {}
+            assert server._promoted_permissions == set()
+            gmail_send = next(
+                e
+                for e in listing.json()["permissions"]
+                if (e["tool"], e["action"]) == ("gmail", "send")
+            )
+            assert (gmail_send["state"], gmail_send["pending_at"]) == ("deny", None)
+        finally:
+            _clear_critical_state()
+
+    async def test_promote_does_not_touch_the_database(self) -> None:
+        """A refused promotion writes nothing."""
+        app = _make_app()
+        _clear_critical_state()
+        mock_update = AsyncMock()
+
+        try:
+            with (
+                patch("admino.database.get_pool", _mock_get_pool()),
+                patch("admino.database.update_permission", mock_update),
+            ):
+                async with AsyncClient(
+                    transport=ASGITransport(app=app), base_url="http://test"
+                ) as c:
+                    resp = await c.patch("/api/critical-permissions/gmail/send")
+
+            assert resp.status_code == 403
+            mock_update.assert_not_awaited()
+        finally:
+            _clear_critical_state()
+
+    async def test_promote_legacy_bearer_token_body_still_refused(self) -> None:
+        """The removed re-auth body no longer unlocks anything: still 403, no cooldown."""
+        from admino import server
+
         app = _make_app()
         _clear_critical_state()
 
@@ -247,42 +317,49 @@ class TestPromoteCriticalPermission:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/critical-permissions/gmail/send",
-                    headers=_AUTH_HEADER,
-                    json={"bearer_token": _TEST_TOKEN},
+                    json={"bearer_token": "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"},
                 )
 
-            assert resp.status_code == 200
-            body = resp.json()
-            assert body["state"] == "deny"
-            assert body["pending_at"] is not None
+            assert resp.status_code == 403
+            assert resp.json() == _PROMOTIONS_UNAVAILABLE
+            assert server._pending_promotions == {}
         finally:
             _clear_critical_state()
 
-    async def test_promote_requires_bearer_token_in_body(self) -> None:
-        """PATCH without bearer_token in body returns 400."""
+    async def test_promote_already_pending_returns_403_and_keeps_pending(self) -> None:
+        """A cooldown started before GH-149 is not promoted; PATCH is refused and leaves it."""
+        from admino import server
+
         app = _make_app()
+        _clear_critical_state()
+        pending_at = datetime.now(UTC) - timedelta(minutes=1)
+        server._pending_promotions[("gmail", "send")] = pending_at
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch("/api/critical-permissions/gmail/send")
+
+            assert resp.status_code == 403
+            assert resp.json() == _PROMOTIONS_UNAVAILABLE
+            assert server._pending_promotions == {("gmail", "send"): pending_at}
+        finally:
+            _clear_critical_state()
+
+    async def test_promote_requires_auth(self) -> None:
+        """PATCH without a session cookie returns 401 (authentication comes first)."""
+        app = _make_app(anonymous=True)
         _clear_critical_state()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                "/api/critical-permissions/gmail/send",
-                headers=_AUTH_HEADER,
-                json={},
-            )
-        assert resp.status_code in (400, 422)
-
-    async def test_promote_wrong_token_returns_401(self) -> None:
-        """PATCH with incorrect bearer_token in body returns 401."""
-        app = _make_app()
-        _clear_critical_state()
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                "/api/critical-permissions/gmail/send",
-                headers=_AUTH_HEADER,
-                json={"bearer_token": "wrong-token-value"},
-            )
+            resp = await c.patch("/api/critical-permissions/gmail/send")
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+
+    async def test_models_critical_permission_promote_removed(self) -> None:
+        """The bearer_token request model is gone (replaced by password re-auth in #161)."""
+        from admino import models
+
+        assert not hasattr(models, "CriticalPermissionPromote")
 
     async def test_promote_unknown_permission_returns_404(self) -> None:
         """PATCH on non-promotable pair (gmail/delete) returns 404."""
@@ -290,39 +367,11 @@ class TestPromoteCriticalPermission:
         _clear_critical_state()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                "/api/critical-permissions/gmail/delete",
-                headers=_AUTH_HEADER,
-                json={"bearer_token": _TEST_TOKEN},
-            )
+            resp = await c.patch("/api/critical-permissions/gmail/delete")
         assert resp.status_code == 404
 
-    async def test_promote_already_pending_returns_existing_pending(self) -> None:
-        """Second promote on same pair returns the same pending_at timestamp."""
-        app = _make_app()
-        _clear_critical_state()
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp1 = await c.patch(
-                    "/api/critical-permissions/gmail/send",
-                    headers=_AUTH_HEADER,
-                    json={"bearer_token": _TEST_TOKEN},
-                )
-                resp2 = await c.patch(
-                    "/api/critical-permissions/gmail/send",
-                    headers=_AUTH_HEADER,
-                    json={"bearer_token": _TEST_TOKEN},
-                )
-
-            assert resp1.status_code == 200
-            assert resp2.status_code == 200
-            assert resp1.json()["pending_at"] == resp2.json()["pending_at"]
-        finally:
-            _clear_critical_state()
-
     async def test_promote_rate_limited(self) -> None:
-        """6th rapid promotion request returns 429."""
+        """6th rapid promotion request returns 429 (the first five are refused with 403)."""
         app = _make_app()
         _clear_critical_state()
 
@@ -330,14 +379,11 @@ class TestPromoteCriticalPermission:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 statuses = []
                 for _ in range(6):
-                    resp = await c.patch(
-                        "/api/critical-permissions/gmail/send",
-                        headers=_AUTH_HEADER,
-                        json={"bearer_token": _TEST_TOKEN},
-                    )
+                    resp = await c.patch("/api/critical-permissions/gmail/send")
                     statuses.append(resp.status_code)
 
-            # First 5 should succeed, 6th should be rate-limited
+            # First 5 are refused (promotions disabled), 6th is rate-limited
+            assert statuses[0] == 403
             assert 429 in statuses
             assert statuses[-1] == 429
         finally:
@@ -353,6 +399,23 @@ class TestDemoteCriticalPermission:
     """PATCH /api/critical-permissions/{tool}/{action} -- demote (confirm -> deny)."""
 
     pytestmark = pytest.mark.asyncio
+
+    async def test_demote_requires_auth(self) -> None:
+        """Demoting also needs a session: no cookie -> 401 and the promotion stays."""
+        from admino import server
+
+        app = _make_app(anonymous=True)
+        _clear_critical_state()
+        server._promoted_permissions.add(("gmail", "send"))
+
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch("/api/critical-permissions/gmail/send")
+
+            assert resp.status_code == 401
+            assert ("gmail", "send") in server._promoted_permissions
+        finally:
+            _clear_critical_state()
 
     async def test_demote_promoted_permission_immediate(self) -> None:
         """Demoting a promoted permission returns state='deny' immediately."""
@@ -375,7 +438,6 @@ class TestDemoteCriticalPermission:
                 ) as c:
                     resp = await c.patch(
                         "/api/critical-permissions/gmail/send",
-                        headers=_AUTH_HEADER,
                     )
 
             assert resp.status_code == 200
@@ -405,7 +467,6 @@ class TestDemoteCriticalPermission:
                 ) as c:
                     resp = await c.patch(
                         "/api/critical-permissions/gmail/send",
-                        headers=_AUTH_HEADER,
                     )
 
             assert resp.status_code == 200
@@ -415,8 +476,8 @@ class TestDemoteCriticalPermission:
         finally:
             _clear_critical_state()
 
-    async def test_demote_does_not_require_bearer_token(self) -> None:
-        """Demoting a promoted permission succeeds without bearer_token in body."""
+    async def test_demote_needs_no_request_body(self) -> None:
+        """Demoting a promoted permission succeeds with no request body."""
         from admino import server
 
         app = _make_app()
@@ -436,7 +497,6 @@ class TestDemoteCriticalPermission:
                 ) as c:
                     resp = await c.patch(
                         "/api/critical-permissions/outlook/send",
-                        headers=_AUTH_HEADER,
                     )
 
             assert resp.status_code == 200
@@ -467,7 +527,6 @@ class TestCancelPendingPromotion:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.delete(
                     "/api/critical-permissions/gmail/send/pending",
-                    headers=_AUTH_HEADER,
                 )
 
             assert resp.status_code == 200
@@ -484,7 +543,6 @@ class TestCancelPendingPromotion:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete(
                 "/api/critical-permissions/gmail/send/pending",
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 404
 
@@ -496,13 +554,12 @@ class TestCancelPendingPromotion:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete(
                 "/api/critical-permissions/gmail/delete/pending",
-                headers=_AUTH_HEADER,
             )
         assert resp.status_code == 404
 
     async def test_cancel_requires_auth(self) -> None:
-        """DELETE without Authorization header returns 401."""
-        app = _make_app()
+        """DELETE without a session cookie returns 401."""
+        app = _make_app(anonymous=True)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete(
@@ -542,11 +599,7 @@ class TestCriticalPermissionsAdversarial:
         _clear_critical_state()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                f"/api/critical-permissions/{tool}/send",
-                headers=_AUTH_HEADER,
-                json={"bearer_token": _TEST_TOKEN},
-            )
+            resp = await c.patch(f"/api/critical-permissions/{tool}/send")
         # Invalid tool identifiers should be rejected (404 for non-promotable
         # or 422 for validation failure -- either is acceptable)
         assert resp.status_code in (404, 422)
@@ -557,11 +610,7 @@ class TestCriticalPermissionsAdversarial:
         _clear_critical_state()
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                "/api/critical-permissions/gmail/delete",
-                headers=_AUTH_HEADER,
-                json={"bearer_token": _TEST_TOKEN},
-            )
+            resp = await c.patch("/api/critical-permissions/gmail/delete")
         assert resp.status_code == 404
 
 
@@ -614,7 +663,6 @@ class TestPostMessageResolvesPromotions:
                 ) as c:
                     resp = await c.post(
                         "/api/message",
-                        headers=_AUTH_HEADER,
                         json={"message": "hello", "session_id": "sess-1"},
                     )
 
@@ -664,7 +712,6 @@ class TestPostMessageResolvesPromotions:
                 ) as c:
                     resp = await c.post(
                         "/api/message",
-                        headers=_AUTH_HEADER,
                         json={"message": "hello", "session_id": "sess-2"},
                     )
 
@@ -714,7 +761,6 @@ class TestPostMessageResolvesPromotions:
                 ) as c:
                     resp = await c.post(
                         "/api/message",
-                        headers=_AUTH_HEADER,
                         json={"message": "hello", "session_id": "sess-3"},
                     )
 
@@ -972,14 +1018,10 @@ class TestSystemPromptDynamicPermissionGuidance:
 
     async def test_system_prompt_includes_dynamic_permission_guidance(self) -> None:
         """System prompt contains guidance about permissions changing mid-conversation."""
-        import os
-
         from admino.config import AppConfig, LLMConfig
         from admino.main import _build_system_prompt
         from admino.tools.registry import ToolDescription
 
-        # AppConfig requires AUTH_TOKEN >= 48 chars with >= 20 unique chars.
-        fake_token = _TEST_TOKEN
         fake_tool = ToolDescription(
             tool="gmail",
             action="send",
@@ -987,12 +1029,9 @@ class TestSystemPromptDynamicPermissionGuidance:
             parameters_schema={"type": "object", "properties": {}},
         )
 
-        with (
-            patch.dict(os.environ, {"AUTH_TOKEN": fake_token}),
-            patch(
-                "admino.tools.registry.get_registered_tools",
-                return_value=[fake_tool],
-            ),
+        with patch(
+            "admino.tools.registry.get_registered_tools",
+            return_value=[fake_tool],
         ):
             config = AppConfig(
                 llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
@@ -1010,13 +1049,10 @@ class TestSystemPromptDynamicPermissionGuidance:
         requested tool is not available. The existing dynamic-permission
         guidance must remain alongside this new guardrail.
         """
-        import os
-
         from admino.config import AppConfig, LLMConfig
         from admino.main import _build_system_prompt
         from admino.tools.registry import ToolDescription
 
-        fake_token = _TEST_TOKEN
         fake_tool = ToolDescription(
             tool="google_calendar",
             action="read",
@@ -1024,12 +1060,9 @@ class TestSystemPromptDynamicPermissionGuidance:
             parameters_schema={"type": "object", "properties": {}},
         )
 
-        with (
-            patch.dict(os.environ, {"AUTH_TOKEN": fake_token}),
-            patch(
-                "admino.tools.registry.get_registered_tools",
-                return_value=[fake_tool],
-            ),
+        with patch(
+            "admino.tools.registry.get_registered_tools",
+            return_value=[fake_tool],
         ):
             config = AppConfig(
                 llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
@@ -1051,8 +1084,6 @@ class TestSystemPromptDynamicPermissionGuidance:
         (``gmail.delete``) must never appear as available, while an allowed
         sibling (``gmail.read``) must.
         """
-        import os
-
         from pydantic import BaseModel, Field
 
         from admino.config import AppConfig, LLMConfig
@@ -1073,11 +1104,10 @@ class TestSystemPromptDynamicPermissionGuidance:
             permissions = PermissionsConfig(
                 tools={"gmail": ToolPermissions(actions={"read": "allow"})}
             )
-            with patch.dict(os.environ, {"AUTH_TOKEN": _TEST_TOKEN}):
-                config = AppConfig(
-                    llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
-                )
-                prompt = _build_system_prompt(config, permissions)
+            config = AppConfig(
+                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+            )
+            prompt = _build_system_prompt(config, permissions)
         finally:
             clear_registry()
 

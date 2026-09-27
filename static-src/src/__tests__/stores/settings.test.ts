@@ -8,7 +8,10 @@
  * and that a response can never smuggle the API token into the store: only
  * the boolean "token configured" indicator is kept. Issue #144 translates
  * the UI: the save toast copy comes from the i18n catalogs and follows the
- * active locale. The network layer (`@/api/settings`) is mocked; nothing
+ * active locale. Issue #149 replaces the bearer token with a server-side
+ * session cookie: the store keeps no `token` / `needsAuth` state, has no
+ * `setToken` / `skipAuth` actions and never reads the old `admino_auth_token`
+ * localStorage key. The network layer (`@/api/settings`) is mocked; nothing
  * touches `fetch`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -426,5 +429,52 @@ describe('settingsStore save toast follows the locale', () => {
 
     expect(title).not.toBe('Saved');
     expect(Object.values(fr)).toContain(title);
+  });
+});
+
+
+/**
+ * A stand-in localStorage that records every key read. happy-dom's Storage
+ * can't be spied through Storage.prototype, so the global is replaced.
+ */
+function recordingStorage(initial: Record<string, string>): { storage: Storage; reads: string[] } {
+  const data = new Map(Object.entries(initial));
+  const reads: string[] = [];
+  const storage: Storage = {
+    get length() {
+      return data.size;
+    },
+    clear: () => data.clear(),
+    getItem: (key: string) => {
+      reads.push(key);
+      return data.get(key) ?? null;
+    },
+    key: (index: number) => [...data.keys()][index] ?? null,
+    removeItem: (key: string) => {
+      data.delete(key);
+    },
+    setItem: (key: string, value: string) => {
+      data.set(key, String(value));
+    },
+  };
+  return { storage, reads };
+}
+
+// --- No bearer token (issue #149) -----------------------------------------
+
+describe('settingsStore has no bearer token', () => {
+  it.each(['token', 'needsAuth', 'setToken', 'skipAuth'])('exposes no %s', (key) => {
+    expect(key in useSettingsStore()).toBe(false);
+  });
+
+  it('never reads a legacy admino_auth_token left in localStorage', () => {
+    const { storage, reads } = recordingStorage({
+      admino_auth_token: 'legacy-bearer-token-0123456789-abcdef',
+    });
+    vi.stubGlobal('localStorage', storage);
+
+    useSettingsStore();
+
+    expect(reads).not.toContain('admino_auth_token');
   });
 });

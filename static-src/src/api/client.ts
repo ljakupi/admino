@@ -58,14 +58,6 @@ export function formatErrorDetail(body: unknown): string | undefined {
   return undefined;
 }
 
-function getAuthHeader(): Record<string, string> {
-  const token = localStorage.getItem('admino_auth_token');
-  if (token) {
-    return { Authorization: `Bearer ${token}` };
-  }
-  return {};
-}
-
 export async function fetchJson<T>(
   path: string,
   init: RequestInit = {},
@@ -77,10 +69,10 @@ export async function fetchJson<T>(
   try {
     const res = await fetch(path, {
       ...init,
+      credentials: 'same-origin',
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
-        ...getAuthHeader(),
         ...(init.headers as Record<string, string> | undefined),
       },
     });

@@ -8,10 +8,12 @@ Admin platform routes (#167) use them as well as the org routes (#164).
 organization always keeps at least one active Org Admin. #164 and #167 call it
 before demoting, deactivating or deleting a user.
 
-``ensure_default_org`` is the single-tenant bridge (GH-147): startup creates
-one organization with the fixed, well-known ``DEFAULT_ORG_ID``, and every
-``tool.call`` audit event belongs to it until login (#149) passes the
-principal's org.
+``ensure_default_org`` and ``DEFAULT_ORG_ID`` are the retired single-tenant
+bridge (GH-147): tool.call audit events belonged to that fixed organization
+until login. Since #149 they carry the acting member's org, startup no longer
+calls ``ensure_default_org`` and nothing outside this module references
+``DEFAULT_ORG_ID``. Both are left for #154, which removes them together with
+the leftover default organization.
 
 Inputs: an asyncpg connection inside the caller's transaction, plus the org_id
 and user_id of the account being changed (the guard), or the pool (the default
@@ -41,7 +43,7 @@ from uuid import UUID
 if TYPE_CHECKING:
     import asyncpg
 
-# The single-tenant org every tool.call audit event belongs to until #149.
+# The retired single-tenant org (GH-147); unused since #149, removed by #154.
 DEFAULT_ORG_ID: Final[UUID] = UUID("00000000-0000-4000-8000-000000000001")
 
 # Idempotent: a second startup (or a renamed default org) changes nothing. The
@@ -69,10 +71,9 @@ _TARGET_AND_ACTIVE_ADMINS_SQL: Final = """
 async def ensure_default_org(executor: asyncpg.Pool | asyncpg.Connection) -> None:
     """Create the default organization (``DEFAULT_ORG_ID``) unless it exists.
 
-    The single-tenant bridge: ``tool.call`` audit events are org-scoped, and
-    today's requests carry no principal, so they belong to this org until
-    login (#149) passes the principal's org. Runs one parameterized,
-    idempotent statement; safe to call on every startup.
+    The retired single-tenant bridge (GH-147): nothing calls it since #149
+    (tool.call events carry the acting member's org), and #154 removes it.
+    Runs one parameterized, idempotent statement.
 
     Args:
         executor: The pool (or a connection) to write through.

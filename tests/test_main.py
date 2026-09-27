@@ -14,9 +14,14 @@ covering:
 - GH-147: the NDJSON audit logger is gone. main() never reads ``config.paths``
   and wires ``Agent(tool_call_recorder=main._build_tool_call_recorder())``; the
   recorder resolves the pool at call time and awaits
-  ``audit_events.record_tool_call`` with the default org and the session's chat
-  id (``uuid5(_SESSION_CHAT_NAMESPACE, session_id)``); errors propagate.
-  ``_async_startup`` runs ``ensure_default_org(pool)`` after the migrations.
+  ``audit_events.record_tool_call`` with the session's chat id
+  (``uuid5(_SESSION_CHAT_NAMESPACE, session_id)``); errors propagate.
+- GH-149: the default-org bridge is retired. The recorder takes the caller's
+  principal and records its org and user (``TenantContext.from_principal``: a
+  Super Admin raises, so the agent aborts the run). Startup no longer calls
+  ``ensure_default_org`` (an empty database gets no organization), main.py
+  doesn't reference ``DEFAULT_ORG_ID``, and startup loads the bundled
+  common-password list once, so a missing list stops startup.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1193,12 +1199,12 @@ class TestMainInfomaniakWiring:
 
 
 # ---------------------------------------------------------------------------
-# GH-147: default org at startup, tool-call recorder wiring
+# GH-147 / GH-149: startup creates no organization; tool-call recorder wiring
 # ---------------------------------------------------------------------------
 
 
 def _patch_startup_db(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> AsyncMock:
-    """Patch every DB step of _async_startup; record the order of the ones that matter."""
+    """Patch every DB step of _async_startup except accounts; record the order of some."""
     monkeypatch.setenv("PG_PASSWORD", "testpass")
     pool = AsyncMock()
 
@@ -1206,21 +1212,17 @@ def _patch_startup_db(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> Asyn
         assert p is pool
         calls.append("migrations")
 
-    async def track_default_org(p: Any) -> None:
-        assert p is pool
-        calls.append("default_org")
-
     async def track_seed_settings(p: Any, _config: Any) -> None:
         calls.append("seed_settings")
 
     monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=pool))
     monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
     monkeypatch.setattr("admino.database.run_migrations", track_migrations)
-    monkeypatch.setattr("admino.accounts.ensure_default_org", track_default_org, raising=False)
     monkeypatch.setattr("admino.database.seed_settings", track_seed_settings)
     monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
     monkeypatch.setattr("admino.database.update_setting", AsyncMock())
     monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
+    monkeypatch.setattr("admino.database.close_pool", AsyncMock())
     monkeypatch.setattr(
         "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
     )
@@ -1230,38 +1232,111 @@ def _patch_startup_db(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> Asyn
     return pool
 
 
-class TestAsyncStartupDefaultOrg:
-    """GH-147: startup creates the default org that tool.call rows belong to."""
+def _sql_statements(pool: AsyncMock) -> list[str]:
+    """Every SQL string the startup pool (or a connection from it) was given."""
+    statements: list[str] = []
+    for mock in (pool, pool.acquire.return_value.__aenter__.return_value):
+        for name in ("execute", "executemany", "fetch", "fetchrow", "fetchval"):
+            method = getattr(mock, name)
+            statements.extend(str(call.args[0]) for call in method.call_args_list if call.args)
+    return statements
+
+
+class TestAsyncStartupCreatesNoOrganization:
+    """GH-149: the default-org bridge is gone; a fresh install has 0 organizations."""
 
     @pytest.mark.asyncio
-    async def test_ensure_default_org_runs_once_after_migrations(
+    async def test_startup_never_calls_ensure_default_org(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The organizations table exists only after the migrations, so the default
-        org is ensured after run_migrations, exactly once, on the startup pool."""
-        calls: list[str] = []
-        _patch_startup_db(monkeypatch, calls)
+        """accounts.ensure_default_org is not called during startup."""
+        _patch_startup_db(monkeypatch, [])
+        ensure = AsyncMock()
+        monkeypatch.setattr("admino.accounts.ensure_default_org", ensure, raising=False)
 
         await _async_startup(MagicMock(), MagicMock())
 
-        assert calls.count("default_org") == 1
-        assert calls.index("migrations") < calls.index("default_org")
+        ensure.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_default_org_failure_aborts_startup(
+    async def test_startup_on_empty_db_inserts_no_organization(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Without the default org every tool.call write would fail, so a failure to
-        create it stops startup instead of being swallowed."""
-        _patch_startup_db(monkeypatch, [])
-        monkeypatch.setattr(
-            "admino.accounts.ensure_default_org",
-            AsyncMock(side_effect=RuntimeError("db down")),
-            raising=False,
-        )
+        """No statement issued at startup inserts into organizations."""
+        pool = _patch_startup_db(monkeypatch, [])
 
-        with pytest.raises(RuntimeError):
+        await _async_startup(MagicMock(), MagicMock())
+
+        offenders = [
+            sql for sql in _sql_statements(pool) if "insert into organizations" in sql.lower()
+        ]
+        assert offenders == []
+
+    def test_main_module_does_not_reference_the_default_org(self) -> None:
+        """main.py neither imports DEFAULT_ORG_ID nor calls ensure_default_org."""
+        source = _MAIN_MODULE_PATH.read_text(encoding="utf-8")
+
+        assert "DEFAULT_ORG_ID" not in source
+        assert "ensure_default_org" not in source
+
+    def test_main_docstring_drops_default_org_and_auth_token(self) -> None:
+        """The startup description no longer mentions the default organization step or
+        AUTH_TOKEN (the bearer token is gone)."""
+        doc = main_module.__doc__ or ""
+
+        assert "default organization" not in doc.lower()
+        assert "AUTH_TOKEN" not in doc
+
+
+class TestStartupLoadsCommonPasswords:
+    """GH-149: the bundled common-password list is loaded once, at startup."""
+
+    @pytest.mark.asyncio
+    async def test_startup_loads_the_list_once(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """passwords.common_passwords() is called exactly once across the startup
+        (in main() or in _async_startup), before the server starts."""
+        events: list[str] = []
+
+        def fake_common_passwords() -> frozenset[str]:
+            events.append("common_passwords")
+            return frozenset({"qwerty123456"})
+
+        monkeypatch.setattr("admino.passwords.common_passwords", fake_common_passwords)
+        mock_deps["uvicorn_run"].side_effect = lambda *_a, **_k: events.append("uvicorn")
+        _patch_startup_db(monkeypatch, [])
+
+        await _async_startup(MagicMock(), MagicMock())
+        main()
+
+        assert events.count("common_passwords") == 1
+        assert events.index("common_passwords") < events.index("uvicorn")
+
+    @pytest.mark.asyncio
+    async def test_missing_list_stops_startup(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing or unreadable list fails startup instead of silently disabling the
+        check: the server never starts."""
+        monkeypatch.setattr(
+            "admino.passwords.common_passwords",
+            MagicMock(side_effect=OSError("common_passwords.txt missing")),
+        )
+        _patch_startup_db(monkeypatch, [])
+
+        failed = False
+        try:
             await _async_startup(MagicMock(), MagicMock())
+        except OSError:
+            failed = True
+        if not failed:
+            with pytest.raises((SystemExit, OSError)) as exc_info:
+                main()
+            if isinstance(exc_info.value, SystemExit):
+                assert exc_info.value.code == 1
+
+        mock_deps["uvicorn_run"].assert_not_called()
 
 
 class TestSessionChatId:
@@ -1288,34 +1363,53 @@ class TestSessionChatId:
         assert isinstance(main_module._SESSION_CHAT_NAMESPACE, uuid.UUID)
 
 
+_RECORDER_USER = uuid.UUID("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d")
+_RECORDER_ORG = uuid.UUID("1f2e3d4c-5b6a-4978-9a8b-7c6d5e4f3a2b")
+
+
+def _member_principal() -> Any:
+    """An editor of _RECORDER_ORG."""
+    from admino.access import Principal
+
+    return Principal(user_id=_RECORDER_USER, kind="member", org_id=_RECORDER_ORG, role="editor")
+
+
+def _recorder_kwargs(**overrides: Any) -> dict[str, Any]:
+    """The seven keywords the agent passes to the recorder."""
+    kwargs: dict[str, Any] = {
+        "principal": _member_principal(),
+        "session_id": "s-abc",
+        "tool": "memory",
+        "action": "read",
+        "decision": "allow",
+        "success": True,
+        "duration_ms": 12,
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
 class TestBuildToolCallRecorder:
-    """GH-147: the recorder main() injects into the Agent."""
+    """GH-147/GH-149: the recorder main() injects into the Agent."""
 
     @pytest.mark.asyncio
-    async def test_records_through_audit_events_with_default_org_and_chat(
+    async def test_records_the_principals_org_and_user_on_the_chat(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """One call → one record_tool_call on the runtime pool, default org, chat target."""
-        from admino.accounts import DEFAULT_ORG_ID
-
+        """One call → one record_tool_call on the runtime pool, with the member's org and
+        user id and the session's chat."""
         pool = MagicMock(name="runtime-pool")
         record = AsyncMock()
         monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=pool))
         monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
 
         recorder = main_module._build_tool_call_recorder()
-        await recorder(
-            session_id="s-abc",
-            tool="memory",
-            action="read",
-            decision="allow",
-            success=True,
-            duration_ms=12,
-        )
+        await recorder(**_recorder_kwargs())
 
         record.assert_awaited_once_with(
             pool,
-            org_id=DEFAULT_ORG_ID,
+            org_id=_RECORDER_ORG,
+            actor_user_id=_RECORDER_USER,
             chat_id=main_module._session_chat_id("s-abc"),
             tool="memory",
             action="read",
@@ -1323,6 +1417,44 @@ class TestBuildToolCallRecorder:
             success=True,
             duration_ms=12,
         )
+
+    @pytest.mark.asyncio
+    async def test_super_admin_principal_raises_and_records_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A Super Admin has no org (no TenantContext): the recorder raises, so the agent
+        aborts the run, and nothing is recorded."""
+        from admino.access import Principal
+        from admino.tenancy import NoTenantContextError
+
+        record = AsyncMock()
+        monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
+
+        recorder = main_module._build_tool_call_recorder()
+        with pytest.raises(NoTenantContextError):
+            await recorder(
+                **_recorder_kwargs(principal=Principal(user_id=_RECORDER_USER, kind="super_admin"))
+            )
+
+        record.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_never_records_into_the_default_org(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bridge is retired: the default org id is never passed."""
+        from admino.accounts import DEFAULT_ORG_ID
+
+        record = AsyncMock()
+        monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
+
+        recorder = main_module._build_tool_call_recorder()
+        await recorder(**_recorder_kwargs())
+
+        assert record.await_args is not None
+        assert DEFAULT_ORG_ID not in record.await_args.kwargs.values()
 
     @pytest.mark.asyncio
     async def test_resolves_the_pool_at_call_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1335,14 +1467,7 @@ class TestBuildToolCallRecorder:
 
         get_pool.assert_not_called()
         with pytest.raises(RuntimeError):
-            await recorder(
-                session_id="s-abc",
-                tool="memory",
-                action="read",
-                decision="allow",
-                success=True,
-                duration_ms=1,
-            )
+            await recorder(**_recorder_kwargs(duration_ms=1))
 
     @pytest.mark.asyncio
     async def test_record_errors_propagate(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1358,14 +1483,7 @@ class TestBuildToolCallRecorder:
 
         recorder = main_module._build_tool_call_recorder()
         with pytest.raises(AuditRecordError):
-            await recorder(
-                session_id="s-abc",
-                tool="memory",
-                action="read",
-                decision="deny",
-                success=False,
-                duration_ms=0,
-            )
+            await recorder(**_recorder_kwargs(decision="deny", success=False, duration_ms=0))
 
 
 class TestNoAuditLogFile:

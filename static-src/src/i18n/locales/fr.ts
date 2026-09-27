@@ -64,8 +64,6 @@ export const fr: Record<MessageKey, Message> = {
   // --- toast (critical permissions store) ---------------------------------
   'toast.criticalPermissions.promotionScheduled.title': 'Activation planifiée',
   'toast.criticalPermissions.promotionScheduled.body': 'Actif dans {time}',
-  'toast.criticalPermissions.authFailed.title': "Échec de l'authentification",
-  'toast.criticalPermissions.authFailed.body': 'Le jeton saisi est invalide.',
   'toast.criticalPermissions.promotionFailed.title': "Échec de l'activation",
   'toast.criticalPermissions.cancelled.title': 'Activation planifiée annulée',
   'toast.criticalPermissions.cancelFailed.title': "Échec de l'annulation",
@@ -230,28 +228,6 @@ export const fr: Record<MessageKey, Message> = {
     other: '{n} refusées',
   },
 
-  // --- auth (access-token dialog) ----------------------------------------
-  'auth.welcome': 'Bienvenue',
-  'auth.intro':
-    "Saisissez votre jeton d'accès pour vous connecter, ou passez cette étape si vous êtes sur un réseau privé.",
-  'auth.tokenLabel': "Jeton d'accès",
-  'auth.tokenPlaceholder': 'Collez votre jeton',
-  'auth.skip': 'Passer',
-  'auth.connect': 'Se connecter',
-  'auth.error.tokenRequired': 'Le jeton est requis',
-  'auth.error.tokenFormat': 'Le jeton doit comporter de 8 à 512 caractères ASCII imprimables',
-  'auth.error.invalidToken': 'Jeton non valide. Vérifiez-le et réessayez.',
-  'auth.error.tokenRequiredByServer': 'Ce serveur exige un jeton. Impossible de passer cette étape.',
-
-  // --- reauth (re-authentication dialog for critical permissions) --------
-  'reauth.title': 'Réauthentifiez-vous pour activer',
-  'reauth.body':
-    "Vous autorisez admino à proposer {action} sur {tool}. Saisissez votre jeton d'authentification pour confirmer. La modification prendra effet après un délai de 5 minutes que vous pouvez annuler.",
-  'reauth.tokenLabel': "Jeton d'authentification",
-  'reauth.tokenPlaceholder': 'Saisissez à nouveau votre jeton bearer',
-  'reauth.tokenHint': 'Jamais journalisé. Vérifié par rapport à votre session active.',
-  'reauth.submit': 'Activer et lancer le délai',
-
   // --- toolsPage (connected accounts, local tools, OAuth callback) -------
   'toolsPage.accounts.title': 'Comptes connectés',
   'toolsPage.accounts.subtitle':
@@ -293,9 +269,6 @@ export const fr: Record<MessageKey, Message> = {
   'settings.nav.about': 'À propos',
   'settings.nav.danger': 'Zone de danger',
   'settings.session.subtitle': 'Identifie ce fil de conversation sur le serveur admino.',
-  'settings.session.token.label': 'Jeton bearer',
-  'settings.session.token.hint': 'Requis uniquement lorsque le serveur fonctionne avec {config}.',
-  'settings.session.token.placeholder': 'Saisissez le jeton bearer',
   'settings.session.id.label': 'ID de session',
   'settings.session.id.hint': 'Lettres, chiffres, tirets, traits de soulignement. 64 caractères max.',
   'settings.session.new.label': 'Nouvelle session',
@@ -369,7 +342,6 @@ export const fr: Record<MessageKey, Message> = {
   'settings.danger.clearConfirm.subtext':
     "Tous les messages et l'historique des appels d'outils de la session actuelle seront supprimés.",
   'settings.danger.clearConfirm.confirm': 'Effacer',
-  'settings.toast.tokenSaved': 'Jeton enregistré',
   'settings.toast.chatCleared': 'Discussion effacée',
   'settings.toast.newSession': 'Nouvelle session démarrée',
   'settings.comingSoon.title': 'Bientôt disponible',

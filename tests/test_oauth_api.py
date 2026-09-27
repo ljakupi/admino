@@ -8,10 +8,15 @@ Covers:
 - GET /api/oauth/callback: exchanges code for tokens, redirects on success/failure
 - GET /api/oauth/google/status: returns connection status
 - DELETE /api/oauth/google: disconnects Google OAuth
+- GH-149: every OAuth route but the callback needs a session (401 without a
+  valid ``admino_session`` cookie). The callback stays public: it is the
+  provider's cross-site redirect (SameSite=Strict cookies are not sent on it)
+  and is protected by the OAuth state token, so its tests run with no session.
 
 Security notes:
 - All tests use mocked OAuth functions — no real Google API calls.
-- Auth token is a known test value, never a real secret.
+- Callers are logged in with tests.auth_helpers (an Org Admin by default); the
+  session token is a known fake value, never a real secret.
 - CSRF state validation tested for invalid/expired/missing cases.
 """
 
@@ -23,17 +28,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
 
 from admino.oauth import OAuthError
 from admino.server import create_app
+from tests.auth_helpers import login, member_session, resolved_session, session_cookie
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"  # >48 chars, >20 unique
-_AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+_UNAUTHORIZED = {"detail": "Unauthorized"}
 
 
 # ---------------------------------------------------------------------------
@@ -41,38 +45,63 @@ _AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
 # ---------------------------------------------------------------------------
 
 
-def _make_config(
-    *,
-    auth_mode: str = "token",
-    token: str | None = _TEST_TOKEN,
-) -> MagicMock:
+def _make_config() -> MagicMock:
     """Build a minimal mock AppConfig.
 
     GH-86: tokens live in PostgreSQL, so there is no ``paths.tokens_dir``.
+    GH-149: there is no ``auth`` section either.
     """
     config = MagicMock()
-    config.auth.mode = auth_mode
+    del config.auth
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    if token is not None:
-        config.auth.token = SecretStr(token)
-    else:
-        config.auth.token = None
     return config
 
 
-def _make_app(
-    agent: Any = None,
-    *,
-    auth_mode: str = "token",
-    token: str | None = _TEST_TOKEN,
-) -> Any:
-    """Create a FastAPI app with mock agent and config."""
+def _make_app(agent: Any = None, *, anonymous: bool = False) -> Any:
+    """Create a FastAPI app with mock agent and config; log an Org Admin in unless anonymous."""
     if agent is None:
         agent = MagicMock()
-    config = _make_config(auth_mode=auth_mode, token=token)
-    return create_app(agent=agent, config=config)
+    app = create_app(agent=agent, config=_make_config())
+    if not anonymous:
+        login(app, member_session("org_admin"))
+    return app
+
+
+# ---------------------------------------------------------------------------
+# GH-149: session required on every OAuth route except the callback
+# ---------------------------------------------------------------------------
+
+_SESSION_OAUTH_ROUTES: list[tuple[str, str]] = [
+    ("GET", "/api/oauth/google/authorize"),
+    ("GET", "/api/oauth/microsoft/authorize"),
+    ("GET", "/api/oauth/google/status"),
+    ("GET", "/api/oauth/microsoft/status"),
+    ("DELETE", "/api/oauth/google"),
+    ("DELETE", "/api/oauth/microsoft"),
+]
+
+
+class TestOAuthSessionRequired:
+    """A cookie that resolves to no session (unknown, revoked, expired) gets a 401."""
+
+    pytestmark = pytest.mark.asyncio
+
+    @pytest.mark.parametrize(("method", "path"), _SESSION_OAUTH_ROUTES)
+    async def test_oauth_route_unknown_session_returns_401(self, method: str, path: str) -> None:
+        app = _make_app(anonymous=True)
+        mock_revoke = AsyncMock(return_value=True)
+        with (
+            resolved_session(None),
+            patch("admino.server.revoke_and_delete_token", mock_revoke),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.request(method, path, headers=session_cookie())
+
+        assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+        mock_revoke.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +125,7 @@ class TestOAuthAuthorize:
             return_value=(fake_url, fake_state),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/google/authorize", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/google/authorize")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -104,12 +133,13 @@ class TestOAuthAuthorize:
         assert data["url"] == fake_url
 
     async def test_oauth_authorize_requires_auth(self) -> None:
-        """Returns 401 when no Authorization header is provided."""
-        app = _make_app()
+        """Returns 401 when no session cookie is sent."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/google/authorize")
 
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_oauth_authorize_missing_env_vars(self) -> None:
         """Returns 500 when build_google_consent_url raises OAuthError."""
@@ -119,7 +149,7 @@ class TestOAuthAuthorize:
             side_effect=OAuthError("GOOGLE_CLIENT_ID environment variable is not set."),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/google/authorize", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/google/authorize")
 
         assert resp.status_code == 500
 
@@ -138,7 +168,7 @@ class TestOAuthCallback:
         """Valid code+state exchanges tokens, saves, and redirects to settings."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         # Pre-populate CSRF state.
         state_token = "valid-state-token"
@@ -179,7 +209,7 @@ class TestOAuthCallback:
 
     async def test_oauth_callback_invalid_state_redirects_error(self) -> None:
         """Unknown state token redirects to settings with error."""
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -200,7 +230,7 @@ class TestOAuthCallback:
         """State older than 10 minutes redirects to settings with error."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         # Insert state that expired 11 minutes ago.
         state_token = "expired-state"
@@ -229,7 +259,7 @@ class TestOAuthCallback:
         """Missing code parameter redirects to settings with error."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         state_token = "valid-state-no-code"
         srv._oauth_pending_states[state_token] = (
@@ -257,7 +287,7 @@ class TestOAuthCallback:
         """OAuthError during code exchange redirects to settings with error."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         state_token = "valid-state-exchange-fail"
         srv._oauth_pending_states[state_token] = (
@@ -311,7 +341,7 @@ class TestOAuthCallback:
         """Auth codes with !, *, ~, and , characters must be accepted (GH-63)."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         state_token = f"state-for-test-{id(code)}"
         srv._oauth_pending_states[state_token] = (
@@ -372,7 +402,7 @@ class TestOAuthCallback:
     )
     async def test_oauth_callback_rejects_malicious_codes(self, code: str) -> None:
         """Codes with dangerous characters must be rejected by validation."""
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -406,7 +436,7 @@ class TestOAuthStatus:
             patch("admino.server.get_connection_status", new=AsyncMock(return_value=(True, True))),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/google/status")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -426,7 +456,7 @@ class TestOAuthStatus:
             ),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/google/status", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/google/status")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -434,12 +464,13 @@ class TestOAuthStatus:
         assert data["services"] == []
 
     async def test_oauth_status_requires_auth(self) -> None:
-        """Returns 401 when no Authorization header is provided."""
-        app = _make_app()
+        """Returns 401 when no session cookie is sent."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/google/status")
 
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +498,7 @@ class TestOAuthDisconnect:
             patch("admino.server._clear_gdrive_cache", mock_gdrive),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
+                resp = await c.delete("/api/oauth/google")
 
         assert resp.status_code == 200
         mock_gmail.assert_awaited_once()
@@ -483,17 +514,18 @@ class TestOAuthDisconnect:
             patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
+                resp = await c.delete("/api/oauth/google")
 
         assert resp.status_code == 404
 
     async def test_oauth_disconnect_requires_auth(self) -> None:
-        """Returns 401 when no Authorization header is provided."""
-        app = _make_app()
+        """Returns 401 when no session cookie is sent."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete("/api/oauth/google")
 
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_oauth_disconnect_oauth_error(self) -> None:
         """Returns 500 when revoke_and_delete_token raises OAuthError."""
@@ -504,7 +536,7 @@ class TestOAuthDisconnect:
             patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete("/api/oauth/google", headers=_AUTH_HEADER)
+                resp = await c.delete("/api/oauth/google")
 
         assert resp.status_code == 500
 
@@ -534,7 +566,7 @@ class TestMicrosoftOAuthDisconnect:
             patch("admino.server._clear_onedrive_cache", mock_onedrive),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
+                resp = await c.delete("/api/oauth/microsoft")
 
         assert resp.status_code == 200
         assert resp.json() == {"status": "disconnected"}
@@ -551,17 +583,18 @@ class TestMicrosoftOAuthDisconnect:
             patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
+                resp = await c.delete("/api/oauth/microsoft")
 
         assert resp.status_code == 404
 
     async def test_microsoft_disconnect_requires_auth(self) -> None:
-        """Returns 401 when no Authorization header is provided."""
-        app = _make_app()
+        """Returns 401 when no session cookie is sent."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.delete("/api/oauth/microsoft")
 
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_microsoft_disconnect_oauth_error(self) -> None:
         """Returns 500 when revoke_and_delete_token raises OAuthError."""
@@ -572,7 +605,7 @@ class TestMicrosoftOAuthDisconnect:
             patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete("/api/oauth/microsoft", headers=_AUTH_HEADER)
+                resp = await c.delete("/api/oauth/microsoft")
 
         assert resp.status_code == 500
 
@@ -598,7 +631,7 @@ class TestMicrosoftOAuthAuthorize:
             return_value=(fake_url, fake_state),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/microsoft/authorize", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/microsoft/authorize")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -606,12 +639,13 @@ class TestMicrosoftOAuthAuthorize:
         assert data["url"] == fake_url
 
     async def test_microsoft_authorize_requires_auth(self) -> None:
-        """Returns 401 when no Authorization header is provided."""
-        app = _make_app()
+        """Returns 401 when no session cookie is sent."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/microsoft/authorize")
 
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
     async def test_microsoft_authorize_missing_env_vars(self) -> None:
         """Returns 500 when build_microsoft_consent_url raises OAuthError."""
@@ -621,7 +655,7 @@ class TestMicrosoftOAuthAuthorize:
             side_effect=OAuthError("MICROSOFT_CLIENT_ID environment variable is not set."),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/microsoft/authorize", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/microsoft/authorize")
 
         assert resp.status_code == 500
 
@@ -645,7 +679,7 @@ class TestMicrosoftOAuthStatus:
             patch("admino.server.get_connection_status", new=AsyncMock(return_value=(True, True))),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/microsoft/status")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -665,7 +699,7 @@ class TestMicrosoftOAuthStatus:
             ),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/microsoft/status", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/microsoft/status")
 
         assert resp.status_code == 200
         data = resp.json()
@@ -673,12 +707,13 @@ class TestMicrosoftOAuthStatus:
         assert data["services"] == []
 
     async def test_microsoft_status_requires_auth(self) -> None:
-        """Returns 401 when no Authorization header is provided."""
-        app = _make_app()
+        """Returns 401 when no session cookie is sent."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/oauth/microsoft/status")
 
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
 
 # ---------------------------------------------------------------------------
@@ -695,7 +730,7 @@ class TestMicrosoftOAuthCallback:
         """Valid code+state for Microsoft exchanges tokens and redirects to settings."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         state_token = "valid-ms-state"
         srv._oauth_pending_states[state_token] = (
@@ -733,7 +768,7 @@ class TestMicrosoftOAuthCallback:
         """OAuthError during Microsoft code exchange redirects with error."""
         import admino.server as srv
 
-        app = _make_app()
+        app = _make_app(anonymous=True)
 
         state_token = "valid-ms-state-fail"
         srv._oauth_pending_states[state_token] = (
@@ -793,7 +828,7 @@ class TestOAuthStateCapacityCap:
             return_value=(fake_url, "new-state"),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/oauth/google/authorize", headers=_AUTH_HEADER)
+                resp = await c.get("/api/oauth/google/authorize")
 
         assert resp.status_code == 200
         # The oldest entry (state-0) should have been evicted.
