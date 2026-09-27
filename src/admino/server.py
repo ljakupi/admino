@@ -2027,8 +2027,9 @@ async def _request_validation_error_handler(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Manage application lifespan — init DB pool and the audit retention job on
-    startup; stop the job, then close the pool, on shutdown.
+    """Manage application lifespan — init DB pool, the audit retention job and,
+    when SMTP is configured, the email outbox sender on startup; stop both
+    background tasks, then close the pool, on shutdown.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -2039,6 +2040,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     from admino.audit_events import run_retention_job
     from admino.database import close_pool, get_pool, init_pool
+    from admino.email_outbox import run_outbox_sender
+    from admino.mailer import load_smtp_config
 
     password = os.environ.get("PG_PASSWORD", "")
     host = os.environ.get("PG_HOST", "localhost")
@@ -2052,6 +2055,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # GH-146: the daily audit retention purge runs while the app is up. The
     # task stays referenced here and is cancelled before the pool closes.
     retention_task = asyncio.create_task(run_retention_job(get_pool()))
+
+    # GH-148: the outbox sender delivers queued transactional email while the
+    # app is up. Without SMTP config (load_smtp_config logs which variables are
+    # missing) nothing starts and mail stays queued. Cancelled before the pool
+    # closes, like the retention task.
+    smtp_config = load_smtp_config()
+    sender_task = (
+        asyncio.create_task(run_outbox_sender(get_pool(), smtp_config))
+        if smtp_config is not None
+        else None
+    )
 
     # Defense-in-depth (GH-80): the Agent is already seeded with the persisted
     # tools-enabled state at construction (main._async_startup). This reload on
@@ -2101,6 +2115,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     retention_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await retention_task
+    if sender_task is not None:
+        sender_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sender_task
     await close_pool()
 
 

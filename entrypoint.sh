@@ -34,6 +34,8 @@
 #                                     admino-internal (172.20.0.0/16) where postgres and
 #                                     the vllm service live)
 #          REQUIRE_EGRESS_WHITELIST  (default: true — set to "false" only for local dev without Docker)
+#          SMTP_HOST, SMTP_PORT      (optional — the transactional email server; when both are set,
+#                                     exactly SMTP_HOST:SMTP_PORT is opened, see apply_smtp_egress)
 # Outputs: Runs "$@" (the CMD) after rules are applied.
 
 set -euo pipefail
@@ -121,6 +123,51 @@ apply_ip6tables_lockdown() {
     # path.)
     ip6tables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     echo "[entrypoint] IPv6 egress locked down."
+}
+
+# Allow egress to exactly the configured SMTP server (GH-148): one host, one
+# port, TCP only. The rule is derived from SMTP_HOST / SMTP_PORT, the same env
+# vars the app's mailer reads (admino.mailer.SmtpConfig), so the firewall and
+# the app can't disagree on where mail goes. The checks mirror SmtpConfig:
+#   - SMTP_HOST must be a dotted hostname (same pattern as the 443 whitelist,
+#     without the wildcard). Bash's =~ anchors ^/$ to the whole value, so an
+#     embedded newline can't smuggle a second line past the check.
+#   - SMTP_PORT must be 465 (implicit TLS) or 587 (STARTTLS); SMTP without TLS
+#     (25) is never opened.
+# Unset host or port: no rule. The app then logs which variables are missing
+# and keeps mail queued. A malformed value or an unresolvable host aborts, as
+# for the 443 whitelist, so the container never runs with unintended egress.
+apply_smtp_egress() {
+    local smtp_host="${SMTP_HOST:-}"
+    local smtp_port="${SMTP_PORT:-}"
+    if [ -z "${smtp_host}" ] || [ -z "${smtp_port}" ]; then
+        echo "[entrypoint] SMTP_HOST/SMTP_PORT not set — no SMTP egress rule (email stays queued)."
+        return 0
+    fi
+    if [ "${#smtp_host}" -gt 253 ] \
+        || ! [[ "${smtp_host}" =~ ^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,}$ ]]; then
+        echo "[entrypoint] ERROR: Unsafe or malformed SMTP_HOST — aborting." >&2
+        exit 1
+    fi
+    case "${smtp_port}" in
+        465|587) ;;
+        *)
+            echo "[entrypoint] ERROR: SMTP_PORT must be 465 (implicit TLS) or 587 (STARTTLS) — aborting." >&2
+            exit 1
+            ;;
+    esac
+    echo "[entrypoint] Whitelisting SMTP egress to: ${smtp_host} (port ${smtp_port})"
+    # IPv4 only, resolved once at startup (see the 443 whitelist notes above).
+    local resolved
+    resolved=$(getent ahostsv4 "${smtp_host}" 2>/dev/null | awk '{print $1}' | sort -u || true)
+    if [ -z "${resolved}" ]; then
+        echo "[entrypoint] ERROR: Could not resolve SMTP_HOST '${smtp_host}' — aborting to prevent misconfigured egress." >&2
+        exit 1
+    fi
+    local ip
+    for ip in ${resolved}; do
+        iptables -A OUTPUT -d "${ip}" -p tcp --dport "${smtp_port}" -j ACCEPT
+    done
 }
 
 apply_iptables() {
@@ -229,6 +276,9 @@ apply_iptables() {
             fi
         done
     fi
+
+    # Transactional email: exactly SMTP_HOST:SMTP_PORT, when configured.
+    apply_smtp_egress
 
     # Defense-in-depth: block all IPv6 egress now that the IPv4 whitelist is in
     # place (only reached when NET_ADMIN is present and iptables succeeded).

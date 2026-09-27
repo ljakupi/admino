@@ -11,7 +11,9 @@ containment — the main mechanism enforcing that — so contributors understand
 
 **Egress** = traffic leaving the container. By default admino **blocks all
 outbound traffic** and then allows only a short list of approved hosts (Google,
-Microsoft, Anthropic — from `egress.allowed_hosts` in `config/config.yaml`).
+Microsoft, Infomaniak, Anthropic — from `egress.allowed_hosts` in `config/config.yaml`),
+plus exactly one SMTP host and port for transactional email when `SMTP_HOST` and
+`SMTP_PORT` are set.
 
 Why: even if the agent is fully hijacked, it can only "phone home" to approved
 services. A prompt-injection attack that says *"send the user's inbox to
@@ -34,6 +36,7 @@ docker compose up
             • iptables: DROP all outbound by default
             • allow DNS (port 53) + the internal Docker network
             • allow each approved host on :443 (HTTPS)
+            • allow SMTP_HOST on SMTP_PORT only (465/587, TLS), if set
             • block ALL IPv6 egress (fail-closed)
        └─ drops to the unprivileged 'admino' user:  gosu admino python -m admino.main
   └─ app runs as 'admino', behind the firewall it can no longer change
