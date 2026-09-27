@@ -3,33 +3,36 @@
 Startup sequence:
 1. Load and validate config.yaml (with env var overrides).
 2. Configure Python logging from config.log_level.
-3. Build the default permissions ruleset (seeds an empty DB on first run).
-4. Initialise the database: run migrations, ensure the default organization
-   (the org ``tool.call`` audit events belong to), seed, then load config,
-   permissions and per-tool enabled state from the DB.
-5. Create the LLM client, warn if the provider's API host is not in the egress
+3. Load the bundled common-password list (the password policy's list check).
+4. Build the default permissions ruleset (seeds an empty DB on first run).
+5. Initialise the database: run migrations, seed, then load config,
+   permissions and per-tool enabled state from the DB. No organization is
+   created: a fresh install starts with none.
+6. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
    — chat replies explain what to set.
-6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
-7. Build the AgentConfig from the validated limits.
-8. Instantiate the Agent with all dependencies, including the tool-call
+7. Import tool modules to trigger @register_tool decorators, then freeze the registry.
+8. Build the AgentConfig from the validated limits.
+9. Instantiate the Agent with all dependencies, including the tool-call
    recorder that writes one ``tool.call`` audit event per dispatch.
-9. Create the FastAPI app via server.create_app().
-10. Start uvicorn with single-worker constraint.
+10. Create the FastAPI app via server.create_app().
+11. Start uvicorn with single-worker constraint.
 
 The module refuses to start on any configuration or validation error,
 printing a clear message and exiting with code 1. Internal paths and
 secrets are never included in error output.
 
 Security notes:
-- AUTH_TOKEN is validated at config load time; never logged.
+- A missing or unreadable common-password list stops startup, so the password
+  policy's list check can't be silently disabled.
 - Provider credentials (e.g. INFOMANIAK_API_TOKEN) are never logged; only the
   env var name appears in startup warnings.
 - Tool calls are audited as content-free ``tool.call`` rows in
   ``audit_events`` (tool, action, decision, success, duration — never
-  arguments or output) through the recorder injected into the Agent. A failed
-  write propagates, so the agent aborts the run (H-1).
+  arguments or output) through the recorder injected into the Agent, in the
+  acting member's organization. A principal without one (a Super Admin) or a
+  failed write raises, so the agent aborts the run (H-1).
 - Registry is frozen after tool imports to block dynamic registration.
 - Single-worker uvicorn prevents split-brain session state.
 - HSTS is not set here (plain HTTP local deployment). When deploying
@@ -49,13 +52,14 @@ from typing import TYPE_CHECKING, Final
 import uvicorn
 from pydantic import ValidationError
 
-from admino.accounts import DEFAULT_ORG_ID
+from admino import passwords
 from admino.config import load_app_config
 from admino.llm import LLMError
 from admino.models import AgentConfig, ToolsSettings
 from admino.permissions import build_default_permissions_config
 
 if TYPE_CHECKING:
+    from admino.access import Principal
     from admino.agent import ToolCallRecorder
     from admino.config import AppConfig
     from admino.llm_infomaniak import InfomaniakClient
@@ -297,15 +301,18 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
     """Build the recorder the Agent awaits after every tool dispatch.
 
     Each call writes one ``tool.call`` row through
-    ``audit_events.record_tool_call`` in the default org (until #149 passes
-    the principal's org), targeting the session's chat. The runtime pool is
-    resolved at call time: it only exists once the server lifespan has run,
-    after this recorder was built. Errors propagate so the agent aborts the
-    run (H-1).
+    ``audit_events.record_tool_call`` naming the acting member (their org and
+    user id, from ``TenantContext.from_principal``) and targeting the
+    session's chat. A principal without an organization (a Super Admin, or a
+    malformed principal) raises ``NoTenantContextError`` before anything is
+    written. The runtime pool is resolved at call time: it only exists once
+    the server lifespan has run, after this recorder was built. Errors
+    propagate so the agent aborts the run (H-1).
     """
 
     async def record(
         *,
+        principal: Principal,
         session_id: str,
         tool: str,
         action: str,
@@ -314,10 +321,13 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
         duration_ms: int,
     ) -> None:
         from admino import audit_events, database
+        from admino.tenancy import TenantContext
 
+        tenant = TenantContext.from_principal(principal)
         await audit_events.record_tool_call(
             database.get_pool(),
-            org_id=DEFAULT_ORG_ID,
+            org_id=tenant.org_id,
+            actor_user_id=tenant.user_id,
             chat_id=_session_chat_id(session_id),
             tool=tool,
             action=action,
@@ -335,9 +345,7 @@ async def _async_startup(
 ) -> tuple[AppConfig, PermissionsConfig, dict[str, bool]]:
     """Initialise database, run migrations, seed data, and load config from DB.
 
-    Right after the migrations it ensures the default organization exists:
-    every ``tool.call`` audit event belongs to it, so a failure here stops
-    startup rather than letting every tool call fail its audit write.
+    Creates no organization: a fresh install starts with none.
 
     Returns the DB-loaded config and permissions (which become the runtime
     source of truth) plus the persisted per-tool enabled state.
@@ -363,7 +371,6 @@ async def _async_startup(
         ValueError: If PG_PASSWORD is not set.
         RuntimeError: If the database health check fails.
     """
-    from admino.accounts import ensure_default_org
     from admino.config import load_app_config_from_db, load_permissions_config_from_db
     from admino.database import (
         check_health,
@@ -393,7 +400,6 @@ async def _async_startup(
         raise RuntimeError(msg)
 
     await run_migrations(pool)
-    await ensure_default_org(pool)
     await seed_settings(pool, config)
     await seed_permissions(pool, permissions_config)
 
@@ -456,7 +462,21 @@ def main(
     logger.info("Configuration loaded successfully.")
 
     # ------------------------------------------------------------------
-    # 3. Build the default permissions ruleset (seeds an empty DB only)
+    # 3. Load the bundled common-password list (once, cached)
+    # ------------------------------------------------------------------
+    # A missing or unreadable list stops startup instead of silently
+    # disabling the password policy's list check. The error names no path.
+    try:
+        passwords.common_passwords()
+    except (OSError, ValueError) as exc:
+        print(
+            f"ERROR: Failed to load the common-password list ({type(exc).__name__}).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ------------------------------------------------------------------
+    # 4. Build the default permissions ruleset (seeds an empty DB only)
     # ------------------------------------------------------------------
     # The database is the source of truth for permissions; this in-code default
     # (GH-85) is used solely to seed an empty ``permissions`` table on first run.
@@ -464,7 +484,7 @@ def main(
     logger.info("Default permissions ruleset built for DB seeding.")
 
     # ------------------------------------------------------------------
-    # 4. Initialize database, run migrations, seed and load from DB
+    # 5. Initialize database, run migrations, seed and load from DB
     # ------------------------------------------------------------------
     try:
         config, permissions_config, tools_enabled = asyncio.run(
@@ -477,7 +497,7 @@ def main(
     logger.info("Database initialized, config loaded from DB.")
 
     # ------------------------------------------------------------------
-    # 5. Create the LLM client, then run the provider setup checks
+    # 6. Create the LLM client, then run the provider setup checks
     # ------------------------------------------------------------------
     # The factory never raises for a missing key or model; these checks only
     # log (warnings/errors) so the app always boots and chat explains the fix.
@@ -495,7 +515,7 @@ def main(
             asyncio.run(_check_infomaniak_startup(llm_client))
 
     # ------------------------------------------------------------------
-    # 6. Import tool modules, then freeze the registry
+    # 7. Import tool modules, then freeze the registry
     # ------------------------------------------------------------------
     # Importing a tool module runs its @register_tool decorators; freezing
     # afterwards blocks any late or dynamic registration.
@@ -506,7 +526,7 @@ def main(
     logger.info("Tool registry frozen.")
 
     # ------------------------------------------------------------------
-    # 7. Build AgentConfig from the validated application config
+    # 8. Build AgentConfig from the validated application config
     # ------------------------------------------------------------------
     agent_config = AgentConfig(
         max_tool_calls=config.limits.max_tool_calls_per_message,
@@ -515,7 +535,7 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 8. Build system prompt from config and instantiate the Agent
+    # 9. Build system prompt from config and instantiate the Agent
     # ------------------------------------------------------------------
     from admino.agent import Agent
 
@@ -544,14 +564,14 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 9. Create the FastAPI app
+    # 10. Create the FastAPI app
     # ------------------------------------------------------------------
     from admino.server import create_app
 
     app = create_app(agent=agent, config=config)
 
     # ------------------------------------------------------------------
-    # 10. Start uvicorn (single worker — required for in-memory session state)
+    # 11. Start uvicorn (single worker — required for in-memory session state)
     # ------------------------------------------------------------------
     logger.info(
         "Starting uvicorn on %s:%d (single worker)",

@@ -258,34 +258,36 @@ class TestSeedSettings:
         mock_config = MagicMock()
         for section in ("server", "llm", "limits", "egress", "database"):
             getattr(mock_config, section).model_dump = MagicMock(return_value={"key": "val"})
-        mock_config.auth.model_dump = MagicMock(return_value={"mode": "vpn"})
         mock_config.log_level = "INFO"
         # GH-143: the files tool config is gone — seeding must never read it.
         del mock_config.files
         # GH-147: so is the paths section (its last field was the audit log path).
         del mock_config.paths
+        # GH-149: and the auth section (auth.mode / AUTH_TOKEN were removed).
+        del mock_config.auth
 
         await db_mod.seed_settings(mock_pool, mock_config)
 
-        # 7 sections: server, llm, auth, limits, egress, database, log_level
+        # 6 sections: server, llm, limits, egress, database, log_level
         insert_calls = [
             c
             for c in conn.execute.call_args_list
             if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
         ]
-        assert len(insert_calls) == 7
+        assert len(insert_calls) == 6
 
     async def test_seed_settings_does_not_seed_files_row(
         self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A fresh install gets no 'files' settings row (GH-143)."""
-        from admino.config import AppConfig, AuthConfig
+        """A fresh install gets no 'files' settings row (GH-143) and no 'auth' row (GH-149)."""
+        from admino.config import AppConfig
 
         monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
         conn = mock_pool._mock_conn
         conn.fetchval = AsyncMock(return_value=0)
 
-        await db_mod.seed_settings(mock_pool, AppConfig(auth=AuthConfig(mode="vpn")))
+        await db_mod.seed_settings(mock_pool, AppConfig())
 
         seeded_keys = {
             c.args[1]
@@ -295,12 +297,54 @@ class TestSeedSettings:
         assert seeded_keys == {
             "server",
             "llm",
-            "auth",
             "limits",
             "egress",
             "database",
             "log_level",
         }
+
+    async def test_seed_settings_does_not_seed_auth_row(
+        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-149: auth.mode is gone, so a fresh install gets no 'auth' settings row."""
+        from admino.config import AppConfig
+
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        monkeypatch.delenv("AUTH_TOKEN", raising=False)
+        conn = mock_pool._mock_conn
+        conn.fetchval = AsyncMock(return_value=0)
+
+        await db_mod.seed_settings(mock_pool, AppConfig())
+
+        seeded_keys = [
+            c.args[1]
+            for c in conn.execute.call_args_list
+            if len(c.args) > 1 and "INSERT INTO settings" in c.args[0]
+        ]
+        assert seeded_keys != []
+        assert "auth" not in seeded_keys
+
+    async def test_seed_settings_seeds_cookie_secure_in_server_row(
+        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The server row carries the new cookie_secure flag (default True)."""
+        import json
+
+        from admino.config import AppConfig
+
+        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
+        conn = mock_pool._mock_conn
+        conn.fetchval = AsyncMock(return_value=0)
+
+        await db_mod.seed_settings(mock_pool, AppConfig())
+
+        server_rows = [
+            json.loads(c.args[2])
+            for c in conn.execute.call_args_list
+            if len(c.args) > 2 and "INSERT INTO settings" in c.args[0] and c.args[1] == "server"
+        ]
+        assert len(server_rows) == 1
+        assert server_rows[0]["cookie_secure"] is True
 
     async def test_seed_settings_default_llm_is_infomaniak(
         self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
@@ -308,13 +352,13 @@ class TestSeedSettings:
         """The settings seed from a default AppConfig selects Infomaniak (GH-142)."""
         import json
 
-        from admino.config import AppConfig, AuthConfig
+        from admino.config import AppConfig
 
         monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
         conn = mock_pool._mock_conn
         conn.fetchval = AsyncMock(return_value=0)
 
-        await db_mod.seed_settings(mock_pool, AppConfig(auth=AuthConfig(mode="vpn")))
+        await db_mod.seed_settings(mock_pool, AppConfig())
 
         llm_rows = [
             c.args[2]
@@ -495,7 +539,6 @@ class TestLoadSettingsFromDb:
         """
         from admino.config import LLMConfig, load_app_config_from_db
 
-        monkeypatch.setenv("AUTH_MODE", "vpn")
         conn = mock_pool._mock_conn
         conn.fetch = AsyncMock(
             return_value=[
@@ -508,6 +551,7 @@ class TestLoadSettingsFromDb:
                         "openai_model": None,
                     },
                 },
+                # A legacy row (migration 0007 deletes it); the loader ignores it.
                 {"key": "auth", "value": {"mode": "vpn"}},
                 {"key": "paths", "value": {}},
                 {"key": "limits", "value": {}},

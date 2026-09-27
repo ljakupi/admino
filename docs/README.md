@@ -17,7 +17,7 @@ read **[Permissions](permissions.md)** and the **[Security Model](SECURITY.md)**
 - **[Getting Started](getting-started.md)** — install with `uv`, configure, run locally or in Docker, connect your Google/Microsoft accounts, and send your first message.
 - **[Permissions](permissions.md)** — how the isolated permission engine decides **allow / confirm / deny**, the hardcoded denials, and the critical-permission promotion flow.
 - **[Tools](tools.md)** — every tool and action admino ships with today, and what's still on the roadmap.
-- **[Configuration](configuration.md)** — LLM providers, `config.yaml`, data & storage, and authentication modes.
+- **[Configuration](configuration.md)** — LLM providers, `config.yaml`, data & storage, and accounts and sessions.
 - **[Security Model](SECURITY.md)** — egress containment, the root→non-root privilege drop, capabilities, and the threat model.
 
 ## Quick links

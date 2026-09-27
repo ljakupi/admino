@@ -24,9 +24,15 @@ Security notes:
   Admin (no org, no role) or member (a UUID org and a member role). Anything a
   low-level bypass could leave behind, e.g. kind 'super_admin' with an org,
   gets nothing.
+- UUID subclasses are normalized: ``user_id`` and ``org_id`` become a plain
+  ``uuid.UUID`` during validation (asyncpg returns its own subclass), so a
+  Principal built from a users row passes ``principal_role``'s exact type
+  check. A value forced onto a Principal after validation is not normalized
+  and still fails closed.
 - A well-formed Principal passes every check, so only trusted server-side
-  code may build one: #149 builds it from the session's users row, never from
-  request data. tests/test_access.py allowlists the modules that build one.
+  code may build one: ``admino.sessions`` is the one builder, from the
+  session's users row re-read on every request, never from request data.
+  tests/test_access.py allowlists the modules that build one.
 - Pure and isolated: no I/O, no logging, and no imports from the server,
   agent, LLM, database, tools, OAuth, audit or permissions modules. The tool
   permission engine (permissions.py) is a separate layer.
@@ -36,16 +42,29 @@ from __future__ import annotations
 
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final, Literal, NoReturn, Self
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, NoReturn, Self
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
 UserKind = Literal["super_admin", "member"]
 MemberRole = Literal["org_admin", "editor", "viewer"]
+
+
+def _plain_uuid(value: UUID) -> UUID:
+    """Return ``value`` as a plain ``uuid.UUID`` with the same 128 bits.
+
+    asyncpg returns ``asyncpg.pgproto.pgproto.UUID`` (a subclass) and Pydantic
+    keeps a subclass instance as it is; rebuilding it drops the subclass.
+    """
+    return value if type(value) is UUID else UUID(int=value.int)
+
+
+# A UUID field that never holds a UUID subclass after validation.
+PlainUUID = Annotated[UUID, AfterValidator(_plain_uuid)]
 
 
 class SealedModel(BaseModel):
@@ -78,9 +97,9 @@ class Principal(SealedModel):
     always belongs to exactly one organization and has exactly one role.
     """
 
-    user_id: UUID
+    user_id: PlainUUID
     kind: UserKind
-    org_id: UUID | None = None
+    org_id: PlainUUID | None = None
     role: MemberRole | None = None
 
     @model_validator(mode="after")

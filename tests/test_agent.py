@@ -26,6 +26,10 @@ Covers:
   are no conversation audit entries any more. H-1: if the recorder raises, the
   run aborts with "Internal error: audit unavailable." (no further LLM call or
   dispatch, no pending confirmation).
+- GH-149: ``Agent.run`` takes a required keyword-only ``principal``
+  (``access.Principal``, the logged-in user); the agent only passes it through.
+  The recorder protocol gains it as a seventh keyword, and every recorder call
+  carries the run's principal unchanged (the same object).
 - Security invariants: no forbidden imports (server, database, audit_events,
   the removed NDJSON audit module, asyncpg), no raw content in logs.
 
@@ -42,11 +46,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, Field
 
 from admino import agent as agent_module
+from admino.access import Principal
 from admino.agent import (
     Agent,
     _build_pending_confirmation,
@@ -116,9 +122,24 @@ class FakeLLM:
         return self._responses.pop(0)
 
 
-# The six keyword arguments of a ToolCallRecorder call (GH-147), and nothing else.
+# The seven keyword arguments of a ToolCallRecorder call (GH-147 + the GH-149
+# principal), and nothing else.
 _RECORDER_KWARGS: frozenset[str] = frozenset(
-    {"session_id", "tool", "action", "decision", "success", "duration_ms"}
+    {"principal", "session_id", "tool", "action", "decision", "success", "duration_ms"}
+)
+
+# The logged-in member every run in this suite acts for (GH-149).
+_PRINCIPAL = Principal(
+    user_id=UUID("11111111-2222-4333-8444-555555555555"),
+    kind="member",
+    org_id=UUID("0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"),
+    role="editor",
+)
+_OTHER_PRINCIPAL = Principal(
+    user_id=UUID("22222222-3333-4444-8555-666666666666"),
+    kind="member",
+    org_id=UUID("0f1e2d3c-4b5a-4968-8776-a5b4c3d2e1f0"),
+    role="org_admin",
 )
 _AUDIT_UNAVAILABLE = "Internal error: audit unavailable."
 
@@ -325,7 +346,7 @@ class TestAgentHappyPath:
         fake = FakeLLM([_text_response("Hello there!")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("Hi", session_id="sess-1", history=[])
+        result = await agent.run("Hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.response == "Hello there!"
@@ -339,7 +360,7 @@ class TestAgentHappyPath:
         fake = FakeLLM([_text_response("Hello!")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("Hi", session_id="sess-1", history=[])
+        result = await agent.run("Hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         roles = [m.role for m in result.history]
         contents = [m.content for m in result.history]
@@ -356,7 +377,7 @@ class TestAgentHappyPath:
         fake = FakeLLM([_text_response("Hello!")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("Hi", session_id="sess-1", history=[])
+        await agent.run("Hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         assert recorder.calls == []
 
@@ -371,7 +392,7 @@ class TestAgentHappyPath:
         caller_history: list[LLMMessage] = [LLMMessage(role="system", content="sys")]
         snapshot = list(caller_history)
 
-        await agent.run("hi", session_id="sess-x", history=caller_history)
+        await agent.run("hi", session_id="sess-x", history=caller_history, principal=_PRINCIPAL)
 
         assert caller_history == snapshot
 
@@ -386,7 +407,7 @@ class TestAgentHappyPath:
         fake = FakeLLM([LLMResponse(content="empty list", tool_calls=[], model="m", done=True)])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hi", session_id="sess-e", history=[])
+        result = await agent.run("hi", session_id="sess-e", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.response == "empty list"
@@ -417,7 +438,7 @@ class TestAgentToolChains:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("say hi", session_id="s", history=[])
+        result = await agent.run("say hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.response == "Done."
@@ -439,7 +460,7 @@ class TestAgentToolChains:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("say hi", session_id="s", history=[])
+        result = await agent.run("say hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert [m.role for m in result.history] == [
             "user",
@@ -465,7 +486,7 @@ class TestAgentToolChains:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("say hi", session_id="s", history=[])
+        await agent.run("say hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         # Second LLM call must see the tool-role result in its context.
         second_call_messages = fake.received_messages[1]
@@ -493,7 +514,7 @@ class TestAgentToolChains:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("go", session_id="s", history=[])
+        result = await agent.run("go", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert [(r.tool, r.action, r.success) for r in result.tool_calls] == [
             ("echo", "say", True),
@@ -521,7 +542,7 @@ class TestAgentToolChains:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("go", session_id="s", history=[])
+        await agent.run("go", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert recorder.outcomes() == [("allow", True), ("allow", True)]
 
@@ -544,7 +565,7 @@ class TestAgentToolChains:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("go", session_id="s", history=[])
+        await agent.run("go", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert recorder.outcomes() == [("allow", True), ("allow", True)]
 
@@ -575,7 +596,7 @@ class TestAgentPermissions:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("try", session_id="s", history=[])
+        result = await agent.run("try", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.response == "I could not do that."
@@ -597,7 +618,7 @@ class TestAgentPermissions:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("try", session_id="s", history=[])
+        result = await agent.run("try", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.tool_calls[0].permission == "deny"
         assert result.tool_calls[0].success is False
@@ -620,7 +641,7 @@ class TestAgentPermissions:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("try", session_id="s", history=[])
+        await agent.run("try", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert recorder.outcomes() == [("deny", False)]
 
@@ -646,7 +667,7 @@ class TestAgentPermissions:
         )
         agent = _build_agent(fake, recorder, permissions, agent_config)
 
-        result = await agent.run("send", session_id="s", history=[])
+        result = await agent.run("send", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.tool_calls[0].permission == "deny"
         assert result.tool_calls[0].success is False
@@ -677,7 +698,7 @@ class TestAgentLimits:
         fake = FakeLLM([always_tool for _ in range(20)])
         agent = _build_agent(fake, recorder, permissions_config, bounded_config)
 
-        result = await agent.run("loop", session_id="s", history=[])
+        result = await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert len(result.tool_calls) == 3
 
@@ -694,7 +715,7 @@ class TestAgentLimits:
         fake = FakeLLM([always_tool for _ in range(20)])
         agent = _build_agent(fake, recorder, permissions_config, bounded_config)
 
-        result = await agent.run("loop", session_id="s", history=[])
+        result = await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "limit_reached"
 
@@ -711,7 +732,7 @@ class TestAgentLimits:
         fake = FakeLLM([always_tool for _ in range(20)])
         agent = _build_agent(fake, recorder, permissions_config, bounded_config)
 
-        result = await agent.run("loop", session_id="s", history=[])
+        result = await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.history[-1].role == "assistant"
         assert "allowed number of tool calls" in result.history[-1].content
@@ -731,7 +752,7 @@ class TestAgentLimits:
         fake = FakeLLM([always_tool for _ in range(20)])
         agent = _build_agent(fake, recorder, permissions_config, bounded_config)
 
-        await agent.run("loop", session_id="s", history=[])
+        await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert recorder.outcomes() == [("allow", True)] * 3
 
@@ -756,7 +777,7 @@ class TestAgentLimits:
         )
         agent = _build_agent(fake, recorder, permissions_config, config)
 
-        result = await agent.run("loop", session_id="s", history=[])
+        result = await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "limit_reached"
         assert len(recorder.calls) == 2
@@ -781,7 +802,7 @@ class TestAgentLimits:
         fake = FakeLLM([always_tool for _ in range(20)])
         agent = _build_agent(fake, recorder, permissions_config, bounded_config)
 
-        await agent.run("loop", session_id="s", history=[])
+        await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert dispatch_count["n"] == 3
 
@@ -810,7 +831,7 @@ class TestAgentConfirmation:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("do", session_id="s", history=[])
+        result = await agent.run("do", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "awaiting_confirmation"
 
@@ -830,7 +851,7 @@ class TestAgentConfirmation:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("do", session_id="s", history=[])
+        result = await agent.run("do", session_id="s", history=[], principal=_PRINCIPAL)
 
         pc = result.pending_confirmation
         assert pc is not None
@@ -859,7 +880,7 @@ class TestAgentConfirmation:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("do", session_id="s", history=[])
+        await agent.run("do", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert called["n"] == 0
 
@@ -893,6 +914,7 @@ class TestAgentConfirmation:
             session_id="s",
             history=[],
             pending_confirmation=pending,
+            principal=_PRINCIPAL,
         )
 
         assert result.status == "final"
@@ -938,6 +960,7 @@ class TestAgentConfirmation:
             session_id="s",
             history=[],
             pending_confirmation=pending,
+            principal=_PRINCIPAL,
         )
 
         assert result.status == "awaiting_confirmation"
@@ -973,6 +996,7 @@ class TestAgentConfirmation:
             session_id="s",
             history=[],
             pending_confirmation=pending,
+            principal=_PRINCIPAL,
         )
 
         # Agent surfaced a safe AgentResult; the dispatch marked the call
@@ -1011,6 +1035,7 @@ class TestAgentConfirmation:
             session_id="s",
             history=[],
             pending_confirmation=pending,
+            principal=_PRINCIPAL,
         )
 
         assert recorder.outcomes() == [("deny", False), ("confirm", False)]
@@ -1036,7 +1061,7 @@ class TestAgentConfirmation:
         agent = _build_agent(fake, recorder, permissions_config, config)
 
         before = datetime.now(UTC)
-        result = await agent.run("do", session_id="s", history=[])
+        result = await agent.run("do", session_id="s", history=[], principal=_PRINCIPAL)
         after = datetime.now(UTC)
 
         pc = result.pending_confirmation
@@ -1080,7 +1105,7 @@ class TestAgentHallucinatedTools:
         )
         agent = _build_agent(fake, recorder, permissions, agent_config)
 
-        result = await agent.run("call fake", session_id="s", history=[])
+        result = await agent.run("call fake", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.tool_calls[0].success is False
@@ -1105,7 +1130,7 @@ class TestAgentHallucinatedTools:
         )
         agent = _build_agent(fake, recorder, permissions, agent_config)
 
-        await agent.run("x", session_id="s", history=[])
+        await agent.run("x", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert len(recorder.calls) == 1
         call = recorder.calls[0]
@@ -1129,7 +1154,7 @@ class TestAgentHallucinatedTools:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("try", session_id="s", history=[])
+        result = await agent.run("try", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.tool_calls[0].success is False
@@ -1149,7 +1174,7 @@ class TestAgentHallucinatedTools:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("x", session_id="s", history=[])
+        result = await agent.run("x", session_id="s", history=[], principal=_PRINCIPAL)
 
         # ``_safe_identifier`` maps malformed strings to ``invalid``.
         assert result.tool_calls[0].tool == "invalid"
@@ -1171,7 +1196,7 @@ class TestAgentHallucinatedTools:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("try", session_id="s", history=[])
+        result = await agent.run("try", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.response == "Recovered."
@@ -1219,7 +1244,7 @@ class TestAgentRejectsRemovedFilesTool:
         )
         agent = _build_agent(fake, recorder, build_default_permissions_config(), agent_config)
 
-        result = await agent.run("open my notes", session_id="s", history=[])
+        result = await agent.run("open my notes", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "final"
         assert result.response == "The local files tool is not available."
@@ -1250,7 +1275,7 @@ class TestAgentRejectsRemovedFilesTool:
         )
         agent = _build_agent(fake, recorder, build_default_permissions_config(), agent_config)
 
-        result = await agent.run("open my notes", session_id="s", history=[])
+        result = await agent.run("open my notes", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.tool_calls[0].permission == "deny"
         assert fake.calls == 2
@@ -1277,7 +1302,7 @@ class TestAgentRejectsRemovedFilesTool:
         )
         agent = _build_agent(fake, recorder, build_default_permissions_config(), agent_config)
 
-        await agent.run("open my notes", session_id="s", history=[])
+        await agent.run("open my notes", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert len(recorder.calls) == 1
         call = recorder.calls[0]
@@ -1303,7 +1328,7 @@ class TestAgentErrorHandling:
         fake.raise_on_call = RuntimeError("internal error with /path/to/secret token=abc123")
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hi", session_id="s", history=[])
+        result = await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "error"
 
@@ -1317,7 +1342,7 @@ class TestAgentErrorHandling:
         fake.raise_on_call = RuntimeError("internal error with /path/to/secret token=abc123")
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hi", session_id="s", history=[])
+        result = await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert "/path/to/secret" not in result.response
         assert "abc123" not in result.response
@@ -1334,7 +1359,7 @@ class TestAgentErrorHandling:
         fake.raise_on_call = RuntimeError("boom")
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hello", session_id="s", history=[])
+        result = await agent.run("hello", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "error"
         assert recorder.calls == []
@@ -1353,7 +1378,7 @@ class TestAgentErrorHandling:
         fake.raise_on_call = LLMError(message, None, user_facing=True)
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hi", session_id="s", history=[])
+        result = await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "error"
         assert result.response == message
@@ -1370,7 +1395,7 @@ class TestAgentErrorHandling:
         fake.raise_on_call = LLMError(message, None, user_facing=True)
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hello", session_id="s", history=[])
+        result = await agent.run("hello", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.history[-1].role == "assistant"
         assert result.history[-1].content == message
@@ -1390,7 +1415,7 @@ class TestAgentErrorHandling:
         fake.raise_on_call = LLMError(message, status_code, user_facing=True)
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hi", session_id="s", history=[])
+        result = await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.response == message
 
@@ -1407,7 +1432,7 @@ class TestAgentErrorHandling:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        result = await agent.run("hi", session_id="s", history=[])
+        result = await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert result.status == "error"
         assert result.response == agent_module._LLM_ERROR_MESSAGE
@@ -1424,7 +1449,7 @@ class TestAgentErrorHandling:
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         with pytest.raises(MemoryError):
-            await agent.run("hi", session_id="s", history=[])
+            await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
     async def test_agent_recursion_error_propagates(
         self,
@@ -1437,7 +1462,7 @@ class TestAgentErrorHandling:
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         with pytest.raises(RecursionError):
-            await agent.run("hi", session_id="s", history=[])
+            await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
 
 # ===========================================================================
@@ -1462,7 +1487,7 @@ class TestAgentContextTrimming:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, config)
 
-        await agent.run("latest", session_id="s", history=history)
+        await agent.run("latest", session_id="s", history=history, principal=_PRINCIPAL)
 
         sent = fake.received_messages[0]
         assert len(sent) <= 10
@@ -1485,7 +1510,7 @@ class TestAgentContextTrimming:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, config, system_prompt="sys")
 
-        await agent.run("latest", session_id="s", history=history)
+        await agent.run("latest", session_id="s", history=history, principal=_PRINCIPAL)
 
         sent = fake.received_messages[0]
         assert sent[0].role == "system"
@@ -1506,7 +1531,7 @@ class TestAgentContextTrimming:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, config)
 
-        await agent.run("latest", session_id="s", history=history)
+        await agent.run("latest", session_id="s", history=history, principal=_PRINCIPAL)
 
         sent = fake.received_messages[0]
         contents = [m.content for m in sent]
@@ -1608,7 +1633,7 @@ class TestAgentDispatchPassthrough:
         )
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("go", session_id="s", history=[])
+        await agent.run("go", session_id="s", history=[], principal=_PRINCIPAL)
 
         assert len(received_kwargs) == 2
         assert all("audit_logger" not in kwargs for kwargs in received_kwargs)
@@ -1683,7 +1708,7 @@ class TestAgentSecurityInvariants:
         user_msg = "USER_SECRET_MESSAGE_MARKER_12345"
 
         with caplog.at_level(logging.DEBUG, logger="admino.agent"):
-            await agent.run(user_msg, session_id="s", history=[])
+            await agent.run(user_msg, session_id="s", history=[], principal=_PRINCIPAL)
 
         for record in caplog.records:
             if record.name.startswith("admino.agent"):
@@ -1701,7 +1726,7 @@ class TestAgentSecurityInvariants:
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         with caplog.at_level(logging.DEBUG, logger="admino.agent"):
-            await agent.run("hi", session_id="s", history=[])
+            await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         for record in caplog.records:
             if record.name.startswith("admino.agent"):
@@ -1727,7 +1752,7 @@ class TestAgentSecurityInvariants:
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         with caplog.at_level(logging.DEBUG, logger="admino.agent"):
-            await agent.run("hi", session_id="s", history=[])
+            await agent.run("hi", session_id="s", history=[], principal=_PRINCIPAL)
 
         for record in caplog.records:
             if record.name.startswith("admino.agent"):
@@ -1816,7 +1841,7 @@ async def test_agent_permission_state_parametrized(
         agent_config=agent_config,
     )
 
-    result = await agent.run("x", session_id="s", history=[])
+    result = await agent.run("x", session_id="s", history=[], principal=_PRINCIPAL)
 
     assert result.tool_calls[0].success is expected_success
 
@@ -1938,7 +1963,7 @@ async def _run_case(
         config,
         tools_enabled=case.tools_enabled,
     )
-    return await agent.run("go", session_id=_REC_SESSION, history=[])
+    return await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
 
 def _pending(tool_call: ToolCall, *, expired: bool = False) -> PendingConfirmation:
@@ -1972,8 +1997,8 @@ class TestToolCallRecorderContract:
         assert recorder_type is not None, "admino.agent must export ToolCallRecorder"
         assert getattr(recorder_type, "_is_protocol", False) is True
 
-    def test_agent_tool_call_recorder_takes_six_keyword_only_arguments(self) -> None:
-        """The protocol's __call__ takes exactly the six metadata keywords, keyword-only."""
+    def test_agent_tool_call_recorder_takes_seven_keyword_only_arguments(self) -> None:
+        """The protocol's __call__ takes exactly the seven keywords (incl. principal)."""
         recorder_type = getattr(agent_module, "ToolCallRecorder", None)
         assert recorder_type is not None
 
@@ -1994,6 +2019,29 @@ class TestToolCallRecorderContract:
     def test_agent_init_drops_audit_logger_and_model_name(self, removed: str) -> None:
         """audit_logger and model_name (it only fed conversation entries) are gone."""
         assert removed not in inspect.signature(Agent.__init__).parameters
+
+    def test_agent_run_takes_required_keyword_only_principal(self) -> None:
+        """GH-149: Agent.run(..., *, principal) with no default."""
+        param = inspect.signature(Agent.run).parameters.get("principal")
+
+        assert param is not None, "Agent.run must take a principal"
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is inspect.Parameter.empty
+
+    async def test_agent_run_without_principal_raises_type_error(
+        self,
+        recorder: RecordingRecorder,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+    ) -> None:
+        """A run is never anonymous: leaving the principal out is a TypeError."""
+        fake = FakeLLM([_text_response("hi")])
+        agent = _build_agent(fake, recorder, permissions_config, agent_config)
+        run: Any = agent.run
+
+        with pytest.raises(TypeError):
+            await run("hi", session_id="s", history=[])
+        assert fake.calls == 0
 
 
 class TestToolCallRecorderPerDispatch:
@@ -2038,13 +2086,67 @@ class TestToolCallRecorderPerDispatch:
         assert duration >= 0
 
     @pytest.mark.parametrize("case", _DISPATCH_CASES)
-    async def test_agent_dispatch_outcome_records_only_the_six_keywords(
+    async def test_agent_dispatch_outcome_records_only_the_seven_keywords(
         self, recorder: RecordingRecorder, agent_config: AgentConfig, case: _DispatchCase
     ) -> None:
-        """No args, no output, no error text: the six metadata keywords and nothing else."""
+        """No args, no output, no error text: the seven keywords and nothing else."""
         await _run_case(case, recorder, agent_config)
 
         assert set(recorder.calls[0]) == _RECORDER_KWARGS
+
+    @pytest.mark.parametrize("case", _DISPATCH_CASES)
+    async def test_agent_dispatch_outcome_records_run_principal_unchanged(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig, case: _DispatchCase
+    ) -> None:
+        """GH-149: the recorder gets the run's principal object itself, whatever the outcome."""
+        await _run_case(case, recorder, agent_config)
+
+        assert recorder.calls[0]["principal"] is _PRINCIPAL
+
+    async def test_agent_each_run_records_its_own_principal(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """One agent, two runs by two users: each record carries its own run's principal."""
+        register_tool("echo", "say", "say", EchoArgs)(echo_handler)
+        fake = FakeLLM(
+            [
+                _tool_response(_say()),
+                _text_response("first"),
+                _tool_response(_say()),
+                _text_response("second"),
+            ]
+        )
+        agent = _build_agent(fake, recorder, _permissions(_ALLOW_SAY), agent_config)
+
+        await agent.run("one", session_id="s1", history=[], principal=_PRINCIPAL)
+        await agent.run("two", session_id="s2", history=[], principal=_OTHER_PRINCIPAL)
+
+        assert [call["principal"] for call in recorder.calls] == [
+            _PRINCIPAL,
+            _OTHER_PRINCIPAL,
+        ]
+        assert recorder.calls[1]["principal"] is _OTHER_PRINCIPAL
+
+    async def test_agent_approved_resume_records_resuming_principal(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """The resumed dispatch is recorded with the principal of the resuming run."""
+        register_tool("echo", "write", "write", EchoArgs)(echo_handler)
+        tool_call = ToolCall(tool="echo", action="write", args={"text": "x"}, tool_call_id="c")
+        fake = FakeLLM([_text_response("Done.")])
+        agent = _build_agent(
+            fake, recorder, _permissions({"echo": {"write": "confirm"}}), agent_config
+        )
+
+        await agent.run(
+            "",
+            session_id=_REC_SESSION,
+            history=[],
+            principal=_OTHER_PRINCIPAL,
+            pending_confirmation=_pending(tool_call),
+        )
+
+        assert [call["principal"] for call in recorder.calls] == [_OTHER_PRINCIPAL]
 
     async def test_agent_malformed_identifier_records_one_failed_deny(
         self,
@@ -2057,7 +2159,7 @@ class TestToolCallRecorderPerDispatch:
         fake = FakeLLM([_tool_response(bad_call), _text_response("recovered")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("try", session_id=_REC_SESSION, history=[])
+        await agent.run("try", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
         assert recorder.outcomes() == [("deny", False)]
         assert recorder.calls[0]["session_id"] == _REC_SESSION
@@ -2074,7 +2176,11 @@ class TestToolCallRecorderPerDispatch:
         )
 
         result = await agent.run(
-            "", session_id=_REC_SESSION, history=[], pending_confirmation=_pending(tool_call)
+            "",
+            session_id=_REC_SESSION,
+            history=[],
+            pending_confirmation=_pending(tool_call),
+            principal=_PRINCIPAL,
         )
 
         assert result.status == "final"
@@ -2097,6 +2203,7 @@ class TestToolCallRecorderPerDispatch:
             session_id=_REC_SESSION,
             history=[],
             pending_confirmation=_pending(tool_call, expired=True),
+            principal=_PRINCIPAL,
         )
 
         assert recorder.outcomes() == [("deny", False)]
@@ -2152,7 +2259,7 @@ class TestToolCallRecorderCarriesNoContent:
         register_tool("echo", "say", "Echo text", EchoArgs)(handler)
         fake = FakeLLM([_tool_response(_say(args)), _text_response("done")])
         agent = _build_agent(fake, recorder, _permissions(_ALLOW_SAY), agent_config)
-        await agent.run("go", session_id=_REC_SESSION, history=[])
+        await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
     @staticmethod
     def _assert_absent(recorder: RecordingRecorder, *markers: str) -> None:
@@ -2229,7 +2336,7 @@ class TestToolCallRecorderFatalErrors:
         agent = _build_agent(fake, recorder, _permissions(_ALLOW_SAY), agent_config)
 
         with pytest.raises(fatal):
-            await agent.run("go", session_id=_REC_SESSION, history=[])
+            await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
 
 @pytest.mark.parametrize("make_error", _RECORDER_ERRORS)
@@ -2244,7 +2351,7 @@ class TestToolCallRecorderFailureAbortsRun:
         fake = FakeLLM([_tool_response(_say()), _text_response("unreachable")])
         agent = _build_agent(fake, recorder, _permissions(_ALLOW_SAY), agent_config)
 
-        result = await agent.run("go", session_id=_REC_SESSION, history=[])
+        result = await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
         assert result.status == "error"
         assert result.response == _AUDIT_UNAVAILABLE
@@ -2257,7 +2364,7 @@ class TestToolCallRecorderFailureAbortsRun:
         fake = FakeLLM([_tool_response(_say()), _text_response("unreachable")])
         agent = _build_agent(fake, recorder, _permissions(_ALLOW_SAY), agent_config)
 
-        await agent.run("go", session_id=_REC_SESSION, history=[])
+        await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
         assert fake.calls == 1
 
@@ -2284,7 +2391,7 @@ class TestToolCallRecorderFailureAbortsRun:
         )
         agent = _build_agent(fake, recorder, _permissions(_ALLOW_SAY), agent_config)
 
-        await agent.run("go", session_id=_REC_SESSION, history=[])
+        await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
         assert runs["n"] == 1
         assert len(recorder.calls) == 1
@@ -2297,7 +2404,7 @@ class TestToolCallRecorderFailureAbortsRun:
         fake = FakeLLM([_tool_response(_say()), _text_response("unreachable")])
         agent = _build_agent(fake, recorder, _permissions({"echo": {"say": "deny"}}), agent_config)
 
-        result = await agent.run("go", session_id=_REC_SESSION, history=[])
+        result = await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
         assert (result.status, result.response) == ("error", _AUDIT_UNAVAILABLE)
         assert fake.calls == 1
@@ -2313,7 +2420,7 @@ class TestToolCallRecorderFailureAbortsRun:
             fake, recorder, _permissions({"echo": {"write": "confirm"}}), agent_config
         )
 
-        result = await agent.run("go", session_id=_REC_SESSION, history=[])
+        result = await agent.run("go", session_id=_REC_SESSION, history=[], principal=_PRINCIPAL)
 
         assert (result.status, result.response) == ("error", _AUDIT_UNAVAILABLE)
         assert result.pending_confirmation is None
@@ -2330,7 +2437,11 @@ class TestToolCallRecorderFailureAbortsRun:
         )
 
         result = await agent.run(
-            "", session_id=_REC_SESSION, history=[], pending_confirmation=_pending(tool_call)
+            "",
+            session_id=_REC_SESSION,
+            history=[],
+            pending_confirmation=_pending(tool_call),
+            principal=_PRINCIPAL,
         )
 
         assert (result.status, result.response) == ("error", _AUDIT_UNAVAILABLE)
@@ -2374,7 +2485,7 @@ class TestAgentPermissionAwareToolPayload:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.delete" not in names
@@ -2391,7 +2502,7 @@ class TestAgentPermissionAwareToolPayload:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.read" in names
@@ -2407,7 +2518,7 @@ class TestAgentPermissionAwareToolPayload:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "echo.write" in names
@@ -2423,7 +2534,7 @@ class TestAgentPermissionAwareToolPayload:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.send" not in names
@@ -2440,7 +2551,7 @@ class TestAgentPermissionAwareToolPayload:
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
         agent._promoted = frozenset({("gmail", "send")})
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.send" in names
@@ -2470,7 +2581,7 @@ class TestAgentToolsEnabledAllTrue:
             tools_enabled={"gmail": True, "google_drive": True, "memory": True},
         )
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.read" in names
@@ -2499,7 +2610,7 @@ class TestAgentToolsEnabledAllTrue:
             tools_enabled={"gmail": True, "google_drive": True, "memory": True},
         )
 
-        await agent.run("hi", session_id="sess-1", history=[])
+        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
         assert [(c["tool"], c["decision"], c["success"]) for c in recorder.calls] == [
             ("gmail", "allow", True)
@@ -2555,7 +2666,7 @@ async def _run_text_turns(
     agent = _build_agent(fake, recorder, permissions, config, system_prompt=_SYS)
     history: list[LLMMessage] = []
     for i in range(turns):
-        result = await agent.run(f"turn-{i}", session_id="s", history=history)
+        result = await agent.run(f"turn-{i}", session_id="s", history=history, principal=_PRINCIPAL)
         history = result.history
     return fake, history
 
@@ -2602,7 +2713,9 @@ async def _run_terminal_path(
             created_at=now,
             expires_at=now + timedelta(seconds=60),
         )
-    return await agent.run("next", session_id="s", history=prior, pending_confirmation=pending)
+    return await agent.run(
+        "next", session_id="s", history=prior, pending_confirmation=pending, principal=_PRINCIPAL
+    )
 
 
 async def _confirm_then_resume(
@@ -2629,13 +2742,14 @@ async def _confirm_then_resume(
     )
     agent = _build_agent(fake, recorder, permissions, config, system_prompt=system_prompt)
 
-    first = await agent.run("please write x", session_id="s", history=[])
+    first = await agent.run("please write x", session_id="s", history=[], principal=_PRINCIPAL)
     assert first.pending_confirmation is not None
     second = await agent.run(
         "",
         session_id="s",
         history=first.history,
         pending_confirmation=first.pending_confirmation,
+        principal=_PRINCIPAL,
     )
     return fake, first, second
 
@@ -2752,7 +2866,9 @@ class TestAgentSystemPromptHistory:
         history: list[LLMMessage] = []
         for i in range(25):
             first_call = fake.calls
-            result = await agent.run(f"turn-{i}", session_id="s", history=history)
+            result = await agent.run(
+                f"turn-{i}", session_id="s", history=history, principal=_PRINCIPAL
+            )
             assert result.status == "final"
             for call in fake.received_messages[first_call:]:
                 _assert_gh140_context_invariants(
@@ -2825,7 +2941,9 @@ class TestAgentSystemPromptHistory:
         )
         agent = _build_agent(fake, recorder, permissions_config, config, system_prompt=_SYS)
 
-        result = await agent.run("CURRENT-REQUEST", session_id="s", history=prior)
+        result = await agent.run(
+            "CURRENT-REQUEST", session_id="s", history=prior, principal=_PRINCIPAL
+        )
 
         assert result.status == "final"
         assert fake.calls == 4
@@ -2884,7 +3002,9 @@ class TestAgentSystemPromptHistory:
             fake, recorder, permissions_config, config, system_prompt=system_prompt
         )
 
-        result = await agent.run("CURRENT-REQUEST", session_id="s", history=prior)
+        result = await agent.run(
+            "CURRENT-REQUEST", session_id="s", history=prior, principal=_PRINCIPAL
+        )
 
         assert result.status == "final"
         assert [_roles_and_contents(call) for call in fake.received_messages] == [
@@ -2906,7 +3026,9 @@ class TestAgentSystemPromptHistory:
             fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
         )
 
-        await agent.run("next", session_id="s", history=_tainted_caller_history())
+        await agent.run(
+            "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
+        )
 
         sent = fake.received_messages[0]
         assert _roles_and_contents(_system_messages(sent)) == [("system", "REAL SYS")]
@@ -2924,7 +3046,9 @@ class TestAgentSystemPromptHistory:
             fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
         )
 
-        await agent.run("next", session_id="s", history=_tainted_caller_history())
+        await agent.run(
+            "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
+        )
 
         sent_contents = [m.content for call in fake.received_messages for m in call]
         assert not any(_INJECTED_LEADING_SYS in c for c in sent_contents)
@@ -2942,7 +3066,9 @@ class TestAgentSystemPromptHistory:
             fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
         )
 
-        result = await agent.run("next", session_id="s", history=_tainted_caller_history())
+        result = await agent.run(
+            "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
+        )
 
         assert _roles_and_contents(result.history) == [
             ("user", "u1"),
@@ -2961,7 +3087,9 @@ class TestAgentSystemPromptHistory:
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
-        await agent.run("next", session_id="s", history=_tainted_caller_history())
+        await agent.run(
+            "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
+        )
 
         assert _system_messages(fake.received_messages[0]) == []
 
@@ -2984,7 +3112,7 @@ class TestAgentSystemPromptHistory:
             fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
         )
 
-        await agent.run("next", session_id="s", history=history)
+        await agent.run("next", session_id="s", history=history, principal=_PRINCIPAL)
 
         assert _agent_warnings(caplog), "expected a WARNING from admino.agent"
         assert not any(_INJECTED_LEADING_SYS in r.getMessage() for r in caplog.records)
@@ -3003,7 +3131,9 @@ class TestAgentSystemPromptHistory:
             fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
         )
 
-        await agent.run("next", session_id="s", history=_tainted_caller_history())
+        await agent.run(
+            "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
+        )
 
         assert _agent_warnings(caplog), "expected a WARNING from admino.agent"
         for record in caplog.records:
@@ -3029,8 +3159,8 @@ class TestAgentSystemPromptHistory:
             LLMMessage(role="assistant", content="earlier reply"),
         ]
 
-        first = await agent.run("hello", session_id="s", history=prior)
-        await agent.run("again", session_id="s", history=first.history)
+        first = await agent.run("hello", session_id="s", history=prior, principal=_PRINCIPAL)
+        await agent.run("again", session_id="s", history=first.history, principal=_PRINCIPAL)
 
         assert _agent_warnings(caplog) == []
 
@@ -3137,9 +3267,9 @@ class TestAgentSystemPromptHistory:
         fake = FakeLLM([_text_response("hi"), _text_response("sure")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config, system_prompt="SYS")
 
-        first = await agent.run("hello", session_id="s", history=[])
+        first = await agent.run("hello", session_id="s", history=[], principal=_PRINCIPAL)
         history = [*first.history, LLMMessage(role="user", content=_PROMOTION_NOTICE)]
-        second = await agent.run("next", session_id="s", history=history)
+        second = await agent.run("next", session_id="s", history=history, principal=_PRINCIPAL)
 
         call = fake.received_messages[1]
         assert _roles_and_contents(_system_messages(call)) == [("system", "SYS")]

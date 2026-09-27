@@ -5,41 +5,70 @@ All user input enters through this module and all responses leave through it.
 The server is a thin HTTP layer that delegates business logic to the agent.
 
 Routes:
+- POST /api/auth/login    — Email/password login; sets the session cookie (public).
+- POST /api/auth/logout   — Revokes the current session and clears the cookie.
+- GET  /api/auth/me       — The logged-in account (from the resolved session).
 - POST /api/message       — Send a user message; returns ChatResponse.
-- GET  /api/events        — SSE stream for a session.
+- GET  /api/events        — SSE stream for a chat session.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
-- GET  /health            — Health check (no auth required).
-- /                       — Static PWA files (no auth required).
+- /api/settings, /api/permissions, /api/critical-permissions, /api/oauth/* —
+  settings, permissions and account connections.
+- GET  /health            — Health check (public).
+- GET  /api/oauth/callback — The OAuth provider's redirect (public, state-checked).
+- /                       — Static PWA files (public).
 
 Security notes:
-- Bearer token auth via FastAPI dependency; constant-time comparison (hmac).
+- Authentication is a server-side session (GH-149): the ``admino_session``
+  cookie (HttpOnly, SameSite=Strict, Path=/, Secure unless
+  ``server.cookie_secure`` is off) carries an opaque token that
+  ``sessions.resolve_session`` checks against the database on every request,
+  re-reading the account, so a deactivated user or org is refused at once.
+  Every route except the public ones above depends on ``require_session``; the
+  ``Principal`` always comes from the session row, never from request data.
+  There is no bearer-token or VPN mode, and ``Authorization`` headers
+  authenticate nothing.
+- The chat routes also need ``Capability.CHAT_SEND`` (403 for a Viewer or a
+  Super Admin); the principal is passed to ``agent.run``.
+- CSRF: ``CrossOriginProtectionMiddleware`` implements Go's
+  CrossOriginProtection check on every non-GET/HEAD/OPTIONS request, before
+  authentication and handlers (the login included): ``Sec-Fetch-Site`` must be
+  ``same-origin``/``none``; without it, an ``Origin`` must match ``Host``.
+  Refusals are 403 ``{"detail": "Cross-origin request refused"}``.
+- Login failures are one generic 401 for every cause (no user enumeration);
+  the email, password and session token are never logged or echoed.
+- Rate limits are per caller: one token bucket per (route, ``user:<id>``) on
+  session routes and per (route, ``ip:<host>``) on public routes, so one caller
+  can't throttle another. Idle buckets are evicted and the map is capped (LRU).
+  Cookies that resolve to no session spend a per-IP budget, so a stream of
+  random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
 - Error responses use generic messages; never leak internal paths or config.
-- CORS restricted to localhost origins by default.
+- CORS restricted to localhost origins by default; no credentials, and only
+  ``Content-Type`` as an allowed request header. ``/openapi.json``, Swagger UI
+  and ReDoc are disabled.
 - HSTS is not set (plain HTTP local deployment). When deploying behind a
   TLS-terminating reverse proxy, configure HSTS at the proxy layer.
 - Does NOT import check_permission — permission decisions live in agent/registry.
 - Does NOT import from permissions.py except PermissionsConfig type (via TYPE_CHECKING).
 
 Deployment note:
-- This module uses module-level dicts (_sessions, _pending_confirmations) for
-  in-memory state. This requires a **single-worker** ASGI deployment. Running
-  multiple workers (e.g. uvicorn --workers 2) will silently split state across
-  processes. Use ``--workers 1`` (the default).
+- This module uses module-level dicts (_sessions, _pending_confirmations,
+  _rate_buckets) for in-memory state. This requires a **single-worker** ASGI
+  deployment. Running multiple workers (e.g. uvicorn --workers 2) will silently
+  split state across processes. Use ``--workers 1`` (the default).
 
-Session ID note:
-- Session IDs are client-provided and validated by Pydantic (alphanumeric,
-  hyphens, underscores, max 64 chars). The server does not generate session IDs.
-  This is by design: the client is the only user (local-first, single-tenant).
-  Two clients sharing the same token AND same session_id will share history —
-  this is acceptable for the single-user threat model.
+Chat session ID note:
+- Chat session IDs are client-provided until #176 and validated by Pydantic
+  (alphanumeric, hyphens, underscores, max 64 chars).
+  In-memory chat state is keyed by ``_chat_key(user_id, session_id)``, so a
+  user reusing another user's session_id sees an empty history and can neither
+  confirm nor cancel the other user's pending tool call.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import hmac
 import json
 import logging
 import os
@@ -48,26 +77,31 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any, Final
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import ValidationError
+from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from admino import auth, sessions
+from admino.access import Capability, Principal, can
 from admino.models import (
     AgentResult,
     ChatRequest,
     ChatResponse,
     ConfirmRequest,
     CriticalPermissionEntry,
-    CriticalPermissionPromote,
     CriticalPermissionsResponse,
     CriticalPermissionState,
     LLMMessage,
+    LoginRequest,
+    MeResponse,
     OAuthAuthorizeResponse,
     OAuthConnectionStatus,
     PendingConfirmation,
@@ -109,8 +143,9 @@ from admino.tools.outlook_calendar import clear_token_cache as _clear_outcal_cac
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
+    from uuid import UUID
 
-    from starlette.responses import Response
+    from starlette.types import ASGIApp, Receive, Scope, Send
 
     from admino.agent import Agent
     from admino.config import AppConfig
@@ -160,97 +195,266 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 # ---------------------------------------------------------------------------
-# Rate limiter
+# CSRF: cross-origin protection
+# ---------------------------------------------------------------------------
+
+# Methods that never change state: exempt from the cross-origin check.
+_SAFE_METHODS: Final = frozenset({"GET", "HEAD", "OPTIONS"})
+# Sec-Fetch-Site values a browser sends for a same-origin or user-initiated request.
+_SAME_ORIGIN_FETCH_SITES: Final = frozenset({"same-origin", "none"})
+_CSRF_REFUSED_DETAIL: Final = "Cross-origin request refused"
+
+
+def _is_cross_origin_request(method: str, headers: Headers) -> bool:
+    """Return True when a request must be refused as cross-origin (CSRF).
+
+    Go 1.25 ``CrossOriginProtection`` algorithm:
+    1. GET, HEAD and OPTIONS are safe by method and always pass.
+    2. If ``Sec-Fetch-Site`` is present, only ``same-origin`` and ``none``
+       (a user-initiated navigation) pass; any other value is refused.
+    3. Otherwise, if ``Origin`` is present, it passes only when its
+       host[:port] equals the ``Host`` header (the scheme is ignored: TLS
+       terminates at the proxy). ``Origin: null`` or a malformed origin is refused.
+    4. With neither header the request doesn't come from a browser and passes;
+       the SameSite=Strict session cookie covers older browsers.
+
+    Args:
+        method: The HTTP request method.
+        headers: The request headers.
+
+    Returns:
+        True if the request is cross-origin and must be refused.
+    """
+    if method.upper() in _SAFE_METHODS:
+        return False
+    fetch_site = headers.get("sec-fetch-site")
+    if fetch_site is not None:
+        return fetch_site.strip().lower() not in _SAME_ORIGIN_FETCH_SITES
+    origin = headers.get("origin")
+    if origin is None:
+        return False
+    try:
+        origin_host = urlsplit(origin.strip()).netloc
+    except ValueError:
+        return True
+    host = headers.get("host", "")
+    return not origin_host or origin_host.lower() != host.strip().lower()
+
+
+class CrossOriginProtectionMiddleware:
+    """Refuses cross-origin state-changing requests before routing (CSRF defence).
+
+    A pure ASGI middleware, so the refusal happens before authentication,
+    rate limiting and handlers run, the login included (login CSRF). A refused
+    request gets 403 ``{"detail": "Cross-origin request refused"}``; nothing
+    from the request is echoed or logged.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Pass the request on, or answer 403 when it is cross-origin."""
+        if scope["type"] == "http" and _is_cross_origin_request(
+            scope["method"], Headers(scope=scope)
+        ):
+            response = JSONResponse(status_code=403, content={"detail": _CSRF_REFUSED_DETAIL})
+            await response(scope, receive, send)
+            return
+        await self._app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (per route and caller)
 # ---------------------------------------------------------------------------
 
 
 class _TokenBucket:
-    """Simple in-process token-bucket rate limiter.
+    """Simple in-process token-bucket rate limiter for one (route, caller).
 
-    Designed for single-user local deployment. Limits requests per second
-    to prevent resource exhaustion (LLM inference, memory). Not shared
-    across workers — requires single-worker deployment (already required
-    by the in-memory session store).
+    Limits requests per second to prevent resource exhaustion (LLM inference,
+    memory, Argon2 CPU). Not shared across workers — requires single-worker
+    deployment (already required by the in-memory chat state).
 
     Args:
         rate: Tokens added per second.
         capacity: Maximum burst capacity.
+        now: The current ``time.monotonic()`` value.
     """
 
-    __slots__ = ("_capacity", "_last_refill", "_rate", "_tokens")
+    __slots__ = ("_capacity", "_rate", "_tokens", "last_used")
 
-    def __init__(self, rate: float, capacity: int) -> None:
+    def __init__(self, rate: float, capacity: int, now: float) -> None:
         self._rate = rate
         self._capacity = capacity
         self._tokens = float(capacity)
-        self._last_refill = time.monotonic()
+        self.last_used = now
 
-    def allow(self) -> bool:
-        """Consume one token. Returns True if the request is allowed."""
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-        self._last_refill = now
+    def _refill(self, now: float) -> None:
+        """Add the tokens earned since the last use, up to the burst capacity."""
+        elapsed = max(0.0, now - self.last_used)
+        self._tokens = min(float(self._capacity), self._tokens + elapsed * self._rate)
+        self.last_used = now
+
+    def allow(self, now: float) -> bool:
+        """Refill for the time elapsed, then consume one token if there is one."""
+        self._refill(now)
         if self._tokens >= 1.0:
             self._tokens -= 1.0
             return True
         return False
 
-
-# Per-path rate limiters. Configured for single-user local use:
-# - POST /api/message: 30 req/min (0.5/s) with burst of 5
-# - POST /api/confirm: 30 req/min (0.5/s) with burst of 5
-# - GET  /api/events:  10 req/min (~0.17/s) with burst of 3 (SSE connections)
-# A global fallback bucket catches any future routes that lack a specific limiter.
-_rate_limiters: dict[str, _TokenBucket] = {}
-_global_rate_limiter: _TokenBucket | None = None
+    def has_token(self, now: float) -> bool:
+        """Refill for the time elapsed and report whether a token is left, consuming none."""
+        self._refill(now)
+        return self._tokens >= 1.0
 
 
-def _check_rate_limit(path: str) -> None:
-    """Check rate limit for a given path. Raises 429 if exceeded.
+# Per-route (tokens per second, burst). Route keys are stable strings, not
+# URL paths with parameters. Read when a bucket is created.
+_RATE_LIMITS: dict[str, tuple[float, int]] = {
+    "/api/message": (0.5, 5),
+    "/api/confirm": (0.5, 5),
+    "/api/events": (0.17, 3),
+    "/api/settings/get": (1.0, 5),
+    "/api/settings/patch": (0.2, 2),
+    "/api/permissions/get": (1.0, 5),
+    "/api/permissions/patch": (0.2, 2),
+    "/api/oauth/google/authorize": (0.2, 2),
+    "/api/oauth/microsoft/authorize": (0.2, 2),
+    "/api/oauth/callback": (0.2, 2),
+    "/api/oauth/google/status": (1.0, 5),
+    "/api/oauth/microsoft/status": (1.0, 5),
+    "/api/oauth/google/disconnect": (0.2, 2),
+    "/api/oauth/microsoft/disconnect": (0.2, 2),
+    "/api/critical-permissions/get": (1.0, 5),
+    "/api/critical-permissions/promote": (5 / 60, 5),
+    "/api/critical-permissions/cancel": (0.5, 5),
+    "/api/auth/login": (0.2, 5),
+    "/api/auth/logout": (0.5, 5),
+    "/api/auth/me": (1.0, 10),
+    # Cookies that resolve to no session, per client IP (see require_session).
+    "/api/auth/session": (1.0, 20),
+}
+# Routes without their own entry still get a bucket per caller.
+_DEFAULT_RATE_LIMIT: tuple[float, int] = (1.0, 10)
+# A bucket unused this long has fully refilled, so dropping it loses nothing.
+_BUCKET_IDLE_TTL_S: float = 900.0
+# Upper bound on the bucket map (least-recently-used buckets are dropped first).
+_MAX_RATE_BUCKETS: int = 10_000
 
-    Uses the path-specific limiter if one exists, otherwise falls back
-    to the global limiter. This ensures new routes are rate-limited by
-    default even if no specific limiter is configured.
+# (route, caller) -> bucket, in least-recently-used order. The caller is
+# "user:<user_id>" on session routes and "ip:<client host>" on public routes
+# and for failed session resolutions.
+_rate_buckets: OrderedDict[tuple[str, str], _TokenBucket] = OrderedDict()
+# The route key of the per-IP budget for cookies that resolve to no session.
+_SESSION_FAILURE_ROUTE: Final = "/api/auth/session"
+
+
+def _evict_idle_buckets(now: float) -> None:
+    """Drop buckets unused for at least ``_BUCKET_IDLE_TTL_S`` seconds.
+
+    ``_rate_buckets`` is kept in least-recently-used order, so the idle
+    buckets are at the front.
+    """
+    while _rate_buckets:
+        oldest_key = next(iter(_rate_buckets))
+        if now - _rate_buckets[oldest_key].last_used < _BUCKET_IDLE_TTL_S:
+            return
+        del _rate_buckets[oldest_key]
+
+
+def _check_rate_limit(route: str, caller: str) -> None:
+    """Consume one token from ``caller``'s bucket for ``route``; 429 when empty.
+
+    Each (route, caller) pair has its own bucket, so one user (or IP)
+    exhausting a route never throttles another. Routes without an entry in
+    ``_RATE_LIMITS`` use ``_DEFAULT_RATE_LIMIT``. Idle buckets are evicted
+    and the map never exceeds ``_MAX_RATE_BUCKETS`` entries.
 
     Args:
-        path: The request path to rate-limit.
+        route: The route key (e.g. ``"/api/message"``).
+        caller: ``"user:<user_id>"`` or ``"ip:<client host>"``.
 
     Raises:
-        HTTPException: 429 if rate limit exceeded.
+        HTTPException: 429 if the caller's bucket is empty.
     """
-    bucket = _rate_limiters.get(path, _global_rate_limiter)
-    if bucket is not None and not bucket.allow():
+    now = time.monotonic()
+    if not _bucket_for(route, caller, now).allow(now):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+
+def _bucket_for(route: str, caller: str, now: float) -> _TokenBucket:
+    """Return (creating it if needed) the bucket of ``(route, caller)``, marked most recent.
+
+    Evicts idle buckets first, and keeps the map within ``_MAX_RATE_BUCKETS``.
+    """
+    _evict_idle_buckets(now)
+    key = (route, caller)
+    bucket = _rate_buckets.get(key)
+    if bucket is None:
+        rate, burst = _RATE_LIMITS.get(route, _DEFAULT_RATE_LIMIT)
+        while _rate_buckets and len(_rate_buckets) >= _MAX_RATE_BUCKETS:
+            _rate_buckets.popitem(last=False)
+        bucket = _TokenBucket(rate, burst, now)
+        _rate_buckets[key] = bucket
+    else:
+        _rate_buckets.move_to_end(key)
+    return bucket
+
+
+def _session_failures_exhausted(caller: str) -> bool:
+    """True when ``caller`` has spent its budget of cookies that resolve to no session.
+
+    Only reads the bucket: an IP whose sessions keep resolving never gets one.
+    """
+    bucket = _rate_buckets.get((_SESSION_FAILURE_ROUTE, caller))
+    return bucket is not None and not bucket.has_token(time.monotonic())
+
+
+def _note_session_failure(caller: str) -> None:
+    """Spend one token of ``caller``'s budget for cookies that resolve to no session."""
+    now = time.monotonic()
+    _bucket_for(_SESSION_FAILURE_ROUTE, caller, now).allow(now)
+
+
+def _user_caller(principal: Principal) -> str:
+    """The rate-limit caller key of a logged-in principal."""
+    return f"user:{principal.user_id}"
+
+
+def _client_ip(request: Request) -> str:
+    """The peer address of the request (``"unknown"`` when the server has none)."""
+    return request.client.host if request.client is not None else "unknown"
 
 
 # ---------------------------------------------------------------------------
 # Module-level state — set during create_app()
 # ---------------------------------------------------------------------------
 
-# Maximum number of concurrent sessions before LRU eviction kicks in.
-# Sized for single-user local deployment with generous headroom.
+# Maximum number of concurrent chat sessions before LRU eviction kicks in.
 _MAX_SESSIONS: int = 256
 
-# In-memory session store: session_id -> conversation history.
-# No persistence across restarts (privacy-first design).
+# In-memory chat state is keyed by _chat_key(user_id, session_id): the chat
+# session id is client-provided (until #176), so keying by it alone would let
+# one user read, confirm or cancel another user's chat.
+
+# Conversation history per chat. No persistence across restarts.
 # OrderedDict enables O(1) LRU eviction when _MAX_SESSIONS is exceeded.
-_sessions: OrderedDict[str, list[LLMMessage]] = OrderedDict()
+_sessions: OrderedDict[tuple[UUID, str], list[LLMMessage]] = OrderedDict()
 
-# Pending confirmations per session: session_id -> PendingConfirmation.
-# Keyed by session_id intentionally — only one pending confirmation per session.
-# A new confirmation for the same session overwrites the previous one. This
-# prevents confirmation queue buildup and simplifies the confirmation UX.
-_pending_confirmations: dict[str, PendingConfirmation] = {}
+# Pending confirmation per chat — only one at a time. A new confirmation for
+# the same chat overwrites the previous one. This prevents confirmation queue
+# buildup and simplifies the confirmation UX.
+_pending_confirmations: dict[tuple[UUID, str], PendingConfirmation] = {}
 
-# Per-session asyncio locks to serialise concurrent requests for the same
-# session. Prevents race conditions where two concurrent POST /api/message
-# requests read the same history snapshot, both run the agent, and the
-# second write silently overwrites the first's result. Also protects the
-# confirmation flow from interleaving with new messages.
-# Keyed by session_id; entries are lazily created and cleaned up on LRU
-# eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
-_session_locks: dict[str, asyncio.Lock] = {}
+# Per-chat asyncio locks to serialise concurrent requests for the same chat.
+# Prevents race conditions where two concurrent POST /api/message requests
+# read the same history snapshot, both run the agent, and the second write
+# silently overwrites the first's result. Also protects the confirmation flow
+# from interleaving with new messages. Entries are lazily created and cleaned
+# up on LRU eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
+_session_locks: dict[tuple[UUID, str], asyncio.Lock] = {}
 
 # OAuth CSRF state tokens: maps state string -> (timestamp, provider, redirect_uri).
 # Entries expire after _OAUTH_STATE_TTL_S seconds. Reaped on each authorize call.
@@ -283,67 +487,80 @@ _config: AppConfig | None = None
 # ---------------------------------------------------------------------------
 
 
-def _get_session_lock(session_id: str) -> asyncio.Lock:
-    """Get or create a per-session asyncio lock.
+def _chat_key(user_id: UUID, session_id: str) -> tuple[UUID, str]:
+    """The key of one user's chat in the in-memory chat state.
 
-    Lazily creates locks on first access. Cleaned up when sessions are
+    Args:
+        user_id: The logged-in principal's user id (from the session).
+        session_id: The client-provided chat session id.
+
+    Returns:
+        The ``(user_id, session_id)`` pair.
+    """
+    return (user_id, session_id)
+
+
+def _get_session_lock(key: tuple[UUID, str]) -> asyncio.Lock:
+    """Get or create the asyncio lock of one chat.
+
+    Lazily creates locks on first access. Cleaned up when chats are
     LRU-evicted in ``_touch_session``, keeping the dict bounded by
     ``_MAX_SESSIONS``.
 
     Args:
-        session_id: The session identifier.
+        key: The chat key from ``_chat_key``.
 
     Returns:
-        The asyncio.Lock for the given session.
+        The asyncio.Lock for the given chat.
     """
-    if session_id not in _session_locks:
-        _session_locks[session_id] = asyncio.Lock()
-    return _session_locks[session_id]
+    if key not in _session_locks:
+        _session_locks[key] = asyncio.Lock()
+    return _session_locks[key]
 
 
-def _touch_session(session_id: str, history: list[LLMMessage]) -> None:
-    """Insert or update a session, maintaining LRU order.
+def _touch_session(key: tuple[UUID, str], history: list[LLMMessage]) -> None:
+    """Insert or update a chat's history, maintaining LRU order.
 
-    If the session store exceeds _MAX_SESSIONS, the least-recently-used
-    session is evicted. This bounds memory usage and prevents DoS via
-    unbounded session creation.
+    If the chat store exceeds _MAX_SESSIONS, the least-recently-used chat is
+    evicted. This bounds memory usage and prevents DoS via unbounded session
+    creation.
 
     Args:
-        session_id: The session identifier.
+        key: The chat key from ``_chat_key``.
         history: The conversation history to store.
     """
     # Move to end if exists (mark as recently used), then update.
-    if session_id in _sessions:
-        _sessions.move_to_end(session_id)
-    _sessions[session_id] = history
+    if key in _sessions:
+        _sessions.move_to_end(key)
+    _sessions[key] = history
 
-    # Evict oldest sessions if over capacity.
+    # Evict oldest chats if over capacity.
     while len(_sessions) > _MAX_SESSIONS:
-        evicted_id, _ = _sessions.popitem(last=False)
-        # Also clean up any pending confirmation and lock for the evicted session.
-        _pending_confirmations.pop(evicted_id, None)
-        _session_locks.pop(evicted_id, None)
-        logger.info("Evicted session %s (session cap %d reached)", evicted_id, _MAX_SESSIONS)
+        evicted_key, _ = _sessions.popitem(last=False)
+        # Also clean up any pending confirmation and lock for the evicted chat.
+        _pending_confirmations.pop(evicted_key, None)
+        _session_locks.pop(evicted_key, None)
+        logger.info("Evicted session %s (session cap %d reached)", evicted_key[1], _MAX_SESSIONS)
 
 
 def _reap_expired_confirmations() -> None:
     """Remove all expired pending confirmations.
 
     Called unconditionally at the top of ``post_message`` and
-    ``post_confirm`` (before acquiring per-session locks) to prevent
+    ``post_confirm`` (before acquiring per-chat locks) to prevent
     stale confirmations from accumulating. This is the enforcement point
     for confirmation_timeout_s configured in LimitsConfig.
 
     IMPORTANT: This function must remain synchronous (no ``await`` calls).
-    Callers invoke it outside per-session locks, so it must complete
-    atomically within a single event-loop tick to avoid cross-session
+    Callers invoke it outside per-chat locks, so it must complete
+    atomically within a single event-loop tick to avoid cross-chat
     race conditions on ``_pending_confirmations``.
     """
     now = datetime.now(UTC)
-    expired = [sid for sid, pc in _pending_confirmations.items() if now >= pc.expires_at]
-    for sid in expired:
-        logger.info("Reaped expired confirmation for session %s", sid)
-        del _pending_confirmations[sid]
+    expired = [key for key, pc in _pending_confirmations.items() if now >= pc.expires_at]
+    for key in expired:
+        logger.info("Reaped expired confirmation for session %s", key[1])
+        del _pending_confirmations[key]
 
 
 _CANCELLED_TOOL_RESULT_MSG = "Tool call cancelled — user sent a new message instead of confirming."
@@ -433,56 +650,78 @@ def _close_dangling_tool_use(history: list[LLMMessage]) -> list[LLMMessage]:
 
 
 # ---------------------------------------------------------------------------
-# Auth dependency
+# Auth dependencies
 # ---------------------------------------------------------------------------
 
+_UNAUTHORIZED_DETAIL: Final = "Unauthorized"
 
-def _get_bearer_token(request: Request) -> str | None:
-    """Extract Bearer token from the Authorization header.
+
+async def require_session(request: Request) -> sessions.AuthenticatedSession:
+    """FastAPI dependency: the session the ``admino_session`` cookie belongs to.
+
+    ``sessions.resolve_session`` re-checks the session and its account in the
+    database on every request (revoked, expired, deactivated user or org all
+    resolve to nothing). Other cookies and ``Authorization`` headers are
+    ignored.
+
+    Args:
+        request: The incoming request.
 
     Returns:
-        The token string, or None if the header is missing or malformed.
-    """
-    auth_header = request.headers.get("authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return None
-    return auth_header[7:]
+        The resolved ``AuthenticatedSession`` (with its ``Principal``).
 
-
-async def require_auth(request: Request) -> None:
-    """FastAPI dependency that enforces Bearer token authentication.
-
-    Skipped for health check and static file routes. Uses constant-time
-    comparison to prevent timing attacks on the token.
+    Per-user rate limits only engage once a session resolves, so cookies that
+    resolve to no session are budgeted per client IP instead: each one spends a
+    token, and an IP that has spent its budget gets 429 before any database
+    lookup. A request without a cookie costs no lookup and spends nothing.
 
     Raises:
-        HTTPException: 401 if the token is missing or invalid.
+        HTTPException: 401 ``Unauthorized`` without a cookie or when the token
+            resolves to no usable session; 429 when the client IP has spent
+            its budget of unresolved cookies. The token is never logged.
     """
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
+    from admino.database import get_pool
 
-    # VPN mode: all connections trusted, no token required.
-    # Logged at WARNING so operators see it at default log level (INFO).
-    if _config.auth.mode == "vpn":
-        logger.warning(
-            "VPN mode: skipping auth for %s %s — all connections trusted",
-            request.method,
-            request.url.path,
-        )
-        return
+    token = request.cookies.get(sessions.SESSION_COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail=_UNAUTHORIZED_DETAIL)
+    caller = f"ip:{_client_ip(request)}"
+    if _session_failures_exhausted(caller):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    session = await sessions.resolve_session(get_pool(), token)
+    if session is None:
+        _note_session_failure(caller)
+        raise HTTPException(status_code=401, detail=_UNAUTHORIZED_DETAIL)
+    return session
 
-    # Token mode: require a valid Bearer token.
-    expected_token = _config.auth.token
-    if expected_token is None:
-        raise HTTPException(status_code=500, detail="Server misconfigured")
 
-    provided = _get_bearer_token(request)
-    if provided is None:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+# The resolved session of the caller (401 without one).
+_SessionDep = Annotated[sessions.AuthenticatedSession, Depends(require_session)]
 
-    # Constant-time comparison to prevent timing attacks.
-    if not hmac.compare_digest(provided, expected_token.get_secret_value()):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+
+async def require_principal(session: _SessionDep) -> Principal:
+    """FastAPI dependency: the logged-in ``Principal`` (401 without a session)."""
+    return session.principal
+
+
+# The logged-in principal (401 without a session).
+_PrincipalDep = Annotated[Principal, Depends(require_principal)]
+
+
+async def require_chat_sender(principal: _PrincipalDep) -> Principal:
+    """FastAPI dependency: a logged-in principal allowed to chat.
+
+    Raises:
+        HTTPException: 403 ``Forbidden`` unless the principal has
+            ``Capability.CHAT_SEND`` (a Viewer or a Super Admin has not).
+    """
+    if not can(principal, Capability.CHAT_SEND):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return principal
+
+
+# A logged-in principal with chat.send (401 without a session, 403 without the role).
+_ChatSenderDep = Annotated[Principal, Depends(require_chat_sender)]
 
 
 # ---------------------------------------------------------------------------
@@ -661,7 +900,7 @@ async def _check_llm_reachable() -> bool:
 
 
 async def health_check() -> dict[str, str | bool]:
-    """Health check endpoint. No auth required. Checks database connectivity.
+    """Health check endpoint. Public (no session). Checks database connectivity.
 
     Reports the active LLM provider/model and whether it is reachable. The DB
     check still gates the 503; an unreachable LLM does not fail the check (it is
@@ -688,18 +927,145 @@ async def health_check() -> dict[str, str | bool]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Auth route handlers
+# ---------------------------------------------------------------------------
+
+
+def _session_max_age_s() -> int:
+    """The session cookie's Max-Age: the fixed session lifetime, in seconds."""
+    return int(sessions.SESSION_LIFETIME.total_seconds())
+
+
+async def post_login(request: Request, body: LoginRequest) -> Response:
+    """Handle POST /api/auth/login — email/password login (public).
+
+    Rate-limited per client IP. On success opens a server-side session and
+    answers 204 with the ``admino_session`` cookie (HttpOnly, SameSite=Strict,
+    Path=/, Max-Age = the session lifetime, Secure iff
+    ``server.cookie_secure``). Every failure cause (unknown email, wrong
+    password, inactive account or organization) is the same 401, and no cookie
+    is set.
+
+    Args:
+        request: The incoming request (client IP and User-Agent for the session).
+        body: Validated LoginRequest; the password is a SecretStr.
+
+    Returns:
+        An empty 204 response carrying the session cookie.
+
+    Raises:
+        HTTPException: 401 on any login failure, 429 when rate-limited.
+
+    Security notes:
+        The email, password and token are never logged or echoed; the 401 body
+        is identical for every cause (no user enumeration).
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/auth/login", f"ip:{_client_ip(request)}")
+
+    from admino.database import get_pool
+
+    try:
+        token = await auth.login(
+            get_pool(),
+            email=body.email,
+            password=body.password.get_secret_value(),
+            ip=request.client.host if request.client is not None else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except auth.LoginFailedError:
+        raise HTTPException(status_code=401, detail=auth.LOGIN_FAILED_MESSAGE) from None
+
+    response = Response(status_code=204)
+    response.set_cookie(
+        key=sessions.SESSION_COOKIE_NAME,
+        value=token,
+        max_age=_session_max_age_s(),
+        path="/",
+        secure=_config.server.cookie_secure,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+async def post_logout(
+    request: Request,
+    session: _SessionDep,
+) -> Response:
+    """Handle POST /api/auth/logout — revoke the current session.
+
+    Only the session of this cookie is revoked (the user's other devices stay
+    logged in). Answers 204 and clears the cookie.
+
+    Args:
+        request: The incoming request (its session cookie is revoked).
+        session: The resolved session (401 without one).
+
+    Returns:
+        An empty 204 response that clears the session cookie.
+    """
+    _check_rate_limit("/api/auth/logout", _user_caller(session.principal))
+
+    from admino.database import get_pool
+
+    token = request.cookies.get(sessions.SESSION_COOKIE_NAME)
+    if token:
+        await auth.logout(get_pool(), token)
+
+    response = Response(status_code=204)
+    response.delete_cookie(
+        key=sessions.SESSION_COOKIE_NAME,
+        path="/",
+        secure=_config.server.cookie_secure if _config is not None else True,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+async def get_me(
+    session: _SessionDep,
+) -> MeResponse:
+    """Handle GET /api/auth/me — the logged-in account and its languages.
+
+    Every value comes from the resolved session (the database), never from the
+    request.
+
+    Args:
+        session: The resolved session (401 without one).
+
+    Returns:
+        MeResponse with the principal's ids, kind, role and languages.
+    """
+    principal = session.principal
+    _check_rate_limit("/api/auth/me", _user_caller(principal))
+    return MeResponse(
+        user_id=principal.user_id,
+        kind=principal.kind,
+        org_id=principal.org_id,
+        role=principal.role,
+        ui_language=session.ui_language,
+        response_language=session.response_language,
+    )
+
+
 async def post_message(
     body: ChatRequest,
-    _auth: None = Depends(require_auth),
+    principal: _ChatSenderDep,
 ) -> ChatResponse:
     """Handle POST /api/message — send a user message to the agent.
 
-    Validates the request, retrieves or creates a session, runs the agent,
-    updates session state, and returns the response.
+    Validates the request, retrieves or creates the caller's chat, runs the
+    agent with the caller's principal, updates chat state, and returns the
+    response.
 
     Args:
         body: Validated ChatRequest with message and session_id.
-        _auth: Auth dependency (side-effect only).
+        principal: The logged-in principal (needs ``chat.send``).
 
     Returns:
         ChatResponse with the agent's reply and tool call summary.
@@ -707,7 +1073,7 @@ async def post_message(
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/message")
+    _check_rate_limit("/api/message", _user_caller(principal))
     _reap_expired_confirmations()
     await _resolve_pending_promotions()
 
@@ -720,25 +1086,26 @@ async def post_message(
         )
 
     session_id = body.session_id
+    key = _chat_key(principal.user_id, session_id)
 
-    # Per-session lock serialises concurrent requests for the same session,
+    # Per-chat lock serialises concurrent requests for the same chat,
     # preventing lost conversation turns from interleaved read-modify-write.
-    async with _get_session_lock(session_id):
-        history = _sessions.get(session_id, [])
+    async with _get_session_lock(key):
+        history = _sessions.get(key, [])
 
-        # If a confirmation was pending for this session, the user has
+        # If a confirmation was pending for this chat, the user has
         # implicitly cancelled it by sending a new chat message. Drop the
         # pending record and close any dangling ``tool_use`` in the stored
         # history so the next LLM call is well-formed. We also call the
         # cleanup unconditionally as a defence-in-depth step — it is a
         # no-op on a well-formed history.
-        if session_id in _pending_confirmations:
+        if key in _pending_confirmations:
             logger.info(
                 "Session %s sent a new message while confirmation was pending — "
                 "cancelling the pending tool call",
                 session_id,
             )
-            del _pending_confirmations[session_id]
+            del _pending_confirmations[key]
         history = _close_dangling_tool_use(history)
 
         logger.info("Processing message for session %s", session_id)
@@ -748,6 +1115,7 @@ async def post_message(
                 user_message=body.message,
                 session_id=session_id,
                 history=history,
+                principal=principal,
             )
         except (MemoryError, RecursionError):
             raise
@@ -755,13 +1123,13 @@ async def post_message(
             logger.error("Agent run failed for session %s", session_id)
             raise HTTPException(status_code=500, detail="Internal error") from None
 
-        # Update session history from the agent's returned history (LRU-tracked).
-        _touch_session(session_id, result.history)
+        # Update chat history from the agent's returned history (LRU-tracked).
+        _touch_session(key, result.history)
 
         # Store pending confirmation if the agent is awaiting one.
         pending_summary: PendingConfirmationSummary | None = None
         if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
-            _pending_confirmations[session_id] = result.pending_confirmation
+            _pending_confirmations[key] = result.pending_confirmation
             pending_summary = _summarise_pending(result.pending_confirmation)
 
         logger.info(
@@ -781,23 +1149,23 @@ async def post_message(
 
 
 async def get_events(
+    principal: _ChatSenderDep,
     session_id: str = Query(
         min_length=1,
         max_length=64,
         pattern=r"^[a-zA-Z0-9_-]+$",
         description="Session identifier. Alphanumeric, hyphens, underscores only.",
     ),
-    _auth: None = Depends(require_auth),
 ) -> StreamingResponse:
-    """Handle GET /api/events — SSE stream for a session.
+    """Handle GET /api/events — SSE stream for one of the caller's chats.
 
     For v1, this is a stub that returns session status. ``_stream_agent_result``
     is implemented and tested but not yet wired into this endpoint — it will
     be connected in v2 when full SSE streaming is completed.
 
     Args:
+        principal: The logged-in principal (needs ``chat.send``).
         session_id: Session identifier from query parameter (Pydantic-validated).
-        _auth: Auth dependency (side-effect only).
 
     Returns:
         StreamingResponse with text/event-stream content type.
@@ -805,9 +1173,9 @@ async def get_events(
     if _agent is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/events")
+    _check_rate_limit("/api/events", _user_caller(principal))
 
-    history = _sessions.get(session_id, [])
+    history = _sessions.get(_chat_key(principal.user_id, session_id), [])
     if not history:
         # No messages in session yet — stream an empty done.
         async def _empty_stream() -> AsyncIterator[str]:
@@ -842,6 +1210,7 @@ async def get_events(
 
 
 async def post_confirm(
+    principal: _ChatSenderDep,
     confirmation_id: str = Path(
         min_length=1,
         max_length=64,
@@ -849,17 +1218,18 @@ async def post_confirm(
         description="Confirmation identifier. Alphanumeric, hyphens, underscores only.",
     ),
     body: ConfirmRequest = ...,  # type: ignore[assignment]
-    _auth: None = Depends(require_auth),
 ) -> ChatResponse:
     """Handle POST /api/confirm/{confirmation_id} — approve or deny a pending action.
 
-    Looks up the pending confirmation by session_id, verifies the confirmation_id
-    matches, checks expiry, and if approved, resumes the agent run.
+    Looks up the caller's pending confirmation by session_id, verifies the
+    confirmation_id matches, checks expiry, and if approved, resumes the agent
+    run with the caller's principal. Another user's pending confirmation is
+    never found (404).
 
     Args:
+        principal: The logged-in principal (needs ``chat.send``).
         confirmation_id: The confirmation ID from the URL path (Pydantic-validated).
         body: Validated ConfirmRequest with session_id and approved flag.
-        _auth: Auth dependency (side-effect only).
 
     Returns:
         ChatResponse with the result of the resumed agent run.
@@ -871,15 +1241,16 @@ async def post_confirm(
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/confirm")
+    _check_rate_limit("/api/confirm", _user_caller(principal))
     _reap_expired_confirmations()
     await _resolve_pending_promotions()
 
     session_id = body.session_id
+    key = _chat_key(principal.user_id, session_id)
 
-    # Per-session lock serialises with concurrent POST /api/message requests.
-    async with _get_session_lock(session_id):
-        pending = _pending_confirmations.get(session_id)
+    # Per-chat lock serialises with concurrent POST /api/message requests.
+    async with _get_session_lock(key):
+        pending = _pending_confirmations.get(key)
 
         if pending is None:
             raise HTTPException(status_code=404, detail="No pending confirmation for this session")
@@ -894,11 +1265,11 @@ async def post_confirm(
         # Check expiry at server layer — avoids a full agent round trip for
         # expired confirmations that the registry would also reject.
         if datetime.now(UTC) >= pending.expires_at:
-            del _pending_confirmations[session_id]
+            del _pending_confirmations[key]
             raise HTTPException(status_code=410, detail="Confirmation has expired")
 
         # Remove the pending confirmation regardless of approval/denial.
-        del _pending_confirmations[session_id]
+        del _pending_confirmations[key]
 
         if not body.approved:
             logger.info("Confirmation %s denied for session %s", confirmation_id, session_id)
@@ -918,7 +1289,7 @@ async def post_confirm(
             )
 
         # Approved — resume the agent with the pending confirmation.
-        history = _sessions.get(session_id, [])
+        history = _sessions.get(key, [])
 
         logger.info(
             "Resuming agent for session %s after confirmation %s",
@@ -931,6 +1302,7 @@ async def post_confirm(
                 user_message="",
                 session_id=session_id,
                 history=history,
+                principal=principal,
                 pending_confirmation=pending,
             )
         except (MemoryError, RecursionError):
@@ -939,11 +1311,11 @@ async def post_confirm(
             logger.error("Agent resume failed for session %s", session_id)
             raise HTTPException(status_code=500, detail="Internal error") from None
 
-        _touch_session(session_id, result.history)
+        _touch_session(key, result.history)
 
         pending_summary: PendingConfirmationSummary | None = None
         if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
-            _pending_confirmations[session_id] = result.pending_confirmation
+            _pending_confirmations[key] = result.pending_confirmation
             pending_summary = _summarise_pending(result.pending_confirmation)
 
         return ChatResponse(
@@ -1091,7 +1463,7 @@ async def _build_settings_response() -> SettingsResponse:
 
 
 async def get_settings(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> SettingsResponse:
     """Handle GET /api/settings — return current settings with masked secrets.
 
@@ -1099,7 +1471,7 @@ async def get_settings(
     replaces sensitive fields (API keys) with boolean flags.
 
     Args:
-        _auth: Auth dependency (side-effect only).
+        principal: The logged-in principal (from the session).
 
     Returns:
         SettingsResponse with current settings.
@@ -1107,13 +1479,13 @@ async def get_settings(
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/settings/get")
+    _check_rate_limit("/api/settings/get", _user_caller(principal))
     return await _build_settings_response()
 
 
 async def patch_settings(
     body: SettingsPatch,
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> SettingsResponse:
     """Handle PATCH /api/settings — partially update settings.
 
@@ -1125,7 +1497,7 @@ async def patch_settings(
 
     Args:
         body: Validated SettingsPatch with optional sections.
-        _auth: Auth dependency (side-effect only).
+        principal: The logged-in principal (from the session).
 
     Returns:
         Updated SettingsResponse after applying the patch.
@@ -1140,7 +1512,7 @@ async def patch_settings(
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/settings/patch")
+    _check_rate_limit("/api/settings/patch", _user_caller(principal))
 
     pool = get_pool()
     current_settings = await load_settings_from_db(pool)
@@ -1275,7 +1647,7 @@ async def patch_settings(
 
 
 async def get_permissions(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> PermissionsResponse:
     """Handle GET /api/permissions — return full permission matrix.
 
@@ -1283,7 +1655,7 @@ async def get_permissions(
     list of (tool, action, permission) entries.
 
     Args:
-        _auth: Auth dependency (side-effect only).
+        principal: The logged-in principal (from the session).
 
     Returns:
         PermissionsResponse with all configured permissions.
@@ -1293,7 +1665,7 @@ async def get_permissions(
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/permissions/get")
+    _check_rate_limit("/api/permissions/get", _user_caller(principal))
 
     pool = get_pool()
     raw = await load_permissions_from_db(pool)
@@ -1310,7 +1682,7 @@ async def get_permissions(
 
 async def patch_permissions(
     body: PermissionPatch,
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> PermissionsResponse:
     """Handle PATCH /api/permissions — update a single permission.
 
@@ -1320,7 +1692,7 @@ async def patch_permissions(
 
     Args:
         body: Validated PermissionPatch with tool, action, permission.
-        _auth: Auth dependency (side-effect only).
+        principal: The logged-in principal (from the session).
 
     Returns:
         Updated PermissionsResponse after applying the change.
@@ -1336,7 +1708,7 @@ async def patch_permissions(
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/permissions/patch")
+    _check_rate_limit("/api/permissions/patch", _user_caller(principal))
 
     # Enforce hardcoded denials: these cannot be set to anything other than "deny".
     if (body.tool, body.action) in HARDCODED_DENIALS and body.permission != "deny":
@@ -1455,12 +1827,12 @@ async def _resolve_pending_promotions() -> None:
 
 
 async def get_critical_permissions(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> CriticalPermissionsResponse:
     """Return the 4 promotable permissions with current state and cooldown info."""
     from admino.permissions import PROMOTABLE_DENIALS
 
-    _check_rate_limit("/api/critical-permissions/get")
+    _check_rate_limit("/api/critical-permissions/get", _user_caller(principal))
     await _resolve_pending_promotions()
 
     entries: list[CriticalPermissionEntry] = []
@@ -1480,12 +1852,19 @@ async def get_critical_permissions(
 
 
 async def patch_critical_permission(
+    principal: _PrincipalDep,
     tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
     action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
-    body: CriticalPermissionPromote | None = None,
-    _auth: None = Depends(require_auth),
 ) -> CriticalPermissionState:
-    """Promote (deny -> confirm with cooldown) or demote (confirm -> deny) a permission."""
+    """Demote a promoted critical permission (confirm -> deny).
+
+    Promotion (deny -> confirm) is disabled until #161 adds password re-auth:
+    a PATCH on a permission that isn't currently promoted answers 403 and
+    starts no cooldown. Any request body is ignored.
+
+    Raises:
+        HTTPException: 404 for a non-promotable pair, 403 for a promotion.
+    """
     from admino.permissions import PROMOTABLE_DENIALS
 
     if (tool, action) not in PROMOTABLE_DENIALS:
@@ -1495,75 +1874,45 @@ async def patch_critical_permission(
 
     # Rate-limit before any await to prevent concurrent requests from
     # racing past the limiter while a coroutine is suspended.
-    _check_rate_limit("/api/critical-permissions/promote")
+    _check_rate_limit("/api/critical-permissions/promote", _user_caller(principal))
 
     # Resolve any expired cooldowns before deciding the current state.
     await _resolve_pending_promotions()
 
-    # DEMOTE path: if currently promoted, revert to deny immediately.
-    if key in _promoted_permissions:
-        _promoted_permissions.discard(key)
-        _pending_promotions.pop(key, None)
-
-        from admino.config import load_permissions_config_from_db
-        from admino.database import get_pool, update_permission
-
-        pool = get_pool()
-        await update_permission(pool, tool, action, "deny")
-        new_perms = await load_permissions_config_from_db(pool)
-        if _agent is not None:
-            _agent._permissions = new_perms
-            _agent._promoted = frozenset(_promoted_permissions)
-
-        logger.warning("Critical permission demoted: tool=%s action=%s", tool, action)
-        return CriticalPermissionState(tool=tool, action=action, state="deny")
-
-    # PROMOTE path: deny -> confirm with re-auth and cooldown.
-    if body is None:
-        raise HTTPException(status_code=400, detail="Re-auth token required for promotion")
-
-    # Validate re-auth token against active session token.
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-    expected_token = _config.auth.token
-    if expected_token is None:
-        raise HTTPException(status_code=500, detail="Server misconfigured")
-    if not hmac.compare_digest(
-        body.bearer_token.get_secret_value().encode(),
-        expected_token.get_secret_value().encode(),
-    ):
-        raise HTTPException(status_code=401, detail="Re-auth failed")
-
-    # Already pending? Return existing pending state.
-    if key in _pending_promotions:
-        return CriticalPermissionState(
-            tool=tool,
-            action=action,
-            state="deny",
-            pending_at=_pending_promotions[key],
+    # PROMOTE path: disabled until #161 (password re-auth).
+    if key not in _promoted_permissions:
+        raise HTTPException(
+            status_code=403,
+            detail="Critical permission promotions are temporarily unavailable.",
         )
 
-    # Start cooldown.
-    now = datetime.now(UTC)
-    _pending_promotions[key] = now
-    logger.warning(
-        "Critical permission promotion started: tool=%s action=%s pending_at=%s",
-        tool,
-        action,
-        now.isoformat(),
-    )
-    return CriticalPermissionState(tool=tool, action=action, state="deny", pending_at=now)
+    # DEMOTE path: currently promoted, revert to deny immediately.
+    _promoted_permissions.discard(key)
+    _pending_promotions.pop(key, None)
+
+    from admino.config import load_permissions_config_from_db
+    from admino.database import get_pool, update_permission
+
+    pool = get_pool()
+    await update_permission(pool, tool, action, "deny")
+    new_perms = await load_permissions_config_from_db(pool)
+    if _agent is not None:
+        _agent._permissions = new_perms
+        _agent._promoted = frozenset(_promoted_permissions)
+
+    logger.warning("Critical permission demoted: tool=%s action=%s", tool, action)
+    return CriticalPermissionState(tool=tool, action=action, state="deny")
 
 
 async def cancel_critical_permission_pending(
+    principal: _PrincipalDep,
     tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
     action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
-    _auth: None = Depends(require_auth),
 ) -> CriticalPermissionState:
     """Cancel a pending promotion cooldown and revert to deny."""
     from admino.permissions import PROMOTABLE_DENIALS
 
-    _check_rate_limit("/api/critical-permissions/cancel")
+    _check_rate_limit("/api/critical-permissions/cancel", _user_caller(principal))
 
     if (tool, action) not in PROMOTABLE_DENIALS:
         raise HTTPException(status_code=404, detail="Not a promotable permission")
@@ -1625,7 +1974,7 @@ def _build_oauth_redirect_uri() -> str:
 
 
 async def oauth_google_authorize(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> OAuthAuthorizeResponse:
     """Build and return a Google OAuth consent URL.
 
@@ -1640,12 +1989,12 @@ async def oauth_google_authorize(
         HTTPException: 500 if OAuth env vars are not configured.
 
     Security notes:
-        - Requires Bearer auth.
+        - Requires a session.
         - Rate limited to prevent state-token flooding.
         - State tokens expire after ``_OAUTH_STATE_TTL_S`` seconds.
         - Never logs credentials or tokens.
     """
-    _check_rate_limit("/api/oauth/google/authorize")
+    _check_rate_limit("/api/oauth/google/authorize", _user_caller(principal))
     _reap_oauth_states()
 
     redirect_uri = _build_oauth_redirect_uri()
@@ -1661,7 +2010,7 @@ async def oauth_google_authorize(
 
 
 async def oauth_microsoft_authorize(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> OAuthAuthorizeResponse:
     """Build and return a Microsoft OAuth consent URL.
 
@@ -1676,12 +2025,12 @@ async def oauth_microsoft_authorize(
         HTTPException: 500 if OAuth env vars are not configured.
 
     Security notes:
-        - Requires Bearer auth.
+        - Requires a session.
         - Rate limited to prevent state-token flooding.
         - State tokens expire after ``_OAUTH_STATE_TTL_S`` seconds.
         - Never logs credentials or tokens.
     """
-    _check_rate_limit("/api/oauth/microsoft/authorize")
+    _check_rate_limit("/api/oauth/microsoft/authorize", _user_caller(principal))
     _reap_oauth_states()
 
     redirect_uri = _build_oauth_redirect_uri()
@@ -1697,6 +2046,7 @@ async def oauth_microsoft_authorize(
 
 
 async def oauth_callback(
+    request: Request,
     code: str | None = Query(default=None, max_length=2048, pattern=r"^[A-Za-z0-9/_.\-+=!*~,]+$"),
     state: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_\-]+$"),
     error: str | None = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_]+$"),
@@ -1707,10 +2057,12 @@ async def oauth_callback(
     exchanges the authorization code for tokens, encrypts the refresh token,
     and persists it to the database (oauth_tokens table).
 
-    No auth required — this endpoint is called by the provider's redirect,
-    not by the authenticated frontend.
+    No session required — this endpoint is the provider's cross-site redirect
+    (a SameSite=Strict session cookie isn't sent on it); the OAuth state token
+    protects it instead. Rate-limited per client IP.
 
     Args:
+        request: The incoming request (its client IP keys the rate limit).
         code: Authorization code from the provider (present on success).
         state: CSRF state token (must match a pending state).
         error: Error string from the provider (present on user denial).
@@ -1724,7 +2076,7 @@ async def oauth_callback(
         - Tokens are Fernet-encrypted before being written to the database.
         - Never logs credentials, tokens, or authorization codes.
     """
-    _check_rate_limit("/api/oauth/callback")
+    _check_rate_limit("/api/oauth/callback", f"ip:{_client_ip(request)}")
 
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -1801,7 +2153,7 @@ async def oauth_callback(
 
 
 async def oauth_google_status(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> OAuthConnectionStatus:
     """Return the connection status for the Google OAuth account.
 
@@ -1811,13 +2163,13 @@ async def oauth_google_status(
         OAuthConnectionStatus indicating whether Google is connected.
 
     Security notes:
-        - Requires Bearer auth.
+        - Requires a session.
         - Never exposes token contents in the response.
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/google/status")
+    _check_rate_limit("/api/oauth/google/status", _user_caller(principal))
 
     from admino.database import get_pool
 
@@ -1831,7 +2183,7 @@ async def oauth_google_status(
 
 
 async def oauth_microsoft_status(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> OAuthConnectionStatus:
     """Return the connection status for the Microsoft OAuth account.
 
@@ -1841,13 +2193,13 @@ async def oauth_microsoft_status(
         OAuthConnectionStatus indicating whether Microsoft is connected.
 
     Security notes:
-        - Requires Bearer auth.
+        - Requires a session.
         - Never exposes token contents in the response.
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/microsoft/status")
+    _check_rate_limit("/api/oauth/microsoft/status", _user_caller(principal))
 
     from admino.database import get_pool
 
@@ -1861,7 +2213,7 @@ async def oauth_microsoft_status(
 
 
 async def oauth_google_disconnect(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> dict[str, str]:
     """Disconnect the Google OAuth account by deleting its token row.
 
@@ -1875,14 +2227,14 @@ async def oauth_google_disconnect(
         HTTPException: 404 if not connected, 500 if deletion fails.
 
     Security notes:
-        - Requires Bearer auth.
+        - Requires a session.
         - Rate limited to prevent abuse.
         - Never logs token contents.
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/google/disconnect")
+    _check_rate_limit("/api/oauth/google/disconnect", _user_caller(principal))
 
     from admino.database import get_pool
 
@@ -1909,7 +2261,7 @@ async def oauth_google_disconnect(
 
 
 async def oauth_microsoft_disconnect(
-    _auth: None = Depends(require_auth),
+    principal: _PrincipalDep,
 ) -> dict[str, str]:
     """Disconnect the Microsoft OAuth account by deleting its token row.
 
@@ -1924,14 +2276,14 @@ async def oauth_microsoft_disconnect(
         HTTPException: 404 if not connected, 500 if deletion fails.
 
     Security notes:
-        - Requires Bearer auth.
+        - Requires a session.
         - Rate limited to prevent abuse.
         - Never logs token contents.
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/microsoft/disconnect")
+    _check_rate_limit("/api/oauth/microsoft/disconnect", _user_caller(principal))
 
     from admino.database import get_pool
 
@@ -2134,7 +2486,7 @@ def create_app(
 
     Args:
         agent: The Agent instance to handle user messages.
-        config: Application configuration (server, auth, CORS, etc.).
+        config: Application configuration (server, limits, LLM, etc.).
 
     Returns:
         A configured FastAPI application ready to serve.
@@ -2151,34 +2503,8 @@ def create_app(
     _pending_promotions.clear()
     _promoted_permissions.clear()
 
-    # Initialize rate limiters (reset on app creation for test isolation).
-    global _global_rate_limiter
-    _rate_limiters.clear()
-    _rate_limiters["/api/message"] = _TokenBucket(rate=0.5, capacity=5)
-    _rate_limiters["/api/confirm"] = _TokenBucket(rate=0.5, capacity=5)
-    _rate_limiters["/api/events"] = _TokenBucket(rate=0.17, capacity=3)
-    _rate_limiters["/api/settings/get"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/settings/patch"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/permissions/patch"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/google/authorize"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/microsoft/authorize"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/callback"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/google/status"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/oauth/microsoft/status"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/oauth/google/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/oauth/microsoft/disconnect"] = _TokenBucket(rate=0.2, capacity=2)
-    _rate_limiters["/api/critical-permissions/get"] = _TokenBucket(rate=1.0, capacity=5)
-    _rate_limiters["/api/critical-permissions/promote"] = _TokenBucket(rate=5 / 60, capacity=5)
-    _rate_limiters["/api/critical-permissions/cancel"] = _TokenBucket(rate=0.5, capacity=5)
-    _global_rate_limiter = _TokenBucket(rate=1.0, capacity=10)
-
-    # Log VPN mode warning at server startup.
-    if config.auth.mode == "vpn":
-        logger.warning(
-            "Server running in VPN mode — all requests are trusted without "
-            "authentication. Ensure network-level access controls are in place."
-        )
+    # Rate-limit buckets start empty (fresh process state, test isolation).
+    _rate_buckets.clear()
 
     app = FastAPI(
         title="admino",
@@ -2186,20 +2512,24 @@ def create_app(
         version="0.1.0",
         docs_url=None,  # Disable Swagger UI in production
         redoc_url=None,  # Disable ReDoc in production
+        openapi_url=None,  # No anonymous map of the API surface
         lifespan=_lifespan,
     )
 
-    # --- Security headers middleware ---
-    # Starlette processes add_middleware calls in LIFO order: first added =
-    # outermost wrapper = last to touch the response. By adding
-    # SecurityHeadersMiddleware first, it wraps the entire stack and injects
-    # headers on every response (including CORS preflight 200s).
+    # --- Middleware ---
+    # Starlette wraps the LAST added middleware outermost. Resulting order for a
+    # request: CORS -> security headers -> cross-origin protection -> routes.
+    # Cross-origin protection (CSRF) therefore refuses a cross-origin write
+    # before authentication, rate limiting and handlers run, and its 403 still
+    # gets the security headers.
+    app.add_middleware(CrossOriginProtectionMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
 
     # --- CORS middleware ---
-    # Default to localhost-only origins for local-first security.
-    # allow_credentials=False: Bearer auth uses Authorization header, not
-    # cookies. Setting True would widen the attack surface for no benefit.
+    # Default to localhost-only origins for local-first security. The PWA is
+    # served same-origin, so the session cookie never needs a cross-origin
+    # credentialed request: allow_credentials stays False, and Content-Type is
+    # the only allowed request header (no Authorization: there is no bearer auth).
     cors_origins = [
         "http://localhost:8000",
         "http://127.0.0.1:8000",
@@ -2211,7 +2541,7 @@ def create_app(
         allow_origins=cors_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
-        allow_headers=["Authorization", "Content-Type"],
+        allow_headers=["Content-Type"],
     )
 
     # --- Error handlers ---
@@ -2221,10 +2551,14 @@ def create_app(
     app.add_exception_handler(ValidationError, _validation_error_handler)  # type: ignore[arg-type]
 
     # --- Routes ---
-    # Health check — no auth.
+    # Public: health check, login and the OAuth callback (plus static files).
+    # Every other route depends on require_session.
     app.get("/health")(health_check)
+    app.post("/api/auth/login", status_code=204, response_model=None)(post_login)
 
-    # API routes — auth required.
+    # API routes — session required.
+    app.post("/api/auth/logout", status_code=204, response_model=None)(post_logout)
+    app.get("/api/auth/me", response_model=MeResponse)(get_me)
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
@@ -2251,7 +2585,7 @@ def create_app(
     app.get("/api/oauth/microsoft/authorize", response_model=OAuthAuthorizeResponse)(
         oauth_microsoft_authorize
     )
-    app.get("/api/oauth/callback")(oauth_callback)
+    app.get("/api/oauth/callback")(oauth_callback)  # public, state-checked
     app.get("/api/oauth/google/status", response_model=OAuthConnectionStatus)(oauth_google_status)
     app.get("/api/oauth/microsoft/status", response_model=OAuthConnectionStatus)(
         oauth_microsoft_status

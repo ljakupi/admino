@@ -1,14 +1,20 @@
-"""End-to-end spec for tool-call auditing and the NDJSON log removal (GH-147).
+"""End-to-end spec for tool-call auditing and the NDJSON log removal (GH-147, GH-149).
 
 A real ``Agent`` runs one tool call through the real registry, wired to the
 recorder ``main._build_tool_call_recorder()`` builds, with the database pool
 mocked. What these tests pin down:
 
-- A tool call writes exactly one ``audit_events`` row through one parameterized
-  INSERT: action ``tool.call``, a system actor, the default org, the session's
+- A tool call by a logged-in member writes exactly one ``audit_events`` row
+  through one parameterized INSERT: action ``tool.call``, actor kind ``member``
+  with the member's ``actor_user_id``, the member's ``org_id``, the session's
   chat as target, and metadata with exactly ``tool, action, decision, success,
   duration_ms``. The tool's argument values and its output appear in no bind
   parameter.
+- GH-149 retires #147's default-org bridge: ``accounts.DEFAULT_ORG_ID`` appears
+  in no bind parameter, and a principal without an organization (a Super Admin)
+  can't write a tool.call row, so the run aborts (H-1) and nothing is written.
+- ``Agent.run`` takes the caller's ``principal`` as a required keyword and the
+  agent passes it to the recorder with the six content-free fields.
 - A turn without a tool call writes nothing (conversation entries are gone).
 - The NDJSON audit log is gone: ``admino.audit`` doesn't exist, no source file
   names an ``.ndjson`` file, and a full run with a tool call creates no
@@ -19,20 +25,26 @@ All asyncpg calls are mocked. No real PostgreSQL connections are made.
 Security notes:
 - No content in audit events (tracker #139 §5): argument values and tool output
   must never reach the audit store.
+- Tenant isolation: each row lands in the acting member's org, never in a
+  shared default org.
 """
 
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 from pydantic import BaseModel, Field
 
 import admino.main as main_module
+from admino.access import Principal
 from admino.agent import Agent
 from admino.llm import LLMResponse
 from admino.models import AgentConfig, ToolCall
@@ -48,6 +60,10 @@ _SRC_DIR = Path(__file__).resolve().parent.parent / "src" / "admino"
 _SESSION = "s-e2e-4b1c"
 _ARG_MARKER = "SECRET-ARG-7f3a"
 _OUTPUT_MARKER = "SECRET-OUTPUT-91bc"
+_USER_ID = uuid.UUID("4d5e6f70-8192-4a3b-9c4d-5e6f7a8b9c0d")
+_ORG_ID = uuid.UUID("e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b")
+_MEMBER = Principal(user_id=_USER_ID, kind="member", org_id=_ORG_ID, role="editor")
+_SUPER_ADMIN = Principal(user_id=_USER_ID, kind="super_admin")
 
 
 class _ScriptedLLM:
@@ -90,12 +106,12 @@ def pool(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return mock_pool
 
 
-def _agent(responses: list[LLMResponse]) -> Agent:
+def _agent(responses: list[LLMResponse], recorder: Any = None) -> Agent:
     register_tool("memory", "read", "Read a note", _ReadArgs)(_read_handler)
     permissions = PermissionsConfig(tools={"memory": ToolPermissions(actions={"read": "allow"})})
     return Agent(
         llm_client=_ScriptedLLM(responses),
-        tool_call_recorder=main_module._build_tool_call_recorder(),
+        tool_call_recorder=recorder or main_module._build_tool_call_recorder(),
         permissions_config=permissions,
         agent_config=AgentConfig(
             max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0
@@ -116,7 +132,9 @@ class TestToolCallWritesOneRow:
 
     @pytest.mark.asyncio
     async def test_one_insert_per_tool_call(self, pool: MagicMock) -> None:
-        result = await _agent(_tool_then_text()).run("go", session_id=_SESSION, history=[])
+        result = await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
 
         assert result.status == "final"
         assert pool.execute.await_count == 1
@@ -124,25 +142,74 @@ class TestToolCallWritesOneRow:
         assert "INSERT INTO audit_events" in sql
 
     @pytest.mark.asyncio
-    async def test_row_is_a_system_tool_call_in_the_default_org_on_the_chat(
+    async def test_row_is_a_member_tool_call_in_the_members_org_on_the_chat(
         self, pool: MagicMock
     ) -> None:
-        from admino.accounts import DEFAULT_ORG_ID
-
-        await _agent(_tool_then_text()).run("go", session_id=_SESSION, history=[])
+        """actor_kind member, the member's user id and org, the session's chat."""
+        await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
 
         params = pool.execute.await_args.args[1:]
         org_id, actor_user_id, actor_kind, action, target_type, target_ids = params[:6]
-        assert org_id == DEFAULT_ORG_ID
-        assert actor_user_id is None
-        assert actor_kind == "system"
+        assert org_id == _ORG_ID
+        assert actor_user_id == _USER_ID
+        assert actor_kind == "member"
         assert action == "tool.call"
         assert target_type == "chat"
         assert json.loads(target_ids) == [str(main_module._session_chat_id(_SESSION))]
 
     @pytest.mark.asyncio
+    async def test_row_follows_the_principal_of_each_run(self, pool: MagicMock) -> None:
+        """Two members of two orgs: each row carries its own caller's org and user."""
+        other = Principal(
+            user_id=uuid.uuid4(), kind="member", org_id=uuid.uuid4(), role="org_admin"
+        )
+        agent = _agent([*_tool_then_text(), *_tool_then_text()])
+
+        await agent.run("go", session_id=_SESSION, history=[], principal=_MEMBER)
+        await agent.run("go", session_id="s-other", history=[], principal=other)
+
+        rows = [call.args[1:3] for call in pool.execute.await_args_list]
+        assert rows == [(_ORG_ID, _USER_ID), (other.org_id, other.user_id)]
+
+    @pytest.mark.asyncio
+    async def test_member_built_from_asyncpg_uuids_is_recorded(self, pool: MagicMock) -> None:
+        """A Principal built from a users row (asyncpg UUIDs) records its org and user."""
+        member = Principal(
+            user_id=PgUUID(str(_USER_ID)),
+            kind="member",
+            org_id=PgUUID(str(_ORG_ID)),
+            role="editor",
+        )
+
+        result = await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=member
+        )
+
+        assert result.status == "final"
+        org_id, actor_user_id = pool.execute.await_args.args[1:3]
+        assert (org_id, actor_user_id) == (_ORG_ID, _USER_ID)
+
+    @pytest.mark.asyncio
+    async def test_default_org_is_in_no_bind_parameter(self, pool: MagicMock) -> None:
+        """#147's bridge is retired: DEFAULT_ORG_ID never reaches the audit store."""
+        from admino.accounts import DEFAULT_ORG_ID
+
+        await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
+
+        assert pool.execute.await_count == 1
+        for call in pool.execute.await_args_list:
+            assert DEFAULT_ORG_ID not in call.args
+            assert str(DEFAULT_ORG_ID) not in " ".join(str(value) for value in call.args)
+
+    @pytest.mark.asyncio
     async def test_metadata_holds_exactly_the_five_decision_fields(self, pool: MagicMock) -> None:
-        await _agent(_tool_then_text()).run("go", session_id=_SESSION, history=[])
+        await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
 
         metadata = json.loads(pool.execute.await_args.args[-1])
         assert set(metadata) == {"tool", "action", "decision", "success", "duration_ms"}
@@ -155,7 +222,9 @@ class TestToolCallWritesOneRow:
 
     @pytest.mark.asyncio
     async def test_no_argument_or_output_value_in_any_bind_parameter(self, pool: MagicMock) -> None:
-        result = await _agent(_tool_then_text()).run("go", session_id=_SESSION, history=[])
+        result = await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
 
         # The tool really ran and produced the marked output...
         assert any(_OUTPUT_MARKER in m.content for m in result.history if m.role == "tool")
@@ -169,7 +238,7 @@ class TestToolCallWritesOneRow:
     async def test_turn_without_tool_call_writes_nothing(self, pool: MagicMock) -> None:
         """Per-turn conversation entries are dropped without replacement."""
         result = await _agent([LLMResponse(content="Hello.")]).run(
-            "hi", session_id=_SESSION, history=[]
+            "hi", session_id=_SESSION, history=[], principal=_MEMBER
         )
 
         assert result.status == "final"
@@ -183,11 +252,78 @@ class TestAuditFailureAbortsTheRun:
     async def test_write_failure_aborts_with_audit_unavailable(self, pool: MagicMock) -> None:
         pool.execute.side_effect = OSError("connection reset")
 
-        result = await _agent(_tool_then_text()).run("go", session_id=_SESSION, history=[])
+        result = await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
 
         assert result.status == "error"
         assert result.response == "Internal error: audit unavailable."
         assert result.pending_confirmation is None
+
+
+class TestPrincipalReachesTheRecorder:
+    """The run's principal is required and handed to the recorder unchanged."""
+
+    def test_run_requires_principal_keyword(self) -> None:
+        """Agent.run(..., *, principal) — keyword-only, no default."""
+        parameter = inspect.signature(Agent.run).parameters["principal"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+
+    @pytest.mark.asyncio
+    async def test_recorder_gets_the_principal_and_six_content_free_fields(self) -> None:
+        """The agent awaits the recorder with exactly seven keywords: the principal plus
+        session_id, tool, action, decision, success and duration_ms."""
+        recorder = AsyncMock()
+
+        await _agent(_tool_then_text(), recorder).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
+
+        recorder.assert_awaited_once()
+        assert recorder.await_args.args == ()
+        kwargs = recorder.await_args.kwargs
+        assert set(kwargs) == {
+            "principal",
+            "session_id",
+            "tool",
+            "action",
+            "decision",
+            "success",
+            "duration_ms",
+        }
+        assert kwargs["principal"] is _MEMBER
+        assert (kwargs["session_id"], kwargs["tool"], kwargs["action"]) == (
+            _SESSION,
+            "memory",
+            "read",
+        )
+
+
+class TestNoOrgNoToolCall:
+    """A principal without an organization can't write a tool.call row: the run aborts."""
+
+    @pytest.mark.asyncio
+    async def test_super_admin_run_aborts_with_audit_unavailable(self, pool: MagicMock) -> None:
+        """A Super Admin has no TenantContext, so the recorder raises and the agent aborts
+        the run (H-1) with the fixed message and no pending confirmation."""
+        result = await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_SUPER_ADMIN
+        )
+
+        assert result.status == "error"
+        assert result.response == "Internal error: audit unavailable."
+        assert result.pending_confirmation is None
+
+    @pytest.mark.asyncio
+    async def test_super_admin_run_writes_nothing(self, pool: MagicMock) -> None:
+        """No row lands anywhere: not in a default org, not without an org."""
+        await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_SUPER_ADMIN
+        )
+
+        pool.execute.assert_not_awaited()
 
 
 class TestNoNdjsonAuditLog:
@@ -211,6 +347,8 @@ class TestNoNdjsonAuditLog:
     ) -> None:
         monkeypatch.chdir(tmp_path)
 
-        await _agent(_tool_then_text()).run("go", session_id=_SESSION, history=[])
+        await _agent(_tool_then_text()).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER
+        )
 
         assert list(tmp_path.rglob("*.ndjson")) == []

@@ -59,6 +59,10 @@ flow under **Settings → Danger zone**:
 1. **Re-authentication** — you prove it's really you.
 2. **A 5-minute cooldown** — a built-in pause before the change takes effect.
 
+> Promoting is **temporarily unavailable**: the re-authentication step moves from the old
+> access token to your password. Until then a promotion is refused with `403`. Demoting a
+> promoted permission still works.
+
 After promotion the action reaches **confirm** — so it *still* asks before every send. You
 can never turn one of these into a silent `allow`.
 

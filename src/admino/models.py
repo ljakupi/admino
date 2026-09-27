@@ -8,7 +8,9 @@ Tool-call audit events are not modelled here: they are content-free rows of
 the ``audit_events`` table, validated by ``admino.audit_events``.
 
 Security notes:
-- No secrets, tokens, passwords, or credentials are stored in any model field.
+- No secrets, tokens, passwords, or credentials are stored in any model field,
+  except ``LoginRequest.password``: a ``SecretStr`` (hidden from repr/str) that
+  lives only for the login request and is never logged or echoed.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators.
@@ -38,8 +40,14 @@ import unicodedata
 from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Any, Final, Literal
+from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from admino.access import (  # noqa: TC001 — Pydantic resolves field annotations at runtime
+    MemberRole,
+    UserKind,
+)
 
 # Control characters to strip from free text shown to users (chat responses,
 # tool-call records, confirmation summaries) and from tool output.
@@ -1491,16 +1499,6 @@ class CriticalPermissionsResponse(BaseModel):
     permissions: list[CriticalPermissionEntry]
 
 
-class CriticalPermissionPromote(BaseModel):
-    """PATCH body for promoting a critical permission (deny -> confirm)."""
-
-    bearer_token: SecretStr = Field(
-        min_length=1,
-        max_length=2048,
-        description="Re-auth token that must match the active session token.",
-    )
-
-
 class CriticalPermissionState(BaseModel):
     """Response after PATCH or DELETE on a critical permission."""
 
@@ -1508,3 +1506,38 @@ class CriticalPermissionState(BaseModel):
     action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
     state: Literal["deny", "confirm"]
     pending_at: datetime | None = None
+
+
+# ---------------------------------------------------------------------------
+# Authentication API models (GH-149)
+# ---------------------------------------------------------------------------
+
+
+class LoginRequest(BaseModel):
+    """POST /api/auth/login request body.
+
+    The email is matched case-insensitively by ``admino.auth``; its format is
+    not validated here (an unknown address fails like a wrong password). The
+    password is a ``SecretStr``: ``repr()``/``str()`` never show it, and the
+    422 handler never echoes request input. Unknown fields are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=254)
+    password: SecretStr = Field(min_length=1, max_length=128)
+
+
+class MeResponse(BaseModel):
+    """GET /api/auth/me response: the logged-in account, from the resolved session.
+
+    Every value comes from the server-side session and users row, never from
+    the request. A Super Admin has no ``org_id`` and no ``role``.
+    """
+
+    user_id: UUID
+    kind: UserKind
+    org_id: UUID | None
+    role: MemberRole | None
+    ui_language: Literal["de", "fr", "en"]
+    response_language: Literal["de", "fr", "it", "en"] | None

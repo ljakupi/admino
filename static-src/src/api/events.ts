@@ -14,11 +14,7 @@ export function openEventStream(
   sessionId: string,
   callbacks: SSECallbacks,
 ): { close: () => void } {
-  const token = localStorage.getItem('admino_auth_token');
   const params = new URLSearchParams({ session_id: sessionId });
-  if (token) {
-    params.set('token', token);
-  }
 
   const source = new EventSource(`/api/events?${params.toString()}`);
 

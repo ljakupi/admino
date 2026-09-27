@@ -28,10 +28,13 @@ Security notes:
 - User message content, raw tool arguments, and assistant text are NEVER
   logged at INFO/DEBUG. Only counts, tool/action names, and status strings
   are emitted via the standard logger.
-- The recorder is the tool-call audit sink. It receives only the session id,
-  the tool/action names the LLM asked for, the final permission decision,
-  the success flag and the dispatch duration — never argument values, tool
-  output or error text. Conversation content is not audited.
+- The recorder is the tool-call audit sink. It receives only the run's
+  principal (the logged-in user, which the agent passes through unread), the
+  session id, the tool/action names the LLM asked for, the final permission
+  decision, the success flag and the dispatch duration — never argument
+  values, tool output or error text. Conversation content is not audited.
+- A run is never anonymous: ``run`` takes the caller's ``principal`` as a
+  required keyword (GH-149); the agent makes no access decision with it.
 - H-1: if the recorder raises, the run aborts with a fixed
   "Internal error: audit unavailable." result: no further LLM call, no
   further dispatch, and no ``pending_confirmation`` is handed out for an
@@ -73,6 +76,7 @@ from admino.models import (
 from admino.tools.registry import dispatch_tool_call, get_registered_tools
 
 if TYPE_CHECKING:
+    from admino.access import Principal
     from admino.llm import LLMClient
     from admino.permissions import PermissionsConfig, PermissionState
     from admino.tools.registry import ToolCallResult, ToolDescription
@@ -108,15 +112,16 @@ class ToolCallRecorder(Protocol):
     """Audit sink the agent awaits exactly once after every tool dispatch.
 
     The entry point binds it to storage (``admino.main`` writes an
-    ``audit_events`` row); the agent only knows this protocol, so it never
-    imports the database layer. Implementations receive content-free
-    metadata only and must raise if the record could not be written — the
-    agent then aborts the run (H-1).
+    ``audit_events`` row in the principal's org); the agent only knows this
+    protocol, so it never imports the database layer. Implementations receive
+    the run's principal plus content-free metadata only and must raise if the
+    record could not be written — the agent then aborts the run (H-1).
     """
 
     async def __call__(
         self,
         *,
+        principal: Principal,
         session_id: str,
         tool: str,
         action: str,
@@ -127,6 +132,7 @@ class ToolCallRecorder(Protocol):
         """Record one dispatch outcome.
 
         Args:
+            principal: The logged-in user the run acts for.
             session_id: The run's session identifier.
             tool: Tool name exactly as the LLM requested it (unvalidated).
             action: Action name exactly as the LLM requested it (unvalidated).
@@ -171,8 +177,8 @@ class Agent:
             llm_client: LLM client implementing the LLMClient protocol.
                 Can be AnthropicClient or OpenAIClient.
             tool_call_recorder: Tool-call audit sink, awaited exactly once
-                after every ``dispatch_tool_call`` with content-free
-                metadata. If it raises, the run aborts (H-1).
+                after every ``dispatch_tool_call`` with the run's principal
+                and content-free metadata. If it raises, the run aborts (H-1).
             permissions_config: Immutable permissions config, forwarded to
                 dispatch on every tool call. The agent itself never inspects
                 it.
@@ -205,6 +211,7 @@ class Agent:
         session_id: str,
         *,
         history: list[LLMMessage],
+        principal: Principal,
         pending_confirmation: PendingConfirmation | None = None,
     ) -> AgentResult:
         """Run the agent loop for a single user message.
@@ -223,6 +230,8 @@ class Agent:
             history: Prior conversation history (caller-owned). The agent
                 copies this list; the original is not mutated. Any
                 ``system``-role messages in it are dropped.
+            principal: The logged-in user the run acts for (required). Passed
+                unchanged to the tool-call recorder with every dispatch.
             pending_confirmation: If set, a previously-issued confirmation is
                 being resumed. The first tool call in this turn is dispatched
                 with this value so ``registry.dispatch_tool_call`` can verify
@@ -303,6 +312,7 @@ class Agent:
         if is_resume and pending_confirmation is not None:
             pre_result = await self._resume_pending_dispatch(
                 pending_confirmation=pending_confirmation,
+                principal=principal,
                 session_id=session_id,
                 working_history=working_history,
                 tool_records=tool_records,
@@ -396,6 +406,7 @@ class Agent:
 
                 dispatched = await self._dispatch_one(
                     tool_call=tool_call,
+                    principal=principal,
                     session_id=session_id,
                     pending_confirmation=carry_confirmation,
                 )
@@ -487,15 +498,17 @@ class Agent:
         self,
         *,
         tool_call: ToolCall,
+        principal: Principal,
         session_id: str,
         pending_confirmation: PendingConfirmation | None,
     ) -> tuple[ToolCallResult, int] | None:
         """Dispatch a single tool call via the registry, then record it.
 
         The one place that times a dispatch and awaits the recorder, so no
-        call site can dispatch without recording. The recorder gets the raw
-        tool/action names the LLM asked for, the final decision, the success
-        flag and the duration — never arguments, output or error text.
+        call site can dispatch without recording. The recorder gets the run's
+        principal, the raw tool/action names the LLM asked for, the final
+        decision, the success flag and the duration — never arguments, output
+        or error text.
 
         Returns:
             ``(result, duration_ms)`` once the outcome is recorded, or
@@ -515,6 +528,7 @@ class Agent:
         duration_ms = int((time.monotonic() - start) * 1000)
         try:
             await self._record_tool_call(
+                principal=principal,
                 session_id=session_id,
                 tool=tool_call.tool,
                 action=tool_call.action,
@@ -533,6 +547,7 @@ class Agent:
         self,
         *,
         pending_confirmation: PendingConfirmation,
+        principal: Principal,
         session_id: str,
         working_history: list[LLMMessage],
         tool_records: list[ToolCallRecord],
@@ -555,6 +570,7 @@ class Agent:
         tool_call = pending_confirmation.tool_call
         dispatched = await self._dispatch_one(
             tool_call=tool_call,
+            principal=principal,
             session_id=session_id,
             pending_confirmation=pending_confirmation,
         )

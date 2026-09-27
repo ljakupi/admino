@@ -5,12 +5,9 @@ import AppNavRail from '@/components/AppNavRail.vue';
 import BottomTabBar from '@/components/BottomTabBar.vue';
 import ToastHost from '@/components/ToastHost.vue';
 import ConnectionBanner from '@/components/ConnectionBanner.vue';
-import AuthDialog from '@/components/AuthDialog.vue';
 import { useConnectionStore } from '@/stores/connection';
-import { useSettingsStore } from '@/stores/settings';
 
 const connection = useConnectionStore();
-const settings = useSettingsStore();
 const route = useRoute();
 
 const showOfflineBanner = computed(() => connection.state === 'offline');
@@ -21,16 +18,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <AuthDialog v-if="settings.needsAuth" />
-  <template v-else>
-    <AppNavRail class="nav-rail" />
-    <main class="main-content">
-      <ConnectionBanner v-if="showOfflineBanner" />
-      <RouterView />
-    </main>
-    <BottomTabBar class="bottom-bar" />
-    <ToastHost />
-  </template>
+  <AppNavRail class="nav-rail" />
+  <main class="main-content">
+    <ConnectionBanner v-if="showOfflineBanner" />
+    <RouterView />
+  </main>
+  <BottomTabBar class="bottom-bar" />
+  <ToastHost />
 </template>
 
 <style scoped>

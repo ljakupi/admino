@@ -626,14 +626,13 @@ describe('chatStore sendMessage errors', () => {
     },
   );
 
-  it('on 401 requires authentication and shows an error toast', async () => {
+  // Issue #149: the token prompt (settings.needsAuth) is gone; the login page
+  // comes with #155. A 401 (no or expired session) still shows an error toast.
+  it('on 401 shows an error toast', async () => {
     mockedPostMessage.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'));
-    const settings = useSettingsStore();
-    settings.needsAuth = false;
 
     await useChatStore().sendMessage('Hello');
 
-    expect(settings.needsAuth).toBe(true);
     expect(toastKinds()).toContain('error');
   });
 

@@ -64,7 +64,6 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
   const permissions = ref<Map<string, PermState>>(new Map());
   const loading = ref(false);
   const error = ref<string | null>(null);
-  const authRow = ref<CritPermDef | null>(null);
 
   function getState(tool: string, action: string): PermState {
     return permissions.value.get(critKey(tool, action)) ?? { state: 'deny', pendingAt: null };
@@ -90,10 +89,10 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
     }
   }
 
-  async function promote(tool: string, action: string, bearerToken: string) {
+  async function promote(tool: string, action: string) {
     const toasts = useToastStore();
     try {
-      const res = await promoteCriticalPermission(tool, action, bearerToken);
+      const res = await promoteCriticalPermission(tool, action);
       permissions.value.set(critKey(tool, action), {
         state: res.state,
         pendingAt: res.pending_at ? new Date(res.pending_at).getTime() : null,
@@ -106,12 +105,8 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
         t('toast.criticalPermissions.promotionScheduled.body', { time: formatCooldown(COOLDOWN_SEC) }),
       );
     } catch (e) {
-      if (e instanceof ApiError && e.status === 401) {
-        toasts.add(
-          'error',
-          t('toast.criticalPermissions.authFailed.title'),
-          t('toast.criticalPermissions.authFailed.body'),
-        );
+      if (e instanceof ApiError) {
+        toasts.add('error', t('toast.criticalPermissions.promotionFailed.title'), e.message);
       } else {
         toasts.add('error', t('toast.criticalPermissions.promotionFailed.title'));
       }
@@ -145,25 +140,14 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
     }
   }
 
-  function openAuth(row: CritPermDef) {
-    authRow.value = row;
-  }
-
-  function closeAuth() {
-    authRow.value = null;
-  }
-
   return {
     permissions,
     loading,
     error,
-    authRow,
     getState,
     load,
     promote,
     cancelPending,
     demote,
-    openAuth,
-    closeAuth,
   };
 });

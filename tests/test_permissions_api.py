@@ -3,14 +3,16 @@
 Covers:
 - GET /api/permissions: returns full permission matrix from DB
 - PATCH /api/permissions: updates single permission, rejects hardcoded denials
-- Auth enforcement on both endpoints (401 without/wrong token)
+- Session enforcement on both endpoints (GH-149): 401 without a session
+  cookie or with one that resolves to no session
 - Validation: invalid identifiers (422), invalid permission values (422)
 - Immediate effect: agent._permissions updated after PATCH
 - Adversarial inputs: oversized identifiers, control characters, injection
 
 Security notes:
 - All tests use mocked database — no real DB or API calls.
-- Auth token is a known test value, never a real secret.
+- Callers are logged in with tests.auth_helpers (an Org Admin by default); the
+  session token is a known fake value, never a real secret.
 - Hardcoded denials cannot be overridden regardless of config.
 """
 
@@ -21,16 +23,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from pydantic import SecretStr
 
 from admino.server import create_app
+from tests.auth_helpers import login, member_session, resolved_session, session_cookie
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_TEST_TOKEN = "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"  # >48 chars, >20 unique
-_AUTH_HEADER = {"Authorization": f"Bearer {_TEST_TOKEN}"}
+_UNAUTHORIZED = {"detail": "Unauthorized"}
 
 # Mocked permission data from load_permissions_from_db.
 _DEFAULT_PERMISSIONS: dict[str, dict[str, str]] = {
@@ -60,28 +61,24 @@ _HARDCODED_DENIALS: list[tuple[str, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def _make_config(*, auth_mode: str = "token", token: str | None = _TEST_TOKEN) -> MagicMock:
-    """Build a minimal mock AppConfig."""
+def _make_config() -> MagicMock:
+    """Build a minimal mock AppConfig (no ``auth`` section: GH-149 removed it)."""
     config = MagicMock()
-    config.auth.mode = auth_mode
+    del config.auth
     config.limits.max_message_length = 4000
     config.server.host = "0.0.0.0"  # noqa: S104
     config.server.port = 8000
-    if token is not None:
-        config.auth.token = SecretStr(token)
-    else:
-        config.auth.token = None
     return config
 
 
-def _make_app(
-    agent: Any = None, *, auth_mode: str = "token", token: str | None = _TEST_TOKEN
-) -> Any:
-    """Create a FastAPI app with mock agent and config."""
+def _make_app(agent: Any = None, *, anonymous: bool = False) -> Any:
+    """Create a FastAPI app with mock agent and config; log an Org Admin in unless anonymous."""
     if agent is None:
         agent = MagicMock()
-    config = _make_config(auth_mode=auth_mode, token=token)
-    return create_app(agent=agent, config=config)
+    app = create_app(agent=agent, config=_make_config())
+    if not anonymous:
+        login(app, member_session("org_admin"))
+    return app
 
 
 def _mock_load_permissions(
@@ -114,7 +111,7 @@ class TestGetPermissions:
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/permissions")
 
         assert resp.status_code == 200
         body = resp.json()
@@ -129,7 +126,7 @@ class TestGetPermissions:
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/permissions")
 
         entries = resp.json()["permissions"]
         for entry in entries:
@@ -145,7 +142,7 @@ class TestGetPermissions:
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/permissions")
 
         entries = resp.json()["permissions"]
         # _DEFAULT_PERMISSIONS has 5 total entries (gmail:3, memory:2)
@@ -159,7 +156,7 @@ class TestGetPermissions:
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/permissions")
 
         entries = resp.json()["permissions"]
         tools_actions = [(e["tool"], e["action"]) for e in entries]
@@ -173,7 +170,7 @@ class TestGetPermissions:
             patch("admino.database.load_permissions_from_db", _mock_load_permissions()),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/permissions", headers=_AUTH_HEADER)
+                resp = await c.get("/api/permissions")
 
         entries = resp.json()["permissions"]
         lookup = {(e["tool"], e["action"]): e["permission"] for e in entries}
@@ -182,21 +179,26 @@ class TestGetPermissions:
         assert lookup[("memory", "delete")] == "deny"
 
     async def test_get_permissions_requires_auth(self) -> None:
-        """GET /api/permissions without Authorization header returns 401."""
-        app = _make_app()
+        """GET /api/permissions without a session cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.get("/api/permissions")
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
-    async def test_get_permissions_wrong_token_returns_401(self) -> None:
-        """GET /api/permissions with incorrect token returns 401."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/permissions",
-                headers={"Authorization": "Bearer wrong-token-value"},
-            )
+    async def test_get_permissions_unknown_session_returns_401(self) -> None:
+        """GET /api/permissions with a cookie that resolves to no session returns 401."""
+        app = _make_app(anonymous=True)
+        load = _mock_load_permissions()
+        with (
+            resolved_session(None),
+            patch("admino.database.load_permissions_from_db", load),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/permissions", headers=session_cookie())
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+        load.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +226,6 @@ class TestPatchPermissions:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read", "permission": "confirm"},
                 )
 
@@ -246,7 +247,6 @@ class TestPatchPermissions:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "list", "permission": "deny"},
                 )
 
@@ -271,32 +271,39 @@ class TestPatchPermissions:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "memory", "action": "recall", "permission": "confirm"},
                 )
 
         assert agent._permissions == mock_load_config.return_value
 
     async def test_patch_permissions_requires_auth(self) -> None:
-        """PATCH /api/permissions without Authorization header returns 401."""
-        app = _make_app()
+        """PATCH /api/permissions without a session cookie returns 401."""
+        app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.patch(
                 "/api/permissions",
                 json={"tool": "gmail", "action": "read", "permission": "allow"},
             )
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
 
-    async def test_patch_permissions_wrong_token_returns_401(self) -> None:
-        """PATCH /api/permissions with incorrect token returns 401."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(
-                "/api/permissions",
-                headers={"Authorization": "Bearer wrong-token-value"},
-                json={"tool": "gmail", "action": "read", "permission": "allow"},
-            )
+    async def test_patch_permissions_unknown_session_returns_401(self) -> None:
+        """PATCH /api/permissions with a cookie that resolves to no session returns 401."""
+        app = _make_app(anonymous=True)
+        mock_update = AsyncMock()
+        with (
+            resolved_session(None),
+            patch("admino.database.update_permission", mock_update),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.patch(
+                    "/api/permissions",
+                    headers=session_cookie(),
+                    json={"tool": "gmail", "action": "read", "permission": "allow"},
+                )
         assert resp.status_code == 401
+        assert resp.json() == _UNAUTHORIZED
+        mock_update.assert_not_awaited()
 
     async def test_patch_permissions_allow_value_accepted(self) -> None:
         """Permission value 'allow' is accepted."""
@@ -313,7 +320,6 @@ class TestPatchPermissions:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read", "permission": "allow"},
                 )
         assert resp.status_code == 200
@@ -333,7 +339,6 @@ class TestPatchPermissions:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read", "permission": "confirm"},
                 )
         assert resp.status_code == 200
@@ -353,7 +358,6 @@ class TestPatchPermissions:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read", "permission": "deny"},
                 )
         assert resp.status_code == 200
@@ -386,7 +390,6 @@ class TestPatchPermissionsHardcodedDenials:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": tool, "action": action, "permission": "allow"},
                 )
         assert resp.status_code == 400
@@ -408,7 +411,6 @@ class TestPatchPermissionsHardcodedDenials:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": tool, "action": action, "permission": "confirm"},
                 )
         assert resp.status_code == 400
@@ -433,7 +435,6 @@ class TestPatchPermissionsHardcodedDenials:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": tool, "action": action, "permission": "deny"},
                 )
         assert resp.status_code == 200
@@ -454,7 +455,6 @@ class TestPatchPermissionsHardcodedDenials:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "send", "permission": "allow"},
                 )
         body = resp.json()
@@ -484,7 +484,6 @@ class TestPatchPermissionsValidation:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read", "permission": "block"},
                 )
         assert resp.status_code == 422
@@ -520,7 +519,6 @@ class TestPatchPermissionsValidation:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": tool_name, "action": "read", "permission": "allow"},
                 )
         assert resp.status_code == 422
@@ -554,7 +552,6 @@ class TestPatchPermissionsValidation:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": action_name, "permission": "allow"},
                 )
         assert resp.status_code == 422
@@ -569,7 +566,6 @@ class TestPatchPermissionsValidation:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"action": "read", "permission": "allow"},
                 )
         assert resp.status_code == 422
@@ -584,7 +580,6 @@ class TestPatchPermissionsValidation:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "permission": "allow"},
                 )
         assert resp.status_code == 422
@@ -599,7 +594,6 @@ class TestPatchPermissionsValidation:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read"},
                 )
         assert resp.status_code == 422
@@ -625,7 +619,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={
                         "tool": "'; DROP TABLE permissions; --",
                         "action": "read",
@@ -644,7 +637,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={
                         "tool": "gmail",
                         "action": "read OR 1=1",
@@ -663,7 +655,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={
                         "tool": "gmail\x00",
                         "action": "read",
@@ -682,7 +673,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={
                         "tool": "gm\u0430il",  # Cyrillic 'a' (homoglyph)
                         "action": "read",
@@ -724,7 +714,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={
                         "tool": "gmail",
                         "action": "read",
@@ -743,7 +732,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={"tool": "gmail", "action": "read", "permission": 1},
                 )
         assert resp.status_code == 422
@@ -758,7 +746,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={},
                 )
         assert resp.status_code == 422
@@ -778,7 +765,6 @@ class TestPermissionsAdversarial:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.patch(
                     "/api/permissions",
-                    headers=_AUTH_HEADER,
                     json={
                         "tool": "gmail",
                         "action": "read",

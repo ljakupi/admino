@@ -40,7 +40,9 @@ from admino.models import (
 # ---------------------------------------------------------------------------
 
 _NOW: datetime = datetime.now(UTC)
-_EXPIRES: datetime = _NOW + timedelta(seconds=30)
+# Computed at import, so it must outlast the whole suite run: PendingConfirmation
+# requires expires_at > created_at, and created_at is set when a test runs.
+_EXPIRES: datetime = _NOW + timedelta(days=1)
 
 
 def _make_tool_call(**overrides: object) -> ToolCall:

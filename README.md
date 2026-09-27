@@ -85,7 +85,7 @@ make dev-db
 make run
 ```
 
-Open **http://localhost:8000** and click **Skip** on the token prompt. With
+Open **http://localhost:8000** and log in. With
 `INFOMANIAK_API_TOKEN` set you're ready to chat on Qwen3.5 (Infomaniak). Without it,
 admino still boots and the chat tells you which variable to set. **Settings → Agent**
 switches to local **vLLM**, **Claude** or **OpenAI**.
@@ -137,7 +137,7 @@ make docker-up                     # → http://localhost:8000 (postgres + agent
 | **[Getting Started](docs/getting-started.md)** | Install, configure, run (local & Docker), connect accounts, first chat |
 | **[Permissions](docs/permissions.md)** | The permission engine: allow / confirm / deny, hardcoded denials, promotion flow |
 | **[Tools](docs/tools.md)** | Every tool and action admino ships with today |
-| **[Configuration](docs/configuration.md)** | LLM providers, `config.yaml`, data & storage, auth modes |
+| **[Configuration](docs/configuration.md)** | LLM providers, `config.yaml`, data & storage, accounts and sessions |
 | **[Security Model](docs/SECURITY.md)** | Egress containment, the root→non-root privilege drop, threat model |
 
 ## 🗺️ Roadmap

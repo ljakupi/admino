@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { ShieldAlert, Mail, Calendar, Clock, Check, Info } from 'lucide-vue-next';
-import ReAuthDialog from './ReAuthDialog.vue';
 import { t } from '@/i18n';
 import {
   useCriticalPermissionsStore,
@@ -97,18 +96,8 @@ function handleToggle(row: CritPermDef) {
   if (isOn(row.tool, row.action) || isPending(row.tool, row.action)) {
     store.demote(row.tool, row.action);
   } else {
-    store.openAuth(row);
-  }
-}
-
-async function handleAuthConfirm(token: string) {
-  if (!store.authRow) return;
-  const { tool, action } = store.authRow;
-  try {
-    await store.promote(tool, action, token);
-    store.closeAuth();
-  } catch {
-    // Toast already shown by store; keep dialog open for retry
+    // Toast already shown by the store on failure (backend refuses until #161).
+    store.promote(row.tool, row.action).catch(() => undefined);
   }
 }
 </script>
@@ -183,15 +172,6 @@ async function handleAuthConfirm(token: string) {
       <span>{{ t('criticalPermissions.footer') }}</span>
     </div>
   </div>
-
-  <ReAuthDialog
-    v-if="store.authRow"
-    :tool="store.authRow.tool"
-    :action="store.authRow.action"
-    :label="t(store.authRow.labelKey)"
-    @confirm="handleAuthConfirm"
-    @cancel="store.closeAuth()"
-  />
 </template>
 
 <style scoped>

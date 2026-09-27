@@ -26,12 +26,13 @@ import inspect
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 from pydantic import ValidationError
 
-from admino.access import Capability, Principal, can
+from admino.access import Capability, Principal, can, principal_role
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -462,9 +463,10 @@ def _principal_builders(path: Path) -> list[str]:
 
 # Modules allowed to build a Principal. A well-formed Principal passes every
 # check, so building one from request data (e.g. Principal(**body)) would mint
-# a Super Admin. #149 adds the single module that builds it from the session's
-# users row, and adding it here is a reviewed decision.
-_PRINCIPAL_BUILDERS: frozenset[str] = frozenset()
+# a Super Admin. sessions.py (#149) is the single builder: it builds the
+# Principal from the session's users row, re-read on every request, never from
+# request data. Adding another module here is a reviewed decision.
+_PRINCIPAL_BUILDERS: frozenset[str] = frozenset({"sessions.py"})
 
 
 class TestPrincipalConstructionSites:
@@ -586,6 +588,89 @@ class TestPrincipal:
 
         with pytest.raises(ValidationError):
             setattr(principal, field, value)
+
+
+# ---------------------------------------------------------------------------
+# 5b. asyncpg UUIDs are normalized to plain uuid.UUID (#149, the #145 bug)
+# ---------------------------------------------------------------------------
+
+
+# Every (capability, member role) pair the matrix grants.
+_MEMBER_GRANTS = [
+    pytest.param(capability, role, id=f"{capability}-{role}")
+    for capability, roles in _EXPECTED_MATRIX.items()
+    for role in _MEMBER_ROLES
+    if role in roles
+]
+
+
+def _pg_uuid() -> PgUUID:
+    """A fresh asyncpg UUID (the subclass a users row returns)."""
+    return PgUUID(str(uuid4()))
+
+
+class TestPrincipalAsyncpgUuid:
+    """A Principal built straight from a users row gets plain uuid.UUID fields.
+
+    asyncpg returns ``asyncpg.pgproto.pgproto.UUID``, a uuid.UUID subclass.
+    ``principal_role`` checks ``type(org_id) is UUID`` (fail closed), so
+    Principal's validation normalizes subclasses to a plain UUID; otherwise a
+    member built from a row would get no role and be denied everything.
+    """
+
+    @pytest.mark.parametrize("role", _MEMBER_ROLES)
+    def test_access_member_from_pg_uuids_has_plain_uuid_fields(self, role: str) -> None:
+        """user_id and org_id are exactly uuid.UUID after validation, same 128 bits."""
+        user_id = _pg_uuid()
+        org_id = _pg_uuid()
+        assert type(user_id) is not UUID  # premise: asyncpg's is a subclass
+        assert isinstance(user_id, UUID)
+
+        principal = Principal(user_id=user_id, kind="member", org_id=org_id, role=role)
+
+        assert type(principal.user_id) is UUID
+        assert type(principal.org_id) is UUID
+        assert (principal.user_id.int, principal.org_id.int) == (user_id.int, org_id.int)
+
+    def test_access_super_admin_from_pg_uuid_has_plain_uuid_field(self) -> None:
+        """A Super Admin's user_id is normalized too."""
+        principal = Principal(user_id=_pg_uuid(), kind="super_admin")
+
+        assert type(principal.user_id) is UUID
+        assert principal.org_id is None
+
+    @pytest.mark.parametrize("role", _MEMBER_ROLES)
+    def test_access_member_from_pg_uuids_gets_its_role(self, role: str) -> None:
+        """principal_role recognizes the member, so its role applies."""
+        principal = Principal(user_id=_pg_uuid(), kind="member", org_id=_pg_uuid(), role=role)
+
+        assert principal_role(principal) == role
+
+    @pytest.mark.parametrize(("capability", "role"), _MEMBER_GRANTS)
+    def test_access_member_from_pg_uuids_passes_can_for_its_role(
+        self, capability: str, role: str
+    ) -> None:
+        """Every capability the matrix grants a member role is granted to a member built
+        from asyncpg UUIDs (denials are unaffected: the bug only ever failed closed)."""
+        principal = Principal(user_id=_pg_uuid(), kind="member", org_id=_pg_uuid(), role=role)
+
+        assert can(principal, Capability(capability)) is True
+
+    def test_access_editor_from_pg_uuids_can_chat(self) -> None:
+        """The login case from the issue: an editor read from the users table can chat."""
+        principal = Principal(user_id=_pg_uuid(), kind="member", org_id=_pg_uuid(), role="editor")
+
+        assert can(principal, Capability.CHAT_SEND) is True
+
+    def test_access_principal_role_still_refuses_a_forged_pg_uuid_org(self) -> None:
+        """principal_role keeps its exact type check: a UUID subclass forced onto a
+        validated Principal (bypassing validation) still gets no role, so the fix lives
+        in validation and forged values keep failing closed."""
+        principal = Principal(user_id=uuid4(), kind="member", org_id=uuid4(), role="org_admin")
+        object.__setattr__(principal, "org_id", _pg_uuid())
+
+        assert principal_role(principal) is None
+        assert can(principal, Capability.ORG_USERS_MANAGE) is False
 
 
 # ---------------------------------------------------------------------------
