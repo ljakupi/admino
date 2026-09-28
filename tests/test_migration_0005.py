@@ -995,9 +995,10 @@ class TestMigration0005PythonSync:
         A shipped migration never changes, so 0005's list stays the original 39
         (test_migration_0005_action_check_lists_the_catalog pins it). The catalog
         grows by replacing the audit_events_action_check constraint in a later
-        migration (0009 for GH-152's session.revoke and session.force_logout), so
-        the exact sync with the live AuditAction lives in that migration's tests
-        (tests/test_migration_0009.py).
+        migration (0009 for GH-152's session.revoke and session.force_logout, 0010
+        for GH-153's invitation.resend), so the exact sync with the live
+        AuditAction lives in the latest such migration's tests
+        (tests/test_migration_0010.py).
         """
         audit_events = _audit_events_module()
         sql_actions = _in_values(_named_check("audit_events_action_check"), "action")

@@ -2029,3 +2029,51 @@ class TestModuleIsolation:
 
         assert "log" in doc
         assert "address" in doc
+
+
+# ---------------------------------------------------------------------------
+# cancel_pending: a resend's stale invitation email (GH-153)
+# ---------------------------------------------------------------------------
+
+
+class TestCancelPending:
+    """cancel_pending() ends a recipient's pending emails of one template, clearing params."""
+
+    async def test_email_outbox_cancel_pending_returns_the_count(self) -> None:
+        from admino import email_outbox
+        from admino.email_templates import EmailTemplate
+
+        executor = MagicMock()
+        executor.execute = AsyncMock(return_value="UPDATE 2")
+
+        cancelled = await email_outbox.cancel_pending(
+            executor, user_id=_USER, template=EmailTemplate.INVITATION
+        )
+
+        assert cancelled == 2
+        assert executor.execute.await_count == 1
+
+    async def test_email_outbox_cancel_pending_sql_scopes_and_scrubs(self) -> None:
+        """One parameterized UPDATE: only this recipient's pending rows of the template,
+        marked failed with params cleared and finished_at set (the finished-row invariant)."""
+        from admino import email_outbox
+        from admino.email_templates import EmailTemplate
+
+        executor = MagicMock()
+        executor.execute = AsyncMock(return_value="UPDATE 0")
+
+        await email_outbox.cancel_pending(
+            executor, user_id=_USER, template=EmailTemplate.INVITATION
+        )
+
+        sql, *args = executor.execute.await_args.args
+        normalized = _normalized(sql)
+        assert normalized.startswith("update email_outbox set ")
+        assert "status = 'failed'" in normalized
+        assert re.search(r"params = '\{\}'(::jsonb)?", normalized)
+        assert "finished_at = now()" in normalized
+        assert re.search(r"recipient_user_id = \$\d", normalized)
+        assert re.search(r"template_key = \$\d", normalized)
+        assert "status = 'pending'" in normalized
+        assert args.count(_USER) == 1
+        assert "invitation" in args

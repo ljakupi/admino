@@ -9,9 +9,10 @@ breaks or delays a request.
 Inputs: ``enqueue_email()`` takes a database executor (the caller's
 connection or the pool), the recipient's user ID and a ``TemplateParams``.
 ``deliver_due()`` and ``run_outbox_sender()`` take the pool and the
-``SmtpConfig``; ``purge_finished()`` takes the pool and a retention in days.
+``SmtpConfig``; ``purge_finished()`` takes the pool and a retention in days;
+``cancel_pending()`` takes an executor, a recipient's user ID and a template.
 Outputs: the new outbox ID; the number of messages a sender pass sent; the
-number of finished rows purged.
+number of finished rows purged; the number of pending rows cancelled.
 
 Lifecycle of a row: pending, then sent, or failed once its attempts are used
 up (MAX_ATTEMPTS, with a backoff doubling from 60 s up to 6 h) or at once when
@@ -47,7 +48,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from admino import mailer
-from admino.email_templates import TemplateParams, params_for, render
+from admino.email_templates import EmailTemplate, TemplateParams, params_for, render
 
 if TYPE_CHECKING:
     from email.message import EmailMessage
@@ -114,6 +115,13 @@ _RETRY_SQL: Final = """
     SET next_attempt_at = now() + make_interval(secs => $2)
     WHERE id = $1 AND status = 'pending'
 """
+# A recipient's queued emails of one template that must not go out any more (a
+# resent invitation's old link). Finished like a final failure: params scrubbed.
+_CANCEL_PENDING_SQL: Final = """
+    UPDATE email_outbox
+    SET status = 'failed', params = '{}'::jsonb, finished_at = now()
+    WHERE recipient_user_id = $1 AND template_key = $2 AND status = 'pending'
+"""
 _PURGE_SQL: Final = """
     DELETE FROM email_outbox
     WHERE status IN ('sent', 'failed') AND finished_at < now() - make_interval(days => $1)
@@ -136,11 +144,16 @@ class RecipientNotFoundError(Exception):
 
 
 class Executor(Protocol):
-    """What enqueue_email() writes through: an asyncpg connection, pool or pooled connection."""
+    """What enqueue_email() and cancel_pending() write through: an asyncpg connection,
+    pool or pooled connection."""
 
     # Any: asyncpg returns the column value untyped.
     async def fetchval(self, query: str, *args: object) -> Any:
         """Run one statement and return the first column of its first row."""
+        ...
+
+    async def execute(self, query: str, *args: object) -> str:
+        """Run one statement and return its status string (e.g. "UPDATE 2")."""
         ...
 
 
@@ -187,6 +200,26 @@ async def enqueue_email(executor: Executor, *, user_id: UUID, params: TemplatePa
     if outbox_id is None:
         raise RecipientNotFoundError
     return outbox_id
+
+
+async def cancel_pending(executor: Executor, *, user_id: UUID, template: EmailTemplate) -> int:
+    """End a recipient's still-pending emails of one template without sending them.
+
+    Used when a newer email replaces them (a resent invitation: the old link no
+    longer works). The rows are marked failed with their params scrubbed, like a
+    final failure, so the one-time link leaves the outbox at once. A row a sender
+    is delivering right now may still go out; its link is dead either way.
+
+    Args:
+        executor: The caller's connection (inside its transaction) or the pool.
+        user_id: The recipient's user ID.
+        template: The template whose pending emails end.
+
+    Returns:
+        The number of rows cancelled.
+    """
+    status = await executor.execute(_CANCEL_PENDING_SQL, user_id, template.value)
+    return int(status.rpartition(" ")[2])
 
 
 async def deliver_due(pool: asyncpg.Pool, config: SmtpConfig) -> int:

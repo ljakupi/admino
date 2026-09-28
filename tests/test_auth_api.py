@@ -92,19 +92,23 @@ _PROMOTE_REFUSED = {"detail": "Critical permission promotions are temporarily un
 _CHAT_BODY = {"message": "hello", "session_id": "chat-1"}
 
 # Routes that answer without a session: the health check, the login, the
-# password reset request and confirm (GH-151), and the OAuth provider's
-# cross-site redirect (protected by its state token).
+# password reset request and confirm (GH-151), opening and accepting an
+# invitation link (GH-153), and the OAuth provider's cross-site redirect
+# (protected by its state token).
 _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("GET", "/health"),
         ("POST", "/api/auth/login"),
         ("POST", "/api/auth/password-reset"),
         ("POST", "/api/auth/password-reset/confirm"),
+        # GH-153: the invitee has no account yet when opening and accepting the link.
+        ("GET", "/api/auth/invitations/{token}"),
+        ("POST", "/api/auth/invitations/{token}/accept"),
         ("GET", "/api/oauth/callback"),
     }
 )
 
-# Routes that exist today (or are added by #149 and #152) and must require a session.
+# Routes that exist today (or are added by #149, #152 and #153) and must require a session.
 _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/api/message"),
@@ -128,6 +132,11 @@ _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("GET", "/api/me/sessions"),
         ("DELETE", "/api/me/sessions/{session_id}"),
         ("POST", "/api/org/users/{user_id}/logout"),
+        # GH-153: an Org Admin's invitations.
+        ("POST", "/api/org/invitations"),
+        ("GET", "/api/org/invitations"),
+        ("DELETE", "/api/org/invitations/{invitation_id}"),
+        ("POST", "/api/org/invitations/{invitation_id}/resend"),
     }
 )
 
@@ -138,6 +147,7 @@ _PATH_VALUES: dict[str, str] = {
     "confirmation_id": "c1",
     "session_id": "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
     "user_id": "1c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e",
+    "invitation_id": "2d3e4f50-6172-4c8d-9e0f-1a2b3c4d5e6f",
 }
 
 
