@@ -9,6 +9,10 @@ Routes:
 - POST /api/auth/password-reset — Emails a password reset link; always 202 (public).
 - POST /api/auth/password-reset/confirm — Sets a new password with a reset link's
   token, ends every session of the account, clears the cookie (public).
+- GET  /api/auth/invitations/{token} — The org name, role and email of a usable
+  invitation link (public).
+- POST /api/auth/invitations/{token}/accept — Accepts an invitation with a name
+  and password; activates the account and sets the session cookie (public).
 - POST /api/auth/logout   — Ends (deletes) the current session and clears the cookie.
 - GET  /api/auth/me       — The logged-in account (from the resolved session).
 - GET  /api/me/sessions   — The caller's live sessions, the current one marked.
@@ -16,6 +20,12 @@ Routes:
   (clears the cookie when it is the current one); audited.
 - POST /api/org/users/{user_id}/logout — An Org Admin ends every session of a
   user of their org; audited.
+- POST /api/org/invitations — An Org Admin invites an email into their org; audited.
+- GET  /api/org/invitations — The pending invitations of the caller's org.
+- DELETE /api/org/invitations/{invitation_id} — Revokes a pending invitation
+  (deletes the invited account); audited.
+- POST /api/org/invitations/{invitation_id}/resend — Sends a pending invitation
+  again with a new link; audited.
 - POST /api/message       — Send a user message; returns ChatResponse.
 - GET  /api/events        — SSE stream for a chat session.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
@@ -46,6 +56,22 @@ Security notes:
   Admin's own org. Another user's session, or a user outside the org, is the
   same 404 as an unknown id. Path ids are typed as UUIDs: anything else is a
   422 that doesn't include the input value.
+- Invitations: sending, revoking and resending need
+  ``Capability.ORG_USERS_INVITE``, listing ``Capability.ORG_USERS_VIEW``, and
+  every statement is scoped to the Org Admin's own org: another org's
+  invitation is the same 404 as an unknown id. The invited account's language
+  is the caller's session language, never a request field. Invitation links
+  are built from ``server.public_url`` only. The two public link routes answer
+  one generic 404 for every link that can't be used (a malformed token, of any
+  length, is a 404 before any database call, never a 422); accepting sets the
+  session cookie exactly like the login. The email, name, password, token and
+  link are never logged or echoed. The token travels in the URL path of the
+  two link routes: uvicorn's access log stays off (``main.py``), and a reverse
+  proxy in front of admino must not log request paths (#156). A refused send
+  (409 ``email_taken`` or ``seat_limit``) is audited and spends a separate,
+  tighter per-user budget (``/api/org/invitations/refused``): once it's spent,
+  sends answer 429 before any database work, so probing whether an email
+  exists elsewhere on the platform stays slow and visible.
 - CSRF: ``CrossOriginProtectionMiddleware`` implements Go's
   CrossOriginProtection check on every non-GET/HEAD/OPTIONS request, before
   authentication and handlers (the login included): ``Sec-Fetch-Site`` must be
@@ -61,8 +87,9 @@ Security notes:
   link that can't be used; the email, token, link and password are never
   logged or echoed.
 - Rate limits are per caller: one token bucket per (route, ``user:<id>``) on
-  session routes and per (route, ``ip:<host>``) on public routes, so one caller
-  can't throttle another. Idle buckets are evicted and the map is capped (LRU).
+  session routes and per (route, ``ip:<host>``) on public routes (the login,
+  the password reset and the invitation link routes), so one caller can't
+  throttle another. Idle buckets are evicted and the map is capped (LRU).
   Cookies that resolve to no session spend a per-IP budget, so a stream of
   random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
@@ -115,7 +142,15 @@ from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from admino import accounts, auth, password_reset, passwords, session_management, sessions
+from admino import (
+    accounts,
+    auth,
+    invitations,
+    password_reset,
+    passwords,
+    session_management,
+    sessions,
+)
 from admino.access import Capability, Principal, can
 from admino.models import (
     AgentResult,
@@ -125,6 +160,11 @@ from admino.models import (
     CriticalPermissionEntry,
     CriticalPermissionsResponse,
     CriticalPermissionState,
+    InvitationAcceptRequest,
+    InvitationCreateRequest,
+    InvitationDetails,
+    InvitationListResponse,
+    InvitationSummary,
     LLMMessage,
     LoginRequest,
     MeResponse,
@@ -370,6 +410,17 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/me/sessions/get": (1.0, 10),
     "/api/me/sessions/delete": (0.5, 5),
     "/api/org/users/logout": (0.5, 5),
+    # Invitations (GH-153): per user on the Org Admin routes, per IP on the
+    # public link routes.
+    "/api/org/invitations/create": (0.2, 5),
+    "/api/org/invitations/get": (1.0, 10),
+    "/api/org/invitations/revoke": (0.5, 5),
+    "/api/org/invitations/resend": (0.2, 5),
+    "/api/auth/invitations/get": (1.0, 10),
+    "/api/auth/invitations/accept": (0.2, 5),
+    # Refused sends (email taken, no free seat), per user: a burst of 5, then one a
+    # minute, so probing whether an email exists on the platform stays slow.
+    "/api/org/invitations/refused": (1 / 60, 5),
 }
 # Routes without their own entry still get a bucket per caller.
 _DEFAULT_RATE_LIMIT: tuple[float, int] = (1.0, 10)
@@ -384,6 +435,8 @@ _MAX_RATE_BUCKETS: int = 10_000
 _rate_buckets: OrderedDict[tuple[str, str], _TokenBucket] = OrderedDict()
 # The route key of the per-IP budget for cookies that resolve to no session.
 _SESSION_FAILURE_ROUTE: Final = "/api/auth/session"
+# The route key of the per-user budget for refused invitation sends.
+_INVITE_REFUSED_ROUTE: Final = "/api/org/invitations/refused"
 
 
 def _evict_idle_buckets(now: float) -> None:
@@ -438,19 +491,20 @@ def _bucket_for(route: str, caller: str, now: float) -> _TokenBucket:
     return bucket
 
 
-def _session_failures_exhausted(caller: str) -> bool:
-    """True when ``caller`` has spent its budget of cookies that resolve to no session.
+def _budget_exhausted(route: str, caller: str) -> bool:
+    """True when ``caller`` has spent its budget of failures on ``route``.
 
-    Only reads the bucket: an IP whose sessions keep resolving never gets one.
+    Only reads the bucket: a caller that never fails never gets one. Used for
+    cookies that resolve to no session and for refused invitation sends.
     """
-    bucket = _rate_buckets.get((_SESSION_FAILURE_ROUTE, caller))
+    bucket = _rate_buckets.get((route, caller))
     return bucket is not None and not bucket.has_token(time.monotonic())
 
 
-def _note_session_failure(caller: str) -> None:
-    """Spend one token of ``caller``'s budget for cookies that resolve to no session."""
+def _spend_budget(route: str, caller: str) -> None:
+    """Spend one token of ``caller``'s failure budget on ``route``."""
     now = time.monotonic()
-    _bucket_for(_SESSION_FAILURE_ROUTE, caller, now).allow(now)
+    _bucket_for(route, caller, now).allow(now)
 
 
 def _user_caller(principal: Principal) -> str:
@@ -722,11 +776,11 @@ async def require_session(request: Request) -> sessions.AuthenticatedSession:
     if not token:
         raise HTTPException(status_code=401, detail=_UNAUTHORIZED_DETAIL)
     caller = f"ip:{_client_ip(request)}"
-    if _session_failures_exhausted(caller):
+    if _budget_exhausted(_SESSION_FAILURE_ROUTE, caller):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
     session = await sessions.resolve_session(get_pool(), token)
     if session is None:
-        _note_session_failure(caller)
+        _spend_budget(_SESSION_FAILURE_ROUTE, caller)
         raise HTTPException(status_code=401, detail=_UNAUTHORIZED_DETAIL)
     return session
 
@@ -968,6 +1022,20 @@ async def health_check() -> dict[str, str | bool]:
 # ---------------------------------------------------------------------------
 
 
+def _set_session_cookie(response: Response, result: auth.LoginResult) -> None:
+    """Set the ``admino_session`` cookie of a new session (HttpOnly, SameSite=Strict, Path=/,
+    Max-Age = the session policy's lifetime, Secure iff ``server.cookie_secure``)."""
+    response.set_cookie(
+        key=sessions.SESSION_COOKIE_NAME,
+        value=result.token,
+        max_age=result.max_age_seconds,
+        path="/",
+        secure=_config.server.cookie_secure if _config is not None else True,
+        httponly=True,
+        samesite="strict",
+    )
+
+
 def _clear_session_cookie(response: Response) -> None:
     """Make the browser drop the ``admino_session`` cookie (Max-Age=0)."""
     response.delete_cookie(
@@ -1022,15 +1090,7 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
         raise HTTPException(status_code=401, detail=auth.LOGIN_FAILED_MESSAGE) from None
 
     response = Response(status_code=204)
-    response.set_cookie(
-        key=sessions.SESSION_COOKIE_NAME,
-        value=result.token,
-        max_age=result.max_age_seconds,
-        path="/",
-        secure=_config.server.cookie_secure,
-        httponly=True,
-        samesite="strict",
-    )
+    _set_session_cookie(response, result)
     return response
 
 
@@ -1314,6 +1374,271 @@ async def post_org_user_logout(
     except accounts.UserNotInOrgError:
         raise HTTPException(status_code=404, detail="User not found") from None
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Invitation route handlers (GH-153)
+# ---------------------------------------------------------------------------
+
+_EMAIL_TAKEN_BODY: Final = {
+    "detail": "A user with this email already exists.",
+    "reason": "email_taken",
+}
+_SEAT_LIMIT_BODY: Final = {"detail": invitations.SEAT_LIMIT_MESSAGE, "reason": "seat_limit"}
+
+
+async def post_org_invitation(
+    request: Request,
+    session: _SessionDep,
+    body: InvitationCreateRequest,
+) -> InvitationSummary | JSONResponse:
+    """Handle POST /api/org/invitations — an Org Admin invites an email into their org.
+
+    The invited account gets the caller's session language (the email goes
+    out in it), and the link is built from ``server.public_url`` only.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        session: The resolved session (401 without one).
+        body: Validated InvitationCreateRequest (the email and the member role).
+
+    Returns:
+        201 with the new invitation's InvitationSummary, or a 409 ``{"detail",
+        "reason"}``: ``email_taken`` when a user with the email exists anywhere
+        on the platform, ``seat_limit`` when the org has no free seat. A 409
+        writes only the ``invitation.refuse`` audit event and spends one token
+        of the caller's refused-send budget.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_USERS_INVITE``, 429 when
+            rate-limited or when the caller has spent their refused-send
+            budget (checked before any database work).
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    principal = session.principal
+    caller = _user_caller(principal)
+    _check_rate_limit("/api/org/invitations/create", caller)
+    if _budget_exhausted(_INVITE_REFUSED_ROUTE, caller):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    from admino.database import get_pool
+
+    try:
+        return await invitations.create_invitation(
+            get_pool(),
+            actor=principal,
+            email=body.email,
+            role=body.role,
+            language=session.ui_language,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except accounts.DuplicateEmailError:
+        _spend_budget(_INVITE_REFUSED_ROUTE, caller)
+        return JSONResponse(status_code=409, content=_EMAIL_TAKEN_BODY)
+    except invitations.SeatLimitError:
+        _spend_budget(_INVITE_REFUSED_ROUTE, caller)
+        return JSONResponse(status_code=409, content=_SEAT_LIMIT_BODY)
+
+
+async def get_org_invitations(principal: _PrincipalDep) -> InvitationListResponse:
+    """Handle GET /api/org/invitations — the pending invitations of the caller's org.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        InvitationListResponse, the most recently sent first, expired ones
+        flagged. No token, hash or link is included.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_USERS_VIEW``, 429 when
+            rate-limited.
+    """
+    _check_rate_limit("/api/org/invitations/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        pending = await invitations.list_invitations(get_pool(), actor=principal)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    return InvitationListResponse(invitations=pending)
+
+
+async def delete_org_invitation(
+    request: Request,
+    principal: _PrincipalDep,
+    invitation_id: UUID,
+) -> Response:
+    """Handle DELETE /api/org/invitations/{invitation_id} — revoke a pending invitation.
+
+    The invited account is deleted with its invitation and queued email, which
+    frees the email and the seat; ``invitation.revoke`` is recorded.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        invitation_id: The invitation (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_USERS_INVITE``; 404 for an
+            unknown id, another org's or an accepted invitation (the same body
+            either way); 429 when rate-limited.
+    """
+    _check_rate_limit("/api/org/invitations/revoke", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        await invitations.revoke_invitation(
+            get_pool(),
+            actor=principal,
+            invitation_id=invitation_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except invitations.InvitationNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=invitations.INVITATION_NOT_FOUND_MESSAGE
+        ) from None
+    return Response(status_code=204)
+
+
+async def post_org_invitation_resend(
+    request: Request,
+    principal: _PrincipalDep,
+    invitation_id: UUID,
+) -> InvitationSummary:
+    """Handle POST /api/org/invitations/{invitation_id}/resend — send it again, new link.
+
+    The token rotates (the old link stops working), the expiry restarts and a
+    new email is queued; ``invitation.resend`` is recorded. No free seat is
+    needed.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        invitation_id: The invitation (a UUID; anything else is a 422).
+
+    Returns:
+        The invitation's InvitationSummary with the new dates.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_USERS_INVITE``; 404 for an
+            unknown id, another org's or an accepted invitation (the same body
+            either way); 429 when rate-limited.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    _check_rate_limit("/api/org/invitations/resend", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        return await invitations.resend_invitation(
+            get_pool(),
+            actor=principal,
+            invitation_id=invitation_id,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except invitations.InvitationNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=invitations.INVITATION_NOT_FOUND_MESSAGE
+        ) from None
+
+
+async def get_invitation_details(request: Request, token: str) -> InvitationDetails:
+    """Handle GET /api/auth/invitations/{token} — what the acceptance page shows (public).
+
+    Rate-limited per client IP. The token is an unbounded path string on
+    purpose: a malformed one gets the same 404 as an unknown one (never a 422),
+    before any database call.
+
+    Args:
+        request: The incoming request (the client IP for the rate limit).
+        token: The token from the invitation link.
+
+    Returns:
+        InvitationDetails: the org name, the role and the email.
+
+    Raises:
+        HTTPException: 404 for every link that can't be used (one body), 429
+            when rate-limited.
+    """
+    _check_rate_limit("/api/auth/invitations/get", f"ip:{_client_ip(request)}")
+
+    from admino.database import get_pool
+
+    try:
+        return await invitations.get_invitation(get_pool(), token)
+    except invitations.InvalidInvitationError:
+        raise HTTPException(
+            status_code=404, detail=invitations.INVALID_INVITATION_MESSAGE
+        ) from None
+
+
+async def post_invitation_accept(
+    request: Request, token: str, body: InvitationAcceptRequest
+) -> Response:
+    """Handle POST /api/auth/invitations/{token}/accept — accept and log in (public).
+
+    Rate-limited per client IP. On success the account is activated with the
+    name and password, a session opens with the org's policy, and the answer
+    is a 204 with the ``admino_session`` cookie, set exactly as by the login.
+
+    Args:
+        request: The incoming request (client IP and User-Agent for the session).
+        token: The token from the invitation link (a malformed one is a 404).
+        body: Validated InvitationAcceptRequest; the password is a SecretStr.
+
+    Returns:
+        An empty 204 response carrying the session cookie, or a 422
+        ``{"detail": <policy message>, "reason": <reason>}`` when the password
+        policy refuses the password (the link stays usable).
+
+    Raises:
+        HTTPException: 404 for every link that can't be used (one body), 429
+            when rate-limited.
+
+    Security notes:
+        The token, name and password are never logged or echoed.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    _check_rate_limit("/api/auth/invitations/accept", f"ip:{_client_ip(request)}")
+
+    from admino.database import get_pool
+
+    try:
+        result = await invitations.accept_invitation(
+            get_pool(),
+            token=token,
+            name=body.name,
+            password=body.password.get_secret_value(),
+            ip=request.client.host if request.client is not None else None,
+            user_agent=request.headers.get("user-agent"),
+        )
+    except invitations.InvalidInvitationError:
+        raise HTTPException(
+            status_code=404, detail=invitations.INVALID_INVITATION_MESSAGE
+        ) from None
+    except passwords.PasswordPolicyError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc), "reason": exc.reason})
+
+    response = Response(status_code=204)
+    _set_session_cookie(response, result)
+    return response
 
 
 async def post_message(
@@ -2822,13 +3147,20 @@ def create_app(
     app.add_exception_handler(ValidationError, _validation_error_handler)  # type: ignore[arg-type]
 
     # --- Routes ---
-    # Public: health check, login, password reset and the OAuth callback (plus
-    # static files). Every other route depends on require_session.
+    # Public: health check, login, password reset, the invitation link routes
+    # and the OAuth callback (plus static files). Every other route depends on
+    # require_session.
     app.get("/health")(health_check)
     app.post("/api/auth/login", status_code=204, response_model=None)(post_login)
     app.post("/api/auth/password-reset", status_code=202, response_model=None)(post_password_reset)
     app.post("/api/auth/password-reset/confirm", status_code=204, response_model=None)(
         post_password_reset_confirm
+    )
+    app.get("/api/auth/invitations/{token}", response_model=InvitationDetails)(
+        get_invitation_details
+    )
+    app.post("/api/auth/invitations/{token}/accept", status_code=204, response_model=None)(
+        post_invitation_accept
     )
 
     # API routes — session required.
@@ -2840,6 +3172,16 @@ def create_app(
     )
     app.post("/api/org/users/{user_id}/logout", status_code=204, response_model=None)(
         post_org_user_logout
+    )
+    app.post("/api/org/invitations", status_code=201, response_model=InvitationSummary)(
+        post_org_invitation
+    )
+    app.get("/api/org/invitations", response_model=InvitationListResponse)(get_org_invitations)
+    app.delete("/api/org/invitations/{invitation_id}", status_code=204, response_model=None)(
+        delete_org_invitation
+    )
+    app.post("/api/org/invitations/{invitation_id}/resend", response_model=InvitationSummary)(
+        post_org_invitation_resend
     )
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)

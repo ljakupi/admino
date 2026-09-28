@@ -1,12 +1,13 @@
-"""Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152).
+"""Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
 Org Admin access to other users' projects, org and platform settings, every
 Super Admin action, residency policy, break-glass sessions, agent tool calls,
-and since GH-152 a user revoking one of their sessions and an Org Admin's forced
-logout) is recorded through one service function, record(), as a row in the
-append-only audit_events table (migration 0005, tests/test_migration_0005.py).
+since GH-152 a user revoking one of their sessions and an Org Admin's forced
+logout, and since GH-153 an invitation sent again) is recorded through one
+service function, record(), as a row in the append-only audit_events table
+(migration 0005, tests/test_migration_0005.py).
 
 What these tests pin down:
 - The action catalog is a closed enum, and every action has exactly one org
@@ -161,6 +162,10 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         "tool.call",
         # GH-152: an Org Admin logs a user of their org out.
         "session.force_logout",
+        # GH-153: an Org Admin sends a pending invitation again with a new link.
+        "invitation.resend",
+        # GH-153: a refused send (email taken, no free seat), so probing shows in the log.
+        "invitation.refuse",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -193,7 +198,16 @@ _ISSUE_CATEGORIES: list[Any] = [
     pytest.param({"login.success", "login.failure"}, id="logins-success-and-failure"),
     pytest.param({"login.lockout"}, id="lockouts"),
     pytest.param({"password_reset.request", "password_reset.complete"}, id="password-resets"),
-    pytest.param({"invitation.create", "invitation.revoke", "invitation.accept"}, id="invitations"),
+    pytest.param(
+        {
+            "invitation.create",
+            "invitation.revoke",
+            "invitation.accept",
+            "invitation.resend",
+            "invitation.refuse",
+        },
+        id="invitations",
+    ),
     pytest.param({"user.role_change", "project.member_role_change"}, id="role-changes"),
     pytest.param({"user.activate"}, id="activations"),
     pytest.param({"user.deactivate"}, id="deactivations"),
@@ -599,10 +613,11 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 41 actions of the spec (GH-146's 39 plus GH-152's
-        session.revoke and session.force_logout): nothing missing, nothing extra."""
+        """The catalog has exactly the 43 actions of the spec (GH-146's 39, GH-152's
+        session.revoke and session.force_logout, GH-153's invitation.resend and
+        invitation.refuse): nothing missing, nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 41
+        assert len(AuditAction) == 43
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:

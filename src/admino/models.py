@@ -9,9 +9,10 @@ the ``audit_events`` table, validated by ``admino.audit_events``.
 
 Security notes:
 - No secrets, tokens, passwords, or credentials are stored in any model field,
-  except ``LoginRequest.password`` and ``PasswordResetConfirmRequest.token`` /
-  ``new_password``: ``SecretStr`` values (hidden from repr/str) that live only
-  for their request and are never logged or echoed.
+  except ``LoginRequest.password``, ``PasswordResetConfirmRequest.token`` /
+  ``new_password`` and ``InvitationAcceptRequest.password``: ``SecretStr``
+  values (hidden from repr/str) that live only for their request and are never
+  logged or echoed. Invitation models carry no token, hash or link.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
@@ -1610,3 +1611,125 @@ class SessionListResponse(BaseModel):
     """GET /api/me/sessions response: the caller's live sessions, most recently active first."""
 
     sessions: list[SessionSummary]
+
+
+# ---------------------------------------------------------------------------
+# Invitation API models (GH-153)
+# ---------------------------------------------------------------------------
+
+# Characters a display name may not contain: control (Cc), format (Cf, e.g.
+# direction overrides and zero-width characters) and line/paragraph separators.
+_NAME_BANNED_CATEGORIES: Final = frozenset({"Cc", "Cf", "Zl", "Zp"})
+# An invite email refuses the same, plus surrogates (Cs): it is shown on the
+# acceptance page and in the org's invitation list.
+_EMAIL_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
+
+
+def _strip_if_str(value: object) -> object:
+    """Strip surrounding whitespace from a string; leave anything else to the type check."""
+    return value.strip() if isinstance(value, str) else value
+
+
+class InvitationCreateRequest(BaseModel):
+    """POST /api/org/invitations request body: who to invite, with which role.
+
+    The email is stripped, then must be 3 to 254 characters without
+    whitespace, control, format (zero-width, direction override), separator or
+    surrogate characters, with exactly one '@' after a non-empty
+    local part and a '.' inside the domain (not its first or last character).
+    Capitalization is kept (the unique index ignores it). The org is always the
+    caller's and the language the caller's session language: unknown fields
+    are refused. Validation messages never repeat the email.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=254)
+    role: MemberRole
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _strip_email(cls, value: object) -> object:
+        """Strip surrounding whitespace before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, value: str) -> str:
+        """Accept a plausible single address; the messages never include it."""
+        if any(
+            char.isspace() or unicodedata.category(char) in _EMAIL_BANNED_CATEGORIES
+            for char in value
+        ):
+            msg = "The email must not contain whitespace, control or invisible characters."
+            raise ValueError(msg)
+        local, at, domain = value.partition("@")
+        if not at or not local or "@" in domain or "." not in domain[1:-1]:
+            msg = "The email must look like name@example.com."
+            raise ValueError(msg)
+        return value
+
+
+class InvitationSummary(BaseModel):
+    """One pending invitation of the caller's org (list, create and resend responses).
+
+    No token, token hash or link: an invitation is identified by its id only.
+    ``expired`` is True once ``expires_at`` has passed; an expired invitation
+    still holds its seat until it is revoked or sent again.
+    """
+
+    id: PlainUUID
+    email: str = Field(max_length=254)
+    role: MemberRole
+    sent_at: datetime
+    expires_at: datetime
+    expired: bool
+
+
+class InvitationListResponse(BaseModel):
+    """GET /api/org/invitations response: the org's pending invitations, newest first."""
+
+    invitations: list[InvitationSummary]
+
+
+class InvitationDetails(BaseModel):
+    """GET /api/auth/invitations/{token} response: what the acceptance page shows.
+
+    The minimum: the org's display name, the offered role and the invited
+    email. No ids, dates or token.
+    """
+
+    org_name: str = Field(max_length=120)
+    role: MemberRole
+    email: str = Field(max_length=254)
+
+
+class InvitationAcceptRequest(BaseModel):
+    """POST /api/auth/invitations/{token}/accept request body.
+
+    The name is stripped, then must be 1 to 120 characters without control,
+    format or line/paragraph separator characters. The password is a
+    ``SecretStr``: ``repr()``/``str()`` never show it, and the 422 handler never
+    echoes request input; its bounds only cap the body (the password policy
+    decides the rest). Unknown fields are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=120)
+    password: SecretStr = Field(min_length=1, max_length=1024)
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _strip_name(cls, value: object) -> object:
+        """Strip surrounding whitespace before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        """Refuse control, format and line/paragraph separator characters."""
+        if any(unicodedata.category(char) in _NAME_BANNED_CATEGORIES for char in value):
+            msg = "The name must not contain control or formatting characters."
+            raise ValueError(msg)
+        return value

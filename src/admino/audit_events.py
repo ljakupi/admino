@@ -7,7 +7,8 @@ users' projects, org and platform settings, Super Admin actions, residency
 policy, break-glass sessions, agent tool calls) is written through
 ``record()`` as one row of the ``audit_events`` table (migration 0005; the
 action catalog CHECK is replaced by migration 0009 for GH-152's session
-actions).
+actions and by migration 0010 for GH-153's invitation.resend and
+invitation.refuse).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -82,10 +83,12 @@ class AuditAction(StrEnum):
     # A user ending one of their sessions; an Org Admin's forced logout (GH-152)
     SESSION_REVOKE = "session.revoke"
     SESSION_FORCE_LOGOUT = "session.force_logout"
-    # Invitations
+    # Invitations (sent, revoked, accepted; sent again with a new link, GH-153)
     INVITATION_CREATE = "invitation.create"
     INVITATION_REVOKE = "invitation.revoke"
     INVITATION_ACCEPT = "invitation.accept"
+    INVITATION_RESEND = "invitation.resend"
+    INVITATION_REFUSE = "invitation.refuse"
     # Role changes, activations, deactivations, account deletion
     USER_ROLE_CHANGE = "user.role_change"
     USER_ACTIVATE = "user.activate"
@@ -158,6 +161,8 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.INVITATION_CREATE: "org",
         AuditAction.INVITATION_REVOKE: "org",
         AuditAction.INVITATION_ACCEPT: "org",
+        AuditAction.INVITATION_RESEND: "org",
+        AuditAction.INVITATION_REFUSE: "org",
         AuditAction.USER_ROLE_CHANGE: "org",
         AuditAction.USER_ACTIVATE: "any",
         AuditAction.USER_DEACTIVATE: "any",

@@ -1,18 +1,64 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151, GH-152).
+"""Shared in-memory database for the service and HTTP tests (GH-151, GH-152, GH-153).
 
-``FakeDb`` stands in for the users, organizations, sessions,
+``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox and audit_events tables behind a
 pool-shaped object (``FakeDb.pool``). The real ``admino.auth``,
 ``admino.sessions``, ``admino.session_management``, ``admino.password_reset``,
-``admino.email_outbox`` and ``admino.audit_events`` code runs against it: each
-statement is recognised by its table and verb, and its bind parameters are
-applied to the in-memory tables, so a test can log in, list and revoke
-sessions, request and confirm a password reset, and check the result.
+``admino.invitations``, ``admino.email_outbox`` and ``admino.audit_events``
+code runs against it: each statement is recognised by its table and verb, and
+its bind parameters are applied to the in-memory tables, so a test can log in,
+list and revoke sessions, request and confirm a password reset, send, list,
+revoke, resend and accept invitations, and check the result.
 
-Inputs: accounts and sessions added with ``add_account`` / ``open_session``.
+Inputs: organizations, accounts and sessions added with ``add_org`` /
+``add_account`` / ``open_session``.
 Outputs: the recorded calls (``calls``: method, SQL, args, which pool or
 connection ran it and inside which transaction), the table state, and the
 outcome of every transaction (``transactions``: commit or rollback).
+
+Organizations and invitations (GH-153):
+- ``orgs`` holds the organizations rows (id, name, seats, status, ...).
+  ``add_org`` creates or updates one; ``add_account`` creates a member's org
+  (active, 100 seats) when it doesn't exist yet. An account's ``org_status``
+  (``add_account(org_status=...)``, or set on ``users[id]`` later) is a
+  per-account view of the org's status, kept for the login, session and reset
+  lookups written before the organizations table existed; None (the default)
+  follows the org's row.
+- ``invitations`` holds the invitations rows of migration 0010 (id, user_id,
+  token_hash, created_at, sent_at, expires_at, accepted_at), keyed by id.
+- Every statement that names ``invitations`` or reads ``organizations`` as
+  its main table, every INSERT, UPDATE and DELETE on ``users``, and every
+  users SELECT scoped by ``org_id = $n`` alone runs through a small SQL reader
+  (``_Statement``). It applies exactly what the SQL states: the FROM / JOIN
+  (inner and LEFT) / USING / UPDATE ... FROM sources, their ON conditions, the
+  AND-ed WHERE predicates (``=``, ``<>``, ``<``, ``<=``, ``>``, ``>=`` between
+  columns, bind parameters, literals and ``now()``; ``IS [NOT] NULL``;
+  ``[NOT] IN (...)`` with a list or an uncorrelated SELECT), ``EXISTS
+  (SELECT ...)`` as the whole query, ``count(...)``, ``ORDER BY``, ``LIMIT``,
+  ``FOR UPDATE`` (recorded, no effect) and ``RETURNING``. A predicate the SQL
+  doesn't state isn't applied, so a missing org scope, status or expiry
+  filter shows up in the results. Values: ``$n`` (optionally cast), string and
+  integer literals, ``NULL``, ``now()`` and ``now() + $n::interval`` (the bound
+  value must be a timedelta).
+- The reader fails the calling test with an AssertionError for anything else
+  (OR, BETWEEN, CTEs, correlated subqueries, ON CONFLICT, another table in a
+  join, ...): an unrecognised statement on these tables never silently
+  returns None, [] or "OK".
+- Like PostgreSQL, an unknown column raises UndefinedColumnError, an
+  unqualified column two sources share raises AmbiguousColumnError, and the
+  schema's rules raise the driver's errors: the case-insensitive unique email
+  (UniqueViolationError, whose text repeats the email, as the driver's does),
+  the users CHECKs of migration 0004 (for the columns a statement writes) and
+  its kind/org_id immutability trigger, the invitations CHECKs of migration
+  0010 (a 32-byte token hash, ``sent_at >= created_at``, ``sent_at < expires_at
+  <= sent_at + 72 hours``), UNIQUE user_id and token_hash, NOT NULL
+  expires_at, and the foreign keys. Deleting a users row cascades to its
+  invitation, queued emails, sessions and reset token.
+- ``now()`` is the fake's clock (``datetime.now(UTC)``) when the statement
+  runs; ``created_at`` and ``sent_at`` default to it.
+- ``after_invitation_lookup`` runs once, right after the first SELECT on
+  invitations bound to a token hash (a concurrent accept, revoke, rotation or
+  expiry between the lookup and the transaction).
 
 The sessions table is the schema after migration 0009 (GH-152):
 - Each row stores its own ``idle_timeout_minutes`` (15 to 480, NOT NULL, no
@@ -42,6 +88,8 @@ Semantics the tests rely on:
 - ``fail_audit`` makes every INSERT INTO audit_events fail like a driver
   error; ``after_token_lookup`` runs right after the reset-token lookup (a
   concurrent request, confirm or expiry between the lookup and the consume).
+- Queued emails record the recipient's ``language`` (copied from the users
+  row, as the real INSERT ... SELECT does).
 - Rows are returned with asyncpg's own UUID type, and INET values as
   ``ipaddress`` objects, as the driver does.
 
@@ -77,6 +125,13 @@ LINK_PREFIX: Final = PUBLIC_URL + "/reset-password#token="
 TOKEN_RE: Final = re.compile(r"[A-Za-z0-9_-]{43}")
 # What the fake upsert stores as the reset token's lifetime.
 FAKE_LIFETIME: Final = timedelta(minutes=30)
+
+# GH-153: the display names of the two well-known orgs, the invitation link and
+# the invitations CHECK's lifetime cap (migration 0010).
+ORG_NAME: Final = "Treuhand Muster AG"
+OTHER_ORG_NAME: Final = "Beispiel Partner GmbH"
+INVITE_LINK_PREFIX: Final = PUBLIC_URL + "/accept-invitation#token="
+INVITATION_MAX_LIFETIME: Final = timedelta(hours=72)
 
 # ---------------------------------------------------------------------------
 # Formatting-tolerant session predicates (normalized SQL: lowercase, single
@@ -118,6 +173,49 @@ _SESSION_COLUMNS: Final = frozenset(
     }
 )
 _MAX_LIFETIME: Final = timedelta(hours=72)
+
+# The columns of the tables the SQL reader models (migrations 0004 and 0010).
+_USER_COLUMNS: Final = frozenset(
+    {
+        "id",
+        "email",
+        "name",
+        "password_hash",
+        "kind",
+        "org_id",
+        "role",
+        "status",
+        "ui_language",
+        "response_language",
+        "created_at",
+        "last_login_at",
+        "deleted_at",
+    }
+)
+_ORG_COLUMNS: Final = frozenset(
+    {
+        "id",
+        "name",
+        "status",
+        "seats",
+        "monthly_budget_chf",
+        "storage_quota_bytes",
+        "data_residency",
+        "default_response_language",
+        "deletion_requested_at",
+        "purge_after",
+        "created_at",
+        "updated_at",
+    }
+)
+_INVITATION_COLUMNS: Final = frozenset(
+    {"id", "user_id", "token_hash", "created_at", "sent_at", "expires_at", "accepted_at"}
+)
+_COLUMNS: Final[dict[str, frozenset[str]]] = {
+    "users": _USER_COLUMNS,
+    "organizations": _ORG_COLUMNS,
+    "invitations": _INVITATION_COLUMNS,
+}
 
 
 def norm(sql: str) -> str:
@@ -238,6 +336,8 @@ class FakeDb:
 
     def __init__(self) -> None:
         self.users: dict[uuid.UUID, dict[str, Any]] = {}
+        self.orgs: dict[uuid.UUID, dict[str, Any]] = {}
+        self.invitations: dict[uuid.UUID, dict[str, Any]] = {}
         self.tokens: dict[uuid.UUID, dict[str, Any]] = {}
         self.sessions: dict[bytes, dict[str, Any]] = {}
         self.outbox: list[dict[str, Any]] = []
@@ -246,11 +346,59 @@ class FakeDb:
         self.transactions: list[tuple[int, str]] = []
         self.fail_audit = False
         self.after_token_lookup: Callable[[], None] | None = None
+        self.after_invitation_lookup: Callable[[], None] | None = None
         self.pool = FakePool(self)
         self._connection_count = 0
         self._transaction_count = 0
 
     # -- fixtures ------------------------------------------------------------
+
+    def add_org(
+        self,
+        org_id: uuid.UUID | None = None,
+        *,
+        name: str | None = None,
+        seats: int | None = None,
+        status: str | None = None,
+    ) -> uuid.UUID:
+        """Create an organization, or change the given fields of an existing one.
+
+        A new org is active with 100 seats; ORG_ID and OTHER_ORG_ID get
+        ORG_NAME and OTHER_ORG_NAME, any other org a generated name. A
+        pending_deletion org has its deletion dates set (the 0004 CHECKs).
+        Returns the org's id (a plain uuid.UUID).
+        """
+        org_id = org_id or uuid.uuid4()
+        row = self.orgs.get(org_id)
+        if row is None:
+            default_names = {ORG_ID: ORG_NAME, OTHER_ORG_ID: OTHER_ORG_NAME}
+            now = datetime.now(UTC)
+            row = {
+                "id": org_id,
+                "name": default_names.get(org_id, f"Org {org_id.hex[:8]}"),
+                "status": "active",
+                "seats": 100,
+                "monthly_budget_chf": 0,
+                "storage_quota_bytes": 0,
+                "data_residency": True,
+                "default_response_language": "en",
+                "deletion_requested_at": None,
+                "purge_after": None,
+                "created_at": now,
+                "updated_at": now,
+            }
+            self.orgs[org_id] = row
+        if name is not None:
+            row["name"] = name
+        if seats is not None:
+            row["seats"] = seats
+        if status is not None:
+            row["status"] = status
+            pending = status == "pending_deletion"
+            now = datetime.now(UTC)
+            row["deletion_requested_at"] = now if pending else None
+            row["purge_after"] = now + timedelta(days=30) if pending else None
+        return org_id
 
     def add_account(
         self,
@@ -258,20 +406,29 @@ class FakeDb:
         kind: str = "member",
         role: str | None = "editor",
         status: str = "active",
-        org_status: str | None = "active",
+        org_status: str | None = None,
         deleted_at: datetime | None = None,
         email: str | None = None,
         password_hash: str | None = "fake$initial",  # noqa: S107 - a fake stored hash
         ui_language: str = "de",
         org_id: uuid.UUID = ORG_ID,
+        name: str | None = "Some Person",
     ) -> uuid.UUID:
-        """Add an account and return its id (a plain uuid.UUID)."""
+        """Add an account and return its id (a plain uuid.UUID).
+
+        A member's org is created (active, 100 seats) if it doesn't exist.
+        ``org_status`` overrides the org's status for this account's login,
+        session and reset lookups only; left out, the account follows the
+        organizations row.
+        """
         user_id = uuid.uuid4()
         is_member = kind == "member"
+        if is_member and org_id not in self.orgs:
+            self.add_org(org_id)
         self.users[user_id] = {
             "id": user_id,
             "email": email or f"user-{user_id.hex[:8]}@example.test",
-            "name": "Some Person",
+            "name": name,
             "kind": kind,
             "org_id": org_id if is_member else None,
             "role": role if is_member else None,
@@ -281,6 +438,8 @@ class FakeDb:
             "org_status": org_status if is_member else None,
             "ui_language": ui_language,
             "response_language": None,
+            "created_at": datetime.now(UTC) - timedelta(days=1),
+            "last_login_at": None,
         }
         return user_id
 
@@ -358,6 +517,44 @@ class FakeDb:
         """Stored audit rows (optionally of one action)."""
         return [row for row in self.audit if action is None or row["action"] == action]
 
+    def invitation_emails(self, user_id: uuid.UUID | None = None) -> list[dict[str, Any]]:
+        """The queued invitation emails (optionally of one user), oldest first."""
+        return [
+            row
+            for row in self.outbox
+            if row["template_key"] == "invitation" and user_id in (None, row["user_id"])
+        ]
+
+    def invitation_token(self, user_id: uuid.UUID | None = None, index: int = -1) -> str:
+        """The token of a queued invitation link (the newest by default)."""
+        link = self.invitation_emails(user_id)[index]["params"]["accept_link"]
+        assert link.startswith(INVITE_LINK_PREFIX), link
+        return str(link[len(INVITE_LINK_PREFIX) :])
+
+    def user_by_email(self, email: str) -> dict[str, Any] | None:
+        """The users row with this email, ignoring capitalization."""
+        return next(
+            (row for row in self.users.values() if row["email"].lower() == email.lower()), None
+        )
+
+    def invitation_of(self, user_id: uuid.UUID) -> dict[str, Any] | None:
+        """The invitations row of a user."""
+        return next((row for row in self.invitations.values() if row["user_id"] == user_id), None)
+
+    def invitation_by_token(self, token: str) -> dict[str, Any] | None:
+        """The invitations row whose hash is this raw token's."""
+        digest = sha256(token)
+        return next((row for row in self.invitations.values() if row["token_hash"] == digest), None)
+
+    def org_status_of(self, account: dict[str, Any]) -> str | None:
+        """The org status a login, session or reset lookup sees for an account."""
+        if account["kind"] != "member":
+            return None
+        if account.get("org_status") is not None:
+            return str(account["org_status"])
+        org = self.orgs.get(account["org_id"])
+        return None if org is None else str(org["status"])
+
     # -- transactions ------------------------------------------------------------
 
     def begin(self) -> int:
@@ -370,6 +567,8 @@ class FakeDb:
         return copy.deepcopy(
             {
                 "users": self.users,
+                "orgs": self.orgs,
+                "invitations": self.invitations,
                 "tokens": self.tokens,
                 "sessions": self.sessions,
                 "outbox": self.outbox,
@@ -380,6 +579,8 @@ class FakeDb:
     def restore(self, state: dict[str, Any]) -> None:
         """Put the tables back as they were (a rollback)."""
         self.users = state["users"]
+        self.orgs = state["orgs"]
+        self.invitations = state["invitations"]
         self.tokens = state["tokens"]
         self.sessions = state["sessions"]
         self.outbox = state["outbox"]
@@ -399,10 +600,14 @@ class FakeDb:
         if re.search(r"\brevoked_at\b", n):
             # Migration 0009 dropped the column: revoking deletes the row.
             raise asyncpg.exceptions.UndefinedColumnError('column "revoked_at" does not exist')
+        if _runs_on_reader(n, args):
+            return self._run_statement(method, n, args)
         if n.startswith("insert into audit_events"):
             return self._insert_audit(n, args)
         if n.startswith("insert into email_outbox"):
             return self._enqueue(args)
+        if n.startswith("update email_outbox") and "recipient_user_id" in n:
+            return self._cancel_outbox(n, args)
         if n.startswith("insert into password_reset_tokens"):
             return self._upsert_token(args)
         if n.startswith("delete from password_reset_tokens"):
@@ -435,6 +640,206 @@ class FakeDb:
             return None
         return "OK"
 
+    def _run_statement(self, method: str, n: str, args: tuple[Any, ...]) -> Any:
+        """Run one statement through the SQL reader and shape its result like asyncpg."""
+        statement = _Statement(self, args, datetime.now(UTC))
+        verb = n.split(" ", 1)[0]
+        if verb == "select":
+            rows = statement.select(n)
+            tag = f"SELECT {len(rows)}"
+            hook = self.after_invitation_lookup
+            if (
+                hook is not None
+                and _primary_table(n) == "invitations"
+                and any(isinstance(arg, bytes | bytearray) for arg in args)
+            ):
+                self.after_invitation_lookup = None
+                hook()
+        elif verb == "insert":
+            rows, count = statement.insert(n)
+            tag = f"INSERT 0 {count}"
+        elif verb == "update":
+            rows, count = statement.update(n)
+            tag = f"UPDATE {count}"
+        elif verb == "delete":
+            rows, count = statement.delete(n)
+            tag = f"DELETE {count}"
+        else:
+            msg = f"the fake doesn't run this statement: {n}"
+            raise AssertionError(msg)
+        if method == "execute":
+            return tag
+        if method == "fetch":
+            return rows
+        if method == "fetchrow":
+            return rows[0] if rows else None
+        return next(iter(rows[0].values())) if rows else None
+
+    # -- the tables behind the SQL reader ------------------------------------
+
+    def table_rows(self, table: str) -> list[dict[str, Any]]:
+        """The stored rows of a table the SQL reader models."""
+        if table == "users":
+            return list(self.users.values())
+        if table == "organizations":
+            return list(self.orgs.values())
+        if table == "invitations":
+            return list(self.invitations.values())
+        msg = f"the fake's SQL reader doesn't model table {table}"
+        raise AssertionError(msg)
+
+    def new_row(self, table: str, given: dict[str, Any], now: datetime) -> dict[str, Any]:
+        """Build, check and store a new users or invitations row (an INSERT)."""
+        if table == "users":
+            row: dict[str, Any] = dict.fromkeys(_USER_COLUMNS)
+            row.update(id=uuid.uuid4(), status="invited", ui_language="en", created_at=now)
+            row.update(given)
+            row["org_status"] = None
+            self.check_row("users", row, changed=set(_USER_COLUMNS), original=None)
+            self.users[row["id"]] = row
+            return row
+        if table == "invitations":
+            row = dict.fromkeys(_INVITATION_COLUMNS)
+            row.update(id=uuid.uuid4(), created_at=now, sent_at=now)
+            row.update(given)
+            self.check_row("invitations", row, changed=set(_INVITATION_COLUMNS), original=None)
+            self.invitations[row["id"]] = row
+            return row
+        msg = f"the fake doesn't insert into {table} (tests create orgs with add_org)"
+        raise AssertionError(msg)
+
+    def check_row(
+        self,
+        table: str,
+        row: dict[str, Any],
+        *,
+        changed: set[str],
+        original: dict[str, Any] | None,
+    ) -> None:
+        """Apply the schema's rules for the written columns, as PostgreSQL would."""
+        if table == "users":
+            self._check_user(row, changed, original)
+        elif table == "invitations":
+            self._check_invitation(row, changed, original)
+        else:
+            msg = f"the invitation flow never writes {table}"
+            raise AssertionError(msg)
+
+    def _check_user(
+        self, row: dict[str, Any], changed: set[str], original: dict[str, Any] | None
+    ) -> None:
+        """Migration 0004's users constraints (for the written columns) and its trigger."""
+        check = asyncpg.exceptions.CheckViolationError
+        if original is not None:
+            for column in ("kind", "org_id"):
+                if column in changed and row[column] != original[column]:
+                    msg = "users.kind and users.org_id can't change"
+                    raise check(msg)
+        for column in ("email", "kind", "status", "ui_language"):
+            if column in changed and row[column] is None:
+                msg = f'null value in column "{column}" of relation "users"'
+                raise asyncpg.exceptions.NotNullViolationError(msg)
+        if "email" in changed:
+            email = row["email"]
+            assert isinstance(email, str), "users.email must be bound as a str"
+            if (
+                not 3 <= len(email) <= 254
+                or any(char.isspace() for char in email)
+                or email.find("@") < 1
+            ):
+                msg = 'new row for relation "users" violates check constraint'
+                raise check(msg)
+            for other in self.users.values():
+                if other["id"] != row["id"] and other["email"].lower() == email.lower():
+                    # The driver's text repeats the key, as asyncpg's does.
+                    msg = (
+                        'duplicate key value violates unique constraint "users_email_lower_key"'
+                        f" DETAIL: Key (lower(email))=({email.lower()}) already exists."
+                    )
+                    raise asyncpg.exceptions.UniqueViolationError(msg)
+        rules = (
+            ("kind", row["kind"] in {"super_admin", "member"}),
+            ("role", row["role"] in {None, "org_admin", "editor", "viewer"}),
+            ("status", row["status"] in {"invited", "active", "deactivated"}),
+            ("ui_language", row["ui_language"] in {"de", "fr", "en"}),
+            ("name", row["name"] is None or 1 <= len(row["name"]) <= 120),
+            (
+                "password_hash",
+                row["password_hash"] is None or 1 <= len(row["password_hash"]) <= 512,
+            ),
+        )
+        for column, valid in rules:
+            if column in changed and not valid:
+                msg = f'new row for relation "users" violates the {column} check'
+                raise check(msg)
+        if changed & {"kind", "org_id", "role"}:
+            is_super_admin = row["kind"] == "super_admin"
+            if is_super_admin != (row["org_id"] is None) or is_super_admin != (row["role"] is None):
+                msg = 'new row for relation "users" violates the super admin checks'
+                raise check(msg)
+        if (
+            changed & {"status", "name", "password_hash"}
+            and row["status"] == "active"
+            and (row["name"] is None or row["password_hash"] is None)
+        ):
+            msg = 'new row for relation "users" violates "users_active_credentials_check"'
+            raise check(msg)
+        if "org_id" in changed and row["org_id"] is not None and row["org_id"] not in self.orgs:
+            msg = 'insert or update on table "users" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
+
+    def _check_invitation(
+        self, row: dict[str, Any], changed: set[str], original: dict[str, Any] | None
+    ) -> None:
+        """Migration 0010's invitations constraints."""
+        del original
+        check = asyncpg.exceptions.CheckViolationError
+        for column in ("id", "user_id", "token_hash", "created_at", "sent_at", "expires_at"):
+            if row[column] is None:
+                msg = f'null value in column "{column}" of relation "invitations"'
+                raise asyncpg.exceptions.NotNullViolationError(msg)
+        if "token_hash" in changed:
+            token_hash = row["token_hash"]
+            if not isinstance(token_hash, bytes | bytearray) or len(token_hash) != 32:
+                msg = 'new row for relation "invitations" violates the token_hash check'
+                raise check(msg)
+        if "user_id" in changed and row["user_id"] not in self.users:
+            msg = 'insert or update on table "invitations" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
+        for other in self.invitations.values():
+            if other["id"] == row["id"]:
+                continue
+            for column in ("user_id", "token_hash"):
+                if column in changed and other[column] == row[column]:
+                    msg = (
+                        f'duplicate key value violates unique constraint "invitations_{column}_key"'
+                    )
+                    raise asyncpg.exceptions.UniqueViolationError(msg)
+        sent_at, expires_at = row["sent_at"], row["expires_at"]
+        if not sent_at >= row["created_at"]:
+            msg = 'new row for relation "invitations" violates the sent_at check'
+            raise check(msg)
+        if not (expires_at > sent_at and expires_at <= sent_at + INVITATION_MAX_LIFETIME):
+            msg = 'new row for relation "invitations" violates the expiry check'
+            raise check(msg)
+
+    def delete_row(self, table: str, row: dict[str, Any]) -> None:
+        """Delete one users or invitations row; a user's rows cascade (ON DELETE CASCADE)."""
+        if table == "invitations":
+            del self.invitations[row["id"]]
+            return
+        assert table == "users", f"the invitation flow never deletes from {table}"
+        user_id = row["id"]
+        del self.users[user_id]
+        self.invitations = {
+            key: value for key, value in self.invitations.items() if value["user_id"] != user_id
+        }
+        self.outbox = [value for value in self.outbox if value["user_id"] != user_id]
+        self.sessions = {
+            key: value for key, value in self.sessions.items() if value["user_id"] != user_id
+        }
+        self.tokens.pop(user_id, None)
+
     def _insert_audit(self, n: str, args: tuple[Any, ...]) -> str:
         if self.fail_audit:
             raise AuditWriteError("the audit write was refused")
@@ -455,10 +860,46 @@ class FakeDb:
             {
                 "user_id": plain(user_id),
                 "template_key": template_key,
+                "language": account["ui_language"],
                 "params": json.loads(params_json),
+                "status": "pending",
+                "finished_at": None,
             }
         )
         return uuid.uuid4()
+
+    def _cancel_outbox(self, n: str, args: tuple[Any, ...]) -> str:
+        """Cancel a recipient's pending emails of one template (a resend's stale link).
+
+        Only the shape the spec allows: scoped by recipient and template to pending rows,
+        marked failed with params cleared and finished_at set (the outbox's finished-row
+        invariant). Anything else fails loudly.
+        """
+        required = (
+            r"^update email_outbox set ",
+            r"\bstatus = 'failed'",
+            r"\bparams = '\{\}'(?:::jsonb)?",
+            rf"\bfinished_at = {NOW_SQL}",
+            r"\brecipient_user_id = \$\d+",
+            r"\btemplate_key = (?:\$\d+|'invitation')",
+            r"\bstatus = 'pending'",
+        )
+        missing = [pattern for pattern in required if not re.search(pattern, n)]
+        assert not missing, f"unexpected email_outbox update: {n!r} (missing {missing})"
+        user_id = plain(_bound(args, r"\brecipient_user_id = \$(\d+)", n))
+        template_match = re.search(r"\btemplate_key = \$(\d+)", n)
+        template = args[int(template_match.group(1)) - 1] if template_match else "invitation"
+        now = datetime.now(UTC)
+        count = 0
+        for row in self.outbox:
+            if (
+                row["user_id"] == user_id
+                and row["template_key"] == template
+                and row["status"] == "pending"
+            ):
+                row.update(status="failed", params={}, finished_at=now)
+                count += 1
+        return f"UPDATE {count}"
 
     def _upsert_token(self, args: tuple[Any, ...]) -> datetime:
         token_hash = next(arg for arg in args if isinstance(arg, bytes))
@@ -497,7 +938,7 @@ class FakeDb:
                     "role": account["role"],
                     "status": account["status"],
                     "deleted_at": account["deleted_at"],
-                    "org_status": account["org_status"],
+                    "org_status": self.org_status_of(account),
                     "expires_at": row["expires_at"],
                 }
                 break
@@ -668,7 +1109,7 @@ class FakeDb:
             "role": account["role"],
             "status": account["status"],
             "deleted_at": account["deleted_at"],
-            "org_status": account["org_status"],
+            "org_status": self.org_status_of(account),
             "ui_language": account["ui_language"],
             "response_language": account["response_language"],
         }
@@ -709,8 +1150,488 @@ class FakeDb:
                     **account,
                     "id": _pg(account["id"]),
                     "org_id": _pg(account["org_id"]),
+                    "org_status": self.org_status_of(account),
                 }
         return None
+
+
+# ---------------------------------------------------------------------------
+# The SQL reader behind the users, organizations and invitations statements
+# (GH-153). It reads normalized SQL (lowercase, single spaces).
+# ---------------------------------------------------------------------------
+
+
+def _masked(text: str) -> str:
+    """Blank out quoted literals and everything inside parentheses (same length).
+
+    The outermost parentheses stay, so top-level structure (keywords, commas,
+    operators) can be found in the masked text and sliced from the original.
+    """
+    out: list[str] = []
+    depth = 0
+    quoted = False
+    for char in text:
+        if quoted:
+            quoted = char != "'"
+            out.append("'" if not quoted and depth == 0 else " ")
+        elif char == "'":
+            quoted = True
+            out.append("'" if depth == 0 else " ")
+        elif char == "(":
+            out.append("(" if depth == 0 else " ")
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            out.append(")" if depth == 0 else " ")
+        else:
+            out.append(char if depth == 0 else " ")
+    assert depth == 0 and not quoted, f"unbalanced SQL: {text}"
+    return "".join(out)
+
+
+def _top_split(text: str, pattern: str) -> list[str]:
+    """Split text at the top-level matches of a regex (outside parentheses and literals)."""
+    masked = _masked(text)
+    parts: list[str] = []
+    start = 0
+    for match in re.finditer(pattern, masked):
+        parts.append(text[start : match.start()].strip())
+        start = match.end()
+    parts.append(text[start:].strip())
+    return parts
+
+
+def _unwrap(text: str) -> str:
+    """Drop parentheses that wrap the whole expression."""
+    text = text.strip()
+    while text.startswith("(") and _masked(text).find(")") == len(text) - 1:
+        text = text[1:-1].strip()
+    return text
+
+
+def _clauses(text: str, keywords: tuple[str, ...]) -> dict[str, str]:
+    """Cut a statement into its top-level clauses, keyed by the keyword that opens each."""
+    masked = _masked(text)
+    found: list[tuple[int, str]] = []
+    for keyword in keywords:
+        hits = list(re.finditer(rf"(?<![\w.]){re.escape(keyword)}(?!\w)", masked))
+        assert len(hits) <= 1, f"the fake can't read two {keyword!r} clauses: {text}"
+        if hits:
+            found.append((hits[0].start(), keyword))
+    found.sort()
+    assert found and found[0][0] == 0, f"the fake can't read this statement: {text}"
+    clauses: dict[str, str] = {}
+    for index, (start, keyword) in enumerate(found):
+        end = found[index + 1][0] if index + 1 < len(found) else len(text)
+        clauses[keyword] = text[start + len(keyword) : end].strip()
+    return clauses
+
+
+@dataclass(frozen=True)
+class _Source:
+    """One table of a FROM / JOIN / USING list: its alias, ON condition and join kind."""
+
+    table: str
+    alias: str
+    on: str | None
+    left: bool
+
+
+def _sources(text: str) -> list[_Source]:
+    """The tables of a FROM (or USING) list, in order."""
+    masked = _masked(text)
+    pieces: list[tuple[str, str]] = []
+    start = 0
+    kind = "first"
+    for match in re.finditer(r" ?, ?| (?:(inner|left(?: outer)?|cross|right|full) )?join ", masked):
+        pieces.append((kind, text[start : match.start()].strip()))
+        kind = "comma" if "," in match.group(0) else (match.group(1) or "inner")
+        start = match.end()
+    pieces.append((kind, text[start:].strip()))
+    sources: list[_Source] = []
+    for kind, piece in pieces:
+        assert kind in {"first", "comma", "inner", "left", "left outer"}, (
+            f"the fake doesn't do {kind} joins: {text}"
+        )
+        match = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(?!on\b)(\w+))?(?: on (.+))?", piece)
+        assert match is not None, f"the fake can't read this FROM item: {piece}"
+        table, alias, on = match.groups()
+        assert table in _COLUMNS, f"the fake's SQL reader doesn't model table {table}: {text}"
+        assert (on is None) == (kind in {"first", "comma"}), f"a join needs ON: {piece}"
+        sources.append(_Source(table, alias or table, on, kind.startswith("left")))
+    return sources
+
+
+def _primary_table(n: str) -> str | None:
+    """The table a statement writes, or the first table its (outermost) SELECT reads."""
+    match = re.match(r"(?:insert into|update|delete from) (?:only )?(\w+)", n)
+    if match is not None:
+        return match.group(1)
+    match = re.search(r"(?<![\w.])from (\w+)", _masked(n)) or re.search(r"(?<![\w.])from (\w+)", n)
+    return None if match is None else match.group(1)
+
+
+def _runs_on_reader(n: str, args: tuple[Any, ...]) -> bool:
+    """True for the statements the SQL reader runs (see the module docstring)."""
+    if re.search(r"\binvitations\b", n):
+        return True
+    table = _primary_table(n)
+    if table == "organizations":
+        return True
+    if table != "users":
+        return False
+    if re.match(r"(?:insert into|update|delete from) users\b", n):
+        return True
+    where = _where(n)
+    return (
+        re.search(ORG_ID_PARAM_RE, where) is not None
+        and re.search(ID_PARAM_RE, where) is None
+        and not any(isinstance(arg, str) for arg in args)
+    )
+
+
+def _store(value: Any) -> Any:
+    """What a table keeps: a plain uuid.UUID for any UUID, other values unchanged."""
+    return uuid.UUID(int=value.int) if isinstance(value, uuid.UUID) else value
+
+
+def _canonical(value: Any) -> Any:
+    """A comparable value: plain UUIDs, bytes for bytearrays."""
+    if isinstance(value, uuid.UUID):
+        return uuid.UUID(int=value.int)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return value
+
+
+def _compare(operator: str, left: Any, right: Any) -> bool:
+    """SQL comparison: anything compared with NULL is not true."""
+    if left is None or right is None:
+        return False
+    left, right = _canonical(left), _canonical(right)
+    if isinstance(left, uuid.UUID) and isinstance(right, str):
+        right = uuid.UUID(right)
+    if isinstance(right, uuid.UUID) and isinstance(left, str):
+        left = uuid.UUID(left)
+    if operator == "=":
+        return bool(left == right)
+    if operator in {"<>", "!="}:
+        return bool(left != right)
+    if operator == "<":
+        return bool(left < right)
+    if operator == "<=":
+        return bool(left <= right)
+    if operator == ">":
+        return bool(left > right)
+    return bool(left >= right)
+
+
+_Context = dict[str, tuple[str, dict[str, Any] | None]]
+
+
+class _Statement:
+    """One statement the SQL reader runs: the database, its bind args and now()."""
+
+    def __init__(self, db: FakeDb, args: tuple[Any, ...], now: datetime) -> None:
+        self.db = db
+        self.args = args
+        self.now = now
+
+    # -- values and predicates ---------------------------------------------------
+
+    def _arg(self, number: str) -> Any:
+        index = int(number) - 1
+        assert 0 <= index < len(self.args), f"${number} has no bound value"
+        return self.args[index]
+
+    def value(self, expr: str, ctx: _Context) -> Any:
+        """Evaluate a value expression in a row context."""
+        expr = _unwrap(expr)
+        if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?)?", expr):
+            return self._arg(match.group(1))
+        if match := re.fullmatch(r"'((?:[^']|'')*)'(?: ?:: ?\w+)?", expr):
+            return match.group(1).replace("''", "'")
+        if expr == "null":
+            return None
+        if expr in {"true", "false"}:
+            return expr == "true"
+        if re.fullmatch(r"-?\d+", expr):
+            return int(expr)
+        if re.fullmatch(NOW_SQL, expr):
+            return self.now
+        if match := re.fullmatch(rf"{NOW_SQL} ?\+ ?\$(\d+) ?:: ?interval", expr):
+            interval = self._arg(match.group(1))
+            assert isinstance(interval, timedelta), "an interval must be bound as a timedelta"
+            return self.now + interval
+        if match := re.fullmatch(r"lower ?\((.+)\)", expr):
+            inner = self.value(match.group(1), ctx)
+            return inner.lower() if isinstance(inner, str) else inner
+        if match := re.fullmatch(r"(?:(\w+)\.)?(\w+)", expr):
+            return self.column(match.group(1), match.group(2), ctx)
+        msg = f"the fake can't evaluate {expr!r}"
+        raise AssertionError(msg)
+
+    def column(self, qualifier: str | None, name: str, ctx: _Context) -> Any:
+        """A column's value in a row context, resolved like PostgreSQL."""
+        if qualifier is not None:
+            if qualifier not in ctx:
+                msg = f'missing FROM-clause entry for table "{qualifier}"'
+                raise asyncpg.exceptions.UndefinedTableError(msg)
+            owners = [qualifier] if name in _COLUMNS[ctx[qualifier][0]] else []
+        else:
+            owners = [alias for alias, (table, _) in ctx.items() if name in _COLUMNS[table]]
+        if len(owners) > 1:
+            msg = f'column reference "{name}" is ambiguous'
+            raise asyncpg.exceptions.AmbiguousColumnError(msg)
+        if not owners:
+            msg = f'column "{name}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
+        row = ctx[owners[0]][1]
+        return None if row is None else row[name]
+
+    def holds(self, text: str, ctx: _Context) -> bool:
+        """True when every AND-ed predicate of a WHERE / ON text holds."""
+        text = _unwrap(text)
+        masked = _masked(text)
+        for keyword in ("or", "between", "exists", "like", "ilike", "any", "all", "case"):
+            assert not re.search(rf"(?<![\w.]){keyword}(?!\w)", masked), (
+                f"the fake doesn't evaluate {keyword.upper()}: {text}"
+            )
+        return all(self.atom(atom, ctx) for atom in _top_split(text, r" and "))
+
+    def atom(self, atom: str, ctx: _Context) -> bool:
+        """Evaluate one predicate."""
+        atom = _unwrap(atom)
+        if " and " in _masked(atom):
+            return self.holds(atom, ctx)
+        masked = _masked(atom)
+        if match := re.fullmatch(r"(.+?) is (not )?null", masked):
+            value = self.value(atom[: match.end(1)], ctx)
+            return (value is not None) if match.group(2) else (value is None)
+        if match := re.fullmatch(r"(.+?) (not )?in ?\( *\)", masked):
+            left = self.value(atom[: match.end(1)], ctx)
+            inner = atom[masked.rindex("(") + 1 : -1].strip()
+            if inner.startswith("select "):
+                values = [next(iter(row.values())) for row in self.select(inner)]
+            else:
+                values = [self.value(item, ctx) for item in _top_split(inner, ",")]
+            found = any(_compare("=", left, value) for value in values)
+            return left is not None and (found != bool(match.group(2)))
+        assert not re.match(r"not ", masked), f"the fake doesn't evaluate NOT: {atom}"
+        if match := re.fullmatch(r"(.+?) ?(<>|!=|<=|>=|=|<|>) ?(.+)", masked):
+            left = self.value(atom[: match.end(1)], ctx)
+            right = self.value(atom[match.start(3) :], ctx)
+            return _compare(match.group(2), left, right)
+        msg = f"the fake can't evaluate the predicate {atom!r}"
+        raise AssertionError(msg)
+
+    # -- row sets ----------------------------------------------------------------
+
+    def contexts(self, sources: list[_Source]) -> list[_Context]:
+        """Every combination of source rows that satisfies the ON conditions."""
+        contexts: list[_Context] = [{}]
+        for source in sources:
+            joined: list[_Context] = []
+            for ctx in contexts:
+                matched = [
+                    candidate
+                    for row in self.db.table_rows(source.table)
+                    if (candidate := {**ctx, source.alias: (source.table, row)})
+                    and (source.on is None or self.holds(source.on, candidate))
+                ]
+                if not matched and source.left:
+                    matched = [{**ctx, source.alias: (source.table, None)}]
+                joined.extend(matched)
+            contexts = joined
+        return contexts
+
+    def filtered(self, contexts: list[_Context], where: str | None) -> list[_Context]:
+        return contexts if where is None else [ctx for ctx in contexts if self.holds(where, ctx)]
+
+    def ordered(self, contexts: list[_Context], text: str) -> list[_Context]:
+        """Sort by an ORDER BY list (NULLs last ascending, first descending, as PostgreSQL)."""
+        keys = []
+        for piece in _top_split(text, ","):
+            match = re.fullmatch(r"(.+?)(?: (asc|desc))?(?: nulls (first|last))?", piece)
+            assert match is not None, f"the fake can't read ORDER BY {piece}"
+            keys.append(match.groups())
+        for expr, direction, nulls in reversed(keys):
+            descending = direction == "desc"
+            nulls_first = (nulls == "first") if nulls else descending
+            present = [ctx for ctx in contexts if self.value(expr, ctx) is not None]
+            absent = [ctx for ctx in contexts if self.value(expr, ctx) is None]
+            present.sort(key=lambda ctx, e=expr: _canonical(self.value(e, ctx)), reverse=descending)
+            contexts = absent + present if nulls_first else present + absent
+        return contexts
+
+    def project(self, text: str, contexts: list[_Context]) -> list[dict[str, Any]]:
+        """Evaluate a SELECT / RETURNING list over the row contexts (asyncpg-shaped values)."""
+        items = []
+        for item in _top_split(text, ","):
+            masked = _masked(item)
+            alias = None
+            expr = item
+            match = re.fullmatch(r"(.+?) as (\w+)", masked) or re.fullmatch(
+                r"((?:\w+\.)?\w+) (\w+)", masked
+            )
+            if match is not None:
+                expr, alias = item[: match.end(1)], match.group(2)
+            expr = expr.strip()
+            assert expr != "*" and not expr.endswith(".*"), "name the columns (no SELECT *)"
+            if count := re.fullmatch(r"count ?\((\*|1|(?:\w+\.)?\w+)\)(?: ?:: ?\w+)?", expr):
+                items.append(("count", alias or "count", count.group(1)))
+            elif re.fullmatch(r"(?:\w+\.)?\w+", expr) and not re.fullmatch(r"-?\d+|null", expr):
+                items.append(("value", alias or expr.rsplit(".", 1)[-1], expr))
+            elif re.search(r"<>|!=|<=|>=|=|<|>| is (?:not )?null$", _masked(expr)):
+                items.append(("predicate", alias or "?column?", expr))
+            else:
+                items.append(("value", alias or "?column?", expr))
+        if any(kind == "count" for kind, _, _ in items):
+            assert all(kind == "count" for kind, _, _ in items), "no GROUP BY in the fake"
+            return [
+                {
+                    key: sum(
+                        1
+                        for ctx in contexts
+                        if expr in {"*", "1"} or self.value(expr, ctx) is not None
+                    )
+                    for _, key, expr in items
+                }
+            ]
+        rows = []
+        for ctx in contexts:
+            row: dict[str, Any] = {}
+            for kind, key, expr in items:
+                value = self.atom(expr, ctx) if kind == "predicate" else self.value(expr, ctx)
+                row[key] = _pg(value) if isinstance(value, uuid.UUID) else value
+            rows.append(row)
+        return rows
+
+    # -- statements --------------------------------------------------------------
+
+    def select(self, n: str) -> list[dict[str, Any]]:
+        masked = _masked(n)
+        if match := re.fullmatch(r"select exists ?\( *\)(?: as (\w+))?", masked):
+            inner = n[masked.index("(") + 1 : masked.rindex(")")].strip()
+            return [{match.group(1) or "exists": bool(self.select(inner))}]
+        clauses = _clauses(
+            n,
+            (
+                "select",
+                "from",
+                "where",
+                "group by",
+                "having",
+                "order by",
+                "limit",
+                "offset",
+                "for update",
+                "for no key update",
+                "for share",
+                "for key share",
+            ),
+        )
+        unsupported = {"group by", "having", "offset", "for share", "for key share"}
+        assert not unsupported & clauses.keys(), f"the fake can't read this SELECT: {n}"
+        assert "from" in clauses, f"a SELECT without FROM: {n}"
+        assert not clauses["select"].startswith("distinct"), "no DISTINCT in the fake"
+        contexts = self.filtered(self.contexts(_sources(clauses["from"])), clauses.get("where"))
+        if "order by" in clauses:
+            contexts = self.ordered(contexts, clauses["order by"])
+        rows = self.project(clauses["select"], contexts)
+        if "limit" in clauses:
+            rows = rows[: int(self.value(clauses["limit"], {}))]
+        return rows
+
+    def insert(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        clauses = _clauses(n, ("insert into", "values", "on conflict", "returning"))
+        assert "on conflict" not in clauses, f"the fake doesn't do ON CONFLICT here: {n}"
+        head = re.fullmatch(r"(\w+) ?\((.*)\)", clauses["insert into"])
+        values = clauses.get("values", "")
+        assert head is not None and _unwrap(values) != values, f"one VALUES row only: {n}"
+        table = head.group(1)
+        columns = [column.strip().strip('"') for column in head.group(2).split(",")]
+        exprs = _top_split(values[1:-1], ",")
+        assert len(columns) == len(exprs), n
+        unknown = set(columns) - _COLUMNS.get(table, frozenset())
+        if unknown:
+            msg = f'column "{sorted(unknown)[0]}" of relation "{table}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
+        given = {
+            column: _store(self.value(expr, {}))
+            for column, expr in zip(columns, exprs, strict=True)
+            if expr != "default"
+        }
+        row = self.db.new_row(table, given, self.now)
+        ctx: _Context = {table: (table, row)}
+        returned = self.project(clauses["returning"], [ctx]) if "returning" in clauses else []
+        return returned, 1
+
+    def update(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        clauses = _clauses(n, ("update", "set", "from", "where", "returning"))
+        head = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(\w+))?", clauses["update"])
+        assert head is not None, n
+        table, alias = head.group(1), head.group(2) or head.group(1)
+        assert table in {"users", "invitations"}, f"the invitation flow never updates {table}"
+        sources = [_Source(table, alias, None, left=False)]
+        if "from" in clauses:
+            sources += _sources(clauses["from"])
+        contexts = self.filtered(self.contexts(sources), clauses.get("where"))
+        assignments = []
+        for piece in _top_split(clauses["set"], ","):
+            match = re.fullmatch(r"(?:\w+\.)?(\w+) ?= ?(.+)", piece)
+            assert match is not None, f"the fake can't read SET {piece}"
+            if match.group(1) not in _COLUMNS[table]:
+                msg = f'column "{match.group(1)}" of relation "{table}" does not exist'
+                raise asyncpg.exceptions.UndefinedColumnError(msg)
+            assignments.append(match.groups())
+        targets: list[tuple[_Context, dict[str, Any], dict[str, Any]]] = []
+        seen: set[int] = set()
+        for ctx in contexts:
+            row = ctx[alias][1]
+            assert row is not None
+            if id(row) in seen:
+                continue
+            seen.add(id(row))
+            new = {column: _store(self.value(expr, ctx)) for column, expr in assignments}
+            targets.append((ctx, row, new))
+        for _, row, new in targets:
+            self.db.check_row(table, {**row, **new}, changed=set(new), original=row)
+        for _, row, new in targets:
+            row.update(new)
+        returned = (
+            self.project(clauses["returning"], [ctx for ctx, _, _ in targets])
+            if "returning" in clauses
+            else []
+        )
+        return returned, len(targets)
+
+    def delete(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        clauses = _clauses(n, ("delete from", "using", "where", "returning"))
+        head = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(\w+))?", clauses["delete from"])
+        assert head is not None, n
+        table, alias = head.group(1), head.group(2) or head.group(1)
+        assert table in {"users", "invitations"}, f"the invitation flow never deletes {table}"
+        sources = [_Source(table, alias, None, left=False)]
+        if "using" in clauses:
+            sources += _sources(clauses["using"])
+        contexts = self.filtered(self.contexts(sources), clauses.get("where"))
+        targets: list[tuple[_Context, dict[str, Any]]] = []
+        seen: set[int] = set()
+        for ctx in contexts:
+            row = ctx[alias][1]
+            assert row is not None
+            if id(row) not in seen:
+                seen.add(id(row))
+                targets.append((ctx, row))
+        returned = (
+            self.project(clauses["returning"], [ctx for ctx, _ in targets])
+            if "returning" in clauses
+            else []
+        )
+        for _, row in targets:
+            self.db.delete_row(table, row)
+        return returned, len(targets)
 
 
 class FakeConnection:

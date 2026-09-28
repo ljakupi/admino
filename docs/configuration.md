@@ -176,16 +176,19 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   of sessions that ended.
 - **Every API route needs a session**, except `/health`, the login endpoint, the two
   password reset endpoints (`POST /api/auth/password-reset` and
-  `POST /api/auth/password-reset/confirm`) and the OAuth callback. A deactivated account, or
-  an account whose organization is deactivated or pending deletion, is refused on its next
-  request, even with a session that's still open.
+  `POST /api/auth/password-reset/confirm`), the two invitation link endpoints
+  (`GET /api/auth/invitations/{token}` and `POST /api/auth/invitations/{token}/accept`)
+  and the OAuth callback. A deactivated account, or an account whose organization is
+  deactivated or pending deletion, is refused on its next request, even with a session
+  that's still open.
 - **A failed login** always answers "Invalid email or password", whatever the reason.
   Successful and failed logins are recorded in the audit log, without the email address.
 - **Cross-site requests** that change something (`POST`, `PATCH`, `DELETE`) are refused
   with `403`.
-- **Rate limits** apply per user, and per IP address for the login and the password reset
-  endpoints (an IP address gets one reset email a minute, after the first three). An IP
-  address that keeps sending unknown session cookies is refused with `429` for a while.
+- **Rate limits** apply per user, and per IP address for the login, the password reset
+  and the invitation link endpoints (an IP address gets one reset email a minute, after
+  the first three). An IP address that keeps sending unknown session cookies is refused
+  with `429` for a while.
 
 **Forgot your password?** Ask for a reset link with your email address. If the account
 exists and may log in, admino emails a link to `/reset-password` that works once, for 30
@@ -197,14 +200,38 @@ nobody can use it to find out which accounts exist. Reset requests and completed
 are recorded in the audit log, without the email address. Only a hash of the link's token
 is stored.
 
+**Invitations.** An Org Admin invites people into their organization with an email
+address and a role (Org Admin, Editor or Viewer): `POST /api/org/invitations`. The
+address can't belong to any account on the platform yet, in any capitalization. admino
+emails the invitee a link to `/accept-invitation` that works once, for 72 hours. Opening
+it shows the organization, the role and the email address; accepting it with a name and a
+password (which follows the password rules above) activates the account and logs the
+invitee in. The email goes out in the inviting admin's language, which also becomes the
+new account's language. A pending invitation takes a seat, even after its link expired,
+until it's revoked or accepted, so an organization with no free seat can't invite anyone
+else. Org Admins list the pending invitations (`GET /api/org/invitations`, expired ones
+marked), revoke one (`DELETE /api/org/invitations/{id}`, which frees the address and the
+seat) or send it again with a new link (`POST /api/org/invitations/{id}/resend`, the old
+link stops working, an email with it that hasn't gone out yet is cancelled, and the 72
+hours start over). Sending, revoking, resending and accepting are recorded in the audit
+log, without the email address. Only a hash of the link's token is stored.
+
+A send refused because the address is already taken, or because there's no free seat,
+answers `409` and is recorded in the audit log too (without the address). Refused sends
+have their own, tighter limit per Org Admin: after five, only one a minute is allowed, and
+further sends get `429`. This keeps anyone from quickly checking which addresses have an
+account elsewhere on the platform. The link's token is part of the URL path of the two
+link endpoints, so admino doesn't write access logs; a reverse proxy in front of it must
+not log request paths either.
+
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `COOKIE_SECURE` | `true` | Marks the session cookie `Secure`, so browsers only send it over HTTPS (and to `http://localhost`). Set it to `false` only when you open admino over plain HTTP from another address, such as a phone on your LAN. |
-| `ADMINO_PUBLIC_URL` | `http://localhost:8000` | The address users open admino at, such as `https://admino.example.ch` (no path). Password reset links, and later invitation links, are built from it, never from the request's `Host` header. It must use `https`; plain `http` is only allowed for `localhost`, `127.0.0.1` and `[::1]`. **Production deployments must set it**, otherwise reset emails point at localhost. An invalid value stops admino at startup. Overrides `server.public_url` in `config.yaml`. |
+| `ADMINO_PUBLIC_URL` | `http://localhost:8000` | The address users open admino at, such as `https://admino.example.ch` (no path). Password reset links and invitation links are built from it, never from the request's `Host` header. It must use `https`; plain `http` is only allowed for `localhost`, `127.0.0.1` and `[::1]`. **Production deployments must set it**, otherwise reset and invitation emails point at localhost. An invalid value stops admino at startup. Overrides `server.public_url` in `config.yaml`. |
 
-> The login page, and the pages for asking for a reset link and choosing the new password,
-> are still being added. Until they ship, the API answers `401` to every call that has no
-> session.
+> The login page, the pages for asking for a reset link and choosing the new password, and
+> the page for accepting an invitation are still being added. Until they ship, the API
+> answers `401` to every call that has no session.
 
 ## Email (SMTP)
 
