@@ -33,6 +33,13 @@ Security notes:
   code may build one: ``admino.sessions`` is the one builder, from the
   session's users row re-read on every request, never from request data.
   tests/test_access.py allowlists the modules that build one.
+- ``Operator`` is the platform operator at the server's terminal (the admin
+  CLI, GH-154): no account, no session, no fields. It is not a Principal, so
+  ``can()`` grants it nothing; the one service that accepts it
+  (``organizations.create_org``) checks for it explicitly. Only
+  ``admino.admin_cli`` builds one (tests/test_access.py enforces it): building
+  one anywhere reachable over HTTP would let a request act with the CLI's
+  rights.
 - Pure and isolated: no I/O, no logging, and no imports from the server,
   agent, LLM, database, tools, OAuth, audit or permissions modules. The tool
   permission engine (permissions.py) is a separate layer.
@@ -110,6 +117,15 @@ class Principal(SealedModel):
             msg = "A Super Admin has no org_id and no role; a member has both."
             raise ValueError(msg)
         return self
+
+
+class Operator(SealedModel):
+    """The platform operator at the server's terminal: the admin CLI's actor.
+
+    Has no account, no session and no fields. Audited as actor kind
+    'operator' with no user id. Never a Principal: ``can()`` refuses it every
+    capability.
+    """
 
 
 class Capability(StrEnum):

@@ -10,7 +10,8 @@ mocked. What these tests pin down:
   chat as target, and metadata with exactly ``tool, action, decision, success,
   duration_ms``. The tool's argument values and its output appear in no bind
   parameter.
-- GH-149 retires #147's default-org bridge: ``accounts.DEFAULT_ORG_ID`` appears
+- GH-149 retires #147's default-org bridge: the default org's id
+  (``00000000-0000-4000-8000-000000000001``; GH-154 removed the constant) appears
   in no bind parameter, and a principal without an organization (a Super Admin)
   can't write a tool.call row, so the run aborts (H-1) and nothing is written.
 - ``Agent.run`` takes the caller's ``principal`` as a required keyword and the
@@ -62,6 +63,8 @@ _ARG_MARKER = "SECRET-ARG-7f3a"
 _OUTPUT_MARKER = "SECRET-OUTPUT-91bc"
 _USER_ID = uuid.UUID("4d5e6f70-8192-4a3b-9c4d-5e6f7a8b9c0d")
 _ORG_ID = uuid.UUID("e1f2a3b4-c5d6-4e7f-8a9b-0c1d2e3f4a5b")
+# #147's default organization (GH-154 removed accounts.DEFAULT_ORG_ID).
+_DEFAULT_ORG_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
 _MEMBER = Principal(user_id=_USER_ID, kind="member", org_id=_ORG_ID, role="editor")
 _SUPER_ADMIN = Principal(user_id=_USER_ID, kind="super_admin")
 
@@ -193,17 +196,15 @@ class TestToolCallWritesOneRow:
 
     @pytest.mark.asyncio
     async def test_default_org_is_in_no_bind_parameter(self, pool: MagicMock) -> None:
-        """#147's bridge is retired: DEFAULT_ORG_ID never reaches the audit store."""
-        from admino.accounts import DEFAULT_ORG_ID
-
+        """#147's bridge is retired: the default org's id never reaches the audit store."""
         await _agent(_tool_then_text()).run(
             "go", session_id=_SESSION, history=[], principal=_MEMBER
         )
 
         assert pool.execute.await_count == 1
         for call in pool.execute.await_args_list:
-            assert DEFAULT_ORG_ID not in call.args
-            assert str(DEFAULT_ORG_ID) not in " ".join(str(value) for value in call.args)
+            assert _DEFAULT_ORG_ID not in call.args
+            assert str(_DEFAULT_ORG_ID) not in " ".join(str(value) for value in call.args)
 
     @pytest.mark.asyncio
     async def test_metadata_holds_exactly_the_five_decision_fields(self, pool: MagicMock) -> None:

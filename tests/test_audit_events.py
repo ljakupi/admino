@@ -85,6 +85,7 @@ from admino.audit_events import (
 )
 from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS
 from admino.server import _lifespan, create_app
+from tests.lifespan_stubs import patch_org_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -2112,12 +2113,14 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
     """Patch the lifespan's database calls and the retention job with fakes.
 
     get_pool() raises until init_pool() ran, like the real one, so the job can
-    only start after the pool exists. GH-152's session purge job is stubbed with
-    its own probe, so the real purge never runs against the MagicMock pool
-    (``create=True``: the job is new in GH-152, and these tests don't depend on it).
+    only start after the pool exists. GH-152's session purge job and GH-154's org
+    purge job are stubbed with their own probes, so no real purge runs against the
+    MagicMock pool (``create=True``: the jobs are new, and these tests don't depend
+    on them).
     """
     state: dict[str, Any] = {"pool": None}
     session_purge = _JobProbe()
+    org_purge = _JobProbe()
 
     async def fake_init_pool(*_args: Any, **_kwargs: Any) -> Any:
         probe.events.append("init_pool")
@@ -2142,6 +2145,7 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
         patch("admino.database.load_settings_from_db", AsyncMock(return_value={})),
         patch("admino.audit_events.run_retention_job", probe.job),
         patch("admino.sessions.run_session_purge_job", session_purge.job, create=True),
+        patch_org_purge_job(org_purge.job),
     ):
         yield
 

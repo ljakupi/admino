@@ -1365,6 +1365,8 @@ class TestSessionChatId:
 
 _RECORDER_USER = uuid.UUID("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d")
 _RECORDER_ORG = uuid.UUID("1f2e3d4c-5b6a-4978-9a8b-7c6d5e4f3a2b")
+# #147's default organization (GH-154 removed accounts.DEFAULT_ORG_ID).
+_DEFAULT_ORG_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
 
 
 def _member_principal() -> Any:
@@ -1443,9 +1445,8 @@ class TestBuildToolCallRecorder:
     async def test_never_records_into_the_default_org(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The bridge is retired: the default org id is never passed."""
-        from admino.accounts import DEFAULT_ORG_ID
-
+        """The bridge is retired: the default org id (#147's
+        00000000-0000-4000-8000-000000000001) is never passed."""
         record = AsyncMock()
         monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock()))
         monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
@@ -1454,7 +1455,7 @@ class TestBuildToolCallRecorder:
         await recorder(**_recorder_kwargs())
 
         assert record.await_args is not None
-        assert DEFAULT_ORG_ID not in record.await_args.kwargs.values()
+        assert _DEFAULT_ORG_ID not in record.await_args.kwargs.values()
 
     @pytest.mark.asyncio
     async def test_resolves_the_pool_at_call_time(self, monkeypatch: pytest.MonkeyPatch) -> None:

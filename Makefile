@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local create-superadmin docker-up-local vllm-ensure vllm-pull vllm-up vllm-down
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down
 
 # Source and package configuration
 SRC_DIR    := src
@@ -175,6 +175,22 @@ create-superadmin:
 	fi
 	docker compose $(COMPOSE_FILES) exec -u admino agent \
 		python -m admino.admin_cli create-superadmin --email "$$EMAIL" --name "$$NAME"
+
+# create-org: create an organization and invite its first Org Admin (GH-154).
+#   make create-org NAME='Treuhand Muster AG' ADMIN_EMAIL=admin@example.ch
+# The plan limits default to 10 seats, CHF 100 a month and 10 GiB; run the CLI
+# directly (python -m admino.admin_cli create-org --help) to set them. With SMTP
+# configured the invitation is emailed; without it, the one-time link is printed
+# on this terminal only (docker compose exec allocates a TTY). NAME and
+# ADMIN_EMAIL reach the fixed argv as quoted environment variables, never
+# spliced into the shell text. Runs as the unprivileged admino user, not root.
+create-org:
+	@if [ -z "$$NAME" ] || [ -z "$$ADMIN_EMAIL" ]; then \
+		echo "Usage: make create-org NAME='Org name' ADMIN_EMAIL=admin@example.ch" >&2; \
+		exit 2; \
+	fi
+	docker compose $(COMPOSE_FILES) exec -u admino agent \
+		python -m admino.admin_cli create-org --name "$$NAME" --admin-email "$$ADMIN_EMAIL"
 
 # vllm-up: bring up just the vllm service (useful to restart it independently).
 vllm-up:

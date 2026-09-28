@@ -1,17 +1,21 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151, GH-152, GH-153).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-154).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox and audit_events tables behind a
 pool-shaped object (``FakeDb.pool``). The real ``admino.auth``,
 ``admino.sessions``, ``admino.session_management``, ``admino.password_reset``,
-``admino.invitations``, ``admino.email_outbox`` and ``admino.audit_events``
-code runs against it: each statement is recognised by its table and verb, and
-its bind parameters are applied to the in-memory tables, so a test can log in,
-list and revoke sessions, request and confirm a password reset, send, list,
-revoke, resend and accept invitations, and check the result.
+``admino.invitations``, ``admino.organizations``, ``admino.email_outbox`` and
+``admino.audit_events`` code runs against it: each statement is recognised by
+its table and verb, and its bind parameters are applied to the in-memory
+tables, so a test can log in, list and revoke sessions, request and confirm a
+password reset, send, list, revoke, resend and accept invitations, create,
+change, deactivate, schedule, cancel and purge organizations, and check the
+result.
 
 Inputs: organizations, accounts and sessions added with ``add_org`` /
-``add_account`` / ``open_session``.
+``add_account`` / ``open_session``; invitations, reset tokens, queued emails
+and audit events seeded with ``add_invitation`` / ``add_reset_token`` /
+``add_email`` / ``add_audit``.
 Outputs: the recorded calls (``calls``: method, SQL, args, which pool or
 connection ran it and inside which transaction), the table state, and the
 outcome of every transaction (``transactions``: commit or rollback).
@@ -26,9 +30,11 @@ Organizations and invitations (GH-153):
   follows the org's row.
 - ``invitations`` holds the invitations rows of migration 0010 (id, user_id,
   token_hash, created_at, sent_at, expires_at, accepted_at), keyed by id.
-- Every statement that names ``invitations`` or reads ``organizations`` as
-  its main table, every INSERT, UPDATE and DELETE on ``users``, and every
-  users SELECT scoped by ``org_id = $n`` alone runs through a small SQL reader
+- Every statement that names ``invitations`` or has ``organizations`` as its
+  main table, every INSERT, UPDATE and DELETE on ``users``, every ``SELECT
+  EXISTS`` and every ``fetch`` on users, every other users SELECT scoped by
+  ``org_id = $n`` alone, and every SELECT on ``audit_events`` runs through a
+  small SQL reader
   (``_Statement``). It applies exactly what the SQL states: the FROM / JOIN
   (inner and LEFT) / USING / UPDATE ... FROM sources, their ON conditions, the
   AND-ed WHERE predicates (``=``, ``<>``, ``<``, ``<=``, ``>``, ``>=`` between
@@ -59,6 +65,47 @@ Organizations and invitations (GH-153):
 - ``after_invitation_lookup`` runs once, right after the first SELECT on
   invitations bound to a token hash (a concurrent accept, revoke, rotation or
   expiry between the lookup and the transaction).
+
+The organization lifecycle (GH-154):
+- INSERT, UPDATE, DELETE and SELECT (``FOR UPDATE`` included) on
+  organizations run through the SQL reader. An INSERT gets the schema's
+  defaults (a new id, status 'active', data_residency true,
+  default_response_language 'en', created_at and updated_at now); name, seats,
+  monthly_budget_chf and storage_quota_bytes have none (NotNullViolationError).
+  Every written row must satisfy all of migration 0004's organizations CHECKs
+  (CheckViolationError): a 1 to 120 character name, 1 to 100000 seats, a
+  budget and a quota >= 0, a known status and response language,
+  ``(status = 'pending_deletion') = (purge_after IS NOT NULL)`` and
+  ``(deletion_requested_at IS NULL) = (purge_after IS NULL)``. The budget is
+  stored like NUMERIC(12,2): converted as asyncpg does (``Decimal(value)``)
+  and rounded to 2 places (NumericValueOutOfRangeError beyond 10 integer
+  digits); an id that exists already raises UniqueViolationError.
+  Nothing sets updated_at but the statement itself (there is no trigger).
+- Value expressions also include ``coalesce(a, b, ...)`` and
+  ``now() + make_interval(days|hours|mins|secs => $n)``.
+- ``DELETE FROM organizations`` behaves like ON DELETE RESTRICT: while any
+  users row (users.org_id) or any audit row (audit_events.org_id) references
+  the org, it raises ForeignKeyViolationError and deletes nothing.
+  ``DELETE FROM users WHERE org_id = $1`` deletes every user of the org
+  whatever its status, and each deleted user cascades to its sessions,
+  invitation, email_outbox rows and reset token.
+- ``SELECT purge_org_audit_events($n)`` emulates migration 0011's function:
+  unless that org exists with status pending_deletion and ``purge_after <=
+  now()`` it raises InsufficientPrivilegeError; otherwise it deletes that org's
+  audit rows and returns how many. Every other DELETE, UPDATE or TRUNCATE that
+  touches audit_events raises InsufficientPrivilegeError, like the
+  append-only trigger, and any other TRUNCATE fails the test.
+- Audit rows keep every column (id, occurred_at, org_id, actor_user_id,
+  actor_kind, action, target_type, target_ids as a list of strings, ip as a
+  string, metadata as a dict). An audit row whose org_id names no org fails
+  like the foreign key. ``fail_audit_when`` (a predicate on the parsed row)
+  makes only matching audit INSERTs fail. SELECTs on audit_events run through
+  the SQL reader.
+- ``fail_sql`` (a regex over the normalized SQL) makes matching statements
+  fail with a driver error (DeadlockDetectedError), for "a database step
+  fails" tests.
+- ``after_org_lookup`` runs once, right after the first SELECT whose main
+  table is organizations (a concurrent change between a lookup and a lock).
 
 The sessions table is the schema after migration 0009 (GH-152):
 - Each row stores its own ``idle_timeout_minutes`` (15 to 480, NOT NULL, no
@@ -109,6 +156,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from ipaddress import ip_address
 from typing import TYPE_CHECKING, Any, Final
 
@@ -211,11 +259,39 @@ _ORG_COLUMNS: Final = frozenset(
 _INVITATION_COLUMNS: Final = frozenset(
     {"id", "user_id", "token_hash", "created_at", "sent_at", "expires_at", "accepted_at"}
 )
+# The audit_events columns of migration 0005 (read-only through the reader).
+_AUDIT_COLUMNS: Final = frozenset(
+    {
+        "id",
+        "occurred_at",
+        "org_id",
+        "actor_user_id",
+        "actor_kind",
+        "action",
+        "target_type",
+        "target_ids",
+        "ip",
+        "metadata",
+    }
+)
 _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "users": _USER_COLUMNS,
     "organizations": _ORG_COLUMNS,
     "invitations": _INVITATION_COLUMNS,
+    "audit_events": _AUDIT_COLUMNS,
 }
+_ORG_STATUSES: Final = frozenset({"active", "deactivated", "pending_deletion"})
+_RESPONSE_LANGUAGES: Final = frozenset({"de", "fr", "it", "en"})
+_CENT: Final = Decimal("0.01")
+_MAX_BUDGET: Final = Decimal(10) ** 10  # NUMERIC(12,2): 10 integer digits
+# The whole statement of migration 0011's purge function call.
+_PURGE_ORG_AUDIT_RE: Final = re.compile(
+    r"select (?:public\.)?purge_org_audit_events ?\( ?\$(\d+)(?: ?:: ?uuid)? ?\)(?: as (\w+))?;?"
+)
+# DML the append-only trigger of audit_events refuses (everything but the purges).
+_AUDIT_REWRITE_RE: Final = re.compile(
+    r"(?<![\w.])(?:delete from|update|truncate(?: table)?)(?: only)? (?:public\.)?audit_events\b"
+)
 
 
 def norm(sql: str) -> str:
@@ -345,8 +421,11 @@ class FakeDb:
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
         self.fail_audit = False
+        self.fail_audit_when: Callable[[dict[str, Any]], bool] | None = None
+        self.fail_sql: str | None = None
         self.after_token_lookup: Callable[[], None] | None = None
         self.after_invitation_lookup: Callable[[], None] | None = None
+        self.after_org_lookup: Callable[[], None] | None = None
         self.pool = FakePool(self)
         self._connection_count = 0
         self._transaction_count = 0
@@ -360,14 +439,20 @@ class FakeDb:
         name: str | None = None,
         seats: int | None = None,
         status: str | None = None,
+        **fields: Any,
     ) -> uuid.UUID:
         """Create an organization, or change the given fields of an existing one.
 
-        A new org is active with 100 seats; ORG_ID and OTHER_ORG_ID get
-        ORG_NAME and OTHER_ORG_NAME, any other org a generated name. A
-        pending_deletion org has its deletion dates set (the 0004 CHECKs).
-        Returns the org's id (a plain uuid.UUID).
+        A new org is active with 100 seats, a budget of 0.00 and no storage
+        quota; ORG_ID and OTHER_ORG_ID get ORG_NAME and OTHER_ORG_NAME, any
+        other org a generated name. A pending_deletion org has its deletion
+        dates set (the 0004 CHECKs): requested now, purge in 30 days. Any other
+        organizations column can be set through ``fields`` (applied last, e.g.
+        ``purge_after`` for an org that is due). Returns the org's id (a plain
+        uuid.UUID).
         """
+        unknown = set(fields) - _ORG_COLUMNS
+        assert not unknown, f"organizations has no column {sorted(unknown)}"
         org_id = org_id or uuid.uuid4()
         row = self.orgs.get(org_id)
         if row is None:
@@ -378,7 +463,7 @@ class FakeDb:
                 "name": default_names.get(org_id, f"Org {org_id.hex[:8]}"),
                 "status": "active",
                 "seats": 100,
-                "monthly_budget_chf": 0,
+                "monthly_budget_chf": Decimal("0.00"),
                 "storage_quota_bytes": 0,
                 "data_residency": True,
                 "default_response_language": "en",
@@ -398,6 +483,7 @@ class FakeDb:
             now = datetime.now(UTC)
             row["deletion_requested_at"] = now if pending else None
             row["purge_after"] = now + timedelta(days=30) if pending else None
+        row.update(fields)
         return org_id
 
     def add_account(
@@ -476,6 +562,92 @@ class FakeDb:
             "user_agent": user_agent,
         }
         return token
+
+    def add_invitation(self, user_id: uuid.UUID, *, sent_ago: timedelta = timedelta(0)) -> str:
+        """Store an invitations row for a user (sent ``sent_ago``, 72 h lifetime); return
+        its raw token."""
+        token = secrets.token_urlsafe(32)
+        sent_at = datetime.now(UTC) - sent_ago
+        invitation_id = uuid.uuid4()
+        self.invitations[invitation_id] = {
+            "id": invitation_id,
+            "user_id": user_id,
+            "token_hash": sha256(token),
+            "created_at": sent_at,
+            "sent_at": sent_at,
+            "expires_at": sent_at + INVITATION_MAX_LIFETIME,
+            "accepted_at": None,
+        }
+        return token
+
+    def add_reset_token(self, user_id: uuid.UUID) -> str:
+        """Store a live password reset token for a user; return the raw token."""
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(UTC)
+        self.tokens[user_id] = {
+            "token_hash": sha256(token),
+            "created_at": now,
+            "expires_at": now + FAKE_LIFETIME,
+        }
+        return token
+
+    def add_email(
+        self,
+        user_id: uuid.UUID,
+        *,
+        template_key: str = "invitation",
+        status: str = "pending",
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Store an email_outbox row for a user (a finished row has no params)."""
+        finished = status != "pending"
+        row = {
+            "user_id": user_id,
+            "template_key": template_key,
+            "language": self.users[user_id]["ui_language"],
+            "params": {} if finished else dict(params or {}),
+            "status": status,
+            "finished_at": datetime.now(UTC) if finished else None,
+        }
+        self.outbox.append(row)
+        return row
+
+    def add_audit(
+        self,
+        *,
+        org_id: uuid.UUID | None,
+        action: str = "tool.call",
+        actor_kind: str = "member",
+        actor_user_id: uuid.UUID | None = None,
+        occurred_at: datetime | None = None,
+        target_type: str | None = None,
+        target_ids: tuple[uuid.UUID, ...] = (),
+        ip: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> uuid.UUID:
+        """Store an audit_events row as the database holds it; return its id.
+
+        A member or Super Admin actor without a user id gets a random one (the
+        actor CHECK); ``occurred_at`` defaults to now.
+        """
+        if actor_kind in {"member", "super_admin"} and actor_user_id is None:
+            actor_user_id = uuid.uuid4()
+        event_id = uuid.uuid4()
+        self.audit.append(
+            {
+                "id": event_id,
+                "occurred_at": occurred_at or datetime.now(UTC),
+                "org_id": org_id,
+                "actor_user_id": actor_user_id,
+                "actor_kind": actor_kind,
+                "action": action,
+                "target_type": target_type,
+                "target_ids": [str(target) for target in target_ids],
+                "ip": ip,
+                "metadata": dict(metadata or {}),
+            }
+        )
+        return event_id
 
     def session(self, token: str) -> dict[str, Any]:
         """The stored session row of a raw token (it must exist)."""
@@ -600,7 +772,16 @@ class FakeDb:
         if re.search(r"\brevoked_at\b", n):
             # Migration 0009 dropped the column: revoking deletes the row.
             raise asyncpg.exceptions.UndefinedColumnError('column "revoked_at" does not exist')
-        if _runs_on_reader(n, args):
+        if self.fail_sql is not None and re.search(self.fail_sql, n):
+            raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
+        if _AUDIT_REWRITE_RE.search(n) or (n.startswith("truncate") and "audit_events" in n):
+            # The append-only trigger (migrations 0005 and 0011): only the purge
+            # functions delete audit rows.
+            raise asyncpg.exceptions.InsufficientPrivilegeError("audit_events is append-only")
+        assert not n.startswith("truncate"), f"the fake doesn't truncate: {n}"
+        if purge := _PURGE_ORG_AUDIT_RE.fullmatch(n):
+            return self._purge_org_audit_events(method, purge, args)
+        if _runs_on_reader(method, n, args):
             return self._run_statement(method, n, args)
         if n.startswith("insert into audit_events"):
             return self._insert_audit(n, args)
@@ -655,6 +836,10 @@ class FakeDb:
             ):
                 self.after_invitation_lookup = None
                 hook()
+            org_hook = self.after_org_lookup
+            if org_hook is not None and _primary_table(n) == "organizations":
+                self.after_org_lookup = None
+                org_hook()
         elif verb == "insert":
             rows, count = statement.insert(n)
             tag = f"INSERT 0 {count}"
@@ -685,11 +870,43 @@ class FakeDb:
             return list(self.orgs.values())
         if table == "invitations":
             return list(self.invitations.values())
+        if table == "audit_events":
+            return list(self.audit)
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
 
+    def normalized(self, table: str, values: dict[str, Any]) -> dict[str, Any]:
+        """The values as the column types store them (asyncpg's encoders, NUMERIC(12,2))."""
+        if table != "organizations":
+            return values
+        stored = dict(values)
+        for column, kind in (
+            ("name", str),
+            ("status", str),
+            ("seats", int),
+            ("storage_quota_bytes", int),
+            ("data_residency", bool),
+        ):
+            value = stored.get(column)
+            if value is not None and not isinstance(value, kind):
+                msg = f"invalid input for query argument ({column}): {kind.__name__} expected"
+                raise asyncpg.exceptions.DataError(msg)
+        budget = stored.get("monthly_budget_chf")
+        if budget is not None:
+            try:
+                amount = budget if isinstance(budget, Decimal) else Decimal(budget)
+                rounded = amount.quantize(_CENT, rounding=ROUND_HALF_UP)
+            except (InvalidOperation, TypeError, ValueError):
+                msg = "invalid input for query argument (monthly_budget_chf)"
+                raise asyncpg.exceptions.DataError(msg) from None
+            if not rounded.is_finite() or abs(rounded) >= _MAX_BUDGET:
+                msg = "numeric field overflow"
+                raise asyncpg.exceptions.NumericValueOutOfRangeError(msg)
+            stored["monthly_budget_chf"] = rounded
+        return stored
+
     def new_row(self, table: str, given: dict[str, Any], now: datetime) -> dict[str, Any]:
-        """Build, check and store a new users or invitations row (an INSERT)."""
+        """Build, check and store a new users, invitations or organizations row (an INSERT)."""
         if table == "users":
             row: dict[str, Any] = dict.fromkeys(_USER_COLUMNS)
             row.update(id=uuid.uuid4(), status="invited", ui_language="en", created_at=now)
@@ -705,7 +922,24 @@ class FakeDb:
             self.check_row("invitations", row, changed=set(_INVITATION_COLUMNS), original=None)
             self.invitations[row["id"]] = row
             return row
-        msg = f"the fake doesn't insert into {table} (tests create orgs with add_org)"
+        if table == "organizations":
+            row = dict.fromkeys(_ORG_COLUMNS)
+            row.update(
+                id=uuid.uuid4(),
+                status="active",
+                data_residency=True,
+                default_response_language="en",
+                created_at=now,
+                updated_at=now,
+            )
+            row.update(self.normalized("organizations", given))
+            if row["id"] in self.orgs:
+                msg = 'duplicate key value violates unique constraint "organizations_pkey"'
+                raise asyncpg.exceptions.UniqueViolationError(msg)
+            self.check_row("organizations", row, changed=set(_ORG_COLUMNS), original=None)
+            self.orgs[row["id"]] = row
+            return row
+        msg = f"the fake doesn't insert into {table} through the SQL reader"
         raise AssertionError(msg)
 
     def check_row(
@@ -721,9 +955,47 @@ class FakeDb:
             self._check_user(row, changed, original)
         elif table == "invitations":
             self._check_invitation(row, changed, original)
+        elif table == "organizations":
+            self._check_org(row)
         else:
-            msg = f"the invitation flow never writes {table}"
+            msg = f"the fake's SQL reader never writes {table}"
             raise AssertionError(msg)
+
+    def _check_org(self, row: dict[str, Any]) -> None:
+        """Migration 0004's organizations constraints, all of them on every written row."""
+        for column in (
+            "id",
+            "name",
+            "status",
+            "seats",
+            "monthly_budget_chf",
+            "storage_quota_bytes",
+            "data_residency",
+            "default_response_language",
+            "created_at",
+            "updated_at",
+        ):
+            if row[column] is None:
+                msg = f'null value in column "{column}" of relation "organizations"'
+                raise asyncpg.exceptions.NotNullViolationError(msg)
+        pending = row["status"] == "pending_deletion"
+        rules = (
+            ("name", 1 <= len(row["name"]) <= 120),
+            ("status", row["status"] in _ORG_STATUSES),
+            ("seats", 1 <= row["seats"] <= 100000),
+            ("monthly_budget_chf", row["monthly_budget_chf"] >= 0),
+            ("storage_quota_bytes", row["storage_quota_bytes"] >= 0),
+            ("default_response_language", row["default_response_language"] in _RESPONSE_LANGUAGES),
+            ("pending_deletion", pending == (row["purge_after"] is not None)),
+            (
+                "deletion_dates",
+                (row["deletion_requested_at"] is None) == (row["purge_after"] is None),
+            ),
+        )
+        for name, valid in rules:
+            if not valid:
+                msg = f'new row for relation "organizations" violates the {name} check'
+                raise asyncpg.exceptions.CheckViolationError(msg)
 
     def _check_user(
         self, row: dict[str, Any], changed: set[str], original: dict[str, Any] | None
@@ -823,12 +1095,29 @@ class FakeDb:
             msg = 'new row for relation "invitations" violates the expiry check'
             raise check(msg)
 
+    def check_delete(self, table: str, row: dict[str, Any]) -> None:
+        """ON DELETE RESTRICT: an org still referenced by a users or audit row stays."""
+        if table != "organizations":
+            return
+        org_id = row["id"]
+        referenced = any(user["org_id"] == org_id for user in self.users.values()) or any(
+            event["org_id"] is not None and _canonical(event["org_id"]) == org_id
+            for event in self.audit
+        )
+        if referenced:
+            msg = 'update or delete on table "organizations" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
+
     def delete_row(self, table: str, row: dict[str, Any]) -> None:
-        """Delete one users or invitations row; a user's rows cascade (ON DELETE CASCADE)."""
+        """Delete one users, invitations or organizations row; a user's rows cascade (ON
+        DELETE CASCADE). Call ``check_delete`` first."""
         if table == "invitations":
             del self.invitations[row["id"]]
             return
-        assert table == "users", f"the invitation flow never deletes from {table}"
+        if table == "organizations":
+            del self.orgs[row["id"]]
+            return
+        assert table == "users", f"the fake never deletes from {table}"
         user_id = row["id"]
         del self.users[user_id]
         self.invitations = {
@@ -843,12 +1132,56 @@ class FakeDb:
     def _insert_audit(self, n: str, args: tuple[Any, ...]) -> str:
         if self.fail_audit:
             raise AuditWriteError("the audit write was refused")
-        row = insert_values(n, args)
+        values = insert_values(n, args)
+        assert "id" not in values and "occurred_at" not in values, "no backdating"
+        row: dict[str, Any] = {"id": uuid.uuid4(), "occurred_at": datetime.now(UTC)}
+        row.update(values)
         row["target_ids"] = json.loads(row["target_ids"])
         row["metadata"] = json.loads(row["metadata"])
         row["ip"] = None if row["ip"] is None else str(row["ip"])
+        if self.fail_audit_when is not None and self.fail_audit_when(row):
+            raise AuditWriteError("the audit write was refused")
+        org_id = row.get("org_id")
+        if org_id is not None and _canonical(org_id) not in self.orgs:
+            msg = 'insert or update on table "audit_events" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
         self.audit.append(row)
         return "INSERT 0 1"
+
+    def _purge_org_audit_events(
+        self, method: str, match: re.Match[str], args: tuple[Any, ...]
+    ) -> Any:
+        """Migration 0011's purge_org_audit_events(uuid): only for a due, pending org."""
+        index = int(match.group(1)) - 1
+        assert 0 <= index < len(args), "purge_org_audit_events needs its org id bound"
+        raw = args[index]
+        org_id = uuid.UUID(raw) if isinstance(raw, str) else raw
+        assert isinstance(org_id, uuid.UUID), "purge_org_audit_events takes a uuid"
+        org = self.orgs.get(_canonical(org_id))
+        now = datetime.now(UTC)
+        if (
+            org is None
+            or org["status"] != "pending_deletion"
+            or org["purge_after"] is None
+            or not org["purge_after"] <= now
+        ):
+            msg = "audit events can only be purged for an organization due for deletion"
+            raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+        kept = [
+            event
+            for event in self.audit
+            if event["org_id"] is None or _canonical(event["org_id"]) != _canonical(org_id)
+        ]
+        purged = len(self.audit) - len(kept)
+        self.audit = kept
+        key = match.group(2) or "purge_org_audit_events"
+        if method == "fetchval":
+            return purged
+        if method == "fetchrow":
+            return {key: purged}
+        if method == "fetch":
+            return [{key: purged}]
+        return "SELECT 1"
 
     def _enqueue(self, args: tuple[Any, ...]) -> Any:
         # email_outbox.enqueue_email binds (user_id, template_key, params_json).
@@ -1271,22 +1604,26 @@ def _primary_table(n: str) -> str | None:
     return None if match is None else match.group(1)
 
 
-def _runs_on_reader(n: str, args: tuple[Any, ...]) -> bool:
+def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
     """True for the statements the SQL reader runs (see the module docstring)."""
     if re.search(r"\binvitations\b", n):
         return True
     table = _primary_table(n)
     if table == "organizations":
         return True
+    if table == "audit_events":
+        return n.startswith("select")
     if table != "users":
         return False
     if re.match(r"(?:insert into|update|delete from) users\b", n):
+        return True
+    if re.match(r"select exists\b", n) or method == "fetch":
         return True
     where = _where(n)
     return (
         re.search(ORG_ID_PARAM_RE, where) is not None
         and re.search(ID_PARAM_RE, where) is None
-        and not any(isinstance(arg, str) for arg in args)
+        and (method == "fetch" or not any(isinstance(arg, str) for arg in args))
     )
 
 
@@ -1363,6 +1700,21 @@ class _Statement:
             interval = self._arg(match.group(1))
             assert isinstance(interval, timedelta), "an interval must be bound as a timedelta"
             return self.now + interval
+        if match := re.fullmatch(
+            rf"{NOW_SQL} ?\+ ?make_interval ?\( ?(days|hours|mins|secs) ?=> ?\$(\d+)"
+            r"(?: ?:: ?\w+)? ?\)",
+            expr,
+        ):
+            amount = self._arg(match.group(2))
+            assert isinstance(amount, int | float) and not isinstance(amount, bool), amount
+            unit = {"days": "days", "hours": "hours", "mins": "minutes", "secs": "seconds"}
+            return self.now + timedelta(**{unit[match.group(1)]: amount})
+        if match := re.fullmatch(r"coalesce ?\((.+)\)", expr):
+            for item in _top_split(match.group(1), ","):
+                value = self.value(item, ctx)
+                if value is not None:
+                    return value
+            return None
         if match := re.fullmatch(r"lower ?\((.+)\)", expr):
             inner = self.value(match.group(1), ctx)
             return inner.lower() if isinstance(inner, str) else inner
@@ -1572,7 +1924,7 @@ class _Statement:
         head = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(\w+))?", clauses["update"])
         assert head is not None, n
         table, alias = head.group(1), head.group(2) or head.group(1)
-        assert table in {"users", "invitations"}, f"the invitation flow never updates {table}"
+        assert table in {"users", "invitations", "organizations"}, f"the fake never updates {table}"
         sources = [_Source(table, alias, None, left=False)]
         if "from" in clauses:
             sources += _sources(clauses["from"])
@@ -1594,7 +1946,7 @@ class _Statement:
                 continue
             seen.add(id(row))
             new = {column: _store(self.value(expr, ctx)) for column, expr in assignments}
-            targets.append((ctx, row, new))
+            targets.append((ctx, row, self.db.normalized(table, new)))
         for _, row, new in targets:
             self.db.check_row(table, {**row, **new}, changed=set(new), original=row)
         for _, row, new in targets:
@@ -1611,7 +1963,7 @@ class _Statement:
         head = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(\w+))?", clauses["delete from"])
         assert head is not None, n
         table, alias = head.group(1), head.group(2) or head.group(1)
-        assert table in {"users", "invitations"}, f"the invitation flow never deletes {table}"
+        assert table in {"users", "invitations", "organizations"}, f"the fake never deletes {table}"
         sources = [_Source(table, alias, None, left=False)]
         if "using" in clauses:
             sources += _sources(clauses["using"])
@@ -1629,6 +1981,8 @@ class _Statement:
             if "returning" in clauses
             else []
         )
+        for _, row in targets:
+            self.db.check_delete(table, row)
         for _, row in targets:
             self.db.delete_row(table, row)
         return returned, len(targets)

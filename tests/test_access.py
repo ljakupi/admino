@@ -768,3 +768,154 @@ class TestAccessIsolation:
         ]
 
         assert admino_imports == []
+
+
+# ---------------------------------------------------------------------------
+# 7. The Operator: the platform operator at the server's terminal (GH-154)
+# ---------------------------------------------------------------------------
+
+
+def _operator_cls() -> Any:
+    """Look access.Operator up at call time (it is new in GH-154)."""
+    from admino import access
+
+    operator = getattr(access, "Operator", None)
+    assert operator is not None, "admino.access must define Operator"
+    return operator
+
+
+def _operator_names(tree: ast.AST) -> set[str]:
+    """'Operator' plus every local alias it is imported under."""
+    names = {"Operator"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            names.update(
+                alias.asname for alias in node.names if alias.name == "Operator" and alias.asname
+            )
+    return names
+
+
+def _is_operator(node: ast.expr, names: set[str]) -> bool:
+    """True for a reference to the Operator class (Operator, an alias, or x.Operator)."""
+    if isinstance(node, ast.Name):
+        return node.id in names
+    return isinstance(node, ast.Attribute) and node.attr == "Operator"
+
+
+def _operator_builders(path: Path) -> list[str]:
+    """Return the Operator constructions/validations in a source file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    names = _operator_names(tree)
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if _is_operator(func, names):
+            found.append(f"{path.name}:{node.lineno} Operator(...)")
+        elif (
+            isinstance(func, ast.Attribute)
+            and func.attr.startswith(("model_validate", "model_construct"))
+            and _is_operator(func.value, names)
+        ):
+            found.append(f"{path.name}:{node.lineno} Operator.{func.attr}(...)")
+    return found
+
+
+def _operator_references(path: Path) -> list[str]:
+    """Every mention of the Operator class in a source file's code (not its prose)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and any(a.name == "Operator" for a in node.names):
+            found.append(f"{path.name}:{node.lineno} import Operator")
+        elif (isinstance(node, ast.Name) and node.id == "Operator") or (
+            isinstance(node, ast.Attribute) and node.attr == "Operator"
+        ):
+            found.append(f"{path.name}:{node.lineno} Operator")
+        elif isinstance(node, ast.Constant) and node.value == "Operator":
+            found.append(f"{path.name}:{node.lineno} 'Operator'")
+    return found
+
+
+class TestOperator:
+    """Operator() is the admin CLI's actor: no account, no session, no capability."""
+
+    def test_access_operator_is_a_sealed_model(self) -> None:
+        from admino.access import SealedModel
+
+        assert issubclass(_operator_cls(), SealedModel)
+
+    def test_access_operator_has_no_fields(self) -> None:
+        """No id, kind, org or role: nothing a caller could set."""
+        assert _operator_cls().model_fields == {}
+
+    def test_access_operator_is_frozen_and_forbids_extra(self) -> None:
+        config = _operator_cls().model_config
+
+        assert config.get("frozen") is True
+        assert config.get("extra") == "forbid"
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            pytest.param({"user_id": str(uuid4())}, id="user_id"),
+            pytest.param({"kind": "super_admin"}, id="kind"),
+            pytest.param({"role": "org_admin"}, id="role"),
+            pytest.param({"org_id": str(uuid4())}, id="org_id"),
+        ],
+    )
+    def test_access_operator_refuses_any_field(self, fields: dict[str, object]) -> None:
+        with pytest.raises(ValidationError):
+            _operator_cls().model_validate(fields)
+
+    def test_access_operator_attributes_cannot_be_set(self) -> None:
+        operator = _operator_cls()()
+
+        with pytest.raises(ValidationError):
+            operator.kind = "super_admin"
+
+    def test_access_operator_model_construct_is_disabled(self) -> None:
+        with pytest.raises(TypeError):
+            _operator_cls().model_construct(kind="super_admin")
+
+    def test_access_operator_model_copy_with_update_is_disabled(self) -> None:
+        with pytest.raises(TypeError):
+            _operator_cls()().model_copy(update={"kind": "super_admin"})
+
+    def test_access_operator_is_not_a_principal(self) -> None:
+        """principal_role gives it no role: it is no account at all."""
+        operator = _operator_cls()()
+
+        assert not isinstance(operator, Principal)
+        assert principal_role(operator) is None
+
+    @pytest.mark.parametrize("capability", list(Capability))
+    def test_access_can_denies_the_operator_every_capability(self, capability: Capability) -> None:
+        """can() is for Principals: the CLI's create-org is authorized by being at the
+        terminal, not by the role matrix."""
+        assert can(_operator_cls()(), capability) is False
+
+
+# The one module allowed to build an Operator. Operator() means "at the server's
+# terminal", so building one anywhere reachable over HTTP would let a request act
+# with the CLI's rights (create an org without a Super Admin session).
+_OPERATOR_BUILDERS: frozenset[str] = frozenset({"admin_cli.py"})
+
+
+class TestOperatorConstructionSites:
+    """The Operator comes from the admin CLI only, never from the HTTP layer."""
+
+    def test_access_operator_is_built_only_in_admin_cli(self) -> None:
+        """admin_cli.py builds the Operator (create-org); no other src module does."""
+        builders = {
+            str(path.relative_to(_SRC_DIR)): _operator_builders(path)
+            for path in sorted(_SRC_DIR.rglob("*.py"))
+        }
+
+        assert {name for name, sites in builders.items() if sites} == _OPERATOR_BUILDERS
+
+    def test_access_operator_is_used_by_admin_cli_never_by_server(self) -> None:
+        """admin_cli.py references Operator; server.py never does (not even an import)."""
+        assert _operator_references(_SRC_DIR / "admin_cli.py") != []
+        assert _operator_references(_SRC_DIR / "server.py") == []

@@ -33,6 +33,7 @@ from httpx import ASGITransport, AsyncClient
 
 from admino.server import create_app
 from tests.auth_helpers import login, member_session, resolved_session, session_cookie
+from tests.lifespan_stubs import patch_org_purge_job
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -812,6 +813,8 @@ class TestLifespanLoadsPromotedPermissions:
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.load_permissions_from_db", mock_load_perms),
                 patch("admino.database.load_settings_from_db", mock_load_settings),
+                # GH-154's org purge job never runs against the MagicMock pool.
+                patch_org_purge_job(AsyncMock()),
             ):
                 # Drive the lifespan context manager directly.
                 async with _lifespan(app):
@@ -848,6 +851,8 @@ class TestLifespanLoadsPromotedPermissions:
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.load_permissions_from_db", mock_load_perms),
                 patch("admino.database.load_settings_from_db", mock_load_settings),
+                # GH-154's org purge job never runs against the MagicMock pool.
+                patch_org_purge_job(AsyncMock()),
             ):
                 async with _lifespan(app):
                     # gmail.send is promotable — should be loaded.
