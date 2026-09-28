@@ -9,7 +9,8 @@ your Google/Microsoft accounts so admino can use its mail, calendar, and drive t
 - [3. Run locally (with uv)](#3-run-locally-with-uv)
 - [4. Run the whole backend in Docker](#4-run-the-whole-backend-in-docker)
 - [5. Create the first Super Admin](#5-create-the-first-super-admin)
-- [6. Your first chat](#6-your-first-chat)
+- [6. Create an organization](#6-create-an-organization)
+- [7. Your first chat](#7-your-first-chat)
 - [Connect your accounts](#connect-your-accounts)
 - [How environment loading differs (local vs Docker)](#how-environment-loading-differs-local-vs-docker)
 - [Upgrading from the single-tenant version](#upgrading-from-the-single-tenant-version)
@@ -180,7 +181,34 @@ python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your
 Then log in at **http://localhost:8000** with that email and password. The Super Admin
 sees the platform only and has no chat; chat needs a member account in an organization.
 
-## 6. Your first chat
+## 6. Create an organization
+
+Chat happens inside an organization. Create one and invite its first Org Admin from the
+command line (the Super Admin can also do it with `POST /api/platform/orgs`, see
+[Organizations](configuration.md#organizations-super-admin)):
+
+```bash
+make create-org NAME='Treuhand Muster AG' ADMIN_EMAIL=admin@example.ch
+```
+
+This runs `python -m admino.admin_cli create-org --name … --admin-email …` inside the agent
+container. For local dev (`make run`), run the same command from your shell with `.env`
+loaded. The plan limits default to **10 seats, CHF 100 a month and 10 GiB of storage**, and
+the invitation email is in English; set them with `--seats`, `--budget-chf`,
+`--storage-quota-gib` and `--language de|fr|en` (see `create-org --help`).
+
+- The command prints the new organization's ID.
+- **With SMTP configured** (see [Email](configuration.md#email-smtp)), the invitation is
+  emailed to the address you gave.
+- **Without SMTP**, nothing is emailed. The command prints the one-time invitation link on
+  your terminal instead; it isn't logged or stored anywhere else. Give it to the future Org
+  Admin. The command refuses to run when its output doesn't go to a terminal (for example
+  when piped into a file), so the link can't end up in a file.
+- The link works once, for 72 hours. Accepting it with a name and a password makes that
+  person the organization's Org Admin, who can then invite everyone else.
+- An address that already has an account is refused, and nothing is created.
+
+## 7. Your first chat
 
 1. Open **http://localhost:8000**.
 2. Log in with your email address and password. See
@@ -248,6 +276,9 @@ platform.**
   connections from the single install to organizations and users. They **drop the existing
   rows** instead of converting them. After that upgrade you set your settings and tool
   permissions again and reconnect your accounts.
+- Some earlier versions created a "Default organization" to hold the audit events of tool
+  calls made before login existed. The upgrade deletes it and its audit events
+  automatically, so an upgraded install starts with no organization, like a new one.
 
 ## Quality gates (for contributors)
 

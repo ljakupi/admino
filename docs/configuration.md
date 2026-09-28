@@ -233,6 +233,50 @@ not log request paths either.
 > the page for accepting an invitation are still being added. Until they ship, the API
 > answers `401` to every call that has no session.
 
+## Organizations (Super Admin)
+
+The Super Admin creates organizations, sets their plan limits, deactivates and deletes
+them, and sets their data residency policy. These routes are for the Super Admin only
+(`403` for everyone else), and they return organization metadata only, never content.
+Every change is recorded in the organization's own audit log, so its Org Admins see what
+the Super Admin did.
+
+- **Create**: `POST /api/platform/orgs` with `name`, `primary_admin_email`, `seats`,
+  `monthly_budget_chf`, `storage_quota` (in bytes) and optionally `status` (`active` by
+  default, or `deactivated`). admino creates the organization and emails its first Org
+  Admin an [invitation](#accounts-and-sessions) in the Super Admin's language. An address
+  that already has an account answers `409` and creates nothing. On the server, the same
+  works from the command line (see
+  [Create an organization](getting-started.md#6-create-an-organization)).
+- **List**: `GET /api/platform/orgs` returns every organization with its status, plan
+  limits, residency policy and deletion dates.
+- **Plan limits**: `PATCH /api/platform/orgs/{id}/limits` with any of `seats`,
+  `monthly_budget_chf` and `storage_quota`. Lowering the seats below the seats in use is
+  allowed; it only stops new invitations until seats are free again.
+- **Deactivate and reactivate**: `POST /api/platform/orgs/{id}/deactivate` and
+  `POST /api/platform/orgs/{id}/reactivate`. Deactivating logs every member out at once,
+  and nobody of that organization can log in or use a link until it's reactivated. Its
+  data is kept.
+- **Delete, in two steps**:
+  1. `POST /api/platform/orgs/{id}/deletion` schedules the deletion. The organization is
+     deactivated (everyone is logged out), its data is purged after **30 days**, and its
+     active Org Admins get an email with the date.
+  2. Until the purge has run, `DELETE /api/platform/orgs/{id}/deletion` cancels it. The
+     organization stays deactivated; reactivate it to let its members back in.
+
+  A background job checks every hour (and at startup) for organizations past their date
+  and **irreversibly** deletes everything they hold: their users with their sessions,
+  invitations and queued email, their audit log, the organization itself, and its files on
+  disk. What stays is the platform's record of the deletion: an `org.purge` audit event
+  with the organization's ID and counts, no names.
+- **Data residency**: `PATCH /api/platform/orgs/{id}/residency` with `{"enabled": true}`
+  or `false`. New organizations start with it on. The change is recorded in the
+  organization's audit log, where its Org Admins see it.
+
+An organization's status can only move this way: active ⇄ deactivated, active or
+deactivated → pending deletion, pending deletion → deactivated (cancelled). Anything else,
+and changing limits or residency while a deletion is pending, answers `409`.
+
 ## Email (SMTP)
 
 admino sends transactional email through **one SMTP account for the whole platform**:

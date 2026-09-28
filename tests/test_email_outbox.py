@@ -95,6 +95,7 @@ from admino.email_templates import (
 )
 from admino.mailer import SmtpConfig, load_smtp_config
 from admino.server import _lifespan, create_app
+from tests.lifespan_stubs import patch_org_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1672,14 +1673,18 @@ class _LifespanProbe:
         """The fake run_session_purge_job (GH-152)."""
         await self._blocking("session-purge")
 
+    async def org_purge(self, *_args: Any, **_kwargs: Any) -> None:
+        """The fake run_org_purge_job (GH-154)."""
+        await self._blocking("org-purge")
+
 
 @contextlib.contextmanager
 def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
     """Patch the lifespan's database calls, the retention job, the session purge job
-    (GH-152), the SMTP config loader and the outbox sender. get_pool() raises until
-    init_pool() ran, like the real one. ``create=True`` on the purge job: it is new in
-    GH-152, and these tests don't depend on it; the stub keeps the real purge from
-    running against the MagicMock pool."""
+    (GH-152), the org purge job (GH-154), the SMTP config loader and the outbox
+    sender. get_pool() raises until init_pool() ran, like the real one. ``create=True``
+    on the purge jobs: they are new, and these tests don't depend on them; the stubs
+    keep the real purges from running against the MagicMock pool."""
     state: dict[str, Any] = {"pool": None}
 
     async def fake_init_pool(*_args: Any, **_kwargs: Any) -> Any:
@@ -1707,6 +1712,7 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.mailer.load_smtp_config", probe.load_smtp_config),
         patch("admino.email_outbox.run_outbox_sender", probe.sender),
         patch("admino.sessions.run_session_purge_job", probe.session_purge, create=True),
+        patch_org_purge_job(probe.org_purge),
     ):
         yield
 

@@ -7,16 +7,24 @@ pending invitations (``list_invitations``), revokes one
 (``get_invitation``: the org name, the role and the email) and accepts it with
 a name and a password (``accept_invitation``), which activates the account and
 opens a session. A Super Admin invites the first Org Admin of an org that has
-no users yet (``invite_first_org_admin``; its route comes with #154).
+no users yet (``invite_first_org_admin``). Creating an organization (#154,
+``admino.organizations.create_org``) invites its first Org Admin inside its
+own transaction through ``send_first_admin_invitation``: the same rules, on
+the caller's connection, by a Super Admin or the admin CLI's ``Operator``,
+optionally without queueing the email; it hands the one-time accept link back
+to the caller (the CLI shows it on the terminal when there is no SMTP).
 
-Inputs: the database pool; the acting ``Principal``, the email, the member
-role, the invitee's language (the inviting admin's session language), the
-configured public URL (``server.public_url``) and the client IP (sending); an
-invitation id (revoking, resending); the token from the link, plus the name,
-password, client IP and user agent (accepting).
-Outputs: an ``InvitationSummary`` (sending, resending), a list of them
-(listing), None (revoking), an ``InvitationDetails`` (opening the link), an
-``auth.LoginResult`` (accepting). Errors: ``PermissionError``,
+Inputs: the database pool (or, for ``send_first_admin_invitation``, a
+connection inside the caller's transaction); the acting ``Principal`` (or
+``Operator``), the email, the member role, the invitee's language (the
+inviting admin's session language), the configured public URL
+(``server.public_url``) and the client IP (sending); an invitation id
+(revoking, resending); the token from the link, plus the name, password,
+client IP and user agent (accepting).
+Outputs: an ``InvitationSummary`` (sending, resending), a ``SentInvitation``
+(the summary and the accept link, from ``send_first_admin_invitation``), a
+list of summaries (listing), None (revoking), an ``InvitationDetails``
+(opening the link), an ``auth.LoginResult`` (accepting). Errors: ``PermissionError``,
 ``accounts.DuplicateEmailError``, ``SeatLimitError``,
 ``InvitationNotFoundError``, ``InvalidInvitationError``, ``OrgNotFoundError``,
 ``OrgHasUsersError`` and ``passwords.PasswordPolicyError``.
@@ -51,11 +59,16 @@ Security notes:
 - Authorization through ``access.can`` before any query: sending, revoking and
   resending need ``Capability.ORG_USERS_INVITE``, listing
   ``Capability.ORG_USERS_VIEW``, the first Org Admin ``Capability.ORG_CREATE``.
+  ``send_first_admin_invitation`` runs inside its caller's transaction and
+  leaves authorization to that caller (``organizations.create_org``). An
+  ``Operator`` is audited as actor kind 'operator', with no user id.
 - Tenant isolation at the data layer: every org statement is scoped by the
   actor's org id. Another org's invitation, an unknown id and an accepted one
   are the same ``InvitationNotFoundError``.
 - Only the token's SHA-256 hash is stored or queried; the raw token travels
-  only inside the queued email's link. A value that can't be a
+  only inside the queued email's link, or, from ``send_first_admin_invitation``,
+  in the returned ``SentInvitation.accept_link`` (kept out of its ``repr()``).
+  A value that can't be a
   ``secrets.token_urlsafe(32)`` token is refused without a query. Every link
   that can't be used (unknown, expired, used, revoked, rotated, an account no
   longer invited, an org that isn't active) is the one
@@ -93,6 +106,7 @@ import asyncio
 import hashlib
 import re
 import secrets
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Final
 
@@ -110,7 +124,7 @@ if TYPE_CHECKING:
     from asyncpg import Record
     from asyncpg.pool import PoolConnectionProxy
 
-    from admino.access import Principal
+    from admino.access import Operator, Principal
 
 INVITATION_LIFETIME: Final = timedelta(hours=72)
 INVALID_INVITATION_MESSAGE: Final = "This invitation link is invalid or has expired."
@@ -236,6 +250,14 @@ class OrgHasUsersError(Exception):
         super().__init__("The organization already has users.")
 
 
+@dataclass(frozen=True)
+class SentInvitation:
+    """A sent invitation and its one-time accept link (a secret: not in ``repr()``)."""
+
+    summary: InvitationSummary
+    accept_link: str = field(repr=False)
+
+
 def _hash_token(token: str) -> bytes:
     """Return the 32-byte SHA-256 digest of a token: what the database stores."""
     return hashlib.sha256(token.encode()).digest()
@@ -253,13 +275,14 @@ def _require(actor: Principal, capability: Capability) -> None:
         raise PermissionError(msg)
 
 
-def _params(org_name: str, public_url: str, token: str, expires_at: datetime) -> InvitationParams:
+def _accept_link(public_url: str, token: str) -> str:
+    """The link the invitee opens: ``{public_url}/accept-invitation#token=<token>``."""
+    return f"{public_url}/accept-invitation#token={token}"
+
+
+def _params(org_name: str, accept_link: str, expires_at: datetime) -> InvitationParams:
     """The invitation email's params: the org name, the link and the expiry."""
-    return InvitationParams(
-        org_name=org_name,
-        accept_link=f"{public_url}/accept-invitation#token={token}",
-        expires_at=expires_at,
-    )
+    return InvitationParams(org_name=org_name, accept_link=accept_link, expires_at=expires_at)
 
 
 async def _record_refusal(
@@ -307,17 +330,19 @@ async def _send(
     *,
     org: Record,
     org_id: UUID | None,
-    actor: Principal,
+    actor: Principal | Operator,
     email: str,
     role: MemberRole,
     language: EmailLanguage,
     public_url: str,
     ip: str | None,
-) -> InvitationSummary:
+    queue_email: bool,
+) -> SentInvitation:
     """Send an invitation into a locked org, inside the caller's transaction.
 
     Checks the seats, inserts the invited users row and the invitation, queues
-    the email and records ``invitation.create`` (see the module docstring).
+    the email (unless ``queue_email`` is False) and records
+    ``invitation.create`` (see the module docstring).
 
     Raises:
         SeatLimitError: If the org has no free seat (nothing is inserted).
@@ -335,23 +360,26 @@ async def _send(
     (invitation,) = await conn.fetch(
         _INSERT_INVITATION_SQL, user_id, _hash_token(token), INVITATION_LIFETIME
     )
-    await email_outbox.enqueue_email(
-        conn,
-        user_id=user_id,
-        params=_params(org["name"], public_url, token, invitation["expires_at"]),
-    )
+    accept_link = _accept_link(public_url, token)
+    if queue_email:
+        await email_outbox.enqueue_email(
+            conn,
+            user_id=user_id,
+            params=_params(org["name"], accept_link, invitation["expires_at"]),
+        )
+    actor_kind, actor_user_id = audit_events.actor_columns(actor)
     await audit_events.record(
         conn,
         action=AuditAction.INVITATION_CREATE,
-        actor_kind=actor.kind,
-        actor_user_id=actor.user_id,
+        actor_kind=actor_kind,
+        actor_user_id=actor_user_id,
         org_id=org_id,
         target_type=TargetType.INVITATION,
         target_ids=(invitation["id"],),
         ip=ip,
         metadata={"role": role, "user_id": user_id},
     )
-    return InvitationSummary(
+    summary = InvitationSummary(
         id=invitation["id"],
         email=email,
         role=role,
@@ -359,6 +387,7 @@ async def _send(
         expires_at=invitation["expires_at"],
         expired=False,
     )
+    return SentInvitation(summary=summary, accept_link=accept_link)
 
 
 async def create_invitation(
@@ -400,7 +429,7 @@ async def create_invitation(
     _require(actor, Capability.ORG_USERS_INVITE)
     try:
         async with pool.acquire() as conn, conn.transaction():
-            return await _send(
+            sent = await _send(
                 conn,
                 org=await _lock_org(conn, actor.org_id),
                 org_id=actor.org_id,
@@ -410,10 +439,71 @@ async def create_invitation(
                 language=language,
                 public_url=public_url,
                 ip=ip,
+                queue_email=True,
             )
     except (accounts.DuplicateEmailError, SeatLimitError) as exc:
         await _record_refusal(pool, actor=actor, org_id=actor.org_id, role=role, error=exc, ip=ip)
         raise
+    return sent.summary
+
+
+async def send_first_admin_invitation(
+    conn: PoolConnectionProxy,
+    *,
+    actor: Principal | Operator,
+    org_id: UUID,
+    email: str,
+    language: EmailLanguage,
+    public_url: str,
+    ip: str | None,
+    queue_email: bool,
+) -> SentInvitation:
+    """Invite the first user of an org without users, as its Org Admin, on the caller's connection.
+
+    Must run inside the caller's transaction, which also decides the
+    authorization (a Super Admin with ``Capability.ORG_CREATE`` or the admin
+    CLI's Operator): the org row is locked, the org must have no users row at
+    all, and the invitation is sent with ``invitation.create`` recorded by
+    ``actor`` in that org's log. Nothing is recorded for a refusal: the
+    caller's transaction rolls back.
+
+    Args:
+        conn: A connection inside the caller's transaction.
+        actor: Who invites: a Super Admin, or the Operator at the terminal.
+        org_id: The org to invite into.
+        email: The invitee's email.
+        language: The invitee's UI language, used for the email too.
+        public_url: The configured origin the link is built from.
+        ip: The client address, if known.
+        queue_email: Whether to queue the invitation email (False: the caller
+            hands the returned link over itself).
+
+    Returns:
+        The SentInvitation: the InvitationSummary and the one-time accept link.
+
+    Raises:
+        OrgNotFoundError: If the org doesn't exist.
+        OrgHasUsersError: If the org has any users row (any status, deleted or
+            not).
+        SeatLimitError, DuplicateEmailError: As for ``create_invitation``.
+        AuditRecordError: If the audit event can't be recorded.
+    """
+    # Locked first: two concurrent first-admin invites can't both see no users.
+    org = await _lock_org(conn, org_id)
+    if await conn.fetchval(_ORG_HAS_USERS_SQL, org_id):
+        raise OrgHasUsersError
+    return await _send(
+        conn,
+        org=org,
+        org_id=org_id,
+        actor=actor,
+        email=email,
+        role="org_admin",
+        language=language,
+        public_url=public_url,
+        ip=ip,
+        queue_email=queue_email,
+    )
 
 
 async def invite_first_org_admin(
@@ -453,24 +543,20 @@ async def invite_first_org_admin(
     _require(actor, Capability.ORG_CREATE)
     try:
         async with pool.acquire() as conn, conn.transaction():
-            # Locked first: two concurrent first-admin invites can't both see no users.
-            org = await _lock_org(conn, org_id)
-            if await conn.fetchval(_ORG_HAS_USERS_SQL, org_id):
-                raise OrgHasUsersError
-            return await _send(
+            sent = await send_first_admin_invitation(
                 conn,
-                org=org,
-                org_id=org_id,
                 actor=actor,
+                org_id=org_id,
                 email=email,
-                role="org_admin",
                 language=language,
                 public_url=public_url,
                 ip=ip,
+                queue_email=True,
             )
     except (accounts.DuplicateEmailError, SeatLimitError) as exc:
         await _record_refusal(pool, actor=actor, org_id=org_id, role="org_admin", error=exc, ip=ip)
         raise
+    return sent.summary
 
 
 async def list_invitations(pool: asyncpg.Pool, *, actor: Principal) -> list[InvitationSummary]:
@@ -586,7 +672,7 @@ async def resend_invitation(
         await email_outbox.enqueue_email(
             conn,
             user_id=row["user_id"],
-            params=_params(row["org_name"], public_url, token, row["expires_at"]),
+            params=_params(row["org_name"], _accept_link(public_url, token), row["expires_at"]),
         )
         await audit_events.record(
             conn,

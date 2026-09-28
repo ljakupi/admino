@@ -15,6 +15,10 @@ connection, inside the caller's transaction, so a failed audit write creates
 no account. A unique violation (a concurrent create) becomes
 DuplicateEmailError, which never carries the email.
 
+GH-154 retires #147's default-org bridge: admino.accounts has neither
+DEFAULT_ORG_ID nor ensure_default_org, and no file under src/admino mentions
+them (migration 0011 schedules the org for the regular purge instead).
+
 All asyncpg calls are mocked. No real PostgreSQL connections are made. The new
 GH-150 names are looked up on the module at call time, so the GH-145 tests in
 this file keep collecting and passing before they exist.
@@ -375,66 +379,34 @@ class TestAccountsModuleDocs:
 
 
 # ---------------------------------------------------------------------------
-# GH-147: the default organization tool.call rows belong to until #149
+# GH-154: #147's default organization is gone
 # ---------------------------------------------------------------------------
 
-
-def _ensure_default_org() -> Any:
-    """Look ensure_default_org up lazily, so the rest of this file collects without it."""
-    func = getattr(accounts_mod, "ensure_default_org", None)
-    assert func is not None, "admino.accounts must define ensure_default_org"
-    return func
+_SRC_DIR = Path(accounts_mod.__file__).resolve().parent
+_DEFAULT_ORG_NAMES: tuple[str, ...] = ("DEFAULT_ORG_ID", "ensure_default_org")
 
 
-def _norm(sql: str) -> str:
-    return re.sub(r"\s+", " ", sql).strip().lower()
+class TestDefaultOrgRemoved:
+    """GH-154 deletes the default-org bridge: migration 0011 schedules the org for the
+    regular purge, and the code that created it no longer exists."""
 
+    def test_accounts_has_no_default_org_id(self) -> None:
+        assert not hasattr(accounts_mod, "DEFAULT_ORG_ID")
 
-class TestDefaultOrg:
-    """startup creates one default organization with a fixed, well-known id."""
+    def test_accounts_has_no_ensure_default_org(self) -> None:
+        assert not hasattr(accounts_mod, "ensure_default_org")
 
-    def test_default_org_id_is_a_fixed_uuid(self) -> None:
-        from uuid import UUID
+    def test_accounts_no_src_file_mentions_the_default_org(self) -> None:
+        """No file under src/admino (code, docstrings, SQL, resources) names either one."""
+        offenders = [
+            f"{path.relative_to(_SRC_DIR)}: {name}"
+            for path in sorted(_SRC_DIR.rglob("*"))
+            if path.is_file() and "__pycache__" not in path.parts and path.suffix != ".pyc"
+            for name in _DEFAULT_ORG_NAMES
+            if name.encode() in path.read_bytes()
+        ]
 
-        default_org_id = getattr(accounts_mod, "DEFAULT_ORG_ID", None)
-        assert isinstance(default_org_id, UUID)
-
-    @pytest.mark.asyncio
-    async def test_one_idempotent_insert_into_organizations(self, conn: MagicMock) -> None:
-        await _ensure_default_org()(conn)
-
-        assert conn.execute.await_count == 1
-        sql = _norm(conn.execute.await_args.args[0])
-        assert sql.startswith("insert into organizations")
-        assert "on conflict (id) do nothing" in sql
-
-    @pytest.mark.asyncio
-    async def test_default_org_id_travels_as_a_bind_parameter(self, conn: MagicMock) -> None:
-        await _ensure_default_org()(conn)
-
-        default_org_id = accounts_mod.DEFAULT_ORG_ID  # type: ignore[attr-defined]
-        sql = conn.execute.await_args.args[0]
-        assert default_org_id in conn.execute.await_args.args[1:]
-        assert str(default_org_id) not in sql
-        assert default_org_id.hex not in sql
-        assert "$1" in sql
-
-    @pytest.mark.asyncio
-    async def test_calling_twice_repeats_the_same_idempotent_statement(
-        self, conn: MagicMock
-    ) -> None:
-        await _ensure_default_org()(conn)
-        await _ensure_default_org()(conn)
-
-        first, second = conn.execute.await_args_list
-        assert first.args == second.args
-
-    @pytest.mark.asyncio
-    async def test_errors_propagate(self, conn: MagicMock) -> None:
-        conn.execute.side_effect = asyncpg.PostgresError("boom")
-
-        with pytest.raises(asyncpg.PostgresError):
-            await _ensure_default_org()(conn)
+        assert offenders == []
 
 
 # ---------------------------------------------------------------------------

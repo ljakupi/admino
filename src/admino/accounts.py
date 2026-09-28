@@ -15,17 +15,10 @@ Super Admin (no org, no role) and records its ``user.activate`` audit event
 (actor ``operator``, no org) on the same connection, inside the caller's
 transaction, so a failed audit write leaves no account behind.
 
-``ensure_default_org`` and ``DEFAULT_ORG_ID`` are the retired single-tenant
-bridge (GH-147): tool.call audit events belonged to that fixed organization
-until login. Since #149 they carry the acting member's org, startup no longer
-calls ``ensure_default_org`` and nothing outside this module references
-``DEFAULT_ORG_ID``. Both are left for #154, which removes them together with
-the leftover default organization.
-
 Inputs: an asyncpg connection inside the caller's transaction, plus the org_id
 and user_id of the account being changed (the guard) or the new Super Admin's
-email, name and password hash; or the pool (the default org, the email
-lookup). Outputs: None, LastAdminError, or UserNotInOrgError when the user
+email, name and password hash; or the pool (the email lookup). Outputs: None,
+LastAdminError, or UserNotInOrgError when the user
 isn't a member of that org (the guard); whether the email is taken
 (``email_exists``); the new user's id, or DuplicateEmailError when the email
 is already taken (``create_super_admin``).
@@ -43,8 +36,8 @@ Security notes:
   raises UserNotInOrgError (callers answer 404), so a mismatched
   (org_id, user_id) pair can't slip past the guard.
 - Parameterized SQL only: org_id and user_id travel as the $1 and $2 bind
-  parameters, DEFAULT_ORG_ID as $1 of the default-org insert, and the email,
-  name and password hash as the $1, $2 and $3 bind parameters.
+  parameters, and the email, name and password hash as the $1, $2 and $3 bind
+  parameters.
 - Content-free audit: the user.activate event names the new user's id only,
   never the email, the name or the hash.
 - No content in errors: the guard's errors carry no IDs, and
@@ -55,7 +48,6 @@ Security notes:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
-from uuid import UUID
 
 import asyncpg
 
@@ -63,18 +55,9 @@ from admino import audit_events
 from admino.audit_events import AuditAction, TargetType
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from asyncpg.pool import PoolConnectionProxy
-
-# The retired single-tenant org (GH-147); unused since #149, removed by #154.
-DEFAULT_ORG_ID: Final[UUID] = UUID("00000000-0000-4000-8000-000000000001")
-
-# Idempotent: a second startup (or a renamed default org) changes nothing. The
-# fixed name and minimal limits satisfy the organizations CHECKs (migration 0004).
-_DEFAULT_ORG_SQL: Final = """
-    INSERT INTO organizations (id, name, seats, monthly_budget_chf, storage_quota_bytes)
-    VALUES ($1, 'Default organization', 1, 0, 0)
-    ON CONFLICT (id) DO NOTHING
-"""
 
 # The target's row (only when it belongs to the org) plus the org's active Org
 # Admins, each flagged, locked in id order.
@@ -98,22 +81,6 @@ _CREATE_SUPER_ADMIN_SQL: Final = """
     VALUES ($1, $2, $3, 'super_admin', 'active')
     RETURNING id
 """
-
-
-async def ensure_default_org(executor: asyncpg.Pool | asyncpg.Connection) -> None:
-    """Create the default organization (``DEFAULT_ORG_ID``) unless it exists.
-
-    The retired single-tenant bridge (GH-147): nothing calls it since #149
-    (tool.call events carry the acting member's org), and #154 removes it.
-    Runs one parameterized, idempotent statement.
-
-    Args:
-        executor: The pool (or a connection) to write through.
-
-    Raises:
-        asyncpg.PostgresError: If the insert fails (propagated unchanged).
-    """
-    await executor.execute(_DEFAULT_ORG_SQL, DEFAULT_ORG_ID)
 
 
 class LastAdminError(Exception):

@@ -16,6 +16,8 @@ optional targets, the client IP and a small metadata dict.
 ``record_tool_call()`` takes an executor, the acting member's org and user
 IDs, the chat ID and one agent tool dispatch's outcome (GH-147, GH-149). ``purge_expired()`` and
 ``run_retention_job()`` take the pool and a retention in months.
+``actor_columns()`` maps who acts (a ``Principal``, or the admin CLI's
+``Operator``) to an event's actor_kind and actor_user_id.
 Outputs: one INSERT per event; the purge returns the number of rows removed.
 
 Security notes:
@@ -57,11 +59,13 @@ from uuid import UUID
 
 from pydantic import ConfigDict, Field, ValidationError, field_validator, model_validator
 
-from admino.access import MemberRole, SealedModel
+from admino.access import MemberRole, Operator, SealedModel
 from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS, PermissionState
 
 if TYPE_CHECKING:
     import asyncpg
+
+    from admino.access import Principal
 
 logger = logging.getLogger(__name__)
 
@@ -370,6 +374,23 @@ class AuditEvent(SealedModel):
             msg = "A target type and target IDs come together."
             raise ValueError(msg)
         return self
+
+
+def actor_columns(actor: Principal | Operator) -> tuple[ActorKind, UUID | None]:
+    """Return the actor_kind and actor_user_id an event of this actor is recorded with.
+
+    A Principal acts as its account ('member' or 'super_admin', its user id);
+    the Operator at the server's terminal as 'operator', with no user id.
+
+    Args:
+        actor: Who acts.
+
+    Returns:
+        The (actor_kind, actor_user_id) pair for ``record()``.
+    """
+    if isinstance(actor, Operator):
+        return "operator", None
+    return actor.kind, actor.user_id
 
 
 async def record(

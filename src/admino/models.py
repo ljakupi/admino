@@ -13,6 +13,11 @@ Security notes:
   ``new_password`` and ``InvitationAcceptRequest.password``: ``SecretStr``
   values (hidden from repr/str) that live only for their request and are never
   logged or echoed. Invitation models carry no token, hash or link.
+- Organization models (GH-154) carry org metadata only: no content, and
+  ``OrgCreateResponse`` no token or link. ``OrgCreateRequest`` and
+  ``OrgLimitsPatch`` hide their input from validation errors (an org name or
+  admin email never reaches a log or a 422 body); seats, quotas and the
+  residency switch are strict ints and bools.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
@@ -41,11 +46,21 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import UTC, datetime
+from decimal import Decimal
 from types import MappingProxyType
-from typing import Any, Final, Literal
+from typing import Annotated, Any, Final, Literal
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    StrictBool,
+    StrictInt,
+    field_validator,
+    model_validator,
+)
 
 from admino.access import (  # noqa: TC001 — Pydantic resolves field annotations at runtime
     MemberRole,
@@ -1630,6 +1645,25 @@ def _strip_if_str(value: object) -> object:
     return value.strip() if isinstance(value, str) else value
 
 
+def _check_invite_email(value: str) -> str:
+    """Accept a plausible single invitee address; the messages never include it.
+
+    No whitespace, control, format, separator or surrogate characters; exactly
+    one '@' after a non-empty local part, and a '.' inside the domain (not its
+    first or last character).
+    """
+    if any(
+        char.isspace() or unicodedata.category(char) in _EMAIL_BANNED_CATEGORIES for char in value
+    ):
+        msg = "The email must not contain whitespace, control or invisible characters."
+        raise ValueError(msg)
+    local, at, domain = value.partition("@")
+    if not at or not local or "@" in domain or "." not in domain[1:-1]:
+        msg = "The email must look like name@example.com."
+        raise ValueError(msg)
+    return value
+
+
 class InvitationCreateRequest(BaseModel):
     """POST /api/org/invitations request body: who to invite, with which role.
 
@@ -1657,17 +1691,7 @@ class InvitationCreateRequest(BaseModel):
     @classmethod
     def _check_email(cls, value: str) -> str:
         """Accept a plausible single address; the messages never include it."""
-        if any(
-            char.isspace() or unicodedata.category(char) in _EMAIL_BANNED_CATEGORIES
-            for char in value
-        ):
-            msg = "The email must not contain whitespace, control or invisible characters."
-            raise ValueError(msg)
-        local, at, domain = value.partition("@")
-        if not at or not local or "@" in domain or "." not in domain[1:-1]:
-            msg = "The email must look like name@example.com."
-            raise ValueError(msg)
-        return value
+        return _check_invite_email(value)
 
 
 class InvitationSummary(BaseModel):
@@ -1733,3 +1757,135 @@ class InvitationAcceptRequest(BaseModel):
             msg = "The name must not contain control or formatting characters."
             raise ValueError(msg)
         return value
+
+
+# ---------------------------------------------------------------------------
+# Organization lifecycle API models (GH-154): org metadata only, no content
+# ---------------------------------------------------------------------------
+
+OrgStatus = Literal["active", "deactivated", "pending_deletion"]
+
+# The plan limits, shared by the create request and the limits patch. The
+# budget fits the organizations column NUMERIC(12,2): at most 10 digits before
+# the point and 2 after; NaN and infinities are refused. The quota is in bytes
+# and stays exact for a JSON reader (2**53 - 1).
+Seats = Annotated[StrictInt, Field(ge=1, le=100_000)]
+BudgetChf = Annotated[Decimal, Field(ge=0, max_digits=12, decimal_places=2, allow_inf_nan=False)]
+StorageQuotaBytes = Annotated[StrictInt, Field(ge=0, le=2**53 - 1)]
+
+# An org name reaches the invitation email's Subject header: the
+# email_templates org-name rule refuses control, format, surrogate and
+# line/paragraph separator characters.
+_ORG_NAME_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
+
+
+class OrgCreateRequest(BaseModel):
+    """POST /api/platform/orgs request body (and the create-org CLI's input).
+
+    The name is stripped, then must be 1 to 120 characters without control,
+    format, surrogate or line/paragraph separator characters. The first Org
+    Admin's email follows ``InvitationCreateRequest.email``'s rules exactly.
+    Seats and the storage quota (bytes) are strict ints; the monthly budget in
+    CHF is a JSON number or numeric string with at most 2 decimals. An org
+    starts active or deactivated, never pending deletion. Residency keeps its
+    default and the invitee's language is the caller's: unknown fields are
+    refused. Validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    name: str = Field(min_length=1, max_length=120)
+    primary_admin_email: str = Field(min_length=3, max_length=254)
+    seats: Seats
+    monthly_budget_chf: BudgetChf
+    storage_quota: StorageQuotaBytes
+    status: Literal["active", "deactivated"] = "active"
+
+    @field_validator("name", "primary_admin_email", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        """Strip surrounding whitespace before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        """Refuse control, format, surrogate and line/paragraph separator characters."""
+        if any(unicodedata.category(char) in _ORG_NAME_BANNED_CATEGORIES for char in value):
+            msg = "The name must not contain control or formatting characters."
+            raise ValueError(msg)
+        return value
+
+    @field_validator("primary_admin_email")
+    @classmethod
+    def _check_email(cls, value: str) -> str:
+        """The invitation email rules; the messages never include the address."""
+        return _check_invite_email(value)
+
+
+class OrgLimitsPatch(BaseModel):
+    """PATCH /api/platform/orgs/{org_id}/limits request body.
+
+    Any of the three plan limits, with the bounds of ``OrgCreateRequest``; a
+    null counts as not given, and at least one must be given.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    seats: Seats | None = None
+    monthly_budget_chf: BudgetChf | None = None
+    storage_quota: StorageQuotaBytes | None = None
+
+    @model_validator(mode="after")
+    def _check_something_given(self) -> OrgLimitsPatch:
+        """Refuse a patch that changes nothing."""
+        if self.seats is None and self.monthly_budget_chf is None and self.storage_quota is None:
+            msg = "Give at least one limit to change."
+            raise ValueError(msg)
+        return self
+
+
+class OrgResidencyPatch(BaseModel):
+    """PATCH /api/platform/orgs/{org_id}/residency request body: a strict bool."""
+
+    # Validation errors never repeat the rejected input.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    enabled: StrictBool
+
+
+class OrgSummary(BaseModel):
+    """One organization's metadata, as the Super Admin sees it (no content).
+
+    ``storage_quota`` is in bytes; ``monthly_budget_chf`` is serialized as a
+    decimal string. The deletion dates are set only while a deletion is
+    pending.
+    """
+
+    id: PlainUUID
+    name: str = Field(max_length=120)
+    status: OrgStatus
+    seats: int
+    monthly_budget_chf: Decimal
+    storage_quota: int
+    data_residency: bool
+    deletion_requested_at: datetime | None
+    purge_after: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class OrgListResponse(BaseModel):
+    """GET /api/platform/orgs response: every organization, oldest first."""
+
+    organizations: list[OrgSummary]
+
+
+class OrgCreateResponse(BaseModel):
+    """POST /api/platform/orgs response: the new org and its first Org Admin's invitation.
+
+    The invitation part carries no token and no link.
+    """
+
+    organization: OrgSummary
+    invitation: InvitationSummary

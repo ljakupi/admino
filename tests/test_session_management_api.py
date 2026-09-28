@@ -61,6 +61,7 @@ from admino import sessions as sessions_mod
 from admino.access import Capability
 from admino.server import _lifespan, create_app
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, fake_hash, sha256
+from tests.lifespan_stubs import patch_org_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1212,13 +1213,18 @@ class _LifespanProbe:
         """The fake run_retention_job."""
         await self._blocking("retention")
 
+    async def org_purge(self, *_args: Any, **_kwargs: Any) -> None:
+        """The fake run_org_purge_job (GH-154)."""
+        await self._blocking("org-purge")
+
 
 @contextlib.contextmanager
 def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
     """Patch the lifespan's database calls and background jobs. get_pool() raises until
     init_pool() ran, like the real one. ``create=True``: run_session_purge_job is new in
     GH-152, so before it exists the patch adds it and the tests fail on their
-    assertions, not on the patch."""
+    assertions, not on the patch. GH-154's org purge job is stubbed too, so it never
+    runs against the MagicMock pool."""
     state: dict[str, Any] = {"pool": None}
 
     async def fake_init_pool(*_args: Any, **_kwargs: Any) -> Any:
@@ -1245,6 +1251,7 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.audit_events.run_retention_job", probe.retention),
         patch("admino.mailer.load_smtp_config", MagicMock(return_value=None)),
         patch("admino.sessions.run_session_purge_job", probe.session_purge, create=True),
+        patch_org_purge_job(probe.org_purge),
     ):
         yield
 

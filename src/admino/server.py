@@ -26,6 +26,19 @@ Routes:
   (deletes the invited account); audited.
 - POST /api/org/invitations/{invitation_id}/resend — Sends a pending invitation
   again with a new link; audited.
+- GET  /api/platform/orgs — Every organization's metadata (Super Admin).
+- POST /api/platform/orgs — Creates an organization and invites its first Org
+  Admin (Super Admin); audited.
+- PATCH /api/platform/orgs/{org_id}/limits — Changes an org's plan limits;
+  audited.
+- POST /api/platform/orgs/{org_id}/deactivate, .../reactivate — Deactivates
+  (ending every session of its users) or reactivates an org; audited.
+- POST /api/platform/orgs/{org_id}/deletion — Schedules an org's deletion after
+  the grace period (its active Org Admins are emailed); audited.
+- DELETE /api/platform/orgs/{org_id}/deletion — Cancels a pending deletion (the
+  org stays deactivated); audited.
+- PATCH /api/platform/orgs/{org_id}/residency — Sets an org's data residency
+  policy; audited in the org's own log.
 - POST /api/message       — Send a user message; returns ChatResponse.
 - GET  /api/events        — SSE stream for a chat session.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
@@ -72,6 +85,21 @@ Security notes:
   tighter per-user budget (``/api/org/invitations/refused``): once it's spent,
   sends answer 429 before any database work, so probing whether an email
   exists elsewhere on the platform stays slow and visible.
+- Platform organizations (GH-154): only a Super Admin reaches them, through
+  ``access.can`` in ``admino.organizations`` (``org.create``,
+  ``org.lifecycle.manage`` for the list and the status changes,
+  ``org.limits.manage``, ``org.residency.manage``); every member role gets
+  403, and the handlers pass the session's ``Principal``, never an
+  ``access.Operator`` (only the admin CLI builds one). Responses carry org
+  metadata only (operator blindness): the create response holds the
+  InvitationSummary, never the token or the link. The first Org Admin gets
+  the caller's session language, and the link is built from
+  ``server.public_url`` only. A taken email is a 409 ``email_taken`` with
+  nothing written; a change the org's status doesn't allow is a 409
+  ``invalid_status``; an unknown org a 404; a failed audit write a 500 with
+  nothing written. Each route spends a per-user bucket before any database
+  work (deactivate/reactivate share one, as do schedule/cancel), and the org
+  name, the admin email, the token and the link are never logged.
 - CSRF: ``CrossOriginProtectionMiddleware`` implements Go's
   CrossOriginProtection check on every non-GET/HEAD/OPTIONS request, before
   authentication and handlers (the login included): ``Sec-Fetch-Site`` must be
@@ -146,6 +174,7 @@ from admino import (
     accounts,
     auth,
     invitations,
+    organizations,
     password_reset,
     passwords,
     session_management,
@@ -170,6 +199,12 @@ from admino.models import (
     MeResponse,
     OAuthAuthorizeResponse,
     OAuthConnectionStatus,
+    OrgCreateRequest,
+    OrgCreateResponse,
+    OrgLimitsPatch,
+    OrgListResponse,
+    OrgResidencyPatch,
+    OrgSummary,
     PasswordResetConfirmRequest,
     PasswordResetRequest,
     PendingConfirmation,
@@ -421,6 +456,15 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     # Refused sends (email taken, no free seat), per user: a burst of 5, then one a
     # minute, so probing whether an email exists on the platform stays slow.
     "/api/org/invitations/refused": (1 / 60, 5),
+    # Platform organization lifecycle (GH-154), per Super Admin. Deactivating
+    # and reactivating share one bucket, as do scheduling and cancelling a
+    # deletion.
+    "/api/platform/orgs/get": (1.0, 10),
+    "/api/platform/orgs/create": (0.2, 5),
+    "/api/platform/orgs/limits": (0.5, 5),
+    "/api/platform/orgs/status": (0.5, 5),
+    "/api/platform/orgs/deletion": (0.2, 5),
+    "/api/platform/orgs/residency": (0.5, 5),
 }
 # Routes without their own entry still get a bucket per caller.
 _DEFAULT_RATE_LIMIT: tuple[float, int] = (1.0, 10)
@@ -1639,6 +1683,333 @@ async def post_invitation_accept(
     response = Response(status_code=204)
     _set_session_cookie(response, result)
     return response
+
+
+# ---------------------------------------------------------------------------
+# Platform organization route handlers (GH-154), Super Admin only
+# ---------------------------------------------------------------------------
+
+_INVALID_ORG_STATUS_BODY: Final = {
+    "detail": organizations.INVALID_STATUS_MESSAGE,
+    "reason": "invalid_status",
+}
+
+
+async def _org_change(change: Awaitable[OrgSummary]) -> OrgSummary | JSONResponse:
+    """Await one organizations change and map its refusals to responses.
+
+    Returns:
+        The org's OrgSummary after the change, or a 409 ``{"detail", "reason":
+        "invalid_status"}`` when the org's status doesn't allow it.
+
+    Raises:
+        HTTPException: 403 without the change's capability, 404 for an
+            unknown org.
+    """
+    try:
+        return await change
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except organizations.OrgNotFoundError:
+        raise HTTPException(status_code=404, detail=organizations.ORG_NOT_FOUND_MESSAGE) from None
+    except organizations.InvalidOrgStatusError:
+        return JSONResponse(status_code=409, content=_INVALID_ORG_STATUS_BODY)
+
+
+async def get_platform_orgs(principal: _PrincipalDep) -> OrgListResponse:
+    """Handle GET /api/platform/orgs — every organization's metadata.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        OrgListResponse: every org, whatever its status, oldest first.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_LIFECYCLE_MANAGE``, 429 when
+            rate-limited.
+    """
+    _check_rate_limit("/api/platform/orgs/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        orgs = await organizations.list_orgs(get_pool(), actor=principal)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    return OrgListResponse(organizations=orgs)
+
+
+async def post_platform_org(
+    request: Request,
+    session: _SessionDep,
+    body: OrgCreateRequest,
+) -> OrgCreateResponse | JSONResponse:
+    """Handle POST /api/platform/orgs — create an org and invite its first Org Admin.
+
+    The invited Org Admin gets the caller's session language (the email goes
+    out in it), and the link is built from ``server.public_url`` only. The
+    response carries neither the token nor the link.
+
+    Args:
+        request: The incoming request (the client IP for the audit events).
+        session: The resolved session (401 without one).
+        body: Validated OrgCreateRequest.
+
+    Returns:
+        201 with the new OrgSummary and the InvitationSummary, or a 409
+        ``{"detail", "reason": "email_taken"}`` when a user with the email
+        exists anywhere on the platform (nothing is written).
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_CREATE``, 429 when
+            rate-limited (checked before any database work).
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    principal = session.principal
+    _check_rate_limit("/api/platform/orgs/create", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        created = await organizations.create_org(
+            get_pool(),
+            actor=principal,
+            request=body,
+            language=session.ui_language,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+            queue_email=True,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except accounts.DuplicateEmailError:
+        return JSONResponse(status_code=409, content=_EMAIL_TAKEN_BODY)
+    # The one-time link stays out of the response: it travels in the email only.
+    return OrgCreateResponse(organization=created.organization, invitation=created.invitation)
+
+
+async def patch_platform_org_limits(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+    body: OrgLimitsPatch,
+) -> OrgSummary | JSONResponse:
+    """Handle PATCH /api/platform/orgs/{org_id}/limits — change an org's plan limits.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization (a UUID; anything else is a 422).
+        body: Validated OrgLimitsPatch (at least one limit).
+
+    Returns:
+        The org's OrgSummary, or a 409 ``invalid_status`` while a deletion is
+        pending.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_LIMITS_MANAGE``; 404 for
+            an unknown org; 429 when rate-limited.
+    """
+    _check_rate_limit("/api/platform/orgs/limits", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _org_change(
+        organizations.update_limits(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            patch=body,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def post_platform_org_deactivate(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+) -> OrgSummary | JSONResponse:
+    """Handle POST /api/platform/orgs/{org_id}/deactivate — deactivate an active org.
+
+    Every session of the org's users ends at once; its content is kept.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization (a UUID; anything else is a 422).
+
+    Returns:
+        The org's OrgSummary, or a 409 ``invalid_status`` unless it is active.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_LIFECYCLE_MANAGE``; 404 for
+            an unknown org; 429 when rate-limited (the bucket it shares with
+            reactivating).
+    """
+    _check_rate_limit("/api/platform/orgs/status", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _org_change(
+        organizations.deactivate_org(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def post_platform_org_reactivate(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+) -> OrgSummary | JSONResponse:
+    """Handle POST /api/platform/orgs/{org_id}/reactivate — reactivate a deactivated org.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization (a UUID; anything else is a 422).
+
+    Returns:
+        The org's OrgSummary, or a 409 ``invalid_status`` unless it is
+        deactivated.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_LIFECYCLE_MANAGE``; 404 for
+            an unknown org; 429 when rate-limited (the bucket it shares with
+            deactivating).
+    """
+    _check_rate_limit("/api/platform/orgs/status", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _org_change(
+        organizations.reactivate_org(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def post_platform_org_deletion(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+) -> OrgSummary | JSONResponse:
+    """Handle POST /api/platform/orgs/{org_id}/deletion — schedule an org's deletion.
+
+    The org is purged after the grace period; its users' sessions end and its
+    active Org Admins are emailed.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization (a UUID; anything else is a 422).
+
+    Returns:
+        The org's OrgSummary with its deletion dates, or a 409
+        ``invalid_status`` when a deletion is already pending.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_LIFECYCLE_MANAGE``; 404 for
+            an unknown org; 429 when rate-limited (the bucket it shares with
+            cancelling).
+    """
+    _check_rate_limit("/api/platform/orgs/deletion", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _org_change(
+        organizations.schedule_deletion(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def delete_platform_org_deletion(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+) -> OrgSummary | JSONResponse:
+    """Handle DELETE /api/platform/orgs/{org_id}/deletion — cancel a pending deletion.
+
+    The org becomes deactivated, never active: reactivating is a separate step.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization (a UUID; anything else is a 422).
+
+    Returns:
+        The org's OrgSummary, or a 409 ``invalid_status`` when no deletion is
+        pending.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_LIFECYCLE_MANAGE``; 404 for
+            an unknown or purged org; 429 when rate-limited (the bucket it
+            shares with scheduling).
+    """
+    _check_rate_limit("/api/platform/orgs/deletion", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _org_change(
+        organizations.cancel_deletion(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def patch_platform_org_residency(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+    body: OrgResidencyPatch,
+) -> OrgSummary | JSONResponse:
+    """Handle PATCH /api/platform/orgs/{org_id}/residency — set the data residency policy.
+
+    Recorded in the org's own log, so its admins see it.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization (a UUID; anything else is a 422).
+        body: Validated OrgResidencyPatch (a strict bool).
+
+    Returns:
+        The org's OrgSummary, or a 409 ``invalid_status`` while a deletion is
+        pending.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_RESIDENCY_MANAGE``; 404 for
+            an unknown org; 429 when rate-limited.
+    """
+    _check_rate_limit("/api/platform/orgs/residency", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _org_change(
+        organizations.set_residency(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            enabled=body.enabled,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
 
 
 async def post_message(
@@ -2968,8 +3339,9 @@ async def _request_validation_error_handler(
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
-    expired-session purge and, when SMTP is configured, the email outbox sender
-    on startup; stop the background tasks, then close the pool, on shutdown.
+    expired-session purge, the organization purge and, when SMTP is configured,
+    the email outbox sender on startup; stop the background tasks, then close
+    the pool, on shutdown.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -3000,6 +3372,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # up. Looked up at call time, like the retention job; cancelled before the
     # pool closes.
     session_purge_task = asyncio.create_task(sessions.run_session_purge_job(get_pool()))
+
+    # GH-154: organizations whose deletion grace period is over (and #147's
+    # default organization, which migration 0011 made due) are purged now and
+    # then hourly while the app is up. Looked up at call time, like the session
+    # purge; cancelled before the pool closes.
+    org_purge_task = asyncio.create_task(organizations.run_org_purge_job(get_pool()))
 
     # GH-148: the outbox sender delivers queued transactional email while the
     # app is up. Without SMTP config (load_smtp_config logs which variables are
@@ -3063,6 +3441,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     session_purge_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await session_purge_task
+    org_purge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await org_purge_task
     if sender_task is not None:
         sender_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -3182,6 +3563,28 @@ def create_app(
     )
     app.post("/api/org/invitations/{invitation_id}/resend", response_model=InvitationSummary)(
         post_org_invitation_resend
+    )
+    app.get("/api/platform/orgs", response_model=OrgListResponse)(get_platform_orgs)
+    app.post("/api/platform/orgs", status_code=201, response_model=OrgCreateResponse)(
+        post_platform_org
+    )
+    app.patch("/api/platform/orgs/{org_id}/limits", response_model=OrgSummary)(
+        patch_platform_org_limits
+    )
+    app.post("/api/platform/orgs/{org_id}/deactivate", response_model=OrgSummary)(
+        post_platform_org_deactivate
+    )
+    app.post("/api/platform/orgs/{org_id}/reactivate", response_model=OrgSummary)(
+        post_platform_org_reactivate
+    )
+    app.post("/api/platform/orgs/{org_id}/deletion", response_model=OrgSummary)(
+        post_platform_org_deletion
+    )
+    app.delete("/api/platform/orgs/{org_id}/deletion", response_model=OrgSummary)(
+        delete_platform_org_deletion
+    )
+    app.patch("/api/platform/orgs/{org_id}/residency", response_model=OrgSummary)(
+        patch_platform_org_residency
     )
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)
