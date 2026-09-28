@@ -989,12 +989,21 @@ class TestMigration0005PurgeFunction:
 class TestMigration0005PythonSync:
     """The CHECKs and functions mirror admino.audit_events."""
 
-    def test_migration_0005_action_check_matches_audit_action(self) -> None:
-        """The SQL action catalog equals AuditAction's values."""
+    def test_migration_0005_action_check_is_still_in_audit_action(self) -> None:
+        """Every action 0005 allows is still an AuditAction (none was dropped).
+
+        A shipped migration never changes, so 0005's list stays the original 39
+        (test_migration_0005_action_check_lists_the_catalog pins it). The catalog
+        grows by replacing the audit_events_action_check constraint in a later
+        migration (0009 for GH-152's session.revoke and session.force_logout), so
+        the exact sync with the live AuditAction lives in that migration's tests
+        (tests/test_migration_0009.py).
+        """
         audit_events = _audit_events_module()
         sql_actions = _in_values(_named_check("audit_events_action_check"), "action")
 
-        assert sql_actions == {action.value for action in audit_events.AuditAction}
+        assert sql_actions is not None
+        assert sql_actions <= {action.value for action in audit_events.AuditAction}
 
     def test_migration_0005_actor_kind_check_matches_actor_kind(self) -> None:
         """The SQL actor kinds equal the ActorKind Literal."""

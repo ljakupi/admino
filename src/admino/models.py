@@ -14,7 +14,8 @@ Security notes:
   for their request and are never logged or echoed.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
-  Bearer headers) and dangerous Unicode via field validators.
+  Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
+  strips control and direction-override characters from the stored user agent.
 - All user-facing string fields have max_length constraints to prevent abuse.
 - ToolCall.args uses dict[str, Any] because LLM output is untyped JSON;
   individual tools validate args via their own Pydantic models before execution.
@@ -47,6 +48,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 
 from admino.access import (  # noqa: TC001 — Pydantic resolves field annotations at runtime
     MemberRole,
+    PlainUUID,
     UserKind,
 )
 
@@ -1572,3 +1574,39 @@ class MeResponse(BaseModel):
     role: MemberRole | None
     ui_language: Literal["de", "fr", "en"]
     response_language: Literal["de", "fr", "it", "en"] | None
+
+
+# ---------------------------------------------------------------------------
+# Session management API models (GH-152)
+# ---------------------------------------------------------------------------
+
+
+class SessionSummary(BaseModel):
+    """One of the caller's live sessions (GET /api/me/sessions).
+
+    No token or token hash: a session is identified by its id only. The IP and
+    the user agent are what the browser sent when the session was opened; the
+    user agent (client-supplied text) is stripped of control and
+    direction-override characters. ``current`` marks the session of the
+    request.
+    """
+
+    id: PlainUUID
+    created_at: datetime
+    last_seen_at: datetime
+    expires_at: datetime
+    ip: str | None = Field(max_length=45)
+    user_agent: str | None = Field(max_length=256)
+    current: bool
+
+    @field_validator("user_agent")
+    @classmethod
+    def _strip_control_chars(cls, value: str | None) -> str | None:
+        """Remove control and direction-override characters from the user agent."""
+        return None if value is None else value.translate(_CONTROL_CHAR_TABLE)
+
+
+class SessionListResponse(BaseModel):
+    """GET /api/me/sessions response: the caller's live sessions, most recently active first."""
+
+    sessions: list[SessionSummary]

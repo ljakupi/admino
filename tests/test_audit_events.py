@@ -1,10 +1,11 @@
-"""Tests for admino.audit_events — the content-free audit event store (GH-146).
+"""Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
 Org Admin access to other users' projects, org and platform settings, every
-Super Admin action, residency policy, break-glass sessions, agent tool calls)
-is recorded through one service function, record(), as a row in the
+Super Admin action, residency policy, break-glass sessions, agent tool calls,
+and since GH-152 a user revoking one of their sessions and an Org Admin's forced
+logout) is recorded through one service function, record(), as a row in the
 append-only audit_events table (migration 0005, tests/test_migration_0005.py).
 
 What these tests pin down:
@@ -24,7 +25,9 @@ What these tests pin down:
 - purge_expired() validates the retention (6 to 84 months, default 12), runs
   purge_audit_events($1) and records one audit.purge event in the same
   transaction. run_retention_job() runs it daily and survives failures, and the
-  server lifespan starts it and cancels it before closing the pool.
+  server lifespan starts it and cancels it before closing the pool. (The
+  lifespan helper here also stubs GH-152's session purge job, which
+  tests/test_session_management_api.py covers.)
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -156,6 +159,8 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         "breakglass.start",
         "breakglass.end",
         "tool.call",
+        # GH-152: an Org Admin logs a user of their org out.
+        "session.force_logout",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -171,6 +176,8 @@ _ANY_SCOPED: frozenset[str] = frozenset(
         "user.activate",
         "user.deactivate",
         "user.delete",
+        # GH-152: a user (member or Super Admin) deletes one of their own sessions.
+        "session.revoke",
     }
 )
 _CATALOG: frozenset[str] = _ORG_SCOPED | _PLATFORM_SCOPED | _ANY_SCOPED
@@ -220,6 +227,9 @@ _ISSUE_CATEGORIES: list[Any] = [
     pytest.param({"breakglass.start", "breakglass.end"}, id="break-glass-sessions"),
     pytest.param({"tool.call"}, id="agent-tool-calls"),
     pytest.param({"audit.purge"}, id="retention-purge"),
+    pytest.param(
+        {"session.revoke", "session.force_logout"}, id="session-revocations-and-forced-logouts"
+    ),
 ]
 
 # Super Admin actions that affect one org: stored with that org's id.
@@ -589,9 +599,10 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 39 actions of the spec: nothing missing, nothing extra."""
+        """The catalog has exactly the 41 actions of the spec (GH-146's 39 plus GH-152's
+        session.revoke and session.force_logout): nothing missing, nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 39
+        assert len(AuditAction) == 41
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:
@@ -2086,9 +2097,12 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
     """Patch the lifespan's database calls and the retention job with fakes.
 
     get_pool() raises until init_pool() ran, like the real one, so the job can
-    only start after the pool exists.
+    only start after the pool exists. GH-152's session purge job is stubbed with
+    its own probe, so the real purge never runs against the MagicMock pool
+    (``create=True``: the job is new in GH-152, and these tests don't depend on it).
     """
     state: dict[str, Any] = {"pool": None}
+    session_purge = _JobProbe()
 
     async def fake_init_pool(*_args: Any, **_kwargs: Any) -> Any:
         probe.events.append("init_pool")
@@ -2112,6 +2126,7 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
         patch("admino.database.load_permissions_from_db", AsyncMock(return_value={})),
         patch("admino.database.load_settings_from_db", AsyncMock(return_value={})),
         patch("admino.audit_events.run_retention_job", probe.job),
+        patch("admino.sessions.run_session_purge_job", session_purge.job, create=True),
     ):
         yield
 

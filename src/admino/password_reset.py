@@ -22,8 +22,8 @@ email is queued through the outbox (#148) with the link
 ``{public_url}/reset-password#token=<token>``, and ``password_reset.request``
 is recorded. A confirm checks the token and the account again, applies the
 password policy, and then, in one transaction, consumes the token, stores
-the new Argon2 hash, revokes every session of the user and records
-``password_reset.complete``.
+the new Argon2 hash, ends every session of the user (deletes its rows,
+``sessions.revoke_user_sessions``) and records ``password_reset.complete``.
 
 Security notes:
 - No user enumeration: ``request_reset`` returns None and raises nothing for

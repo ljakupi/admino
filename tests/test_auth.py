@@ -1,4 +1,4 @@
-"""Tests for admino.auth — the email/password login and logout service (GH-149).
+"""Tests for admino.auth — the email/password login and logout service (GH-149, GH-152).
 
 ``login(pool, *, email, password, ip, user_agent)`` looks the account up by
 email (case-insensitive), verifies the password with exactly one Argon2 call on
@@ -8,8 +8,14 @@ and either opens a session or fails with one generic ``LoginFailedError``.
 What these tests pin down:
 - Success: a session row with the token's hash, ``last_login_at`` updated, a
   ``login.success`` audit event (actor kind and user id from the row, the row's
-  org, the client IP), the raw token returned. A hash with older parameters is
-  rehashed with the current ones; a current hash is left alone.
+  org, the client IP), and a frozen ``LoginResult`` returned: the raw token (kept
+  out of its repr) and the cookie's ``max_age_seconds``. A hash with older
+  parameters is rehashed with the current ones; a current hash is left alone.
+- Session policy (GH-152): the session is opened with
+  ``sessions.session_policy_for(<the account's kind>)``: a member's row stores
+  the org policy's idle timeout and lifetime, a Super Admin's the platform
+  policy's, and ``max_age_seconds`` is that lifetime in seconds (43200 by
+  default).
 - Failure, for every cause (unknown email, wrong password, invited user without
   a password, deactivated or deleted user, user of a deactivated or
   pending-deletion org): the same ``LoginFailedError("Invalid email or password")``,
@@ -20,7 +26,7 @@ What these tests pin down:
 - The email is a bind parameter of the lookup (``lower(email) = lower($1)``) and
   nowhere else: not in any other statement, not in the audit row or its
   metadata, not in any log line. The password is never logged.
-- ``logout`` revokes the session.
+- ``logout`` deletes the session row (GH-152: no revoked_at any more).
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -33,6 +39,7 @@ Security notes:
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import logging
 import re
@@ -45,9 +52,12 @@ from typing import TYPE_CHECKING, Any
 import pytest
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 
+from admino import auth as auth_mod
 from admino import passwords
+from admino import sessions as sessions_mod
 from admino.auth import LOGIN_FAILED_MESSAGE, LoginFailedError, login, logout
 from admino.sessions import hash_session_token
+from tests.db_fakes import NowPlus, insert_values
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -234,8 +244,9 @@ class _VerifySpy:
         monkeypatch.setattr(passwords, "verify_password", spy)
 
 
-async def _login(pool: _FakePool, **overrides: Any) -> str:
-    """Call login with the default credentials, IP and user agent."""
+async def _login(pool: _FakePool, **overrides: Any) -> Any:
+    """Call login with the default credentials, IP and user agent; return its result
+    (a LoginResult since GH-152)."""
     kwargs: dict[str, Any] = {
         "email": _EMAIL,
         "password": _PASSWORD,
@@ -353,7 +364,7 @@ class TestLoginSuccess:
 
     async def test_auth_login_returns_a_session_token(self, current_hash: str) -> None:
         """The raw token (token_urlsafe(32)) is returned for the cookie."""
-        token = await _login(_FakePool(_member(current_hash)))
+        token = (await _login(_FakePool(_member(current_hash)))).token
 
         assert _TOKEN_RE.fullmatch(token) is not None
 
@@ -362,7 +373,7 @@ class TestLoginSuccess:
         and the user's id."""
         pool = _FakePool(_member(current_hash))
 
-        token = await _login(pool)
+        token = (await _login(pool)).token
 
         inserts = pool.matching(r"insert into sessions")
         assert len(inserts) == 1
@@ -402,7 +413,7 @@ class TestLoginSuccess:
         """A Super Admin logs in (no org needed): actor super_admin, org_id NULL."""
         pool = _FakePool(_super_admin(current_hash))
 
-        token = await _login(pool)
+        token = (await _login(pool)).token
 
         assert _TOKEN_RE.fullmatch(token) is not None
         row = pool.audit_rows()[0]
@@ -428,7 +439,7 @@ class TestLoginSuccess:
         """The lookup is case-insensitive, so the login succeeds with another casing."""
         pool = _FakePool(_member(current_hash))
 
-        token = await _login(pool, email=_EMAIL.upper())
+        token = (await _login(pool, email=_EMAIL.upper())).token
 
         assert _TOKEN_RE.fullmatch(token) is not None
 
@@ -443,6 +454,169 @@ class TestLoginSuccess:
         args = pool.matching(r"insert into sessions")[0][2]
         assert any(str(arg) == _IP for arg in args)
         assert _USER_AGENT in args
+
+
+# ---------------------------------------------------------------------------
+# 3b. The LoginResult and the session policy (GH-152)
+# ---------------------------------------------------------------------------
+
+
+def _session_insert(pool: _FakePool) -> dict[str, Any]:
+    """The one INSERT INTO sessions, column → bound value (NowPlus for now() + $n)."""
+    inserts = pool.matching(r"insert into sessions")
+    assert len(inserts) == 1, pool.calls
+    _, sql, args = inserts[0]
+    return insert_values(sql, args)
+
+
+def _policy(idle: int, lifetime: int) -> Any:
+    return sessions_mod.SessionPolicy(idle_timeout_minutes=idle, max_lifetime_hours=lifetime)
+
+
+class TestLoginResult:
+    """login returns a frozen LoginResult: the token and the cookie's Max-Age."""
+
+    async def test_auth_login_returns_a_login_result(self, current_hash: str) -> None:
+        """An auth.LoginResult with the raw token and max_age_seconds (an int)."""
+        result = await _login(_FakePool(_member(current_hash)))
+
+        assert type(result) is auth_mod.LoginResult
+        assert _TOKEN_RE.fullmatch(result.token) is not None
+        assert result.max_age_seconds == 43200
+        assert type(result.max_age_seconds) is int
+
+    async def test_auth_login_result_repr_hides_the_token(self, current_hash: str) -> None:
+        """repr() and str() never show the token (it may end up in a log or traceback)."""
+        result = await _login(_FakePool(_member(current_hash)))
+
+        assert result.token not in repr(result)
+        assert result.token not in str(result)
+
+    async def test_auth_login_result_is_frozen(self, current_hash: str) -> None:
+        """The result can't be changed after login built it."""
+        result = await _login(_FakePool(_member(current_hash)))
+
+        assert type(result) is auth_mod.LoginResult
+        with pytest.raises((AttributeError, TypeError, ValueError)):
+            result.max_age_seconds = 1
+        assert result.max_age_seconds == 43200
+
+    def test_auth_login_is_annotated_to_return_a_login_result(self) -> None:
+        """login's return annotation names LoginResult (no longer str)."""
+        annotation = inspect.signature(login).return_annotation
+
+        assert "LoginResult" in str(annotation)
+
+
+class TestLoginSessionPolicy:
+    """The session's idle timeout and lifetime come from sessions.session_policy_for."""
+
+    async def test_auth_login_member_session_uses_the_org_default(self, current_hash: str) -> None:
+        """A member: idle 60 minutes, expires_at = now() + 12 hours, Max-Age 43200."""
+        pool = _FakePool(_member(current_hash))
+
+        result = await _login(pool)
+
+        row = _session_insert(pool)
+        assert row["idle_timeout_minutes"] == 60
+        assert row["expires_at"] == NowPlus(timedelta(hours=12))
+        assert result.max_age_seconds == 43200
+
+    async def test_auth_login_super_admin_session_uses_the_platform_default(
+        self, current_hash: str
+    ) -> None:
+        """A Super Admin: the platform default (also 60 minutes / 12 hours)."""
+        pool = _FakePool(_super_admin(current_hash))
+
+        result = await _login(pool)
+
+        row = _session_insert(pool)
+        assert row["idle_timeout_minutes"] == 60
+        assert row["expires_at"] == NowPlus(timedelta(hours=12))
+        assert result.max_age_seconds == 43200
+
+    async def test_auth_login_platform_policy_applies_to_super_admins_only(
+        self, current_hash: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a 30-minute / 8-hour platform policy the Super Admin's row stores 30 and
+        now() + 8 h and Max-Age is 28800; a member in the same test keeps 60 / 12 h /
+        43200."""
+        monkeypatch.setattr(sessions_mod, "PLATFORM_SESSION_POLICY", _policy(30, 8))
+        admin_pool = _FakePool(_super_admin(current_hash))
+        member_pool = _FakePool(_member(current_hash))
+
+        admin = await _login(admin_pool)
+        member = await _login(member_pool)
+
+        admin_row = _session_insert(admin_pool)
+        assert (admin_row["idle_timeout_minutes"], admin_row["expires_at"]) == (
+            30,
+            NowPlus(timedelta(hours=8)),
+        )
+        assert admin.max_age_seconds == 28800
+        member_row = _session_insert(member_pool)
+        assert (member_row["idle_timeout_minutes"], member_row["expires_at"]) == (
+            60,
+            NowPlus(timedelta(hours=12)),
+        )
+        assert member.max_age_seconds == 43200
+
+    async def test_auth_login_org_policy_applies_to_members_only(
+        self, current_hash: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a 20-minute / 2-hour org policy the member's row stores 20 and now() + 2 h
+        and Max-Age is 7200; a Super Admin keeps 60 / 12 h / 43200."""
+        monkeypatch.setattr(sessions_mod, "DEFAULT_ORG_SESSION_POLICY", _policy(20, 2))
+        member_pool = _FakePool(_member(current_hash))
+        admin_pool = _FakePool(_super_admin(current_hash))
+
+        member = await _login(member_pool)
+        admin = await _login(admin_pool)
+
+        member_row = _session_insert(member_pool)
+        assert (member_row["idle_timeout_minutes"], member_row["expires_at"]) == (
+            20,
+            NowPlus(timedelta(hours=2)),
+        )
+        assert member.max_age_seconds == 7200
+        admin_row = _session_insert(admin_pool)
+        assert (admin_row["idle_timeout_minutes"], admin_row["expires_at"]) == (
+            60,
+            NowPlus(timedelta(hours=12)),
+        )
+        assert admin.max_age_seconds == 43200
+
+    async def test_auth_login_asks_session_policy_for_the_accounts_kind(
+        self, current_hash: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The policy comes from sessions.session_policy_for(account kind)."""
+        real = sessions_mod.session_policy_for
+        kinds: list[str] = []
+
+        def spy(kind: str) -> Any:
+            kinds.append(kind)
+            return real(kind)
+
+        monkeypatch.setattr(sessions_mod, "session_policy_for", spy)
+
+        await _login(_FakePool(_member(current_hash)))
+        await _login(_FakePool(_super_admin(current_hash)))
+
+        assert kinds == ["member", "super_admin"]
+
+    @pytest.mark.parametrize("cause", ["wrong-password", "deactivated", "unknown-email"])
+    async def test_auth_login_failure_asks_for_no_policy(
+        self, cause: str, current_hash: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed login opens no session, so it needs no policy."""
+        calls: list[Any] = []
+        monkeypatch.setattr(sessions_mod, "session_policy_for", lambda kind: calls.append(kind))
+        account, password = _failure_case(cause, current_hash)
+
+        with pytest.raises(LoginFailedError):
+            await _login(_FakePool(account), password=password)
+
+        assert calls == []
 
 
 class TestLoginRehash:
@@ -704,7 +878,7 @@ class TestLoginNoContent:
         token = ""
 
         with pytest.raises(LoginFailedError) if cause != "success" else contextlib.nullcontext():
-            token = await _login(_FakePool(account), password=password)
+            token = (await _login(_FakePool(account), password=password)).token
 
         text = caplog.text.casefold()
         assert _EMAIL.casefold() not in text
@@ -720,18 +894,21 @@ class TestLoginNoContent:
 
 
 class TestLogout:
-    """logout revokes the session behind the token."""
+    """logout deletes the session row behind the token (GH-152)."""
 
-    async def test_auth_logout_revokes_the_session(self) -> None:
-        """One UPDATE sessions SET revoked_at, bound to the token's hash."""
+    async def test_auth_logout_deletes_the_session_row(self) -> None:
+        """One DELETE FROM sessions WHERE token_hash = $1, bound to the token's hash; no
+        UPDATE (the revoked_at column is gone)."""
         token = "L" * 43
         pool = _FakePool(None)
 
         await logout(pool, token)
 
-        updates = pool.matching(r"update sessions set revoked_at")
-        assert len(updates) == 1
-        assert updates[0][2] == (hash_session_token(token),)
+        deletes = pool.matching(r"^delete from sessions where (?:\w+\.)?token_hash = \$1$")
+        assert len(deletes) == 1
+        assert deletes[0][2] == (hash_session_token(token),)
+        assert pool.matching(r"^update sessions\b") == []
+        assert all("revoked_at" not in _norm(sql) for _, sql, _ in pool.calls)
 
     async def test_auth_logout_malformed_token_issues_no_query(self) -> None:
         """A token that can't exist touches nothing."""

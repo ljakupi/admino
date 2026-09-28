@@ -1,4 +1,5 @@
-"""HTTP-layer spec for email/password login, sessions, CSRF and per-caller rate limits (GH-149).
+"""HTTP-layer spec for email/password login, sessions, CSRF and per-caller rate limits
+(GH-149, GH-152).
 
 The FastAPI app from ``create_app()`` runs against a fake database (the pool
 ``admino.database.get_pool`` returns is an in-memory stand-in for the users,
@@ -10,12 +11,13 @@ What these tests pin down:
   SameSite=Strict, Path=/, Max-Age=43200, Secure iff ``server.cookie_secure``);
   every failure → 401 with one identical body and no cookie; 422 on a bad body;
   nothing the caller sent is echoed back.
-- ``POST /api/auth/logout`` revokes the session and clears the cookie;
-  ``GET /api/auth/me`` returns the resolved principal and languages.
+- ``POST /api/auth/logout`` deletes the session row (GH-152) and clears the
+  cookie; ``GET /api/auth/me`` returns the resolved principal and languages.
 - Every route except ``/health``, the login, the password reset endpoints
   (GH-151) and the OAuth callback requires a valid session (a route-enumeration
   test walks ``app.routes``), and the session is re-checked on every request: a
-  deactivated user or org is refused at once.
+  deactivated user or org, a deleted (revoked) session, an expired one and one
+  idle past its timeout (GH-152) are refused at once.
 - The chat routes need ``chat.send``: 403 for a Super Admin and a Viewer.
 - CSRF: state-changing requests pass only when ``Sec-Fetch-Site`` is
   ``same-origin``/``none`` or, without it, when ``Origin`` matches ``Host``;
@@ -50,6 +52,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 from fastapi import HTTPException
@@ -62,6 +65,7 @@ from admino import models, server
 from admino.access import Principal
 from admino.models import AgentResult, LLMMessage, PendingConfirmation, ToolCall
 from admino.server import create_app
+from tests.db_fakes import NowPlus, insert_values
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -100,7 +104,7 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
     }
 )
 
-# Routes that exist today (or are added by #149) and must require a session.
+# Routes that exist today (or are added by #149 and #152) and must require a session.
 _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/api/message"),
@@ -121,11 +125,20 @@ _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("DELETE", "/api/oauth/microsoft"),
         ("POST", "/api/auth/logout"),
         ("GET", "/api/auth/me"),
+        ("GET", "/api/me/sessions"),
+        ("DELETE", "/api/me/sessions/{session_id}"),
+        ("POST", "/api/org/users/{user_id}/logout"),
     }
 )
 
 # Valid dummy values for path parameters.
-_PATH_VALUES: dict[str, str] = {"tool": "gmail", "action": "send", "confirmation_id": "c1"}
+_PATH_VALUES: dict[str, str] = {
+    "tool": "gmail",
+    "action": "send",
+    "confirmation_id": "c1",
+    "session_id": "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
+    "user_id": "1c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e",
+}
 
 
 def _norm(sql: str) -> str:
@@ -161,8 +174,13 @@ class _FakeDb:
     - The session lookup (any query naming sessions) returns the joined session
       row for the bytes bind parameter (the token hash), re-reading the account
       each time, so flipping an account's status takes effect on the next call.
-    - INSERT INTO sessions stores a session; UPDATE sessions ... revoked_at
-      revokes one. Every call is recorded.
+    - The sessions table is the schema after migration 0009 (GH-152): each row
+      has its own idle timeout and last_seen_at, and there is no revoked_at
+      column (a statement naming it fails like PostgreSQL's
+      UndefinedColumnError). INSERT INTO sessions stores a session (without
+      idle_timeout_minutes it fails like a NOT NULL violation), DELETE FROM
+      sessions ... token_hash deletes one (logout), and UPDATE sessions SET
+      last_seen_at touches one by id. Every call is recorded.
     """
 
     def __init__(self) -> None:
@@ -211,17 +229,19 @@ class _FakeDb:
         self,
         account: dict[str, Any],
         *,
-        revoked: bool = False,
         expired: bool = False,
+        idle: bool = False,
     ) -> str:
-        """Store a session for the account and return its raw token."""
+        """Store a session for the account (60-minute idle timeout) and return its raw
+        token. ``idle``: last seen 61 minutes ago."""
         token = secrets.token_urlsafe(32)
         now = datetime.now(UTC)
         self.sessions[_sha256(token)] = {
             "session_id": PgUUID(str(uuid.uuid4())),
             "user_id": _plain(account["id"]),
             "expires_at": now - timedelta(seconds=1) if expired else now + timedelta(hours=12),
-            "revoked_at": now if revoked else None,
+            "last_seen_at": now - timedelta(minutes=61) if idle else now,
+            "idle_timeout_minutes": 60,
         }
         return token
 
@@ -230,12 +250,16 @@ class _FakeDb:
     def handle(self, method: str, sql: str, args: tuple[Any, ...]) -> Any:
         self.calls.append((method, sql, args))
         normalized = _norm(sql)
+        if re.search(r"\brevoked_at\b", normalized):
+            # Migration 0009 dropped the column: revoking deletes the row.
+            raise asyncpg.exceptions.UndefinedColumnError('column "revoked_at" does not exist')
         if "insert into sessions" in normalized:
             self._insert_session(sql, args)
             return uuid.uuid4() if method != "execute" else "INSERT 0 1"
-        if normalized.startswith("update sessions") and "revoked_at" in normalized:
-            self._revoke(args)
-            return "UPDATE 1"
+        if normalized.startswith("delete from sessions"):
+            return self._delete(normalized, args)
+        if normalized.startswith("update sessions"):
+            return self._touch(normalized, args)
         if method == "fetchrow" and "sessions" in normalized:
             return self._session_row(args)
         if method == "fetchrow" and "users" in normalized and "insert" not in normalized:
@@ -248,24 +272,39 @@ class _FakeDb:
 
     def _insert_session(self, sql: str, args: tuple[Any, ...]) -> None:
         self.session_inserts.append((sql, args))
-        token_hash = next(arg for arg in args if isinstance(arg, bytes))
-        user_id = next(arg for arg in args if isinstance(arg, uuid.UUID))
-        expires_at = next(
-            (arg for arg in args if isinstance(arg, datetime)),
-            datetime.now(UTC) + timedelta(hours=12),
-        )
-        self.sessions[token_hash] = {
+        values = insert_values(sql, args)
+        if values.get("idle_timeout_minutes") is None:
+            msg = 'null value in column "idle_timeout_minutes" of relation "sessions"'
+            raise asyncpg.exceptions.NotNullViolationError(msg)
+        now = datetime.now(UTC)
+        expires_at = values["expires_at"]
+        if isinstance(expires_at, NowPlus):
+            expires_at = now + expires_at.interval
+        self.sessions[values["token_hash"]] = {
             "session_id": PgUUID(str(uuid.uuid4())),
-            "user_id": _plain(user_id),
+            "user_id": _plain(values["user_id"]),
             "expires_at": expires_at,
-            "revoked_at": None,
+            "last_seen_at": now,
+            "idle_timeout_minutes": values["idle_timeout_minutes"],
         }
 
-    def _revoke(self, args: tuple[Any, ...]) -> None:
+    def _delete(self, normalized: str, args: tuple[Any, ...]) -> str:
+        """Logout: DELETE FROM sessions WHERE token_hash = $1."""
+        assert "token_hash" in normalized, normalized
         token_hash = next(arg for arg in args if isinstance(arg, bytes))
-        session = self.sessions.get(token_hash)
-        if session is not None and session["revoked_at"] is None:
-            session["revoked_at"] = datetime.now(UTC)
+        return "DELETE 1" if self.sessions.pop(token_hash, None) is not None else "DELETE 0"
+
+    def _touch(self, normalized: str, args: tuple[Any, ...]) -> str:
+        """The throttled UPDATE sessions SET last_seen_at = now() WHERE id = $n."""
+        match = re.search(r"(?<![\w.])(?:\w+\.)?id = \$(\d+)", normalized)
+        assert match is not None, normalized
+        session_id = str(args[int(match.group(1)) - 1])
+        count = 0
+        for session in self.sessions.values():
+            if str(session["session_id"]) == session_id:
+                session["last_seen_at"] = datetime.now(UTC)
+                count += 1
+        return f"UPDATE {count}"
 
     def _session_row(self, args: tuple[Any, ...]) -> dict[str, Any] | None:
         token_hash = next((arg for arg in args if isinstance(arg, bytes)), None)
@@ -275,8 +314,9 @@ class _FakeDb:
         account = self.accounts[session["user_id"]]
         return {
             "session_id": session["session_id"],
-            "revoked_at": session["revoked_at"],
             "expires_at": session["expires_at"],
+            "last_seen_at": session["last_seen_at"],
+            "idle_timeout_minutes": session["idle_timeout_minutes"],
             "user_id": account["id"],
             "kind": account["kind"],
             "org_id": account["org_id"],
@@ -694,7 +734,7 @@ class TestLoginValidation:
 
 
 class TestLogout:
-    """Logout revokes the current session and clears the cookie."""
+    """Logout deletes the current session's row and clears the cookie."""
 
     def test_auth_api_logout_returns_204(self, db: _FakeDb) -> None:
         """204, empty body."""
@@ -705,13 +745,14 @@ class TestLogout:
         assert response.status_code == 204
         assert response.content == b""
 
-    def test_auth_api_logout_revokes_the_session(self, db: _FakeDb) -> None:
-        """The stored session gets revoked_at through UPDATE sessions ... token hash."""
+    def test_auth_api_logout_deletes_the_session_row(self, db: _FakeDb) -> None:
+        """The stored session is deleted through DELETE FROM sessions ... token hash (GH-152:
+        rows don't outlive their session)."""
         token = db.open_session(db.add_account())
 
         _client(_app()).post("/api/auth/logout", headers=_cookie(token))
 
-        assert db.sessions[_sha256(token)]["revoked_at"] is not None
+        assert _sha256(token) not in db.sessions
 
     def test_auth_api_logout_session_no_longer_works(self, db: _FakeDb) -> None:
         """The same cookie is refused afterwards."""
@@ -735,7 +776,7 @@ class TestLogout:
         assert attributes.get("path") == "/"
 
     def test_auth_api_logout_leaves_other_sessions_alone(self, db: _FakeDb) -> None:
-        """Only the current session is revoked, not the user's other devices."""
+        """Only the current session is deleted, not the user's other devices."""
         account = db.add_account()
         current = db.open_session(account)
         other = db.open_session(account)
@@ -743,7 +784,7 @@ class TestLogout:
 
         client.post("/api/auth/logout", headers=_cookie(current))
 
-        assert db.sessions[_sha256(other)]["revoked_at"] is None
+        assert _sha256(other) in db.sessions
         assert client.get("/api/auth/me", headers=_cookie(other)).status_code == 200
 
     def test_auth_api_logout_requires_a_session(self, db: _FakeDb) -> None:
@@ -868,9 +909,14 @@ def _credentials(db: _FakeDb, variant: str) -> dict[str, str]:
     if variant == "wrong-cookie-name":
         return {"Cookie": f"session={db.open_session(db.add_account())}"}
     if variant == "revoked":
-        return _cookie(db.open_session(db.add_account(), revoked=True))
+        # Revoking deletes the row (GH-152): the cookie names a session that is gone.
+        token = db.open_session(db.add_account())
+        del db.sessions[_sha256(token)]
+        return _cookie(token)
     if variant == "expired":
         return _cookie(db.open_session(db.add_account(), expired=True))
+    if variant == "idle":
+        return _cookie(db.open_session(db.add_account(), idle=True))
     if variant == "user-deactivated":
         return _cookie(db.open_session(db.add_account(status="deactivated")))
     if variant == "org-deactivated":
@@ -886,6 +932,7 @@ _UNUSABLE_SESSIONS = [
     "wrong-cookie-name",
     "revoked",
     "expired",
+    "idle",
     "user-deactivated",
     "org-deactivated",
 ]
@@ -942,6 +989,10 @@ class TestRouteEnumeration:
             if (method, path) in _PUBLIC_ROUTES:
                 continue
             checked += 1
+            # Each route starts from a fresh per-IP budget: this test checks the 401, not
+            # the unresolved-cookie throttle (pinned by TestUnresolvedSessionThrottle), which
+            # would otherwise answer 429 once the routes outnumber its burst.
+            server._rate_buckets.clear()
             response = _request_route(client, method, route, _credentials(db, variant))
             if response.status_code != 401 or response.json() != _UNAUTHORIZED:
                 offenders.append(f"{method} {path}: {response.status_code} {response.text[:80]}")
@@ -1239,14 +1290,14 @@ class TestCsrf:
         assert response.json() == _CSRF_REFUSED
 
     def test_auth_api_csrf_logout_refused_keeps_the_session(self, db: _FakeDb) -> None:
-        """A cross-site logout is refused and revokes nothing."""
+        """A cross-site logout is refused and deletes nothing."""
         token = db.open_session(db.add_account())
 
         _client(_app()).post(
             "/api/auth/logout", headers={**_cookie(token), "Sec-Fetch-Site": "cross-site"}
         )
 
-        assert db.sessions[_sha256(token)]["revoked_at"] is None
+        assert _sha256(token) in db.sessions
 
     def test_auth_api_csrf_runs_before_authentication(self, db: _FakeDb) -> None:
         """A cross-site POST without a cookie is a 403 (CSRF), not a 401."""
@@ -1332,7 +1383,8 @@ class _Clock:
         self.now += seconds
 
 
-# Existing per-route rates stay; #149 adds the three auth routes.
+# Existing per-route rates stay; #149 adds the three auth routes, #152 the three session
+# management routes.
 _EXPECTED_RATES: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
@@ -1356,6 +1408,10 @@ _EXPECTED_RATES: dict[str, tuple[float, int]] = {
     "/api/auth/me": (1.0, 10),
     # Failed session resolutions (a cookie that resolves to no session), per client IP.
     "/api/auth/session": (1.0, 20),
+    # GH-152: the session management routes, per user.
+    "/api/me/sessions/get": (1.0, 10),
+    "/api/me/sessions/delete": (0.5, 5),
+    "/api/org/users/logout": (0.5, 5),
 }
 
 

@@ -156,9 +156,24 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   these settings change, your hash is upgraded at your next login. A password has 12 to 128
   characters, isn't your email address, and isn't one of the 100,000 most common passwords.
   That list is bundled with admino, so nothing is sent anywhere to check a password.
-- **Sessions** last 12 hours. Your browser only holds a random token in the
-  `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database only
-  stores its SHA-256 hash. Logging out ends the session at once.
+- **Sessions** end after 60 minutes without activity, and after 12 hours at most, even
+  when you stay active. That's your organization's session policy; a later release lets
+  Org Admins change it (15 to 480 minutes idle, 1 to 72 hours at most). Super Admins get
+  the platform's policy, with the same defaults. Your browser only holds a random token in
+  the `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database
+  only stores its SHA-256 hash.
+- **Ending a session** deletes it at once, and its cookie stops working on the next
+  request: logging out, ending one of your sessions, an Org Admin's forced logout, and a
+  password reset (which ends all of them). Sessions that expired or went idle are deleted
+  every hour.
+- **Your sessions**: `GET /api/me/sessions` lists the sessions you're logged in with (when
+  each started and was last used, until when it can last, its IP address and browser, and
+  which one is the current one). `DELETE /api/me/sessions/{id}` ends one of them, for
+  example a browser you forgot to log out of. Ending a session is recorded in the audit
+  log.
+- **Forced logout**: an Org Admin can log a user of their organization out of every device
+  with `POST /api/org/users/{id}/logout`. It's recorded in the audit log, with the number
+  of sessions that ended.
 - **Every API route needs a session**, except `/health`, the login endpoint, the two
   password reset endpoints (`POST /api/auth/password-reset` and
   `POST /api/auth/password-reset/confirm`) and the OAuth callback. A deactivated account, or
