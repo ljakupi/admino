@@ -662,3 +662,86 @@ class TestRevokeSession:
         await revoke_session(executor, token)
 
         assert executor.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 7. revoke_user_sessions (GH-151): every live session of one user
+# ---------------------------------------------------------------------------
+
+
+class _StatusExecutor(_Executor):
+    """An executor whose execute() answers a fixed asyncpg status string."""
+
+    def __init__(self, status: str) -> None:
+        super().__init__()
+        self._status = status
+
+    async def execute(self, sql: str, *args: Any) -> str:
+        self.calls.append(("execute", sql, args))
+        return self._status
+
+
+async def _revoke_user(executor: _Executor, user_id: Any = _USER_ID) -> Any:
+    """Call admino.sessions.revoke_user_sessions, looked up at call time (GH-151)."""
+    import admino.sessions as sessions_mod
+
+    return await sessions_mod.revoke_user_sessions(executor, user_id)
+
+
+class TestRevokeUserSessions:
+    """revoke_user_sessions revokes every live session of a user with one UPDATE
+    (a password reset, and later the account-page password change of #166)."""
+
+    async def test_sessions_revoke_user_issues_one_update(self) -> None:
+        """UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL."""
+        executor = _StatusExecutor("UPDATE 2")
+
+        await _revoke_user(executor)
+
+        assert len(executor.calls) == 1
+        method, sql, _ = executor.calls[0]
+        assert method == "execute"
+        normalized = _norm(sql)
+        assert normalized.startswith("update sessions set revoked_at = now() where ")
+        where = normalized.split(" where ", 1)[1]
+        assert re.fullmatch(
+            r"(?:(?:\w+\.)?user_id = \$1 and (?:\w+\.)?revoked_at is null"
+            r"|(?:\w+\.)?revoked_at is null and (?:\w+\.)?user_id = \$1)",
+            where,
+        ), where
+
+    async def test_sessions_revoke_user_binds_only_the_user_id(self) -> None:
+        """The user id is the one bind parameter and never part of the SQL text."""
+        executor = _StatusExecutor("UPDATE 1")
+
+        await _revoke_user(executor)
+
+        _, sql, args = executor.calls[0]
+        assert args == (_USER_ID,)
+        assert str(_USER_ID) not in sql
+
+    @pytest.mark.parametrize("count", [0, 1, 3, 250])
+    async def test_sessions_revoke_user_returns_the_revoked_count(self, count: int) -> None:
+        """The count comes from asyncpg's status string ("UPDATE <n>") as an int."""
+        result = await _revoke_user(_StatusExecutor(f"UPDATE {count}"))
+
+        assert result == count
+        assert type(result) is int
+
+    async def test_sessions_revoke_user_accepts_an_asyncpg_uuid(self) -> None:
+        """The users row's asyncpg UUID can be passed straight through."""
+        executor = _StatusExecutor("UPDATE 1")
+
+        await _revoke_user(executor, PgUUID(str(_USER_ID)))
+
+        assert executor.calls[0][2] == (_USER_ID,)
+
+    async def test_sessions_revoke_user_is_scoped_to_the_user_only(self) -> None:
+        """No token hash or session id narrows or widens it: the user id is the scope."""
+        executor = _StatusExecutor("UPDATE 0")
+
+        await _revoke_user(executor)
+
+        sql = _norm(executor.calls[0][1])
+        assert "token_hash" not in sql
+        assert re.search(r"\bwhere\b.*\b(?:\w+\.)?id = ", sql.replace("user_id", "")) is None

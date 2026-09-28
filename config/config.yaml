@@ -16,6 +16,10 @@ server:
   # Secure cookies on http://localhost too. Only plain-HTTP access from another
   # address (e.g. a phone on the LAN) needs COOKIE_SECURE=false (see .env.example).
   cookie_secure: true
+  # The address users open admino at; password reset links are built from it.
+  # https only (plain http for localhost). Deployments set ADMINO_PUBLIC_URL,
+  # which overrides this value (see .env.example).
+  public_url: "http://localhost:8000"
 
 database:
   min_pool_size: 2

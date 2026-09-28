@@ -6,10 +6,12 @@ cookie. Every request resolves the cookie back to its session, re-reading the
 user's row, and builds the ``Principal`` from that row.
 
 Inputs: a database executor (the pool or a connection) plus a raw session
-token, or the user id, client IP and user agent of a new session.
+token, the user id, client IP and user agent of a new session, or the user
+id whose sessions all end.
 Outputs: the raw token of a new session (``create_session``), the
 ``AuthenticatedSession`` of a usable session or None (``resolve_session``),
-nothing (``revoke_session``).
+nothing (``revoke_session``), the number of sessions revoked
+(``revoke_user_sessions``).
 
 Security notes:
 - The one Principal builder: this is the only module that builds an
@@ -83,6 +85,12 @@ _RESOLVE_SQL: Final = """
 _REVOKE_SQL: Final = """
     UPDATE sessions SET revoked_at = now()
     WHERE token_hash = $1 AND revoked_at IS NULL
+"""
+
+# Every live session of one user (a password reset logs out every device).
+_REVOKE_USER_SQL: Final = """
+    UPDATE sessions SET revoked_at = now()
+    WHERE user_id = $1 AND revoked_at IS NULL
 """
 
 
@@ -220,3 +228,21 @@ async def revoke_session(executor: Executor, token: str) -> None:
     if not _is_plausible_token(token):
         return
     await executor.execute(_REVOKE_SQL, hash_session_token(token))
+
+
+async def revoke_user_sessions(executor: Executor, user_id: UUID) -> int:
+    """Revoke every live session of a user with one UPDATE.
+
+    Used when a password changes (a reset, and the account-page change of
+    #166): every device is logged out, the caller's own included.
+
+    Args:
+        executor: The pool or a connection (inside the caller's transaction).
+        user_id: The account whose sessions end.
+
+    Returns:
+        The number of sessions revoked (already revoked ones aren't counted).
+    """
+    status = await executor.execute(_REVOKE_USER_SQL, user_id)
+    # asyncpg's status string: "UPDATE <count>".
+    return int(status.rpartition(" ")[2])

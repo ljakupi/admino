@@ -6,6 +6,9 @@ The server is a thin HTTP layer that delegates business logic to the agent.
 
 Routes:
 - POST /api/auth/login    — Email/password login; sets the session cookie (public).
+- POST /api/auth/password-reset — Emails a password reset link; always 202 (public).
+- POST /api/auth/password-reset/confirm — Sets a new password with a reset link's
+  token, ends every session of the account, clears the cookie (public).
 - POST /api/auth/logout   — Revokes the current session and clears the cookie.
 - GET  /api/auth/me       — The logged-in account (from the resolved session).
 - POST /api/message       — Send a user message; returns ChatResponse.
@@ -36,6 +39,13 @@ Security notes:
   Refusals are 403 ``{"detail": "Cross-origin request refused"}``.
 - Login failures are one generic 401 for every cause (no user enumeration);
   the email, password and session token are never logged or echoed.
+- A password reset request answers the same empty 202 for every email, before
+  any account work: the service runs as a background task after the response,
+  so neither the body nor the timing tells whether the account exists. Reset
+  links are built from ``server.public_url`` only, never from the request's
+  Host or X-Forwarded-* headers. A failed confirm is one generic 400 for every
+  link that can't be used; the email, token, link and password are never
+  logged or echoed.
 - Rate limits are per caller: one token bucket per (route, ``user:<id>``) on
   session routes and per (route, ``ip:<host>``) on public routes, so one caller
   can't throttle another. Idle buckets are evicted and the map is capped (LRU).
@@ -86,10 +96,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import ValidationError
+from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from admino import auth, sessions
+from admino import auth, password_reset, passwords, sessions
 from admino.access import Capability, Principal, can
 from admino.models import (
     AgentResult,
@@ -104,6 +115,8 @@ from admino.models import (
     MeResponse,
     OAuthAuthorizeResponse,
     OAuthConnectionStatus,
+    PasswordResetConfirmRequest,
+    PasswordResetRequest,
     PendingConfirmation,
     PendingConfirmationSummary,
     PermissionEntry,
@@ -331,6 +344,9 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/critical-permissions/promote": (5 / 60, 5),
     "/api/critical-permissions/cancel": (0.5, 5),
     "/api/auth/login": (0.2, 5),
+    # One reset email per minute per IP after a burst of 3 (limits inbox flooding).
+    "/api/auth/password-reset": (1 / 60, 3),
+    "/api/auth/password-reset/confirm": (0.2, 5),
     "/api/auth/logout": (0.5, 5),
     "/api/auth/me": (1.0, 10),
     # Cookies that resolve to no session, per client IP (see require_session).
@@ -984,6 +1000,116 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
         key=sessions.SESSION_COOKIE_NAME,
         value=token,
         max_age=_session_max_age_s(),
+        path="/",
+        secure=_config.server.cookie_secure,
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+async def _request_reset_in_background(*, email: str, public_url: str, ip: str | None) -> None:
+    """Run ``password_reset.request_reset`` after the 202 has been sent.
+
+    A failure can't reach the caller any more (and must not: it would tell
+    whether the account exists), so it is logged by exception class name only:
+    no message text, no traceback, no email.
+    """
+    from admino.database import get_pool
+
+    try:
+        await password_reset.request_reset(get_pool(), email=email, public_url=public_url, ip=ip)
+    except Exception as exc:
+        logger.error("Password reset request failed (%s).", type(exc).__name__)
+
+
+async def post_password_reset(request: Request, body: PasswordResetRequest) -> Response:
+    """Handle POST /api/auth/password-reset — email a password reset link (public).
+
+    Rate-limited per client IP. Always answers an empty 202: the account
+    lookup, the token and the email happen in a background task after the
+    response, so the answer is the same, and as fast, for every email.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        body: Validated PasswordResetRequest.
+
+    Returns:
+        An empty 202 response carrying the background task.
+
+    Raises:
+        HTTPException: 429 when rate-limited.
+
+    Security notes:
+        The link base is ``server.public_url``, never a request header. The
+        email is never logged or echoed.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/auth/password-reset", f"ip:{_client_ip(request)}")
+
+    return Response(
+        status_code=202,
+        background=BackgroundTask(
+            _request_reset_in_background,
+            email=body.email,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+        ),
+    )
+
+
+async def post_password_reset_confirm(
+    request: Request, body: PasswordResetConfirmRequest
+) -> Response:
+    """Handle POST /api/auth/password-reset/confirm — set a new password (public).
+
+    Rate-limited per client IP. On success the password is changed and every
+    session of the account ends, this browser's included: answers 204 and
+    clears the session cookie.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        body: Validated PasswordResetConfirmRequest; token and password are SecretStr.
+
+    Returns:
+        An empty 204 response that clears the session cookie, or a 422
+        ``{"detail": <policy message>, "reason": <reason>}`` when the password
+        policy refuses the new password (the link stays usable).
+
+    Raises:
+        HTTPException: 400 for every link that can't be used (malformed,
+            unknown, expired, used or replaced token, or an account that may no
+            longer log in), 429 when rate-limited.
+
+    Security notes:
+        The token and password are never logged or echoed.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit("/api/auth/password-reset/confirm", f"ip:{_client_ip(request)}")
+
+    from admino.database import get_pool
+
+    try:
+        await password_reset.confirm_reset(
+            get_pool(),
+            token=body.token.get_secret_value(),
+            new_password=body.new_password.get_secret_value(),
+            ip=request.client.host if request.client is not None else None,
+        )
+    except password_reset.InvalidResetTokenError:
+        raise HTTPException(
+            status_code=400, detail=password_reset.INVALID_RESET_TOKEN_MESSAGE
+        ) from None
+    except passwords.PasswordPolicyError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc), "reason": exc.reason})
+
+    response = Response(status_code=204)
+    response.delete_cookie(
+        key=sessions.SESSION_COOKIE_NAME,
         path="/",
         secure=_config.server.cookie_secure,
         httponly=True,
@@ -2551,10 +2677,14 @@ def create_app(
     app.add_exception_handler(ValidationError, _validation_error_handler)  # type: ignore[arg-type]
 
     # --- Routes ---
-    # Public: health check, login and the OAuth callback (plus static files).
-    # Every other route depends on require_session.
+    # Public: health check, login, password reset and the OAuth callback (plus
+    # static files). Every other route depends on require_session.
     app.get("/health")(health_check)
     app.post("/api/auth/login", status_code=204, response_model=None)(post_login)
+    app.post("/api/auth/password-reset", status_code=202, response_model=None)(post_password_reset)
+    app.post("/api/auth/password-reset/confirm", status_code=204, response_model=None)(
+        post_password_reset_confirm
+    )
 
     # API routes — session required.
     app.post("/api/auth/logout", status_code=204, response_model=None)(post_logout)
