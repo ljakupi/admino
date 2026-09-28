@@ -1,12 +1,19 @@
-"""Account repository: organizations and users, including the last-admin guard (GH-145).
+"""Account repository: organizations, users, the last-admin guard and the Super Admin bootstrap.
 
 Organizations and users are account metadata, not org content, so the
 functions here take an explicit org_id instead of a TenantContext: the Super
 Admin platform routes (#167) use them as well as the org routes (#164).
 
-``ensure_not_last_active_admin`` is the single last-admin guard: an
+``ensure_not_last_active_admin`` is the single last-admin guard (GH-145): an
 organization always keeps at least one active Org Admin. #164 and #167 call it
 before demoting, deactivating or deleting a user.
+
+``email_exists`` and ``create_super_admin`` back the create-superadmin CLI (GH-150,
+``admino.admin_cli``). ``email_exists`` is a case-insensitive lookup, like the
+users_email_lower_key unique index. ``create_super_admin`` inserts an active
+Super Admin (no org, no role) and records its ``user.activate`` audit event
+(actor ``operator``, no org) on the same connection, inside the caller's
+transaction, so a failed audit write leaves no account behind.
 
 ``ensure_default_org`` and ``DEFAULT_ORG_ID`` are the retired single-tenant
 bridge (GH-147): tool.call audit events belonged to that fixed organization
@@ -16,23 +23,33 @@ calls ``ensure_default_org`` and nothing outside this module references
 the leftover default organization.
 
 Inputs: an asyncpg connection inside the caller's transaction, plus the org_id
-and user_id of the account being changed (the guard), or the pool (the default
-org). Output: None, LastAdminError, or UserNotInOrgError when the user isn't a
-member of that org.
+and user_id of the account being changed (the guard) or the new Super Admin's
+email, name and password hash; or the pool (the default org, the email
+lookup). Outputs: None, LastAdminError, or UserNotInOrgError when the user
+isn't a member of that org (the guard); whether the email is taken
+(``email_exists``); the new user's id, or DuplicateEmailError when the email
+is already taken (``create_super_admin``).
 
 Concurrency: the caller must hold a transaction. The guard locks the target's
 row and the org's active Org Admin rows with SELECT ... FOR UPDATE, in id order
 so concurrent guards can't deadlock. Concurrent demotions serialize: under READ
 COMMITTED the second transaction waits for the first, then re-checks the locked
-rows after it commits and sees the demoted admin gone, so both can't pass.
+rows after it commits and sees the demoted admin gone, so both can't pass. Two
+concurrent Super Admin creates with the same email collide on the unique
+index: the second gets DuplicateEmailError.
 
 Security notes:
 - Tenant isolation: the target must belong to org_id. A user of another org
   raises UserNotInOrgError (callers answer 404), so a mismatched
   (org_id, user_id) pair can't slip past the guard.
 - Parameterized SQL only: org_id and user_id travel as the $1 and $2 bind
-  parameters, and DEFAULT_ORG_ID as $1 of the default-org insert.
-- No content in errors: the guard's errors carry no IDs.
+  parameters, DEFAULT_ORG_ID as $1 of the default-org insert, and the email,
+  name and password hash as the $1, $2 and $3 bind parameters.
+- Content-free audit: the user.activate event names the new user's id only,
+  never the email, the name or the hash.
+- No content in errors: the guard's errors carry no IDs, and
+  DuplicateEmailError is raised ``from None`` with a fixed message, so the
+  driver's detail (which repeats the email) doesn't travel with it.
 """
 
 from __future__ import annotations
@@ -40,8 +57,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Final
 from uuid import UUID
 
+import asyncpg
+
+from admino import audit_events
+from admino.audit_events import AuditAction, TargetType
+
 if TYPE_CHECKING:
-    import asyncpg
+    from asyncpg.pool import PoolConnectionProxy
 
 # The retired single-tenant org (GH-147); unused since #149, removed by #154.
 DEFAULT_ORG_ID: Final[UUID] = UUID("00000000-0000-4000-8000-000000000001")
@@ -65,6 +87,16 @@ _TARGET_AND_ACTIVE_ADMINS_SQL: Final = """
       AND (id = $2 OR (role = 'org_admin' AND status = 'active' AND deleted_at IS NULL))
     ORDER BY id
     FOR UPDATE
+"""
+
+# Case-insensitive, like the users_email_lower_key unique index.
+_EMAIL_EXISTS_SQL: Final = "SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower($1))"
+
+# A Super Admin has no org and no role (org_id and role stay NULL).
+_CREATE_SUPER_ADMIN_SQL: Final = """
+    INSERT INTO users (email, name, password_hash, kind, status)
+    VALUES ($1, $2, $3, 'super_admin', 'active')
+    RETURNING id
 """
 
 
@@ -96,6 +128,73 @@ class UserNotInOrgError(Exception):
 
     def __init__(self) -> None:
         super().__init__("The user is not a member of this organization.")
+
+
+class DuplicateEmailError(Exception):
+    """Raised when a user with the email (in any capitalization) already exists."""
+
+    def __init__(self) -> None:
+        super().__init__("A user with this email already exists.")
+
+
+async def email_exists(executor: asyncpg.Pool | asyncpg.Connection, email: str) -> bool:
+    """Return whether a user with this email exists, ignoring capitalization.
+
+    Args:
+        executor: The pool or a connection to read through.
+        email: The email to look up (the single bind parameter).
+
+    Returns:
+        True if a user (of any org, or a Super Admin) has this email.
+    """
+    return bool(await executor.fetchval(_EMAIL_EXISTS_SQL, email))
+
+
+async def create_super_admin(
+    conn: asyncpg.Connection | PoolConnectionProxy,
+    *,
+    email: str,
+    name: str,
+    password_hash: str,
+) -> UUID:
+    """Insert an active Super Admin and record its user.activate audit event.
+
+    Must run inside the caller's transaction: the insert and the audit event
+    commit or roll back together.
+
+    Args:
+        conn: An asyncpg connection inside the caller's transaction.
+        email: The Super Admin's email address.
+        name: The display name.
+        password_hash: The Argon2id PHC string of the password.
+
+    Returns:
+        The new user's id.
+
+    Raises:
+        RuntimeError: If conn is not inside a transaction (no query is issued).
+        DuplicateEmailError: If a user with this email already exists (nothing
+            is audited).
+        AuditRecordError: If the audit event can't be recorded; the caller's
+            transaction must roll back.
+    """
+    if not conn.is_in_transaction():
+        msg = "A Super Admin must be created inside a transaction."
+        raise RuntimeError(msg)
+    try:
+        user_id: UUID = await conn.fetchval(_CREATE_SUPER_ADMIN_SQL, email, name, password_hash)
+    except asyncpg.UniqueViolationError:
+        raise DuplicateEmailError from None
+    await audit_events.record(
+        conn,
+        action=AuditAction.USER_ACTIVATE,
+        actor_kind="operator",
+        actor_user_id=None,
+        org_id=None,
+        target_type=TargetType.USER,
+        target_ids=[user_id],
+    )
+    return user_id
 
 
 async def ensure_not_last_active_admin(

@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local docker-up-local vllm-ensure vllm-pull vllm-up vllm-down
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local create-superadmin docker-up-local vllm-ensure vllm-pull vllm-up vllm-down
 
 # Source and package configuration
 SRC_DIR    := src
@@ -161,6 +161,20 @@ start: docker-up
 # (provisions the model on demand via vllm-ensure). Select the "vLLM" provider in
 # Settings → Agent (or set llm.provider: "vllm") to chat with it.
 start-local: docker-up-local
+
+# create-superadmin: create the first Super Admin in the running agent container.
+#   make create-superadmin EMAIL=you@example.ch NAME='Your Name'
+# The CLI prompts for the password on the terminal (docker compose exec allocates
+# a TTY), so the password never appears in argv or shell history. EMAIL and NAME
+# reach the fixed argv as quoted environment variables ("$$EMAIL"), never spliced
+# into the shell text. Runs as the unprivileged admino user, not root.
+create-superadmin:
+	@if [ -z "$$EMAIL" ] || [ -z "$$NAME" ]; then \
+		echo "Usage: make create-superadmin EMAIL=you@example.ch NAME='Your Name'" >&2; \
+		exit 2; \
+	fi
+	docker compose $(COMPOSE_FILES) exec -u admino agent \
+		python -m admino.admin_cli create-superadmin --email "$$EMAIL" --name "$$NAME"
 
 # vllm-up: bring up just the vllm service (useful to restart it independently).
 vllm-up:

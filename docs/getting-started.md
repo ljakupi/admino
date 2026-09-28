@@ -8,7 +8,8 @@ your Google/Microsoft accounts so admino can use its mail, calendar, and drive t
 - [2. Configure](#2-configure)
 - [3. Run locally (with uv)](#3-run-locally-with-uv)
 - [4. Run the whole backend in Docker](#4-run-the-whole-backend-in-docker)
-- [5. Your first chat](#5-your-first-chat)
+- [5. Create the first Super Admin](#5-create-the-first-super-admin)
+- [6. Your first chat](#6-your-first-chat)
 - [Connect your accounts](#connect-your-accounts)
 - [How environment loading differs (local vs Docker)](#how-environment-loading-differs-local-vs-docker)
 - [Upgrading from the single-tenant version](#upgrading-from-the-single-tenant-version)
@@ -113,7 +114,7 @@ make run
 ```
 
 The API comes up on **http://localhost:8000**. Continue to
-[Your first chat](#5-your-first-chat).
+[Create the first Super Admin](#5-create-the-first-super-admin).
 
 Stop the dev database when you're done with `make dev-db-down`.
 
@@ -144,7 +145,42 @@ directory is mounted into the container, so the agent can't reach files on your 
 > cache headroom. Allocate **~12–16 GB** in Docker Desktop → Settings → Resources →
 > Memory (the default 8 GB is not enough).
 
-## 5. Your first chat
+## 5. Create the first Super Admin
+
+admino has no public sign-up. The first account is a **Super Admin**, created from the
+command line. The Super Admin runs the platform and belongs to no organization.
+
+With the Docker stack running (`make start`):
+
+```bash
+make create-superadmin EMAIL=you@example.ch NAME='Your Name'
+```
+
+This runs `python -m admino.admin_cli create-superadmin --email … --name …` inside the
+agent container (`docker compose exec`, as the unprivileged `admino` user). For local dev
+(`make run`), run the same command from your shell with `.env` loaded:
+
+```bash
+python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your Name'
+```
+
+- The command asks for the password twice on the terminal. It never takes the password as
+  an argument, so it doesn't end up in your shell history or the process list. Without an
+  interactive terminal (e.g. `docker compose exec -T`, or input piped in) it refuses to run.
+- The password follows the [password policy](configuration.md#accounts-and-sessions): 12
+  to 128 characters, not your email address, and not one of the 100,000 most common
+  passwords. A weak password or a typo in the confirmation asks again, up to three times.
+- An email address that's already taken is refused, whatever its capitalization.
+- The command applies pending database migrations first, so it also works on a fresh
+  database before the agent's first start.
+- The new account is active right away, and the creation is recorded in the audit log
+  (`user.activate`, without the email or name). Neither the password nor the email is
+  logged.
+
+Then log in at **http://localhost:8000** with that email and password. The Super Admin
+sees the platform only and has no chat; chat needs a member account in an organization.
+
+## 6. Your first chat
 
 1. Open **http://localhost:8000**.
 2. Log in with your email address and password. See

@@ -264,29 +264,6 @@ def _build_system_prompt(
     return "\n".join(lines)
 
 
-def _build_database_url() -> str | None:
-    """Build a PostgreSQL DSN from individual env vars, URL-encoding the password.
-
-    Reads PG_HOST, PG_PORT, PG_USER, PG_DATABASE, and PG_PASSWORD from the
-    environment. Returns None if PG_PASSWORD is not set.
-
-    Returns:
-        A postgresql:// connection string, or None if required vars are missing.
-    """
-    from urllib.parse import quote_plus
-
-    password = os.environ.get("PG_PASSWORD")
-    if not password:
-        return None
-
-    host = os.environ.get("PG_HOST", "localhost")
-    port = os.environ.get("PG_PORT", "5432")
-    user = os.environ.get("PG_USER", "admino")
-    database = os.environ.get("PG_DATABASE", "admino")
-
-    return f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
-
-
 def _session_chat_id(session_id: str) -> uuid.UUID:
     """Return the chat id a session's ``tool.call`` audit events target.
 
@@ -375,6 +352,7 @@ async def _async_startup(
     from admino.database import (
         check_health,
         close_pool,
+        database_url_from_env,
         init_pool,
         load_settings_from_db,
         run_migrations,
@@ -383,7 +361,7 @@ async def _async_startup(
         update_setting,
     )
 
-    database_url = _build_database_url()
+    database_url = database_url_from_env()
     if not database_url:
         msg = "PG_PASSWORD environment variable is required but not set."
         raise ValueError(msg)
