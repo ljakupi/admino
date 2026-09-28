@@ -11,8 +11,9 @@ link ``{public_url}/reset-password#token=<token>`` and records
 without touching the database, looks the token up by its hash, refuses an
 unknown or expired token or an account that may no longer log in, applies the
 password policy, and then, in one transaction, consumes the token atomically,
-stores the new Argon2 hash, revokes every session of the user
-(``sessions.revoke_user_sessions``) and records ``password_reset.complete``.
+stores the new Argon2 hash, ends every session of the user by deleting its rows
+(``sessions.revoke_user_sessions``; GH-152 made revocation a DELETE) and records
+``password_reset.complete``.
 
 What these tests pin down:
 - Constants: a 30-minute lifetime; one generic ``InvalidResetTokenError``
@@ -35,13 +36,14 @@ What these tests pin down:
 - The policy runs after the token checks; a policy failure writes nothing and
   leaves the token usable.
 - Success: token consumed first, new hash (computed off the event loop's
-  thread) stored, all live sessions of the user revoked (others untouched),
-  audit with the revoked count; one committed transaction.
+  thread) stored, every session row of the user deleted (others untouched),
+  audit with the deleted count; one committed transaction.
 - Audit rows: exact actors, targets, IP and metadata; an audit failure
   propagates and rolls everything back (fail closed).
 - No email, token, password or link in any log line, audit row or error.
 
-All database calls go to the in-memory fake of tests/password_reset_fakes.py.
+All database calls go to the in-memory fake of tests/db_fakes.py (re-exported by
+tests/password_reset_fakes.py).
 Argon2 is replaced by a fast spy (the real hashing is covered by
 tests/test_passwords.py); the real policy, outbox, audit and session code runs.
 
@@ -1183,7 +1185,7 @@ class TestConfirmPolicy:
 
 
 class TestConfirmSuccess:
-    """Token consumed, new hash stored, every session revoked, audited: one transaction."""
+    """Token consumed, new hash stored, every session deleted, audited: one transaction."""
 
     async def test_password_reset_confirm_returns_none(self, pr: ModuleType, db: FakeDb) -> None:
         _add_active(db)
@@ -1238,10 +1240,10 @@ class TestConfirmSuccess:
         assert consume.args[:2] == (sha256(token), user_id)
         assert user_id not in db.tokens
 
-    async def test_password_reset_confirm_revokes_every_live_session_of_the_user(
+    async def test_password_reset_confirm_deletes_every_session_of_the_user(
         self, pr: ModuleType, db: FakeDb
     ) -> None:
-        """All the user's sessions are revoked; another user's sessions are untouched."""
+        """All the user's session rows are deleted; another user's sessions are untouched."""
         user_id = _add_active(db)
         other_id = db.add_account(email="bystander@example.test")
         mine = [db.open_session(user_id) for _ in range(3)]
@@ -1285,12 +1287,13 @@ class TestConfirmSuccess:
         self, pr: ModuleType, db: FakeDb, who: str
     ) -> None:
         """password_reset.complete: the account as actor, its org, target user [id], the IP,
-        metadata {"sessions_revoked": <live sessions revoked>}."""
+        metadata {"sessions_revoked": <session rows of the user deleted>}; another user's
+        session isn't counted."""
         user_id = _add_active(db, **_ELIGIBLE[who])
         account = db.users[user_id]
         db.open_session(user_id)
         db.open_session(user_id)
-        db.open_session(user_id, revoked=True)
+        db.open_session(db.add_account(email="bystander@example.test"))
         token = await _issue(pr, db)
 
         await _confirm(pr, db, token)
@@ -1320,7 +1323,7 @@ class TestConfirmSuccess:
     async def test_password_reset_confirm_writes_in_one_committed_transaction(
         self, pr: ModuleType, db: FakeDb
     ) -> None:
-        """Consume, password update, session revocation and audit share one connection and
+        """Consume, password update, session deletion and audit share one connection and
         one transaction, which commits; the token is consumed first and the audit is last."""
         _add_active(db)
         token = await _issue(pr, db)
@@ -1337,7 +1340,8 @@ class TestConfirmSuccess:
         assert in_tx[0] is consume, kinds
         assert in_tx[-1].normalized.startswith("insert into audit_events"), kinds
         assert _one(db.matching(r"^update users set password_hash")).tx == consume.tx
-        assert _one(db.matching(r"^update sessions set revoked_at")).tx == consume.tx
+        assert _one(db.matching(r"^delete from sessions\b")).tx == consume.tx
+        assert db.matching(r"^update sessions\b") == []
         assert db.transactions == [(consume.tx, "commit")]
         assert {call.via for call in _writes(db)} == {consume.via}
 
@@ -1368,7 +1372,7 @@ class TestConfirmConsumeRace:
         self, pr: ModuleType, db: FakeDb, race: str
     ) -> None:
         """The DELETE returns no row: InvalidResetTokenError, and no password update, no
-        session revocation and no audit statement follow."""
+        session deletion and no audit statement follow."""
         user_id = _add_active(db)
         session = db.open_session(user_id)
         token = await _issue(pr, db)
@@ -1388,7 +1392,7 @@ class TestConfirmConsumeRace:
             await _confirm(pr, db, token)
 
         assert db.matching(r"^update users\b") == []
-        assert db.matching(r"^update sessions\b") == []
+        assert db.matching(r"^(?:update|delete from) sessions\b") == []
         assert db.matching(r"^insert into audit_events\b") == []
         assert db.users[user_id]["password_hash"] == "fake$initial"
         assert not db.session_revoked(session)
@@ -1400,7 +1404,8 @@ class TestConfirmConsumeRace:
 
 
 class TestConfirmAuditFailure:
-    """Fail closed: no password change, no revocation and no consumed token unaudited."""
+    """Fail closed: no password change, no session deletion and no consumed token
+    unaudited."""
 
     async def test_password_reset_confirm_audit_failure_propagates_and_rolls_back(
         self, pr: ModuleType, db: FakeDb

@@ -1,11 +1,13 @@
 """Content-free, append-only audit event store: action catalog, record(), retention purge (GH-146).
 
-Every security-relevant action (logins and lockouts, password resets,
-invitations, role changes, activations, sharing changes, deletions and
-restores, exports, Org Admin access to other users' projects, org and platform
-settings, Super Admin actions, residency policy, break-glass sessions, agent
-tool calls) is written through ``record()`` as one row of the ``audit_events``
-table (migration 0005).
+Every security-relevant action (logins and lockouts, password resets, session
+revocations and forced logouts, invitations, role changes, activations,
+sharing changes, deletions and restores, exports, Org Admin access to other
+users' projects, org and platform settings, Super Admin actions, residency
+policy, break-glass sessions, agent tool calls) is written through
+``record()`` as one row of the ``audit_events`` table (migration 0005; the
+action catalog CHECK is replaced by migration 0009 for GH-152's session
+actions).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -77,6 +79,9 @@ class AuditAction(StrEnum):
     # Password resets (action names, not secrets: S105 matches the member names)
     PASSWORD_RESET_REQUEST = "password_reset.request"  # noqa: S105
     PASSWORD_RESET_COMPLETE = "password_reset.complete"  # noqa: S105
+    # A user ending one of their sessions; an Org Admin's forced logout (GH-152)
+    SESSION_REVOKE = "session.revoke"
+    SESSION_FORCE_LOGOUT = "session.force_logout"
     # Invitations
     INVITATION_CREATE = "invitation.create"
     INVITATION_REVOKE = "invitation.revoke"
@@ -148,6 +153,8 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.LOGIN_LOCKOUT: "any",
         AuditAction.PASSWORD_RESET_REQUEST: "any",
         AuditAction.PASSWORD_RESET_COMPLETE: "any",
+        AuditAction.SESSION_REVOKE: "any",
+        AuditAction.SESSION_FORCE_LOGOUT: "org",
         AuditAction.INVITATION_CREATE: "org",
         AuditAction.INVITATION_REVOKE: "org",
         AuditAction.INVITATION_ACCEPT: "org",

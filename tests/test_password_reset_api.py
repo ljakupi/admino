@@ -1,7 +1,7 @@
 """HTTP-layer spec for self-service password reset (GH-151).
 
 The FastAPI app from ``create_app()`` runs against the in-memory database of
-tests/password_reset_fakes.py (what ``admino.database.get_pool`` returns) with
+tests/db_fakes.py (what ``admino.database.get_pool`` returns) with
 a fake config whose ``server.public_url`` is ``https://admino.example.ch``. The
 real ``admino.password_reset``, ``admino.sessions``, ``admino.email_outbox``
 and ``admino.audit_events`` code runs; only Argon2 is replaced by a fast fake.
@@ -16,7 +16,7 @@ What these tests pin down:
   still answers 202 and logs the exception class name only.
 - ``POST /api/auth/password-reset/confirm {token, new_password}``: 204 with an
   empty body, the ``admino_session`` cookie deleted, the password changed and
-  every session of the user revoked (other devices are logged out at once).
+  every session row of the user deleted (other devices are logged out at once).
   An unknown, malformed, expired, used or superseded token, or an account that
   may no longer log in → 400 ``{"detail": "This reset link is invalid or has
   expired."}`` and nothing changes. A policy failure → 422 ``{"detail": <policy
@@ -487,7 +487,7 @@ class TestRequestEndpoint:
 
 
 class TestConfirmSuccess:
-    """204, cookie cleared, new password, every session revoked, audited."""
+    """204, cookie cleared, new password, every session row deleted, audited."""
 
     def test_password_reset_api_confirm_returns_204_with_empty_body(self, db: FakeDb) -> None:
         user_id = db.add_account(email=_EMAIL)
@@ -528,8 +528,8 @@ class TestConfirmSuccess:
         assert [_me(app, session) for session in devices] == [401, 401, 401]
         assert _me(app, other) == 200
 
-    def test_password_reset_api_confirm_revokes_the_callers_own_session(self, db: FakeDb) -> None:
-        """The browser that resets is logged out too."""
+    def test_password_reset_api_confirm_deletes_the_callers_own_session(self, db: FakeDb) -> None:
+        """The browser that resets is logged out too: its session row is gone."""
         user_id = db.add_account(email=_EMAIL)
         session = db.open_session(user_id)
         app = _app()
@@ -589,7 +589,7 @@ class TestConfirmSuccess:
 
 
 def _unchanged(db: FakeDb, user_id: uuid.UUID, token: str, session: str) -> None:
-    """Nothing was written: old password, token still stored, session still live."""
+    """Nothing was written: old password, token still stored, session row still there."""
     assert db.users[user_id]["password_hash"] == "fake$initial"
     assert db.tokens[user_id]["token_hash"] == sha256(token)
     assert not db.session_revoked(session)

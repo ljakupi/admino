@@ -1,16 +1,19 @@
-"""Email/password login and logout (GH-149).
+"""Email/password login and logout (GH-149, GH-152).
 
 Inputs: the database pool, plus the email, password, client IP and user agent
 of a login attempt, or the raw session token of a logout.
-Outputs: ``login`` returns the raw session token for the ``admino_session``
-cookie, or raises ``LoginFailedError``; ``logout`` revokes the session.
+Outputs: ``login`` returns a ``LoginResult`` (the raw session token for the
+``admino_session`` cookie and the cookie's Max-Age), or raises
+``LoginFailedError``; ``logout`` deletes the session.
 
 A login succeeds when the account exists, the password matches, the user is
 active and not deleted, and the user is a Super Admin or a member of an active
 organization. It then re-hashes a password stored with older Argon2
-parameters, stamps ``last_login_at``, opens a session and records
-``login.success``, all in one transaction. Every other outcome records
-``login.failure`` and raises the same ``LoginFailedError``.
+parameters, stamps ``last_login_at``, opens a session with the account's
+session policy (``sessions.session_policy_for``: the org policy for a member,
+the platform policy for a Super Admin) and records ``login.success``, all in
+one transaction. Every other outcome records ``login.failure`` and raises the
+same ``LoginFailedError``.
 
 Security notes:
 - No user enumeration: one message ("Invalid email or password") for every
@@ -26,6 +29,8 @@ Security notes:
   statement or a log line; the email is only the lookup's bind parameter.
 - Fail closed: a failed ``login.success`` record rolls the session back, so
   no session is handed out unaudited.
+- ``LoginResult`` keeps the token out of its repr, so it can't end up in a
+  log line or traceback.
 - Parameterized SQL only: values travel as bind parameters.
 """
 
@@ -34,6 +39,8 @@ from __future__ import annotations
 import asyncio
 import secrets
 from typing import TYPE_CHECKING, Any, Final
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from admino import audit_events, passwords, sessions
 from admino.audit_events import AuditAction
@@ -67,6 +74,16 @@ _DUMMY_HASH: Final = passwords.encode_phc(
 )
 
 
+class LoginResult(BaseModel):
+    """A successful login: the session token and how long its cookie may live."""
+
+    model_config = ConfigDict(frozen=True)
+
+    # repr=False: never shown by repr() or str().
+    token: str = Field(repr=False)
+    max_age_seconds: int
+
+
 class LoginFailedError(Exception):
     """Raised for every failed login, whatever the cause; carries no input."""
 
@@ -94,8 +111,8 @@ def may_log_in(account: Any) -> bool:
 
 async def login(
     pool: asyncpg.Pool, *, email: str, password: str, ip: str | None, user_agent: str | None
-) -> str:
-    """Check an email and password and open a session.
+) -> LoginResult:
+    """Check an email and password and open a session with the account's policy.
 
     Args:
         pool: The database pool.
@@ -105,7 +122,8 @@ async def login(
         user_agent: The client's User-Agent header, if any.
 
     Returns:
-        The raw session token, for the session cookie.
+        The LoginResult: the raw session token, for the session cookie, and
+        the cookie's Max-Age (the policy's lifetime, in seconds).
 
     Raises:
         LoginFailedError: For every failure (unknown email, wrong password, an
@@ -130,6 +148,7 @@ async def login(
         raise LoginFailedError
 
     user_id = account["id"]
+    policy = sessions.session_policy_for(account["kind"])
     new_hash = None
     if passwords.needs_rehash(stored_hash):
         new_hash = await asyncio.to_thread(passwords.hash_password, password)
@@ -137,7 +156,9 @@ async def login(
         if new_hash is not None:
             await conn.execute(_REHASH_SQL, new_hash, user_id)
         await conn.execute(_LAST_LOGIN_SQL, user_id)
-        token = await sessions.create_session(conn, user_id=user_id, ip=ip, user_agent=user_agent)
+        token = await sessions.create_session(
+            conn, user_id=user_id, policy=policy, ip=ip, user_agent=user_agent
+        )
         await audit_events.record(
             conn,
             action=AuditAction.LOGIN_SUCCESS,
@@ -146,11 +167,11 @@ async def login(
             org_id=account["org_id"],
             ip=ip,
         )
-    return token
+    return LoginResult(token=token, max_age_seconds=int(policy.max_lifetime.total_seconds()))
 
 
 async def logout(pool: asyncpg.Pool, token: str) -> None:
-    """Revoke the session behind a session token.
+    """End the session behind a session token by deleting its row.
 
     Args:
         pool: The database pool.

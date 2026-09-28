@@ -9,8 +9,13 @@ Routes:
 - POST /api/auth/password-reset — Emails a password reset link; always 202 (public).
 - POST /api/auth/password-reset/confirm — Sets a new password with a reset link's
   token, ends every session of the account, clears the cookie (public).
-- POST /api/auth/logout   — Revokes the current session and clears the cookie.
+- POST /api/auth/logout   — Ends (deletes) the current session and clears the cookie.
 - GET  /api/auth/me       — The logged-in account (from the resolved session).
+- GET  /api/me/sessions   — The caller's live sessions, the current one marked.
+- DELETE /api/me/sessions/{session_id} — Ends one of the caller's sessions
+  (clears the cookie when it is the current one); audited.
+- POST /api/org/users/{user_id}/logout — An Org Admin ends every session of a
+  user of their org; audited.
 - POST /api/message       — Send a user message; returns ChatResponse.
 - GET  /api/events        — SSE stream for a chat session.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
@@ -26,12 +31,21 @@ Security notes:
   ``server.cookie_secure`` is off) carries an opaque token that
   ``sessions.resolve_session`` checks against the database on every request,
   re-reading the account, so a deactivated user or org is refused at once.
+  A session ends after its idle timeout or at the end of its lifetime (its
+  policy, GH-152); the cookie's Max-Age is that lifetime. Ending a session
+  deletes its row, so the cookie is refused on its next request.
   Every route except the public ones above depends on ``require_session``; the
   ``Principal`` always comes from the session row, never from request data.
   There is no bearer-token or VPN mode, and ``Authorization`` headers
   authenticate nothing.
 - The chat routes also need ``Capability.CHAT_SEND`` (403 for a Viewer or a
   Super Admin); the principal is passed to ``agent.run``.
+- Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
+  and only ever reads or deletes the caller's own sessions; a forced logout
+  needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
+  Admin's own org. Another user's session, or a user outside the org, is the
+  same 404 as an unknown id. Path ids are typed as UUIDs: anything else is a
+  422 that doesn't include the input value.
 - CSRF: ``CrossOriginProtectionMiddleware`` implements Go's
   CrossOriginProtection check on every non-GET/HEAD/OPTIONS request, before
   authentication and handlers (the login included): ``Sec-Fetch-Site`` must be
@@ -89,6 +103,7 @@ from datetime import UTC, datetime
 from pathlib import Path as PathLib
 from typing import TYPE_CHECKING, Annotated, Any, Final
 from urllib.parse import urlsplit
+from uuid import UUID  # noqa: TC003 — FastAPI resolves path parameter annotations at runtime
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
@@ -100,7 +115,7 @@ from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from admino import auth, password_reset, passwords, sessions
+from admino import accounts, auth, password_reset, passwords, session_management, sessions
 from admino.access import Capability, Principal, can
 from admino.models import (
     AgentResult,
@@ -122,6 +137,7 @@ from admino.models import (
     PermissionEntry,
     PermissionPatch,
     PermissionsResponse,
+    SessionListResponse,
     SettingsAppearance,
     SettingsConnectedAccounts,
     SettingsImmutable,
@@ -156,7 +172,6 @@ from admino.tools.outlook_calendar import clear_token_cache as _clear_outcal_cac
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
-    from uuid import UUID
 
     from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -351,6 +366,10 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/auth/me": (1.0, 10),
     # Cookies that resolve to no session, per client IP (see require_session).
     "/api/auth/session": (1.0, 20),
+    # Session management (GH-152), per user.
+    "/api/me/sessions/get": (1.0, 10),
+    "/api/me/sessions/delete": (0.5, 5),
+    "/api/org/users/logout": (0.5, 5),
 }
 # Routes without their own entry still get a bucket per caller.
 _DEFAULT_RATE_LIMIT: tuple[float, int] = (1.0, 10)
@@ -676,9 +695,10 @@ async def require_session(request: Request) -> sessions.AuthenticatedSession:
     """FastAPI dependency: the session the ``admino_session`` cookie belongs to.
 
     ``sessions.resolve_session`` re-checks the session and its account in the
-    database on every request (revoked, expired, deactivated user or org all
-    resolve to nothing). Other cookies and ``Authorization`` headers are
-    ignored.
+    database on every request (a deleted, expired or idle session, a
+    deactivated user or org all resolve to nothing) and refreshes its
+    ``last_seen_at`` at most once a minute. Other cookies and ``Authorization``
+    headers are ignored.
 
     Args:
         request: The incoming request.
@@ -948,9 +968,15 @@ async def health_check() -> dict[str, str | bool]:
 # ---------------------------------------------------------------------------
 
 
-def _session_max_age_s() -> int:
-    """The session cookie's Max-Age: the fixed session lifetime, in seconds."""
-    return int(sessions.SESSION_LIFETIME.total_seconds())
+def _clear_session_cookie(response: Response) -> None:
+    """Make the browser drop the ``admino_session`` cookie (Max-Age=0)."""
+    response.delete_cookie(
+        key=sessions.SESSION_COOKIE_NAME,
+        path="/",
+        secure=_config.server.cookie_secure if _config is not None else True,
+        httponly=True,
+        samesite="strict",
+    )
 
 
 async def post_login(request: Request, body: LoginRequest) -> Response:
@@ -958,7 +984,7 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
 
     Rate-limited per client IP. On success opens a server-side session and
     answers 204 with the ``admino_session`` cookie (HttpOnly, SameSite=Strict,
-    Path=/, Max-Age = the session lifetime, Secure iff
+    Path=/, Max-Age = the lifetime of the account's session policy, Secure iff
     ``server.cookie_secure``). Every failure cause (unknown email, wrong
     password, inactive account or organization) is the same 401, and no cookie
     is set.
@@ -985,7 +1011,7 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
     from admino.database import get_pool
 
     try:
-        token = await auth.login(
+        result = await auth.login(
             get_pool(),
             email=body.email,
             password=body.password.get_secret_value(),
@@ -998,8 +1024,8 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
     response = Response(status_code=204)
     response.set_cookie(
         key=sessions.SESSION_COOKIE_NAME,
-        value=token,
-        max_age=_session_max_age_s(),
+        value=result.token,
+        max_age=result.max_age_seconds,
         path="/",
         secure=_config.server.cookie_secure,
         httponly=True,
@@ -1108,13 +1134,7 @@ async def post_password_reset_confirm(
         return JSONResponse(status_code=422, content={"detail": str(exc), "reason": exc.reason})
 
     response = Response(status_code=204)
-    response.delete_cookie(
-        key=sessions.SESSION_COOKIE_NAME,
-        path="/",
-        secure=_config.server.cookie_secure,
-        httponly=True,
-        samesite="strict",
-    )
+    _clear_session_cookie(response)
     return response
 
 
@@ -1122,13 +1142,13 @@ async def post_logout(
     request: Request,
     session: _SessionDep,
 ) -> Response:
-    """Handle POST /api/auth/logout — revoke the current session.
+    """Handle POST /api/auth/logout — end the current session.
 
-    Only the session of this cookie is revoked (the user's other devices stay
-    logged in). Answers 204 and clears the cookie.
+    Only the session of this cookie ends: its row is deleted (the user's other
+    devices stay logged in). Answers 204 and clears the cookie. Not audited.
 
     Args:
-        request: The incoming request (its session cookie is revoked).
+        request: The incoming request (its session cookie's session ends).
         session: The resolved session (401 without one).
 
     Returns:
@@ -1143,13 +1163,7 @@ async def post_logout(
         await auth.logout(get_pool(), token)
 
     response = Response(status_code=204)
-    response.delete_cookie(
-        key=sessions.SESSION_COOKIE_NAME,
-        path="/",
-        secure=_config.server.cookie_secure if _config is not None else True,
-        httponly=True,
-        samesite="strict",
-    )
+    _clear_session_cookie(response)
     return response
 
 
@@ -1177,6 +1191,129 @@ async def get_me(
         ui_language=session.ui_language,
         response_language=session.response_language,
     )
+
+
+# ---------------------------------------------------------------------------
+# Session management route handlers (GH-152)
+# ---------------------------------------------------------------------------
+
+
+async def get_my_sessions(session: _SessionDep) -> SessionListResponse:
+    """Handle GET /api/me/sessions — the caller's live sessions.
+
+    Args:
+        session: The resolved session (401 without one); its session is marked
+            ``current``.
+
+    Returns:
+        SessionListResponse, the most recently active session first. No token
+        or token hash is included.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ACCOUNT_MANAGE``, 429 when
+            rate-limited.
+    """
+    principal = session.principal
+    if not can(principal, Capability.ACCOUNT_MANAGE):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    _check_rate_limit("/api/me/sessions/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return SessionListResponse(
+        sessions=await session_management.list_user_sessions(
+            get_pool(), user_id=principal.user_id, current_session_id=session.session_id
+        )
+    )
+
+
+async def delete_my_session(
+    request: Request,
+    session: _SessionDep,
+    session_id: UUID,
+) -> Response:
+    """Handle DELETE /api/me/sessions/{session_id} — end one of the caller's sessions.
+
+    The session's row is deleted and ``session.revoke`` is recorded. Ending the
+    request's own session also clears the cookie.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        session: The resolved session (401 without one).
+        session_id: The session to end (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ACCOUNT_MANAGE``; 404 when the
+            session doesn't exist or isn't the caller's (the same body either
+            way); 429 when rate-limited.
+    """
+    principal = session.principal
+    if not can(principal, Capability.ACCOUNT_MANAGE):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    _check_rate_limit("/api/me/sessions/delete", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        await session_management.revoke_own_session(
+            get_pool(),
+            principal=principal,
+            session_id=session_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except session_management.SessionNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=session_management.SESSION_NOT_FOUND_MESSAGE
+        ) from None
+
+    response = Response(status_code=204)
+    if session_id == session.session_id:
+        _clear_session_cookie(response)
+    return response
+
+
+async def post_org_user_logout(
+    request: Request,
+    principal: _PrincipalDep,
+    user_id: UUID,
+) -> Response:
+    """Handle POST /api/org/users/{user_id}/logout — log a user of the org out everywhere.
+
+    Every session of the user is deleted and ``session.force_logout`` is
+    recorded (also when there was none).
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        user_id: The user to log out (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 403 without ``Capability.ORG_USERS_MANAGE``; 404 when
+            the user isn't a member of the caller's org, is deleted or doesn't
+            exist (the same body either way); 429 when rate-limited.
+    """
+    _check_rate_limit("/api/org/users/logout", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        await session_management.force_logout(
+            get_pool(),
+            actor=principal,
+            user_id=user_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except accounts.UserNotInOrgError:
+        raise HTTPException(status_code=404, detail="User not found") from None
+    return Response(status_code=204)
 
 
 async def post_message(
@@ -2505,9 +2642,9 @@ async def _request_validation_error_handler(
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Manage application lifespan — init DB pool, the audit retention job and,
-    when SMTP is configured, the email outbox sender on startup; stop both
-    background tasks, then close the pool, on shutdown.
+    """Manage application lifespan — init DB pool, the audit retention job, the
+    expired-session purge and, when SMTP is configured, the email outbox sender
+    on startup; stop the background tasks, then close the pool, on shutdown.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -2533,6 +2670,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # GH-146: the daily audit retention purge runs while the app is up. The
     # task stays referenced here and is cancelled before the pool closes.
     retention_task = asyncio.create_task(run_retention_job(get_pool()))
+
+    # GH-152: expired and idle session rows are purged hourly while the app is
+    # up. Looked up at call time, like the retention job; cancelled before the
+    # pool closes.
+    session_purge_task = asyncio.create_task(sessions.run_session_purge_job(get_pool()))
 
     # GH-148: the outbox sender delivers queued transactional email while the
     # app is up. Without SMTP config (load_smtp_config logs which variables are
@@ -2593,6 +2735,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     retention_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await retention_task
+    session_purge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await session_purge_task
     if sender_task is not None:
         sender_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -2689,6 +2834,13 @@ def create_app(
     # API routes — session required.
     app.post("/api/auth/logout", status_code=204, response_model=None)(post_logout)
     app.get("/api/auth/me", response_model=MeResponse)(get_me)
+    app.get("/api/me/sessions", response_model=SessionListResponse)(get_my_sessions)
+    app.delete("/api/me/sessions/{session_id}", status_code=204, response_model=None)(
+        delete_my_session
+    )
+    app.post("/api/org/users/{user_id}/logout", status_code=204, response_model=None)(
+        post_org_user_logout
+    )
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)

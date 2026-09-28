@@ -1668,11 +1668,18 @@ class _LifespanProbe:
         """The fake run_retention_job."""
         await self._blocking("retention")
 
+    async def session_purge(self, *_args: Any, **_kwargs: Any) -> None:
+        """The fake run_session_purge_job (GH-152)."""
+        await self._blocking("session-purge")
+
 
 @contextlib.contextmanager
 def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
-    """Patch the lifespan's database calls, the retention job, the SMTP config loader and the
-    outbox sender. get_pool() raises until init_pool() ran, like the real one."""
+    """Patch the lifespan's database calls, the retention job, the session purge job
+    (GH-152), the SMTP config loader and the outbox sender. get_pool() raises until
+    init_pool() ran, like the real one. ``create=True`` on the purge job: it is new in
+    GH-152, and these tests don't depend on it; the stub keeps the real purge from
+    running against the MagicMock pool."""
     state: dict[str, Any] = {"pool": None}
 
     async def fake_init_pool(*_args: Any, **_kwargs: Any) -> Any:
@@ -1699,6 +1706,7 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.audit_events.run_retention_job", probe.retention),
         patch("admino.mailer.load_smtp_config", probe.load_smtp_config),
         patch("admino.email_outbox.run_outbox_sender", probe.sender),
+        patch("admino.sessions.run_session_purge_job", probe.session_purge, create=True),
     ):
         yield
 
