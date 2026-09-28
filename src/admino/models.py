@@ -9,8 +9,9 @@ the ``audit_events`` table, validated by ``admino.audit_events``.
 
 Security notes:
 - No secrets, tokens, passwords, or credentials are stored in any model field,
-  except ``LoginRequest.password``: a ``SecretStr`` (hidden from repr/str) that
-  lives only for the login request and is never logged or echoed.
+  except ``LoginRequest.password`` and ``PasswordResetConfirmRequest.token`` /
+  ``new_password``: ``SecretStr`` values (hidden from repr/str) that live only
+  for their request and are never logged or echoed.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators.
@@ -1526,6 +1527,36 @@ class LoginRequest(BaseModel):
 
     email: str = Field(min_length=3, max_length=254)
     password: SecretStr = Field(min_length=1, max_length=128)
+
+
+class PasswordResetRequest(BaseModel):
+    """POST /api/auth/password-reset request body.
+
+    The email is matched case-insensitively by ``admino.password_reset``; its
+    format is not validated here (an unknown address gets the same 202 as a
+    known one). The 422 handler never echoes request input. Unknown fields are
+    refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(min_length=3, max_length=254)
+
+
+class PasswordResetConfirmRequest(BaseModel):
+    """POST /api/auth/password-reset/confirm request body.
+
+    The token (from the emailed link) and the new password are ``SecretStr``:
+    ``repr()``/``str()`` never show them, and the 422 handler never echoes
+    request input. The bounds only cap the body: ``admino.password_reset``
+    decides whether the token can exist, and the password policy decides the
+    password. Unknown fields are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    token: SecretStr = Field(min_length=1, max_length=128)
+    new_password: SecretStr = Field(min_length=1, max_length=1024)
 
 
 class MeResponse(BaseModel):

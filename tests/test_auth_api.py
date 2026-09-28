@@ -12,9 +12,10 @@ What these tests pin down:
   nothing the caller sent is echoed back.
 - ``POST /api/auth/logout`` revokes the session and clears the cookie;
   ``GET /api/auth/me`` returns the resolved principal and languages.
-- Every route except ``/health``, the login and the OAuth callback requires a
-  valid session (a route-enumeration test walks ``app.routes``), and the session
-  is re-checked on every request: a deactivated user or org is refused at once.
+- Every route except ``/health``, the login, the password reset endpoints
+  (GH-151) and the OAuth callback requires a valid session (a route-enumeration
+  test walks ``app.routes``), and the session is re-checked on every request: a
+  deactivated user or org is refused at once.
 - The chat routes need ``chat.send``: 403 for a Super Admin and a Viewer.
 - CSRF: state-changing requests pass only when ``Sec-Fetch-Site`` is
   ``same-origin``/``none`` or, without it, when ``Origin`` matches ``Host``;
@@ -86,10 +87,17 @@ _LOGIN_FAILED = {"detail": "Invalid email or password"}
 _PROMOTE_REFUSED = {"detail": "Critical permission promotions are temporarily unavailable."}
 _CHAT_BODY = {"message": "hello", "session_id": "chat-1"}
 
-# Routes that answer without a session: the health check, the login and the
-# OAuth provider's cross-site redirect (protected by its state token).
+# Routes that answer without a session: the health check, the login, the
+# password reset request and confirm (GH-151), and the OAuth provider's
+# cross-site redirect (protected by its state token).
 _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
-    {("GET", "/health"), ("POST", "/api/auth/login"), ("GET", "/api/oauth/callback")}
+    {
+        ("GET", "/health"),
+        ("POST", "/api/auth/login"),
+        ("POST", "/api/auth/password-reset"),
+        ("POST", "/api/auth/password-reset/confirm"),
+        ("GET", "/api/oauth/callback"),
+    }
 )
 
 # Routes that exist today (or are added by #149) and must require a session.
@@ -887,7 +895,8 @@ class TestRouteEnumeration:
     """Walk app.routes: every route outside the public allowlist requires a session."""
 
     def test_auth_api_public_routes_exist(self) -> None:
-        """/health, the login and the OAuth callback are registered."""
+        """/health, the login, the password reset endpoints and the OAuth callback are
+        registered."""
         routes = {(method, path) for method, path, _ in _api_routes(_app())}
 
         assert routes >= _PUBLIC_ROUTES

@@ -159,22 +159,37 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
 - **Sessions** last 12 hours. Your browser only holds a random token in the
   `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database only
   stores its SHA-256 hash. Logging out ends the session at once.
-- **Every API route needs a session**, except `/health`, the login endpoint and the OAuth
-  callback. A deactivated account, or an account whose organization is deactivated or
-  pending deletion, is refused on its next request, even with a session that's still open.
+- **Every API route needs a session**, except `/health`, the login endpoint, the two
+  password reset endpoints (`POST /api/auth/password-reset` and
+  `POST /api/auth/password-reset/confirm`) and the OAuth callback. A deactivated account, or
+  an account whose organization is deactivated or pending deletion, is refused on its next
+  request, even with a session that's still open.
 - **A failed login** always answers "Invalid email or password", whatever the reason.
   Successful and failed logins are recorded in the audit log, without the email address.
 - **Cross-site requests** that change something (`POST`, `PATCH`, `DELETE`) are refused
   with `403`.
-- **Rate limits** apply per user, and per IP address for the login. An IP address that keeps
-  sending unknown session cookies is refused with `429` for a while.
+- **Rate limits** apply per user, and per IP address for the login and the password reset
+  endpoints (an IP address gets one reset email a minute, after the first three). An IP
+  address that keeps sending unknown session cookies is refused with `429` for a while.
+
+**Forgot your password?** Ask for a reset link with your email address. If the account
+exists and may log in, admino emails a link to `/reset-password` that works once, for 30
+minutes. Asking again replaces the older link, so only the newest one works. When you set
+the new password, it has to follow the password rules above, and every session of the
+account ends, so all your devices are logged out, including the browser you reset from.
+The request always answers `202` the same way, whether the address exists or not, so
+nobody can use it to find out which accounts exist. Reset requests and completed resets
+are recorded in the audit log, without the email address. Only a hash of the link's token
+is stored.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `COOKIE_SECURE` | `true` | Marks the session cookie `Secure`, so browsers only send it over HTTPS (and to `http://localhost`). Set it to `false` only when you open admino over plain HTTP from another address, such as a phone on your LAN. |
+| `ADMINO_PUBLIC_URL` | `http://localhost:8000` | The address users open admino at, such as `https://admino.example.ch` (no path). Password reset links, and later invitation links, are built from it, never from the request's `Host` header. It must use `https`; plain `http` is only allowed for `localhost`, `127.0.0.1` and `[::1]`. **Production deployments must set it**, otherwise reset emails point at localhost. An invalid value stops admino at startup. Overrides `server.public_url` in `config.yaml`. |
 
-> The login page and the command that creates the first account are still being added.
-> Until they ship, the API answers `401` to every call that has no session.
+> The login page, and the pages for asking for a reset link and choosing the new password,
+> are still being added. Until they ship, the API answers `401` to every call that has no
+> session.
 
 ## Email (SMTP)
 

@@ -18,6 +18,15 @@ without error and the ``AUTH_TOKEN`` / ``AUTH_MODE`` env vars have no effect.
 ``Secure`` flag; the ``COOKIE_SECURE`` env var overrides it
 (true/1/yes/on -> True, false/0/no/off -> False, case-insensitive; any other
 value logs a warning and is ignored).
+
+GH-151: ``ServerConfig.public_url`` is the base of password reset (and later
+invitation) links, never the request's Host header. Default
+``http://localhost:8000``, stored without a trailing slash. It must be an
+origin: https with a host and an optional port (plain http only for localhost,
+127.0.0.1 and [::1]), no user info, no path other than "/", no query or
+fragment, no whitespace or control characters, at most 2048 characters; the
+error never repeats the value. ``ADMINO_PUBLIC_URL`` (set and non-empty)
+overrides it, and an invalid value makes config loading fail.
 """
 
 from __future__ import annotations
@@ -50,6 +59,12 @@ if TYPE_CHECKING:
 def _no_cookie_secure_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start every test without a COOKIE_SECURE override from the developer's shell."""
     monkeypatch.delenv("COOKIE_SECURE", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_public_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test without an ADMINO_PUBLIC_URL override from the developer's shell."""
+    monkeypatch.delenv("ADMINO_PUBLIC_URL", raising=False)
 
 
 # A strong value of the removed AUTH_TOKEN env var (it must have no effect now).
@@ -1354,3 +1369,224 @@ class TestProviderCleanup:
         config = LLMConfig(provider="vllm")
         assert config.provider == "vllm"
         assert config.vllm_model == "Qwen/Qwen3-4B-Instruct-2507"
+
+
+# ---------------------------------------------------------------------------
+# GH-151: ServerConfig.public_url + ADMINO_PUBLIC_URL env override
+# ---------------------------------------------------------------------------
+
+_PUBLIC_URL_DEFAULT = "http://localhost:8000"
+
+# (value, stored value): origins, stored without a trailing slash.
+_PUBLIC_URLS_ACCEPTED: list[object] = [
+    pytest.param("https://admino.example.ch", "https://admino.example.ch", id="https"),
+    pytest.param("https://admino.example.ch/", "https://admino.example.ch", id="trailing-slash"),
+    pytest.param("https://admino.example.ch:8443", "https://admino.example.ch:8443", id="port"),
+    pytest.param(
+        "https://admino.example.ch:8443/", "https://admino.example.ch:8443", id="port-slash"
+    ),
+    pytest.param("https://127.0.0.1", "https://127.0.0.1", id="https-ip"),
+    pytest.param("http://localhost:8000", "http://localhost:8000", id="http-localhost"),
+    pytest.param("http://localhost", "http://localhost", id="http-localhost-no-port"),
+    pytest.param("http://localhost:8000/", "http://localhost:8000", id="http-localhost-slash"),
+    pytest.param("http://127.0.0.1:8000", "http://127.0.0.1:8000", id="http-127"),
+    pytest.param("http://[::1]:8000", "http://[::1]:8000", id="http-ipv6-loopback"),
+]
+
+_PUBLIC_URLS_REFUSED: list[object] = [
+    pytest.param("javascript:alert(1)", id="javascript"),
+    pytest.param("ftp://admino.example.ch", id="ftp"),
+    pytest.param("file:///etc/passwd", id="file"),
+    pytest.param("data:text/html,hi", id="data"),
+    pytest.param("http://admino.example.ch", id="http-public-host"),
+    pytest.param("http://192.168.1.10:8000", id="http-lan"),
+    pytest.param("http://localhost.evil.example", id="http-localhost-lookalike"),
+    pytest.param("http://127.0.0.1.nip.io", id="http-loopback-lookalike"),
+    pytest.param("https://", id="no-host"),
+    pytest.param("https:///reset", id="no-host-path"),
+    pytest.param("https://:8443", id="port-only"),
+    pytest.param("admino.example.ch", id="no-scheme"),
+    pytest.param("//admino.example.ch", id="scheme-relative"),
+    pytest.param("", id="empty"),
+    pytest.param("https://user@admino.example.ch", id="userinfo"),
+    pytest.param("https://user:secret@admino.example.ch", id="userinfo-password"),
+    pytest.param("https://admino.example.ch\\@evil.example", id="backslash-userinfo"),
+    pytest.param("https://admino.example.ch/app", id="path"),
+    pytest.param("https://admino.example.ch/app/", id="path-slash"),
+    pytest.param("https://admino.example.ch//", id="double-slash"),
+    pytest.param("https://admino.example.ch?next=1", id="query"),
+    pytest.param("https://admino.example.ch/?next=1", id="slash-query"),
+    pytest.param("https://admino.example.ch#top", id="fragment"),
+    pytest.param("https://admino.example.ch:99999", id="port-out-of-range"),
+    pytest.param("https://admino.example.ch:port", id="port-not-a-number"),
+    pytest.param(" https://admino.example.ch", id="leading-space"),
+    pytest.param("https://admino.example.ch ", id="trailing-space"),
+    pytest.param("https://admino.example.ch\n", id="trailing-newline"),
+    pytest.param("https://admino.exa mple.ch", id="inner-space"),
+    pytest.param("https://admino.example.ch\t", id="tab"),
+    pytest.param("https://admino.example.ch" + chr(0), id="nul"),
+    pytest.param("https://admino.example" + chr(0x7F) + "ch", id="del"),
+    pytest.param("https://admino.example.ch" + chr(0x2028), id="line-separator"),
+    pytest.param("https://" + "a" * 2041, id="2049-chars"),
+]
+
+# (value, distinctive parts that must not appear in the error).
+_PUBLIC_URL_ECHO_CASES: list[object] = [
+    pytest.param("https://echomarkerq7.example.ch/secretpathq7", ["echomarkerq7", "secretpathq7"]),
+    pytest.param("http://echomarkerq7.example.ch", ["echomarkerq7"]),
+    pytest.param("https://userq7secret@echomarkerq7.example.ch", ["userq7secret", "echomarkerq7"]),
+    pytest.param("https://echomarkerq7.example.ch:portmarkerq7", ["portmarkerq7", "echomarkerq7"]),
+    pytest.param("https://echomarkerq7.example.ch?tokenq7=1", ["tokenq7", "echomarkerq7"]),
+    pytest.param("javascript:echomarkerq7()", ["echomarkerq7"]),
+]
+
+
+class TestPublicUrl:
+    """server.public_url: the configured origin reset links are built from."""
+
+    def test_server_config_public_url_default(self) -> None:
+        assert ServerConfig().public_url == _PUBLIC_URL_DEFAULT  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(("value", "stored"), _PUBLIC_URLS_ACCEPTED)
+    def test_server_config_public_url_accepts_origins(self, value: str, stored: str) -> None:
+        """https origins (http for loopback), stored without a trailing slash."""
+        assert ServerConfig(public_url=value).public_url == stored  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize("value", _PUBLIC_URLS_REFUSED)
+    def test_server_config_public_url_refuses_non_origins(self, value: str) -> None:
+        """Other schemes, http off loopback, no host, user info, a path, a query, a
+        fragment, a bad port, whitespace or control characters, over 2048 characters."""
+        with pytest.raises(ValidationError):
+            ServerConfig(public_url=value)  # type: ignore[call-arg]
+
+    @pytest.mark.parametrize(("value", "parts"), _PUBLIC_URL_ECHO_CASES)
+    def test_server_config_public_url_error_does_not_echo_the_value(
+        self, value: str, parts: list[str]
+    ) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ServerConfig(public_url=value)  # type: ignore[call-arg]
+
+        errors = exc_info.value.errors(include_url=False, include_input=False)
+        rendered = f"{exc_info.value!s} {errors!r}"
+        for part in parts:
+            assert part not in rendered
+
+    def test_loaded_config_public_url_defaults_to_localhost(self, tmp_path: Path) -> None:
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.public_url == _PUBLIC_URL_DEFAULT  # type: ignore[attr-defined]
+
+    def test_yaml_public_url_is_read_and_normalized(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  public_url: "https://admino.example.ch/"'
+        )
+        assert load_app_config(yaml_path).server.public_url == "https://admino.example.ch"  # type: ignore[attr-defined]
+
+    def test_yaml_invalid_public_url_fails_loading(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  public_url: "http://admino.example.ch"'
+        )
+        with pytest.raises(ValueError, match=r"Invalid application config"):
+            load_app_config(yaml_path)
+
+    def test_public_url_env_sets_it(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://admino.example.ch")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.public_url == "https://admino.example.ch"  # type: ignore[attr-defined]
+
+    def test_public_url_env_overrides_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://from-env.example.ch/")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  public_url: "https://from-yaml.example.ch"'
+        )
+        assert load_app_config(yaml_path).server.public_url == "https://from-env.example.ch"  # type: ignore[attr-defined]
+
+    def test_public_url_env_keeps_other_server_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The override only replaces public_url inside the server section."""
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://admino.example.ch")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  host: "127.0.0.1"\n  port: 9090'
+        )
+        config = load_app_config(yaml_path)
+        assert (config.server.host, config.server.port) == ("127.0.0.1", 9090)
+        assert config.server.public_url == "https://admino.example.ch"  # type: ignore[attr-defined]
+
+    def test_public_url_empty_env_is_ignored(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ADMINO_PUBLIC_URL= (empty) leaves the YAML value in place."""
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  public_url: "https://from-yaml.example.ch"'
+        )
+        assert load_app_config(yaml_path).server.public_url == "https://from-yaml.example.ch"  # type: ignore[attr-defined]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://envmarkerq9.example.ch",
+            "javascript:envmarkerq9()",
+            "https://envmarkerq9.example.ch/path",
+        ],
+    )
+    def test_public_url_invalid_env_fails_loading_without_echo(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+    ) -> None:
+        """An invalid override isn't silently ignored: loading fails, and neither the error
+        nor the log repeats the value."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", value)
+
+        with pytest.raises(ValueError, match=r"Invalid application config") as exc_info:
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+
+        assert "envmarkerq9" not in str(exc_info.value)
+        assert "envmarkerq9" not in caplog.text
+
+    @pytest.mark.parametrize(("value", "parts"), _PUBLIC_URL_ECHO_CASES)
+    def test_app_config_public_url_error_does_not_echo_the_value(
+        self, value: str, parts: list[str]
+    ) -> None:
+        """Validated through AppConfig (the DB loader's path), the error still hides the value."""
+        with pytest.raises(ValidationError) as exc_info:
+            AppConfig.model_validate({"server": {"public_url": value}})
+
+        rendered = f"{exc_info.value!s} {exc_info.value!r}"
+        for part in parts:
+            assert part not in rendered
+
+    async def test_public_url_invalid_value_fails_db_loading_without_echo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An invalid override fails the DB-backed loader too, and the error (which startup
+        logs with %s) doesn't repeat the value."""
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "http://dbmarkerq8.example.ch/pathq8")
+        mock_data: dict[str, object] = {"server": {"host": "127.0.0.1", "port": 8000}}
+        with (
+            patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)),
+            pytest.raises(ValueError) as exc_info,
+        ):
+            await load_app_config_from_db(MagicMock())
+
+        assert "dbmarkerq8" not in str(exc_info.value)
+        assert "pathq8" not in str(exc_info.value)
+
+    async def test_public_url_env_applies_to_db_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DB-backed loader applies the same override."""
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://admino.example.ch")
+        mock_data: dict[str, object] = {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert config.server.public_url == "https://admino.example.ch"  # type: ignore[attr-defined]

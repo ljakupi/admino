@@ -74,8 +74,16 @@ class LoginFailedError(Exception):
         super().__init__(LOGIN_FAILED_MESSAGE)
 
 
-def _may_log_in(account: Any) -> bool:
-    """True when an existing account may open a session (the password aside)."""
+def may_log_in(account: Any) -> bool:
+    """True when an existing account may open a session (the password aside).
+
+    The account must be active and not deleted, and be a Super Admin or a
+    member of an active org. ``admino.password_reset`` applies the same rule.
+
+    Args:
+        account: A users row with ``status``, ``deleted_at``, ``kind`` and the
+            org's status as ``org_status``.
+    """
     if account["status"] != "active" or account["deleted_at"] is not None:
         return False
     return bool(
@@ -110,7 +118,7 @@ async def login(
     matches = await asyncio.to_thread(
         passwords.verify_password, password, stored_hash or _DUMMY_HASH
     )
-    if account is None or not stored_hash or not matches or not _may_log_in(account):
+    if account is None or not stored_hash or not matches or not may_log_in(account):
         await audit_events.record(
             pool,
             action=AuditAction.LOGIN_FAILURE,

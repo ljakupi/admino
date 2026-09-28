@@ -23,7 +23,7 @@ default), and the shipped config keeps ``server.cookie_secure`` on.
 
 Hermeticity: ``load_app_config`` and the ``LLMConfig`` validators consult a
 number of environment variables (provider keys/tokens, LLM_PROVIDER, VLLM_*
-overrides, COOKIE_SECURE, LOG_LEVEL, AUDIT_LOG_PATH). A fixture clears all of
+overrides, COOKIE_SECURE, ADMINO_PUBLIC_URL, LOG_LEVEL, AUDIT_LOG_PATH). A fixture clears all of
 them so these tests are independent of the developer's shell environment.
 """
 
@@ -59,6 +59,7 @@ _ENV_VARS_TO_CLEAR = (
     "VLLM_BASE_URL",
     "VLLM_MAX_MODEL_LEN",
     "COOKIE_SECURE",
+    "ADMINO_PUBLIC_URL",
     "LOG_LEVEL",
     "AUDIT_LOG_PATH",
 )
@@ -166,6 +167,13 @@ class TestShippedConfigDefaults:
     def test_shipped_config_cookie_secure_is_on(self, shipped_config: AppConfig) -> None:
         """The shipped config keeps the session cookie's Secure flag on."""
         assert shipped_config.server.cookie_secure is True
+
+    def test_shipped_config_public_url_is_the_local_default(
+        self, shipped_config: AppConfig
+    ) -> None:
+        """GH-151: laptop-first, reset links point at http://localhost:8000 unless a
+        deployment sets ADMINO_PUBLIC_URL."""
+        assert shipped_config.server.public_url == "http://localhost:8000"  # type: ignore[attr-defined]
 
     def test_shipped_egress_includes_infomaniak(self, shipped_config: AppConfig) -> None:
         """The default provider's API host is whitelisted (GH-142)."""
@@ -283,6 +291,11 @@ class TestShippedEnvExample:
         """GH-149: no AUTH_TOKEN / AUTH_MODE line, active or commented out."""
         pattern = re.compile(rf"^\s*#?\s*{removed}\s*=", re.MULTILINE)
         assert pattern.search(env_text) is None
+
+    def test_env_example_documents_admino_public_url(self, env_text: str) -> None:
+        """GH-151: production deployments set ADMINO_PUBLIC_URL (the base of reset links),
+        and .env.example says so."""
+        assert re.search(r"^\s*#?\s*ADMINO_PUBLIC_URL\s*=", env_text, re.MULTILINE) is not None
 
     def test_env_example_documents_cookie_secure_without_disabling_it(self, env_text: str) -> None:
         """COOKIE_SECURE is documented, and no active line turns the Secure flag off."""

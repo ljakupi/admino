@@ -16,6 +16,11 @@ Security notes:
 - The session cookie is ``Secure`` by default (``server.cookie_secure``); only
   a recognised false value of COOKIE_SECURE turns it off, and an unrecognised
   value is ignored with a warning, so a typo can't weaken it.
+- ``server.public_url`` (ADMINO_PUBLIC_URL) is the only base of emailed links
+  (password resets, later invitations); the request's Host header never is,
+  so a forged Host can't poison a link. It must be a bare https origin (plain
+  http only for localhost, 127.0.0.1 and [::1]); an invalid value fails
+  config loading, and the error never repeats the value.
 """
 
 from __future__ import annotations
@@ -24,10 +29,12 @@ import ipaddress
 import logging
 import os
 import re
+import unicodedata
 from typing import TYPE_CHECKING, Final, Literal
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from admino.permissions import PermissionsConfig, validate_permissions_config
 
@@ -46,6 +53,54 @@ _PROVIDER_KEY_ENV: Final[dict[str, str]] = {
     "openai": "OPENAI_API_KEY",
 }
 
+# Hosts a plain-http public URL may name (a laptop install); anything else needs https.
+_LOOPBACK_HOSTS: Final = frozenset({"localhost", "127.0.0.1", "::1"})
+# Control, format, surrogate and line/paragraph separator characters.
+_UNSAFE_URL_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+# Characters an emailed link may not carry (admino.email_templates refuses them too).
+_URL_BANNED_CHARS: Final = frozenset('<>"\\')
+_PUBLIC_URL_ERROR: Final = (
+    "server.public_url must be an https origin such as https://admino.example.ch "
+    "(plain http only for localhost), without user info, path, query or fragment."
+)
+
+
+def _check_public_url(value: str) -> str:
+    """Return the origin ``scheme://host[:port]`` of a public URL, without a trailing slash.
+
+    Refuses anything but a bare https origin (plain http only for a loopback
+    host). The error never repeats the value: urlsplit() and the port parser
+    echo the netloc or the port text, so their errors are replaced.
+    """
+    if any(
+        char.isspace()
+        or char in _URL_BANNED_CHARS
+        or unicodedata.category(char) in _UNSAFE_URL_CATEGORIES
+        for char in value
+    ):
+        raise ValueError(_PUBLIC_URL_ERROR)
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        raise ValueError(_PUBLIC_URL_ERROR) from None
+    if (
+        parts.scheme not in ("https", "http")
+        or not parts.hostname
+        or "@" in parts.netloc
+        or port == 0
+        or parts.netloc.endswith(":")
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(_PUBLIC_URL_ERROR)
+    if parts.scheme == "http" and parts.hostname not in _LOOPBACK_HOSTS:
+        raise ValueError(_PUBLIC_URL_ERROR)
+    # Rebuilt from its parts, so an empty "?" or "#" can't ride along.
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 # ---------------------------------------------------------------------------
 # Pydantic config models
 # ---------------------------------------------------------------------------
@@ -53,6 +108,9 @@ _PROVIDER_KEY_ENV: Final[dict[str, str]] = {
 
 class ServerConfig(BaseModel):
     """HTTP server settings."""
+
+    # Validation errors never repeat the rejected input (e.g. a public URL).
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     host: str = Field(
         default="0.0.0.0",  # noqa: S104
@@ -72,6 +130,16 @@ class ServerConfig(BaseModel):
             "only for plain-HTTP access from another address, e.g. a phone on the LAN."
         ),
     )
+    public_url: str = Field(
+        default="http://localhost:8000",
+        min_length=1,
+        max_length=2048,
+        description=(
+            "The origin users reach admino at (https; plain http only for localhost). "
+            "Emailed links such as password resets are built from it, never from the "
+            "request's Host header. ADMINO_PUBLIC_URL overrides it."
+        ),
+    )
 
     @field_validator("host")
     @classmethod
@@ -85,6 +153,12 @@ class ServerConfig(BaseModel):
             msg = f"ServerConfig.host {v[:64]!r} is not a valid IP address or 'localhost'."
             raise ValueError(msg) from None
         return v
+
+    @field_validator("public_url")
+    @classmethod
+    def validate_public_url(cls, v: str) -> str:
+        """Accept a bare https origin (http for loopback only), without a trailing slash."""
+        return _check_public_url(v)
 
 
 class LLMConfig(BaseModel):
@@ -392,8 +466,14 @@ class AppConfig(BaseModel):
     - VLLM_BASE_URL     -> llm.vllm_base_url
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len
     - COOKIE_SECURE     -> server.cookie_secure
+    - ADMINO_PUBLIC_URL -> server.public_url
     - LOG_LEVEL         -> log_level
     """
+
+    # Pydantic applies hide_input_in_errors from the model being validated, not
+    # from nested ones: without it here, an invalid server.public_url loaded from
+    # the database would reach the startup error log.
+    model_config = ConfigDict(hide_input_in_errors=True)
 
     server: ServerConfig = Field(default_factory=ServerConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -480,6 +560,28 @@ def _apply_cookie_secure_override(data: dict[str, object]) -> None:
     server_section["cookie_secure"] = value in _TRUE_VALUES
 
 
+def _apply_public_url_override(data: dict[str, object]) -> None:
+    """Apply the ADMINO_PUBLIC_URL env override to ``server.public_url`` in-place.
+
+    Unset or empty changes nothing. Any other value replaces the YAML value
+    and is validated with it, so an invalid value fails config loading instead
+    of being ignored (the value itself is never logged).
+
+    Args:
+        data: Raw config dict parsed from YAML (mutated in place).
+    """
+    value = os.environ.get("ADMINO_PUBLIC_URL")
+    if not value:
+        return
+    server_section = data.setdefault("server", {})
+    if not isinstance(server_section, dict):
+        logger.warning(
+            "Cannot apply ADMINO_PUBLIC_URL override: 'server' config section is not a mapping."
+        )
+        return
+    server_section["public_url"] = value
+
+
 def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     """Apply environment variable overrides to raw config data.
 
@@ -489,6 +591,7 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     - VLLM_BASE_URL      -> llm.vllm_base_url
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len (parsed to int)
     - COOKIE_SECURE      -> server.cookie_secure (true/false/1/0/yes/no/on/off)
+    - ADMINO_PUBLIC_URL  -> server.public_url (an invalid value fails validation)
     - LOG_LEVEL          -> log_level
 
     Args:
@@ -509,6 +612,7 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
 
     _apply_vllm_env_overrides(data)
     _apply_cookie_secure_override(data)
+    _apply_public_url_override(data)
 
     log_level = os.environ.get("LOG_LEVEL")
     if log_level:
