@@ -1,15 +1,21 @@
 <script setup lang="ts">
-import { Trash2, Download, MoreVertical } from 'lucide-vue-next';
+import { Trash2, MoreVertical } from 'lucide-vue-next';
+import { computed, ref } from 'vue';
 import StatusDot from './StatusDot.vue';
 import IconButton from './IconButton.vue';
+import { canSendChat } from '@/services/access';
+import { useAuthStore } from '@/stores/auth';
 import { useConnectionStore } from '@/stores/connection';
 import { useChatStore } from '@/stores/chat';
 import { t } from '@/i18n';
-import { ref } from 'vue';
 
+const auth = useAuthStore();
 const connection = useConnectionStore();
 const chatStore = useChatStore();
 const showMobileMenu = ref(false);
+
+// A Viewer never has a thread to clear (they can't send messages either).
+const showClearChat = computed(() => canSendChat(auth.role));
 
 function clearChat() {
   chatStore.clearThread();
@@ -23,12 +29,12 @@ function clearChat() {
       <span class="wordmark">admino</span>
       <StatusDot :state="connection.state" />
     </div>
-    <div class="header-actions desktop-only">
+    <div v-if="showClearChat" class="header-actions desktop-only">
       <IconButton :aria-label="t('chat.header.clearChat')" @click="clearChat">
         <Trash2 :size="18" :stroke-width="1.75" />
       </IconButton>
     </div>
-    <div class="header-actions mobile-only">
+    <div v-if="showClearChat" class="header-actions mobile-only">
       <IconButton :aria-label="t('chat.header.menu')" @click="showMobileMenu = !showMobileMenu">
         <MoreVertical :size="18" :stroke-width="1.75" />
       </IconButton>

@@ -20,11 +20,14 @@ export const en = {
   'common.confirm': 'Confirm',
   'common.loading': 'Loading',
 
-  // --- nav (top-level page navigation, issue #15) ----------------------
+  // --- nav (top-level page navigation, issue #15; issue #155: role-aware shell) ---
   'nav.chat': 'Chat',
   'nav.tools': 'Tools',
   'nav.permissions': 'Permissions',
+  'nav.organization': 'Organization',
   'nav.settings': 'Settings',
+  'nav.platform': 'Platform',
+  'nav.logout': 'Log out',
   'nav.mainNavigation': 'Main navigation',
 
   // --- status (connection state pill) ----------------------------------
@@ -47,7 +50,6 @@ export const en = {
   'toast.common.saveFailed.title': 'Save failed',
 
   // --- toast (chat store) ------------------------------------------------
-  'toast.chat.authRequired': 'Authentication required',
   'toast.chat.slowDown.title': 'Slow down',
   'toast.chat.slowDown.body': 'admino is rate-limited.',
   'toast.chat.genericError.title': 'Something went wrong',
@@ -339,4 +341,80 @@ export const en = {
   'settings.comingSoon.resetSettings': 'Reset settings is not yet available.',
   'settings.comingSoon.eraseAll': 'Erase all data is not yet available.',
   'settings.comingSoon.toggle': 'This toggle is not yet available.',
+  'settings.session.logout.label': 'Log out',
+  'settings.session.logout.hint': 'End your session on this device.',
+
+  // --- auth (session-expired toast, error copy, issue #155) --------------
+  'auth.sessionExpired.title': 'Session expired',
+  'auth.sessionExpired.body': 'Please log in again.',
+  'auth.login.error.invalid': 'Invalid email or password',
+  'auth.error.rateLimited': 'Too many attempts. Please wait a moment and try again.',
+  'auth.error.generic': 'Something went wrong. Please try again.',
+  'auth.reset.error.invalidLink': 'This reset link is invalid or has expired.',
+  'auth.invitation.error.invalidLink': 'This invitation link is invalid or has expired.',
+  'auth.invitation.error.invalidName': 'Please enter your name.',
+
+  // --- auth.password (password policy, issue #155) -----------------------
+  'auth.password.error.tooShort': 'Password is too short.',
+  'auth.password.error.tooLong': 'Password is too long.',
+  'auth.password.error.common': 'This password is too common.',
+  'auth.password.error.equalsEmail': 'Password must not be your email address.',
+  'auth.password.error.mismatch': 'Passwords do not match.',
+  'auth.password.error.generic': 'This password does not meet the requirements.',
+  'auth.password.rule.length': 'Between {min} and {max} characters.',
+  'auth.password.rule.common': 'Not a commonly used password.',
+  'auth.password.rule.email': 'Not the same as your email address.',
+
+  // --- auth.role (invited role, shown on the Accept invitation page) -----
+  'auth.role.orgAdmin': 'Org Admin',
+  'auth.role.editor': 'Editor',
+  'auth.role.viewer': 'Viewer',
+
+  // --- auth.login (Login page) --------------------------------------------
+  'auth.login.title': 'Log in',
+  'auth.login.email.label': 'Email',
+  'auth.login.password.label': 'Password',
+  'auth.login.submit': 'Log in',
+  'auth.login.forgotPassword': 'Forgot password?',
+
+  // --- auth.forgotPassword (Forgot password page) -------------------------
+  'auth.forgotPassword.title': 'Forgot password',
+  'auth.forgotPassword.subtitle': "Enter your email and we'll send you a reset link.",
+  'auth.forgotPassword.email.label': 'Email',
+  'auth.forgotPassword.submit': 'Send reset link',
+  'auth.forgotPassword.success':
+    "If an account exists for that address, we've sent a reset link. It's valid for 30 minutes.",
+  'auth.forgotPassword.backToLogin': 'Back to log in',
+
+  // --- auth.reset (Reset password page) ------------------------------------
+  'auth.reset.title': 'Reset password',
+  'auth.reset.invalidLink.heading': 'This link is invalid or has expired.',
+  'auth.reset.invalidLink.cta': 'Request a new link',
+  'auth.reset.password.label': 'New password',
+  'auth.reset.confirm.label': 'Confirm new password',
+  'auth.reset.submit': 'Change password',
+  'auth.reset.success': 'Password changed. Log in with your new password.',
+
+  // --- auth.invitation (Accept invitation page) ----------------------------
+  'auth.invitation.title': 'Accept invitation',
+  'auth.invitation.invalidLink.heading': 'This invitation link is invalid or has expired.',
+  'auth.invitation.org.label': 'Organization',
+  'auth.invitation.role.label': 'Role',
+  'auth.invitation.email.label': 'Email',
+  'auth.invitation.name.label': 'Full name',
+  'auth.invitation.password.label': 'Password',
+  'auth.invitation.confirm.label': 'Confirm password',
+  'auth.invitation.submit': 'Accept invitation',
+
+  // --- organization page (placeholder, issue #155) --------------------------
+  'organization.empty.heading': 'Organization',
+  'organization.empty.subtext': 'User management and organization settings will appear here.',
+
+  // --- platform page (placeholder, Super Admin console, issue #155) ---------
+  'platform.empty.heading': 'Platform console',
+  'platform.empty.subtext': 'The platform console will appear here.',
+
+  // --- chat page (read-only viewer, issue #155) -----------------------------
+  'chat.viewerEmpty.heading': 'Nothing shared with you yet',
+  'chat.viewerEmpty.subtext': 'Projects that others share with you will appear here.',
 } satisfies Record<string, Message>;

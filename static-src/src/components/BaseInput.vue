@@ -7,6 +7,11 @@ defineProps<{
   hint?: string;
   disabled?: boolean;
   modelValue?: string;
+  autocomplete?: string;
+  name?: string;
+  maxlength?: number;
+  required?: boolean;
+  readonly?: boolean;
 }>();
 
 defineEmits<{
@@ -23,6 +28,11 @@ defineEmits<{
       :type="type ?? 'text'"
       :placeholder="placeholder"
       :disabled="disabled"
+      :autocomplete="autocomplete"
+      :name="name"
+      :maxlength="maxlength"
+      :required="required"
+      :readonly="readonly"
       :value="modelValue"
       @input="$emit('update:modelValue', ($event.target as HTMLInputElement).value)"
       @blur="$emit('blur')"

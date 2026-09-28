@@ -16,11 +16,14 @@ export const fr: Record<MessageKey, Message> = {
   'common.confirm': 'Confirmer',
   'common.loading': 'Chargement',
 
-  // --- nav (top-level page navigation, issue #15) ----------------------
+  // --- nav (top-level page navigation, issue #15; issue #155: role-aware shell) ---
   'nav.chat': 'Discussion',
   'nav.tools': 'Outils',
   'nav.permissions': 'Autorisations',
+  'nav.organization': 'Organisation',
   'nav.settings': 'Paramètres',
+  'nav.platform': 'Plateforme',
+  'nav.logout': 'Se déconnecter',
   'nav.mainNavigation': 'Navigation principale',
 
   // --- status (connection state pill) ----------------------------------
@@ -44,7 +47,6 @@ export const fr: Record<MessageKey, Message> = {
   'toast.common.saveFailed.title': "Échec de l'enregistrement",
 
   // --- toast (chat store) ------------------------------------------------
-  'toast.chat.authRequired': 'Authentification requise',
   'toast.chat.slowDown.title': 'Ralentissez',
   'toast.chat.slowDown.body': 'admino est actuellement limité en débit.',
   'toast.chat.genericError.title': 'Un problème est survenu',
@@ -348,4 +350,81 @@ export const fr: Record<MessageKey, Message> = {
   'settings.comingSoon.resetSettings': "La réinitialisation des paramètres n'est pas encore disponible.",
   'settings.comingSoon.eraseAll': "L'effacement de toutes les données n'est pas encore disponible.",
   'settings.comingSoon.toggle': "Cette option n'est pas encore disponible.",
+  'settings.session.logout.label': 'Se déconnecter',
+  'settings.session.logout.hint': 'Met fin à votre session sur cet appareil.',
+
+  // --- auth (session-expired toast, error copy, issue #155) --------------
+  'auth.sessionExpired.title': 'Session expirée',
+  'auth.sessionExpired.body': 'Veuillez vous reconnecter.',
+  'auth.login.error.invalid': 'E-mail ou mot de passe invalide',
+  'auth.error.rateLimited': "Trop de tentatives. Veuillez patienter un instant et réessayer.",
+  'auth.error.generic': "Un problème est survenu. Veuillez réessayer.",
+  'auth.reset.error.invalidLink': 'Ce lien de réinitialisation est invalide ou a expiré.',
+  'auth.invitation.error.invalidLink': "Ce lien d'invitation est invalide ou a expiré.",
+  'auth.invitation.error.invalidName': 'Veuillez saisir votre nom.',
+
+  // --- auth.password (password policy, issue #155) -----------------------
+  'auth.password.error.tooShort': 'Le mot de passe est trop court.',
+  'auth.password.error.tooLong': 'Le mot de passe est trop long.',
+  'auth.password.error.common': 'Ce mot de passe est trop courant.',
+  'auth.password.error.equalsEmail': "Le mot de passe ne doit pas être votre adresse e-mail.",
+  'auth.password.error.mismatch': 'Les mots de passe ne correspondent pas.',
+  'auth.password.error.generic': 'Ce mot de passe ne respecte pas les exigences.',
+  'auth.password.rule.length': 'Entre {min} et {max} caractères.',
+  'auth.password.rule.common': 'Pas un mot de passe courant.',
+  'auth.password.rule.email': "Différent de votre adresse e-mail.",
+
+  // --- auth.role (invited role, shown on the Accept invitation page) -----
+  'auth.role.orgAdmin': "Administrateur de l'organisation",
+  'auth.role.editor': 'Éditeur',
+  'auth.role.viewer': 'Lecteur',
+
+  // --- auth.login (Login page) --------------------------------------------
+  'auth.login.title': 'Connexion',
+  'auth.login.email.label': 'E-mail',
+  'auth.login.password.label': 'Mot de passe',
+  'auth.login.submit': 'Se connecter',
+  'auth.login.forgotPassword': 'Mot de passe oublié?',
+
+  // --- auth.forgotPassword (Forgot password page) -------------------------
+  'auth.forgotPassword.title': 'Mot de passe oublié',
+  'auth.forgotPassword.subtitle': 'Saisissez votre e-mail et nous vous enverrons un lien de réinitialisation.',
+  'auth.forgotPassword.email.label': 'E-mail',
+  'auth.forgotPassword.submit': 'Envoyer le lien',
+  'auth.forgotPassword.success':
+    "Si un compte existe pour cette adresse, nous avons envoyé un lien de réinitialisation. Il est valable 30 minutes.",
+  'auth.forgotPassword.backToLogin': 'Retour à la connexion',
+
+  // --- auth.reset (Reset password page) ------------------------------------
+  'auth.reset.title': 'Réinitialiser le mot de passe',
+  'auth.reset.invalidLink.heading': 'Ce lien est invalide ou a expiré.',
+  'auth.reset.invalidLink.cta': 'Demander un nouveau lien',
+  'auth.reset.password.label': 'Nouveau mot de passe',
+  'auth.reset.confirm.label': 'Confirmer le nouveau mot de passe',
+  'auth.reset.submit': 'Changer le mot de passe',
+  'auth.reset.success': 'Mot de passe modifié. Connectez-vous avec votre nouveau mot de passe.',
+
+  // --- auth.invitation (Accept invitation page) ----------------------------
+  'auth.invitation.title': "Accepter l'invitation",
+  'auth.invitation.invalidLink.heading': "Ce lien d'invitation est invalide ou a expiré.",
+  'auth.invitation.org.label': 'Organisation',
+  'auth.invitation.role.label': 'Rôle',
+  'auth.invitation.email.label': 'E-mail',
+  'auth.invitation.name.label': 'Nom complet',
+  'auth.invitation.password.label': 'Mot de passe',
+  'auth.invitation.confirm.label': 'Confirmer le mot de passe',
+  'auth.invitation.submit': "Accepter l'invitation",
+
+  // --- organization page (placeholder, issue #155) --------------------------
+  'organization.empty.heading': 'Organisation',
+  'organization.empty.subtext':
+    "La gestion des utilisateurs et les paramètres de l'organisation apparaîtront ici.",
+
+  // --- platform page (placeholder, Super Admin console, issue #155) ---------
+  'platform.empty.heading': 'Console de la plateforme',
+  'platform.empty.subtext': 'La console de la plateforme apparaîtra ici.',
+
+  // --- chat page (read-only viewer, issue #155) -----------------------------
+  'chat.viewerEmpty.heading': "Rien n'a encore été partagé avec vous",
+  'chat.viewerEmpty.subtext': "Les projets que d'autres partagent avec vous apparaîtront ici.",
 };

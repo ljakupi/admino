@@ -1,18 +1,28 @@
 <script setup lang="ts">
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import { computed } from 'vue';
+import { LogOut } from 'lucide-vue-next';
+import IconButton from './IconButton.vue';
+import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
-import { NAV_ITEMS } from '@/services/navigation';
+import { navItemsFor } from '@/services/navigation';
 import { t } from '@/i18n';
 
 const route = useRoute();
+const router = useRouter();
+const auth = useAuthStore();
 const chatStore = useChatStore();
 
 const pendingCount = computed(() =>
   chatStore.pendingConfirmation ? 1 : 0,
 );
 
-const navItems = NAV_ITEMS;
+const navItems = computed(() => navItemsFor(auth.role));
+
+async function onLogout(): Promise<void> {
+  await auth.logout();
+  await router.replace('/login');
+}
 </script>
 
 <template>
@@ -24,7 +34,7 @@ const navItems = NAV_ITEMS;
         :key="item.to"
         :to="item.to"
         class="nav-item"
-        :class="{ active: route.path === item.to }"
+        :class="{ active: route.path.startsWith(item.to) }"
         :aria-label="t(item.labelKey)"
         :title="t(item.labelKey)"
       >
@@ -36,6 +46,11 @@ const navItems = NAV_ITEMS;
           />
         </span>
       </RouterLink>
+    </div>
+    <div class="nav-footer">
+      <IconButton :aria-label="t('nav.logout')" :title="t('nav.logout')" @click="onLogout">
+        <LogOut :size="20" :stroke-width="1.75" />
+      </IconButton>
     </div>
   </nav>
 </template>
@@ -103,5 +118,9 @@ const navItems = NAV_ITEMS;
   height: 8px;
   border-radius: 50%;
   background: var(--color-error);
+}
+
+.nav-footer {
+  margin-top: auto;
 }
 </style>

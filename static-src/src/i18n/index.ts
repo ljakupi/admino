@@ -6,9 +6,13 @@
  * stores can `import { t } from '@/i18n'` directly, or call `useI18n()`
  * (always the same instance — there is nothing per-component to set up).
  *
- * Starts in `'en'`, with no browser-language detection: every screen must
- * read exactly as it did before this issue. Issue #166 will later call
- * `setLocale(user.ui_language)` once the setting exists server-side.
+ * The instance itself still starts in `'en'` (nothing async can run at
+ * module load), but the active locale changes the moment the app knows more
+ * (issue #155): before login it follows the browser's Accept-Language
+ * (`@/services/locale`'s `browserLocale()`); after login it follows the
+ * signed-in profile's `ui_language`, applied by the auth store
+ * (`@/stores/auth`) whenever it loads or refreshes the profile. Issue #166
+ * will let a user change `ui_language` from Settings.
  */
 import { createI18n } from './core';
 import { de } from './locales/de';

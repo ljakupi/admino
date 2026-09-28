@@ -1,15 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import {
   Key, BrainCircuit, Palette, Bell, Info, TriangleAlert,
-  ShieldCheck, Plus, Github,
+  ShieldCheck, Plus, Github, LogOut,
 } from 'lucide-vue-next';
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
 import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
 import I18nT from '@/components/I18nT.vue';
 import { useSettingsStore, type LLMProvider } from '@/stores/settings';
+import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
 import { modelOptions, providerLabel, trustNote } from '@/services/llmProviders';
@@ -18,7 +19,9 @@ import { useI18n, type MessageKey } from '@/i18n';
 const { t } = useI18n();
 
 const route = useRoute();
+const router = useRouter();
 const settings = useSettingsStore();
+const auth = useAuthStore();
 const chatStore = useChatStore();
 const toasts = useToastStore();
 
@@ -126,6 +129,11 @@ function handleNewSession() {
   chatStore.clearThread();
   draftSessionId.value = settings.sessionId;
   toasts.add('success', t('settings.toast.newSession'));
+}
+
+async function handleLogout() {
+  await auth.logout();
+  await router.replace('/login');
 }
 
 async function handleDisconnectAll() {
@@ -248,6 +256,16 @@ async function onInfomaniakModelChange(event: Event) {
               <button class="s-btn secondary" @click="handleNewSession">
                 <Plus :size="14" :stroke-width="2" />
                 {{ t('settings.session.new.label') }}
+              </button>
+            </div>
+            <div class="s-row">
+              <div class="row-label">
+                {{ t('settings.session.logout.label') }}
+                <span class="row-hint">{{ t('settings.session.logout.hint') }}</span>
+              </div>
+              <button class="s-btn danger" @click="handleLogout">
+                <LogOut :size="14" :stroke-width="2" />
+                {{ t('settings.session.logout.label') }}
               </button>
             </div>
           </div>

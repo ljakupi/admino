@@ -10,6 +10,7 @@ import { useConnectionStore } from '@/stores/connection';
 const connection = useConnectionStore();
 const route = useRoute();
 
+const isPublicRoute = computed(() => route.meta.public === true);
 const showOfflineBanner = computed(() => connection.state === 'offline');
 
 onMounted(() => {
@@ -18,13 +19,19 @@ onMounted(() => {
 </script>
 
 <template>
-  <AppNavRail class="nav-rail" />
-  <main class="main-content">
-    <ConnectionBanner v-if="showOfflineBanner" />
+  <template v-if="isPublicRoute">
     <RouterView />
-  </main>
-  <BottomTabBar class="bottom-bar" />
-  <ToastHost />
+    <ToastHost />
+  </template>
+  <template v-else>
+    <AppNavRail class="nav-rail" />
+    <main class="main-content">
+      <ConnectionBanner v-if="showOfflineBanner" />
+      <RouterView />
+    </main>
+    <BottomTabBar class="bottom-bar" />
+    <ToastHost />
+  </template>
 </template>
 
 <style scoped>

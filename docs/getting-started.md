@@ -179,7 +179,8 @@ python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your
   logged.
 
 Then log in at **http://localhost:8000** with that email and password. The Super Admin
-sees the platform only and has no chat; chat needs a member account in an organization.
+only sees the Platform page (which later releases fill in) and has no chat; chat needs a
+member account in an organization.
 
 ## 6. Create an organization
 
@@ -204,14 +205,16 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
   your terminal instead; it isn't logged or stored anywhere else. Give it to the future Org
   Admin. The command refuses to run when its output doesn't go to a terminal (for example
   when piped into a file), so the link can't end up in a file.
-- The link works once, for 72 hours. Accepting it with a name and a password makes that
-  person the organization's Org Admin, who can then invite everyone else.
+- The link works once, for 72 hours. It opens the **Accept invitation** page, where the
+  future Org Admin sets their name and password and is logged in as the organization's Org
+  Admin. They can then invite everyone else.
 - An address that already has an account is refused, and nothing is created.
 
 ## 7. Your first chat
 
 1. Open **http://localhost:8000**.
-2. Log in with your email address and password. See
+2. Log in with your email address and password. **Forgot password?** on the login page
+   emails you a reset link. See
    [Accounts and sessions](configuration.md#accounts-and-sessions).
 3. With `INFOMANIAK_API_TOKEN` set, the default Infomaniak model answers right away.
    If the token is missing, admino still starts and the chat replies that Infomaniak

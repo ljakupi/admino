@@ -1,18 +1,20 @@
 <script setup lang="ts">
 import { useRoute } from 'vue-router';
 import { computed } from 'vue';
+import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
-import { NAV_ITEMS } from '@/services/navigation';
+import { navItemsFor } from '@/services/navigation';
 import { t } from '@/i18n';
 
 const route = useRoute();
+const auth = useAuthStore();
 const chatStore = useChatStore();
 
 const pendingCount = computed(() =>
   chatStore.pendingConfirmation ? 1 : 0,
 );
 
-const tabs = NAV_ITEMS;
+const tabs = computed(() => navItemsFor(auth.role));
 </script>
 
 <template>
@@ -22,7 +24,7 @@ const tabs = NAV_ITEMS;
       :key="tab.to"
       :to="tab.to"
       class="tab"
-      :class="{ active: route.path === tab.to }"
+      :class="{ active: route.path.startsWith(tab.to) }"
       :aria-label="t(tab.labelKey)"
     >
       <span class="tab-icon-wrap">
