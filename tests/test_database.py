@@ -682,3 +682,91 @@ class TestRemoveFilesToolMigration:
         assert re.search(r"\$\d", sql) is None
         assert "%s" not in sql
         assert "%(" not in sql
+
+
+# ---------------------------------------------------------------------------
+# TestDatabaseUrlFromEnv (GH-150)
+# ---------------------------------------------------------------------------
+
+_PG_ENV_VARS: tuple[str, ...] = ("PG_HOST", "PG_PORT", "PG_USER", "PG_DATABASE", "PG_PASSWORD")
+
+
+@pytest.fixture()
+def clean_pg_env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
+    """Remove every PG_* variable, so each test sets exactly what it needs."""
+    for name in _PG_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    return monkeypatch
+
+
+class TestDatabaseUrlFromEnv:
+    """database_url_from_env() builds the DSN from PG_* (moved from main, GH-150).
+
+    The server startup and the admin CLI share it. PG_PASSWORD is required;
+    the other variables have defaults. The password is URL-encoded with
+    quote_plus, so characters like "/" and "@" can't break the DSN.
+    """
+
+    def test_database_url_from_env_defaults_when_only_password_set(
+        self, clean_pg_env: pytest.MonkeyPatch
+    ) -> None:
+        """Only PG_PASSWORD set → localhost:5432, user and database 'admino'."""
+        clean_pg_env.setenv("PG_PASSWORD", "hunter2hunter2")
+
+        assert db_mod.database_url_from_env() == (
+            "postgresql://admino:hunter2hunter2@localhost:5432/admino"
+        )
+
+    def test_database_url_from_env_uses_overrides(self, clean_pg_env: pytest.MonkeyPatch) -> None:
+        """PG_HOST, PG_PORT, PG_USER and PG_DATABASE override the defaults."""
+        clean_pg_env.setenv("PG_HOST", "postgres")
+        clean_pg_env.setenv("PG_PORT", "6543")
+        clean_pg_env.setenv("PG_USER", "agent")
+        clean_pg_env.setenv("PG_DATABASE", "admino_prod")
+        clean_pg_env.setenv("PG_PASSWORD", "hunter2hunter2")
+
+        assert db_mod.database_url_from_env() == (
+            "postgresql://agent:hunter2hunter2@postgres:6543/admino_prod"
+        )
+
+    def test_database_url_from_env_url_encodes_password(
+        self, clean_pg_env: pytest.MonkeyPatch
+    ) -> None:
+        """A password with '/' and '@' is percent-encoded (quote_plus), never verbatim."""
+        clean_pg_env.setenv("PG_PASSWORD", "s3cr3t/p@ss")
+
+        url = db_mod.database_url_from_env()
+
+        assert url == "postgresql://admino:s3cr3t%2Fp%40ss@localhost:5432/admino"
+
+    def test_database_url_from_env_url_encodes_colon_and_percent(
+        self, clean_pg_env: pytest.MonkeyPatch
+    ) -> None:
+        """':' and '%' in the password are percent-encoded too."""
+        clean_pg_env.setenv("PG_PASSWORD", "a:b%c")
+
+        url = db_mod.database_url_from_env()
+
+        assert url == "postgresql://admino:a%3Ab%25c@localhost:5432/admino"
+
+    def test_database_url_from_env_without_password_returns_none(
+        self, clean_pg_env: pytest.MonkeyPatch
+    ) -> None:
+        """PG_PASSWORD unset → None (the caller reports the missing variable)."""
+        clean_pg_env.setenv("PG_HOST", "postgres")
+
+        assert db_mod.database_url_from_env() is None
+
+    def test_database_url_from_env_with_empty_password_returns_none(
+        self, clean_pg_env: pytest.MonkeyPatch
+    ) -> None:
+        """PG_PASSWORD set but empty → None, not a DSN with an empty password."""
+        clean_pg_env.setenv("PG_PASSWORD", "")
+
+        assert db_mod.database_url_from_env() is None
+
+    def test_database_url_builder_is_no_longer_duplicated_in_main(self) -> None:
+        """The builder moved: admino.main no longer defines its own _build_database_url."""
+        import admino.main as main_mod
+
+        assert not hasattr(main_mod, "_build_database_url")

@@ -2,10 +2,12 @@
 
 Owns the asyncpg pool lifecycle. All database access in admino goes through
 the pool returned by get_pool(). Migrations are plain numbered SQL files
-executed in order on startup.
+executed in order on startup. ``database_url_from_env()`` builds the DSN that
+both the server startup and the admin CLI open the pool with.
 
 Security notes:
-- DATABASE_URL is read from env var only, never from YAML or config files.
+- The DSN is built from the PG_* env vars only, never from YAML or config
+  files. The password is percent-encoded into it and never logged.
 - All SQL uses parameterized queries ($1, $2). No string interpolation.
 - Org-content repository functions take a TenantContext (admino.tenancy) as
   their first argument and filter by its org_id; there is no unscoped path.
@@ -16,9 +18,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote_plus
 
 import asyncpg
 
@@ -33,6 +37,29 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _pool: asyncpg.Pool | None = None
+
+
+def database_url_from_env() -> str | None:
+    """Build a PostgreSQL DSN from the PG_* env vars, URL-encoding the password.
+
+    PG_HOST defaults to localhost, PG_PORT to 5432, PG_USER and PG_DATABASE to
+    admino. PG_PASSWORD is required and percent-encoded (quote_plus), so
+    characters like "/" and "@" can't break the DSN.
+
+    Returns:
+        A ``postgresql://`` connection string, or None when PG_PASSWORD is
+        unset or empty (the caller reports the missing variable).
+    """
+    password = os.environ.get("PG_PASSWORD")
+    if not password:
+        return None
+
+    host = os.environ.get("PG_HOST", "localhost")
+    port = os.environ.get("PG_PORT", "5432")
+    user = os.environ.get("PG_USER", "admino")
+    database = os.environ.get("PG_DATABASE", "admino")
+
+    return f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
 
 
 async def init_pool(

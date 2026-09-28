@@ -28,11 +28,10 @@ import asyncio
 import os
 import sys
 from datetime import UTC, datetime
-from urllib.parse import quote_plus
 
 import httpx
 
-from admino.database import close_pool, init_pool, run_migrations
+from admino.database import close_pool, database_url_from_env, init_pool, run_migrations
 from admino.oauth import (
     GOOGLE_SCOPES,
     MICROSOFT_SCOPES,
@@ -52,11 +51,10 @@ _DEFAULT_REDIRECT_URI: str = "http://localhost:8000/oauth/callback"
 
 
 def _build_dsn() -> str:
-    """Build a PostgreSQL DSN from the PG_* env vars, URL-encoding the password.
+    """Build a PostgreSQL DSN from the PG_* env vars, or exit when PG_PASSWORD is missing.
 
-    Mirrors ``admino.main._build_database_url``: PG_HOST defaults to
-    localhost, PG_PORT to 5432, PG_USER/PG_DATABASE to admino. PG_PASSWORD
-    is required; if it is missing an error is printed to stderr and the
+    Uses ``admino.database.database_url_from_env`` (the DSN the server starts
+    with). If PG_PASSWORD is missing an error is printed to stderr and the
     process exits with code 1.
 
     Returns:
@@ -65,20 +63,14 @@ def _build_dsn() -> str:
     Raises:
         SystemExit: If PG_PASSWORD is not set.
     """
-    password = os.environ.get("PG_PASSWORD")
-    if not password:
+    dsn = database_url_from_env()
+    if dsn is None:
         print(
             "Error: PG_PASSWORD environment variable is not set.",
             file=sys.stderr,
         )
         sys.exit(1)
-
-    host = os.environ.get("PG_HOST", "localhost")
-    port = os.environ.get("PG_PORT", "5432")
-    user = os.environ.get("PG_USER", "admino")
-    database = os.environ.get("PG_DATABASE", "admino")
-
-    return f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
+    return dsn
 
 
 def _get_redirect_uri() -> str:

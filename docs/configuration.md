@@ -148,6 +148,10 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 admino has user accounts: you log in with your email address and password, and the
 server keeps your session.
 
+There's no public sign-up. The first account, a Super Admin, is created on the server with
+`make create-superadmin` (see
+[Create the first Super Admin](getting-started.md#5-create-the-first-super-admin)).
+
 - **Passwords** are hashed with **Argon2id** (19 MiB of memory, 2 iterations, 1 lane). When
   these settings change, your hash is upgraded at your next login. A password has 12 to 128
   characters, isn't your email address, and isn't one of the 100,000 most common passwords.

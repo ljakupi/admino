@@ -80,12 +80,14 @@ cp .env.example .env
 # 3. Load .env into your shell — `make run` reads the shell environment, not .env
 set -a; source .env; set +a
 
-# 4. Start PostgreSQL (Docker), then the agent
+# 4. Start PostgreSQL (Docker), create the first account (prompts for a password), start the agent
 make dev-db
+python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your Name'
 make run
 ```
 
-Open **http://localhost:8000** and log in. With
+Open **http://localhost:8000** and log in (see
+[Create the first Super Admin](docs/getting-started.md#5-create-the-first-super-admin)). With
 `INFOMANIAK_API_TOKEN` set you're ready to chat on Qwen3.5 (Infomaniak). Without it,
 admino still boots and the chat tells you which variable to set. **Settings → Agent**
 switches to local **vLLM**, **Claude** or **OpenAI**.
@@ -125,6 +127,7 @@ cp .env.example .env               # change PG_PASSWORD; set INFOMANIAK_API_TOKE
 make docker-build
 make docker-up                     # → http://localhost:8000 (postgres + agent)
 # or: make start-local             # adds the opt-in local vllm container
+make create-superadmin EMAIL=you@example.ch NAME='Your Name'   # first account
 ```
 
 > **New here?** The [Getting Started guide](docs/getting-started.md) walks through
