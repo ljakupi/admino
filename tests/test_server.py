@@ -100,11 +100,15 @@ def _make_config() -> Any:
     """Build a minimal mock AppConfig.
 
     It has no ``auth`` attribute at all (GH-149): the server must never read
-    ``config.auth`` again, so touching it raises AttributeError.
+    ``config.auth`` again, so touching it raises AttributeError. The server
+    section carries the real defaults the app reads (GH-156): CORS allows
+    ``public_url`` only, and no proxy is trusted.
     """
     config = MagicMock()
     del config.auth
     config.limits.max_message_length = 4000
+    config.server.public_url = "http://localhost:8000"
+    config.server.trusted_proxies = []
     return config
 
 

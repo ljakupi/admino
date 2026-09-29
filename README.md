@@ -130,6 +130,10 @@ make docker-up                     # → http://localhost:8000 (postgres + agent
 make create-superadmin EMAIL=you@example.ch NAME='Your Name'   # first account
 ```
 
+On a server, `make start-prod` puts a Caddy TLS reverse proxy in front of the agent for
+`ADMINO_DOMAIN` (HTTPS with Let's Encrypt, HSTS). See
+[Production deployment](docs/configuration.md#production-deployment-tls-reverse-proxy).
+
 > **New here?** The [Getting Started guide](docs/getting-started.md) walks through
 > configuration, connecting Google/Microsoft accounts, and your first chat in detail.
 

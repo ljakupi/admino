@@ -29,7 +29,17 @@
 #      NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
 #      reservation (tracked in issue #132).
 #
-# The Makefile wraps these with `make start` / `make start-local` — see Makefile.
+#   3. Production — Caddy TLS reverse proxy in front of the agent (GH-156)
+#      docker-compose.prod.yml adds Caddy (HTTPS for ADMINO_DOMAIN, HSTS,
+#      Let's Encrypt certificates) and keeps the agent off the host's ports.
+#        make start-prod  # postgres + agent + caddy; never vllm
+#
+# Host port for modes 1 and 2: docker-compose.local.yml publishes the agent on
+# 127.0.0.1:8000, and the Makefile's laptop targets pass it. The production
+# targets leave it out, so there the agent publishes no port.
+#
+# The Makefile wraps these with `make start` / `make start-local` /
+# `make start-prod` — see Makefile.
 
 services:
 
@@ -101,13 +111,9 @@ services:
     security_opt:
       - no-new-privileges:true
 
-    # Bind to localhost only. For LAN/VPN access, change to "0.0.0.0:8000:8000"
-    # or use a reverse proxy. Never expose directly on a public interface.
-    # Every API call needs a login session. The session cookie is Secure by
-    # default, so plain-HTTP access from another address (e.g. a phone on your
-    # LAN) also needs COOKIE_SECURE=false in .env.
-    ports:
-      - "127.0.0.1:8000:8000"
+    # No published port here. docker-compose.local.yml (laptop) publishes
+    # 127.0.0.1:8000; in production (docker-compose.prod.yml) the agent is
+    # reachable only through the Caddy TLS reverse proxy.
 
     depends_on:
       postgres:

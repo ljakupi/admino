@@ -435,6 +435,9 @@ def _config(*, cookie_secure: bool = True) -> MagicMock:
     config.server.host = "127.0.0.1"
     config.server.port = 8000
     config.server.cookie_secure = cookie_secure
+    # GH-156: the real defaults the app reads (CORS allows public_url only; no proxy trusted).
+    config.server.public_url = "http://localhost:8000"
+    config.server.trusted_proxies = []
     config.llm.provider = "infomaniak"
     config.llm.active_model_name = "test-model"
     return config

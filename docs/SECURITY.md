@@ -76,6 +76,32 @@ itself in — not full root:
 | `cap_add: SETUID`, `SETGID` | Add back only "switch user" (so `gosu` can drop root → admino). |
 | `security_opt: no-new-privileges` | Once dropped to `admino`, it can never climb back to root. |
 
+## The TLS reverse proxy (production profile)
+
+In production (`docker-compose.prod.yml`), a Caddy container sits in front of the agent. It's
+the only service on the host's ports (80 and 443). It terminates TLS with a Let's Encrypt
+certificate, redirects HTTP to HTTPS and sends HSTS. It gets the same treatment as the agent:
+
+- **Its own egress firewall.** `deploy/caddy/entrypoint.sh` drops all outbound traffic
+  except DNS, the agent's port 8000 on the internal proxy network, and Let's Encrypt's
+  ACME API on 443 (certificate issuance and renewal). Caddy is configured to use no other
+  certificate authority and to make no OCSP requests. There's no opt-out: without
+  `NET_ADMIN`, the container refuses to start.
+- **Root → non-root.** After the firewall is set, `su-exec` drops to the `caddy` user,
+  which runs with **no capabilities** and `no-new-privileges`. Binding ports 80 and 443
+  needs none: the `net.ipv4.ip_unprivileged_port_start=0` sysctl only applies to the
+  container's own network namespace. The Caddyfile and entrypoint are root-owned and
+  read-only, and the container's root filesystem is read-only.
+- **No request paths in logs.** Invitation and password reset tokens travel in URL paths.
+  Caddy keeps no access log, and its default log leaves out `http.log.error` and the
+  reverse proxy's logger, the two loggers that would print a request's path and query string.
+- **Client IPs can't be spoofed.** Caddy replaces any `X-Forwarded-For` a client sends
+  with the client's real address. The agent believes `X-Forwarded-For` and
+  `X-Forwarded-Proto` only from Caddy's fixed address (`server.trusted_proxies`, set by
+  `ADMINO_TRUSTED_PROXIES`), so per-IP rate limits and audit events record real client
+  addresses. uvicorn's own forwarded-header handling is off, so it doesn't trust other
+  addresses such as `127.0.0.1`.
+
 ## Known limitations & tradeoffs
 
 We prefer to be transparent about what this does **not** guarantee:
@@ -83,12 +109,20 @@ We prefer to be transparent about what this does **not** guarantee:
 - **IP staleness.** Approved hosts are resolved to IPs **once at startup**;
   iptables rules pin those IPs. Cloud providers rotate IPs, so on a long-running
   container the rules can drift and legitimate calls may start failing. Restart
-  to re-resolve. (This is the biggest weakness of the current mechanism.)
+  to re-resolve. (This is the biggest weakness of the current mechanism.) The
+  same applies to the Caddy proxy's Let's Encrypt rule. Let's Encrypt's API
+  address rarely changes, but if renewals start failing, restart the `caddy` container.
 - **DNS egress is broad.** Port 53 is allowed to any destination because
   Docker's embedded resolver forwards upstream to an address we can't predict
   portably. This leaves a low-bandwidth DNS-tunneling exfiltration channel open.
   Accepted for the laptop/home-server threat model; rate-limiting is a candidate
   follow-up.
+- **The Docker host can reach the agent directly.** In the production profile the
+  agent publishes no port, and its proxy network is `internal`, but processes on
+  the server itself can still open plain HTTP to the agent's container address,
+  bypassing TLS. They get no more than any other client: the login is still
+  required, and their forwarded headers are ignored because they don't come from
+  Caddy's address. Anyone with that access to the server can already read `.env`.
 - **Laptop-first.** This control exists because the default deployment is a
   laptop or home server, where there is no cloud network policy. Cloud
   deployments can and should *also* use native egress controls (K8s

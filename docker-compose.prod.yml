@@ -1,0 +1,134 @@
+# admino — Production overlay: Caddy TLS reverse proxy in front of the agent (GH-156).
+#
+# Usage (see Makefile):
+#   make docker-build-prod   # build the agent and caddy images
+#   make start-prod          # start postgres + agent + caddy (never vllm)
+#   make docker-logs-prod    # follow logs
+#   make docker-down-prod    # stop everything
+# which run, e.g.:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres agent caddy
+#
+# docker-compose.local.yml (the laptop port) is left out, so the agent
+# publishes NO host port: Caddy is the only service on the host's ports (80 and
+# 443), and it reaches the agent over the internal `proxy` network.
+#
+# Requires ADMINO_DOMAIN in .env: the public hostname (e.g. admino.example.ch)
+# whose DNS A record points at this server, with ports 80 and 443 open inbound.
+# Caddy then gets a Let's Encrypt certificate for it and renews it on its own.
+# ADMINO_DOMAIN=localhost runs a local test with Caddy's internal CA instead.
+#
+# What this profile guarantees:
+#   - HTTPS only: HTTP redirects to HTTPS, and Caddy sends HSTS.
+#   - The agent trusts X-Forwarded-For / X-Forwarded-Proto only from Caddy's
+#     fixed address (ADMINO_TRUSTED_PROXIES), so client IPs in rate limits and
+#     audit events are real and can't be spoofed by other peers.
+#   - The session cookie is Secure (COOKIE_SECURE=true, set here so .env can't
+#     turn it off), and links and CORS use https://ADMINO_DOMAIN.
+#   - Caddy's only egress is Let's Encrypt (iptables in deploy/caddy/entrypoint.sh),
+#     it keeps no access log, and it never logs request paths or query strings
+#     (invitation tokens travel in URL paths).
+#   - No vllm service: the make targets list the services explicitly, so even a
+#     COMPOSE_PROFILES=vllm in the environment can't start it here.
+#   - One agent process: main.py runs a single uvicorn worker, and the fixed
+#     container_name keeps the agent at one replica. Pending confirmations,
+#     rate-limit buckets and other state live in that process's memory.
+
+services:
+  agent:
+    environment:
+      # These override the same keys in .env (compose gives `environment`
+      # precedence over `env_file`).
+      ADMINO_PUBLIC_URL: "https://${ADMINO_DOMAIN:?Set ADMINO_DOMAIN in .env (e.g. admino.example.ch)}"
+      COOKIE_SECURE: "true"
+      # Caddy's fixed address on the proxy network (see caddy.networks below).
+      ADMINO_TRUSTED_PROXIES: "172.31.0.10/32"
+    networks:
+      # Reached by Caddy only; internal, so no route to the outside.
+      - proxy
+
+  caddy:
+    build:
+      context: deploy/caddy
+      dockerfile: Dockerfile
+    image: admino-caddy:local
+    container_name: admino-caddy
+    restart: unless-stopped
+
+    # Least privilege, as for the agent. The root entrypoint needs:
+    #   NET_ADMIN     — apply the iptables egress whitelist
+    #   SETUID/SETGID — let su-exec drop root → caddy
+    # Caddy itself then runs with no capabilities: binding 80/443 is allowed by
+    # the ip_unprivileged_port_start sysctl below (scoped to this container's
+    # network namespace).
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv4.ip_unprivileged_port_start: "0"
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /run
+
+    # The only published ports of the production profile. HTTP (80) serves the
+    # Let's Encrypt HTTP-01 challenge and redirects everything else to HTTPS.
+    ports:
+      - "80:80"
+      - "443:443"
+
+    environment:
+      ADMINO_DOMAIN: "${ADMINO_DOMAIN:?Set ADMINO_DOMAIN in .env (e.g. admino.example.ch)}"
+      # Where the agent listens: Caddy's egress rule allows TCP 8000 in this range.
+      PROXY_NETWORK: "172.31.0.0/24"
+
+    volumes:
+      # Certificates, keys and the ACME account (owned by the caddy user).
+      - caddy-data:/data
+      # Caddy's autosaved runtime config.
+      - caddy-config:/config
+
+    networks:
+      proxy:
+        # Fixed, so the agent can trust exactly this address (ADMINO_TRUSTED_PROXIES).
+        ipv4_address: 172.31.0.10
+      # Published ports and the Let's Encrypt egress. Only Caddy is attached.
+      edge: {}
+
+    depends_on:
+      agent:
+        condition: service_healthy
+
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+
+# `proxy` (internal: true): Caddy ↔ agent only; no external routing, and neither
+# postgres nor vllm is attached. Pinned so Caddy's address is known in advance.
+# Change it only if it collides with an existing network, and then update
+# ADMINO_TRUSTED_PROXIES, PROXY_NETWORK and caddy's ipv4_address together.
+# `edge`: a standard bridge for Caddy's published ports and its egress, which
+# deploy/caddy/entrypoint.sh restricts to Let's Encrypt.
+networks:
+  proxy:
+    name: admino-proxy
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+  edge:
+    name: admino-edge
+    driver: bridge
+
+volumes:
+  caddy-data:
+    name: admino-caddy-data
+  caddy-config:
+    name: admino-caddy-config

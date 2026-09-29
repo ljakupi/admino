@@ -35,8 +35,11 @@ Security notes:
   failed write raises, so the agent aborts the run (H-1).
 - Registry is frozen after tool imports to block dynamic registration.
 - Single-worker uvicorn prevents split-brain session state.
-- HSTS is not set here (plain HTTP local deployment). When deploying
-  behind a TLS reverse proxy, configure HSTS at the proxy layer.
+- HSTS is not set here: the Caddy proxy of the production profile
+  (docker-compose.prod.yml) terminates TLS and sends it.
+- uvicorn runs with ``proxy_headers=False``: X-Forwarded-For/Proto are
+  believed only from ``server.trusted_proxies`` (the app's middleware), never
+  from uvicorn's own default trust of 127.0.0.1 or FORWARDED_ALLOW_IPS.
 """
 
 from __future__ import annotations
@@ -565,6 +568,10 @@ def main(
         log_level=config.log_level.lower(),
         # Disable uvicorn's default access log to avoid double-logging.
         access_log=False,
+        # uvicorn's own X-Forwarded-* handling (it trusts 127.0.0.1, or
+        # FORWARDED_ALLOW_IPS, by default) must never run: the app's
+        # server.trusted_proxies is the only source of truth.
+        proxy_headers=False,
     )
 
 

@@ -15,12 +15,20 @@ Security notes:
 - YAML parsing uses safe_load only (no arbitrary Python object deserialization).
 - The session cookie is ``Secure`` by default (``server.cookie_secure``); only
   a recognised false value of COOKIE_SECURE turns it off, and an unrecognised
-  value is ignored with a warning, so a typo can't weaken it.
+  value is ignored with a warning, so a typo can't weaken it. A non-Secure
+  cookie is development-only: it is refused with an https ``server.public_url``,
+  so a production deployment can't run with it.
 - ``server.public_url`` (ADMINO_PUBLIC_URL) is the only base of emailed links
   (password resets, later invitations); the request's Host header never is,
   so a forged Host can't poison a link. It must be a bare https origin (plain
   http only for localhost, 127.0.0.1 and [::1]); an invalid value fails
   config loading, and the error never repeats the value.
+- ``server.trusted_proxies`` (ADMINO_TRUSTED_PROXIES) lists the reverse proxy
+  networks whose X-Forwarded-For/Proto headers are believed; the default is
+  empty (no peer is trusted, loopback included). Each entry must be an
+  IPv4/IPv6 address or network without host bits set or a scope ID, and not
+  /0 (every address); at most 16. An invalid value fails config loading, and neither
+  the error nor the log repeats it.
 """
 
 from __future__ import annotations
@@ -62,6 +70,14 @@ _URL_BANNED_CHARS: Final = frozenset('<>"\\')
 _PUBLIC_URL_ERROR: Final = (
     "server.public_url must be an https origin such as https://admino.example.ch "
     "(plain http only for localhost), without user info, path, query or fragment."
+)
+_TRUSTED_PROXIES_ERROR: Final = (
+    "server.trusted_proxies entries must be IPv4 or IPv6 addresses or CIDR networks, "
+    "without host bits set, a scope ID, or a prefix length of 0."
+)
+_INSECURE_COOKIE_ERROR: Final = (
+    "server.cookie_secure may be false (COOKIE_SECURE=false) only in development, with "
+    "a plain-http localhost server.public_url; an https public URL needs the Secure cookie."
 )
 
 
@@ -107,7 +123,13 @@ def _check_public_url(value: str) -> str:
 
 
 class ServerConfig(BaseModel):
-    """HTTP server settings."""
+    """HTTP server settings.
+
+    ``trusted_proxies`` lists the reverse proxy networks whose X-Forwarded-For
+    and X-Forwarded-Proto headers are believed (empty: trust no peer).
+    ``cookie_secure=False`` is development-only: it is refused with an https
+    ``public_url``.
+    """
 
     # Validation errors never repeat the rejected input (e.g. a public URL).
     model_config = ConfigDict(hide_input_in_errors=True)
@@ -126,8 +148,8 @@ class ServerConfig(BaseModel):
     cookie_secure: bool = Field(
         default=True,
         description=(
-            "Set the Secure flag on the session cookie. Turn it off (COOKIE_SECURE=false) "
-            "only for plain-HTTP access from another address, e.g. a phone on the LAN."
+            "Set the Secure flag on the session cookie. Turning it off (COOKIE_SECURE=false) "
+            "is development-only: it is refused with an https public_url."
         ),
     )
     public_url: str = Field(
@@ -138,6 +160,15 @@ class ServerConfig(BaseModel):
             "The origin users reach admino at (https; plain http only for localhost). "
             "Emailed links such as password resets are built from it, never from the "
             "request's Host header. ADMINO_PUBLIC_URL overrides it."
+        ),
+    )
+    trusted_proxies: list[str] = Field(
+        default_factory=list,
+        max_length=16,
+        description=(
+            "Reverse proxy addresses or CIDR networks whose X-Forwarded-For and "
+            "X-Forwarded-Proto headers are believed; empty (the default) trusts no peer. "
+            "ADMINO_TRUSTED_PROXIES (comma-separated) overrides it."
         ),
     )
 
@@ -159,6 +190,37 @@ class ServerConfig(BaseModel):
     def validate_public_url(cls, v: str) -> str:
         """Accept a bare https origin (http for loopback only), without a trailing slash."""
         return _check_public_url(v)
+
+    @field_validator("trusted_proxies")
+    @classmethod
+    def validate_trusted_proxies(cls, v: list[str]) -> list[str]:
+        """Store each entry as a network string (an address becomes a /32 or /128).
+
+        Refuses anything but an IPv4/IPv6 address or network, a network with
+        host bits set, a /0 prefix (it would trust every address) and an IPv6
+        scope ID (ipaddress would keep any text after '%'). The error never
+        repeats the value: the ipaddress module's messages do, so they are
+        replaced.
+        """
+        networks: list[str] = []
+        for entry in v:
+            if "%" in entry:
+                raise ValueError(_TRUSTED_PROXIES_ERROR)
+            try:
+                network = ipaddress.ip_network(entry, strict=True)
+            except ValueError:
+                raise ValueError(_TRUSTED_PROXIES_ERROR) from None
+            if network.prefixlen == 0:
+                raise ValueError(_TRUSTED_PROXIES_ERROR)
+            networks.append(str(network))
+        return networks
+
+    @model_validator(mode="after")
+    def validate_insecure_cookie_is_dev_only(self) -> ServerConfig:
+        """Refuse ``cookie_secure=False`` with an https public URL (without repeating it)."""
+        if not self.cookie_secure and self.public_url.startswith("https://"):
+            raise ValueError(_INSECURE_COOKIE_ERROR)
+        return self
 
 
 class LLMConfig(BaseModel):
@@ -467,12 +529,14 @@ class AppConfig(BaseModel):
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len
     - COOKIE_SECURE     -> server.cookie_secure
     - ADMINO_PUBLIC_URL -> server.public_url
+    - ADMINO_TRUSTED_PROXIES -> server.trusted_proxies
     - LOG_LEVEL         -> log_level
     """
 
     # Pydantic applies hide_input_in_errors from the model being validated, not
-    # from nested ones: without it here, an invalid server.public_url loaded from
-    # the database would reach the startup error log.
+    # from nested ones: without it here, an invalid server.public_url or
+    # server.trusted_proxies loaded from the database would reach the startup
+    # error log.
     model_config = ConfigDict(hide_input_in_errors=True)
 
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -582,6 +646,31 @@ def _apply_public_url_override(data: dict[str, object]) -> None:
     server_section["public_url"] = value
 
 
+def _apply_trusted_proxies_override(data: dict[str, object]) -> None:
+    """Apply the ADMINO_TRUSTED_PROXIES env override to ``server.trusted_proxies`` in-place.
+
+    A comma-separated list: items are stripped and empty items dropped. Unset
+    or blank changes nothing. Any other value replaces the YAML list and is
+    validated with it, so an invalid value fails config loading instead of
+    being ignored (the value itself is never logged).
+
+    Args:
+        data: Raw config dict parsed from YAML (mutated in place).
+    """
+    items = [item.strip() for item in os.environ.get("ADMINO_TRUSTED_PROXIES", "").split(",")]
+    proxies = [item for item in items if item]
+    if not proxies:
+        return
+    server_section = data.setdefault("server", {})
+    if not isinstance(server_section, dict):
+        logger.warning(
+            "Cannot apply ADMINO_TRUSTED_PROXIES override: 'server' config section is not "
+            "a mapping."
+        )
+        return
+    server_section["trusted_proxies"] = proxies
+
+
 def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     """Apply environment variable overrides to raw config data.
 
@@ -592,6 +681,8 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     - VLLM_MAX_MODEL_LEN -> llm.vllm_max_model_len (parsed to int)
     - COOKIE_SECURE      -> server.cookie_secure (true/false/1/0/yes/no/on/off)
     - ADMINO_PUBLIC_URL  -> server.public_url (an invalid value fails validation)
+    - ADMINO_TRUSTED_PROXIES -> server.trusted_proxies (comma-separated; an invalid
+      value fails validation)
     - LOG_LEVEL          -> log_level
 
     Args:
@@ -613,6 +704,7 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     _apply_vllm_env_overrides(data)
     _apply_cookie_secure_override(data)
     _apply_public_url_override(data)
+    _apply_trusted_proxies_override(data)
 
     log_level = os.environ.get("LOG_LEVEL")
     if log_level:

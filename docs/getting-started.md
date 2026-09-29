@@ -139,8 +139,14 @@ make docker-down              # stop everything
 first run it downloads the model weights (~8 GB) into a Docker volume, and it skips the
 download once they're cached. Then pick **vLLM** in **Settings → Agent**.
 
-The API is published on **http://localhost:8000** (bound to `127.0.0.1` only). No host
-directory is mounted into the container, so the agent can't reach files on your machine.
+The API is published on **http://localhost:8000** (bound to `127.0.0.1` only, by
+`docker-compose.local.yml`). No host directory is mounted into the container, so the
+agent can't reach files on your machine.
+
+**On a server.** `make start-prod` runs the production profile instead: a Caddy reverse
+proxy serves admino over HTTPS at `ADMINO_DOMAIN`, with a Let's Encrypt certificate, and
+the agent publishes no port. See
+[Production deployment](configuration.md#production-deployment-tls-reverse-proxy).
 
 > **Docker Desktop memory (`make start-local` only):** the vLLM CPU container needs ~8 GB for the model plus KV
 > cache headroom. Allocate **~12–16 GB** in Docker Desktop → Settings → Resources →
