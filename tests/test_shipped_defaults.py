@@ -21,10 +21,18 @@ GH-149 removes the old auth: the shipped config.yaml has no ``auth`` section
 and documents ``COOKIE_SECURE`` (the session cookie's Secure flag, on by
 default), and the shipped config keeps ``server.cookie_secure`` on.
 
+GH-156 (TLS reverse proxy): the shipped config.yaml sets
+``server.trusted_proxies`` to an empty list (trust nobody; the production
+compose overlay sets ADMINO_TRUSTED_PROXIES), and ``.env.example`` documents
+``ADMINO_DOMAIN`` (the production profile's public hostname) and
+``ADMINO_TRUSTED_PROXIES``, and describes ``COOKIE_SECURE=false`` as
+development-only.
+
 Hermeticity: ``load_app_config`` and the ``LLMConfig`` validators consult a
 number of environment variables (provider keys/tokens, LLM_PROVIDER, VLLM_*
-overrides, COOKIE_SECURE, ADMINO_PUBLIC_URL, LOG_LEVEL, AUDIT_LOG_PATH). A fixture clears all of
-them so these tests are independent of the developer's shell environment.
+overrides, COOKIE_SECURE, ADMINO_PUBLIC_URL, ADMINO_TRUSTED_PROXIES, LOG_LEVEL,
+AUDIT_LOG_PATH). A fixture clears all of them so these tests are independent of
+the developer's shell environment.
 """
 
 from __future__ import annotations
@@ -60,6 +68,7 @@ _ENV_VARS_TO_CLEAR = (
     "VLLM_MAX_MODEL_LEN",
     "COOKIE_SECURE",
     "ADMINO_PUBLIC_URL",
+    "ADMINO_TRUSTED_PROXIES",
     "LOG_LEVEL",
     "AUDIT_LOG_PATH",
 )
@@ -98,6 +107,16 @@ def _active_env_values(env_text: str, key: str) -> list[str]:
         if line.startswith(prefix):
             values.append(line[len(prefix) :].strip())
     return values
+
+
+def _paragraphs_mentioning(env_text: str, key: str) -> list[str]:
+    """Return the blank-line separated blocks of a .env file that contain ``KEY=``.
+
+    A block is the comment paragraph around a variable, so it holds the
+    variable's own documentation (active or commented-out line alike).
+    """
+    pattern = re.compile(rf"^\s*#?\s*{re.escape(key)}\s*=", re.MULTILINE)
+    return [block for block in re.split(r"\n\s*\n", env_text) if pattern.search(block)]
 
 
 def _requirement_name(requirement: str) -> str:
@@ -174,6 +193,19 @@ class TestShippedConfigDefaults:
         """GH-151: laptop-first, reset links point at http://localhost:8000 unless a
         deployment sets ADMINO_PUBLIC_URL."""
         assert shipped_config.server.public_url == "http://localhost:8000"  # type: ignore[attr-defined]
+
+    def test_shipped_config_yaml_sets_empty_trusted_proxies(self) -> None:
+        """GH-156: config.yaml states server.trusted_proxies as an empty list (trust
+        nobody); the production compose overlay sets ADMINO_TRUSTED_PROXIES."""
+        raw = yaml.safe_load(SHIPPED_CONFIG_PATH.read_text(encoding="utf-8"))
+        assert isinstance(raw, dict)
+        assert isinstance(raw.get("server"), dict)
+        assert "trusted_proxies" in raw["server"]
+        assert raw["server"]["trusted_proxies"] == []
+
+    def test_shipped_config_trusts_no_proxy(self, shipped_config: AppConfig) -> None:
+        """GH-156: loaded, the shipped config trusts no proxy's forwarded headers."""
+        assert shipped_config.server.trusted_proxies == []
 
     def test_shipped_egress_includes_infomaniak(self, shipped_config: AppConfig) -> None:
         """The default provider's API host is whitelisted (GH-142)."""
@@ -302,6 +334,23 @@ class TestShippedEnvExample:
         assert "COOKIE_SECURE" in env_text
         values = _active_env_values(env_text, "COOKIE_SECURE")
         assert all(value.lower() in {"true", "1", "yes", "on"} for value in values)
+
+    @pytest.mark.parametrize("variable", ["ADMINO_DOMAIN", "ADMINO_TRUSTED_PROXIES"])
+    def test_env_example_documents_production_proxy_variable(
+        self, env_text: str, variable: str
+    ) -> None:
+        """GH-156: the production profile's public hostname (ADMINO_DOMAIN) and the
+        trusted proxy list (ADMINO_TRUSTED_PROXIES) are documented, active or commented."""
+        pattern = re.compile(rf"^\s*#?\s*{variable}\s*=", re.MULTILINE)
+        assert pattern.search(env_text) is not None
+
+    def test_env_example_describes_insecure_cookie_as_dev_only(self, env_text: str) -> None:
+        """GH-156: COOKIE_SECURE=false is described as a development-only setting."""
+        paragraphs = _paragraphs_mentioning(env_text, "COOKIE_SECURE")
+        assert paragraphs, "COOKIE_SECURE is not documented"
+        # "dev", "dev-only" or "development" ("device" doesn't count).
+        dev_only = re.compile(r"\b(?:dev|development)\b", re.IGNORECASE)
+        assert any(dev_only.search(block) for block in paragraphs)
 
     def test_env_example_provider_unset_or_infomaniak(self, env_text: str) -> None:
         """Any active LLM_PROVIDER line must be 'infomaniak'.

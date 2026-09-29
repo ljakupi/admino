@@ -27,6 +27,17 @@ origin: https with a host and an optional port (plain http only for localhost,
 fragment, no whitespace or control characters, at most 2048 characters; the
 error never repeats the value. ``ADMINO_PUBLIC_URL`` (set and non-empty)
 overrides it, and an invalid value makes config loading fail.
+
+GH-156: ``ServerConfig.trusted_proxies`` (default ``[]``: trust nobody) lists
+the reverse proxy's addresses or networks. Each entry is an IPv4/IPv6 address
+or a CIDR network, stored as a network string (``172.31.0.10`` becomes
+``172.31.0.10/32``); anything else, a network with host bits set, a prefix
+length of 0 (every address) or more than 16 entries fails validation, and the
+error never repeats the value. ``ADMINO_TRUSTED_PROXIES`` (a comma-separated
+list; blank items ignored) replaces the YAML list; unset or blank changes
+nothing; an invalid value makes config loading fail without the value reaching
+the error or the log. A non-Secure session cookie (``cookie_secure=False``) is
+dev-only: it is refused with an https public URL.
 """
 
 from __future__ import annotations
@@ -65,6 +76,12 @@ def _no_cookie_secure_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _no_public_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start every test without an ADMINO_PUBLIC_URL override from the developer's shell."""
     monkeypatch.delenv("ADMINO_PUBLIC_URL", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_trusted_proxies_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test without an ADMINO_TRUSTED_PROXIES override from the developer's shell."""
+    monkeypatch.delenv("ADMINO_TRUSTED_PROXIES", raising=False)
 
 
 # A strong value of the removed AUTH_TOKEN env var (it must have no effect now).
@@ -1590,3 +1607,418 @@ class TestPublicUrl:
         with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
             config = await load_app_config_from_db(MagicMock())
         assert config.server.public_url == "https://admino.example.ch"  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# GH-156: ServerConfig.trusted_proxies + ADMINO_TRUSTED_PROXIES env override
+# ---------------------------------------------------------------------------
+
+# (entry, stored network string): addresses become single-host networks.
+_TRUSTED_PROXIES_ACCEPTED: list[object] = [
+    pytest.param("172.31.0.10", "172.31.0.10/32", id="ipv4-address"),
+    pytest.param("172.31.0.10/32", "172.31.0.10/32", id="ipv4-single-host-network"),
+    pytest.param("172.31.0.0/24", "172.31.0.0/24", id="ipv4-network"),
+    pytest.param("10.0.0.0/8", "10.0.0.0/8", id="ipv4-wide-network"),
+    pytest.param("127.0.0.1", "127.0.0.1/32", id="ipv4-loopback"),
+    pytest.param("2001:db8::1", "2001:db8::1/128", id="ipv6-address"),
+    pytest.param("2001:db8::/64", "2001:db8::/64", id="ipv6-network"),
+    pytest.param("::1", "::1/128", id="ipv6-loopback"),
+]
+
+_TRUSTED_PROXIES_REFUSED: list[object] = [
+    pytest.param("not-an-ip", id="not-an-ip"),
+    pytest.param("localhost", id="hostname-localhost"),
+    pytest.param("caddy", id="hostname-service"),
+    pytest.param("*", id="wildcard"),
+    pytest.param("", id="empty"),
+    pytest.param("300.1.1.1", id="octet-out-of-range"),
+    pytest.param("172.31.0.10/24", id="host-bits-set"),
+    pytest.param("2001:db8::1/64", id="ipv6-host-bits-set"),
+    pytest.param("0.0.0.0/0", id="ipv4-every-address"),
+    pytest.param("::/0", id="ipv6-every-address"),
+    pytest.param("10.0.0.0/33", id="prefix-too-long"),
+    pytest.param("10.0.0.0/abc", id="prefix-not-a-number"),
+    pytest.param("172.31.0.10, 10.0.0.0/8", id="comma-list-in-one-entry"),
+    # An IPv6 scope ID is meaningless for a proxy network, and ipaddress would
+    # keep any text after '%' in the stored entry.
+    pytest.param("fe80::%eth0/64", id="ipv6-network-scope-id"),
+    pytest.param("fe80::1%anything-goes", id="ipv6-address-scope-id"),
+]
+
+# (value, distinctive parts that must not appear in the error). The ipaddress
+# module's own messages repeat the value, so re-raising them would leak it.
+_TRUSTED_PROXY_ECHO_CASES: list[object] = [
+    pytest.param("evil-proxy-value", ["evil-proxy-value"], id="not-an-ip"),
+    pytest.param("10.123.45.67/24", ["10.123.45.67"], id="host-bits-set"),
+    pytest.param("2001:db8:77::1/64", ["2001:db8:77::1"], id="ipv6-host-bits-set"),
+    pytest.param("310.20.30.40", ["310.20.30.40"], id="octet-out-of-range"),
+    pytest.param("10.20.30.0/99", ["10.20.30.0"], id="prefix-too-long"),
+]
+
+# ADMINO_TRUSTED_PROXIES values that must fail config loading.
+_TRUSTED_PROXIES_ENV_REFUSED: list[object] = [
+    pytest.param("not-an-ip", id="not-an-ip"),
+    pytest.param("localhost", id="hostname"),
+    pytest.param("*", id="wildcard"),
+    pytest.param("0.0.0.0/0", id="ipv4-every-address"),
+    pytest.param("::/0", id="ipv6-every-address"),
+    pytest.param("172.31.0.10/24", id="host-bits-set"),
+    pytest.param("172.31.0.10, not-an-ip", id="one-bad-item"),
+    pytest.param("172.31.0.10;10.0.0.0/8", id="wrong-separator"),
+    pytest.param(",".join(f"10.0.{i}.0/24" for i in range(17)), id="17-items"),
+]
+
+# (ADMINO_TRUSTED_PROXIES value, marker that must reach neither the error nor the log).
+_TRUSTED_PROXIES_ENV_ECHO_CASES: list[object] = [
+    pytest.param("proxymarkerq3", "proxymarkerq3", id="not-an-ip"),
+    pytest.param("172.31.0.10, proxymarkerq3", "proxymarkerq3", id="one-bad-item"),
+    pytest.param("10.77.66.55/24", "10.77.66.55", id="host-bits-set"),
+    pytest.param("fd00:77::1/64", "fd00:77::1", id="ipv6-host-bits-set"),
+]
+
+
+class TestTrustedProxies:
+    """server.trusted_proxies: the reverse proxy addresses whose X-Forwarded-* headers count."""
+
+    def test_server_config_trusted_proxies_default_is_empty(self) -> None:
+        """Default: trust nobody (forwarded headers are ignored from every peer)."""
+        assert ServerConfig().trusted_proxies == []
+
+    @pytest.mark.parametrize(("value", "stored"), _TRUSTED_PROXIES_ACCEPTED)
+    def test_server_config_trusted_proxies_accepts_addresses_and_networks(
+        self, value: str, stored: str
+    ) -> None:
+        """Addresses and CIDR networks are stored as network strings."""
+        assert ServerConfig(trusted_proxies=[value]).trusted_proxies == [stored]
+
+    def test_server_config_trusted_proxies_keeps_the_order(self) -> None:
+        config = ServerConfig(trusted_proxies=["10.0.0.0/8", "172.31.0.10", "2001:db8::/64"])
+        assert config.trusted_proxies == ["10.0.0.0/8", "172.31.0.10/32", "2001:db8::/64"]
+
+    @pytest.mark.parametrize("value", _TRUSTED_PROXIES_REFUSED)
+    def test_server_config_trusted_proxies_refuses_invalid_entries(self, value: str) -> None:
+        """Not an IP, host bits set (strict), a /0 prefix (every address), a bad prefix."""
+        with pytest.raises(ValidationError):
+            ServerConfig(trusted_proxies=[value])
+
+    def test_server_config_trusted_proxies_refuses_a_bad_entry_among_good_ones(self) -> None:
+        """One invalid entry fails the whole list (it is never silently dropped)."""
+        with pytest.raises(ValidationError):
+            ServerConfig(trusted_proxies=["172.31.0.10", "not-an-ip", "10.0.0.0/8"])
+
+    def test_server_config_trusted_proxies_refuses_non_string_entries(self) -> None:
+        """An integer entry is refused (ipaddress would read 167772161 as 10.0.0.1)."""
+        with pytest.raises(ValidationError):
+            ServerConfig.model_validate({"trusted_proxies": [167772161]})
+
+    def test_server_config_trusted_proxies_accepts_16_entries(self) -> None:
+        entries = [f"10.0.{i}.0/24" for i in range(16)]
+        assert len(ServerConfig(trusted_proxies=entries).trusted_proxies) == 16
+
+    def test_server_config_trusted_proxies_refuses_17_entries(self) -> None:
+        entries = [f"10.0.{i}.0/24" for i in range(17)]
+        with pytest.raises(ValidationError):
+            ServerConfig(trusted_proxies=entries)
+
+    @pytest.mark.parametrize(("value", "parts"), _TRUSTED_PROXY_ECHO_CASES)
+    def test_server_config_trusted_proxies_error_does_not_echo_the_value(
+        self, value: str, parts: list[str]
+    ) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ServerConfig(trusted_proxies=[value])
+
+        errors = exc_info.value.errors(include_url=False, include_input=False)
+        rendered = f"{exc_info.value!s} {errors!r}"
+        for part in parts:
+            assert part not in rendered
+
+    @pytest.mark.parametrize(("value", "parts"), _TRUSTED_PROXY_ECHO_CASES)
+    def test_app_config_trusted_proxies_error_does_not_echo_the_value(
+        self, value: str, parts: list[str]
+    ) -> None:
+        """Validated through AppConfig (the DB loader's path), the error still hides the value."""
+        with pytest.raises(ValidationError) as exc_info:
+            AppConfig.model_validate({"server": {"trusted_proxies": [value]}})
+
+        rendered = f"{exc_info.value!s} {exc_info.value!r}"
+        for part in parts:
+            assert part not in rendered
+
+    def test_loaded_config_trusted_proxies_defaults_to_empty(self, tmp_path: Path) -> None:
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.trusted_proxies == []
+
+    def test_yaml_trusted_proxies_is_read_and_normalized(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  trusted_proxies:\n    - "172.31.0.10"\n    - "fd00:31::/64"',
+        )
+        config = load_app_config(yaml_path)
+        assert config.server.trusted_proxies == ["172.31.0.10/32", "fd00:31::/64"]
+
+    def test_yaml_invalid_trusted_proxies_fails_loading(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  trusted_proxies:\n    - "0.0.0.0/0"'
+        )
+        with pytest.raises(ValueError, match=r"Invalid application config"):
+            load_app_config(yaml_path)
+
+    def test_trusted_proxies_env_sets_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", "172.31.0.10")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.trusted_proxies == ["172.31.0.10/32"]
+
+    def test_trusted_proxies_env_is_a_comma_separated_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whitespace around items is stripped and empty items are ignored."""
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", " 172.31.0.10 , 10.0.0.0/8 ,")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.trusted_proxies == ["172.31.0.10/32", "10.0.0.0/8"]
+
+    def test_trusted_proxies_env_replaces_the_yaml_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", "172.31.0.10")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  trusted_proxies:\n    - "10.0.0.0/8"\n    - "192.168.0.0/16"',
+        )
+        assert load_app_config(yaml_path).server.trusted_proxies == ["172.31.0.10/32"]
+
+    @pytest.mark.parametrize("value", ["", "   ", "\t"], ids=["empty", "spaces", "tab"])
+    def test_trusted_proxies_blank_env_keeps_the_yaml_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """A blank ADMINO_TRUSTED_PROXIES changes nothing."""
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", value)
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  trusted_proxies:\n    - "10.0.0.0/8"'
+        )
+        assert load_app_config(yaml_path).server.trusted_proxies == ["10.0.0.0/8"]
+
+    @pytest.mark.parametrize("value", ["", "   "], ids=["empty", "spaces"])
+    def test_trusted_proxies_blank_env_keeps_the_default(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", value)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.trusted_proxies == []
+
+    def test_trusted_proxies_env_keeps_other_server_settings(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The override only replaces trusted_proxies inside the server section."""
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", "172.31.0.10")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  host: "127.0.0.1"\n  port: 9090\n  public_url: "https://admino.example.ch"',
+        )
+        config = load_app_config(yaml_path)
+        assert (config.server.host, config.server.port) == ("127.0.0.1", 9090)
+        assert config.server.public_url == "https://admino.example.ch"
+        assert config.server.trusted_proxies == ["172.31.0.10/32"]
+
+    @pytest.mark.parametrize("value", _TRUSTED_PROXIES_ENV_REFUSED)
+    def test_trusted_proxies_invalid_env_fails_loading(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """An invalid override is never silently ignored: loading fails."""
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", value)
+        with pytest.raises(ValueError):
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+
+    @pytest.mark.parametrize(("value", "marker"), _TRUSTED_PROXIES_ENV_ECHO_CASES)
+    def test_trusted_proxies_invalid_env_is_never_echoed_or_logged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+        marker: str,
+    ) -> None:
+        """Neither the error nor any log line (DEBUG included) repeats the value."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", value)
+
+        with pytest.raises(ValueError) as exc_info:
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+
+        assert marker not in str(exc_info.value)
+        assert marker not in caplog.text
+
+    def test_trusted_proxies_invalid_env_names_the_setting(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The operator learns which setting to fix (the error or the log names it)."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", "proxymarkerq3")
+
+        with pytest.raises(ValueError) as exc_info:
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+
+        assert "trusted_proxies" in f"{exc_info.value} {caplog.text}".lower()
+
+    async def test_trusted_proxies_env_applies_to_db_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DB-backed loader applies the same override (replacing the stored list)."""
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", " 172.31.0.10 , 10.0.0.0/8")
+        mock_data: dict[str, object] = {
+            "server": {"host": "127.0.0.1", "port": 8000, "trusted_proxies": ["192.168.0.0/16"]},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert config.server.trusted_proxies == ["172.31.0.10/32", "10.0.0.0/8"]
+
+    async def test_trusted_proxies_db_row_is_normalized(self) -> None:
+        """Without the env var, a stored server row's list is validated like YAML."""
+        mock_data: dict[str, object] = {
+            "server": {"host": "127.0.0.1", "port": 8000, "trusted_proxies": ["172.31.0.10"]},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
+            config = await load_app_config_from_db(MagicMock())
+        assert config.server.trusted_proxies == ["172.31.0.10/32"]
+
+    async def test_trusted_proxies_invalid_env_fails_db_loading_without_echo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An invalid override fails the DB-backed loader too, and the error (which startup
+        logs with %s) doesn't repeat the value."""
+        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", "172.31.0.10, proxymarkerq4")
+        mock_data: dict[str, object] = {"server": {"host": "127.0.0.1", "port": 8000}}
+        with (
+            patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)),
+            pytest.raises(ValueError) as exc_info,
+        ):
+            await load_app_config_from_db(MagicMock())
+
+        assert "proxymarkerq4" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# GH-156: a non-Secure session cookie is dev-only (plain-http loopback URL)
+# ---------------------------------------------------------------------------
+
+_HTTPS_PUBLIC_URLS: list[object] = [
+    pytest.param("https://admino.example.ch", id="https"),
+    pytest.param("https://admino.example.ch:8443", id="https-port"),
+    pytest.param("https://127.0.0.1", id="https-loopback-ip"),
+    pytest.param("https://localhost:8443", id="https-localhost"),
+]
+
+_LOOPBACK_HTTP_PUBLIC_URLS: list[object] = [
+    pytest.param("http://localhost:8000", id="localhost"),
+    pytest.param("http://localhost", id="localhost-no-port"),
+    pytest.param("http://127.0.0.1:8000", id="ipv4-loopback"),
+    pytest.param("http://[::1]:8000", id="ipv6-loopback"),
+]
+
+
+class TestInsecureCookieIsDevOnly:
+    """cookie_secure=False is only allowed with a plain-http (loopback) public URL."""
+
+    @pytest.mark.parametrize("url", _HTTPS_PUBLIC_URLS)
+    def test_server_config_insecure_cookie_refused_with_https_public_url(self, url: str) -> None:
+        with pytest.raises(ValidationError):
+            ServerConfig(cookie_secure=False, public_url=url)
+
+    def test_server_config_insecure_cookie_error_names_the_field_not_the_url(self) -> None:
+        """The error tells the operator what to fix (cookie_secure) without the URL."""
+        with pytest.raises(ValidationError) as exc_info:
+            ServerConfig(cookie_secure=False, public_url="https://cookiemarkerq5.example.ch")
+
+        errors = exc_info.value.errors(include_url=False, include_input=False)
+        rendered = f"{exc_info.value!s} {errors!r}"
+        assert "cookiemarkerq5" not in rendered
+        assert "cookie_secure" in rendered.lower()
+
+    def test_server_config_insecure_cookie_allowed_with_default_public_url(self) -> None:
+        """The dev profile (http://localhost:8000) keeps working without Secure."""
+        assert ServerConfig(cookie_secure=False).cookie_secure is False
+
+    @pytest.mark.parametrize("url", _LOOPBACK_HTTP_PUBLIC_URLS)
+    def test_server_config_insecure_cookie_allowed_with_loopback_http_url(self, url: str) -> None:
+        assert ServerConfig(cookie_secure=False, public_url=url).cookie_secure is False
+
+    @pytest.mark.parametrize("url", _HTTPS_PUBLIC_URLS)
+    def test_server_config_secure_cookie_allowed_with_https_public_url(self, url: str) -> None:
+        assert ServerConfig(cookie_secure=True, public_url=url).cookie_secure is True
+
+    def test_yaml_insecure_cookie_with_https_public_url_fails_loading(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml",
+            'server:\n  cookie_secure: false\n  public_url: "https://admino.example.ch"',
+        )
+        with pytest.raises(ValueError, match=r"Invalid application config"):
+            load_app_config(yaml_path)
+
+    def test_cookie_secure_env_false_with_https_public_url_fails_loading_without_echo(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """COOKIE_SECURE=false in production fails startup; the URL is never repeated."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setenv("COOKIE_SECURE", "false")
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://cookiemarkerq5.example.ch")
+
+        with pytest.raises(ValueError) as exc_info:
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+
+        assert "cookiemarkerq5" not in str(exc_info.value)
+        assert "cookiemarkerq5" not in caplog.text
+
+    def test_cookie_secure_env_false_over_yaml_https_public_url_fails_loading(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COOKIE_SECURE", "false")
+        yaml_path = _write_yaml(
+            tmp_path / "config.yaml", 'server:\n  public_url: "https://admino.example.ch"'
+        )
+        with pytest.raises(ValueError):
+            load_app_config(yaml_path)
+
+    def test_cookie_secure_env_true_with_https_public_url_loads(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("COOKIE_SECURE", "true")
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://admino.example.ch")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.cookie_secure is True
+        assert config.server.public_url == "https://admino.example.ch"
+
+    def test_cookie_secure_env_false_keeps_working_on_localhost(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The dev-only flag still loads with the local http public URL."""
+        monkeypatch.setenv("COOKIE_SECURE", "false")
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "http://localhost:8000")
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.server.cookie_secure is False
+
+    async def test_insecure_cookie_with_https_public_url_fails_db_loading(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The DB-backed loader refuses it too, and the error doesn't repeat the URL."""
+        monkeypatch.setenv("COOKIE_SECURE", "false")
+        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://cookiemarkerq5.example.ch")
+        mock_data: dict[str, object] = {
+            "server": {"host": "127.0.0.1", "port": 8000},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+        with (
+            patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)),
+            pytest.raises(ValueError) as exc_info,
+        ):
+            await load_app_config_from_db(MagicMock())
+
+        assert "cookiemarkerq5" not in str(exc_info.value)

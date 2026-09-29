@@ -17,6 +17,7 @@ admino is configured by two things:
 - [`config.yaml` reference](#configyaml-reference)
 - [Accounts and sessions](#accounts-and-sessions)
 - [Email (SMTP)](#email-smtp)
+- [Production deployment (TLS reverse proxy)](#production-deployment-tls-reverse-proxy)
 - [Data & storage](#data--storage)
 - [Egress whitelist](#egress-whitelist)
 
@@ -137,7 +138,7 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 
 | Section | What it controls |
 | --- | --- |
-| `server` | Bind `host` / `port` for the ASGI server. |
+| `server` | Bind `host` / `port` for the ASGI server, the session cookie's `cookie_secure` flag, the `public_url` users open admino at, and the `trusted_proxies` whose `X-Forwarded-*` headers are believed (see [Production deployment](#production-deployment-tls-reverse-proxy)). |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
 | `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). |
@@ -222,12 +223,14 @@ have their own, tighter limit per Org Admin: after five, only one a minute is al
 further sends get `429`. This keeps anyone from quickly checking which addresses have an
 account elsewhere on the platform. The link's token is part of the URL path of the two
 link endpoints, so admino doesn't write access logs; a reverse proxy in front of it must
-not log request paths either.
+not log request paths either. The bundled Caddy proxy doesn't (see
+[Production deployment](#production-deployment-tls-reverse-proxy)).
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `COOKIE_SECURE` | `true` | Marks the session cookie `Secure`, so browsers only send it over HTTPS (and to `http://localhost`). Set it to `false` only when you open admino over plain HTTP from another address, such as a phone on your LAN. |
-| `ADMINO_PUBLIC_URL` | `http://localhost:8000` | The address users open admino at, such as `https://admino.example.ch` (no path). Password reset links and invitation links are built from it, never from the request's `Host` header. It must use `https`; plain `http` is only allowed for `localhost`, `127.0.0.1` and `[::1]`. **Production deployments must set it**, otherwise reset and invitation emails point at localhost. An invalid value stops admino at startup. Overrides `server.public_url` in `config.yaml`. |
+| `COOKIE_SECURE` | `true` | Marks the session cookie `Secure`, so browsers only send it over HTTPS (and to `http://localhost`). `false` is a **development-only** setting, for opening a laptop install over plain HTTP from another address, such as a phone on your LAN. admino refuses to start with `false` when `ADMINO_PUBLIC_URL` is `https`, and the production profile always sets `true`. |
+| `ADMINO_PUBLIC_URL` | `http://localhost:8000` | The address users open admino at, such as `https://admino.example.ch` (no path). Password reset links and invitation links are built from it, never from the request's `Host` header. It must use `https`; plain `http` is only allowed for `localhost`, `127.0.0.1` and `[::1]`. **Production deployments must set it**, otherwise reset and invitation emails point at localhost (the production profile sets it to `https://ADMINO_DOMAIN`). It's also the only origin CORS allows. An invalid value stops admino at startup. Overrides `server.public_url` in `config.yaml`. |
+| `ADMINO_TRUSTED_PROXIES` | *(empty)* | Comma-separated IP addresses or CIDR ranges of the reverse proxies in front of admino. Only a request that arrives from one of them has its `X-Forwarded-For` (the client's IP, used by per-IP rate limits and audit events) and `X-Forwarded-Proto` believed; every other peer's are ignored. Empty trusts nobody. A range covering every address (`0.0.0.0/0`, `::/0`) and invalid entries stop admino at startup. The production profile sets Caddy's address. Overrides `server.trusted_proxies` in `config.yaml`. |
 
 **In the app.** The PWA has a **Log in** page, a **Forgot password** page that asks for
 the reset link, a **Reset password** page that the emailed link opens, and an **Accept
@@ -347,6 +350,58 @@ addresses.
 and logs which variables to fix (names only, never values). Emails stay queued and go out
 after SMTP is configured and admino restarts.
 
+## Production deployment (TLS reverse proxy)
+
+The production profile runs admino behind **[Caddy](https://caddyserver.com)**, which
+terminates TLS with a Let's Encrypt certificate. It's defined in
+[`docker-compose.prod.yml`](../docker-compose.prod.yml) and started with its own `make`
+targets:
+
+```bash
+# .env: ADMINO_DOMAIN=admino.example.ch (plus the usual PG_PASSWORD, INFOMANIAK_API_TOKEN, SMTP_*)
+make docker-build-prod    # build the agent and caddy images
+make start-prod           # postgres + agent + caddy
+make docker-logs-prod     # follow logs
+make docker-down-prod     # stop everything
+```
+
+Before the first start, point the domain's DNS `A` record at the server and open ports
+**80** and **443** inbound. Caddy requests the certificate on its first start and renews it
+on its own. Port 80 answers Let's Encrypt's challenge and redirects everything else to
+HTTPS.
+
+What the profile sets up:
+
+- **HTTPS only.** Plain HTTP redirects to HTTPS, and every response carries
+  `Strict-Transport-Security: max-age=31536000; includeSubDomains` (HSTS). admino's own
+  security headers (CSP, `X-Frame-Options`, and the rest) are passed through unchanged.
+- **The agent publishes no port.** Caddy is the only service on the host's ports, and it
+  reaches the agent over an internal network that postgres isn't on.
+- **Real client IPs.** Caddy replaces any `X-Forwarded-For` a client sends with the
+  client's address. The agent believes it only from Caddy's fixed address
+  (`ADMINO_TRUSTED_PROXIES=172.31.0.10/32`), so per-IP rate limits and audit events see
+  the real client, and no other peer can fake one.
+- **Secure session cookie and one origin.** The profile sets `COOKIE_SECURE=true` and
+  `ADMINO_PUBLIC_URL=https://ADMINO_DOMAIN`, overriding `.env`. Emailed links use that
+  address, and CORS allows only that origin.
+- **Proxy egress: Let's Encrypt only.** Caddy's container has its own firewall that allows
+  only Let's Encrypt's ACME API (certificate issuance and renewal) and the agent. It then
+  drops root and runs without any capabilities. See the [Security Model](SECURITY.md#the-tls-reverse-proxy-production-profile).
+- **No request paths in logs.** Caddy keeps no access log, and the loggers that would
+  print a request's path or query string are turned off: invitation and reset tokens are
+  part of some URLs.
+- **No local model, one process.** The profile never starts the `vllm` container, and the
+  agent runs as a single uvicorn process in a single container. Pending confirmations and
+  rate-limit counters live in that process's memory, so don't scale it out.
+
+**Trying it on a laptop.** With `ADMINO_DOMAIN=localhost`, Caddy uses its own local
+certificate authority instead of Let's Encrypt. Check it with curl, e.g.
+`curl -k -I https://localhost` and `curl -I http://localhost`. A browser that opens
+`https://localhost` may remember the HSTS header and from then on switch
+`http://localhost` addresses to HTTPS, including the laptop profile on
+`http://localhost:8000`. If that happens, delete the `localhost` entry (in Chrome:
+`chrome://net-internals/#hsts`).
+
 ## Data & storage
 
 PostgreSQL holds `settings`, `permissions`, `memory` notes, `oauth_tokens`, the
@@ -372,6 +427,10 @@ host is present. The provider hosts are `api.infomaniak.com` (default, included)
 Those hosts are opened on port 443 only. The one exception is email: when `SMTP_HOST` and
 `SMTP_PORT` are set, `entrypoint.sh` also opens exactly that host on that port (465 or
 587). See [Email (SMTP)](#email-smtp).
+
+In the production profile, the Caddy proxy has a separate whitelist with a single
+external host: Let's Encrypt's ACME API (`acme-v02.api.letsencrypt.org`, port 443). See
+[Production deployment](#production-deployment-tls-reverse-proxy).
 
 For the full picture of how egress containment works — the firewall, the root→non-root
 privilege drop, capabilities, and known limitations — read the

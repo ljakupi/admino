@@ -14,12 +14,20 @@ server:
   port: 8000
   # The session cookie's Secure flag. Keep it on: Chrome and Firefox accept
   # Secure cookies on http://localhost too. Only plain-HTTP access from another
-  # address (e.g. a phone on the LAN) needs COOKIE_SECURE=false (see .env.example).
+  # address (e.g. a phone on the LAN) needs the development-only
+  # COOKIE_SECURE=false (see .env.example); it's refused with an https public_url.
   cookie_secure: true
-  # The address users open admino at; password reset links are built from it.
-  # https only (plain http for localhost). Deployments set ADMINO_PUBLIC_URL,
-  # which overrides this value (see .env.example).
+  # The address users open admino at; password reset and invitation links are
+  # built from it, and it's the only origin CORS allows. https only (plain http
+  # for localhost). Deployments set ADMINO_PUBLIC_URL, which overrides this
+  # value (see .env.example).
   public_url: "http://localhost:8000"
+  # The reverse proxies whose X-Forwarded-For / X-Forwarded-Proto headers are
+  # believed (IP addresses or CIDR ranges). Empty trusts nobody: the client IP
+  # used by rate limits and audit events is the connection's peer. The
+  # production profile (docker-compose.prod.yml) sets ADMINO_TRUSTED_PROXIES to
+  # its Caddy proxy's address, which overrides this value.
+  trusted_proxies: []
 
 database:
   min_pool_size: 2

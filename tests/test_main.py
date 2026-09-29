@@ -22,6 +22,10 @@ covering:
   ``ensure_default_org`` (an empty database gets no organization), main.py
   doesn't reference ``DEFAULT_ORG_ID``, and startup loads the bundled
   common-password list once, so a missing list stops startup.
+- GH-156: uvicorn runs one process (``workers=1``) with ``proxy_headers=False``,
+  so its own X-Forwarded-* handling (which trusts 127.0.0.1 or the
+  FORWARDED_ALLOW_IPS env var) never runs; the app's ``server.trusted_proxies``
+  is the only source of truth.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -41,6 +45,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+import uvicorn
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import admino.main as main_module
 from admino.config import LLMConfig
@@ -626,6 +632,59 @@ class TestUvicornLogLevel:
 
         kw = mock_deps["uvicorn_run"].call_args.kwargs
         assert kw["workers"] == 1
+
+
+# ---------------------------------------------------------------------------
+# GH-156: uvicorn never applies its own X-Forwarded-* trust
+# ---------------------------------------------------------------------------
+
+
+class TestUvicornProxyHeaders:
+    """uvicorn runs with ``proxy_headers=False``: the app's ``server.trusted_proxies`` is
+    the only source of truth for X-Forwarded-For / X-Forwarded-Proto.
+
+    Left on, uvicorn's own middleware trusts 127.0.0.1 (or whatever the
+    FORWARDED_ALLOW_IPS env var says, ``*`` included) before the app sees the
+    request.
+    """
+
+    def test_uvicorn_proxy_headers_disabled(self, mock_deps: dict[str, Any]) -> None:
+        main(config_path=Path("c.yaml"))
+
+        kw = mock_deps["uvicorn_run"].call_args.kwargs
+        assert kw["proxy_headers"] is False
+
+    def test_uvicorn_proxy_headers_disabled_with_forwarded_allow_ips_env(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FORWARDED_ALLOW_IPS=* in the environment doesn't turn uvicorn's trust back on."""
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+
+        main(config_path=Path("c.yaml"))
+
+        kw = mock_deps["uvicorn_run"].call_args.kwargs
+        assert kw.get("proxy_headers") is False
+
+    def test_uvicorn_config_from_main_leaves_the_app_unwrapped(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fed into a real uvicorn.Config, main()'s arguments never wrap the app in uvicorn's
+        ProxyHeadersMiddleware, even with FORWARDED_ALLOW_IPS=*."""
+        monkeypatch.setenv("FORWARDED_ALLOW_IPS", "*")
+
+        main(config_path=Path("c.yaml"))
+
+        async def asgi_app(scope: Any, receive: Any, send: Any) -> None:
+            """A stand-in ASGI app (never called)."""
+
+        # No logging setup (the test must not reconfigure the uvicorn loggers), and no
+        # websocket protocol import (admino serves none; its import only warns).
+        kwargs = {**mock_deps["uvicorn_run"].call_args.kwargs, "log_config": None}
+        kwargs["log_level"] = None
+        kwargs["ws"] = "none"
+        uvicorn_config = uvicorn.Config(asgi_app, **kwargs)
+        uvicorn_config.load()
+        assert not isinstance(uvicorn_config.loaded_app, ProxyHeadersMiddleware)
 
 
 # ---------------------------------------------------------------------------

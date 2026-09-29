@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down docker-build-prod docker-up-prod docker-down-prod docker-logs-prod start-prod
 
 # Source and package configuration
 SRC_DIR    := src
@@ -15,8 +15,19 @@ PACKAGE    := admino
 # stack up together with vllm.
 # NVIDIA GPU serving: swap the CPU image for the CUDA image + a GPU
 # reservation (tracked in issue #132).
+# docker-compose.local.yml publishes the agent on 127.0.0.1:8000 (laptop).
 # --------------------------------------------------------------------------
-COMPOSE_FILES := -f docker-compose.yml
+COMPOSE_FILES := -f docker-compose.yml -f docker-compose.local.yml
+
+# --------------------------------------------------------------------------
+# Production profile (GH-156): docker-compose.prod.yml adds the Caddy TLS
+# reverse proxy for ADMINO_DOMAIN (set it in .env) and leaves out
+# docker-compose.local.yml, so the agent publishes no host port. The
+# services are listed explicitly, so a COMPOSE_PROFILES=vllm in the
+# environment can never start the local vllm container in production.
+# --------------------------------------------------------------------------
+PROD_COMPOSE_FILES := -f docker-compose.yml -f docker-compose.prod.yml
+PROD_SERVICES      := postgres agent caddy
 
 # --------------------------------------------------------------------------
 # Local vLLM container settings
@@ -156,6 +167,23 @@ vllm-ensure:
 
 # start: alias for docker-up (postgres + agent, default Infomaniak provider).
 start: docker-up
+
+# docker-build-prod: build the agent and caddy images of the production profile.
+docker-build-prod:
+	docker compose $(PROD_COMPOSE_FILES) build agent caddy
+
+# docker-up-prod: postgres + agent + the Caddy TLS reverse proxy on ports 80/443.
+docker-up-prod:
+	docker compose $(PROD_COMPOSE_FILES) up -d $(PROD_SERVICES)
+
+docker-down-prod:
+	docker compose $(PROD_COMPOSE_FILES) down
+
+docker-logs-prod:
+	docker compose $(PROD_COMPOSE_FILES) logs -f
+
+# start-prod: alias for docker-up-prod (production profile, see above).
+start-prod: docker-up-prod
 
 # start-local: alias for docker-up-local — adds the opt-in local vllm container
 # (provisions the model on demand via vllm-ensure). Select the "vLLM" provider in

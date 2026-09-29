@@ -1,0 +1,57 @@
+# admino — Caddy TLS reverse proxy (production profile, GH-156)
+#
+# Terminates TLS for ADMINO_DOMAIN with an automatic Let's Encrypt certificate,
+# redirects HTTP to HTTPS, sends HSTS and forwards every request to the agent
+# over the internal proxy network. Caddy replaces any client-supplied
+# X-Forwarded-For with the client's address and sets X-Forwarded-Proto; the
+# agent trusts those headers only from this container's address
+# (ADMINO_TRUSTED_PROXIES in docker-compose.prod.yml).
+#
+# Logging: the site has no `log` directive, so there is no access log. The
+# loggers that print a request's path and query are excluded from the default
+# log as well: invitation and password reset tokens travel in URL paths
+# (/api/auth/invitations/{token}, GH-153), so a path must never reach a log.
+#
+# ADMINO_DOMAIN is validated by entrypoint.sh before Caddy reads this file.
+{
+	# No admin API: a config change means rebuilding and restarting the container.
+	admin off
+
+	# Let's Encrypt is the only certificate issuer (Caddy otherwise falls back
+	# to ZeroSSL), so the proxy's only egress is Let's Encrypt's ACME API.
+	# ADMINO_DOMAIN=localhost still gets a certificate from Caddy's internal CA.
+	acme_ca https://acme-v02.api.letsencrypt.org/directory
+
+	# No OCSP requests: another egress destination, and Let's Encrypt
+	# certificates no longer carry an OCSP URL.
+	ocsp_stapling off
+
+	# The internal CA (localhost only) is never installed into the container's trust store.
+	skip_install_trust
+
+	servers {
+		# HTTP/1.1 and HTTP/2 only: HTTP/3 needs UDP 443, which isn't published.
+		protocols h1 h2
+	}
+
+	log default {
+		output stderr
+		format json
+		# http.log.error and the reverse proxy's logger include the request's URI.
+		exclude http.log.error http.handlers.reverse_proxy
+	}
+}
+
+{$ADMINO_DOMAIN} {
+	header {
+		# Browsers use HTTPS only for this host (and its subdomains) for a year.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		# No proxy software banner.
+		-Server
+		-Via
+		# Apply after the agent's response headers are copied, so these always win.
+		defer
+	}
+
+	reverse_proxy agent:8000
+}

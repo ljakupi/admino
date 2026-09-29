@@ -1,0 +1,21 @@
+# admino — Laptop overlay: publish the agent on 127.0.0.1:8000.
+#
+# The Makefile's laptop targets pass this file (COMPOSE_FILES), so `make start`
+# and `make start-local` serve the PWA and API on http://localhost:8000.
+# Without make:
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up -d
+#
+# The production profile (docker-compose.prod.yml, `make start-prod`) leaves
+# this file out: there the agent publishes no host port and is reachable only
+# through the Caddy TLS reverse proxy.
+
+services:
+  agent:
+    # Bind to localhost only. Never expose the agent directly on a public
+    # interface: use the production profile (Caddy, TLS) for remote access.
+    # Every API call needs a login session. The session cookie is Secure by
+    # default, so plain-HTTP access from another address (e.g. a phone on your
+    # LAN, with "0.0.0.0:8000:8000" here) also needs the dev-only
+    # COOKIE_SECURE=false in .env.
+    ports:
+      - "127.0.0.1:8000:8000"

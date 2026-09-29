@@ -81,8 +81,9 @@ Security notes:
   length, is a 404 before any database call, never a 422); accepting sets the
   session cookie exactly like the login. The email, name, password, token and
   link are never logged or echoed. The token travels in the URL path of the
-  two link routes: uvicorn's access log stays off (``main.py``), and a reverse
-  proxy in front of admino must not log request paths (#156). A refused send
+  two link routes: uvicorn's access log stays off (``main.py``), and the
+  bundled Caddy config of the production profile doesn't log request paths
+  (a custom reverse proxy in front of admino must not either). A refused send
   (409 ``email_taken`` or ``seat_limit``) is audited and spends a separate,
   tighter per-user budget (``/api/org/invitations/refused``): once it's spent,
   sends answer 429 before any database work, so probing whether an email
@@ -124,11 +125,15 @@ Security notes:
   random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
 - Error responses use generic messages; never leak internal paths or config.
-- CORS restricted to localhost origins by default; no credentials, and only
-  ``Content-Type`` as an allowed request header. ``/openapi.json``, Swagger UI
-  and ReDoc are disabled.
-- HSTS is not set (plain HTTP local deployment). When deploying behind a
-  TLS-terminating reverse proxy, configure HSTS at the proxy layer.
+- CORS allows only ``server.public_url`` as an origin; no credentials, and
+  only ``Content-Type`` as an allowed request header. ``/openapi.json``,
+  Swagger UI and ReDoc are disabled.
+- HSTS is not set by the app: the Caddy proxy of the production profile
+  (docker-compose.prod.yml) terminates TLS and sends it.
+- X-Forwarded-For/Proto are believed only from a peer inside
+  ``server.trusted_proxies`` (empty by default: no peer, loopback included);
+  the resolved client address feeds the per-IP rate limits and the audit
+  events. X-Forwarded-Host is never trusted.
 - Does NOT import check_permission — permission decisions live in agent/registry.
 - Does NOT import from permissions.py except PermissionsConfig type (via TYPE_CHECKING).
 
@@ -242,6 +247,7 @@ from admino.oauth import (
     revoke_and_delete_token,
     save_token,
 )
+from admino.proxy_headers import TrustedProxyHeadersMiddleware
 from admino.tools.gmail import clear_token_cache as _clear_gmail_cache
 from admino.tools.google_calendar import clear_token_cache as _clear_gcal_cache
 from admino.tools.google_drive import clear_token_cache as _clear_gdrive_cache
@@ -273,10 +279,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     Permissions-Policy). Applied even for local-only deployments because
     the PWA runs in a browser that respects these headers.
 
-    Note: ``Strict-Transport-Security`` (HSTS) is intentionally omitted.
-    This app serves over plain HTTP for local deployment. When deployed
-    behind a TLS-terminating reverse proxy (nginx, Caddy), HSTS must be
-    configured at the proxy layer — not here.
+    Note: ``Strict-Transport-Security`` (HSTS) is intentionally omitted: the
+    app itself serves plain HTTP, and TLS terminates at the reverse proxy. The
+    production profile's Caddy proxy (docker-compose.prod.yml) sends HSTS.
     """
 
     async def dispatch(
@@ -611,7 +616,11 @@ def _user_caller(principal: Principal) -> str:
 
 
 def _client_ip(request: Request) -> str:
-    """The peer address of the request (``"unknown"`` when the server has none)."""
+    """The client address of the request (``"unknown"`` when the server has none).
+
+    The peer address, or the resolved client address when the request came
+    through a trusted proxy (``server.trusted_proxies``).
+    """
     return request.client.host if request.client is not None else "unknown"
 
 
@@ -3549,31 +3558,34 @@ def create_app(
 
     # --- Middleware ---
     # Starlette wraps the LAST added middleware outermost. Resulting order for a
-    # request: CORS -> security headers -> cross-origin protection -> routes.
-    # Cross-origin protection (CSRF) therefore refuses a cross-origin write
-    # before authentication, rate limiting and handlers run, and its 403 still
-    # gets the security headers.
+    # request: trusted proxy headers (when configured) -> CORS -> security
+    # headers -> cross-origin protection -> routes. Cross-origin protection
+    # (CSRF) therefore refuses a cross-origin write before authentication, rate
+    # limiting and handlers run, and its 403 still gets the security headers.
     app.add_middleware(CrossOriginProtectionMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
 
     # --- CORS middleware ---
-    # Default to localhost-only origins for local-first security. The PWA is
-    # served same-origin, so the session cookie never needs a cross-origin
+    # The one allowed origin is server.public_url. The PWA is served
+    # same-origin, so the session cookie never needs a cross-origin
     # credentialed request: allow_credentials stays False, and Content-Type is
     # the only allowed request header (no Authorization: there is no bearer auth).
-    cors_origins = [
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=cors_origins,
+        allow_origins=[config.server.public_url],
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Content-Type"],
     )
+
+    # --- Trusted proxy headers (outermost) ---
+    # Added last, so CORS, the security headers, the CSRF check, the per-IP rate
+    # limits, the audit events and the handlers all see the client address and
+    # scheme the trusted reverse proxy reports. Not installed without trusted
+    # proxies: X-Forwarded-* headers are then ignored from every peer.
+    trusted_proxies = list(config.server.trusted_proxies)
+    if trusted_proxies:
+        app.add_middleware(TrustedProxyHeadersMiddleware, trusted_proxies=trusted_proxies)
 
     # --- Error handlers ---
     # RequestValidationError: raised by FastAPI for request body/query/path validation.
