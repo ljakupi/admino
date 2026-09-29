@@ -3,6 +3,28 @@ export interface ChatRequest {
   session_id: string;
 }
 
+// Auth types (issue #155: auth pages and role-aware app shell)
+
+export type UserKind = 'member' | 'super_admin';
+export type MemberRole = 'org_admin' | 'editor' | 'viewer';
+
+/** `GET /api/auth/me`. A Super Admin has no org and no role; a member always has both. */
+export interface MeResponse {
+  user_id: string;
+  kind: UserKind;
+  org_id: string | null;
+  role: MemberRole | null;
+  ui_language: string;
+  response_language: string | null;
+}
+
+/** `GET /api/auth/invitations/{token}`: the invitation's public details. */
+export interface InvitationDetails {
+  org_name: string;
+  role: MemberRole;
+  email: string;
+}
+
 export interface ToolCallRecord {
   tool: string;
   action: string;

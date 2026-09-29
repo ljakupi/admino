@@ -10,9 +10,12 @@
  * page used. The tests read tool calls straight from `thread` instead. Issue
  * #144 translates the UI: toast copy comes from the i18n catalogs, so it
  * follows the active locale (asserted as "English under en, a different
- * de-catalog string under de", without depending on the German wording). The
- * network layer (`@/api/messages`) is mocked; error cases use the real
- * `ApiError` class.
+ * de-catalog string under de", without depending on the German wording).
+ * Issue #155 moves the 401 handling out of the store: the global unauthorized
+ * handler shows the session-expired toast and redirects to login, so a 401
+ * adds no chat toast (thinking is still removed and the connection returns
+ * to idle). The network layer (`@/api/messages`) is mocked; error cases use
+ * the real `ApiError` class.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
@@ -20,6 +23,7 @@ import { postMessage, confirmDecision } from '@/api/messages';
 import { ApiError } from '@/api/client';
 import { setLocale } from '@/i18n';
 import { de } from '@/i18n/locales/de';
+import { en } from '@/i18n/locales/en';
 import { useChatStore } from '@/stores/chat';
 import { useConnectionStore } from '@/stores/connection';
 import { useSettingsStore } from '@/stores/settings';
@@ -626,14 +630,19 @@ describe('chatStore sendMessage errors', () => {
     },
   );
 
-  // Issue #149: the token prompt (settings.needsAuth) is gone; the login page
-  // comes with #155. A 401 (no or expired session) still shows an error toast.
-  it('on 401 shows an error toast', async () => {
+  // Issue #155 supersedes #149's interim error toast: the global 401 handler
+  // (services/session.ts -> auth store) owns the one session-expired toast and
+  // the redirect to login, so the chat store adds no toast of its own on a 401.
+  it('on 401 adds no toast of its own (the global 401 handler owns the session-expired toast)', async () => {
     mockedPostMessage.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'));
 
     await useChatStore().sendMessage('Hello');
 
-    expect(toastKinds()).toContain('error');
+    expect(useToastStore().toasts).toEqual([]);
+  });
+
+  it('no longer has the interim toast.chat.authRequired catalog key', () => {
+    expect(Object.hasOwn(en, 'toast.chat.authRequired')).toBe(false);
   });
 
   it('on 429 shows a warning toast and keeps the connection online', async () => {
@@ -848,6 +857,18 @@ describe('chatStore approve', () => {
 
     expect(mockedConfirmDecision).toHaveBeenCalledTimes(2);
     expect(findCard(card.id)?.state).toBe('completed');
+  });
+
+  // Issue #155: the global 401 handler owns the session-expired toast. The card
+  // goes back to pending, so it can still be approved after logging back in.
+  it('on 401 returns the card to pending and adds no toast of its own', async () => {
+    const card = await seedPendingCard();
+    mockedConfirmDecision.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'));
+
+    await useChatStore().approve(card.id);
+
+    expect(findCard(card.id)?.state).toBe('pending');
+    expect(useToastStore().toasts).toEqual([]);
   });
 
   it('on another error marks the card error with an error toast', async () => {

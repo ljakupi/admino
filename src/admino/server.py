@@ -46,7 +46,9 @@ Routes:
   settings, permissions and account connections.
 - GET  /health            — Health check (public).
 - GET  /api/oauth/callback — The OAuth provider's redirect (public, state-checked).
-- /                       — Static PWA files (public).
+- /                       — Static PWA files (public); a missing client route
+  (outside /api and /health, last segment without an extension) gets
+  index.html for the PWA's router.
 
 Security notes:
 - Authentication is a server-side session (GH-149): the ``admino_session``
@@ -168,7 +170,9 @@ from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from pydantic import ValidationError
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.staticfiles import StaticFiles
 
 from admino import (
     accounts,
@@ -365,6 +369,56 @@ class CrossOriginProtectionMiddleware:
             await response(scope, receive, send)
             return
         await self._app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# PWA static files with the client-route fallback
+# ---------------------------------------------------------------------------
+
+# First path segments that belong to the server, never to the PWA's router.
+_SERVER_PATH_PREFIXES: Final[frozenset[str]] = frozenset({"api", "health"})
+
+
+def _is_client_route(path: str) -> bool:
+    """Whether a static-files ``path`` names a PWA client route.
+
+    ``path`` is the relative, normalized path StaticFiles resolves (OS
+    separators, ``"."`` for the root). A client route is outside ``api`` and
+    ``health`` and its last segment has no file extension (no ``"."``).
+    """
+    segments = [s for s in path.replace(os.sep, "/").split("/") if s not in ("", ".")]
+    return not segments or (segments[0] not in _SERVER_PATH_PREFIXES and "." not in segments[-1])
+
+
+class _SpaStaticFiles(StaticFiles):
+    """StaticFiles that answer a missing client route with ``index.html``.
+
+    The PWA routes on the client (history mode), so a first visit to an
+    emailed ``/reset-password#token=...`` link or a reload of ``/login`` must
+    get ``index.html`` rather than a 404.
+
+    Security notes:
+    - The fallback file is resolved by StaticFiles itself (fixed name
+      ``index.html``), so no filesystem path is built from the request and
+      StaticFiles' traversal guard still applies to every lookup.
+    - ``api``/``health`` paths and missing files with an extension keep their
+      404; other methods keep StaticFiles' 405. Nothing from the request is
+      echoed or logged.
+    - A ``404.html`` in the directory (which html mode returns with status 404
+      instead of raising) doesn't defeat the fallback.
+    """
+
+    async def get_response(self, path: str, scope: Scope) -> Response:
+        """Serve ``path``, or ``index.html`` when it is a missing client route."""
+        try:
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if exc.status_code != 404 or not _is_client_route(path):
+                raise
+            return await super().get_response("index.html", scope)
+        if response.status_code == 404 and _is_client_route(path):
+            return await super().get_response("index.html", scope)
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -3625,7 +3679,9 @@ def create_app(
     #   1. ADMINO_STATIC_DIR env var (explicit override, e.g. for tests)
     #   2. /app/static (Docker image layout — copied by Dockerfile)
     #   3. <repo>/static (dev layout: src/admino/server.py -> repo root -> static)
-    # Mount only if a directory is found; skip silently in tests.
+    # Mount only if a directory is found; skip silently in tests. A missing
+    # client route (e.g. /login, /reset-password) is answered with index.html
+    # for the PWA's router; /api and /health paths never fall back.
     static_dir: PathLib | None = None
     env_static = os.environ.get("ADMINO_STATIC_DIR")
     candidates: list[PathLib] = []
@@ -3638,8 +3694,6 @@ def create_app(
             static_dir = candidate
             break
     if static_dir is not None:
-        from fastapi.staticfiles import StaticFiles
-
-        app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+        app.mount("/", _SpaStaticFiles(directory=str(static_dir), html=True), name="static")
 
     return app

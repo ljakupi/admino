@@ -9,17 +9,21 @@ import ToolCallChip from '@/components/ToolCallChip.vue';
 import InputBar from '@/components/InputBar.vue';
 import EmptyState from '@/components/EmptyState.vue';
 import SuggestionChip from '@/components/SuggestionChip.vue';
+import { canSendChat } from '@/services/access';
+import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
 import { useAutoScroll } from '@/composables/useAutoScroll';
 import { useKeyboardShortcuts } from '@/composables/useKeyboardShortcuts';
 import { useI18n, type MessageKey } from '@/i18n';
 import type { ThreadItem, ChatMessage, ToolCallUI } from '@/api/types';
 
+const auth = useAuthStore();
 const chatStore = useChatStore();
 const threadRef = ref<HTMLElement | null>(null);
 const { onScroll, scrollToBottom } = useAutoScroll(threadRef);
 
 const isEmpty = computed(() => chatStore.thread.length === 0);
+const canSend = computed(() => canSendChat(auth.role));
 
 const { t } = useI18n();
 
@@ -139,7 +143,7 @@ useKeyboardShortcuts({
       @scroll="onScroll"
     >
       <EmptyState
-        v-if="isEmpty"
+        v-if="isEmpty && canSend"
         :icon="MessageCircle"
         :heading="t('chat.empty.heading')"
         :subtext="t('chat.empty.subtext')"
@@ -153,6 +157,13 @@ useKeyboardShortcuts({
           />
         </div>
       </EmptyState>
+
+      <EmptyState
+        v-else-if="isEmpty"
+        :icon="MessageCircle"
+        :heading="t('chat.viewerEmpty.heading')"
+        :subtext="t('chat.viewerEmpty.subtext')"
+      />
 
       <template v-else>
         <template v-for="(item, idx) in displayItems" :key="idx">
@@ -186,7 +197,7 @@ useKeyboardShortcuts({
         </template>
       </template>
     </div>
-    <InputBar :disabled="chatStore.sending" @send="handleSend" />
+    <InputBar v-if="canSend" :disabled="chatStore.sending" @send="handleSend" />
   </div>
 </template>
 

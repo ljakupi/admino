@@ -57,6 +57,63 @@ code, .mono {
   font-weight: var(--fw-regular);
 }
 
+/* Auth pages (Login, Forgot/Reset password, Accept invitation) — shared, so
+   each page's <style scoped> doesn't have to redefine the same handful of rules. */
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.auth-subtitle {
+  margin: 0 0 var(--space-2);
+  color: var(--color-text-muted);
+  font-size: var(--fs-caption);
+}
+
+.auth-success {
+  color: var(--color-text);
+  font-size: var(--fs-body);
+  line-height: var(--lh-relaxed);
+}
+
+.auth-error {
+  margin: 0;
+  color: var(--color-error);
+  font-size: var(--fs-caption);
+}
+
+.auth-rules {
+  margin: 0 0 var(--space-2);
+  padding-left: var(--space-5);
+  color: var(--color-text-muted);
+  font-size: var(--fs-caption);
+  line-height: var(--lh-relaxed);
+}
+
+.auth-link {
+  display: block;
+  margin-top: var(--space-5);
+  text-align: center;
+  font-size: var(--fs-caption);
+  color: var(--color-primary-mid);
+  font-weight: var(--fw-medium);
+  text-decoration: none;
+}
+
+.auth-link:hover {
+  text-decoration: underline;
+}
+
+.auth-readonly {
+  padding: 10px 14px;
+  background: var(--color-bg);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-input);
+  font-size: var(--fs-body);
+  color: var(--color-text-muted);
+}
+
 /* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;

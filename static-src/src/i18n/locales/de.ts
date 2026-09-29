@@ -17,11 +17,14 @@ export const de: Record<MessageKey, Message> = {
   'common.confirm': 'Bestätigen',
   'common.loading': 'Wird geladen',
 
-  // --- nav (top-level page navigation, issue #15) ----------------------
+  // --- nav (top-level page navigation, issue #15; issue #155: role-aware shell) ---
   'nav.chat': 'Chat',
   'nav.tools': 'Tools',
   'nav.permissions': 'Berechtigungen',
+  'nav.organization': 'Organisation',
   'nav.settings': 'Einstellungen',
+  'nav.platform': 'Plattform',
+  'nav.logout': 'Abmelden',
   'nav.mainNavigation': 'Hauptnavigation',
 
   // --- status (connection state pill) ----------------------------------
@@ -45,7 +48,6 @@ export const de: Record<MessageKey, Message> = {
   'toast.common.saveFailed.title': 'Speichern fehlgeschlagen',
 
   // --- toast (chat store) ------------------------------------------------
-  'toast.chat.authRequired': 'Authentifizierung erforderlich',
   'toast.chat.slowDown.title': 'Bitte langsamer',
   'toast.chat.slowDown.body': 'admino ist aktuell ratenbegrenzt.',
   'toast.chat.genericError.title': 'Etwas ist schiefgelaufen',
@@ -347,4 +349,82 @@ export const de: Record<MessageKey, Message> = {
   'settings.comingSoon.resetSettings': 'Das Zurücksetzen der Einstellungen ist noch nicht verfügbar.',
   'settings.comingSoon.eraseAll': 'Das Löschen aller Daten ist noch nicht verfügbar.',
   'settings.comingSoon.toggle': 'Dieser Schalter ist noch nicht verfügbar.',
+  'settings.session.logout.label': 'Abmelden',
+  'settings.session.logout.hint': 'Beendet Ihre Sitzung auf diesem Gerät.',
+
+  // --- auth (session-expired toast, error copy, issue #155) --------------
+  'auth.sessionExpired.title': 'Sitzung abgelaufen',
+  'auth.sessionExpired.body': 'Bitte melden Sie sich erneut an.',
+  'auth.login.error.invalid': 'E-Mail oder Passwort ungültig',
+  'auth.error.rateLimited': 'Zu viele Versuche. Bitte warten Sie einen Moment und versuchen Sie es erneut.',
+  'auth.error.generic': 'Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.',
+  'auth.reset.error.invalidLink': 'Dieser Link zum Zurücksetzen ist ungültig oder abgelaufen.',
+  'auth.invitation.error.invalidLink': 'Dieser Einladungslink ist ungültig oder abgelaufen.',
+  'auth.invitation.error.invalidName': 'Bitte geben Sie Ihren Namen ein.',
+
+  // --- auth.password (password policy, issue #155) -----------------------
+  'auth.password.error.tooShort': 'Das Passwort ist zu kurz.',
+  'auth.password.error.tooLong': 'Das Passwort ist zu lang.',
+  'auth.password.error.common': 'Dieses Passwort ist zu gebräuchlich.',
+  'auth.password.error.equalsEmail': 'Das Passwort darf nicht Ihrer E-Mail-Adresse entsprechen.',
+  'auth.password.error.mismatch': 'Die Passwörter stimmen nicht überein.',
+  'auth.password.error.generic': 'Dieses Passwort erfüllt die Anforderungen nicht.',
+  'auth.password.rule.length': 'Zwischen {min} und {max} Zeichen.',
+  'auth.password.rule.common': 'Kein häufig verwendetes Passwort.',
+  'auth.password.rule.email': 'Nicht identisch mit Ihrer E-Mail-Adresse.',
+
+  // --- auth.role (invited role, shown on the Accept invitation page) -----
+  'auth.role.orgAdmin': 'Organisations-Admin',
+  'auth.role.editor': 'Bearbeiter',
+  'auth.role.viewer': 'Betrachter',
+
+  // --- auth.login (Login page) --------------------------------------------
+  'auth.login.title': 'Anmelden',
+  'auth.login.email.label': 'E-Mail',
+  'auth.login.password.label': 'Passwort',
+  'auth.login.submit': 'Anmelden',
+  'auth.login.forgotPassword': 'Passwort vergessen?',
+
+  // --- auth.forgotPassword (Forgot password page) -------------------------
+  'auth.forgotPassword.title': 'Passwort vergessen',
+  'auth.forgotPassword.subtitle':
+    'Geben Sie Ihre E-Mail-Adresse ein, wir senden Ihnen einen Link zum Zurücksetzen.',
+  'auth.forgotPassword.email.label': 'E-Mail',
+  'auth.forgotPassword.submit': 'Link senden',
+  'auth.forgotPassword.success':
+    'Falls für diese Adresse ein Konto besteht, haben wir einen Link zum Zurücksetzen gesendet. Er ist 30 Minuten gültig.',
+  'auth.forgotPassword.backToLogin': 'Zurück zur Anmeldung',
+
+  // --- auth.reset (Reset password page) ------------------------------------
+  'auth.reset.title': 'Passwort zurücksetzen',
+  'auth.reset.invalidLink.heading': 'Dieser Link ist ungültig oder abgelaufen.',
+  'auth.reset.invalidLink.cta': 'Neuen Link anfordern',
+  'auth.reset.password.label': 'Neues Passwort',
+  'auth.reset.confirm.label': 'Neues Passwort bestätigen',
+  'auth.reset.submit': 'Passwort ändern',
+  'auth.reset.success': 'Passwort geändert. Melden Sie sich mit Ihrem neuen Passwort an.',
+
+  // --- auth.invitation (Accept invitation page) ----------------------------
+  'auth.invitation.title': 'Einladung annehmen',
+  'auth.invitation.invalidLink.heading': 'Dieser Einladungslink ist ungültig oder abgelaufen.',
+  'auth.invitation.org.label': 'Organisation',
+  'auth.invitation.role.label': 'Rolle',
+  'auth.invitation.email.label': 'E-Mail',
+  'auth.invitation.name.label': 'Vollständiger Name',
+  'auth.invitation.password.label': 'Passwort',
+  'auth.invitation.confirm.label': 'Passwort bestätigen',
+  'auth.invitation.submit': 'Einladung annehmen',
+
+  // --- organization page (placeholder, issue #155) --------------------------
+  'organization.empty.heading': 'Organisation',
+  'organization.empty.subtext':
+    'Benutzerverwaltung und Organisationseinstellungen werden hier erscheinen.',
+
+  // --- platform page (placeholder, Super Admin console, issue #155) ---------
+  'platform.empty.heading': 'Plattform-Konsole',
+  'platform.empty.subtext': 'Die Plattform-Konsole wird hier erscheinen.',
+
+  // --- chat page (read-only viewer, issue #155) -----------------------------
+  'chat.viewerEmpty.heading': 'Noch nichts mit Ihnen geteilt',
+  'chat.viewerEmpty.subtext': 'Projekte, die andere mit Ihnen teilen, erscheinen hier.',
 };

@@ -229,9 +229,34 @@ not log request paths either.
 | `COOKIE_SECURE` | `true` | Marks the session cookie `Secure`, so browsers only send it over HTTPS (and to `http://localhost`). Set it to `false` only when you open admino over plain HTTP from another address, such as a phone on your LAN. |
 | `ADMINO_PUBLIC_URL` | `http://localhost:8000` | The address users open admino at, such as `https://admino.example.ch` (no path). Password reset links and invitation links are built from it, never from the request's `Host` header. It must use `https`; plain `http` is only allowed for `localhost`, `127.0.0.1` and `[::1]`. **Production deployments must set it**, otherwise reset and invitation emails point at localhost. An invalid value stops admino at startup. Overrides `server.public_url` in `config.yaml`. |
 
-> The login page, the pages for asking for a reset link and choosing the new password, and
-> the page for accepting an invitation are still being added. Until they ship, the API
-> answers `401` to every call that has no session.
+**In the app.** The PWA has a **Log in** page, a **Forgot password** page that asks for
+the reset link, a **Reset password** page that the emailed link opens, and an **Accept
+invitation** page where the invitee sets their name and password. The link's token stays
+in the part of the URL after `#`, which the browser never sends to the server, and the page
+removes it from the address bar as soon as it has read it. The password fields list the
+password rules, and errors stay as generic as the server's answers ("Invalid email or
+password", "This reset link is invalid or has expired."). Before you log in, the pages
+follow your browser's language (German, French or English, otherwise English); after you
+log in, they follow your account's language.
+
+When a session ends (it expired, went idle, or was ended elsewhere), the next request
+answers `401`. The app then says your session has expired and opens the login page. After
+you log in again, it takes you back to the page you were on. The server serves the app for
+these pages' addresses too, so the emailed links work in a browser that has never opened
+admino before.
+
+What you see depends on your role:
+
+| Role | Pages |
+| --- | --- |
+| Org Admin | Chat, Tools, Permissions, Organization, Settings |
+| Editor | Chat, Tools, Settings |
+| Viewer | Chat (read-only: projects shared with you, with no message box) and Settings |
+| Super Admin | Platform only (no chat) |
+
+The Organization and Platform pages are placeholders that later releases fill in. The
+server checks every request on its own, so a hidden page's API still refuses a role that
+isn't allowed to use it.
 
 ## Organizations (Super Admin)
 

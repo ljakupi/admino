@@ -150,11 +150,11 @@ export const useChatStore = defineStore('chat', () => {
       if (err instanceof ApiError) {
         // The server answered, so it is reachable: end the run instead of leaving it 'working'.
         connection.setIdle();
-        if (err.status === 401) {
-          toasts.add('error', t('toast.chat.authRequired'));
-        } else if (err.status === 429) {
+        // A 401 is handled globally (services/session.ts -> auth store): one
+        // session-expired toast and a redirect to login — no toast of our own.
+        if (err.status === 429) {
           toasts.add('warning', t('toast.chat.slowDown.title'), t('toast.chat.slowDown.body'));
-        } else {
+        } else if (err.status !== 401) {
           toasts.add('error', t('toast.chat.genericError.title'), t('toast.chat.genericError.body'));
         }
       } else {
@@ -203,6 +203,10 @@ export const useChatStore = defineStore('chat', () => {
         item.data.error = t('chat.toolCall.expired');
       } else if (err instanceof ApiError && err.status === 429) {
         toasts.add('warning', t('toast.chat.slowDown.title'), t('toast.chat.slowDown.body'));
+        item.data.state = 'pending';
+      } else if (err instanceof ApiError && err.status === 401) {
+        // Handled globally (services/session.ts -> auth store): back to pending, no toast of
+        // our own, so the same card can be approved again once the user logs back in.
         item.data.state = 'pending';
       } else {
         toasts.add('error', t('toast.chat.genericError.title'));

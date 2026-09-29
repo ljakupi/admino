@@ -2,15 +2,37 @@
 // Agent-loop calls (message/confirm) pass a longer per-call timeout — see messages.ts.
 const TIMEOUT_MS = 30_000;
 
+// Statuses whose success body is intentionally empty (issue #155: login, logout,
+// password-reset confirm, invitation accept answer 204; password-reset request
+// answers 202). `fetchJson` resolves `undefined` for these without ever reading
+// the body, so a caller can't accidentally try to parse a body that isn't there.
+const NO_BODY_STATUSES: ReadonlySet<number> = new Set([202, 204]);
+
+// A `reason` is only ever a short snake_case code the backend emits on purpose
+// (e.g. the password policy's `too_short`) — never free text. Anything else
+// (wrong type, wrong shape, wrong charset/length) leaves `reason` undefined, so
+// a hostile or malformed body can never smuggle text through it.
+const REASON_RE = /^[a-z_]{1,40}$/;
+
 export class ApiError extends Error {
   constructor(
     public status: number,
     public statusText: string,
     message?: string,
+    public reason?: string,
   ) {
     super(message ?? `${status} ${statusText}`);
     this.name = 'ApiError';
   }
+}
+
+/** A 401 from any non-auth endpoint calls this once, then the caller still gets the ApiError. */
+type UnauthorizedHandler = () => void;
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+
+/** Registers (or, with `null`, unregisters) the app-wide 401 handler. See {@link fetchJson}. */
+export function setUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler;
 }
 
 // Bounds so a pathological or proxy-injected error body can never amplify into
@@ -58,6 +80,16 @@ export function formatErrorDetail(body: unknown): string | undefined {
   return undefined;
 }
 
+/**
+ * Extract `ApiError.reason` from a FastAPI error body: only a top-level string
+ * `reason` matching {@link REASON_RE}. See the module doc for why.
+ */
+export function extractReason(body: unknown): string | undefined {
+  if (!body || typeof body !== 'object') return undefined;
+  const reason = (body as { reason?: unknown }).reason;
+  return typeof reason === 'string' && REASON_RE.test(reason) ? reason : undefined;
+}
+
 export async function fetchJson<T>(
   path: string,
   init: RequestInit = {},
@@ -79,12 +111,28 @@ export async function fetchJson<T>(
 
     if (!res.ok) {
       let message: string | undefined;
+      let reason: string | undefined;
       try {
-        message = formatErrorDetail(await res.json());
+        const body: unknown = await res.json();
+        message = formatErrorDetail(body);
+        reason = extractReason(body);
       } catch {
         // Non-JSON / empty error body — fall back to the status line.
       }
-      throw new ApiError(res.status, res.statusText, message);
+
+      if (res.status === 401 && !path.startsWith('/api/auth/') && unauthorizedHandler) {
+        try {
+          unauthorizedHandler();
+        } catch {
+          // A throwing handler must never replace the ApiError thrown below.
+        }
+      }
+
+      throw new ApiError(res.status, res.statusText, message, reason);
+    }
+
+    if (NO_BODY_STATUSES.has(res.status)) {
+      return undefined as T;
     }
 
     return (await res.json()) as T;
