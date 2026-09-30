@@ -95,7 +95,7 @@ from admino.email_templates import (
 )
 from admino.mailer import SmtpConfig, load_smtp_config
 from admino.server import _lifespan, create_app
-from tests.lifespan_stubs import patch_org_purge_job
+from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1713,6 +1713,8 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.email_outbox.run_outbox_sender", probe.sender),
         patch("admino.sessions.run_session_purge_job", probe.session_purge, create=True),
         patch_org_purge_job(probe.org_purge),
+        # GH-157: the login throttle purge never runs against the MagicMock pool.
+        patch_login_throttle_purge_job(AsyncMock()),
     ):
         yield
 

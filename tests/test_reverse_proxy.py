@@ -389,6 +389,7 @@ class TestForwardedClientInAuditAndLimits:
         assert (_LOGIN, f"ip:{_CLIENT_A}") in server._rate_buckets
         assert (_LOGIN, f"ip:{_PROXY_IP}") not in server._rate_buckets
 
+    @pytest.mark.usefixtures("login_delays")  # GH-157: the shared email's delays
     def test_reverse_proxy_login_budget_is_per_forwarded_client(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -406,6 +407,7 @@ class TestForwardedClientInAuditAndLimits:
         assert statuses_a == [401] * burst + [429]
         assert status_b == 401
 
+    @pytest.mark.usefixtures("login_delays")  # GH-157: the shared email's delays
     def test_reverse_proxy_untrusted_peer_cannot_escape_its_login_budget(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:

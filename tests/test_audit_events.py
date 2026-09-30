@@ -85,7 +85,7 @@ from admino.audit_events import (
 )
 from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS
 from admino.server import _lifespan, create_app
-from tests.lifespan_stubs import patch_org_purge_job
+from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -2146,6 +2146,8 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
         patch("admino.audit_events.run_retention_job", probe.job),
         patch("admino.sessions.run_session_purge_job", session_purge.job, create=True),
         patch_org_purge_job(org_purge.job),
+        # GH-157: the login throttle purge never runs against the MagicMock pool.
+        patch_login_throttle_purge_job(AsyncMock()),
     ):
         yield
 

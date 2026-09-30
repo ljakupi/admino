@@ -32,6 +32,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from admino.server import _lifespan, create_app
+from tests.lifespan_stubs import patch_login_throttle_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -122,6 +123,8 @@ def _patched_lifespan(probe: _LifespanProbe, smtp_config: Any = None) -> Iterato
         patch("admino.mailer.load_smtp_config", MagicMock(return_value=smtp_config)),
         patch("admino.email_outbox.run_outbox_sender", probe.sender),
         patch("admino.organizations.run_org_purge_job", probe.org_purge),
+        # GH-157: the login throttle purge never runs against the MagicMock pool.
+        patch_login_throttle_purge_job(AsyncMock()),
     ):
         yield
 

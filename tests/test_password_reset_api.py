@@ -622,12 +622,18 @@ class TestConfirmRefused:
     def test_password_reset_api_confirm_malformed_token_is_400_without_query(
         self, db: FakeDb, token: str
     ) -> None:
-        """A token that passes body validation but can't exist: 400 and no database call."""
+        """A token that passes body validation but can't exist: 400 and no token or account
+        lookup. GH-157: only the IP throttle's own login_throttle statements run (the
+        malformed link counts as a failed attempt)."""
         response = _confirm(_client(_app()), token)
 
         assert response.status_code == 400
         assert response.json() == _INVALID
-        assert db.calls == []
+        assert [
+            call.normalized
+            for call in db.calls
+            if not re.search(r"\blogin_throttle\b", call.normalized)
+        ] == []
 
     @pytest.mark.parametrize("seconds_ago", [1, 3600])
     def test_password_reset_api_confirm_expired_token_is_400(

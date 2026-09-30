@@ -1,22 +1,47 @@
 """Shared pytest fixtures for the admino test suite.
 
-Provides common mocks for the PostgreSQL connection pool (asyncpg.Pool)
-and other shared test infrastructure.
+Provides common mocks for the PostgreSQL connection pool (asyncpg.Pool),
+the recorder of the login throttle's progressive delays (GH-157) and other
+shared test infrastructure.
 
 Security notes:
 - All fixtures use mocks — no real database connections are made.
+- No test ever really sleeps for a login delay: a test that can reach one
+  (four or more failed attempts sharing an email or an IP) requests
+  ``login_delays``.
 """
 
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+
+@pytest.fixture()
+def login_delays(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the progressive delays of the login throttle instead of sleeping (GH-157).
+
+    ``admino.login_throttle`` awaits every delay through its module attribute
+    ``sleep`` (an alias of ``asyncio.sleep``); this replaces it with a recorder
+    and returns the list of requested delays, in order. Not autouse, and the
+    module is imported here, lazily: before it exists only the tests that ask
+    for this fixture fail.
+    """
+    import admino.login_throttle as login_throttle
+
+    delays: list[float] = []
+
+    async def record(delay: float, *_args: Any, **_kwargs: Any) -> None:
+        delays.append(float(delay))
+
+    monkeypatch.setattr(login_throttle, "sleep", record)
+    return delays
 
 
 @pytest.fixture(autouse=True)
