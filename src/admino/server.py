@@ -39,12 +39,15 @@ Routes:
   org stays deactivated); audited.
 - PATCH /api/platform/orgs/{org_id}/residency — Sets an org's data residency
   policy; audited in the org's own log.
+- GET  /api/platform/diagnostics — The database status, the active LLM provider
+  and model, and whether the LLM looks reachable (Super Admin).
 - POST /api/message       — Send a user message; returns ChatResponse.
 - GET  /api/events        — SSE stream for a chat session.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
 - /api/settings, /api/permissions, /api/critical-permissions, /api/oauth/* —
   settings, permissions and account connections.
-- GET  /health            — Health check (public).
+- GET  /health            — Health check (public): ``{"status": "ok"}``, or 503
+  ``{"status": "degraded"}`` when the database is unreachable; nothing else.
 - GET  /api/oauth/callback — The OAuth provider's redirect (public, state-checked).
 - /                       — Static PWA files (public); a missing client route
   (outside /api and /health, last segment without an extension) gets
@@ -130,15 +133,30 @@ Security notes:
   link that can't be used; the email, token, link and password are never
   logged or echoed.
 - Rate limits are per caller: one token bucket per (route, ``user:<id>``) on
-  session routes and per (route, ``ip:<host>``) on public routes (the login,
-  the password reset and the invitation link routes), so one caller can't
-  throttle another. Idle buckets are evicted and the map is capped (LRU).
+  session routes and per (route, ``ip:<host>``) on public routes (the health
+  check, the login, the password reset and the invitation link routes), so
+  one caller can't throttle another. Idle buckets are evicted and the map is
+  capped (LRU).
   The buckets live in process memory; the lockouts above live in PostgreSQL
   and survive a restart.
   Cookies that resolve to no session spend a per-IP budget, so a stream of
   random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
 - Error responses use generic messages; never leak internal paths or config.
+- Request IDs and unhandled errors (GH-158): ``RequestIdMiddleware`` (pure
+  ASGI, outermost) gives every HTTP request a fresh ``uuid4().hex`` in
+  ``logs.request_id_var``, so every log line of the request carries it, and
+  sends it back as ``X-Request-ID`` on every response (the CSRF 403, 404,
+  422, 429, 500 and static files included). An incoming ``X-Request-ID`` is
+  ignored. An exception escaping the app is logged once as ``"Unhandled
+  exception: <ClassName>"`` (no exc_info, no message, so no traceback) and
+  answered 500 ``{"detail": "Internal error"}``; it is never re-raised.
+- Health exposure (GH-158): the public ``/health`` answers the database
+  status only (per-IP bucket, before the database check) and never probes
+  the LLM. The provider, model and reachability are behind
+  ``Capability.PLATFORM_DIAGNOSTICS_VIEW`` (Super Admin) on
+  ``/api/platform/diagnostics``, which spends a per-user bucket and checks the
+  capability before any probe.
 - CORS allows only ``server.public_url`` as an origin; no credentials, and
   only ``Content-Type`` as an allowed request header. ``/openapi.json``,
   Swagger UI and ReDoc are disabled.
@@ -179,7 +197,7 @@ from datetime import UTC, datetime
 from pathlib import Path as PathLib
 from typing import TYPE_CHECKING, Annotated, Any, Final
 from urllib.parse import urlsplit
-from uuid import UUID  # noqa: TC003 — FastAPI resolves path parameter annotations at runtime
+from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
@@ -205,6 +223,7 @@ from admino import (
     sessions,
 )
 from admino.access import Capability, Principal, can
+from admino.logs import request_id_var
 from admino.models import (
     AgentResult,
     ChatRequest,
@@ -236,6 +255,7 @@ from admino.models import (
     PermissionEntry,
     PermissionPatch,
     PermissionsResponse,
+    PlatformDiagnosticsResponse,
     SessionListResponse,
     SettingsAppearance,
     SettingsConnectedAccounts,
@@ -273,7 +293,7 @@ from admino.tools.outlook_calendar import clear_token_cache as _clear_outcal_cac
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
-    from starlette.types import ASGIApp, Receive, Scope, Send
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from admino.agent import Agent
     from admino.config import AppConfig
@@ -284,6 +304,21 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Security headers middleware
 # ---------------------------------------------------------------------------
+
+# Sent on every response: by SecurityHeadersMiddleware, and by
+# RequestIdMiddleware on the 500 it answers for an unhandled exception.
+_SECURITY_HEADERS: Final[dict[str, str]] = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "connect-src 'self'; img-src 'self' data:; font-src 'self'; "
+        "object-src 'none'; frame-ancestors 'none'; base-uri 'self'; "
+        "form-action 'self'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+}
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -306,18 +341,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     ) -> Response:
         """Add security headers to every response."""
         response = await call_next(request)
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "connect-src 'self'; img-src 'self' data:; font-src 'self'; "
-            "object-src 'none'; frame-ancestors 'none'; base-uri 'self'; "
-            "form-action 'self'"
-        )
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=(), payment=()"
-        )
+        response.headers.update(_SECURITY_HEADERS)
         return response
 
 
@@ -389,6 +413,65 @@ class CrossOriginProtectionMiddleware:
             await response(scope, receive, send)
             return
         await self._app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------
+# Request IDs and unhandled exceptions
+# ---------------------------------------------------------------------------
+
+_INTERNAL_ERROR_DETAIL: Final = "Internal error"
+
+
+class RequestIdMiddleware:
+    """Gives every HTTP request an ID and turns an escaping exception into a generic 500.
+
+    A pure ASGI middleware, installed outermost. Each request gets a fresh
+    ``uuid4().hex``, held in ``logs.request_id_var`` while the request runs
+    (every log line of the request carries it) and sent back as
+    ``X-Request-ID`` on every response. An incoming ``X-Request-ID`` is
+    ignored: never echoed, logged or used.
+
+    An exception that escapes the app is logged once at ERROR as
+    ``"Unhandled exception: <ClassName>"`` (no exc_info, no message) and
+    answered 500 ``{"detail": "Internal error"}`` (with the security headers,
+    since SecurityHeadersMiddleware sits inside and never sees it) when the
+    response hasn't started. It is never re-raised, so neither Starlette nor uvicorn logs a
+    traceback. HTTPExceptions are answered inside the app and never get here.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Run the request with its ID; answer 500 for an unhandled exception."""
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        request_id = uuid4().hex
+        header = (b"x-request-id", request_id.encode("ascii"))
+        started = False
+
+        async def send_with_request_id(message: Message) -> None:
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                message = {**message, "headers": [*message.get("headers", []), header]}
+            await send(message)
+
+        token = request_id_var.set(request_id)
+        try:
+            await self._app(scope, receive, send_with_request_id)
+        except Exception as exc:
+            logger.error("Unhandled exception: %s", type(exc).__name__)
+            if not started:
+                response = JSONResponse(
+                    status_code=500,
+                    content={"detail": _INTERNAL_ERROR_DETAIL},
+                    headers=_SECURITY_HEADERS,
+                )
+                await response(scope, receive, send_with_request_id)
+        finally:
+            request_id_var.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +622,11 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/platform/orgs/status": (0.5, 5),
     "/api/platform/orgs/deletion": (0.2, 5),
     "/api/platform/orgs/residency": (0.5, 5),
+    # GH-158: the public health check, per IP. Generous: the PWA polls it every
+    # 10 seconds per tab and the container healthcheck hits it too.
+    "/health": (5.0, 30),
+    # GH-158: platform diagnostics (the LLM probe), per Super Admin.
+    "/api/platform/diagnostics": (1.0, 10),
 }
 # Routes without their own entry still get a bucket per caller.
 _DEFAULT_RATE_LIMIT: tuple[float, int] = (1.0, 10)
@@ -1111,32 +1199,62 @@ async def _check_llm_reachable() -> bool:
 # ---------------------------------------------------------------------------
 
 
-async def health_check() -> dict[str, str | bool]:
-    """Health check endpoint. Public (no session). Checks database connectivity.
+async def health_check(request: Request) -> dict[str, str] | JSONResponse:
+    """Handle GET /health — public (no session): up or degraded, nothing else.
 
-    Reports the active LLM provider/model and whether it is reachable. The DB
-    check still gates the 503; an unreachable LLM does not fail the check (it is
-    reported via ``llm_reachable=False``).
+    Checks database connectivity only: no LLM probe, no config. The provider,
+    model and LLM reachability are for the Super Admin, on
+    ``GET /api/platform/diagnostics``.
+
+    Args:
+        request: The incoming request (the client IP for the rate limit).
 
     Returns:
-        A status dict with ``status``, ``provider``, ``model``, ``llm_reachable``.
+        200 ``{"status": "ok"}``, or 503 ``{"status": "degraded"}`` when the
+        database is unreachable.
 
     Raises:
-        HTTPException: 503 if the database is unreachable.
+        HTTPException: 429 when the client IP is rate-limited (before the
+            database check).
     """
+    _check_rate_limit("/health", f"ip:{_client_ip(request)}")
+
+    from admino.database import check_health
+
+    if not await check_health():
+        return JSONResponse(status_code=503, content={"status": "degraded"})
+    return {"status": "ok"}
+
+
+async def get_platform_diagnostics(principal: _PrincipalDep) -> PlatformDiagnosticsResponse:
+    """Handle GET /api/platform/diagnostics — the LLM setup and statuses (Super Admin).
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        PlatformDiagnosticsResponse: the database status, the active provider
+        and model, and whether the LLM looks reachable.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.PLATFORM_DIAGNOSTICS_VIEW`` (both before any probe).
+    """
+    _check_rate_limit("/api/platform/diagnostics", _user_caller(principal))
+    if not can(principal, Capability.PLATFORM_DIAGNOSTICS_VIEW):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
     from admino.database import check_health
 
     db_ok = await check_health()
-    if not db_ok:
-        raise HTTPException(status_code=503, detail="Database unreachable")
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-    return {
-        "status": "ok",
-        "provider": _config.llm.provider,
-        "model": _config.llm.active_model_name,
-        "llm_reachable": await _check_llm_reachable(),
-    }
+    return PlatformDiagnosticsResponse(
+        status="ok" if db_ok else "degraded",
+        provider=_config.llm.provider,
+        model=_config.llm.active_model_name or None,
+        llm_reachable=await _check_llm_reachable(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2842,13 +2960,15 @@ async def patch_permissions(
 
     await update_permission(pool, body.tool, body.action, body.permission)
 
-    # Audit log: record the permission change at WARNING level.
+    # Audit log: record the permission change at WARNING level (validated
+    # identifiers and states only).
+    changed_tool, changed_action, new_value = body.tool, body.action, body.permission
     logger.warning(
         "Permission changed: tool=%s action=%s old=%s new=%s",
-        body.tool,
-        body.action,
+        changed_tool,
+        changed_action,
         old_value,
-        body.permission,
+        new_value,
     )
 
     # Reload permissions config and update the running agent immediately.
@@ -3690,6 +3810,12 @@ def create_app(
     if trusted_proxies:
         app.add_middleware(TrustedProxyHeadersMiddleware, trusted_proxies=trusted_proxies)
 
+    # --- Request IDs (outermost, GH-158) ---
+    # Added last, so every response (the CSRF 403, 404, 422, 429, static files
+    # and the 500 for an unhandled exception) carries X-Request-ID, and every
+    # log line of the request carries the same ID.
+    app.add_middleware(RequestIdMiddleware)
+
     # --- Error handlers ---
     # RequestValidationError: raised by FastAPI for request body/query/path validation.
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)  # type: ignore[arg-type]
@@ -3700,7 +3826,7 @@ def create_app(
     # Public: health check, login, password reset, the invitation link routes
     # and the OAuth callback (plus static files). Every other route depends on
     # require_session.
-    app.get("/health")(health_check)
+    app.get("/health", response_model=None)(health_check)
     app.post("/api/auth/login", status_code=204, response_model=None)(post_login)
     app.post("/api/auth/password-reset", status_code=202, response_model=None)(post_password_reset)
     app.post("/api/auth/password-reset/confirm", status_code=204, response_model=None)(
@@ -3754,6 +3880,9 @@ def create_app(
     )
     app.patch("/api/platform/orgs/{org_id}/residency", response_model=OrgSummary)(
         patch_platform_org_residency
+    )
+    app.get("/api/platform/diagnostics", response_model=PlatformDiagnosticsResponse)(
+        get_platform_diagnostics
     )
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)

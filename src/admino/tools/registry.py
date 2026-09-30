@@ -42,6 +42,7 @@ from typing import Final
 
 from pydantic import BaseModel, Field, ValidationError
 
+from admino.logs import safe_log
 from admino.models import (
     _CONTROL_CHAR_TABLE,
     PendingConfirmation,
@@ -315,8 +316,8 @@ async def dispatch_tool_call(
     if entry is None:
         logger.warning(
             "Rejected unknown tool %s.%s (not in registry)",
-            raw_tool[:64],
-            raw_action[:64],
+            safe_log(raw_tool),
+            safe_log(raw_action),
         )
         unknown = PermissionResult(allowed="deny", reason="Tool is not registered.")
         return ToolCallResult(
@@ -364,8 +365,8 @@ async def dispatch_tool_call(
         ):
             logger.warning(
                 "Rejected mismatched pending_confirmation for %s.%s",
-                raw_tool[:64],
-                raw_action[:64],
+                safe_log(raw_tool),
+                safe_log(raw_action),
             )
             mismatched = PermissionResult(
                 allowed="deny",
@@ -381,8 +382,8 @@ async def dispatch_tool_call(
         if datetime.now(UTC) >= pending_confirmation.expires_at:
             logger.warning(
                 "Rejected expired pending_confirmation for %s.%s",
-                raw_tool[:64],
-                raw_action[:64],
+                safe_log(raw_tool),
+                safe_log(raw_action),
             )
             expired = PermissionResult(
                 allowed="deny",
@@ -434,8 +435,8 @@ async def dispatch_tool_call(
         error_type = type(exc).__name__
         logger.error(
             "Tool %s.%s raised %s during execution",
-            raw_tool[:64],
-            raw_action[:64],
+            safe_log(raw_tool),
+            safe_log(raw_action),
             error_type,
         )
         return ToolCallResult(
@@ -448,8 +449,8 @@ async def dispatch_tool_call(
     if not isinstance(result, str):
         logger.error(
             "Tool %s.%s returned non-string type %s",
-            raw_tool[:64],
-            raw_action[:64],
+            safe_log(raw_tool),
+            safe_log(raw_action),
             type(result).__name__,
         )
         return ToolCallResult(

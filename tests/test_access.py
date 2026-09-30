@@ -16,7 +16,10 @@ Security notes:
   NULL iff role is NULL.
 - Isolation: access.py is pure (no I/O) and imports nothing from the server,
   agent, LLM, database, tools, OAuth or audit modules. The tool permission
-  engine (permissions.py) stays a separate layer and imports nothing from admino.
+  engine (permissions.py) stays a separate layer: its one admino import is
+  ``admino.logs`` (the shared ``safe_log`` sanitizer, GH-158).
+- GH-158: ``platform.diagnostics.view`` (the LLM provider, model and
+  reachability behind ``GET /api/platform/diagnostics``) is Super Admin only.
 """
 
 from __future__ import annotations
@@ -68,6 +71,8 @@ _EXPECTED_MATRIX: dict[str, frozenset[str]] = {
     "usage.view.platform": _SA_ONLY,
     # Row 4 — Platform audit log
     "audit.view.platform": _SA_ONLY,
+    # Platform diagnostics: LLM provider, model and reachability (GH-158)
+    "platform.diagnostics.view": _SA_ONLY,
     # Row 5 — Manage users and invitations in own org
     "org.users.view": _ORG_ADMIN_ONLY,
     "org.users.invite": _ORG_ADMIN_ONLY,
@@ -166,6 +171,7 @@ _PLATFORM_CAPABILITIES: tuple[str, ...] = (
     "platform.defaults.manage",
     "usage.view.platform",
     "audit.view.platform",
+    "platform.diagnostics.view",
 )
 
 # Strings that are not capability values: denied for every role, never raising.
@@ -759,15 +765,16 @@ class TestAccessIsolation:
         assert _forbidden_calls(_SRC_DIR / "access.py") == []
 
     def test_access_permission_engine_imports_nothing_from_admino(self) -> None:
-        """Permission engine untouched: permissions.py gains no admino import (access,
-        tenancy, accounts or anything else), so the two authorization layers stay apart."""
+        """Permission engine stays apart: permissions.py's only admino import is
+        ``admino.logs`` (its safe_log sanitizer, GH-158); never access, tenancy,
+        accounts or anything else, so the two authorization layers stay apart."""
         admino_imports = [
             m
             for m in _imported_modules(_SRC_DIR / "permissions.py")
             if m == "admino" or m.startswith("admino.")
         ]
 
-        assert admino_imports == []
+        assert admino_imports == ["admino.logs"]
 
 
 # ---------------------------------------------------------------------------

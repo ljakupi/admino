@@ -221,7 +221,8 @@ class TestFilesToolRemovedFromPermissions:
         assert "not listed" in result.reason.lower()
 
     def test_permissions_module_imports_unchanged(self) -> None:
-        """permissions.py gains no imports: its import set is pinned."""
+        """permissions.py's import set is pinned. GH-158 (user-approved): ``_safe_log``
+        moved to ``admino.logs.safe_log``, so ``admino.logs`` replaces ``unicodedata``."""
         source_path = Path(__file__).resolve().parent.parent / "src" / "admino" / "permissions.py"
         tree = ast.parse(source_path.read_text(encoding="utf-8"))
         imported: set[str] = set()
@@ -230,7 +231,7 @@ class TestFilesToolRemovedFromPermissions:
                 imported.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom) and node.module is not None:
                 imported.add(node.module)
-        assert imported == {"__future__", "logging", "re", "unicodedata", "typing", "pydantic"}
+        assert imported == {"__future__", "logging", "re", "typing", "pydantic", "admino.logs"}
 
 
 # ---------------------------------------------------------------------------

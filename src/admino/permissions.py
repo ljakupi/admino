@@ -6,7 +6,9 @@ the immutable PermissionsConfig; it never sees LLM context, conversation
 history, user messages, or tool arguments.
 
 Security notes:
-- This module must NEVER import from agent.py, llm.py, or server.py.
+- This module must NEVER import from agent.py, llm.py, or server.py. Its one
+  admino import is ``admino.logs`` (the standard-library-only ``safe_log``
+  sanitizer for identifiers in log lines and error messages).
 - Hardcoded denials cannot be overridden by configuration.
 - Default-deny: any unlisted tool/action combination is denied.
 - check_permission is a pure function: no logging, no network calls, no
@@ -24,10 +26,11 @@ from __future__ import annotations
 
 import logging
 import re
-import unicodedata
 from typing import Final, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+from admino.logs import safe_log
 
 logger = logging.getLogger(__name__)
 
@@ -114,19 +117,6 @@ if not HARDCODED_DENIALS <= _CONFIRM_ONLY_ACTIONS:
         "Every hardcoded denial must also be in _CONFIRM_ONLY_ACTIONS "
         "to prevent accidental promotion if removed from HARDCODED_DENIALS."
     )
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _safe_log(s: str, max_len: int = 64) -> str:
-    """Sanitize a string for safe log output."""
-    return "".join(
-        c if c.isprintable() and unicodedata.category(c) != "Cf" else f"\\u{ord(c):04x}"
-        for c in s[:max_len]
-    )
-
 
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -224,21 +214,21 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
     tools: dict[str, ToolPermissions] = {}
     for tool_name, actions in raw.items():
         if not _VALID_IDENTIFIER.fullmatch(tool_name):
-            msg = f"Invalid tool name in permissions config: {_safe_log(repr(tool_name))}"
+            msg = f"Invalid tool name in permissions config: {safe_log(repr(tool_name))}"
             raise ValueError(msg)
         cleaned_actions: dict[str, PermissionState] = {}
         for action_name, state in actions.items():
             if not _VALID_IDENTIFIER.fullmatch(action_name):
-                msg = f"Invalid action name in permissions config: {_safe_log(repr(action_name))}"
+                msg = f"Invalid action name in permissions config: {safe_log(repr(action_name))}"
                 raise ValueError(msg)
             if (tool_name, action_name) in HARDCODED_DENIALS:
                 if state != "deny":
                     logger.warning(
                         "permission config sets %s.%s to '%s', "
                         "but this is a hardcoded denial — enforcing 'deny'.",
-                        _safe_log(tool_name),
-                        _safe_log(action_name),
-                        _safe_log(state),
+                        safe_log(tool_name),
+                        safe_log(action_name),
+                        safe_log(state),
                     )
                 # Always store 'deny' for hardcoded denials so the config
                 # never contains misleading values.
@@ -246,8 +236,8 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
             else:
                 if state not in ("allow", "confirm", "deny"):
                     msg = (
-                        f"Invalid permission state {_safe_log(repr(state))} for "
-                        f"{_safe_log(tool_name)}.{_safe_log(action_name)}. "
+                        f"Invalid permission state {safe_log(repr(state))} for "
+                        f"{safe_log(tool_name)}.{safe_log(action_name)}. "
                         "Must be 'allow', 'confirm', or 'deny'."
                     )
                     raise ValueError(msg)
@@ -256,8 +246,8 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
                     logger.warning(
                         "permission config sets %s.%s to 'allow', but this is a "
                         "write-mutating action — downgrading to 'confirm'.",
-                        _safe_log(tool_name),
-                        _safe_log(action_name),
+                        safe_log(tool_name),
+                        safe_log(action_name),
                     )
                     cleaned_actions[action_name] = "confirm"
                 else:
@@ -266,7 +256,7 @@ def validate_permissions_config(raw: dict[str, dict[str, str]]) -> PermissionsCo
         if not cleaned_actions:
             logger.warning(
                 "permission config tool %s has no actions configured.",
-                _safe_log(tool_name),
+                safe_log(tool_name),
             )
         tools[tool_name] = ToolPermissions(actions=cleaned_actions)
     return PermissionsConfig(tools=tools)

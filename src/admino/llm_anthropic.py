@@ -45,6 +45,7 @@ from admino.llm import (
     strip_control_chars,
     validate_tools_payload,
 )
+from admino.logs import safe_log
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
@@ -231,14 +232,15 @@ def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
         # Reverse the dot→double-underscore encoding applied in _convert_tools_to_anthropic
         # so the rest of the parse logic can use standard 'tool.action' dot notation.
         name_safe = strip_control_chars(_anthropic_name_to_dot(name))[:64]
+        log_name = safe_log(_anthropic_name_to_dot(name))
         arguments = getattr(block, "input", {})
         if not isinstance(arguments, dict):
-            logger.warning("Skipping tool call '%s': input is not a dict", name_safe)
+            logger.warning("Skipping tool call '%s': input is not a dict", log_name)
             continue
 
         if not check_args_depth(arguments):
             logger.warning(
-                "Skipping tool call '%s': arguments exceed nesting depth limit", name_safe
+                "Skipping tool call '%s': arguments exceed nesting depth limit", log_name
             )
             continue
         # Quick pre-screen on top-level values only; nested strings are covered
@@ -246,22 +248,22 @@ def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
         if len(arguments) > 32 or any(
             isinstance(v, str) and len(v) > 2048 for v in arguments.values()
         ):
-            logger.warning("Skipping tool call '%s': arguments exceed size limits", name_safe)
+            logger.warning("Skipping tool call '%s': arguments exceed size limits", log_name)
             continue
         if len(json.dumps(arguments)) > 16384:
-            logger.warning("Skipping tool call '%s': arguments exceed size limits", name_safe)
+            logger.warning("Skipping tool call '%s': arguments exceed size limits", log_name)
             continue
 
         if "." not in name_safe:
             logger.warning(
                 "Skipping tool call '%s': name must use 'tool.action' dot notation",
-                name_safe,
+                log_name,
             )
             continue
 
         tool, action = name_safe.split(".", maxsplit=1)
         if not tool or not action:
-            logger.warning("Skipping tool call '%s': empty tool or action component", name_safe)
+            logger.warning("Skipping tool call '%s': empty tool or action component", log_name)
             continue
 
         try:
@@ -269,7 +271,7 @@ def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
         except ValidationError:
             logger.warning(
                 "Skipping tool call '%s': tool/action failed schema validation",
-                name_safe,
+                log_name,
             )
 
     return parsed

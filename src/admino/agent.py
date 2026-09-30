@@ -340,14 +340,18 @@ class Agent:
             except (MemoryError, RecursionError):
                 raise
             except Exception as exc:
-                # For LLMError, log .message (our own safe string, never an HTTP
-                # body or credential). For other exceptions, log only the type.
+                # Logged by type (and, for an LLMError, its HTTP status) only,
+                # never a message: no provider text reaches the log (GH-158).
                 # A user-facing LLMError carries a fixed, actionable message
                 # (e.g. "set INFOMANIAK_API_TOKEN") that is shown verbatim; every
                 # other failure gets the generic reply.
                 reply = _LLM_ERROR_MESSAGE
                 if isinstance(exc, LLMError):
-                    logger.error("LLM chat call failed: %s", exc.message)
+                    logger.error(
+                        "LLM chat call failed: %s (status %s)",
+                        type(exc).__name__,
+                        exc.status_code,
+                    )
                     if exc.user_facing:
                         reply = exc.message
                 else:
