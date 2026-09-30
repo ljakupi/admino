@@ -65,6 +65,7 @@ from admino import models, server
 from admino.access import Principal
 from admino.models import AgentResult, LLMMessage, PendingConfirmation, ToolCall
 from admino.server import create_app
+from tests.db_fakes import FakeDb as SharedFakeDb
 from tests.db_fakes import NowPlus, insert_values
 
 if TYPE_CHECKING:
@@ -156,6 +157,14 @@ def _norm(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip().lower()
 
 
+def _is_throttle_sql(normalized: str) -> bool:
+    """True for a statement of the login throttle (GH-157): its login_throttle table and
+    the FROM-less digest the database computes as the account subject."""
+    return re.search(r"\blogin_throttle\b", normalized) is not None or (
+        normalized.startswith("select") and " from " not in normalized and "sha256" in normalized
+    )
+
+
 def _sha256(token: str) -> bytes:
     """The stored form of a session token."""
     return hashlib.sha256(token.encode()).digest()
@@ -191,6 +200,9 @@ class _FakeDb:
       idle_timeout_minutes it fails like a NOT NULL violation), DELETE FROM
       sessions ... token_hash deletes one (logout), and UPDATE sessions SET
       last_seen_at touches one by id. Every call is recorded.
+    - GH-157: the login throttle's statements run on the login_throttle table of
+      the shared tests/db_fakes.py database (``throttle``), so several failures
+      sharing an email or an IP are counted, delayed and locked as in production.
     """
 
     def __init__(self) -> None:
@@ -198,6 +210,7 @@ class _FakeDb:
         self.sessions: dict[bytes, dict[str, Any]] = {}
         self.calls: list[tuple[str, str, tuple[Any, ...]]] = []
         self.session_inserts: list[tuple[str, tuple[Any, ...]]] = []
+        self.throttle = SharedFakeDb()
         self.pool = _FakePool(self)
 
     # -- fixtures ------------------------------------------------------------
@@ -260,6 +273,8 @@ class _FakeDb:
     def handle(self, method: str, sql: str, args: tuple[Any, ...]) -> Any:
         self.calls.append((method, sql, args))
         normalized = _norm(sql)
+        if _is_throttle_sql(normalized):
+            return self.throttle.handle(method, sql, args, "pool", None)
         if re.search(r"\brevoked_at\b", normalized):
             # Migration 0009 dropped the column: revoking deletes the row.
             raise asyncpg.exceptions.UndefinedColumnError('column "revoked_at" does not exist')
@@ -1524,11 +1539,12 @@ class TestRateLimitPerCaller:
 
         assert [first.status_code, second.status_code, third.status_code] == [200, 200, 429]
 
-    @pytest.mark.usefixtures("fast_passwords")
+    @pytest.mark.usefixtures("fast_passwords", "login_delays")
     def test_auth_api_login_is_limited_per_client_ip(
         self, db: _FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """One IP hammering the login gets 429; another IP is unaffected."""
+        """One IP hammering the login gets 429; another IP is unaffected. (GH-157: the
+        shared email's earlier failures delay IP B's attempt; login_delays records it.)"""
         app = _app()
         monkeypatch.setitem(server._RATE_LIMITS, "/api/auth/login", (0.001, 3))
         client_a = _client(app, _IP_A)

@@ -184,6 +184,19 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   that's still open.
 - **A failed login** always answers "Invalid email or password", whatever the reason.
   Successful and failed logins are recorded in the audit log, without the email address.
+- **Brute-force protection** counts failed logins per account and per IP address, and
+  the counts survive a restart. After 3 failures in 15 minutes, each further attempt
+  waits before the password is checked: 1, 2, 4, then 8 seconds. After 10 failures in
+  15 minutes, the account or the IP address is locked for 15 minutes. A locked login
+  gets the same "Invalid email or password" as a wrong password, even with the right
+  password, and the lock expires on its own. Every lockout is recorded in the audit log
+  (`login.lockout`). An address that was never registered is counted the same way, so
+  the protection doesn't reveal which accounts exist.
+- **Password reset and invitation links share the IP counter.** An unusable link counts
+  as a failed attempt from that IP address. While the address is locked, confirming a
+  reset, opening an invitation link, accepting an invitation and asking for a reset
+  link answer `429` "Too many attempts. Try again later." Asking for a reset link never
+  counts as a failure. The limits above are fixed for now; they aren't configurable.
 - **Cross-site requests** that change something (`POST`, `PATCH`, `DELETE`) are refused
   with `403`.
 - **Rate limits** apply per user, and per IP address for the login, the password reset

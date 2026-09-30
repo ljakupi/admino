@@ -23,9 +23,14 @@ What these tests pin down:
   known (a ``system`` actor with no user and no org otherwise).
 - Equalized timing: ``admino.passwords.verify_password`` runs exactly once per
   login, whatever the outcome, off the event loop's thread.
-- The email is a bind parameter of the lookup (``lower(email) = lower($1)``) and
+- The email is a bind parameter of the lookup (``lower(email) = lower($1)``) and,
+  since GH-157, the input of the login throttle's account subject
+  (``sha256(convert_to(lower($n), 'UTF8'))``, computed by the database), and
   nowhere else: not in any other statement, not in the audit row or its
-  metadata, not in any log line. The password is never logged.
+  metadata, not in any log line. The password is never logged. The throttle's
+  own statements run on the login_throttle table of tests/db_fakes.py (a fresh
+  counter per test pool, so no delay or lockout); its behavior is specified in
+  tests/test_login_throttle.py.
 - ``logout`` deletes the session row (GH-152: no revoked_at any more).
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
@@ -57,7 +62,7 @@ from admino import passwords
 from admino import sessions as sessions_mod
 from admino.auth import LOGIN_FAILED_MESSAGE, LoginFailedError, login, logout
 from admino.sessions import hash_session_token
-from tests.db_fakes import NowPlus, insert_values
+from tests.db_fakes import FakeDb, NowPlus, insert_values
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -81,6 +86,37 @@ def _norm(sql: str) -> str:
     return re.sub(r"\s+", " ", sql).strip().lower()
 
 
+# GH-157: the login throttle's own statements (its login_throttle table, and the
+# FROM-less digest the database computes as the account subject).
+_DIGEST_RE = re.compile(
+    r"sha256 ?\( ?convert_to ?\( ?lower ?\( ?\$(\d+)(?: ?:: ?\w+)? ?\) ?, ?'utf-?8' ?\) ?\)"
+)
+
+
+def _is_throttle_sql(sql: str) -> bool:
+    """True for a statement of the login throttle (GH-157)."""
+    normalized = _norm(sql)
+    return re.search(r"\blogin_throttle\b", normalized) is not None or (
+        normalized.startswith("select") and " from " not in normalized and "sha256" in normalized
+    )
+
+
+def _only_digests_the_email(sql: str, args: tuple[Any, ...]) -> bool:
+    """True when every bind parameter carrying the email is used only as the input of
+    sha256(convert_to(lower($n), 'UTF8')), the account subject (GH-157)."""
+    normalized = _norm(sql)
+    positions = [
+        index + 1
+        for index, arg in enumerate(args)
+        if isinstance(arg, str) and arg.casefold() == _EMAIL.casefold()
+    ]
+    digested = [int(number) for number in _DIGEST_RE.findall(normalized)]
+    return bool(positions) and all(
+        len(re.findall(rf"\${position}(?!\d)", normalized)) == digested.count(position)
+        for position in positions
+    )
+
+
 # ---------------------------------------------------------------------------
 # A recording pool: the same calls whether the code uses the pool or a
 # connection acquired from it (optionally inside a transaction)
@@ -93,20 +129,17 @@ class _FakeConnection:
     def __init__(self, pool: _FakePool) -> None:
         self._pool = pool
 
-    async def execute(self, sql: str, *args: Any) -> str:
-        return self._pool.record("execute", sql, args)
+    async def execute(self, sql: str, *args: Any) -> Any:
+        return self._pool.run("execute", sql, args)
 
     async def fetchrow(self, sql: str, *args: Any) -> Any:
-        self._pool.record("fetchrow", sql, args)
-        return self._pool.answer_fetchrow(sql)
+        return self._pool.run("fetchrow", sql, args)
 
     async def fetchval(self, sql: str, *args: Any) -> Any:
-        self._pool.record("fetchval", sql, args)
-        return uuid.uuid4()
+        return self._pool.run("fetchval", sql, args)
 
-    async def fetch(self, sql: str, *args: Any) -> list[Any]:
-        self._pool.record("fetch", sql, args)
-        return []
+    async def fetch(self, sql: str, *args: Any) -> Any:
+        return self._pool.run("fetch", sql, args)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[None]:
@@ -123,9 +156,21 @@ class _FakePool(_FakeConnection):
         super().__init__(self)
         self.account = account
         self.calls: list[tuple[str, str, tuple[Any, ...]]] = []
+        # GH-157: the login throttle's statements run on the shared fake's
+        # login_throttle table (a fresh counter per pool: no delay, no lockout).
+        self.throttle = FakeDb()
 
-    def record(self, method: str, sql: str, args: tuple[Any, ...]) -> str:
+    def run(self, method: str, sql: str, args: tuple[Any, ...]) -> Any:
+        """Record a call and answer it: the throttle's statements go to its table."""
         self.calls.append((method, sql, args))
+        if _is_throttle_sql(sql):
+            return self.throttle.handle(method, sql, args, "pool", None)
+        if method == "fetchrow":
+            return self.answer_fetchrow(sql)
+        if method == "fetchval":
+            return uuid.uuid4()
+        if method == "fetch":
+            return []
         return "OK"
 
     def answer_fetchrow(self, sql: str) -> Any:
@@ -343,7 +388,9 @@ class TestLoginLookup:
         assert re.search(r"\bleft (?:outer )?join organizations\b", sql) is not None
 
     async def test_auth_login_issues_a_single_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Exactly one read query (the lookup); nothing else is read to decide the outcome."""
+        """Exactly one read of the users table (the lookup); nothing else is read to decide
+        the outcome but the login throttle's own state (GH-157: its login_throttle rows and
+        the account subject's digest)."""
         pool = _FakePool(None)
         _VerifySpy(monkeypatch)
 
@@ -351,7 +398,9 @@ class TestLoginLookup:
             await _login(pool)
 
         reads = [call for call in pool.calls if call[0] in {"fetchrow", "fetch", "fetchval"}]
-        assert len(reads) == 1
+        user_reads = [call for call in reads if re.search(r"\busers\b", _norm(call[1]))]
+        assert len(user_reads) == 1
+        assert all(_is_throttle_sql(call[1]) for call in reads if call not in user_reads)
 
 
 # ---------------------------------------------------------------------------
@@ -839,7 +888,8 @@ class TestLoginNoContent:
 
     @pytest.mark.parametrize("cause", _ALL_CAUSES)
     async def test_auth_login_email_only_in_the_lookup(self, cause: str, current_hash: str) -> None:
-        """No other statement (audit, session, updates) carries the email in SQL or args."""
+        """No other statement (audit, session, updates, throttle counters) carries the email
+        in SQL or args; only the account subject's digest takes it as its input (GH-157)."""
         account, password = _case(cause, current_hash)
         pool = _FakePool(account)
 
@@ -847,6 +897,10 @@ class TestLoginNoContent:
             await _login(pool, password=password)
 
         for _, sql, args in pool.non_lookup_calls():
+            if any(isinstance(arg, str) and arg.casefold() == _EMAIL.casefold() for arg in args):
+                assert _only_digests_the_email(sql, args), sql
+                assert _EMAIL.casefold() not in sql.casefold()
+                continue
             flattened = f"{sql} {' '.join(str(arg) for arg in args)}".casefold()
             assert _EMAIL.casefold() not in flattened
             assert "marker.person" not in flattened

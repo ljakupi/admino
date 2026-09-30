@@ -102,6 +102,36 @@ certificate, redirects HTTP to HTTPS and sends HSTS. It gets the same treatment 
   addresses. uvicorn's own forwarded-header handling is off, so it doesn't trust other
   addresses such as `127.0.0.1`.
 
+## Brute-force protection
+
+Failed logins are counted per account and per client IP address in PostgreSQL, so a
+restart doesn't reset them. After 3 failures in 15 minutes each attempt waits 1, 2, 4,
+then 8 seconds before the password is checked. After 10 failures in 15 minutes the
+account or the address is locked for 15 minutes, and the lockout is audit-logged
+(`login.lockout`). The password reset and invitation links share the address's counter.
+
+- **No user enumeration.** A locked login answers exactly like a wrong password. The
+  account counter keys on the typed email, so an unknown email is counted, delayed and
+  locked like a real one.
+- **No race.** Each attempt counts as a failure before its check, inside a row lock, so
+  parallel attempts can't slip past the limit.
+- **No email or IP text stored.** The counters hold SHA-256 digests and counts only, and
+  are deleted within about 30 minutes of their last effect. The digests are unsalted,
+  so they're pseudonymous, not anonymous: someone who can read the table can recover an
+  email or IPv4 address by hashing guesses. That's accepted, because the same reader
+  already sees client IPs in the audit log and account emails in the users table.
+- **IPv6 is grouped by /64.** One client usually holds a whole /64 network, so all its
+  addresses share one counter. An IPv4 address counts on its own.
+- **Accepted trade-off: shared addresses.** Everyone behind one public IP address (an
+  office NAT, a VPN exit) shares its counter, so ten failures from colleagues or an
+  attacker there lock the login for all of them for 15 minutes. Other addresses are
+  unaffected, and an account lock never depends on the address.
+- **Accepted trade-off: slow guessing.** Like any "10 failures in 15 minutes" rule, the
+  lockout doesn't stop an attacker who stops at 9 failures per window: they can keep
+  going at about 36 guesses an hour per account or address. Every guess is recorded in
+  the audit log (`login.failure`), and the password rules (at least 12 characters,
+  common passwords refused) make that rate negligible.
+
 ## Known limitations & tradeoffs
 
 We prefer to be transparent about what this does **not** guarantee:

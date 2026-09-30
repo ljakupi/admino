@@ -1,24 +1,50 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-154).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-157).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
-password_reset_tokens, email_outbox and audit_events tables behind a
-pool-shaped object (``FakeDb.pool``). The real ``admino.auth``,
+password_reset_tokens, email_outbox, audit_events and login_throttle tables
+behind a pool-shaped object (``FakeDb.pool``). The real ``admino.auth``,
 ``admino.sessions``, ``admino.session_management``, ``admino.password_reset``,
-``admino.invitations``, ``admino.organizations``, ``admino.email_outbox`` and
-``admino.audit_events`` code runs against it: each statement is recognised by
-its table and verb, and its bind parameters are applied to the in-memory
-tables, so a test can log in, list and revoke sessions, request and confirm a
-password reset, send, list, revoke, resend and accept invitations, create,
-change, deactivate, schedule, cancel and purge organizations, and check the
-result.
+``admino.invitations``, ``admino.organizations``, ``admino.email_outbox``,
+``admino.audit_events`` and ``admino.login_throttle`` code runs against it:
+each statement is recognised by its table and verb, and its bind parameters
+are applied to the in-memory tables, so a test can log in, list and revoke
+sessions, request and confirm a password reset, send, list, revoke, resend and
+accept invitations, create, change, deactivate, schedule, cancel and purge
+organizations, count failed attempts and lock them out, and check the result.
 
 Inputs: organizations, accounts and sessions added with ``add_org`` /
-``add_account`` / ``open_session``; invitations, reset tokens, queued emails
-and audit events seeded with ``add_invitation`` / ``add_reset_token`` /
-``add_email`` / ``add_audit``.
+``add_account`` / ``open_session``; invitations, reset tokens, queued emails,
+audit events and throttle counters seeded with ``add_invitation`` /
+``add_reset_token`` / ``add_email`` / ``add_audit`` / ``add_throttle``.
 Outputs: the recorded calls (``calls``: method, SQL, args, which pool or
-connection ran it and inside which transaction), the table state, and the
-outcome of every transaction (``transactions``: commit or rollback).
+connection ran it and inside which transaction), the table state, the
+outcome of every transaction (``transactions``: commit or rollback) and how
+many transactions are open right now (``open_transactions``).
+
+The login throttle (GH-157):
+- ``throttle`` holds the login_throttle rows of migration 0012 (scope,
+  subject, failures, window_started_at, locked_until, expires_at), one dict
+  per row; ``throttle_row(scope, subject)`` finds one and ``add_throttle``
+  seeds one. ``account_subject(email)`` is what the database computes as the
+  account subject: ``sha256(convert_to(lower(<email>), 'UTF8'))``.
+- Every statement that names login_throttle runs through the SQL reader:
+  INSERT (``ON CONFLICT (scope, subject) DO NOTHING`` included: a row whose
+  key exists is skipped, after its CHECKs ran, as in PostgreSQL), SELECT
+  (``FOR UPDATE`` recorded, no effect), UPDATE and DELETE. So does a
+  FROM-less SELECT that computes a digest (``SELECT sha256(convert_to(
+  lower($n), 'UTF8'))``).
+- The table has no column defaults: a missing value is a
+  NotNullViolationError. Written rows must satisfy migration 0012's rules:
+  scope 'account' or 'ip', a 32-byte bytea subject, failures an int >= 0,
+  ``expires_at > window_started_at``, ``locked_until IS NULL OR expires_at >=
+  locked_until`` (CheckViolationError) and the (scope, subject) primary key
+  (UniqueViolationError). A subject that isn't bytes, failures that aren't an
+  int and a naive datetime (asyncpg would read it as local time) raise
+  DataError. The key of a stored row never changes.
+- Value expressions also include ``sha256(<bytea>)``, ``convert_to(<text>,
+  'UTF8')``, ``greatest(...)`` / ``least(...)`` (NULLs ignored),
+  ``interval '<n> <unit>'``, ``make_interval(<unit> => <value>)`` and binary
+  ``+`` / ``-``.
 
 Organizations and invitations (GH-153):
 - ``orgs`` holds the organizations rows (id, name, seats, status, ...).
@@ -47,9 +73,9 @@ Organizations and invitations (GH-153):
   integer literals, ``NULL``, ``now()`` and ``now() + $n::interval`` (the bound
   value must be a timedelta).
 - The reader fails the calling test with an AssertionError for anything else
-  (OR, BETWEEN, CTEs, correlated subqueries, ON CONFLICT, another table in a
-  join, ...): an unrecognised statement on these tables never silently
-  returns None, [] or "OK".
+  (OR, BETWEEN, CASE, CTEs, correlated subqueries, any ON CONFLICT but
+  login_throttle's DO NOTHING, another table in a join, ...): an unrecognised
+  statement on these tables never silently returns None, [] or "OK".
 - Like PostgreSQL, an unknown column raises UndefinedColumnError, an
   unqualified column two sources share raises AmbiguousColumnError, and the
   schema's rules raise the driver's errors: the case-insensitive unique email
@@ -274,11 +300,29 @@ _AUDIT_COLUMNS: Final = frozenset(
         "metadata",
     }
 )
+# The login_throttle columns of migration 0012 (GH-157): no email, no IP text.
+_THROTTLE_COLUMNS: Final = frozenset(
+    {"scope", "subject", "failures", "window_started_at", "locked_until", "expires_at"}
+)
+# What the test side assumes as the failure window when it seeds a row
+# (admino.login_throttle.FAILURE_WINDOW).
+THROTTLE_WINDOW: Final = timedelta(minutes=15)
 _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "users": _USER_COLUMNS,
     "organizations": _ORG_COLUMNS,
     "invitations": _INVITATION_COLUMNS,
     "audit_events": _AUDIT_COLUMNS,
+    "login_throttle": _THROTTLE_COLUMNS,
+}
+# The tables the SQL reader writes (INSERT, UPDATE, DELETE).
+_WRITABLE: Final = frozenset({"users", "invitations", "organizations", "login_throttle"})
+_INTERVAL_UNITS: Final = {
+    "sec": "seconds",
+    "second": "seconds",
+    "min": "minutes",
+    "minute": "minutes",
+    "hour": "hours",
+    "day": "days",
 }
 _ORG_STATUSES: Final = frozenset({"active", "deactivated", "pending_deletion"})
 _RESPONSE_LANGUAGES: Final = frozenset({"de", "fr", "it", "en"})
@@ -307,6 +351,12 @@ def sha256(token: str) -> bytes:
 def fake_hash(password: str) -> str:
     """The fast stand-in for passwords.hash_password."""
     return "fake$" + hashlib.sha256(password.encode()).hexdigest()
+
+
+def account_subject(email: str) -> bytes:
+    """The account subject the database computes for a typed email (GH-157):
+    ``sha256(convert_to(lower(<email>), 'UTF8'))``, the fake's lower() being Python's."""
+    return hashlib.sha256(email.lower().encode("utf-8")).digest()
 
 
 def plain(value: Any) -> uuid.UUID:
@@ -418,8 +468,10 @@ class FakeDb:
         self.sessions: dict[bytes, dict[str, Any]] = {}
         self.outbox: list[dict[str, Any]] = []
         self.audit: list[dict[str, Any]] = []
+        self.throttle: list[dict[str, Any]] = []
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
+        self.open_transactions = 0
         self.fail_audit = False
         self.fail_audit_when: Callable[[dict[str, Any]], bool] | None = None
         self.fail_sql: str | None = None
@@ -649,6 +701,51 @@ class FakeDb:
         )
         return event_id
 
+    def add_throttle(
+        self,
+        scope: str,
+        subject: bytes,
+        *,
+        failures: int = 0,
+        window_started_at: datetime | None = None,
+        locked_until: datetime | None = None,
+        expires_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Store a login_throttle row as migration 0012 allows it; return the stored row.
+
+        ``window_started_at`` defaults to now; ``expires_at`` to the moment the
+        row stops having any effect: ``max(window_started_at + 15 minutes,
+        locked_until)``. The row must satisfy the table's rules (a seeded row
+        is one the database could hold).
+        """
+        started = window_started_at or datetime.now(UTC)
+        if expires_at is None:
+            expires_at = started + THROTTLE_WINDOW
+            if locked_until is not None:
+                expires_at = max(expires_at, locked_until)
+        row = {
+            "scope": scope,
+            "subject": subject,
+            "failures": failures,
+            "window_started_at": started,
+            "locked_until": locked_until,
+            "expires_at": expires_at,
+        }
+        self._check_throttle(row, None)
+        self.throttle.append(row)
+        return row
+
+    def throttle_row(self, scope: str, subject: bytes | None) -> dict[str, Any] | None:
+        """The stored login_throttle row of (scope, subject), if there is one."""
+        return next(
+            (
+                row
+                for row in self.throttle
+                if row["scope"] == scope and subject is not None and row["subject"] == subject
+            ),
+            None,
+        )
+
     def session(self, token: str) -> dict[str, Any]:
         """The stored session row of a raw token (it must exist)."""
         return self.sessions[sha256(token)]
@@ -745,6 +842,7 @@ class FakeDb:
                 "sessions": self.sessions,
                 "outbox": self.outbox,
                 "audit": self.audit,
+                "throttle": self.throttle,
             }
         )
 
@@ -757,6 +855,7 @@ class FakeDb:
         self.sessions = state["sessions"]
         self.outbox = state["outbox"]
         self.audit = state["audit"]
+        self.throttle = state["throttle"]
 
     def new_connection(self) -> FakeConnection:
         """A new connection on this database."""
@@ -872,11 +971,18 @@ class FakeDb:
             return list(self.invitations.values())
         if table == "audit_events":
             return list(self.audit)
+        if table == "login_throttle":
+            return list(self.throttle)
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
 
     def normalized(self, table: str, values: dict[str, Any]) -> dict[str, Any]:
         """The values as the column types store them (asyncpg's encoders, NUMERIC(12,2))."""
+        if table == "login_throttle":
+            subject = values.get("subject")
+            if isinstance(subject, bytearray | memoryview):
+                return {**values, "subject": bytes(subject)}
+            return values
         if table != "organizations":
             return values
         stored = dict(values)
@@ -905,10 +1011,33 @@ class FakeDb:
             stored["monthly_budget_chf"] = rounded
         return stored
 
-    def new_row(self, table: str, given: dict[str, Any], now: datetime) -> dict[str, Any]:
-        """Build, check and store a new users, invitations or organizations row (an INSERT)."""
+    def new_row(
+        self,
+        table: str,
+        given: dict[str, Any],
+        now: datetime,
+        *,
+        skip_conflict: bool = False,
+    ) -> dict[str, Any] | None:
+        """Build, check and store a new users, invitations, organizations or
+        login_throttle row (an INSERT).
+
+        ``skip_conflict``: ON CONFLICT (scope, subject) DO NOTHING on login_throttle:
+        a row whose key exists is not stored (None), after its CHECKs ran.
+        """
+        if table == "login_throttle":
+            # No column defaults (migration 0012): the app sets every value.
+            row: dict[str, Any] = dict.fromkeys(_THROTTLE_COLUMNS)
+            row.update(self.normalized(table, given))
+            if skip_conflict and self.throttle_row(row["scope"], row["subject"]) is not None:
+                self._check_throttle(row, None, check_key=False)
+                return None
+            self._check_throttle(row, None)
+            self.throttle.append(row)
+            return row
+        assert not skip_conflict, f"the fake does ON CONFLICT on login_throttle only: {table}"
         if table == "users":
-            row: dict[str, Any] = dict.fromkeys(_USER_COLUMNS)
+            row = dict.fromkeys(_USER_COLUMNS)
             row.update(id=uuid.uuid4(), status="invited", ui_language="en", created_at=now)
             row.update(given)
             row["org_status"] = None
@@ -957,9 +1086,63 @@ class FakeDb:
             self._check_invitation(row, changed, original)
         elif table == "organizations":
             self._check_org(row)
+        elif table == "login_throttle":
+            if original is not None:
+                for column in ("scope", "subject"):
+                    assert row[column] == original[column], (
+                        f"the key of a login_throttle row never changes ({column})"
+                    )
+            self._check_throttle(row, original)
         else:
             msg = f"the fake's SQL reader never writes {table}"
             raise AssertionError(msg)
+
+    def _check_throttle(
+        self, row: dict[str, Any], original: dict[str, Any] | None, *, check_key: bool = True
+    ) -> None:
+        """Migration 0012's login_throttle constraints, all of them on every written row."""
+        for column in ("scope", "subject", "failures", "window_started_at", "expires_at"):
+            if row[column] is None:
+                msg = f'null value in column "{column}" of relation "login_throttle"'
+                raise asyncpg.exceptions.NotNullViolationError(msg)
+        if not isinstance(row["scope"], str):
+            msg = "invalid input for query argument (scope): str expected"
+            raise asyncpg.exceptions.DataError(msg)
+        if not isinstance(row["subject"], bytes):
+            msg = "invalid input for query argument (subject): bytes expected"
+            raise asyncpg.exceptions.DataError(msg)
+        if type(row["failures"]) is not int:
+            msg = "invalid input for query argument (failures): int expected"
+            raise asyncpg.exceptions.DataError(msg)
+        for column in ("window_started_at", "locked_until", "expires_at"):
+            value = row[column]
+            if value is not None and (not isinstance(value, datetime) or value.tzinfo is None):
+                # asyncpg reads a naive datetime as local time: refuse it here.
+                msg = f"invalid input for query argument ({column}): an aware datetime expected"
+                raise asyncpg.exceptions.DataError(msg)
+        rules = (
+            ("scope", row["scope"] in {"account", "ip"}),
+            ("subject", len(row["subject"]) == 32),
+            ("failures", row["failures"] >= 0),
+            ("window", row["expires_at"] > row["window_started_at"]),
+            (
+                "lock",
+                row["locked_until"] is None or row["expires_at"] >= row["locked_until"],
+            ),
+        )
+        for name, valid in rules:
+            if not valid:
+                msg = f'new row for relation "login_throttle" violates the {name} check'
+                raise asyncpg.exceptions.CheckViolationError(msg)
+        if not check_key:
+            return
+        for other in self.throttle:
+            if other is not original and (other["scope"], other["subject"]) == (
+                row["scope"],
+                row["subject"],
+            ):
+                msg = 'duplicate key value violates unique constraint "login_throttle_pkey"'
+                raise asyncpg.exceptions.UniqueViolationError(msg)
 
     def _check_org(self, row: dict[str, Any]) -> None:
         """Migration 0004's organizations constraints, all of them on every written row."""
@@ -1109,8 +1292,11 @@ class FakeDb:
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
 
     def delete_row(self, table: str, row: dict[str, Any]) -> None:
-        """Delete one users, invitations or organizations row; a user's rows cascade (ON
-        DELETE CASCADE). Call ``check_delete`` first."""
+        """Delete one users, invitations, organizations or login_throttle row; a user's rows
+        cascade (ON DELETE CASCADE). Call ``check_delete`` first."""
+        if table == "login_throttle":
+            self.throttle = [other for other in self.throttle if other is not row]
+            return
         if table == "invitations":
             del self.invitations[row["id"]]
             return
@@ -1542,6 +1728,25 @@ def _unwrap(text: str) -> str:
     return text
 
 
+def _binary_split(text: str) -> tuple[str, str, str] | None:
+    """Split ``a + b`` / ``a - b`` at its last top-level operator (left-associative).
+
+    A ``-`` counts as binary only after an operand (not a leading sign); operators
+    inside parentheses or literals don't count. None when there is no such operator.
+    """
+    masked = _masked(text)
+    position = None
+    for index, char in enumerate(masked):
+        if char not in "+-" or index == 0:
+            continue
+        before = masked[:index].rstrip()
+        if before and (before[-1].isalnum() or before[-1] in ")_'"):
+            position = index
+    if position is None:
+        return None
+    return text[:position].strip(), masked[position], text[position + 1 :].strip()
+
+
 def _clauses(text: str, keywords: tuple[str, ...]) -> dict[str, str]:
     """Cut a statement into its top-level clauses, keyed by the keyword that opens each."""
     masked = _masked(text)
@@ -1606,9 +1811,12 @@ def _primary_table(n: str) -> str | None:
 
 def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
     """True for the statements the SQL reader runs (see the module docstring)."""
-    if re.search(r"\binvitations\b", n):
+    if re.search(r"\binvitations\b", n) or re.search(r"\blogin_throttle\b", n):
         return True
     table = _primary_table(n)
+    if table is None and n.startswith("select") and re.search(r"\bsha256 ?\(", n):
+        # GH-157: a FROM-less digest, e.g. the account subject of a typed email.
+        return True
     if table == "organizations":
         return True
     if table == "audit_events":
@@ -1686,6 +1894,13 @@ class _Statement:
         expr = _unwrap(expr)
         if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?)?", expr):
             return self._arg(match.group(1))
+        if match := re.fullmatch(
+            r"(?:interval ?'(\d+) ?([a-z]+?)s?'|'(\d+) ?([a-z]+?)s?' ?:: ?interval)", expr
+        ):
+            amount = int(match.group(1) or match.group(3))
+            unit = _INTERVAL_UNITS.get(match.group(2) or match.group(4))
+            assert unit is not None, f"the fake can't read the interval {expr!r}"
+            return timedelta(**{unit: amount})
         if match := re.fullmatch(r"'((?:[^']|'')*)'(?: ?:: ?\w+)?", expr):
             return match.group(1).replace("''", "'")
         if expr == "null":
@@ -1709,15 +1924,59 @@ class _Statement:
             assert isinstance(amount, int | float) and not isinstance(amount, bool), amount
             unit = {"days": "days", "hours": "hours", "mins": "minutes", "secs": "seconds"}
             return self.now + timedelta(**{unit[match.group(1)]: amount})
+        if match := re.fullmatch(
+            r"make_interval ?\( ?(days|hours|mins|secs) ?=> ?(.+?) ?\)(?: ?:: ?interval)?", expr
+        ):
+            amount = self.value(match.group(2), ctx)
+            assert isinstance(amount, int | float) and not isinstance(amount, bool), amount
+            unit = {"days": "days", "hours": "hours", "mins": "minutes", "secs": "seconds"}
+            return timedelta(**{unit[match.group(1)]: amount})
+        if (binary := _binary_split(expr)) is not None:
+            left_text, operator, right_text = binary
+            left, right = self.value(left_text, ctx), self.value(right_text, ctx)
+            if left is None or right is None:
+                return None
+            return left + right if operator == "+" else left - right
         if match := re.fullmatch(r"coalesce ?\((.+)\)", expr):
             for item in _top_split(match.group(1), ","):
                 value = self.value(item, ctx)
                 if value is not None:
                     return value
             return None
+        if match := re.fullmatch(r"(greatest|least) ?\((.+)\)", expr):
+            # Like PostgreSQL, NULL arguments are ignored.
+            present = [
+                value
+                for item in _top_split(match.group(2), ",")
+                if (value := self.value(item, ctx)) is not None
+            ]
+            if not present:
+                return None
+            return max(present) if match.group(1) == "greatest" else min(present)
         if match := re.fullmatch(r"lower ?\((.+)\)", expr):
             inner = self.value(match.group(1), ctx)
             return inner.lower() if isinstance(inner, str) else inner
+        if match := re.fullmatch(r"convert_to ?\((.+)\)", expr):
+            items = _top_split(match.group(1), ",")
+            assert len(items) == 2, f"convert_to takes a text and an encoding: {expr!r}"
+            encoding = self.value(items[1], ctx)
+            assert isinstance(encoding, str), expr
+            assert re.sub(r"[^a-z0-9]", "", encoding.lower()) == "utf8", (
+                f"the fake converts to UTF8 only: {expr!r}"
+            )
+            text = self.value(items[0], ctx)
+            if text is None:
+                return None
+            assert isinstance(text, str), f"convert_to needs a text value: {expr!r}"
+            return text.encode("utf-8")
+        if match := re.fullmatch(r"sha256 ?\((.+)\)", expr):
+            data = self.value(match.group(1), ctx)
+            if data is None:
+                return None
+            if not isinstance(data, bytes | bytearray):
+                msg = "function sha256(text) does not exist"
+                raise asyncpg.exceptions.UndefinedFunctionError(msg)
+            return hashlib.sha256(bytes(data)).digest()
         if match := re.fullmatch(r"(?:(\w+)\.)?(\w+)", expr):
             return self.column(match.group(1), match.group(2), ctx)
         msg = f"the fake can't evaluate {expr!r}"
@@ -1885,7 +2144,10 @@ class _Statement:
         )
         unsupported = {"group by", "having", "offset", "for share", "for key share"}
         assert not unsupported & clauses.keys(), f"the fake can't read this SELECT: {n}"
-        assert "from" in clauses, f"a SELECT without FROM: {n}"
+        if "from" not in clauses:
+            # GH-157: a FROM-less SELECT (a computed digest) is one row of values.
+            assert set(clauses) == {"select"}, f"a SELECT without FROM: {n}"
+            return self.project(clauses["select"], [{}])
         assert not clauses["select"].startswith("distinct"), "no DISTINCT in the fake"
         contexts = self.filtered(self.contexts(_sources(clauses["from"])), clauses.get("where"))
         if "order by" in clauses:
@@ -1897,11 +2159,18 @@ class _Statement:
 
     def insert(self, n: str) -> tuple[list[dict[str, Any]], int]:
         clauses = _clauses(n, ("insert into", "values", "on conflict", "returning"))
-        assert "on conflict" not in clauses, f"the fake doesn't do ON CONFLICT here: {n}"
         head = re.fullmatch(r"(\w+) ?\((.*)\)", clauses["insert into"])
         values = clauses.get("values", "")
         assert head is not None and _unwrap(values) != values, f"one VALUES row only: {n}"
         table = head.group(1)
+        skip_conflict = False
+        if "on conflict" in clauses:
+            # GH-157: only login_throttle's ON CONFLICT (scope, subject) DO NOTHING.
+            assert table == "login_throttle" and re.fullmatch(
+                r"(?:\( ?(?:scope ?, ?subject|subject ?, ?scope) ?\) ?)?do nothing",
+                clauses["on conflict"],
+            ), f"the fake doesn't do this ON CONFLICT: {n}"
+            skip_conflict = True
         columns = [column.strip().strip('"') for column in head.group(2).split(",")]
         exprs = _top_split(values[1:-1], ",")
         assert len(columns) == len(exprs), n
@@ -1914,7 +2183,9 @@ class _Statement:
             for column, expr in zip(columns, exprs, strict=True)
             if expr != "default"
         }
-        row = self.db.new_row(table, given, self.now)
+        row = self.db.new_row(table, given, self.now, skip_conflict=skip_conflict)
+        if row is None:
+            return [], 0
         ctx: _Context = {table: (table, row)}
         returned = self.project(clauses["returning"], [ctx]) if "returning" in clauses else []
         return returned, 1
@@ -1924,7 +2195,7 @@ class _Statement:
         head = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(\w+))?", clauses["update"])
         assert head is not None, n
         table, alias = head.group(1), head.group(2) or head.group(1)
-        assert table in {"users", "invitations", "organizations"}, f"the fake never updates {table}"
+        assert table in _WRITABLE, f"the fake never updates {table}"
         sources = [_Source(table, alias, None, left=False)]
         if "from" in clauses:
             sources += _sources(clauses["from"])
@@ -1963,7 +2234,7 @@ class _Statement:
         head = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(\w+))?", clauses["delete from"])
         assert head is not None, n
         table, alias = head.group(1), head.group(2) or head.group(1)
-        assert table in {"users", "invitations", "organizations"}, f"the fake never deletes {table}"
+        assert table in _WRITABLE, f"the fake never deletes {table}"
         sources = [_Source(table, alias, None, left=False)]
         if "using" in clauses:
             sources += _sources(clauses["using"])
@@ -2016,6 +2287,7 @@ class FakeConnection:
         tx_id = self._db.begin()
         state = self._db.snapshot()
         self.tx = tx_id
+        self._db.open_transactions += 1
         try:
             yield
         except BaseException as exc:
@@ -2026,6 +2298,7 @@ class FakeConnection:
             self._db.transactions.append((tx_id, "commit"))
         finally:
             self.tx = None
+            self._db.open_transactions -= 1
 
     def is_in_transaction(self) -> bool:
         return self.tx is not None

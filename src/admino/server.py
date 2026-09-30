@@ -78,7 +78,7 @@ Security notes:
   is the caller's session language, never a request field. Invitation links
   are built from ``server.public_url`` only. The two public link routes answer
   one generic 404 for every link that can't be used (a malformed token, of any
-  length, is a 404 before any database call, never a 422); accepting sets the
+  length, is a 404 before any token lookup, never a 422); accepting sets the
   session cookie exactly like the login. The email, name, password, token and
   link are never logged or echoed. The token travels in the URL path of the
   two link routes: uvicorn's access log stays off (``main.py``), and the
@@ -110,6 +110,18 @@ Security notes:
   Refusals are 403 ``{"detail": "Cross-origin request refused"}``.
 - Login failures are one generic 401 for every cause (no user enumeration);
   the email, password and session token are never logged or echoed.
+- Brute-force protection (GH-157, ``admino.login_throttle``): failed logins
+  are counted per account and per client IP in PostgreSQL. From the third
+  failure in 15 minutes an attempt waits (1, 2, 4, then 8 seconds) before its
+  check; the 10th locks the account or IP for 15 minutes (audited as
+  ``login.lockout``). A locked login is the same 401 as a wrong password. The
+  password reset confirm and the two invitation link routes share the login's
+  per-IP counter: a locked IP gets 429 "Too many attempts. Try again later."
+  before any lookup, an unusable link counts as a failure, and a usable one
+  (a password-policy 422 included) releases its reservation. A reset request
+  from a locked IP gets the same 429 before anything is queued; otherwise it
+  waits out the IP's delay and never counts. The throttle runs after the
+  route's token bucket and after body validation.
 - A password reset request answers the same empty 202 for every email, before
   any account work: the service runs as a background task after the response,
   so neither the body nor the timing tells whether the account exists. Reset
@@ -121,6 +133,8 @@ Security notes:
   session routes and per (route, ``ip:<host>``) on public routes (the login,
   the password reset and the invitation link routes), so one caller can't
   throttle another. Idle buckets are evicted and the map is capped (LRU).
+  The buckets live in process memory; the lockouts above live in PostgreSQL
+  and survive a restart.
   Cookies that resolve to no session spend a per-IP budget, so a stream of
   random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
@@ -183,6 +197,7 @@ from admino import (
     accounts,
     auth,
     invitations,
+    login_throttle,
     organizations,
     password_reset,
     passwords,
@@ -1157,12 +1172,14 @@ def _clear_session_cookie(response: Response) -> None:
 async def post_login(request: Request, body: LoginRequest) -> Response:
     """Handle POST /api/auth/login — email/password login (public).
 
-    Rate-limited per client IP. On success opens a server-side session and
-    answers 204 with the ``admino_session`` cookie (HttpOnly, SameSite=Strict,
-    Path=/, Max-Age = the lifetime of the account's session policy, Secure iff
+    Rate-limited per client IP, then throttled per account and per client IP
+    (``auth.login``: a progressive delay from the third failure, a 15-minute
+    lockout at the 10th). On success opens a server-side session and answers
+    204 with the ``admino_session`` cookie (HttpOnly, SameSite=Strict, Path=/,
+    Max-Age = the lifetime of the account's session policy, Secure iff
     ``server.cookie_secure``). Every failure cause (unknown email, wrong
-    password, inactive account or organization) is the same 401, and no cookie
-    is set.
+    password, inactive account or organization, a locked account or IP) is
+    the same 401, and no cookie is set.
 
     Args:
         request: The incoming request (client IP and User-Agent for the session).
@@ -1175,8 +1192,8 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
         HTTPException: 401 on any login failure, 429 when rate-limited.
 
     Security notes:
-        The email, password and token are never logged or echoed; the 401 body
-        is identical for every cause (no user enumeration).
+        The email, password and token are never logged or echoed; the 401 is
+        identical for every cause, a lockout included (no user enumeration).
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -1219,19 +1236,23 @@ async def _request_reset_in_background(*, email: str, public_url: str, ip: str |
 async def post_password_reset(request: Request, body: PasswordResetRequest) -> Response:
     """Handle POST /api/auth/password-reset — email a password reset link (public).
 
-    Rate-limited per client IP. Always answers an empty 202: the account
-    lookup, the token and the email happen in a background task after the
-    response, so the answer is the same, and as fast, for every email.
+    Rate-limited per client IP. A client IP that the brute-force protection
+    has locked gets 429 before anything is queued; any other waits out its
+    IP's progressive delay (the request itself never counts as a failure).
+    Then it always answers an empty 202: the account lookup, the token and the
+    email happen in a background task after the response, so the answer is
+    the same, and as fast, for every email.
 
     Args:
-        request: The incoming request (the client IP for the audit event).
+        request: The incoming request (the client IP for the throttle and the
+            audit event).
         body: Validated PasswordResetRequest.
 
     Returns:
         An empty 202 response carrying the background task.
 
     Raises:
-        HTTPException: 429 when rate-limited.
+        HTTPException: 429 when rate-limited or when the client IP is locked.
 
     Security notes:
         The link base is ``server.public_url``, never a request header. The
@@ -1242,15 +1263,66 @@ async def post_password_reset(request: Request, body: PasswordResetRequest) -> R
 
     _check_rate_limit("/api/auth/password-reset", f"ip:{_client_ip(request)}")
 
+    from admino.database import get_pool
+
+    ip = request.client.host if request.client is not None else None
+    if not await login_throttle.admit(get_pool(), ip=ip):
+        raise HTTPException(status_code=429, detail=login_throttle.TOO_MANY_ATTEMPTS_MESSAGE)
+
     return Response(
         status_code=202,
         background=BackgroundTask(
             _request_reset_in_background,
             email=body.email,
             public_url=_config.server.public_url,
-            ip=request.client.host if request.client is not None else None,
+            ip=ip,
         ),
     )
+
+
+async def _throttled_link[T](
+    request: Request, work: Callable[[], Awaitable[T]], *, unusable: type[Exception]
+) -> T:
+    """Run a public link route's work under the client IP's login throttle (GH-157).
+
+    The link routes (password reset confirm, invitation details and accept)
+    share the login's per-IP failure counter. A locked IP gets 429 before
+    ``work`` runs, so no token or account is looked up and nothing is written.
+    Otherwise the attempt reserves one failure and waits out the progressive
+    delay first. ``unusable`` (a link that can't be used) keeps the failure,
+    and the 10th locks the IP (audited as ``login.lockout``); a result, or a
+    password-policy refusal (the link was usable), releases it. Any other
+    error keeps it (fail closed). Every exception is re-raised for the route
+    to map.
+
+    Args:
+        request: The incoming request (the client IP).
+        work: Starts the route's service call.
+        unusable: The service's exception for a link that can't be used.
+
+    Returns:
+        What ``work`` returned.
+
+    Raises:
+        HTTPException: 429 when the client IP is locked.
+    """
+    from admino.database import get_pool
+
+    pool = get_pool()
+    ip = request.client.host if request.client is not None else None
+    attempt = await login_throttle.begin(pool, email=None, ip=ip)
+    if attempt.locked:
+        raise HTTPException(status_code=429, detail=login_throttle.TOO_MANY_ATTEMPTS_MESSAGE)
+    try:
+        result = await work()
+    except unusable:
+        await login_throttle.fail(pool, attempt, ip=ip)
+        raise
+    except passwords.PasswordPolicyError:
+        await login_throttle.succeed(pool, attempt)
+        raise
+    await login_throttle.succeed(pool, attempt)
+    return result
 
 
 async def post_password_reset_confirm(
@@ -1258,12 +1330,15 @@ async def post_password_reset_confirm(
 ) -> Response:
     """Handle POST /api/auth/password-reset/confirm — set a new password (public).
 
-    Rate-limited per client IP. On success the password is changed and every
-    session of the account ends, this browser's included: answers 204 and
-    clears the session cookie.
+    Rate-limited per client IP, then throttled by the client IP's login
+    failure counter (``_throttled_link``): a locked IP gets 429 before the
+    token is looked up, an unusable link counts as a failure. On success the
+    password is changed and every session of the account ends, this browser's
+    included: answers 204 and clears the session cookie.
 
     Args:
-        request: The incoming request (the client IP for the audit event).
+        request: The incoming request (the client IP for the throttle and the
+            audit event).
         body: Validated PasswordResetConfirmRequest; token and password are SecretStr.
 
     Returns:
@@ -1274,7 +1349,8 @@ async def post_password_reset_confirm(
     Raises:
         HTTPException: 400 for every link that can't be used (malformed,
             unknown, expired, used or replaced token, or an account that may no
-            longer log in), 429 when rate-limited.
+            longer log in), 429 when rate-limited or when the client IP is
+            locked.
 
     Security notes:
         The token and password are never logged or echoed.
@@ -1287,11 +1363,15 @@ async def post_password_reset_confirm(
     from admino.database import get_pool
 
     try:
-        await password_reset.confirm_reset(
-            get_pool(),
-            token=body.token.get_secret_value(),
-            new_password=body.new_password.get_secret_value(),
-            ip=request.client.host if request.client is not None else None,
+        await _throttled_link(
+            request,
+            lambda: password_reset.confirm_reset(
+                get_pool(),
+                token=body.token.get_secret_value(),
+                new_password=body.new_password.get_secret_value(),
+                ip=request.client.host if request.client is not None else None,
+            ),
+            unusable=password_reset.InvalidResetTokenError,
         )
     except password_reset.InvalidResetTokenError:
         raise HTTPException(
@@ -1668,12 +1748,15 @@ async def post_org_invitation_resend(
 async def get_invitation_details(request: Request, token: str) -> InvitationDetails:
     """Handle GET /api/auth/invitations/{token} — what the acceptance page shows (public).
 
-    Rate-limited per client IP. The token is an unbounded path string on
-    purpose: a malformed one gets the same 404 as an unknown one (never a 422),
-    before any database call.
+    Rate-limited per client IP, then throttled by the client IP's login
+    failure counter (``_throttled_link``): a locked IP gets 429 before the
+    token is looked up, an unusable link counts as a failure. The token is an
+    unbounded path string on purpose: a malformed one gets the same 404 as an
+    unknown one (never a 422), before any token lookup.
 
     Args:
-        request: The incoming request (the client IP for the rate limit).
+        request: The incoming request (the client IP for the rate limit and
+            the throttle).
         token: The token from the invitation link.
 
     Returns:
@@ -1681,14 +1764,18 @@ async def get_invitation_details(request: Request, token: str) -> InvitationDeta
 
     Raises:
         HTTPException: 404 for every link that can't be used (one body), 429
-            when rate-limited.
+            when rate-limited or when the client IP is locked.
     """
     _check_rate_limit("/api/auth/invitations/get", f"ip:{_client_ip(request)}")
 
     from admino.database import get_pool
 
     try:
-        return await invitations.get_invitation(get_pool(), token)
+        return await _throttled_link(
+            request,
+            lambda: invitations.get_invitation(get_pool(), token),
+            unusable=invitations.InvalidInvitationError,
+        )
     except invitations.InvalidInvitationError:
         raise HTTPException(
             status_code=404, detail=invitations.INVALID_INVITATION_MESSAGE
@@ -1700,12 +1787,16 @@ async def post_invitation_accept(
 ) -> Response:
     """Handle POST /api/auth/invitations/{token}/accept — accept and log in (public).
 
-    Rate-limited per client IP. On success the account is activated with the
-    name and password, a session opens with the org's policy, and the answer
-    is a 204 with the ``admino_session`` cookie, set exactly as by the login.
+    Rate-limited per client IP, then throttled by the client IP's login
+    failure counter (``_throttled_link``): a locked IP gets 429 before the
+    token is looked up, an unusable link counts as a failure. On success the
+    account is activated with the name and password, a session opens with the
+    org's policy, and the answer is a 204 with the ``admino_session`` cookie,
+    set exactly as by the login.
 
     Args:
-        request: The incoming request (client IP and User-Agent for the session).
+        request: The incoming request (client IP and User-Agent for the session,
+            the client IP for the throttle).
         token: The token from the invitation link (a malformed one is a 404).
         body: Validated InvitationAcceptRequest; the password is a SecretStr.
 
@@ -1716,7 +1807,7 @@ async def post_invitation_accept(
 
     Raises:
         HTTPException: 404 for every link that can't be used (one body), 429
-            when rate-limited.
+            when rate-limited or when the client IP is locked.
 
     Security notes:
         The token, name and password are never logged or echoed.
@@ -1728,13 +1819,17 @@ async def post_invitation_accept(
     from admino.database import get_pool
 
     try:
-        result = await invitations.accept_invitation(
-            get_pool(),
-            token=token,
-            name=body.name,
-            password=body.password.get_secret_value(),
-            ip=request.client.host if request.client is not None else None,
-            user_agent=request.headers.get("user-agent"),
+        result = await _throttled_link(
+            request,
+            lambda: invitations.accept_invitation(
+                get_pool(),
+                token=token,
+                name=body.name,
+                password=body.password.get_secret_value(),
+                ip=request.client.host if request.client is not None else None,
+                user_agent=request.headers.get("user-agent"),
+            ),
+            unusable=invitations.InvalidInvitationError,
         )
     except invitations.InvalidInvitationError:
         raise HTTPException(
@@ -3402,9 +3497,9 @@ async def _request_validation_error_handler(
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
-    expired-session purge, the organization purge and, when SMTP is configured,
-    the email outbox sender on startup; stop the background tasks, then close
-    the pool, on shutdown.
+    expired-session purge, the organization purge, the expired login-throttle
+    purge and, when SMTP is configured, the email outbox sender on startup;
+    stop the background tasks, then close the pool, on shutdown.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -3441,6 +3536,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # then hourly while the app is up. Looked up at call time, like the session
     # purge; cancelled before the pool closes.
     org_purge_task = asyncio.create_task(organizations.run_org_purge_job(get_pool()))
+
+    # GH-157: login_throttle rows past their expiry (ended failure windows and
+    # lockouts) are purged now and then hourly while the app is up. Looked up
+    # at call time, like the session purge; cancelled before the pool closes.
+    throttle_purge_task = asyncio.create_task(login_throttle.run_purge_job(get_pool()))
 
     # GH-148: the outbox sender delivers queued transactional email while the
     # app is up. Without SMTP config (load_smtp_config logs which variables are
@@ -3507,6 +3607,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     org_purge_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await org_purge_task
+    throttle_purge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await throttle_purge_task
     if sender_task is not None:
         sender_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):

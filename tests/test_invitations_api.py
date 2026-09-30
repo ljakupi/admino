@@ -1272,7 +1272,10 @@ class TestDetailsRoute:
 
         assert response.status_code == 404
         assert response.json() == _INVALID
-        assert db.calls == []
+        # GH-157: only the IP throttle's own statements run; no invitation or user lookup.
+        assert [
+            call.normalized for call in db.calls if "login_throttle" not in call.normalized
+        ] == []
 
     @pytest.mark.parametrize("case", _UNUSABLE_CASES)
     def test_invitations_api_details_unusable_link_is_404(self, db: FakeDb, case: str) -> None:
@@ -1481,7 +1484,10 @@ class TestAcceptRoute:
 
         assert response.status_code == 404
         assert response.json() == _INVALID
-        assert db.calls == []
+        # GH-157: only the IP throttle's own statements run; no invitation or user lookup.
+        assert [
+            call.normalized for call in db.calls if "login_throttle" not in call.normalized
+        ] == []
 
     def test_invitations_api_accept_404_bodies_are_identical(self, db: FakeDb) -> None:
         _, session = _admin(db)

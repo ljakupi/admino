@@ -61,7 +61,7 @@ from admino import sessions as sessions_mod
 from admino.access import Capability
 from admino.server import _lifespan, create_app
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, fake_hash, sha256
-from tests.lifespan_stubs import patch_org_purge_job
+from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1189,6 +1189,8 @@ class _LifespanProbe:
         self.pool: Any = MagicMock(name="pool")
         self.purge_pools: list[Any] = []
         self.purge_tasks: list[asyncio.Task[Any]] = []
+        self.throttle_purge_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.throttle_purge_tasks: list[asyncio.Task[Any]] = []
 
     async def _blocking(self, name: str) -> None:
         """Block until cancelled, then finish after one more loop turn."""
@@ -1216,6 +1218,14 @@ class _LifespanProbe:
     async def org_purge(self, *_args: Any, **_kwargs: Any) -> None:
         """The fake run_org_purge_job (GH-154)."""
         await self._blocking("org-purge")
+
+    async def throttle_purge(self, *args: Any, **kwargs: Any) -> None:
+        """The fake login_throttle.run_purge_job (GH-157)."""
+        task = asyncio.current_task()
+        assert task is not None
+        self.throttle_purge_tasks.append(task)
+        self.throttle_purge_calls.append((args, kwargs))
+        await self._blocking("throttle-purge")
 
 
 @contextlib.contextmanager
@@ -1252,6 +1262,8 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.mailer.load_smtp_config", MagicMock(return_value=None)),
         patch("admino.sessions.run_session_purge_job", probe.session_purge, create=True),
         patch_org_purge_job(probe.org_purge),
+        # GH-157: a no-op until admino.login_throttle exists (see lifespan_stubs).
+        patch_login_throttle_purge_job(probe.throttle_purge),
     ):
         yield
 
@@ -1327,3 +1339,84 @@ class TestLifespanRunsThePurge:
 
         assert "retention-started" in probe.events
         assert "purge-started" in probe.events
+
+
+class TestLifespanRunsTheThrottlePurge:
+    """GH-157: expired login_throttle rows are purged while the app is up, like the
+    sessions: ``login_throttle.run_purge_job(get_pool())`` in its own task, looked up at
+    call time, started after the pool exists, cancelled and awaited before it closes."""
+
+    async def test_session_management_api_lifespan_starts_the_throttle_purge(self) -> None:
+        probe = _LifespanProbe()
+        app = create_app(agent=MagicMock(), config=_make_app_config())
+
+        with _patched_lifespan(probe):
+            async with asyncio.timeout(5), _lifespan(app):
+                await _let_tasks_run()
+                assert len(probe.throttle_purge_calls) == 1
+                args, kwargs = probe.throttle_purge_calls[0]
+                assert (args[0] if args else kwargs.get("pool")) is probe.pool
+                assert len(probe.throttle_purge_tasks) == 1
+                assert probe.throttle_purge_tasks[0] is not asyncio.current_task()
+                assert not probe.throttle_purge_tasks[0].done()
+
+    async def test_session_management_api_lifespan_throttle_purge_uses_the_default_interval(
+        self,
+    ) -> None:
+        import admino.login_throttle as throttle
+
+        probe = _LifespanProbe()
+        app = create_app(agent=MagicMock(), config=_make_app_config())
+
+        with _patched_lifespan(probe):
+            async with asyncio.timeout(5), _lifespan(app):
+                await _let_tasks_run()
+
+        ((args, kwargs),) = probe.throttle_purge_calls
+        assert args[1:] == ()
+        assert set(kwargs) <= {"pool", "interval_seconds"}
+        assert kwargs.get("interval_seconds", throttle.PURGE_INTERVAL_SECONDS) == (
+            throttle.PURGE_INTERVAL_SECONDS
+        )
+
+    async def test_session_management_api_lifespan_starts_the_throttle_purge_after_init_pool(
+        self,
+    ) -> None:
+        probe = _LifespanProbe()
+        app = create_app(agent=MagicMock(), config=_make_app_config())
+
+        with _patched_lifespan(probe):
+            async with asyncio.timeout(5), _lifespan(app):
+                await _let_tasks_run()
+
+        assert "throttle-purge-started" in probe.events
+        assert probe.events.index("init_pool") < probe.events.index("throttle-purge-started")
+
+    async def test_session_management_api_lifespan_stops_the_throttle_purge_before_the_pool(
+        self,
+    ) -> None:
+        """Cancelled on shutdown and finished before the pool closes."""
+        probe = _LifespanProbe()
+        app = create_app(agent=MagicMock(), config=_make_app_config())
+
+        with _patched_lifespan(probe):
+            async with asyncio.timeout(5), _lifespan(app):
+                await _let_tasks_run()
+
+        assert len(probe.throttle_purge_tasks) == 1
+        assert probe.throttle_purge_tasks[0].cancelled()
+        assert "throttle-purge-finished" in probe.events
+        assert probe.events.index("throttle-purge-finished") < probe.events.index("close_pool")
+
+    async def test_session_management_api_lifespan_keeps_the_session_purge_next_to_it(
+        self,
+    ) -> None:
+        probe = _LifespanProbe()
+        app = create_app(agent=MagicMock(), config=_make_app_config())
+
+        with _patched_lifespan(probe):
+            async with asyncio.timeout(5), _lifespan(app):
+                await _let_tasks_run()
+
+        assert "purge-started" in probe.events
+        assert "throttle-purge-started" in probe.events
