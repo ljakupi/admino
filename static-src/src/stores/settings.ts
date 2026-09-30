@@ -1,20 +1,40 @@
+/**
+ * Settings store (issue #159: settings split into platform, organization and
+ * user scopes).
+ *
+ * The Settings page now shows only the caller's own settings, so this store
+ * keeps no LLM state or actions (the Agent section left Settings). It owns:
+ * - `loadSettings` / `saveSetting`: the user's theme and notifications
+ *   through `GET` / `PATCH /api/me/settings`.
+ * - `setNotificationsEnabled`: optimistic, reverted on failure.
+ * - `loadConnections`: the Google/Microsoft OAuth connection status.
+ * - `loadOrgTools` / `setToolEnabled`: the organization's enabled tool
+ *   services through `GET` / `PATCH /api/org/settings` (Org Admin only).
+ * - `connectGoogle` / `connectMicrosoft` / `disconnectGoogle` /
+ *   `disconnectMicrosoft`: unchanged OAuth flows.
+ * - `sessionId` / `newSession`: unchanged (the chat store depends on them).
+ */
 import { defineStore } from 'pinia';
-import { ref, computed } from 'vue';
-import { getSettings, patchSettings, getOAuthAuthorizeUrl, disconnectOAuth } from '@/api/settings';
+import { ref } from 'vue';
+import {
+  disconnectOAuth,
+  getMySettings,
+  getOAuthAuthorizeUrl,
+  getOAuthStatus,
+  getOrgSettings,
+  patchMySettings,
+  patchOrgSettings,
+} from '@/api/settings';
 import { useToastStore } from '@/stores/toasts';
 import { t } from '@/i18n';
 import type {
-  SettingsResponse,
-  SettingsPatch,
-  LLMProviderName,
   AppTheme,
   ConnectedAccounts,
+  OAuthConnectionStatus,
   ToolsSettings,
+  UserSettingsPatch,
+  UserSettingsResponse,
 } from '@/api/types';
-
-// Keep the old union type alias for backward compat with components
-// The API uses 'anthropic' but the UI labels it 'claude' — we map here.
-export type LLMProvider = 'infomaniak' | 'claude' | 'openai' | 'vllm';
 
 const SESSION_KEY = 'admino_session_id';
 
@@ -28,15 +48,22 @@ function generateSessionId(): string {
   return `s-${ts}-${rand}`;
 }
 
-/** Map API provider name to UI provider label */
-function apiToUiProvider(api: LLMProviderName): LLMProvider {
-  return api === 'anthropic' ? 'claude' : api;
+const DISCONNECTED: OAuthConnectionStatus = { connected: false, healthy: false, email: null, services: [] };
+
+/** The status as given, with a non-string `email` normalized to `null`. */
+function normalizeStatus(status: OAuthConnectionStatus): OAuthConnectionStatus {
+  return { ...status, email: typeof status.email === 'string' ? status.email : null };
 }
 
-/** Map UI provider label back to API provider name */
-function uiToApiProvider(ui: LLMProvider): LLMProviderName {
-  return ui === 'claude' ? 'anthropic' : ui;
-}
+const DEFAULT_TOOLS: ToolsSettings = {
+  gmail: true,
+  google_calendar: true,
+  google_drive: true,
+  outlook: true,
+  outlook_calendar: true,
+  onedrive: true,
+  memory: true,
+};
 
 export const useSettingsStore = defineStore('settings', () => {
   // Session ID — stays in localStorage
@@ -56,71 +83,32 @@ export const useSettingsStore = defineStore('settings', () => {
     sessionId.value = fresh;
   }
 
-  // --- Server-side settings ---
+  // --- User settings (GET/PATCH /api/me/settings) ---
   const loading = ref(false);
   const error = ref<string | null>(null);
-
-  // LLM
-  const llmProvider = ref<LLMProviderName>('infomaniak');
-  const llmAnthropicModel = ref('');
-  const llmOpenAiModel = ref('');
-  const llmVllmModel = ref('');
-  const vllmAvailableModels = ref<string[]>([]);
-  const anthropicKeyConfigured = ref(false);
-  const openAiKeyConfigured = ref(false);
-  const llmInfomaniakModel = ref('');
-  const infomaniakAvailableModels = ref<string[]>([]);
-  const infomaniakTokenConfigured = ref(false);
-
-  // Appearance
   const theme = ref<AppTheme>('light');
+  const notificationsEnabled = ref(true);
 
-  // Notifications
-  const notificationsEnabled = ref(false);
-
-  // Connected accounts
+  // --- Connected accounts (GET /api/oauth/{provider}/status) ---
   const connectedAccounts = ref<ConnectedAccounts>({
-    google: { connected: false, healthy: false, email: null, services: [] },
-    microsoft: { connected: false, healthy: false, email: null, services: [] },
+    google: { ...DISCONNECTED },
+    microsoft: { ...DISCONNECTED },
   });
 
-  // Tools enabled state
-  const tools = ref<ToolsSettings>({
-    gmail: true,
-    google_calendar: true,
-    google_drive: true,
-    outlook: true,
-    outlook_calendar: true,
-    onedrive: true,
-    memory: true,
-  });
+  // --- Organization tools (GET/PATCH /api/org/settings) ---
+  const tools = ref<ToolsSettings>({ ...DEFAULT_TOOLS });
 
-  // Computed ref for backward compat with components that read `provider`.
-  const provider = computed<LLMProvider>(() => apiToUiProvider(llmProvider.value));
-
-  function applyResponse(data: SettingsResponse) {
-    llmProvider.value = data.llm.provider;
-    llmAnthropicModel.value = data.llm.anthropic_model;
-    llmOpenAiModel.value = data.llm.openai_model;
-    llmVllmModel.value = data.llm.vllm_model;
-    vllmAvailableModels.value = data.llm.vllm_available_models;
-    anthropicKeyConfigured.value = data.llm.anthropic_key_configured;
-    openAiKeyConfigured.value = data.llm.openai_key_configured;
-    llmInfomaniakModel.value = data.llm.infomaniak_model;
-    infomaniakAvailableModels.value = data.llm.infomaniak_available_models;
-    infomaniakTokenConfigured.value = data.llm.infomaniak_token_configured;
+  function applyUserSettings(data: UserSettingsResponse) {
     theme.value = data.appearance.theme;
     notificationsEnabled.value = data.notifications.enabled;
-    connectedAccounts.value = data.connected_accounts;
-    tools.value = data.tools;
   }
 
   async function loadSettings() {
     loading.value = true;
     error.value = null;
     try {
-      const data = await getSettings();
-      applyResponse(data);
+      const data = await getMySettings();
+      applyUserSettings(data);
     } catch (e) {
       error.value = e instanceof Error ? e.message : t('settings.error.loadFailed');
     } finally {
@@ -128,11 +116,11 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  async function saveSetting(patch: SettingsPatch) {
+  async function saveSetting(patch: UserSettingsPatch) {
     const toasts = useToastStore();
     try {
-      const data = await patchSettings(patch);
-      applyResponse(data);
+      const data = await patchMySettings(patch);
+      applyUserSettings(data);
       toasts.add('success', t('toast.common.saved'));
     } catch (e) {
       const msg = e instanceof Error ? e.message : t('settings.error.saveFailed');
@@ -141,42 +129,49 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  // Convenience setters that call saveSetting internally
-  async function setProvider(ui: LLMProvider) {
-    const previous = llmProvider.value;
-    llmProvider.value = uiToApiProvider(ui);
+  async function setNotificationsEnabled(value: boolean) {
+    const previous = notificationsEnabled.value;
+    notificationsEnabled.value = value;
     try {
-      await saveSetting({ llm: { provider: llmProvider.value } });
-    } catch (e) {
-      // Revert the optimistic switch so the UI reflects the server's rejection.
-      llmProvider.value = previous;
-      throw e;
+      await saveSetting({ notifications: { enabled: value } });
+    } catch {
+      notificationsEnabled.value = previous;
     }
   }
 
-  async function setAnthropicModel(value: string) {
-    llmAnthropicModel.value = value;
-    await saveSetting({ llm: { anthropic_model: value } });
+  async function loadConnections() {
+    const [google, microsoft] = await Promise.all([
+      getOAuthStatus('google').catch(() => DISCONNECTED),
+      getOAuthStatus('microsoft').catch(() => DISCONNECTED),
+    ]);
+    connectedAccounts.value = {
+      google: normalizeStatus(google),
+      microsoft: normalizeStatus(microsoft),
+    };
   }
 
-  async function setOpenAiModel(value: string) {
-    llmOpenAiModel.value = value;
-    await saveSetting({ llm: { openai_model: value } });
+  async function loadOrgTools() {
+    try {
+      const data = await getOrgSettings();
+      tools.value = data.tools;
+    } catch {
+      // Keep the current tools — the caller may not be an Org Admin.
+    }
   }
 
-  async function setVllmModel(value: string) {
-    llmVllmModel.value = value;
-    await saveSetting({ llm: { vllm_model: value } });
-  }
-
-  async function setInfomaniakModel(value: string) {
-    llmInfomaniakModel.value = value;
-    await saveSetting({ llm: { infomaniak_model: value } });
-  }
-
-  async function setNotificationsEnabled(value: boolean) {
-    notificationsEnabled.value = value;
-    await saveSetting({ notifications: { enabled: value } });
+  async function setToolEnabled(tool: keyof ToolsSettings, enabled: boolean) {
+    const toasts = useToastStore();
+    const previous = tools.value[tool];
+    tools.value = { ...tools.value, [tool]: enabled };
+    try {
+      const data = await patchOrgSettings({ tools: { [tool]: enabled } });
+      tools.value = data.tools;
+      toasts.add('success', t('toast.common.saved'));
+    } catch (e) {
+      tools.value = { ...tools.value, [tool]: previous };
+      const msg = e instanceof Error ? e.message : t('settings.error.saveFailed');
+      toasts.add('error', t('toast.common.saveFailed.title'), msg);
+    }
   }
 
   async function connectGoogle() {
@@ -217,7 +212,7 @@ export const useSettingsStore = defineStore('settings', () => {
     const toasts = useToastStore();
     try {
       await disconnectOAuth('google');
-      await loadSettings();
+      await loadConnections();
       toasts.add('success', t('toast.settings.googleDisconnected'));
     } catch (e) {
       const msg = e instanceof Error ? e.message : t('settings.error.disconnectFailed');
@@ -229,7 +224,7 @@ export const useSettingsStore = defineStore('settings', () => {
     const toasts = useToastStore();
     try {
       await disconnectOAuth('microsoft');
-      await loadSettings();
+      await loadConnections();
       toasts.add('success', t('toast.settings.microsoftDisconnected'));
     } catch (e) {
       const msg = e instanceof Error ? e.message : t('settings.error.disconnectFailed');
@@ -237,57 +232,28 @@ export const useSettingsStore = defineStore('settings', () => {
     }
   }
 
-  async function setToolEnabled(tool: keyof ToolsSettings, enabled: boolean) {
-    const previous = tools.value[tool];
-    tools.value = { ...tools.value, [tool]: enabled };
-    try {
-      await saveSetting({ tools: { [tool]: enabled } });
-    } catch {
-      tools.value = { ...tools.value, [tool]: previous };
-    }
-  }
-
   return {
     // Session
     sessionId,
     newSession,
-    // Compat computed
-    provider,
-    // Raw LLM state
-    llmProvider,
-    llmAnthropicModel,
-    llmOpenAiModel,
-    llmVllmModel,
-    vllmAvailableModels,
-    anthropicKeyConfigured,
-    openAiKeyConfigured,
-    llmInfomaniakModel,
-    infomaniakAvailableModels,
-    infomaniakTokenConfigured,
-    // Appearance
+    // User settings
     theme,
-    // Notifications
     notificationsEnabled,
-    // Connected accounts
-    connectedAccounts,
-    // Tools
-    tools,
-    setToolEnabled,
-    // Loading state
     loading,
     error,
-    // Actions
     loadSettings,
     saveSetting,
-    setProvider,
-    setAnthropicModel,
-    setOpenAiModel,
-    setVllmModel,
-    setInfomaniakModel,
     setNotificationsEnabled,
+    // Connected accounts
+    connectedAccounts,
+    loadConnections,
     connectGoogle,
     connectMicrosoft,
     disconnectGoogle,
     disconnectMicrosoft,
+    // Organization tools
+    tools,
+    loadOrgTools,
+    setToolEnabled,
   };
 });

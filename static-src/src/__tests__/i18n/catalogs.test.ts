@@ -222,8 +222,9 @@ describe('i18n catalogs', () => {
 // the user's machine for Infomaniak's Swiss servers, and admino itself may
 // run on a VPS. No locale may claim that data stays local, the copy that
 // introduces admino (Settings → About, the empty chat) names Infomaniak as
-// the default, and vLLM is described as today's local CPU container, not
-// the old Apple Silicon / Metal setup.
+// the default, and no copy describes the old Apple Silicon / Metal vLLM
+// setup. Issue #159 moves the platform LLM out of Settings: the Settings →
+// Agent section and the About trust note are gone, and so is their copy.
 
 const LOCAL_ONLY_CLAIMS: Record<Locale, RegExp> = {
   en: /on your machine|local-only|stays? local/i,
@@ -249,16 +250,21 @@ describe('i18n catalog product claims', () => {
     ]).toEqual([true, true]);
   });
 
-  it.each<Locale>(['en', 'de', 'fr'])('%s describes vLLM as the local CPU container', (target) => {
+  it.each<Locale>(['en', 'de', 'fr'])('%s never describes the old Apple Silicon / Metal vLLM setup', (target) => {
     const catalog = CATALOGS[target];
-    const outdated = EN_KEYS.filter((key) =>
+    const outdated = Object.keys(catalog).filter((key) =>
       formsOf(catalog[key]).some((form) => /Apple Silicon|\bMetal\b/.test(form)),
     );
 
-    expect([
-      outdated,
-      /\bCPU\b/.test(String(catalog['settings.agent.subtitle'])),
-      /\bCPU\b/.test(String(catalog['settings.agent.vllm.modelHint'])),
-    ]).toEqual([[], true, true]);
+    expect(outdated).toEqual([]);
+  });
+
+  it.each<Locale>(['en', 'de', 'fr'])('%s keeps no copy of the removed Settings → Agent section or About trust note', (target) => {
+    const removed = Object.keys(CATALOGS[target]).filter(
+      (key) =>
+        key.startsWith('settings.agent.') || key === 'settings.nav.agent' || key === 'settings.about.trustTitle',
+    );
+
+    expect(removed).toEqual([]);
   });
 });

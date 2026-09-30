@@ -1,9 +1,12 @@
 """Configuration loading and validation for admino.
 
 Reads and validates the main application config (config.yaml) at startup, and
-provides the database-backed loaders that become the runtime source of truth
-once the DB is seeded. Tool permission rules live in permissions.py; their
-in-code defaults (DEFAULT_PERMISSIONS) seed an empty DB on first run.
+provides the database-backed permissions loader. Tool permission rules live in
+permissions.py; their in-code defaults (DEFAULT_PERMISSIONS) seed an empty DB
+on first run. Deployment config (server, egress, database, log level and
+format) comes from config.yaml and its env overrides only; the platform LLM
+and limits are stored in ``platform_settings`` (``admino.scoped_settings``,
+GH-159), seeded from this config.
 
 Environment variable overrides are supported for deployment flexibility.
 Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
@@ -292,10 +295,10 @@ class LLMConfig(BaseModel):
     )
 
     # -- Anthropic settings (used when provider=anthropic) --
-    # No hardcoded default: the model ID must come from config.yaml (or
-    # Settings → Agent) so that a stale or retired ID can never be silently
-    # substituted. A missing value for the active provider logs a warning and
-    # chat asks the user to choose a model (see below).
+    # No hardcoded default: the model ID must come from config.yaml (or the
+    # Super Admin's PATCH /api/platform/settings) so that a stale or retired ID
+    # can never be silently substituted. A missing value for the active
+    # provider logs a warning and chat asks for a model (see below).
     anthropic_model: str | None = Field(
         default=None,
         max_length=200,
@@ -368,7 +371,8 @@ class LLMConfig(BaseModel):
         if not self.active_model_name:
             logger.warning(
                 "llm.provider is '%s' but llm.%s_model is not set. admino starts "
-                "anyway; chat replies will ask to choose a model in Settings → Agent.",
+                "anyway; chat replies will ask for a model; the Super Admin sets it "
+                "with PATCH /api/platform/settings.",
                 self.provider,
                 self.provider,
             )
@@ -520,8 +524,8 @@ class AppConfig(BaseModel):
     Unknown top-level sections are ignored (Pydantic's default ``extra``
     behaviour), so a legacy ``files`` section (from before GH-143), ``paths``
     section (the removed NDJSON audit log path, GH-147) or ``auth`` section
-    (the removed auth modes, GH-149) left in an existing config.yaml or
-    settings table still validates and is dropped.
+    (the removed auth modes, GH-149) left in an existing config.yaml still
+    validates and is dropped.
 
     Environment variable overrides are applied after YAML loading:
     - LLM_PROVIDER      -> llm.provider
@@ -537,8 +541,7 @@ class AppConfig(BaseModel):
 
     # Pydantic applies hide_input_in_errors from the model being validated, not
     # from nested ones: without it here, an invalid server.public_url or
-    # server.trusted_proxies loaded from the database would reach the startup
-    # error log.
+    # server.trusted_proxies would reach an error log.
     model_config = ConfigDict(hide_input_in_errors=True)
 
     server: ServerConfig = Field(default_factory=ServerConfig)
@@ -807,25 +810,6 @@ def load_app_config(config_path: Path) -> AppConfig:
 # ---------------------------------------------------------------------------
 # Database-backed config loaders
 # ---------------------------------------------------------------------------
-
-
-async def load_app_config_from_db(pool: asyncpg.Pool) -> AppConfig:
-    """Load application config from the database.
-
-    Fetches settings rows, reconstructs the config dict, applies env
-    overrides, and validates via Pydantic.
-
-    Args:
-        pool: The asyncpg connection pool.
-
-    Returns:
-        A validated AppConfig instance loaded from the database.
-    """
-    from admino.database import load_settings_from_db
-
-    data = await load_settings_from_db(pool)
-    data = _apply_env_overrides(data)
-    return AppConfig.model_validate(data)
 
 
 async def load_permissions_config_from_db(

@@ -65,7 +65,6 @@ from admino.config import (
     LLMConfig,
     ServerConfig,
     load_app_config,
-    load_app_config_from_db,
     load_permissions_config_from_db,
 )
 
@@ -606,21 +605,6 @@ class TestFilesToolConfigRemoved:
         config = load_app_config(yaml_path)
         assert not hasattr(config, "files")
 
-    async def test_legacy_files_row_in_db_settings_is_ignored(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A DB seeded before GH-143 (stale files row) still boots."""
-        mock_data: dict[str, object] = {
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-            "files": {
-                "allowed_paths": [{"path": "/app/documents", "label": "", "access": "read"}],
-                "max_read_chars": 10000,
-            },
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
-        assert not hasattr(config, "files")
-
 
 class TestServerConfigValidation:
     """ServerConfig field boundary validation."""
@@ -720,20 +704,6 @@ class TestAuthConfigRemoved:
         )
         assert "auth" not in config.model_dump()
 
-    async def test_legacy_auth_row_in_db_settings_is_ignored(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A DB seeded before GH-149 (auth row, until migration 0007 deletes it) still boots."""
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        monkeypatch.delenv("AUTH_MODE", raising=False)
-        mock_data: dict[str, object] = {
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-            "auth": {"mode": "token"},
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
-        assert not hasattr(config, "auth")
-
     @pytest.mark.parametrize("value", ["tooshort", _OLD_AUTH_TOKEN, "not base64!@#" * 5])
     def test_auth_token_env_has_no_effect(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
@@ -752,19 +722,6 @@ class TestAuthConfigRemoved:
         monkeypatch.delenv("AUTH_TOKEN", raising=False)
         monkeypatch.setenv("AUTH_MODE", value)
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
-        assert not hasattr(config, "auth")
-
-    async def test_auth_mode_env_has_no_effect_on_db_config(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The DB loader applies no AUTH_MODE override either (no token demanded)."""
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        monkeypatch.setenv("AUTH_MODE", "token")
-        mock_data: dict[str, object] = {
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
         assert not hasattr(config, "auth")
 
     def test_config_module_never_reads_auth_env_vars(self) -> None:
@@ -1252,19 +1209,6 @@ class TestCookieSecure:
             if record.levelno >= logging.WARNING
         )
 
-    async def test_cookie_secure_env_applies_to_db_config(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The DB-backed loader applies the same COOKIE_SECURE override."""
-        monkeypatch.setenv("COOKIE_SECURE", "false")
-        mock_data: dict[str, object] = {
-            "server": {"host": "127.0.0.1", "port": 8000},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
-        assert config.server.cookie_secure is False
-
 
 # ---------------------------------------------------------------------------
 # DatabaseConfig validation
@@ -1295,53 +1239,16 @@ class TestDatabaseConfig:
 # ---------------------------------------------------------------------------
 
 
-class TestLoadAppConfigFromDb:
-    """Tests for load_app_config_from_db()."""
+class TestDatabaseBackedAppConfigRemoved:
+    """GH-159: the key/value settings table is dropped. Deployment config (server,
+    egress, database, log level and format) comes from config.yaml and its env
+    overrides only; the platform LLM and limits come from platform_settings
+    (admino.scoped_settings)."""
 
-    async def test_calls_load_settings_from_db(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """load_app_config_from_db calls load_settings_from_db and returns AppConfig."""
-        mock_pool = MagicMock()
-        mock_data: dict[str, object] = {
-            "server": {"host": "127.0.0.1", "port": 8000},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-            # A legacy row (migration 0007 deletes it); the loader ignores it.
-            "auth": {"mode": "vpn"},
-            "paths": {},
-            "limits": {},
-            "egress": {},
-            "database": {},
-            "log_level": "INFO",
-        }
-        mock_load = AsyncMock(return_value=mock_data)
+    def test_config_db_backed_app_config_loader_is_removed(self) -> None:
+        import admino.config as config_module
 
-        with patch("admino.database.load_settings_from_db", new=mock_load):
-            result = await load_app_config_from_db(mock_pool)
-
-        mock_load.assert_awaited_once_with(mock_pool)
-        assert isinstance(result, AppConfig)
-        assert result.server.host == "127.0.0.1"
-
-    async def test_applies_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """load_app_config_from_db applies environment variable overrides."""
-        mock_pool = MagicMock()
-        mock_data: dict[str, object] = {
-            "server": {},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-            # A legacy row (migration 0007 deletes it); the loader ignores it.
-            "auth": {"mode": "vpn"},
-            "paths": {},
-            "limits": {},
-            "egress": {},
-            "database": {},
-            "log_level": "INFO",
-        }
-        mock_load = AsyncMock(return_value=mock_data)
-        monkeypatch.setenv("LOG_LEVEL", "DEBUG")
-
-        with patch("admino.database.load_settings_from_db", new=mock_load):
-            result = await load_app_config_from_db(mock_pool)
-
-        assert result.log_level == "DEBUG"
+        assert not hasattr(config_module, "load_app_config_from_db")
 
 
 class TestLoadPermissionsConfigFromDb:
@@ -1591,35 +1498,6 @@ class TestPublicUrl:
         rendered = f"{exc_info.value!s} {exc_info.value!r}"
         for part in parts:
             assert part not in rendered
-
-    async def test_public_url_invalid_value_fails_db_loading_without_echo(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An invalid override fails the DB-backed loader too, and the error (which startup
-        logs with %s) doesn't repeat the value."""
-        monkeypatch.setenv("ADMINO_PUBLIC_URL", "http://dbmarkerq8.example.ch/pathq8")
-        mock_data: dict[str, object] = {"server": {"host": "127.0.0.1", "port": 8000}}
-        with (
-            patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)),
-            pytest.raises(ValueError) as exc_info,
-        ):
-            await load_app_config_from_db(MagicMock())
-
-        assert "dbmarkerq8" not in str(exc_info.value)
-        assert "pathq8" not in str(exc_info.value)
-
-    async def test_public_url_env_applies_to_db_config(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The DB-backed loader applies the same override."""
-        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://admino.example.ch")
-        mock_data: dict[str, object] = {
-            "server": {"host": "127.0.0.1", "port": 8000},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
-        assert config.server.public_url == "https://admino.example.ch"  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -1877,44 +1755,6 @@ class TestTrustedProxies:
 
         assert "trusted_proxies" in f"{exc_info.value} {caplog.text}".lower()
 
-    async def test_trusted_proxies_env_applies_to_db_config(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The DB-backed loader applies the same override (replacing the stored list)."""
-        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", " 172.31.0.10 , 10.0.0.0/8")
-        mock_data: dict[str, object] = {
-            "server": {"host": "127.0.0.1", "port": 8000, "trusted_proxies": ["192.168.0.0/16"]},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
-        assert config.server.trusted_proxies == ["172.31.0.10/32", "10.0.0.0/8"]
-
-    async def test_trusted_proxies_db_row_is_normalized(self) -> None:
-        """Without the env var, a stored server row's list is validated like YAML."""
-        mock_data: dict[str, object] = {
-            "server": {"host": "127.0.0.1", "port": 8000, "trusted_proxies": ["172.31.0.10"]},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-        }
-        with patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)):
-            config = await load_app_config_from_db(MagicMock())
-        assert config.server.trusted_proxies == ["172.31.0.10/32"]
-
-    async def test_trusted_proxies_invalid_env_fails_db_loading_without_echo(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """An invalid override fails the DB-backed loader too, and the error (which startup
-        logs with %s) doesn't repeat the value."""
-        monkeypatch.setenv("ADMINO_TRUSTED_PROXIES", "172.31.0.10, proxymarkerq4")
-        mock_data: dict[str, object] = {"server": {"host": "127.0.0.1", "port": 8000}}
-        with (
-            patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)),
-            pytest.raises(ValueError) as exc_info,
-        ):
-            await load_app_config_from_db(MagicMock())
-
-        assert "proxymarkerq4" not in str(exc_info.value)
-
 
 # ---------------------------------------------------------------------------
 # GH-156: a non-Secure session cookie is dev-only (plain-http loopback URL)
@@ -2017,24 +1857,6 @@ class TestInsecureCookieIsDevOnly:
         monkeypatch.setenv("ADMINO_PUBLIC_URL", "http://localhost:8000")
         config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
         assert config.server.cookie_secure is False
-
-    async def test_insecure_cookie_with_https_public_url_fails_db_loading(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The DB-backed loader refuses it too, and the error doesn't repeat the URL."""
-        monkeypatch.setenv("COOKIE_SECURE", "false")
-        monkeypatch.setenv("ADMINO_PUBLIC_URL", "https://cookiemarkerq5.example.ch")
-        mock_data: dict[str, object] = {
-            "server": {"host": "127.0.0.1", "port": 8000},
-            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-        }
-        with (
-            patch("admino.database.load_settings_from_db", new=AsyncMock(return_value=mock_data)),
-            pytest.raises(ValueError) as exc_info,
-        ):
-            await load_app_config_from_db(MagicMock())
-
-        assert "cookiemarkerq5" not in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------

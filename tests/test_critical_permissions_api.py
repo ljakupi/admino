@@ -33,7 +33,11 @@ from httpx import ASGITransport, AsyncClient
 
 from admino.server import create_app
 from tests.auth_helpers import login, member_session, resolved_session, session_cookie
-from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
+from tests.lifespan_stubs import (
+    patch_login_throttle_purge_job,
+    patch_org_purge_job,
+    patch_tools_gate,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -802,7 +806,6 @@ class TestLifespanLoadsPromotedPermissions:
             "gmail": {"send": "confirm"},
         }
         mock_load_perms = AsyncMock(return_value=db_perms)
-        mock_load_settings = AsyncMock(return_value={})
         mock_init = AsyncMock()
         mock_close = AsyncMock()
 
@@ -812,7 +815,8 @@ class TestLifespanLoadsPromotedPermissions:
                 patch("admino.database.close_pool", mock_close),
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.load_permissions_from_db", mock_load_perms),
-                patch("admino.database.load_settings_from_db", mock_load_settings),
+                # GH-159: the tools gate reload never reads the MagicMock pool.
+                patch_tools_gate(),
                 # GH-154's org purge job never runs against the MagicMock pool.
                 patch_org_purge_job(AsyncMock()),
                 # GH-157: nor does the login throttle purge.
@@ -842,7 +846,6 @@ class TestLifespanLoadsPromotedPermissions:
             "gmail": {"send": "confirm", "delete": "confirm"},
         }
         mock_load_perms = AsyncMock(return_value=db_perms)
-        mock_load_settings = AsyncMock(return_value={})
         mock_init = AsyncMock()
         mock_close = AsyncMock()
 
@@ -852,7 +855,8 @@ class TestLifespanLoadsPromotedPermissions:
                 patch("admino.database.close_pool", mock_close),
                 patch("admino.database.get_pool", _mock_get_pool()),
                 patch("admino.database.load_permissions_from_db", mock_load_perms),
-                patch("admino.database.load_settings_from_db", mock_load_settings),
+                # GH-159: the tools gate reload never reads the MagicMock pool.
+                patch_tools_gate(),
                 # GH-154's org purge job never runs against the MagicMock pool.
                 patch_org_purge_job(AsyncMock()),
                 # GH-157: nor does the login throttle purge.

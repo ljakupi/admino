@@ -73,14 +73,12 @@ export const de: Record<MessageKey, Message> = {
   'toast.criticalPermissions.disabled': 'Deaktiviert: {permission}',
   'toast.criticalPermissions.disableFailed.title': 'Deaktivieren fehlgeschlagen',
 
-  // --- settings (fallback error strings, agent trust note) -----------------
+  // --- settings (fallback error strings) ------------------------------------
   'settings.error.loadFailed': 'Einstellungen konnten nicht geladen werden',
   'settings.error.saveFailed': 'Einstellungen konnten nicht gespeichert werden',
   'settings.error.unexpectedRedirect': 'Unerwartete OAuth-Weiterleitungs-URL.',
   'settings.error.oauthStartFailed': 'OAuth-Vorgang konnte nicht gestartet werden',
   'settings.error.disconnectFailed': 'Trennen fehlgeschlagen',
-  'settings.agent.trustNote':
-    'Einstellungen, Audit-Log und Gedächtnis werden auf Ihrem admino-Server gespeichert. Nur {provider} verarbeitet die Konversationsinhalte.',
 
   // --- permissions (fallback error strings, critical permission copy) ------
   'permissions.error.loadFailed': 'Berechtigungen konnten nicht geladen werden',
@@ -266,7 +264,6 @@ export const de: Record<MessageKey, Message> = {
   'settings.nav.group.app': 'App',
   'settings.nav.group.system': 'System',
   'settings.nav.session': 'Sitzung',
-  'settings.nav.agent': 'Agent',
   'settings.nav.appearance': 'Darstellung',
   'settings.nav.notifications': 'Benachrichtigungen',
   'settings.nav.about': 'Über',
@@ -276,31 +273,6 @@ export const de: Record<MessageKey, Message> = {
   'settings.session.id.hint': 'Buchstaben, Ziffern, Bindestriche, Unterstriche. Max. 64 Zeichen.',
   'settings.session.new.label': 'Neue Sitzung',
   'settings.session.new.hint': 'Leert den Chatverlauf.',
-  'settings.agent.subtitle':
-    'Mit welchem LLM admino arbeitet. Infomaniak ist der Standard; vLLM (lokaler CPU-Container), Claude und OpenAI sind optionale Alternativen.',
-  'settings.agent.provider.label': 'Anbieter',
-  'settings.agent.provider.hint':
-    'Infomaniak, Claude und OpenAI senden Ihre Nachrichten zur Verarbeitung an ihre Server. vLLM ist eine lokale, optionale Alternative, die Sie selbst betreiben.',
-  'settings.agent.model.label': 'Modell',
-  'settings.agent.model.placeholder': 'z. B. {example}',
-  'settings.agent.model.emptyError': 'Der Modellname darf nicht leer sein',
-  'settings.agent.model.exactIdHint': 'Exakte Modell-ID, z. B. {example}. Siehe {link}.',
-  'settings.agent.anthropic.modelList': 'Modellliste von Anthropic',
-  'settings.agent.openai.modelList': 'Modellliste von OpenAI',
-  'settings.agent.infomaniak.noModels':
-    'Keine Modelle aufgelistet – setzen Sie {env} auf dem Server, um sie zu laden.',
-  'settings.agent.infomaniak.privacy':
-    'Verarbeitung in der Schweiz; Anfragen werden weder gespeichert noch für Training verwendet (Infomaniak).',
-  'settings.agent.vllm.noModels':
-    'Kein bereitgestelltes Modell erkannt – der lokale vLLM-Container ist optional: Starten Sie ihn mit {cmd}.',
-  'settings.agent.vllm.modelHint':
-    'Die HuggingFace-Repo-ID des Modells, das der lokale vLLM-CPU-Container bereitstellt.',
-  'settings.agent.apiToken.label': 'API-Token',
-  'settings.agent.apiKey.label': 'API-Schlüssel',
-  'settings.agent.secretHint':
-    '{env} · Wird auf dem Server als Umgebungsvariable gesetzt. Nie an Ihren Browser gesendet.',
-  'settings.agent.secret.configured': 'Konfiguriert',
-  'settings.agent.secret.notConfigured': 'Nicht konfiguriert',
   'settings.appearance.subtitle': 'So sieht die Oberfläche aus. Änderungen gelten sofort.',
   'settings.appearance.theme.label': 'Design',
   'settings.appearance.theme.hint': 'Der dunkle Modus ist für v2 geplant.',
@@ -322,7 +294,6 @@ export const de: Record<MessageKey, Message> = {
   'settings.about.versionValue': 'admino {version} (Alpha)',
   'settings.about.sourceCode': 'Quellcode',
   'settings.about.license': 'Lizenz',
-  'settings.about.trustTitle': 'Ihr admino-Server',
   'settings.danger.subtitle':
     'Diese Aktionen können nicht rückgängig gemacht werden. Jede verlangt eine Bestätigung.',
   'settings.danger.clear.label': 'Gespräch leeren',

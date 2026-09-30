@@ -115,8 +115,13 @@ _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("POST", "/api/message"),
         ("GET", "/api/events"),
         ("POST", "/api/confirm/{confirmation_id}"),
-        ("GET", "/api/settings"),
-        ("PATCH", "/api/settings"),
+        # GH-159: the settings scopes (the old /api/settings is gone).
+        ("GET", "/api/me/settings"),
+        ("PATCH", "/api/me/settings"),
+        ("GET", "/api/org/settings"),
+        ("PATCH", "/api/org/settings"),
+        ("GET", "/api/platform/settings"),
+        ("PATCH", "/api/platform/settings"),
         ("GET", "/api/permissions"),
         ("PATCH", "/api/permissions"),
         ("GET", "/api/critical-permissions"),
@@ -1291,7 +1296,6 @@ class TestCsrf:
     @pytest.mark.parametrize(
         ("method", "path", "body"),
         [
-            ("PATCH", "/api/settings", {}),
             (
                 "PATCH",
                 "/api/permissions",
@@ -1417,8 +1421,6 @@ _EXPECTED_RATES: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
     "/api/events": (0.17, 3),
-    "/api/settings/get": (1.0, 5),
-    "/api/settings/patch": (0.2, 2),
     "/api/permissions/get": (1.0, 5),
     "/api/permissions/patch": (0.2, 2),
     "/api/oauth/google/authorize": (0.2, 2),
@@ -1588,11 +1590,11 @@ class TestUnresolvedSessionThrottle:
         client = _client(app, _IP_A)
 
         statuses = [
-            client.get("/api/settings", headers=_cookie(secrets.token_urlsafe(32))).status_code
+            client.get("/api/permissions", headers=_cookie(secrets.token_urlsafe(32))).status_code
             for _ in range(3)
         ]
         queries_before = _session_queries(db)
-        refused = client.get("/api/settings", headers=_cookie(secrets.token_urlsafe(32)))
+        refused = client.get("/api/permissions", headers=_cookie(secrets.token_urlsafe(32)))
 
         assert statuses == [401, 401, 401]
         assert refused.status_code == 429

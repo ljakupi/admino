@@ -13,7 +13,7 @@ Mirrors the mocking style of ``tests/test_llm_openai.py`` exactly:
 ``client._client.chat.completions.create``.
 
 GH-142: a missing/empty ``vllm_model`` no longer fails construction; chat()
-answers "No vLLM model is set … Settings → Agent" instead. Connection/timeout
+answers "No vLLM model is set … ask your administrator" instead. Connection/timeout
 failures become user-facing (still "starting or unavailable", now pointing to
 ``make start-local``), 404/429/5xx map to the user-facing catalogue, and other
 4xx (including 401/403 — vLLM has no key) stay internal.
@@ -561,7 +561,7 @@ class TestVLLMUserFacingErrors:
 
     @pytest.mark.parametrize("model", [None, ""], ids=["none", "empty"])
     async def test_vllm_missing_model_chat_user_facing(self, model: str | None) -> None:
-        """No model → "No vLLM model is set … Settings → Agent", no API call."""
+        """No model → "No vLLM model is set … ask your administrator", no API call."""
         client = _make_client(_make_llm_config(vllm_model=model))  # type: ignore[arg-type]
         create = AsyncMock(return_value=_make_completion())
         client._client.chat.completions.create = create
@@ -573,7 +573,8 @@ class TestVLLMUserFacingErrors:
         assert exc_info.value.user_facing is True
         assert exc_info.value.status_code is None
         assert "No vLLM model is set" in message
-        assert "Settings → Agent" in message
+        assert "ask your administrator" in message
+        assert "Settings → Agent" not in message  # GH-159: that section is gone
         create.assert_not_awaited()
 
     @pytest.mark.parametrize(
@@ -604,7 +605,7 @@ class TestVLLMUserFacingErrors:
     @pytest.mark.parametrize(
         ("cls", "status", "phrases"),
         [
-            (openai.NotFoundError, 404, ("vLLM", "Settings → Agent")),
+            (openai.NotFoundError, 404, ("vLLM", "ask your administrator")),
             (openai.RateLimitError, 429, ("vLLM", "rate limit")),
             (openai.InternalServerError, 500, ("vLLM", "unavailable")),
             (openai.InternalServerError, 503, ("vLLM", "unavailable")),

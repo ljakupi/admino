@@ -20,6 +20,12 @@ Security notes:
   residency switch are strict ints and bools.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
+- Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
+  ``PlatformSettingsPatch`` refuse unknown keys at every level (another
+  scope's key, an org id, an LLM endpoint), take strict bools, need at least
+  one value and hide their input from validation errors. Model names must
+  fully match the model-name rule, the same as migration 0013's CHECK.
+  ``SettingsLLM`` shows key presence flags only, never a key.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
@@ -1245,15 +1251,19 @@ class OneDriveSearchArgs(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Settings API models (server.py Settings endpoints)
+# Settings API models: the user, org and platform scopes (GH-159)
 # ---------------------------------------------------------------------------
 
-# Shell metacharacter pattern for model name validation (mirrors LLMConfig).
-_MODEL_NAME_RE: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.:\-/]*$")
+# A model name: letters, digits, '_', '.', ':', '/' and '-', starting with a
+# letter or digit, at most 200 characters. Always used with fullmatch (Python's
+# '$' would accept a trailing newline). Migration 0013's CHECK on the
+# platform_settings model columns is the same rule.
+_MODEL_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}")
+_MODEL_NAME_ERROR: Final = "Model name contains invalid characters."
 
 
 class SettingsLLM(BaseModel):
-    """LLM settings exposed via the Settings API.
+    """The platform LLM as GET/PATCH /api/platform/settings shows it (Super Admin).
 
     Credentials are never exposed: only ``*_configured`` boolean flags.
     """
@@ -1278,12 +1288,11 @@ class SettingsLLM(BaseModel):
     def validate_model_name(cls, v: str) -> str:
         """Reject model names containing shell metacharacters or control chars.
 
-        An empty string is allowed: inactive-provider model fields have no
-        hardcoded default and are rendered blank when unset in config.
+        An empty string is allowed: a model that isn't set (NULL in
+        ``platform_settings``) is shown blank.
         """
-        if v and not _MODEL_NAME_RE.match(v):
-            msg = "Model name contains invalid characters."
-            raise ValueError(msg)
+        if v and _MODEL_NAME_RE.fullmatch(v) is None:
+            raise ValueError(_MODEL_NAME_ERROR)
         return v
 
     @field_validator("vllm_available_models", "infomaniak_available_models")
@@ -1298,38 +1307,21 @@ class SettingsLLM(BaseModel):
         local vLLM connection) could return ids with unexpected characters.
         Keep only ids matching the same allowlist enforced on user-supplied
         model names, and bound the count, so a malicious server cannot spoof
-        the Settings UI or smuggle characters past downstream sanitisers.
+        the settings response or smuggle characters past downstream sanitisers.
         """
-        return [m for m in v if isinstance(m, str) and len(m) <= 200 and _MODEL_NAME_RE.match(m)][
-            :64
-        ]
+        return [m for m in v if isinstance(m, str) and _MODEL_NAME_RE.fullmatch(m)][:64]
 
 
 class SettingsAppearance(BaseModel):
-    """Appearance settings."""
+    """Appearance settings (user scope)."""
 
     theme: Literal["light", "dark", "system"] = "light"
 
 
 class SettingsNotifications(BaseModel):
-    """Notification preferences."""
+    """Notification preferences (user scope)."""
 
     enabled: bool = True
-
-
-class SettingsLimits(BaseModel):
-    """Rate and size limits (read-only subset exposed to frontend)."""
-
-    max_tool_calls_per_message: int = Field(ge=1, le=100)
-    confirmation_timeout_s: int = Field(ge=10, le=3600)
-    max_message_length: int = Field(ge=1, le=100_000)
-
-
-class SettingsImmutable(BaseModel):
-    """Immutable server settings — read-only in API response."""
-
-    host: str
-    port: int
 
 
 class OAuthAuthorizeResponse(BaseModel):
@@ -1358,20 +1350,18 @@ class OAuthConnectionStatus(BaseModel):
 
 
 class ToolsSettings(BaseModel):
-    """Per-tool enabled/disabled state.
+    """Per-tool enabled/disabled state (the org scope's tool services).
 
-    Each field corresponds to a registered tool name. Default is True
-    (enabled) for all tools, matching the implicit behavior before this
-    feature was added.
+    Each field corresponds to a registered tool name and maps to an
+    ``org_settings.<tool>_enabled`` column. Default is True (enabled) for
+    all tools, like the column defaults of migration 0013.
 
-    strict=True (mirrors :class:`SettingsPatchTools`): a non-boolean value
-    loaded from the DB JSONB ``tools`` column — e.g. a manually corrupted or
-    externally migrated ``"false"`` string — must raise ``ValidationError``
-    and trip the explicit all-enabled fallback, NOT be silently coerced to
-    ``True`` and re-enable a service the user disabled (GH-80 security gate).
+    strict=True: a non-boolean value (e.g. a ``"false"`` string) raises
+    ``ValidationError`` instead of being silently coerced to ``True`` and
+    re-enabling a service that was turned off (GH-80 security gate).
 
-    Unknown keys are dropped, so a legacy ``files`` toggle still stored in the
-    DB from before GH-143 validates and is never reported or written back.
+    Unknown keys are dropped, so a legacy ``files`` toggle (removed in
+    GH-143) is never reported.
     """
 
     model_config = ConfigDict(strict=True)
@@ -1385,29 +1375,17 @@ class ToolsSettings(BaseModel):
     memory: bool = True
 
 
-class SettingsConnectedAccounts(BaseModel):
-    """Connected OAuth account statuses."""
-
-    google: OAuthConnectionStatus = Field(default_factory=OAuthConnectionStatus)
-    microsoft: OAuthConnectionStatus = Field(default_factory=OAuthConnectionStatus)
-
-
-class SettingsResponse(BaseModel):
-    """GET /api/settings response — full settings with masked sensitive fields."""
-
-    llm: SettingsLLM
-    appearance: SettingsAppearance
-    notifications: SettingsNotifications
-    limits: SettingsLimits
-    server: SettingsImmutable
-    connected_accounts: SettingsConnectedAccounts = Field(
-        default_factory=SettingsConnectedAccounts,
-    )
-    tools: ToolsSettings = Field(default_factory=ToolsSettings)
-
-
 class SettingsPatchLLM(BaseModel):
-    """Partial LLM settings for PATCH."""
+    """Partial platform LLM settings for PATCH /api/platform/settings.
+
+    Only the provider and the four model names can be changed: every other
+    key (an endpoint URL, a timeout, a key) is refused. A model name must
+    fully match ``[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}``, the database CHECK of
+    migration 0013 (so a trailing newline is refused here, not by the
+    database). Validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     provider: Literal["infomaniak", "anthropic", "openai", "vllm"] | None = None
     anthropic_model: str | None = Field(default=None, max_length=200)
@@ -1415,42 +1393,83 @@ class SettingsPatchLLM(BaseModel):
     infomaniak_model: str | None = Field(default=None, max_length=200)
     vllm_model: str | None = Field(default=None, max_length=200)
 
-    @field_validator(
-        "anthropic_model", "openai_model", "infomaniak_model", "vllm_model", mode="before"
-    )
+    @field_validator("anthropic_model", "openai_model", "infomaniak_model", "vllm_model")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
-        """Reject model names containing shell metacharacters or control chars."""
+        """Refuse a model name that isn't a full match of the model-name rule.
+
+        Runs after the type and length checks: a non-string or a name over 200
+        characters is already a validation error. The message never includes
+        the value.
+        """
         if v is None:
             return v
-        if not _MODEL_NAME_RE.match(v):
-            msg = "Model name contains invalid characters."
-            raise ValueError(msg)
+        if not isinstance(v, str) or _MODEL_NAME_RE.fullmatch(v) is None:
+            raise ValueError(_MODEL_NAME_ERROR)
         return v
 
 
 class SettingsPatchAppearance(BaseModel):
-    """Partial appearance settings for PATCH."""
+    """Partial appearance settings for PATCH /api/me/settings."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     theme: Literal["light", "dark", "system"] | None = None
 
 
 class SettingsPatchNotifications(BaseModel):
-    """Partial notification settings for PATCH."""
+    """Partial notification settings for PATCH /api/me/settings (a strict bool)."""
 
-    enabled: bool | None = None
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    enabled: StrictBool | None = None
 
 
-class SettingsPatchTools(BaseModel):
-    """Partial tool enable/disable updates for PATCH.
+class UserSettingsResponse(BaseModel):
+    """GET/PATCH /api/me/settings response: the caller's own theme and notifications."""
 
-    Only provided fields are updated; omitted tools keep their current state.
-    Unknown tool names (e.g. the removed ``files`` toggle, GH-143) are ignored
-    and never persisted.
-    strict=True rejects string coercion (e.g. "yes") — only JSON booleans accepted.
+    appearance: SettingsAppearance
+    notifications: SettingsNotifications
+
+
+class UserSettingsPatch(BaseModel):
+    """PATCH /api/me/settings request body: the caller's theme and/or notifications.
+
+    Another scope's key (llm, tools, limits), a language or a user id is
+    refused, never ignored. A null counts as not given, and at least one value
+    must be given. Validation errors never repeat the input.
     """
 
-    model_config = ConfigDict(strict=True)
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    appearance: SettingsPatchAppearance | None = None
+    notifications: SettingsPatchNotifications | None = None
+
+    @model_validator(mode="after")
+    def _check_something_given(self) -> UserSettingsPatch:
+        """Refuse a patch that changes nothing."""
+        theme = None if self.appearance is None else self.appearance.theme
+        enabled = None if self.notifications is None else self.notifications.enabled
+        if theme is None and enabled is None:
+            msg = "Give at least one setting to change."
+            raise ValueError(msg)
+        return self
+
+
+class OrgSettingsResponse(BaseModel):
+    """GET/PATCH /api/org/settings response: the Org Admin's own org's tool services."""
+
+    tools: ToolsSettings
+
+
+class OrgToolsPatch(BaseModel):
+    """The tool services to switch on or off; a null (or a missing tool) is not given.
+
+    Strict bools only; an unknown tool (e.g. the removed ``files`` toggle) is
+    refused, never ignored.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
 
     gmail: bool | None = None
     google_calendar: bool | None = None
@@ -1461,13 +1480,64 @@ class SettingsPatchTools(BaseModel):
     memory: bool | None = None
 
 
-class SettingsPatch(BaseModel):
-    """PATCH /api/settings request body — all fields optional for partial update."""
+class OrgSettingsPatch(BaseModel):
+    """PATCH /api/org/settings request body: at least one tool service to change.
 
-    llm: SettingsPatchLLM | None = None
-    appearance: SettingsPatchAppearance | None = None
-    notifications: SettingsPatchNotifications | None = None
-    tools: SettingsPatchTools | None = None
+    The org is always the caller's own: an ``org_id`` (or any other key) in
+    the body is refused. Validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    tools: OrgToolsPatch
+
+    @model_validator(mode="after")
+    def _check_something_given(self) -> OrgSettingsPatch:
+        """Refuse a patch that names no tool."""
+        if not self.tools.model_dump(exclude_none=True):
+            msg = "Give at least one tool to change."
+            raise ValueError(msg)
+        return self
+
+
+class PlatformLimits(BaseModel):
+    """The platform limits (read-only until #160), with ``LimitsConfig``'s bounds."""
+
+    max_tool_calls_per_message: int = Field(ge=1, le=100)
+    max_pending_confirmations: int = Field(ge=1, le=50)
+    confirmation_timeout_s: int = Field(ge=10, le=3600)
+    max_message_length: int = Field(ge=1, le=100_000)
+    max_context_messages: int = Field(ge=1, le=200)
+
+
+class PlatformSettingsResponse(BaseModel):
+    """GET/PATCH /api/platform/settings response (Super Admin): the LLM and the limits.
+
+    No content and no secret: key presence flags only.
+    """
+
+    llm: SettingsLLM
+    limits: PlatformLimits
+
+
+class PlatformSettingsPatch(BaseModel):
+    """PATCH /api/platform/settings request body: the platform LLM only.
+
+    A ``limits`` key is refused until #160 makes the limits editable. At least
+    one llm field must be given. Validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    llm: SettingsPatchLLM
+
+    @model_validator(mode="after")
+    def _check_something_given(self) -> PlatformSettingsPatch:
+        """Refuse a patch that names no llm field."""
+        if not self.llm.model_dump(exclude_none=True):
+            msg = "Give at least one LLM setting to change."
+            raise ValueError(msg)
+        return self
 
 
 # ---------------------------------------------------------------------------

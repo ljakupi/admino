@@ -1079,7 +1079,7 @@ class TestAnthropicUserFacingErrors:
     async def test_claude_missing_model_chat_user_facing(
         self, monkeypatch: pytest.MonkeyPatch, model: str | None
     ) -> None:
-        """No model → "No Claude model is set … Settings → Agent", no API call."""
+        """No model → "No Claude model is set … ask your administrator", no API call."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test123")
         client, create = _mocked_client(model=model)
 
@@ -1090,7 +1090,8 @@ class TestAnthropicUserFacingErrors:
         assert exc_info.value.user_facing is True
         assert exc_info.value.status_code is None
         assert "No Claude model is set" in message
-        assert "Settings → Agent" in message
+        assert "ask your administrator" in message
+        assert "Settings → Agent" not in message  # GH-159: that section is gone
         create.assert_not_awaited()
 
     @pytest.mark.parametrize(
@@ -1106,7 +1107,7 @@ class TestAnthropicUserFacingErrors:
                 403,
                 ("Claude", "rejected the API", "ANTHROPIC_API_KEY"),
             ),
-            (anthropic.NotFoundError, 404, ("Claude", "Settings → Agent")),
+            (anthropic.NotFoundError, 404, ("Claude", "ask your administrator")),
             (anthropic.RateLimitError, 429, ("Claude", "rate limit")),
             (anthropic.InternalServerError, 500, ("Claude", "temporarily unavailable")),
             (anthropic.InternalServerError, 503, ("Claude", "temporarily unavailable")),

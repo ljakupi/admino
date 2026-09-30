@@ -75,14 +75,12 @@ export const en = {
   'toast.criticalPermissions.disabled': 'Disabled: {permission}',
   'toast.criticalPermissions.disableFailed.title': 'Disable failed',
 
-  // --- settings (fallback error strings, agent trust note) -----------------
+  // --- settings (fallback error strings) ------------------------------------
   'settings.error.loadFailed': 'Failed to load settings',
   'settings.error.saveFailed': 'Failed to save settings',
   'settings.error.unexpectedRedirect': 'Unexpected OAuth redirect URL.',
   'settings.error.oauthStartFailed': 'Failed to start OAuth flow',
   'settings.error.disconnectFailed': 'Failed to disconnect',
-  'settings.agent.trustNote':
-    'Settings, audit log, and memory are stored on your admino server. Only {provider} processes the conversation content.',
 
   // --- permissions (fallback error strings, critical permission copy) ------
   'permissions.error.loadFailed': 'Failed to load permissions',
@@ -264,7 +262,6 @@ export const en = {
   'settings.nav.group.app': 'App',
   'settings.nav.group.system': 'System',
   'settings.nav.session': 'Session',
-  'settings.nav.agent': 'Agent',
   'settings.nav.appearance': 'Appearance',
   'settings.nav.notifications': 'Notifications',
   'settings.nav.about': 'About',
@@ -274,30 +271,6 @@ export const en = {
   'settings.session.id.hint': 'Alphanumeric, hyphens, underscores. Max 64 chars.',
   'settings.session.new.label': 'New session',
   'settings.session.new.hint': 'Clears the chat thread.',
-  'settings.agent.subtitle':
-    'Which LLM admino talks to. Infomaniak is the default; vLLM (local CPU container), Claude, and OpenAI are opt-in alternatives.',
-  'settings.agent.provider.label': 'Provider',
-  'settings.agent.provider.hint':
-    'Infomaniak, Claude, and OpenAI send your messages to their servers for processing. vLLM is a local, opt-in alternative you run yourself.',
-  'settings.agent.model.label': 'Model',
-  'settings.agent.model.placeholder': 'e.g. {example}',
-  'settings.agent.model.emptyError': 'Model name must not be empty',
-  'settings.agent.model.exactIdHint': 'Exact model ID, e.g. {example}. See {link}.',
-  'settings.agent.anthropic.modelList': "Anthropic's model list",
-  'settings.agent.openai.modelList': "OpenAI's model list",
-  'settings.agent.infomaniak.noModels': 'No models listed — set {env} on the server to load them.',
-  'settings.agent.infomaniak.privacy':
-    "Processed in Switzerland; queries aren't recorded or used for training (Infomaniak).",
-  'settings.agent.vllm.noModels':
-    'No served model detected — the local vLLM container is opt-in: start it with {cmd}.',
-  'settings.agent.vllm.modelHint':
-    'The HuggingFace repo id of the model served by the local vLLM CPU container.',
-  'settings.agent.apiToken.label': 'API token',
-  'settings.agent.apiKey.label': 'API key',
-  'settings.agent.secretHint':
-    '{env} · Set on the server as an environment variable. Never sent to your browser.',
-  'settings.agent.secret.configured': 'Configured',
-  'settings.agent.secret.notConfigured': 'Not configured',
   'settings.appearance.subtitle': 'How the interface looks. Changes apply immediately.',
   'settings.appearance.theme.label': 'Theme',
   'settings.appearance.theme.hint': 'Dark mode is on the roadmap for v2.',
@@ -317,7 +290,6 @@ export const en = {
   'settings.about.versionValue': 'admino {version} (Alpha)',
   'settings.about.sourceCode': 'Source code',
   'settings.about.license': 'License',
-  'settings.about.trustTitle': 'Your admino server',
   'settings.danger.subtitle': 'These actions cannot be undone. Each one prompts for confirmation.',
   'settings.danger.clear.label': 'Clear conversation',
   'settings.danger.clear.hint': 'Wipes the current chat thread. Audit log is preserved by design.',

@@ -1206,15 +1206,15 @@ class TestFilesToolModelsRemoved:
         assert "files" not in dumped
         assert dumped["gmail"] is False
 
-    def test_settings_patch_tools_fields_exclude_files(self) -> None:
-        """SettingsPatchTools accepts toggles for exactly the remaining tools."""
-        from admino.models import SettingsPatchTools
+    def test_org_tools_patch_fields_exclude_files(self) -> None:
+        """OrgToolsPatch (GH-159) toggles exactly the remaining tools."""
+        from admino.models import OrgToolsPatch
 
-        assert set(SettingsPatchTools.model_fields) == _REMAINING_TOOL_NAMES
+        assert set(OrgToolsPatch.model_fields) == _REMAINING_TOOL_NAMES
 
-    def test_settings_patch_tools_ignores_files_key(self) -> None:
-        """A PATCH body toggling files validates but carries no update."""
-        from admino.models import SettingsPatchTools
+    def test_org_tools_patch_rejects_files_key(self) -> None:
+        """GH-159: a PATCH body toggling files is refused (extra="forbid"), not ignored."""
+        from admino.models import OrgToolsPatch
 
-        patch_body = SettingsPatchTools.model_validate({"files": False})
-        assert patch_body.model_dump(exclude_none=True) == {}
+        with pytest.raises(ValidationError):
+            OrgToolsPatch.model_validate({"files": False})

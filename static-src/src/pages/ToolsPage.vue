@@ -7,18 +7,28 @@ import {
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
 import { useSettingsStore } from '@/stores/settings';
+import { useAuthStore } from '@/stores/auth';
 import { useToastStore } from '@/stores/toasts';
+import { canManageOrgSettings } from '@/services/access';
 import type { ToolsSettings } from '@/api/types';
 import { useI18n, type MessageKey } from '@/i18n';
 
 const { t } = useI18n();
 const router = useRouter();
 const settings = useSettingsStore();
+const auth = useAuthStore();
 const toasts = useToastStore();
+
+// Only an Org Admin may see/change which tool services are enabled for the
+// organization (until #161 replaces the interim gate; see GH-159 contract).
+const canManageTools = computed(() => canManageOrgSettings(auth.role));
 
 // --- OAuth callback handling (moved from SettingsPage) ---
 onMounted(async () => {
-  await settings.loadSettings();
+  await settings.loadConnections();
+  if (canManageTools.value) {
+    await settings.loadOrgTools();
+  }
 
   // Only process OAuth callback params if we actually initiated a flow
   const oauthPending = sessionStorage.getItem('oauth_pending');
@@ -195,7 +205,7 @@ async function confirmDisconnect() {
                 </button>
               </div>
             </div>
-            <div v-if="googleConnected" class="provider-services">
+            <div v-if="googleConnected && canManageTools" class="provider-services">
               <div v-for="svc in googleServices" :key="svc.id" class="service-row">
                 <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
@@ -244,7 +254,7 @@ async function confirmDisconnect() {
                 </button>
               </div>
             </div>
-            <div v-if="microsoftConnected" class="provider-services">
+            <div v-if="microsoftConnected && canManageTools" class="provider-services">
               <div v-for="svc in microsoftServices" :key="svc.id" class="service-row">
                 <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
@@ -260,7 +270,7 @@ async function confirmDisconnect() {
         </section>
 
         <!-- ── Local tools ── -->
-        <section class="tools-section">
+        <section v-if="canManageTools" class="tools-section">
           <div class="section-head">
             <h2 class="section-title">{{ t('toolsPage.local.title') }}</h2>
             <p class="section-sub">{{ t('toolsPage.local.subtitle') }}</p>

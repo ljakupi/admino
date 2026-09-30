@@ -1,0 +1,397 @@
+/**
+ * Settings API client tests (issue #159: settings split into platform,
+ * organization and user scopes).
+ *
+ * The old single `/api/settings` endpoint is gone, so `@/api/settings` no
+ * longer exports `getSettings` / `patchSettings`. It wraps:
+ * - `getMySettings()` -> `GET /api/me/settings` (the caller's own theme and
+ *   notifications, every role),
+ * - `patchMySettings(patch)` -> `PATCH /api/me/settings`,
+ * - `getOrgSettings()` -> `GET /api/org/settings` (Org Admin only; anyone else
+ *   gets a 403),
+ * - `patchOrgSettings(patch)` -> `PATCH /api/org/settings`,
+ * - `getOAuthStatus(provider)` -> `GET /api/oauth/{provider}/status`, where
+ *   the provider is only ever `google` or `microsoft`. Any other value throws
+ *   `Invalid provider` before a request is made, so a crafted value can never
+ *   reach another path.
+ * `getOAuthAuthorizeUrl` and `disconnectOAuth` are unchanged (regression
+ * guards below). Every call goes through `fetchJson`, so it sends the session
+ * cookie (`credentials: 'same-origin'`) and a PATCH body is exactly the
+ * JSON-encoded patch. No call ever targets `/api/settings`.
+ *
+ * `fetch` is stubbed; nothing touches the network.
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { ApiError } from '@/api/client';
+import * as settingsApi from '@/api/settings';
+import {
+  disconnectOAuth,
+  getMySettings,
+  getOAuthAuthorizeUrl,
+  getOAuthStatus,
+  getOrgSettings,
+  patchMySettings,
+  patchOrgSettings,
+} from '@/api/settings';
+import type {
+  OAuthConnectionStatus,
+  OrgSettingsPatch,
+  OrgSettingsResponse,
+  UserSettingsPatch,
+  UserSettingsResponse,
+} from '@/api/types';
+
+const fetchMock = vi.fn<typeof fetch>();
+
+const MY_SETTINGS: UserSettingsResponse = {
+  appearance: { theme: 'dark' },
+  notifications: { enabled: false },
+};
+
+const ORG_SETTINGS: OrgSettingsResponse = {
+  tools: {
+    gmail: false,
+    google_calendar: true,
+    google_drive: true,
+    outlook: true,
+    outlook_calendar: false,
+    onedrive: true,
+    memory: true,
+  },
+};
+
+const GOOGLE_STATUS: OAuthConnectionStatus = {
+  connected: true,
+  healthy: true,
+  email: 'alice@example.ch',
+  services: ['gmail', 'google_calendar'],
+};
+
+const MICROSOFT_STATUS: OAuthConnectionStatus = {
+  connected: false,
+  healthy: false,
+  email: null,
+  services: [],
+};
+
+function jsonResponse(status: number, body: unknown, statusText = ''): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    statusText,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+/** The URL and RequestInit of the only fetch call. */
+function sent(): { url: string; init: RequestInit } {
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [input, init] = fetchMock.mock.calls[0];
+  return { url: String(input), init: init ?? {} };
+}
+
+function methodOf(init: RequestInit): string {
+  return (init.method ?? 'GET').toUpperCase();
+}
+
+function bodyOf(init: RequestInit): unknown {
+  return typeof init.body === 'string' ? JSON.parse(init.body) : init.body;
+}
+
+/** The request of the only fetch call, in a comparable shape. */
+function sentRequest(): { method: string; url: string; body: unknown; credentials: unknown } {
+  const { url, init } = sent();
+  return { method: methodOf(init), url, body: bodyOf(init), credentials: init.credentials };
+}
+
+/**
+ * Runs `fn` and returns what it threw, whether it threw synchronously or
+ * returned a rejected promise. Fails when it succeeds.
+ */
+async function thrownBy(fn: () => unknown): Promise<unknown> {
+  try {
+    await fn();
+  } catch (e) {
+    return e;
+  }
+  throw new Error('expected the call to throw');
+}
+
+beforeEach(() => {
+  localStorage.clear();
+  fetchMock.mockReset();
+  vi.stubGlobal('fetch', fetchMock);
+});
+
+// --- The old single-scope client is gone ---------------------------------
+
+describe('settings api old /api/settings client removed', () => {
+  it.each(['getSettings', 'patchSettings'])('no longer exports %s', (name) => {
+    expect(name in settingsApi).toBe(false);
+  });
+
+  it('never sends a request to /api/settings from any settings call', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input);
+      if (url.startsWith('/api/me/settings')) return jsonResponse(200, MY_SETTINGS);
+      if (url.startsWith('/api/org/settings')) return jsonResponse(200, ORG_SETTINGS);
+      if (url.endsWith('/status')) return jsonResponse(200, MICROSOFT_STATUS);
+      if (url.endsWith('/authorize')) return jsonResponse(200, { url: 'https://accounts.example/' });
+      return jsonResponse(200, { status: 'disconnected' });
+    });
+
+    await getMySettings();
+    await patchMySettings({ notifications: { enabled: true } });
+    await getOrgSettings();
+    await patchOrgSettings({ tools: { gmail: true } });
+    await getOAuthStatus('google');
+    await getOAuthStatus('microsoft');
+    await getOAuthAuthorizeUrl('google');
+    await disconnectOAuth('microsoft');
+
+    const urls = fetchMock.mock.calls.map(([input]) => String(input));
+    expect({
+      calls: urls.length,
+      legacy: urls.filter((url) => /^\/api\/settings(?:[/?#]|$)/.test(url)),
+    }).toEqual({ calls: 8, legacy: [] });
+  });
+});
+
+// --- User scope: /api/me/settings -----------------------------------------
+
+describe('settings api getMySettings', () => {
+  it('sends GET /api/me/settings with the session cookie and no body', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    await getMySettings();
+
+    expect(sentRequest()).toEqual({
+      method: 'GET',
+      url: '/api/me/settings',
+      body: undefined,
+      credentials: 'same-origin',
+    });
+  });
+
+  it('resolves the parsed user settings body', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    expect(await getMySettings()).toEqual(MY_SETTINGS);
+  });
+
+  it('rejects a 401 with an ApiError carrying the status', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(401, { detail: 'Unauthorized' }, 'Unauthorized'));
+
+    const error = await thrownBy(() => getMySettings());
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(401);
+  });
+});
+
+describe('settings api patchMySettings', () => {
+  const patches: Array<[string, UserSettingsPatch]> = [
+    ['a theme change', { appearance: { theme: 'system' } }],
+    ['a notifications change', { notifications: { enabled: false } }],
+    ['both scopes at once', { appearance: { theme: 'dark' }, notifications: { enabled: true } }],
+  ];
+
+  it.each(patches)('sends PATCH /api/me/settings with exactly the patch as JSON (%s)', async (_label, patch) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    await patchMySettings(patch);
+
+    expect(sentRequest()).toEqual({
+      method: 'PATCH',
+      url: '/api/me/settings',
+      body: patch,
+      credentials: 'same-origin',
+    });
+  });
+
+  it('sends the JSON encoding of the patch unchanged (no extra keys)', async () => {
+    const patch: UserSettingsPatch = { notifications: { enabled: true } };
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    await patchMySettings(patch);
+
+    expect(sent().init.body).toBe(JSON.stringify(patch));
+  });
+
+  it('resolves the stored user settings the server returns', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    expect(await patchMySettings({ appearance: { theme: 'dark' } })).toEqual(MY_SETTINGS);
+  });
+
+  it('rejects a 422 with an ApiError carrying the backend message', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(422, { detail: [{ loc: ['body'], msg: 'Value error, Nothing to update', type: 'value_error' }] }),
+    );
+
+    const error = await thrownBy(() => patchMySettings({ appearance: {} }));
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect({ status: (error as ApiError).status, message: (error as ApiError).message }).toEqual({
+      status: 422,
+      message: 'Nothing to update',
+    });
+  });
+});
+
+// --- Organization scope: /api/org/settings --------------------------------
+
+describe('settings api getOrgSettings', () => {
+  it('sends GET /api/org/settings with the session cookie and no body', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    await getOrgSettings();
+
+    expect(sentRequest()).toEqual({
+      method: 'GET',
+      url: '/api/org/settings',
+      body: undefined,
+      credentials: 'same-origin',
+    });
+  });
+
+  it('resolves the parsed org tools', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    expect(await getOrgSettings()).toEqual(ORG_SETTINGS);
+  });
+
+  it('rejects the 403 a non-admin gets with an ApiError carrying the status', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, { detail: 'Forbidden' }, 'Forbidden'));
+
+    const error = await thrownBy(() => getOrgSettings());
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect({ status: (error as ApiError).status, message: (error as ApiError).message }).toEqual({
+      status: 403,
+      message: 'Forbidden',
+    });
+  });
+});
+
+describe('settings api patchOrgSettings', () => {
+  const patches: Array<[string, OrgSettingsPatch]> = [
+    ['one tool off', { tools: { gmail: false } }],
+    ['one tool on', { tools: { memory: true } }],
+    ['several tools', { tools: { outlook: false, onedrive: true, google_drive: false } }],
+  ];
+
+  it.each(patches)('sends PATCH /api/org/settings with exactly the patch as JSON (%s)', async (_label, patch) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    await patchOrgSettings(patch);
+
+    expect(sentRequest()).toEqual({
+      method: 'PATCH',
+      url: '/api/org/settings',
+      body: patch,
+      credentials: 'same-origin',
+    });
+  });
+
+  it('sends the JSON encoding of the patch unchanged (no extra keys)', async () => {
+    const patch: OrgSettingsPatch = { tools: { outlook_calendar: false } };
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    await patchOrgSettings(patch);
+
+    expect(sent().init.body).toBe(JSON.stringify(patch));
+  });
+
+  it('resolves the org tools the server returns', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    expect(await patchOrgSettings({ tools: { gmail: false } })).toEqual(ORG_SETTINGS);
+  });
+
+  it('rejects the 403 an Editor gets with an ApiError carrying the status', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, { detail: 'Forbidden' }, 'Forbidden'));
+
+    const error = await thrownBy(() => patchOrgSettings({ tools: { gmail: false } }));
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(403);
+  });
+});
+
+// --- OAuth connection status ----------------------------------------------
+
+describe('settings api getOAuthStatus', () => {
+  it.each([
+    ['google', GOOGLE_STATUS],
+    ['microsoft', MICROSOFT_STATUS],
+  ] as const)('sends GET /api/oauth/%s/status and resolves the parsed status', async (provider, status) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, status));
+
+    const result = await getOAuthStatus(provider);
+
+    expect({ request: sentRequest(), result }).toEqual({
+      request: {
+        method: 'GET',
+        url: `/api/oauth/${provider}/status`,
+        body: undefined,
+        credentials: 'same-origin',
+      },
+      result: status,
+    });
+  });
+
+  it.each(['github', '../x', '', 'Google', 'MICROSOFT', 'google/../settings', 'google?x=1', '__proto__', 'constructor'])(
+    'throws "Invalid provider" for %j without sending any request',
+    async (provider) => {
+      const error = await thrownBy(() => getOAuthStatus(provider as 'google'));
+
+      expect({
+        isError: error instanceof Error,
+        message: (error as Error).message,
+        requests: fetchMock.mock.calls.length,
+      }).toEqual({ isError: true, message: 'Invalid provider', requests: 0 });
+    },
+  );
+});
+
+// --- Unchanged OAuth calls (regression guards) ----------------------------
+
+describe('settings api unchanged oauth calls', () => {
+  it('getOAuthAuthorizeUrl sends GET /api/oauth/{provider}/authorize and resolves the url', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { url: 'https://login.example/authorize' }));
+
+    const result = await getOAuthAuthorizeUrl('microsoft');
+
+    expect({ request: sentRequest(), result }).toEqual({
+      request: {
+        method: 'GET',
+        url: '/api/oauth/microsoft/authorize',
+        body: undefined,
+        credentials: 'same-origin',
+      },
+      result: { url: 'https://login.example/authorize' },
+    });
+  });
+
+  it('disconnectOAuth sends DELETE /api/oauth/{provider}', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { status: 'disconnected' }));
+
+    await disconnectOAuth('google');
+
+    expect(sentRequest()).toEqual({
+      method: 'DELETE',
+      url: '/api/oauth/google',
+      body: undefined,
+      credentials: 'same-origin',
+    });
+  });
+
+  it('disconnectOAuth rejects an unknown provider without sending any request', async () => {
+    const error = await thrownBy(() => disconnectOAuth('github' as 'google'));
+
+    expect({ message: (error as Error).message, requests: fetchMock.mock.calls.length }).toEqual({
+      message: 'Invalid provider',
+      requests: 0,
+    });
+  });
+});

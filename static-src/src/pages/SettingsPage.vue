@@ -1,19 +1,17 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
-  Key, BrainCircuit, Palette, Bell, Info, TriangleAlert,
-  ShieldCheck, Plus, Github, LogOut,
+  Key, Palette, Bell, Info, TriangleAlert,
+  Plus, Github, LogOut,
 } from 'lucide-vue-next';
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
 import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
-import I18nT from '@/components/I18nT.vue';
-import { useSettingsStore, type LLMProvider } from '@/stores/settings';
+import { useSettingsStore } from '@/stores/settings';
 import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
-import { modelOptions, providerLabel, trustNote } from '@/services/llmProviders';
 import { useI18n, type MessageKey } from '@/i18n';
 
 const { t } = useI18n();
@@ -26,7 +24,7 @@ const chatStore = useChatStore();
 const toasts = useToastStore();
 
 const showClearConfirm = ref(false);
-const activeSection = ref(route.hash === '#danger' ? 'danger' : 'agent');
+const activeSection = ref(route.hash === '#danger' ? 'danger' : 'appearance');
 
 // --- Subnav definition ---
 const NAV: {
@@ -42,7 +40,6 @@ const NAV: {
   {
     groupKey: 'settings.nav.group.app',
     items: [
-      { id: 'agent', labelKey: 'settings.nav.agent', icon: BrainCircuit },
       { id: 'appearance', labelKey: 'settings.nav.appearance', icon: Palette },
       { id: 'notifications', labelKey: 'settings.nav.notifications', icon: Bell },
     ],
@@ -56,27 +53,10 @@ const NAV: {
   },
 ];
 
-// --- LLM / Agent section ---
-const providers: { value: LLMProvider; label: string; badge?: string }[] = [
-  { value: 'infomaniak', label: providerLabel('infomaniak') },
-  { value: 'vllm', label: providerLabel('vllm') },
-  { value: 'claude', label: providerLabel('anthropic') },
-  { value: 'openai', label: providerLabel('openai') },
-];
-
-const draftAnthropicModel = ref('');
-const draftOpenAiModel = ref('');
-
-// Keys, not text, so a shown error follows a locale switch.
-const anthropicModelError = ref<MessageKey | undefined>(undefined);
-const openAiModelError = ref<MessageKey | undefined>(undefined);
-
 // --- Session section ---
 const draftSessionId = ref('');
 
 function syncDrafts() {
-  draftAnthropicModel.value = settings.llmAnthropicModel;
-  draftOpenAiModel.value = settings.llmOpenAiModel;
   draftSessionId.value = settings.sessionId;
 }
 
@@ -84,33 +64,6 @@ onMounted(async () => {
   await settings.loadSettings();
   syncDrafts();
 });
-
-async function onProviderChange(p: LLMProvider) {
-  await settings.setProvider(p);
-}
-
-function validateModel(value: string): MessageKey | undefined {
-  if (!value.trim()) return 'settings.agent.model.emptyError';
-  return undefined;
-}
-
-async function onAnthropicModelBlur() {
-  const err = validateModel(draftAnthropicModel.value);
-  anthropicModelError.value = err;
-  if (err) return;
-  if (draftAnthropicModel.value !== settings.llmAnthropicModel) {
-    await settings.setAnthropicModel(draftAnthropicModel.value.trim());
-  }
-}
-
-async function onOpenAiModelBlur() {
-  const err = validateModel(draftOpenAiModel.value);
-  openAiModelError.value = err;
-  if (err) return;
-  if (draftOpenAiModel.value !== settings.llmOpenAiModel) {
-    await settings.setOpenAiModel(draftOpenAiModel.value.trim());
-  }
-}
 
 // --- Notifications ---
 async function onNotificationsChange(value: boolean) {
@@ -137,6 +90,7 @@ async function handleLogout() {
 }
 
 async function handleDisconnectAll() {
+  await settings.loadConnections();
   if (settings.connectedAccounts.google.connected) {
     await settings.disconnectGoogle();
   }
@@ -156,44 +110,6 @@ function handleEraseAll() {
 function handleComingSoonToggle() {
   toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.toggle'));
 }
-
-const currentProvider = computed(() => settings.llmProvider);
-const anthropicConfigured = computed(() => settings.anthropicKeyConfigured);
-const openAiConfigured = computed(() => settings.openAiKeyConfigured);
-
-// The env var whose absence the API-key/token status row for the active
-// provider points at.
-const apiKeyEnvVar = computed(() => {
-  if (currentProvider.value === 'anthropic') return 'ANTHROPIC_API_KEY';
-  if (currentProvider.value === 'openai') return 'OPENAI_API_KEY';
-  return 'INFOMANIAK_API_TOKEN';
-});
-
-// vLLM / Infomaniak: the dropdown options are the union of live served/listed
-// models + the configured model (so it stays visible even when the server is
-// unreachable and the list is []).
-const vllmModelOptions = computed<string[]>(() =>
-  modelOptions(settings.vllmAvailableModels, settings.llmVllmModel),
-);
-
-const infomaniakModelOptions = computed<string[]>(() =>
-  modelOptions(settings.infomaniakAvailableModels, settings.llmInfomaniakModel),
-);
-
-async function onVllmModelChange(event: Event) {
-  const value = (event.target as HTMLSelectElement).value;
-  if (!value) return;
-  if (value === settings.llmVllmModel) return;
-  await settings.setVllmModel(value);
-}
-
-async function onInfomaniakModelChange(event: Event) {
-  const value = (event.target as HTMLSelectElement).value;
-  if (!value) return;
-  if (value === settings.llmInfomaniakModel) return;
-  await settings.setInfomaniakModel(value);
-}
-
 </script>
 
 <template>
@@ -267,159 +183,6 @@ async function onInfomaniakModelChange(event: Event) {
                 <LogOut :size="14" :stroke-width="2" />
                 {{ t('settings.session.logout.label') }}
               </button>
-            </div>
-          </div>
-        </template>
-
-        <!-- ── AGENT ── -->
-        <template v-if="activeSection === 'agent'">
-          <div class="section-head">
-            <h2 class="section-title">{{ t('settings.nav.agent') }}</h2>
-            <p class="section-sub">{{ t('settings.agent.subtitle') }}</p>
-          </div>
-          <div class="s-card">
-            <!-- Provider segmented control -->
-            <div class="s-row">
-              <div class="row-label">
-                {{ t('settings.agent.provider.label') }}
-                <span class="row-hint">{{ t('settings.agent.provider.hint') }}</span>
-              </div>
-              <div class="seg">
-                <button
-                  v-for="p in providers"
-                  :key="p.value"
-                  class="seg-btn"
-                  :class="{ active: settings.provider === p.value }"
-                  @click="onProviderChange(p.value)"
-                >
-                  {{ p.label }}<span v-if="p.badge" class="soon-badge">{{ p.badge }}</span>
-                </button>
-              </div>
-            </div>
-
-            <!-- Model field -->
-            <div class="s-row stack">
-              <div class="row-label">{{ t('settings.agent.model.label') }}</div>
-              <template v-if="currentProvider === 'infomaniak'">
-                <select
-                  class="s-input"
-                  :value="settings.llmInfomaniakModel"
-                  @change="onInfomaniakModelChange"
-                >
-                  <option
-                    v-for="model in infomaniakModelOptions"
-                    :key="model"
-                    :value="model"
-                  >{{ model }}</option>
-                </select>
-                <I18nT
-                  v-if="settings.infomaniakAvailableModels.length === 0"
-                  class="row-hint"
-                  keypath="settings.agent.infomaniak.noModels"
-                >
-                  <template #env><code class="inline-code">INFOMANIAK_API_TOKEN</code></template>
-                </I18nT>
-                <span class="row-hint model-hint">
-                  {{ t('settings.agent.infomaniak.privacy') }}
-                </span>
-              </template>
-              <template v-else-if="currentProvider === 'anthropic'">
-                <input
-                  v-model="draftAnthropicModel"
-                  class="s-input mono"
-                  type="text"
-                  :placeholder="t('settings.agent.model.placeholder', { example: 'claude-sonnet-4-6' })"
-                  @blur="onAnthropicModelBlur"
-                />
-                <span v-if="anthropicModelError" class="input-error">{{ t(anthropicModelError) }}</span>
-                <I18nT class="row-hint model-hint" keypath="settings.agent.model.exactIdHint">
-                  <template #example><code class="inline-code">claude-sonnet-4-6</code></template>
-                  <template #link>
-                    <a
-                      href="https://docs.claude.com/en/docs/about-claude/models/overview"
-                      class="hint-link"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >{{ t('settings.agent.anthropic.modelList') }}</a>
-                  </template>
-                </I18nT>
-              </template>
-              <template v-else-if="currentProvider === 'openai'">
-                <input
-                  v-model="draftOpenAiModel"
-                  class="s-input mono"
-                  type="text"
-                  :placeholder="t('settings.agent.model.placeholder', { example: 'gpt-4o' })"
-                  @blur="onOpenAiModelBlur"
-                />
-                <span v-if="openAiModelError" class="input-error">{{ t(openAiModelError) }}</span>
-                <I18nT class="row-hint model-hint" keypath="settings.agent.model.exactIdHint">
-                  <template #example><code class="inline-code">gpt-4o</code></template>
-                  <template #link>
-                    <a
-                      href="https://platform.openai.com/docs/models"
-                      class="hint-link"
-                      target="_blank"
-                      rel="noopener noreferrer"
-                    >{{ t('settings.agent.openai.modelList') }}</a>
-                  </template>
-                </I18nT>
-              </template>
-              <template v-else-if="currentProvider === 'vllm'">
-                <select
-                  class="s-input"
-                  :value="settings.llmVllmModel"
-                  @change="onVllmModelChange"
-                >
-                  <option
-                    v-for="model in vllmModelOptions"
-                    :key="model"
-                    :value="model"
-                  >{{ model }}</option>
-                </select>
-                <I18nT
-                  v-if="settings.vllmAvailableModels.length === 0"
-                  class="row-hint"
-                  keypath="settings.agent.vllm.noModels"
-                >
-                  <template #cmd><code class="inline-code">make start-local</code></template>
-                </I18nT>
-                <span class="row-hint model-hint">
-                  {{ t('settings.agent.vllm.modelHint') }}
-                </span>
-              </template>
-            </div>
-
-            <!-- Infomaniak: API token indicator -->
-            <div v-if="currentProvider === 'infomaniak'" class="s-row">
-              <div class="row-label">
-                {{ t('settings.agent.apiToken.label') }}
-                <I18nT class="row-hint" keypath="settings.agent.secretHint">
-                  <template #env><code class="inline-code">{{ apiKeyEnvVar }}</code></template>
-                </I18nT>
-              </div>
-              <span
-                class="api-key-status"
-                :class="settings.infomaniakTokenConfigured ? 'status-ok' : 'status-missing'"
-              >
-                {{ settings.infomaniakTokenConfigured ? t('settings.agent.secret.configured') : t('settings.agent.secret.notConfigured') }}
-              </span>
-            </div>
-
-            <!-- Claude / OpenAI: API key indicator -->
-            <div v-if="currentProvider === 'anthropic' || currentProvider === 'openai'" class="s-row">
-              <div class="row-label">
-                {{ t('settings.agent.apiKey.label') }}
-                <I18nT class="row-hint" keypath="settings.agent.secretHint">
-                  <template #env><code class="inline-code">{{ apiKeyEnvVar }}</code></template>
-                </I18nT>
-              </div>
-              <span
-                class="api-key-status"
-                :class="(currentProvider === 'anthropic' ? anthropicConfigured : openAiConfigured) ? 'status-ok' : 'status-missing'"
-              >
-                {{ (currentProvider === 'anthropic' ? anthropicConfigured : openAiConfigured) ? t('settings.agent.secret.configured') : t('settings.agent.secret.notConfigured') }}
-              </span>
             </div>
           </div>
         </template>
@@ -502,13 +265,6 @@ async function onInfomaniakModelChange(event: Event) {
             <div class="s-row">
               <div class="row-label">{{ t('settings.about.license') }}</div>
               <span class="muted-value">Apache-2.0</span>
-            </div>
-          </div>
-          <div class="trust-badge">
-            <ShieldCheck :size="20" :stroke-width="1.75" class="trust-icon" />
-            <div>
-              <div class="trust-title">{{ t('settings.about.trustTitle') }}</div>
-              <div class="trust-body">{{ trustNote(settings.llmProvider) }}</div>
             </div>
           </div>
         </template>
@@ -800,34 +556,6 @@ async function onInfomaniakModelChange(event: Event) {
   max-width: 100%;
 }
 
-.input-error {
-  font-size: 12px;
-  color: var(--color-error);
-}
-
-.model-hint {
-  line-height: var(--lh-relaxed);
-}
-
-.hint-link {
-  color: var(--color-primary-mid);
-  font-weight: var(--fw-medium);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-}
-
-.hint-link:hover {
-  color: var(--color-primary);
-}
-
-.inline-code {
-  font-family: var(--font-mono);
-  background: #F5F7F5;
-  padding: 1px 5px;
-  border-radius: 4px;
-  font-size: 0.9em;
-}
-
 /* ── Buttons ── */
 .s-btn {
   display: inline-flex;
@@ -947,20 +675,6 @@ async function onInfomaniakModelChange(event: Event) {
   vertical-align: middle;
 }
 
-/* ── API key status ── */
-.api-key-status {
-  font-size: var(--fs-caption);
-  font-weight: var(--fw-medium);
-}
-
-.status-ok {
-  color: #1F5C2F;
-}
-
-.status-missing {
-  color: var(--color-text-muted);
-}
-
 /* ── About section ── */
 .mono-value {
   font-family: var(--font-mono);
@@ -984,35 +698,6 @@ async function onInfomaniakModelChange(event: Event) {
 
 .source-link:hover {
   text-decoration: underline;
-}
-
-/* ── Trust badge ── */
-.trust-badge {
-  padding: 14px 18px;
-  background: #DCF8C6;
-  border: 1px solid #BFE6A3;
-  border-radius: 10px;
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
-  color: #1F5C2F;
-  font-size: 13px;
-}
-
-.trust-icon {
-  color: var(--color-accent);
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-
-.trust-title {
-  font-weight: var(--fw-semibold);
-  margin-bottom: 2px;
-}
-
-.trust-body {
-  color: #1F5C2F;
-  line-height: var(--lh-relaxed);
 }
 
 /* ── Danger zone ── */

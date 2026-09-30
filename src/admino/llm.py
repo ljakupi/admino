@@ -104,7 +104,7 @@ def not_configured_error(label: str, env_var: str) -> LLMError:
 def missing_model_error(label: str) -> LLMError:
     """Return the user-facing error for a provider without a model."""
     return LLMError(
-        message=f"No {label} model is set; choose one in Settings → Agent.",
+        message=f"No {label} model is set; ask your administrator to choose one.",
         user_facing=True,
     )
 
@@ -141,7 +141,7 @@ def provider_status_error(
         return LLMError(
             message=(
                 f"{label} doesn't offer the configured model; "
-                "choose another one in Settings → Agent."
+                "ask your administrator to choose another one."
             ),
             status_code=status_code,
             user_facing=True,
