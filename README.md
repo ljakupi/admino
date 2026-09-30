@@ -62,7 +62,7 @@ your say-so.
 - **Docker** + Docker Compose — runs PostgreSQL (and the whole backend, optionally)
 - **An Infomaniak AI Services API token** for the default model — create it in the Infomaniak Manager with the `ai-tools` scope and set `INFOMANIAK_API_TOKEN` in `.env`. See [Configuration → Infomaniak](docs/configuration.md#infomaniak-ai-services-default).
 - *Optional, local inference:* `make start-local` adds the vLLM CPU container (downloads the model, ~8 GB, on first run). See [Configuration → Local vLLM](docs/configuration.md#local-vllm-cpu-container). Docker Desktop needs ~12–16 GB RAM allocated.
-- *Optional, other cloud providers:* an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Set it in `.env` and switch the provider in Settings → Agent.
+- *Optional, other cloud providers:* an [Anthropic](https://console.anthropic.com/) or [OpenAI](https://platform.openai.com/api-keys) API key. Set it in `.env` and switch the provider (see [Configuration → LLM providers](docs/configuration.md#llm-providers)).
 - *Optional:* Google / Microsoft OAuth apps to enable the mail, calendar, and drive tools — see [Getting Started → Connect your accounts](docs/getting-started.md#connect-your-accounts).
 
 ### Run locally (with uv)
@@ -89,8 +89,9 @@ make run
 Open **http://localhost:8000** and log in (see
 [Create the first Super Admin](docs/getting-started.md#5-create-the-first-super-admin)). With
 `INFOMANIAK_API_TOKEN` set you're ready to chat on Qwen3.5 (Infomaniak). Without it,
-admino still boots and the chat tells you which variable to set. **Settings → Agent**
-switches to local **vLLM**, **Claude** or **OpenAI**.
+admino still boots and the chat tells you which variable to set. To use local **vLLM**,
+**Claude** or **OpenAI**, switch the provider (see
+[Configuration → LLM providers](docs/configuration.md#llm-providers)).
 
 ### Local vLLM serving — CPU container (opt-in, cross-platform)
 
@@ -103,7 +104,7 @@ make start-local # downloads the model on first run (~8 GB), then brings up post
 make vllm-down   # stop just the vllm container when done
 ```
 
-Then pick **vLLM** in Settings → Agent.
+Then set `llm.provider: "vllm"` in `config/config.yaml` (or `LLM_PROVIDER=vllm`) and restart.
 
 The agent reaches the vllm container at `http://vllm:8000/v1` over the shared internal
 Docker bridge. Until the container is ready, admino boots and replies with a friendly

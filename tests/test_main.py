@@ -26,6 +26,11 @@ covering:
   so its own X-Forwarded-* handling (which trusts 127.0.0.1 or the
   FORWARDED_ALLOW_IPS env var) never runs; the app's ``server.trusted_proxies``
   is the only source of truth.
+- GH-159: ``_async_startup`` runs against tests/db_fakes.FakeDb: it seeds the
+  ``platform_settings`` row from config.yaml (the llm re-applied on every
+  boot, the limits kept), returns the config overlaid with the stored llm and
+  limits, and computes the tools gate as the AND over every ``org_settings``
+  row. main.py no longer uses the dropped settings table's helpers.
 - GH-158: main() calls ``_configure_logging(config.log_level, config.log_format)``
   and runs uvicorn with ``log_config=None`` (and ``access_log=False``), so
   uvicorn's own loggers install no handlers of their own and go through the
@@ -45,10 +50,11 @@ import ast
 import inspect
 import logging
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
@@ -56,9 +62,10 @@ import uvicorn
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import admino.main as main_module
-from admino.config import LLMConfig
+from admino.config import AppConfig, LLMConfig
 from admino.llm import LLMError
 from admino.main import _async_startup, _configure_logging, _import_tool_modules, main
+from tests.db_fakes import TOOL_NAMES, FakeDb
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -969,12 +976,120 @@ class TestMainDatabaseStartupFailures:
 
 
 # ---------------------------------------------------------------------------
-# _async_startup direct tests
+# _async_startup direct tests (GH-159: the platform row and the org tools gate)
 # ---------------------------------------------------------------------------
+
+_ALL_TOOLS_ON: dict[str, bool] = dict.fromkeys(TOOL_NAMES, True)
+_STORED_LIMITS: dict[str, int] = {
+    "max_tool_calls_per_message": 7,
+    "max_pending_confirmations": 4,
+    "confirmation_timeout_s": 120,
+    "max_message_length": 5000,
+    "max_context_messages": 30,
+}
+_REMOVED_STARTUP_HELPERS = (
+    "seed_settings",
+    "update_setting",
+    "load_settings_from_db",
+    "load_app_config_from_db",
+)
+
+
+def _startup_config(**limits: int) -> AppConfig:
+    """A real config.yaml-shaped AppConfig (Anthropic, pool sizes 3 and 10)."""
+    return AppConfig.model_validate(
+        {
+            "server": {
+                "host": "127.0.0.1",
+                "port": 8123,
+                "public_url": "https://admino.example.ch",
+            },
+            "llm": {
+                "provider": "anthropic",
+                "anthropic_model": "claude-sonnet-4-6",
+                "openai_model": "gpt-4o",
+                "timeout_s": 77,
+            },
+            "limits": limits,
+            "database": {"min_pool_size": 3, "max_pool_size": 10},
+            "log_level": "WARNING",
+        }
+    )
+
+
+@dataclass
+class _Startup:
+    """The fake database _async_startup runs on, and its patched steps.
+
+    ``events`` records (step, number of statements run so far) for the patched steps.
+    """
+
+    db: FakeDb
+    events: list[tuple[str, int]]
+    init_pool: AsyncMock
+    seed_permissions: AsyncMock
+    load_permissions: AsyncMock
+    close_pool: AsyncMock
+    permissions: MagicMock
+
+
+def _patch_startup_db(monkeypatch: pytest.MonkeyPatch) -> _Startup:
+    """Run _async_startup against tests/db_fakes.FakeDb (GH-159).
+
+    Migrations, the permission seed and load, the health check and the pool's
+    close are patched; the settings code (admino.scoped_settings) runs for real
+    against the fake's platform_settings and org_settings tables, and any
+    statement on the dropped ``settings`` table fails like PostgreSQL.
+    """
+    monkeypatch.setenv("PG_PASSWORD", "testpass")
+    db = FakeDb()
+    events: list[tuple[str, int]] = []
+
+    def step(name: str) -> Any:
+        def _record(*_args: Any, **_kwargs: Any) -> Any:
+            events.append((name, len(db.calls)))
+            return DEFAULT
+
+        return _record
+
+    permissions = MagicMock(name="db-permissions")
+    init_pool = AsyncMock(return_value=db.pool, side_effect=step("init_pool"))
+    seed_permissions = AsyncMock(side_effect=step("seed_permissions"))
+    load_permissions = AsyncMock(return_value=permissions, side_effect=step("load_permissions"))
+    close_pool = AsyncMock(side_effect=step("close_pool"))
+    monkeypatch.setattr("admino.database.init_pool", init_pool)
+    monkeypatch.setattr("admino.database.get_pool", lambda: db.pool)
+    monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        "admino.database.run_migrations", AsyncMock(side_effect=step("run_migrations"))
+    )
+    monkeypatch.setattr("admino.database.seed_permissions", seed_permissions)
+    monkeypatch.setattr("admino.database.close_pool", close_pool)
+    monkeypatch.setattr("admino.config.load_permissions_config_from_db", load_permissions)
+    return _Startup(
+        db=db,
+        events=events,
+        init_pool=init_pool,
+        seed_permissions=seed_permissions,
+        load_permissions=load_permissions,
+        close_pool=close_pool,
+        permissions=permissions,
+    )
+
+
+def _platform_llm(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "provider": row["llm_provider"],
+        **{
+            column: row[column]
+            for column in ("infomaniak_model", "vllm_model", "anthropic_model", "openai_model")
+        },
+    }
 
 
 class TestAsyncStartup:
-    """Tests for _async_startup() coroutine directly."""
+    """_async_startup: migrations, the platform row seeded from config.yaml and overlaid
+    onto the config, permissions, and the interim tools gate over org_settings (GH-159)."""
 
     @pytest.mark.asyncio
     async def test_raises_when_pg_password_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -996,170 +1111,164 @@ class TestAsyncStartup:
             await _async_startup(MagicMock(), MagicMock())
 
     @pytest.mark.asyncio
-    async def test_happy_path_returns_db_config_and_permissions(
+    async def test_async_startup_first_boot_seeds_the_platform_row_from_the_config(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """_async_startup returns (config, permissions, tools_enabled) from DB.
-
-        GH-80: startup now returns a 3-tuple whose first two elements are the
-        DB-loaded config and permissions.
-        """
-        monkeypatch.setenv("PG_PASSWORD", "testpass")
-        mock_pool = AsyncMock()
-        mock_db_config = MagicMock()
-        mock_db_perms = MagicMock()
-
-        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
-        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
-        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
-        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
-        monkeypatch.setattr(
-            "admino.config.load_app_config_from_db", AsyncMock(return_value=mock_db_config)
-        )
-        monkeypatch.setattr(
-            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=mock_db_perms)
-        )
-
-        result = await _async_startup(MagicMock(), MagicMock())
-        assert result[0] is mock_db_config
-        assert result[1] is mock_db_perms
-
-    @pytest.mark.asyncio
-    async def test_returns_tools_enabled_from_persisted_settings(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The 3rd element reflects persisted 'off' state, defaulting others True.
-
-        GH-80: a service toggled off in the DB must come back disabled on the
-        next boot. The persisted ``tools`` section is validated through
-        ``ToolsSettings`` so the returned dict is a full enabled-state map.
-        """
-        monkeypatch.setenv("PG_PASSWORD", "testpass")
-        mock_pool = AsyncMock()
-
-        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
-        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
-        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
-        monkeypatch.setattr(
-            "admino.database.load_settings_from_db",
-            AsyncMock(return_value={"tools": {"gmail": False}}),
-        )
-        monkeypatch.setattr(
-            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-        monkeypatch.setattr(
-            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-
-        from admino.models import ToolsSettings
-
-        result = await _async_startup(MagicMock(), MagicMock())
-        tools_enabled = result[2]
-        assert tools_enabled == ToolsSettings(gmail=False).model_dump()
-        assert tools_enabled["gmail"] is False
-        assert tools_enabled["memory"] is True
-
-    @pytest.mark.asyncio
-    async def test_tools_enabled_all_true_when_no_tools_section(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """When the DB has no 'tools' key, tools_enabled is the all-True default.
-
-        GH-80: absence of persisted state must mean every service is enabled
-        (ToolsSettings defaults), never accidentally disabled.
-        """
-        monkeypatch.setenv("PG_PASSWORD", "testpass")
-        mock_pool = AsyncMock()
-
-        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
-        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
-        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
-        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
-        monkeypatch.setattr(
-            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-        monkeypatch.setattr(
-            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-
-        from admino.models import ToolsSettings
-
-        result = await _async_startup(MagicMock(), MagicMock())
-        tools_enabled = result[2]
-        assert tools_enabled == ToolsSettings().model_dump()
-        assert all(tools_enabled.values())
-
-    @pytest.mark.asyncio
-    async def test_reapplies_llm_section_from_config_on_boot(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """config.yaml is authoritative: the llm settings row is overwritten from
-        config on every boot, so editing config.yaml always takes effect."""
-        monkeypatch.setenv("PG_PASSWORD", "testpass")
-        mock_pool = AsyncMock()
-        mock_update = AsyncMock()
-
-        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
-        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
-        monkeypatch.setattr("admino.database.update_setting", mock_update)
-        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
-        monkeypatch.setattr(
-            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-        monkeypatch.setattr(
-            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-
-        config = MagicMock()
-        llm_dump = {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"}
-        config.llm.model_dump.return_value = llm_dump
+        """An empty platform_settings table gets config.yaml's llm and limits."""
+        startup = _patch_startup_db(monkeypatch)
+        config = _startup_config(max_message_length=6000)
 
         await _async_startup(config, MagicMock())
 
-        mock_update.assert_awaited_once_with(mock_pool, "llm", llm_dump)
+        row = startup.db.platform_row()
+        assert row is not None
+        assert _platform_llm(row) == {
+            "provider": "anthropic",
+            "infomaniak_model": config.llm.infomaniak_model,
+            "vllm_model": config.llm.vllm_model,
+            "anthropic_model": "claude-sonnet-4-6",
+            "openai_model": "gpt-4o",
+        }
+        assert {key: row[key] for key in _STORED_LIMITS} == config.limits.model_dump()
+
+    @pytest.mark.asyncio
+    async def test_async_startup_later_boot_reapplies_the_llm_and_keeps_the_limits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """config.yaml's llm is re-applied on every boot; the stored limits are kept."""
+        startup = _patch_startup_db(monkeypatch)
+        startup.db.add_platform_settings(
+            llm_provider="openai", openai_model="gpt-4.1", **_STORED_LIMITS
+        )
+
+        await _async_startup(_startup_config(), MagicMock())
+
+        row = startup.db.platform_row()
+        assert row is not None
+        assert (row["llm_provider"], row["openai_model"]) == ("anthropic", "gpt-4o")
+        assert {key: row[key] for key in _STORED_LIMITS} == _STORED_LIMITS
+
+    @pytest.mark.asyncio
+    async def test_async_startup_returns_the_config_overlaid_with_the_platform_row(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The returned config: the stored llm and limits; every other section (server,
+        egress, database, log level, the llm timeout) from config.yaml."""
+        startup = _patch_startup_db(monkeypatch)
+        startup.db.add_platform_settings(**_STORED_LIMITS)
+        config = _startup_config()
+
+        result = await _async_startup(config, MagicMock())
+
+        runtime = result[0]
+        assert type(runtime) is AppConfig
+        assert (runtime.llm.provider, runtime.llm.anthropic_model) == (
+            "anthropic",
+            "claude-sonnet-4-6",
+        )
+        assert runtime.limits.model_dump() == _STORED_LIMITS
+        assert runtime.server == config.server
+        assert runtime.egress == config.egress
+        assert runtime.database == config.database
+        assert (runtime.log_level, runtime.llm.timeout_s) == ("WARNING", 77)
+
+    @pytest.mark.asyncio
+    async def test_async_startup_returns_the_loaded_permissions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permissions are seeded on the startup pool, then loaded from it."""
+        startup = _patch_startup_db(monkeypatch)
+        permissions_config = MagicMock(name="default-permissions")
+
+        result = await _async_startup(_startup_config(), permissions_config)
+
+        assert len(result) == 3
+        assert result[1] is startup.permissions
+        startup.seed_permissions.assert_awaited_once_with(startup.db.pool, permissions_config)
+        startup.load_permissions.assert_awaited_once_with(startup.db.pool)
+
+    @pytest.mark.asyncio
+    async def test_async_startup_tools_gate_is_the_and_over_every_org(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-80 + GH-159: a service one org turned off stays off after a restart, even
+        when another org has it on."""
+        startup = _patch_startup_db(monkeypatch)
+        first = startup.db.add_org()
+        second = startup.db.add_org()
+        startup.db.add_org_settings(first, gmail=False)
+        startup.db.add_org_settings(second, gmail=True, memory=False)
+
+        result = await _async_startup(_startup_config(), MagicMock())
+
+        assert dict(result[2]) == {**_ALL_TOOLS_ON, "gmail": False, "memory": False}
+
+    @pytest.mark.asyncio
+    async def test_async_startup_tools_gate_all_on_without_org_rows(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No org_settings row: every service is on (never accidentally disabled)."""
+        _patch_startup_db(monkeypatch)
+
+        result = await _async_startup(_startup_config(), MagicMock())
+
+        assert dict(result[2]) == _ALL_TOOLS_ON
+        assert all(type(value) is bool for value in result[2].values())
+
+    @pytest.mark.asyncio
+    async def test_async_startup_order_migrate_seed_read_then_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Migrations run before any statement, the platform row is seeded before it is
+        read, and the startup pool is closed after the last statement."""
+        startup = _patch_startup_db(monkeypatch)
+
+        await _async_startup(_startup_config(), MagicMock())
+
+        calls = startup.db.calls
+        steps = dict(startup.events)
+        assert steps["run_migrations"] == 0
+        seeds = [
+            i
+            for i, c in enumerate(calls)
+            if c.normalized.startswith("insert into platform_settings")
+        ]
+        reads = [
+            i
+            for i, c in enumerate(calls)
+            if c.normalized.startswith("select") and "from platform_settings" in c.normalized
+        ]
+        gates = [i for i, c in enumerate(calls) if "from org_settings" in c.normalized]
+        assert seeds and reads and gates
+        assert seeds[0] < reads[0]
+        assert steps["close_pool"] == len(calls)
 
     @pytest.mark.asyncio
     async def test_calls_init_pool_with_config_values(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """_async_startup passes pool size from config to init_pool."""
-        monkeypatch.setenv("PG_PASSWORD", "testpass")
-        mock_init = AsyncMock(return_value=AsyncMock())
-        monkeypatch.setattr("admino.database.init_pool", mock_init)
-        monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-        monkeypatch.setattr("admino.database.run_migrations", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_settings", AsyncMock())
-        monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
-        monkeypatch.setattr("admino.database.update_setting", AsyncMock())
-        monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
-        monkeypatch.setattr(
-            "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-        monkeypatch.setattr(
-            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
-        )
+        startup = _patch_startup_db(monkeypatch)
 
-        config = MagicMock()
-        config.database.min_pool_size = 3
-        config.database.max_pool_size = 10
-        await _async_startup(config, MagicMock())
+        await _async_startup(_startup_config(), MagicMock())
 
-        mock_init.assert_called_once()
-        call_args = mock_init.call_args
+        startup.init_pool.assert_called_once()
+        call_args = startup.init_pool.call_args
         assert call_args[0][0].startswith("postgresql://")
         assert call_args[1] == {"min_size": 3, "max_size": 10}
+
+    @pytest.mark.parametrize("name", _REMOVED_STARTUP_HELPERS)
+    def test_main_module_no_longer_uses_the_settings_table_helpers(self, name: str) -> None:
+        """GH-159: the key/value settings table is gone, and so are its helpers."""
+        tree = ast.parse(_MAIN_MODULE_PATH.read_text(encoding="utf-8"))
+        used = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+
+        assert name not in used
 
 
 # ---------------------------------------------------------------------------
@@ -1378,45 +1487,6 @@ class TestMainInfomaniakWiring:
 # ---------------------------------------------------------------------------
 
 
-def _patch_startup_db(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> AsyncMock:
-    """Patch every DB step of _async_startup except accounts; record the order of some."""
-    monkeypatch.setenv("PG_PASSWORD", "testpass")
-    pool = AsyncMock()
-
-    async def track_migrations(p: Any) -> None:
-        assert p is pool
-        calls.append("migrations")
-
-    async def track_seed_settings(p: Any, _config: Any) -> None:
-        calls.append("seed_settings")
-
-    monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=pool))
-    monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-    monkeypatch.setattr("admino.database.run_migrations", track_migrations)
-    monkeypatch.setattr("admino.database.seed_settings", track_seed_settings)
-    monkeypatch.setattr("admino.database.seed_permissions", AsyncMock())
-    monkeypatch.setattr("admino.database.update_setting", AsyncMock())
-    monkeypatch.setattr("admino.database.load_settings_from_db", AsyncMock(return_value={}))
-    monkeypatch.setattr("admino.database.close_pool", AsyncMock())
-    monkeypatch.setattr(
-        "admino.config.load_app_config_from_db", AsyncMock(return_value=MagicMock())
-    )
-    monkeypatch.setattr(
-        "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
-    )
-    return pool
-
-
-def _sql_statements(pool: AsyncMock) -> list[str]:
-    """Every SQL string the startup pool (or a connection from it) was given."""
-    statements: list[str] = []
-    for mock in (pool, pool.acquire.return_value.__aenter__.return_value):
-        for name in ("execute", "executemany", "fetch", "fetchrow", "fetchval"):
-            method = getattr(mock, name)
-            statements.extend(str(call.args[0]) for call in method.call_args_list if call.args)
-    return statements
-
-
 class TestAsyncStartupCreatesNoOrganization:
     """GH-149: the default-org bridge is gone; a fresh install has 0 organizations."""
 
@@ -1425,11 +1495,11 @@ class TestAsyncStartupCreatesNoOrganization:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """accounts.ensure_default_org is not called during startup."""
-        _patch_startup_db(monkeypatch, [])
+        _patch_startup_db(monkeypatch)
         ensure = AsyncMock()
         monkeypatch.setattr("admino.accounts.ensure_default_org", ensure, raising=False)
 
-        await _async_startup(MagicMock(), MagicMock())
+        await _async_startup(_startup_config(), MagicMock())
 
         ensure.assert_not_called()
 
@@ -1438,14 +1508,13 @@ class TestAsyncStartupCreatesNoOrganization:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """No statement issued at startup inserts into organizations."""
-        pool = _patch_startup_db(monkeypatch, [])
+        startup = _patch_startup_db(monkeypatch)
 
-        await _async_startup(MagicMock(), MagicMock())
+        await _async_startup(_startup_config(), MagicMock())
 
-        offenders = [
-            sql for sql in _sql_statements(pool) if "insert into organizations" in sql.lower()
-        ]
-        assert offenders == []
+        assert startup.db.calls
+        assert startup.db.matching(r"\binsert into organizations\b") == []
+        assert startup.db.orgs == {}
 
     def test_main_module_does_not_reference_the_default_org(self) -> None:
         """main.py neither imports DEFAULT_ORG_ID nor calls ensure_default_org."""
@@ -1480,9 +1549,9 @@ class TestStartupLoadsCommonPasswords:
 
         monkeypatch.setattr("admino.passwords.common_passwords", fake_common_passwords)
         mock_deps["uvicorn_run"].side_effect = lambda *_a, **_k: events.append("uvicorn")
-        _patch_startup_db(monkeypatch, [])
+        _patch_startup_db(monkeypatch)
 
-        await _async_startup(MagicMock(), MagicMock())
+        await _async_startup(_startup_config(), MagicMock())
         main()
 
         assert events.count("common_passwords") == 1
@@ -1498,11 +1567,11 @@ class TestStartupLoadsCommonPasswords:
             "admino.passwords.common_passwords",
             MagicMock(side_effect=OSError("common_passwords.txt missing")),
         )
-        _patch_startup_db(monkeypatch, [])
+        _patch_startup_db(monkeypatch)
 
         failed = False
         try:
-            await _async_startup(MagicMock(), MagicMock())
+            await _async_startup(_startup_config(), MagicMock())
         except OSError:
             failed = True
         if not failed:

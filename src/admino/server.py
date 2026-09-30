@@ -44,8 +44,13 @@ Routes:
 - POST /api/message       — Send a user message; returns ChatResponse.
 - GET  /api/events        — SSE stream for a chat session.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
-- /api/settings, /api/permissions, /api/critical-permissions, /api/oauth/* —
-  settings, permissions and account connections.
+- GET/PATCH /api/me/settings — The caller's own theme and notifications (every
+  role).
+- GET/PATCH /api/org/settings — The Org Admin's own org's tool services; audited.
+- GET/PATCH /api/platform/settings — The platform LLM (PATCH) and limits
+  (read-only until #160) (Super Admin); audited.
+- /api/permissions, /api/critical-permissions, /api/oauth/* — permissions and
+  account connections.
 - GET  /health            — Health check (public): ``{"status": "ok"}``, or 503
   ``{"status": "degraded"}`` when the database is unreachable; nothing else.
 - GET  /api/oauth/callback — The OAuth provider's redirect (public, state-checked).
@@ -106,6 +111,19 @@ Security notes:
   nothing written. Each route spends a per-user bucket before any database
   work (deactivate/reactivate share one, as do schedule/cancel), and the org
   name, the admin email, the token and the link are never logged.
+- Settings scopes (GH-159, ``admino.scoped_settings``): each route spends a
+  per-user bucket, then checks its capability before any database work or
+  provider probe: ``account.manage`` for /api/me/settings (the caller's own
+  row only), ``org.settings.manage`` for /api/org/settings (the principal's
+  own org only, never a request value), ``platform.defaults.manage`` for
+  /api/platform/settings. Org and platform changes share one transaction with
+  their audit event (a failed audit write is a 500 with nothing written); the
+  platform events name the changed fields, never a provider or model value.
+  A platform LLM switch builds the new client before anything is written
+  (400 with nothing written when it can't be built) and closes the old one
+  best-effort. The platform response carries key presence flags, never a
+  key. After an org change, and at lifespan start, the agent's tools gate is
+  the interim AND over every org (retired by #161).
 - CSRF: ``CrossOriginProtectionMiddleware`` implements Go's
   CrossOriginProtection check on every non-GET/HEAD/OPTIONS request, before
   authentication and handlers (the login included): ``Sec-Fetch-Site`` must be
@@ -195,7 +213,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
-from typing import TYPE_CHECKING, Annotated, Any, Final
+from typing import TYPE_CHECKING, Annotated, Final
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
 
@@ -219,6 +237,7 @@ from admino import (
     organizations,
     password_reset,
     passwords,
+    scoped_settings,
     session_management,
     sessions,
 )
@@ -247,6 +266,8 @@ from admino.models import (
     OrgLimitsPatch,
     OrgListResponse,
     OrgResidencyPatch,
+    OrgSettingsPatch,
+    OrgSettingsResponse,
     OrgSummary,
     PasswordResetConfirmRequest,
     PasswordResetRequest,
@@ -256,17 +277,13 @@ from admino.models import (
     PermissionPatch,
     PermissionsResponse,
     PlatformDiagnosticsResponse,
+    PlatformSettingsPatch,
+    PlatformSettingsResponse,
     SessionListResponse,
-    SettingsAppearance,
-    SettingsConnectedAccounts,
-    SettingsImmutable,
-    SettingsLimits,
     SettingsLLM,
-    SettingsNotifications,
-    SettingsPatch,
-    SettingsResponse,
     SSEEvent,
-    ToolsSettings,
+    UserSettingsPatch,
+    UserSettingsResponse,
 )
 from admino.oauth import (
     OAuthError,
@@ -297,6 +314,7 @@ if TYPE_CHECKING:
 
     from admino.agent import Agent
     from admino.config import AppConfig
+    from admino.llm import LLMClient
 
 logger = logging.getLogger(__name__)
 
@@ -576,8 +594,13 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
     "/api/events": (0.17, 3),
-    "/api/settings/get": (1.0, 5),
-    "/api/settings/patch": (0.2, 2),
+    # GH-159: the settings scopes, per user.
+    "/api/me/settings/get": (1.0, 10),
+    "/api/me/settings/patch": (0.5, 5),
+    "/api/org/settings/get": (1.0, 10),
+    "/api/org/settings/patch": (0.5, 5),
+    "/api/platform/settings/get": (1.0, 10),
+    "/api/platform/settings/patch": (0.2, 5),
     "/api/permissions/get": (1.0, 5),
     "/api/permissions/patch": (0.2, 2),
     "/api/oauth/google/authorize": (0.2, 2),
@@ -1153,7 +1176,7 @@ async def _get_vllm_available_models() -> list[str]:
 async def _get_infomaniak_available_models(provider: str) -> list[str]:
     """List the models offered by the live Infomaniak client's product.
 
-    Only runs when ``provider`` (the effective provider shown in Settings) is
+    Only runs when ``provider`` (the stored platform provider) is
     ``infomaniak`` AND the agent's live LLM client is an ``InfomaniakClient``
     (imported lazily, so no other provider loads it). Otherwise returns ``[]``.
     ``InfomaniakClient.list_models()`` never raises and returns ``[]`` on a
@@ -2563,294 +2586,241 @@ async def post_confirm(
 
 
 # ---------------------------------------------------------------------------
-# Settings helpers
+# Settings scope route handlers (GH-159): /api/me, /api/org, /api/platform
 # ---------------------------------------------------------------------------
 
 
-async def _build_settings_response() -> SettingsResponse:
-    """Load settings from DB and construct the SettingsResponse.
+def _require_capability(principal: Principal, capability: Capability) -> None:
+    """Raise 403 ``Forbidden`` unless the principal has the capability (before any work)."""
+    if not can(principal, capability):
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    Masks sensitive fields (API keys replaced by boolean flags).
-    Reads OAuth connection status from the DB for connected_accounts.
+
+async def _platform_settings_response(
+    stored: scoped_settings.StoredPlatformSettings,
+) -> PlatformSettingsResponse:
+    """Build the PlatformSettingsResponse of the stored platform row.
+
+    A model that isn't set (NULL) is shown as ``""``. The available models come
+    from the two provider probes (filtered again by ``SettingsLLM``); the key
+    flags are the presence of the env vars, never their values.
+    """
+    llm = stored.llm
+    return PlatformSettingsResponse(
+        llm=SettingsLLM(
+            provider=llm.provider,
+            anthropic_model=llm.anthropic_model or "",
+            openai_model=llm.openai_model or "",
+            infomaniak_model=llm.infomaniak_model or "",
+            infomaniak_available_models=await _get_infomaniak_available_models(llm.provider),
+            vllm_model=llm.vllm_model or "",
+            vllm_available_models=await _get_vllm_available_models(),
+            # Presence flags only — credential values never leave the server.
+            anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
+            openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
+            infomaniak_token_configured=bool(os.environ.get("INFOMANIAK_API_TOKEN")),
+        ),
+        limits=stored.limits,
+    )
+
+
+async def _close_llm_client(client: LLMClient) -> None:
+    """Close an LLM client best-effort: a failure is logged by class name and never raised."""
+    try:
+        await client.close()
+    except Exception as exc:
+        logger.warning("Failed to close an LLM client (%s).", type(exc).__name__)
+
+
+async def get_my_settings(principal: _PrincipalDep) -> UserSettingsResponse:
+    """Handle GET /api/me/settings — the caller's own theme and notifications.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
 
     Returns:
-        A fully populated SettingsResponse.
+        UserSettingsResponse: the stored values, or the defaults without a row.
 
     Raises:
-        HTTPException: 500 if DB or config is unavailable.
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ACCOUNT_MANAGE`` (both before any database work).
     """
-    from admino.database import get_pool, load_settings_from_db
+    _check_rate_limit("/api/me/settings/get", _user_caller(principal))
+    _require_capability(principal, Capability.ACCOUNT_MANAGE)
 
-    if _config is None:
+    from admino.database import get_pool
+
+    return await scoped_settings.get_user_settings(get_pool(), actor=principal)
+
+
+async def patch_my_settings(
+    principal: _PrincipalDep, body: UserSettingsPatch
+) -> UserSettingsResponse:
+    """Handle PATCH /api/me/settings — change the caller's own theme and/or notifications.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+        body: Validated UserSettingsPatch (422 without echo otherwise).
+
+    Returns:
+        UserSettingsResponse: the stored values after the change.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ACCOUNT_MANAGE`` (both before any database work).
+    """
+    _check_rate_limit("/api/me/settings/patch", _user_caller(principal))
+    _require_capability(principal, Capability.ACCOUNT_MANAGE)
+
+    from admino.database import get_pool
+
+    return await scoped_settings.update_user_settings(get_pool(), actor=principal, patch=body)
+
+
+async def get_org_settings(principal: _PrincipalDep) -> OrgSettingsResponse:
+    """Handle GET /api/org/settings — the tool services of the Org Admin's own org.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        OrgSettingsResponse: the stored switches, or every tool on without a row.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_SETTINGS_MANAGE`` (both before any database work).
+    """
+    _check_rate_limit("/api/org/settings/get", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_SETTINGS_MANAGE)
+
+    from admino.database import get_pool
+
+    return await scoped_settings.get_org_settings(get_pool(), actor=principal)
+
+
+async def patch_org_settings(
+    request: Request, principal: _PrincipalDep, body: OrgSettingsPatch
+) -> OrgSettingsResponse:
+    """Handle PATCH /api/org/settings — switch tool services of the Org Admin's own org.
+
+    Each real change is an ``org.settings_change`` audit event in the same
+    transaction (an audit failure is a 500 with nothing written). Afterwards
+    the running agent's gate is recomputed with the INTERIM AND over every
+    org (``scoped_settings.all_orgs_tools_gate``, retired by #161), so the
+    next dispatch respects the change.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        body: Validated OrgSettingsPatch (422 without echo otherwise).
+
+    Returns:
+        OrgSettingsResponse: the org's switches after the change.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_SETTINGS_MANAGE`` (both before any database work).
+    """
+    if _agent is None:
         raise HTTPException(status_code=500, detail="Server not configured")
+    _check_rate_limit("/api/org/settings/patch", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_SETTINGS_MANAGE)
+
+    from admino.database import get_pool
 
     pool = get_pool()
-    settings = await load_settings_from_db(pool)
-
-    # LLM section with masked key flags. Fall back to the live config
-    # (config.yaml-driven) rather than hardcoded literals so the displayed
-    # values reflect the authoritative source.
-    llm_data = settings.get("llm", {})
-    # The SettingsLLM provider Literal includes every provider ("infomaniak",
-    # "anthropic", "openai", "vllm"), so no coercion is needed — the stored
-    # provider always displays as the selected one.
-    provider = llm_data.get("provider") or _config.llm.provider
-    config_vllm_model = _config.llm.vllm_model
-    config_infomaniak_model = _config.llm.infomaniak_model
-    llm_section = SettingsLLM(
-        provider=provider,
-        anthropic_model=llm_data.get("anthropic_model") or _config.llm.anthropic_model or "",
-        openai_model=llm_data.get("openai_model") or _config.llm.openai_model or "",
-        infomaniak_model=llm_data.get("infomaniak_model")
-        or (config_infomaniak_model if isinstance(config_infomaniak_model, str) else "")
-        or "",
-        infomaniak_available_models=await _get_infomaniak_available_models(provider),
-        vllm_model=llm_data.get("vllm_model")
-        or (config_vllm_model if isinstance(config_vllm_model, str) else "")
-        or "",
-        vllm_available_models=await _get_vllm_available_models(),
-        # Presence flags only — credential values never leave the server.
-        anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
-        openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
-        infomaniak_token_configured=bool(os.environ.get("INFOMANIAK_API_TOKEN")),
+    result = await scoped_settings.update_org_settings(
+        pool,
+        actor=principal,
+        patch=body,
+        ip=request.client.host if request.client is not None else None,
     )
-
-    # Appearance section (default to light if missing).
-    appearance_data = settings.get("appearance", {})
-    appearance_section = SettingsAppearance(
-        theme=appearance_data.get("theme", "light"),
-    )
-
-    # Notifications section (default to enabled if missing).
-    notifications_data = settings.get("notifications", {})
-    notifications_section = SettingsNotifications(
-        enabled=notifications_data.get("enabled", True),
-    )
-
-    # Limits section.
-    limits_data = settings.get("limits", {})
-    limits_section = SettingsLimits(
-        max_tool_calls_per_message=limits_data.get("max_tool_calls_per_message", 10),
-        confirmation_timeout_s=limits_data.get("confirmation_timeout_s", 300),
-        max_message_length=limits_data.get("max_message_length", 4000),
-    )
-
-    # Server section (immutable, read-only).
-    server_data = settings.get("server", {})
-    server_section = SettingsImmutable(
-        host=server_data.get("host", _config.server.host),
-        port=server_data.get("port", _config.server.port),
-    )
-
-    # Connected accounts — report connection AND health (a dead refresh token
-    # is connected-but-unhealthy, which the UI renders as "Not connected").
-    # get_connection_status reads only the DB row, so it never blocks load.
-    # A connection-status lookup failure must never 500 the settings page —
-    # fall back to "disconnected" so the page still renders.
-    connected = SettingsConnectedAccounts()
-    try:
-        google_connected, google_healthy = await get_connection_status(get_pool(), "google")
-        microsoft_connected, microsoft_healthy = await get_connection_status(
-            get_pool(), "microsoft"
-        )
-    except (OAuthError, OSError, TypeError) as exc:
-        # A pool that is unavailable or misconfigured must not 500 the
-        # settings page — degrade to "disconnected" and log the failure.
-        logger.warning("Failed to read OAuth connection status: %s", type(exc).__name__)
-        google_connected = google_healthy = False
-        microsoft_connected = microsoft_healthy = False
-    if google_connected:
-        connected.google = OAuthConnectionStatus(
-            connected=True,
-            healthy=google_healthy,
-            services=["gmail", "google_calendar", "google_drive"],
-        )
-    if microsoft_connected:
-        connected.microsoft = OAuthConnectionStatus(
-            connected=True,
-            healthy=microsoft_healthy,
-            services=["outlook", "outlook_calendar", "onedrive"],
-        )
-
-    # Tools section — per-tool enabled/disabled state.
-    # Defensive: fall back to defaults if DB data is corrupted.
-    tools_data = settings.get("tools", {})
-    try:
-        tools_section = ToolsSettings(**tools_data)
-    except ValidationError:
-        logger.warning("Corrupt tools settings in DB — falling back to defaults")
-        tools_section = ToolsSettings()
-
-    return SettingsResponse(
-        llm=llm_section,
-        appearance=appearance_section,
-        notifications=notifications_section,
-        limits=limits_section,
-        server=server_section,
-        connected_accounts=connected,
-        tools=tools_section,
-    )
+    _agent._tools_enabled = await scoped_settings.all_orgs_tools_gate(pool)
+    return result
 
 
-# ---------------------------------------------------------------------------
-# Settings route handlers
-# ---------------------------------------------------------------------------
-
-
-async def get_settings(
-    principal: _PrincipalDep,
-) -> SettingsResponse:
-    """Handle GET /api/settings — return current settings with masked secrets.
-
-    Loads settings from the database, maps them to the response model, and
-    replaces sensitive fields (API keys) with boolean flags.
+async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsResponse:
+    """Handle GET /api/platform/settings — the platform LLM and limits (Super Admin).
 
     Args:
-        principal: The logged-in principal (from the session).
+        principal: The logged-in principal (401 without a session).
 
     Returns:
-        SettingsResponse with current settings.
-    """
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-
-    _check_rate_limit("/api/settings/get", _user_caller(principal))
-    return await _build_settings_response()
-
-
-async def patch_settings(
-    body: SettingsPatch,
-    principal: _PrincipalDep,
-) -> SettingsResponse:
-    """Handle PATCH /api/settings — partially update settings.
-
-    Validates the patch, merges with current DB values, validates the merged
-    result against the full config model, persists, and re-initialises the LLM
-    client when the provider changes, or when the active provider's model
-    (``vllm_model`` / ``infomaniak_model``) changes. A missing API key/token or
-    model never blocks the switch: chat replies explain what to set.
-
-    Args:
-        body: Validated SettingsPatch with optional sections.
-        principal: The logged-in principal (from the session).
-
-    Returns:
-        Updated SettingsResponse after applying the patch.
+        PlatformSettingsResponse: the stored LLM (with the probed model lists
+        and key presence flags) and the limits (read-only until #160).
 
     Raises:
-        HTTPException: 400 on validation errors, 500 on server errors.
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.PLATFORM_DEFAULTS_MANAGE`` (both before any database
+            work or provider probe).
     """
-    from admino.config import LLMConfig
-    from admino.database import get_pool, load_settings_from_db, update_setting
-    from admino.llm import create_llm_client
+    _check_rate_limit("/api/platform/settings/get", _user_caller(principal))
+    _require_capability(principal, Capability.PLATFORM_DEFAULTS_MANAGE)
 
+    from admino.database import get_pool
+
+    stored = await scoped_settings.load_platform_settings(get_pool())
+    return await _platform_settings_response(stored)
+
+
+async def patch_platform_settings(
+    request: Request, principal: _PrincipalDep, body: PlatformSettingsPatch
+) -> PlatformSettingsResponse:
+    """Handle PATCH /api/platform/settings — change the platform LLM (Super Admin).
+
+    The given fields are merged over the stored LLM and validated as an
+    ``LLMConfig`` (the config's other llm fields kept). A provider change, or
+    a model change of the active vllm/infomaniak provider, builds the new
+    client BEFORE anything is written; a no-op never does. The change and its
+    ``platform.settings_change`` audit event share one transaction. Only then
+    is the new client swapped in and the old one closed (best-effort). The
+    limits are read-only until #160.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        body: Validated PlatformSettingsPatch (422 without echo otherwise).
+
+    Returns:
+        PlatformSettingsResponse: the platform settings after the change.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.PLATFORM_DEFAULTS_MANAGE`` (both before any database
+            work), 400 when the merged LLM config is invalid or its client
+            can't be built (nothing written).
+    """
+    global _config
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
+    _check_rate_limit("/api/platform/settings/patch", _user_caller(principal))
+    _require_capability(principal, Capability.PLATFORM_DEFAULTS_MANAGE)
 
-    _check_rate_limit("/api/settings/patch", _user_caller(principal))
+    from admino.config import LLMConfig
+    from admino.database import get_pool
+    from admino.llm import create_llm_client
 
     pool = get_pool()
-    current_settings = await load_settings_from_db(pool)
-    llm_reinit_needed = False
-    # The LLMConfig produced by validating the merged patch, captured so the
-    # re-init block below reuses it directly instead of re-reading the DB (which,
-    # right after update_setting, is the same authoritative value).
-    new_llm_config: LLMConfig | None = None
+    current = (await scoped_settings.load_platform_settings(pool)).llm.model_dump()
+    merged = {**current, **body.llm.model_dump(exclude_none=True)}
+    try:
+        new_llm_config = LLMConfig.model_validate({**_config.llm.model_dump(mode="json"), **merged})
+    except ValidationError as exc:
+        safe_errors = [
+            {"loc": [str(loc) for loc in err["loc"]], "msg": err["msg"], "type": err["type"]}
+            for err in exc.errors(include_input=False)
+        ]
+        raise HTTPException(status_code=400, detail=safe_errors) from None
 
-    # --- LLM section ---
-    if body.llm is not None:
-        llm_current: dict[str, Any] = dict(current_settings.get("llm", {}))
-        patch_fields = body.llm.model_dump(exclude_none=True)
-
-        # Track whether the running LLM client must be rebuilt. A provider
-        # change always requires it. A changed vllm_model / infomaniak_model
-        # requires it too when the effective provider is (or becomes) that
-        # provider — the model, and therefore the client, changed. A no-op
-        # (same value) must NOT re-init.
-        if "provider" in patch_fields and patch_fields["provider"] != llm_current.get("provider"):
-            llm_reinit_needed = True
-        effective_provider = patch_fields.get("provider", llm_current.get("provider"))
-        model_field = f"{effective_provider}_model"
-        if (
-            effective_provider in ("vllm", "infomaniak")
-            and model_field in patch_fields
-            and patch_fields[model_field] != llm_current.get(model_field)
-        ):
-            llm_reinit_needed = True
-
-        # Merge non-None patch fields into current values.
-        for key, value in patch_fields.items():
-            llm_current[key] = value
-
-        # Validate merged result against the full LLMConfig model. Backfill
-        # from the live config (config.yaml) so model fields not stored in the
-        # DB are sourced from the authoritative config rather than defaults.
-        try:
-            new_llm_config = LLMConfig.model_validate(
-                {**_config.llm.model_dump(mode="json"), **llm_current}
-            )
-        except ValidationError as exc:
-            safe_errors = []
-            for err in exc.errors(include_input=False):
-                safe_errors.append(
-                    {
-                        "loc": [str(loc) for loc in err["loc"]],
-                        "msg": err["msg"],
-                        "type": err["type"],
-                    }
-                )
-            raise HTTPException(status_code=400, detail=safe_errors) from None
-
-        await update_setting(pool, "llm", llm_current)
-
-    # --- Appearance section ---
-    if body.appearance is not None:
-        appearance_current: dict[str, Any] = dict(current_settings.get("appearance", {}))
-        patch_fields = body.appearance.model_dump(exclude_none=True)
-        for key, value in patch_fields.items():
-            appearance_current[key] = value
-        await update_setting(pool, "appearance", appearance_current)
-
-    # --- Notifications section ---
-    if body.notifications is not None:
-        notifications_current: dict[str, Any] = dict(
-            current_settings.get("notifications", {}),
-        )
-        patch_fields = body.notifications.model_dump(exclude_none=True)
-        for key, value in patch_fields.items():
-            notifications_current[key] = value
-        await update_setting(pool, "notifications", notifications_current)
-
-    # --- Tools section ---
-    if body.tools is not None:
-        tools_current: dict[str, Any] = dict(current_settings.get("tools", {}))
-        patch_fields = body.tools.model_dump(exclude_none=True)
-        for key, value in patch_fields.items():
-            tools_current[key] = value
-        # Validate through ToolsSettings to strip unknown keys and ensure
-        # all values are proper booleans before persisting and hot-reloading.
-        validated_tools = ToolsSettings.model_validate(tools_current).model_dump()
-        # Audit log: record each real on/off change (skip no-ops) at WARNING so
-        # every DB-mutating service toggle from the UI is traceable, mirroring
-        # the permission-change audit trail. A tool with no stored value
-        # defaults to enabled, matching ToolsSettings defaults.
-        for key, new_value in patch_fields.items():
-            old_value = current_settings.get("tools", {}).get(key, True)
-            if old_value != new_value:
-                logger.warning(
-                    "Service toggled: tool=%s old=%s new=%s",
-                    key,
-                    old_value,
-                    new_value,
-                )
-        await update_setting(pool, "tools", validated_tools)
-        # Hot-reload: push updated tools-enabled state to the running agent
-        # so the next dispatch respects the change immediately.
-        if _agent is not None:
-            _agent._tools_enabled = validated_tools
-
-    # --- Re-initialise LLM client if the provider or the active model changed ---
-    if llm_reinit_needed and new_llm_config is not None:
+    # A provider change always needs a new client; so does a model change of
+    # the vllm or infomaniak provider when it is the active one.
+    provider = new_llm_config.provider
+    model_field = f"{provider}_model"
+    reinit = provider != current["provider"] or (
+        provider in ("vllm", "infomaniak") and merged[model_field] != current[model_field]
+    )
+    new_client: LLMClient | None = None
+    if reinit:
         try:
             new_client = create_llm_client(new_llm_config)
         except (ValueError, ImportError) as exc:
@@ -2859,21 +2829,32 @@ async def patch_settings(
                 status_code=400,
                 detail="Failed to create LLM client for the selected provider",
             ) from None
-        # Single-user, single-worker deployment: concurrent requests are
-        # serialised by the event loop, so this reference swap is atomic.
-        # Retire the previous client AFTER swapping so its HTTP connection pool
-        # is released instead of leaked across repeated provider switches.
-        # Teardown is best-effort: a close() failure on the now-unreferenced
-        # client must never fail the settings update.
+
+    try:
+        stored = await scoped_settings.update_platform_llm(
+            pool,
+            actor=principal,
+            patch=body.llm,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except Exception:
+        # Nothing was written: the running client stays, the new one is retired.
+        if new_client is not None:
+            await _close_llm_client(new_client)
+        raise
+
+    # The live config follows the stored row, so diagnostics and the
+    # provider-gated probes (vLLM models, reachability) report the provider
+    # that now processes messages, not the one the process started with.
+    _config = scoped_settings.apply_platform_settings(_config, stored)
+    if new_client is not None:
+        # Single worker: the event loop serialises requests, so the swap is atomic.
+        # The retired client is closed so its connection pool isn't leaked.
         old_client = _agent._llm
         _agent._llm = new_client
-        try:
-            await old_client.close()
-        except Exception:
-            logger.warning("Failed to close retired LLM client after LLM settings change")
-        logger.info("LLM client re-initialised for provider: %s", new_llm_config.provider)
-
-    return await _build_settings_response()
+        await _close_llm_client(old_client)
+        logger.info("LLM client re-initialised after a platform LLM change.")
+    return await _platform_settings_response(stored)
 
 
 # ---------------------------------------------------------------------------
@@ -3673,27 +3654,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         else None
     )
 
-    # Defense-in-depth (GH-80): the Agent is already seeded with the persisted
-    # tools-enabled state at construction (main._async_startup). This reload on
-    # the runtime pool is a redundant safety net so a disabled service stays
-    # gated even if the construction-time seed is ever bypassed. Both paths use
-    # ToolsSettings validation, so they cannot diverge.
+    # Defense-in-depth (GH-80): the Agent is already seeded with the tools gate
+    # at construction (main._async_startup). This recompute on the runtime pool
+    # is a redundant safety net so a disabled service stays gated even if the
+    # construction-time seed is ever bypassed. Until #161 the gate is the
+    # interim AND over every org's org_settings row (GH-159); a failure keeps
+    # the construction-time gate.
     if _agent is not None:
         try:
-            from admino.database import get_pool, load_settings_from_db
-
-            pool = get_pool()
-            db_settings = await load_settings_from_db(pool)
-            tools_data = db_settings.get("tools", {})
-            if isinstance(tools_data, dict):
-                validated = ToolsSettings.model_validate(tools_data)
-                _agent._tools_enabled = validated.model_dump()
-        except Exception:
-            # The construction-time seed from main._async_startup remains in
-            # effect, so a disabled tool stays gated — this reload is only a
-            # defense-in-depth refresh, not the primary gate.
+            _agent._tools_enabled = await scoped_settings.all_orgs_tools_gate(get_pool())
+        except Exception as exc:
             logger.warning(
-                "Lifespan tools-settings reload failed — construction-time gate remains active."
+                "Lifespan tools-gate reload failed (%s); the construction-time gate remains "
+                "active.",
+                type(exc).__name__,
             )
 
     # Load previously-promoted critical permissions from the database so
@@ -3887,8 +3861,16 @@ def create_app(
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
-    app.get("/api/settings", response_model=SettingsResponse)(get_settings)
-    app.patch("/api/settings", response_model=SettingsResponse)(patch_settings)
+    app.get("/api/me/settings", response_model=UserSettingsResponse)(get_my_settings)
+    app.patch("/api/me/settings", response_model=UserSettingsResponse)(patch_my_settings)
+    app.get("/api/org/settings", response_model=OrgSettingsResponse)(get_org_settings)
+    app.patch("/api/org/settings", response_model=OrgSettingsResponse)(patch_org_settings)
+    app.get("/api/platform/settings", response_model=PlatformSettingsResponse)(
+        get_platform_settings
+    )
+    app.patch("/api/platform/settings", response_model=PlatformSettingsResponse)(
+        patch_platform_settings
+    )
     app.get("/api/permissions", response_model=PermissionsResponse)(get_permissions)
     app.patch("/api/permissions", response_model=PermissionsResponse)(patch_permissions)
     app.get("/api/critical-permissions", response_model=CriticalPermissionsResponse)(

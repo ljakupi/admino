@@ -61,7 +61,11 @@ from admino import sessions as sessions_mod
 from admino.access import Capability
 from admino.server import _lifespan, create_app
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, fake_hash, sha256
-from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
+from tests.lifespan_stubs import (
+    patch_login_throttle_purge_job,
+    patch_org_purge_job,
+    patch_tools_gate,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -1257,7 +1261,8 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.database.close_pool", fake_close_pool),
         patch("admino.database.get_pool", fake_get_pool),
         patch("admino.database.load_permissions_from_db", AsyncMock(return_value={})),
-        patch("admino.database.load_settings_from_db", AsyncMock(return_value={})),
+        # GH-159: the tools gate reload never reads the MagicMock pool.
+        patch_tools_gate(),
         patch("admino.audit_events.run_retention_job", probe.retention),
         patch("admino.mailer.load_smtp_config", MagicMock(return_value=None)),
         patch("admino.sessions.run_session_purge_job", probe.session_purge, create=True),

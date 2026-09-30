@@ -1,25 +1,80 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-157).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-159).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
-password_reset_tokens, email_outbox, audit_events and login_throttle tables
-behind a pool-shaped object (``FakeDb.pool``). The real ``admino.auth``,
-``admino.sessions``, ``admino.session_management``, ``admino.password_reset``,
+password_reset_tokens, email_outbox, audit_events, login_throttle,
+platform_settings, org_settings and user_settings tables behind a pool-shaped
+object (``FakeDb.pool``). The real ``admino.auth``, ``admino.sessions``,
+``admino.session_management``, ``admino.password_reset``,
 ``admino.invitations``, ``admino.organizations``, ``admino.email_outbox``,
-``admino.audit_events`` and ``admino.login_throttle`` code runs against it:
-each statement is recognised by its table and verb, and its bind parameters
-are applied to the in-memory tables, so a test can log in, list and revoke
-sessions, request and confirm a password reset, send, list, revoke, resend and
-accept invitations, create, change, deactivate, schedule, cancel and purge
-organizations, count failed attempts and lock them out, and check the result.
+``admino.audit_events``, ``admino.login_throttle`` and
+``admino.scoped_settings`` code runs against it: each statement is recognised
+by its table and verb, and its bind parameters are applied to the in-memory
+tables, so a test can log in, list and revoke sessions, request and confirm a
+password reset, send, list, revoke, resend and accept invitations, create,
+change, deactivate, schedule, cancel and purge organizations, count failed
+attempts and lock them out, read and change the platform, org and user
+settings, and check the result.
 
 Inputs: organizations, accounts and sessions added with ``add_org`` /
 ``add_account`` / ``open_session``; invitations, reset tokens, queued emails,
-audit events and throttle counters seeded with ``add_invitation`` /
-``add_reset_token`` / ``add_email`` / ``add_audit`` / ``add_throttle``.
+audit events, throttle counters and settings rows seeded with
+``add_invitation`` / ``add_reset_token`` / ``add_email`` / ``add_audit`` /
+``add_throttle`` / ``add_platform_settings`` / ``add_org_settings`` /
+``add_user_settings``.
 Outputs: the recorded calls (``calls``: method, SQL, args, which pool or
 connection ran it and inside which transaction), the table state, the
 outcome of every transaction (``transactions``: commit or rollback) and how
 many transactions are open right now (``open_transactions``).
+
+The settings scopes (GH-159, migration 0013):
+- The old key/value ``settings`` table is dropped: any statement that reads,
+  writes, creates or drops a table named ``settings`` fails with asyncpg's
+  UndefinedTableError, as it would against the migrated database.
+- ``platform_settings`` holds at most one row (``platform_row()``): ``id``
+  (BOOLEAN primary key, default true, CHECK (id)), ``llm_provider`` (NOT NULL,
+  one of infomaniak / vllm / anthropic / openai), ``infomaniak_model``,
+  ``vllm_model``, ``anthropic_model``, ``openai_model`` (NULL or a name that
+  fully matches ``[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}``: no trailing newline),
+  the five limits (NOT NULL, no default: ``max_tool_calls_per_message`` 1 to
+  100, ``max_pending_confirmations`` 1 to 50, ``confirmation_timeout_s`` 10 to
+  3600, ``max_message_length`` 1 to 100000, ``max_context_messages`` 1 to 200)
+  and ``updated_at`` (NOT NULL, default now()).
+- ``org_settings`` (``org_settings``, keyed by org id): ``org_id`` (primary
+  key, references organizations ON DELETE CASCADE), the seven
+  ``<tool>_enabled`` BOOLEANs (NOT NULL, default true) and ``updated_at``.
+- ``user_settings`` (``user_settings``, keyed by user id): ``user_id``
+  (primary key, references users ON DELETE CASCADE), ``theme`` (NOT NULL,
+  default 'light', one of light / dark / system), ``notifications_enabled``
+  (NOT NULL, default true) and ``updated_at``.
+- Every statement naming one of the three tables runs through the SQL
+  reader. Written rows must satisfy the migration: a value of the wrong
+  Python type (a non-bool for a BOOLEAN, a non-int for an INTEGER, a non-str
+  for a TEXT, a naive datetime) is a DataError, a missing NOT NULL value a
+  NotNullViolationError, a broken CHECK a CheckViolationError, a taken key a
+  UniqueViolationError and an org or user that doesn't exist a
+  ForeignKeyViolationError. Deleting a users row deletes its user_settings
+  row; deleting an organizations row deletes its org_settings row (CASCADE).
+- The SQL forms the reader runs on these tables (``$n`` bind parameters,
+  optionally cast, literals, ``DEFAULT``, ``now()`` and ``coalesce(...)``
+  anywhere a value goes):
+  - ``INSERT INTO t [AS a] (cols) VALUES (exprs) [ON CONFLICT [(key)] DO
+    NOTHING | ON CONFLICT (key) DO UPDATE SET col = expr, ... [WHERE ...]]
+    [RETURNING ...]``. The conflict target must be the table's primary key.
+    In DO UPDATE, ``EXCLUDED.col`` is the proposed row and ``t.col`` (or
+    ``a.col``) the stored one; an unqualified column is ambiguous, as in
+    PostgreSQL. The proposed row's CHECKs run before the conflict check.
+  - ``INSERT INTO t (cols) SELECT ... FROM ...`` (one row per selected row;
+    what migration 0013 seeds with).
+  - ``SELECT cols FROM t [WHERE key = $n] [FOR UPDATE]`` (FOR UPDATE is
+    recorded, no effect); ``WHERE id``, ``WHERE id = true`` and ``WHERE id IS
+    TRUE`` on platform_settings.
+  - ``UPDATE t SET col = coalesce($n, col), ..., updated_at = now() [WHERE
+    ...] [RETURNING ...]`` and ``DELETE FROM t [WHERE ...]``.
+  - Aggregates over all rows, without GROUP BY: ``SELECT bool_and(col) AS x,
+    ... FROM org_settings`` (also ``every``, ``bool_or``, ``count`` and
+    ``coalesce(bool_and(col), true)``). An aggregate over no rows is NULL
+    (count: 0), as in PostgreSQL; FOR UPDATE with an aggregate fails with
+    FeatureNotSupportedError.
 
 The login throttle (GH-157):
 - ``throttle`` holds the login_throttle rows of migration 0012 (scope,
@@ -307,15 +362,94 @@ _THROTTLE_COLUMNS: Final = frozenset(
 # What the test side assumes as the failure window when it seeds a row
 # (admino.login_throttle.FAILURE_WINDOW).
 THROTTLE_WINDOW: Final = timedelta(minutes=15)
+
+# GH-159: the settings scopes of migration 0013.
+TOOL_NAMES: Final = (
+    "gmail",
+    "google_calendar",
+    "google_drive",
+    "outlook",
+    "outlook_calendar",
+    "onedrive",
+    "memory",
+)
+LLM_PROVIDERS: Final = frozenset({"infomaniak", "vllm", "anthropic", "openai"})
+THEMES: Final = frozenset({"light", "dark", "system"})
+MODEL_COLUMNS: Final = ("infomaniak_model", "vllm_model", "anthropic_model", "openai_model")
+# The model-name CHECK of migration 0013, read the way PostgreSQL reads it
+# ('^...$' anchors the whole value: a trailing newline doesn't match).
+MODEL_NAME_RE: Final = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}")
+LIMIT_BOUNDS: Final[dict[str, tuple[int, int]]] = {
+    "max_tool_calls_per_message": (1, 100),
+    "max_pending_confirmations": (1, 50),
+    "confirmation_timeout_s": (10, 3600),
+    "max_message_length": (1, 100000),
+    "max_context_messages": (1, 200),
+}
+_PLATFORM_SETTINGS_COLUMNS: Final = frozenset(
+    {"id", "llm_provider", *MODEL_COLUMNS, *LIMIT_BOUNDS, "updated_at"}
+)
+_ORG_SETTINGS_COLUMNS: Final = frozenset(
+    {"org_id", *(f"{tool}_enabled" for tool in TOOL_NAMES), "updated_at"}
+)
+_USER_SETTINGS_COLUMNS: Final = frozenset(
+    {"user_id", "theme", "notifications_enabled", "updated_at"}
+)
+_SETTINGS_TABLES: Final = frozenset({"platform_settings", "org_settings", "user_settings"})
+# The primary key of every table an INSERT ... ON CONFLICT may name.
+_CONFLICT_KEYS: Final[dict[str, tuple[str, ...]]] = {
+    "platform_settings": ("id",),
+    "org_settings": ("org_id",),
+    "user_settings": ("user_id",),
+    "login_throttle": ("scope", "subject"),
+}
+# Column types of the settings tables (for asyncpg's encoders and the NOT NULLs).
+_SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
+    "platform_settings": {
+        "id": "bool",
+        "llm_provider": "text",
+        **dict.fromkeys(MODEL_COLUMNS, "text"),
+        **dict.fromkeys(LIMIT_BOUNDS, "int"),
+        "updated_at": "timestamptz",
+    },
+    "org_settings": {
+        "org_id": "uuid",
+        **{f"{tool}_enabled": "bool" for tool in TOOL_NAMES},
+        "updated_at": "timestamptz",
+    },
+    "user_settings": {
+        "user_id": "uuid",
+        "theme": "text",
+        "notifications_enabled": "bool",
+        "updated_at": "timestamptz",
+    },
+}
+_SETTINGS_NULLABLE: Final[dict[str, frozenset[str]]] = {
+    "platform_settings": frozenset(MODEL_COLUMNS),
+    "org_settings": frozenset(),
+    "user_settings": frozenset(),
+}
+# A statement on the old key/value settings table (dropped by migration 0013).
+_OLD_SETTINGS_RE: Final = re.compile(
+    r"(?<![\w.])(?:from|into|update|join|table|exists|truncate)\s+(?:only\s+)?"
+    r"(?:public\.)?\"?settings\"?(?![\w])"
+)
+_AGGREGATE_RE: Final = re.compile(r"(?<![\w.])(?:count|bool_and|bool_or|every|min|max|sum) ?\(")
+
 _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "users": _USER_COLUMNS,
     "organizations": _ORG_COLUMNS,
     "invitations": _INVITATION_COLUMNS,
     "audit_events": _AUDIT_COLUMNS,
     "login_throttle": _THROTTLE_COLUMNS,
+    "platform_settings": _PLATFORM_SETTINGS_COLUMNS,
+    "org_settings": _ORG_SETTINGS_COLUMNS,
+    "user_settings": _USER_SETTINGS_COLUMNS,
 }
 # The tables the SQL reader writes (INSERT, UPDATE, DELETE).
-_WRITABLE: Final = frozenset({"users", "invitations", "organizations", "login_throttle"})
+_WRITABLE: Final = frozenset(
+    {"users", "invitations", "organizations", "login_throttle", *_SETTINGS_TABLES}
+)
 _INTERVAL_UNITS: Final = {
     "sec": "seconds",
     "second": "seconds",
@@ -469,6 +603,10 @@ class FakeDb:
         self.outbox: list[dict[str, Any]] = []
         self.audit: list[dict[str, Any]] = []
         self.throttle: list[dict[str, Any]] = []
+        # GH-159: the settings scopes (migration 0013).
+        self.platform_settings: list[dict[str, Any]] = []
+        self.org_settings: dict[uuid.UUID, dict[str, Any]] = {}
+        self.user_settings: dict[uuid.UUID, dict[str, Any]] = {}
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
         self.open_transactions = 0
@@ -735,6 +873,83 @@ class FakeDb:
         self.throttle.append(row)
         return row
 
+    def add_platform_settings(self, **columns: Any) -> dict[str, Any]:
+        """Store the platform_settings row (GH-159) as migration 0013 allows it; return it.
+
+        Defaults: the LLMConfig and LimitsConfig defaults (provider infomaniak,
+        its model and vllm's set, the Anthropic and OpenAI models NULL; 10, 3,
+        300, 4000 and 20), updated now. Any column can be given.
+        """
+        unknown = set(columns) - _PLATFORM_SETTINGS_COLUMNS
+        assert not unknown, f"platform_settings has no column {sorted(unknown)}"
+        assert not self.platform_settings, "platform_settings holds one row at most"
+        row: dict[str, Any] = {
+            "id": True,
+            "llm_provider": "infomaniak",
+            "infomaniak_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+            "vllm_model": "Qwen/Qwen3-4B-Instruct-2507",
+            "anthropic_model": None,
+            "openai_model": None,
+            "max_tool_calls_per_message": 10,
+            "max_pending_confirmations": 3,
+            "confirmation_timeout_s": 300,
+            "max_message_length": 4000,
+            "max_context_messages": 20,
+            "updated_at": datetime.now(UTC),
+        }
+        row.update(columns)
+        self.check_settings("platform_settings", row, original=None)
+        self.platform_settings.append(row)
+        return row
+
+    def add_org_settings(
+        self, org_id: uuid.UUID, *, updated_at: datetime | None = None, **tools: bool
+    ) -> dict[str, Any]:
+        """Store an org's org_settings row (GH-159); every tool not given is enabled.
+
+        ``tools`` are tool names (``gmail=False``), stored as ``<tool>_enabled``.
+        """
+        unknown = set(tools) - set(TOOL_NAMES)
+        assert not unknown, f"no such tool {sorted(unknown)}"
+        row: dict[str, Any] = {
+            "org_id": org_id,
+            **{f"{tool}_enabled": tools.get(tool, True) for tool in TOOL_NAMES},
+            "updated_at": updated_at or datetime.now(UTC),
+        }
+        self.check_settings("org_settings", row, original=None)
+        self.org_settings[org_id] = row
+        return row
+
+    def add_user_settings(
+        self,
+        user_id: uuid.UUID,
+        *,
+        theme: str = "light",
+        notifications_enabled: bool = True,
+        updated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Store a user's user_settings row (GH-159)."""
+        row: dict[str, Any] = {
+            "user_id": user_id,
+            "theme": theme,
+            "notifications_enabled": notifications_enabled,
+            "updated_at": updated_at or datetime.now(UTC),
+        }
+        self.check_settings("user_settings", row, original=None)
+        self.user_settings[user_id] = row
+        return row
+
+    def platform_row(self) -> dict[str, Any] | None:
+        """The platform_settings row, if there is one."""
+        return self.platform_settings[0] if self.platform_settings else None
+
+    def org_tools(self, org_id: uuid.UUID) -> dict[str, bool] | None:
+        """The stored tool switches of an org by tool name (None without a row)."""
+        row = self.org_settings.get(org_id)
+        if row is None:
+            return None
+        return {tool: row[f"{tool}_enabled"] for tool in TOOL_NAMES}
+
     def throttle_row(self, scope: str, subject: bytes | None) -> dict[str, Any] | None:
         """The stored login_throttle row of (scope, subject), if there is one."""
         return next(
@@ -843,6 +1058,9 @@ class FakeDb:
                 "outbox": self.outbox,
                 "audit": self.audit,
                 "throttle": self.throttle,
+                "platform_settings": self.platform_settings,
+                "org_settings": self.org_settings,
+                "user_settings": self.user_settings,
             }
         )
 
@@ -856,6 +1074,9 @@ class FakeDb:
         self.outbox = state["outbox"]
         self.audit = state["audit"]
         self.throttle = state["throttle"]
+        self.platform_settings = state["platform_settings"]
+        self.org_settings = state["org_settings"]
+        self.user_settings = state["user_settings"]
 
     def new_connection(self) -> FakeConnection:
         """A new connection on this database."""
@@ -871,6 +1092,9 @@ class FakeDb:
         if re.search(r"\brevoked_at\b", n):
             # Migration 0009 dropped the column: revoking deletes the row.
             raise asyncpg.exceptions.UndefinedColumnError('column "revoked_at" does not exist')
+        if _OLD_SETTINGS_RE.search(_masked_literals(n)):
+            # Migration 0013 dropped the key/value settings table (GH-159).
+            raise asyncpg.exceptions.UndefinedTableError('relation "settings" does not exist')
         if self.fail_sql is not None and re.search(self.fail_sql, n):
             raise asyncpg.exceptions.DeadlockDetectedError("deadlock detected")
         if _AUDIT_REWRITE_RE.search(n) or (n.startswith("truncate") and "audit_events" in n):
@@ -973,8 +1197,122 @@ class FakeDb:
             return list(self.audit)
         if table == "login_throttle":
             return list(self.throttle)
+        if table == "platform_settings":
+            return list(self.platform_settings)
+        if table == "org_settings":
+            return list(self.org_settings.values())
+        if table == "user_settings":
+            return list(self.user_settings.values())
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
+
+    # -- the settings tables of migration 0013 (GH-159) ----------------------------
+
+    def settings_defaults(self, table: str, given: dict[str, Any], now: datetime) -> dict[str, Any]:
+        """A new settings row: the column defaults of migration 0013, then the given values."""
+        row: dict[str, Any] = dict.fromkeys(_COLUMNS[table])
+        if table == "platform_settings":
+            row["id"] = True
+        elif table == "org_settings":
+            row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
+        else:
+            row.update(theme="light", notifications_enabled=True)
+        row["updated_at"] = now
+        row.update(given)
+        return row
+
+    def settings_by_key(self, table: str, row: dict[str, Any]) -> dict[str, Any] | None:
+        """The stored settings row with the same primary key, if any."""
+        (key,) = _CONFLICT_KEYS[table]
+        for other in self.table_rows(table):
+            if _canonical(other[key]) == _canonical(row[key]):
+                return other
+        return None
+
+    def store_settings(self, table: str, row: dict[str, Any]) -> None:
+        """Store a new, checked settings row."""
+        if table == "platform_settings":
+            self.platform_settings.append(row)
+        elif table == "org_settings":
+            self.org_settings[row["org_id"]] = row
+        else:
+            self.user_settings[row["user_id"]] = row
+
+    def check_settings(
+        self,
+        table: str,
+        row: dict[str, Any],
+        *,
+        original: dict[str, Any] | None,
+        keys: bool = True,
+    ) -> None:
+        """Migration 0013's rules for a written settings row, as PostgreSQL applies them.
+
+        Types first (asyncpg's encoders), then NOT NULL, the CHECKs and (unless
+        ``keys`` is False) the primary key and the foreign key. A key given as
+        a str is stored as a uuid.UUID, like the driver's uuid codec.
+        """
+        types = _SETTINGS_TYPES[table]
+        for column, value in list(row.items()):
+            assert column in types, f"{table} has no column {column}"
+            if value is None:
+                continue
+            kind = types[column]
+            valid = True
+            if kind == "bool":
+                valid = type(value) is bool
+            elif kind == "int":
+                valid = type(value) is int
+            elif kind == "text":
+                valid = isinstance(value, str)
+            elif kind == "timestamptz":
+                valid = isinstance(value, datetime) and value.tzinfo is not None
+            elif isinstance(value, str):
+                try:
+                    row[column] = uuid.UUID(value)
+                except ValueError:
+                    valid = False
+            else:
+                valid = isinstance(value, uuid.UUID)
+                if valid:
+                    row[column] = _canonical(value)
+            if not valid:
+                msg = f"invalid input for query argument ({column}): {kind} expected"
+                raise asyncpg.exceptions.DataError(msg)
+        for column in types:
+            if row.get(column) is None and column not in _SETTINGS_NULLABLE[table]:
+                msg = f'null value in column "{column}" of relation "{table}"'
+                raise asyncpg.exceptions.NotNullViolationError(msg)
+        rules: list[tuple[str, bool]] = []
+        if table == "platform_settings":
+            rules.append(("id", row["id"] is True))
+            rules.append(("llm_provider", row["llm_provider"] in LLM_PROVIDERS))
+            rules.extend(
+                (column, row[column] is None or MODEL_NAME_RE.fullmatch(row[column]) is not None)
+                for column in MODEL_COLUMNS
+            )
+            rules.extend(
+                (column, low <= row[column] <= high) for column, (low, high) in LIMIT_BOUNDS.items()
+            )
+        elif table == "user_settings":
+            rules.append(("theme", row["theme"] in THEMES))
+        for name, valid in rules:
+            if not valid:
+                msg = f'new row for relation "{table}" violates the {name} check'
+                raise asyncpg.exceptions.CheckViolationError(msg)
+        if not keys:
+            return
+        (key,) = _CONFLICT_KEYS[table]
+        for other in self.table_rows(table):
+            if other is not original and _canonical(other[key]) == _canonical(row[key]):
+                msg = f'duplicate key value violates unique constraint "{table}_pkey"'
+                raise asyncpg.exceptions.UniqueViolationError(msg)
+        if table == "org_settings" and _canonical(row["org_id"]) not in self.orgs:
+            msg = 'insert or update on table "org_settings" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
+        if table == "user_settings" and _canonical(row["user_id"]) not in self.users:
+            msg = 'insert or update on table "user_settings" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
 
     def normalized(self, table: str, values: dict[str, Any]) -> dict[str, Any]:
         """The values as the column types store them (asyncpg's encoders, NUMERIC(12,2))."""
@@ -1093,6 +1431,8 @@ class FakeDb:
                         f"the key of a login_throttle row never changes ({column})"
                     )
             self._check_throttle(row, original)
+        elif table in _SETTINGS_TABLES:
+            self.check_settings(table, row, original=original)
         else:
             msg = f"the fake's SQL reader never writes {table}"
             raise AssertionError(msg)
@@ -1292,8 +1632,9 @@ class FakeDb:
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
 
     def delete_row(self, table: str, row: dict[str, Any]) -> None:
-        """Delete one users, invitations, organizations or login_throttle row; a user's rows
-        cascade (ON DELETE CASCADE). Call ``check_delete`` first."""
+        """Delete one users, invitations, organizations, login_throttle or settings row; a
+        user's rows and an org's org_settings row cascade (ON DELETE CASCADE). Call
+        ``check_delete`` first."""
         if table == "login_throttle":
             self.throttle = [other for other in self.throttle if other is not row]
             return
@@ -1302,10 +1643,23 @@ class FakeDb:
             return
         if table == "organizations":
             del self.orgs[row["id"]]
+            # GH-159: org_settings.org_id REFERENCES organizations ON DELETE CASCADE.
+            self.org_settings.pop(row["id"], None)
+            return
+        if table == "platform_settings":
+            self.platform_settings = [other for other in self.platform_settings if other is not row]
+            return
+        if table == "org_settings":
+            del self.org_settings[row["org_id"]]
+            return
+        if table == "user_settings":
+            del self.user_settings[row["user_id"]]
             return
         assert table == "users", f"the fake never deletes from {table}"
         user_id = row["id"]
         del self.users[user_id]
+        # GH-159: user_settings.user_id REFERENCES users ON DELETE CASCADE.
+        self.user_settings.pop(user_id, None)
         self.invitations = {
             key: value for key, value in self.invitations.items() if value["user_id"] != user_id
         }
@@ -1680,6 +2034,19 @@ class FakeDb:
 # ---------------------------------------------------------------------------
 
 
+def _masked_literals(text: str) -> str:
+    """Blank out the contents of quoted literals (same length); parentheses stay."""
+    out: list[str] = []
+    quoted = False
+    for char in text:
+        if char == "'":
+            quoted = not quoted
+            out.append(char)
+        else:
+            out.append(" " if quoted else char)
+    return "".join(out)
+
+
 def _masked(text: str) -> str:
     """Blank out quoted literals and everything inside parentheses (same length).
 
@@ -1813,6 +2180,9 @@ def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
     """True for the statements the SQL reader runs (see the module docstring)."""
     if re.search(r"\binvitations\b", n) or re.search(r"\blogin_throttle\b", n):
         return True
+    if re.search(r"\b(?:platform|org|user)_settings\b", n):
+        # GH-159: the settings scopes of migration 0013.
+        return True
     table = _primary_table(n)
     if table is None and n.startswith("select") and re.search(r"\bsha256 ?\(", n):
         # GH-157: a FROM-less digest, e.g. the account subject of a typed email.
@@ -1833,6 +2203,46 @@ def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
         and re.search(ID_PARAM_RE, where) is None
         and (method == "fetch" or not any(isinstance(arg, str) for arg in args))
     )
+
+
+@dataclass(frozen=True)
+class _Conflict:
+    """An ON CONFLICT clause: DO NOTHING (no assignments) or DO UPDATE SET ... [WHERE]."""
+
+    assignments: tuple[tuple[str, str], ...] | None
+    where: str | None
+
+
+def _on_conflict(table: str, text: str | None) -> _Conflict | None:
+    """Read the ON CONFLICT clause of an INSERT into a settings table (None: no clause).
+
+    The conflict target, when given, must be the table's primary key
+    (InvalidColumnReferenceError otherwise, as in PostgreSQL); DO UPDATE needs one.
+    """
+    if text is None:
+        return None
+    match = re.match(r"(?:\( ?([\w ,]+?) ?\) ?)?do (nothing$|update set )", text)
+    assert match is not None, f"the fake can't read ON CONFLICT {text!r}"
+    if match.group(1) is not None:
+        target = {column.strip() for column in match.group(1).split(",")}
+        if target != set(_CONFLICT_KEYS[table]):
+            msg = "no unique or exclusion constraint matches the ON CONFLICT specification"
+            raise asyncpg.exceptions.InvalidColumnReferenceError(msg)
+    if match.group(2) == "nothing":
+        return _Conflict(assignments=None, where=None)
+    assert match.group(1) is not None, "ON CONFLICT DO UPDATE needs a conflict target"
+    parts = _top_split(text[match.end() :], r" where ")
+    assert len(parts) <= 2, text
+    assignments = []
+    for piece in _top_split(parts[0], ","):
+        assignment = re.fullmatch(r"(\w+) ?= ?(.+)", piece)
+        assert assignment is not None, f"the fake can't read SET {piece}"
+        column, expr = assignment.groups()
+        if column not in _COLUMNS[table]:
+            msg = f'column "{column}" of relation "{table}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
+        assignments.append((column, expr))
+    return _Conflict(assignments=tuple(assignments), where=parts[1] if len(parts) == 2 else None)
 
 
 def _store(value: Any) -> Any:
@@ -1938,11 +2348,10 @@ class _Statement:
                 return None
             return left + right if operator == "+" else left - right
         if match := re.fullmatch(r"coalesce ?\((.+)\)", expr):
-            for item in _top_split(match.group(1), ","):
-                value = self.value(item, ctx)
-                if value is not None:
-                    return value
-            return None
+            # Every argument is resolved (PostgreSQL resolves column references when it
+            # parses the statement), then the first non-NULL one wins.
+            values = [self.value(item, ctx) for item in _top_split(match.group(1), ",")]
+            return next((value for value in values if value is not None), None)
         if match := re.fullmatch(r"(greatest|least) ?\((.+)\)", expr):
             # Like PostgreSQL, NULL arguments are ignored.
             present = [
@@ -2019,6 +2428,17 @@ class _Statement:
         if match := re.fullmatch(r"(.+?) is (not )?null", masked):
             value = self.value(atom[: match.end(1)], ctx)
             return (value is not None) if match.group(2) else (value is None)
+        if match := re.fullmatch(r"(.+?) is (not )?(true|false)", masked):
+            # GH-159: e.g. "WHERE id IS TRUE" on platform_settings.
+            value = self.value(atom[: match.end(1)], ctx)
+            assert value is None or type(value) is bool, f"IS TRUE needs a boolean: {atom}"
+            holds = value is (match.group(3) == "true")
+            return holds != bool(match.group(2))
+        if re.fullmatch(r"(?:\w+\.)?\w+", masked):
+            # GH-159: a bare boolean column ("WHERE id") or literal.
+            value = self.value(atom, ctx)
+            assert value is None or type(value) is bool, f"not a boolean predicate: {atom}"
+            return value is True
         if match := re.fullmatch(r"(.+?) (not )?in ?\( *\)", masked):
             left = self.value(atom[: match.end(1)], ctx)
             inner = atom[masked.rindex("(") + 1 : -1].strip()
@@ -2089,26 +2509,20 @@ class _Statement:
                 expr, alias = item[: match.end(1)], match.group(2)
             expr = expr.strip()
             assert expr != "*" and not expr.endswith(".*"), "name the columns (no SELECT *)"
-            if count := re.fullmatch(r"count ?\((\*|1|(?:\w+\.)?\w+)\)(?: ?:: ?\w+)?", expr):
-                items.append(("count", alias or "count", count.group(1)))
+            if _AGGREGATE_RE.search(_masked_literals(expr)):
+                name = re.match(r"(?:coalesce ?\( ?)?(\w+)", expr)
+                assert name is not None, expr
+                items.append(("aggregate", alias or name.group(1), expr))
             elif re.fullmatch(r"(?:\w+\.)?\w+", expr) and not re.fullmatch(r"-?\d+|null", expr):
                 items.append(("value", alias or expr.rsplit(".", 1)[-1], expr))
             elif re.search(r"<>|!=|<=|>=|=|<|>| is (?:not )?null$", _masked(expr)):
                 items.append(("predicate", alias or "?column?", expr))
             else:
                 items.append(("value", alias or "?column?", expr))
-        if any(kind == "count" for kind, _, _ in items):
-            assert all(kind == "count" for kind, _, _ in items), "no GROUP BY in the fake"
-            return [
-                {
-                    key: sum(
-                        1
-                        for ctx in contexts
-                        if expr in {"*", "1"} or self.value(expr, ctx) is not None
-                    )
-                    for _, key, expr in items
-                }
-            ]
+        if any(kind == "aggregate" for kind, _, _ in items):
+            # One row over every context (no GROUP BY in the fake).
+            assert all(kind == "aggregate" for kind, _, _ in items), "no GROUP BY in the fake"
+            return [{key: self.aggregate(expr, contexts) for _, key, expr in items}]
         rows = []
         for ctx in contexts:
             row: dict[str, Any] = {}
@@ -2117,6 +2531,38 @@ class _Statement:
                 row[key] = _pg(value) if isinstance(value, uuid.UUID) else value
             rows.append(row)
         return rows
+
+    def aggregate(self, expr: str, contexts: list[_Context]) -> Any:
+        """Evaluate an aggregate expression over every row context, as PostgreSQL would.
+
+        ``count(*)`` / ``count(1)`` / ``count(col)``; ``bool_and`` / ``every`` /
+        ``bool_or`` (NULL over no non-NULL input); ``coalesce(...)`` of aggregates
+        and constants; an optional trailing cast is ignored.
+        """
+        expr = _unwrap(expr)
+        cast = re.fullmatch(r"(.+?) ?:: ?\w+", _masked(expr))
+        if cast is not None:
+            return self.aggregate(expr[: cast.end(1)], contexts)
+        if match := re.fullmatch(r"count ?\((\*|1|.+)\)", expr):
+            inner = match.group(1).strip()
+            if inner in {"*", "1"}:
+                return len(contexts)
+            return sum(1 for ctx in contexts if self.value(inner, ctx) is not None)
+        if match := re.fullmatch(r"(bool_and|every|bool_or) ?\((.+)\)", expr):
+            values = [self.value(match.group(2), ctx) for ctx in contexts]
+            present = [value for value in values if value is not None]
+            assert all(type(value) is bool for value in present), f"{match.group(1)} of non-bools"
+            if not present:
+                return None
+            return any(present) if match.group(1) == "bool_or" else all(present)
+        if match := re.fullmatch(r"coalesce ?\((.+)\)", expr):
+            for item in _top_split(match.group(1), ","):
+                value = self.aggregate(item, contexts)
+                if value is not None:
+                    return value
+            return None
+        assert not _AGGREGATE_RE.search(_masked_literals(expr)), f"the fake can't read {expr!r}"
+        return self.value(expr, {})
 
     # -- statements --------------------------------------------------------------
 
@@ -2149,6 +2595,11 @@ class _Statement:
             assert set(clauses) == {"select"}, f"a SELECT without FROM: {n}"
             return self.project(clauses["select"], [{}])
         assert not clauses["select"].startswith("distinct"), "no DISTINCT in the fake"
+        if ("for update" in clauses or "for no key update" in clauses) and _AGGREGATE_RE.search(
+            _masked_literals(clauses["select"])
+        ):
+            msg = "FOR UPDATE is not allowed with aggregate functions"
+            raise asyncpg.exceptions.FeatureNotSupportedError(msg)
         contexts = self.filtered(self.contexts(_sources(clauses["from"])), clauses.get("where"))
         if "order by" in clauses:
             contexts = self.ordered(contexts, clauses["order by"])
@@ -2158,6 +2609,8 @@ class _Statement:
         return rows
 
     def insert(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        if re.search(r"\b(?:platform|org|user)_settings\b", n.split("(", 1)[0]):
+            return self.insert_settings(n)
         clauses = _clauses(n, ("insert into", "values", "on conflict", "returning"))
         head = re.fullmatch(r"(\w+) ?\((.*)\)", clauses["insert into"])
         values = clauses.get("values", "")
@@ -2189,6 +2642,77 @@ class _Statement:
         ctx: _Context = {table: (table, row)}
         returned = self.project(clauses["returning"], [ctx]) if "returning" in clauses else []
         return returned, 1
+
+    def insert_settings(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        """An INSERT into a settings table of migration 0013 (see the module docstring)."""
+        clauses = _clauses(n, ("insert into", "values", "select", "on conflict", "returning"))
+        head = re.fullmatch(r"(\w+)(?: as (\w+))? ?\((.*)\)", clauses["insert into"])
+        assert head is not None, f"the fake can't read this INSERT: {n}"
+        table, alias = head.group(1), head.group(2) or head.group(1)
+        assert table in _SETTINGS_TABLES, n
+        columns = [column.strip().strip('"') for column in head.group(3).split(",")]
+        unknown = set(columns) - _COLUMNS[table]
+        if unknown:
+            msg = f'column "{sorted(unknown)[0]}" of relation "{table}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
+        candidates: list[dict[str, Any]] = []
+        if "values" in clauses:
+            values = clauses["values"]
+            assert "select" not in clauses and _unwrap(values) != values, f"one VALUES row: {n}"
+            exprs = _top_split(values[1:-1], ",")
+            assert len(columns) == len(exprs), n
+            candidates.append(
+                {
+                    column: _store(self.value(expr, {}))
+                    for column, expr in zip(columns, exprs, strict=True)
+                    if expr != "default"
+                }
+            )
+        else:
+            assert "select" in clauses, f"no rows to add: {n}"
+            for selected in self.select("select " + clauses["select"]):
+                row_values = list(selected.values())
+                assert len(row_values) == len(columns), n
+                candidates.append(
+                    {
+                        column: _store(value)
+                        for column, value in zip(columns, row_values, strict=True)
+                    }
+                )
+        conflict = _on_conflict(table, clauses.get("on conflict"))
+        returned: list[dict[str, Any]] = []
+        count = 0
+        for given in candidates:
+            row = self.db.settings_defaults(table, given, self.now)
+            # The proposed row's CHECKs run before the conflict check, as in PostgreSQL.
+            self.db.check_settings(table, row, original=None, keys=False)
+            existing = self.db.settings_by_key(table, row)
+            if existing is None:
+                self.db.check_settings(table, row, original=None)
+                self.db.store_settings(table, row)
+                target = row
+            elif conflict is None:
+                msg = f'duplicate key value violates unique constraint "{table}_pkey"'
+                raise asyncpg.exceptions.UniqueViolationError(msg)
+            elif conflict.assignments is None:
+                continue
+            else:
+                ctx: _Context = {alias: (table, existing), "excluded": (table, row)}
+                if conflict.where is not None and not self.holds(conflict.where, ctx):
+                    continue
+                new = {
+                    column: _store(self.value(expr, ctx)) for column, expr in conflict.assignments
+                }
+                self.db.check_settings(table, {**existing, **new}, original=existing)
+                existing.update(new)
+                if "org_id" in new or "user_id" in new or "id" in new:
+                    msg = "the fake never changes a settings row's key"
+                    raise AssertionError(msg)
+                target = existing
+            count += 1
+            if "returning" in clauses:
+                returned.extend(self.project(clauses["returning"], [{alias: (table, target)}]))
+        return returned, count
 
     def update(self, n: str) -> tuple[list[dict[str, Any]], int]:
         clauses = _clauses(n, ("update", "set", "from", "where", "returning"))

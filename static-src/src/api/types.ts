@@ -106,23 +106,10 @@ export type ThreadItem =
   | { type: 'tool_call'; data: ToolCallUI }
   | { type: 'thinking'; data: { id: string } };
 
-// Settings types
+// Settings types (issue #159: settings split into platform, organization and
+// user scopes — the old single `/api/settings` is gone).
 
-export type LLMProviderName = 'infomaniak' | 'anthropic' | 'openai' | 'vllm';
 export type AppTheme = 'light' | 'dark' | 'system';
-
-export interface LLMSettings {
-  provider: LLMProviderName;
-  anthropic_model: string;
-  openai_model: string;
-  vllm_model: string;
-  vllm_available_models: string[];
-  anthropic_key_configured: boolean;
-  openai_key_configured: boolean;
-  infomaniak_model: string;
-  infomaniak_available_models: string[];
-  infomaniak_token_configured: boolean;
-}
 
 export interface AppearanceSettings {
   theme: AppTheme;
@@ -130,52 +117,6 @@ export interface AppearanceSettings {
 
 export interface NotificationSettings {
   enabled: boolean;
-}
-
-export interface LimitsSettings {
-  max_tool_calls_per_message: number;
-  confirmation_timeout_s: number;
-  max_message_length: number;
-}
-
-export interface ServerSettings {
-  host: string;
-  port: number;
-}
-
-export interface OAuthAccountInfo {
-  connected: boolean;
-  /**
-   * True when the stored refresh token is still believed valid. A connected
-   * but unhealthy account (dead/revoked refresh token) is shown as "Not
-   * connected" — see `effectivelyConnected` on the Tools page.
-   */
-  healthy: boolean;
-  email: string | null;
-  services: string[];
-}
-
-export interface ConnectedAccounts {
-  google: OAuthAccountInfo;
-  microsoft: OAuthAccountInfo;
-}
-
-export interface SettingsResponse {
-  llm: LLMSettings;
-  appearance: AppearanceSettings;
-  notifications: NotificationSettings;
-  limits: LimitsSettings;
-  server: ServerSettings;
-  connected_accounts: ConnectedAccounts;
-  tools: ToolsSettings;
-}
-
-export interface LLMSettingsPatch {
-  provider?: LLMProviderName;
-  anthropic_model?: string;
-  openai_model?: string;
-  vllm_model?: string;
-  infomaniak_model?: string;
 }
 
 export interface ToolsSettings {
@@ -188,11 +129,42 @@ export interface ToolsSettings {
   memory: boolean;
 }
 
-export interface SettingsPatch {
-  llm?: LLMSettingsPatch;
+/** `GET`/`PATCH /api/me/settings` — the caller's own theme and notifications. */
+export interface UserSettingsResponse {
+  appearance: AppearanceSettings;
+  notifications: NotificationSettings;
+}
+
+export interface UserSettingsPatch {
   appearance?: { theme?: AppTheme };
   notifications?: { enabled?: boolean };
-  tools?: Partial<ToolsSettings>;
+}
+
+/** `GET`/`PATCH /api/org/settings` — Org Admin only: which tool services are enabled. */
+export interface OrgSettingsResponse {
+  tools: ToolsSettings;
+}
+
+export interface OrgSettingsPatch {
+  tools: Partial<ToolsSettings>;
+}
+
+/** `GET /api/oauth/{provider}/status`. */
+export interface OAuthConnectionStatus {
+  connected: boolean;
+  /**
+   * True when the stored refresh token is still believed valid. A connected
+   * but unhealthy account (dead/revoked refresh token) is shown as "Not
+   * connected" — see `effectivelyConnected` on the Tools page.
+   */
+  healthy: boolean;
+  email: string | null;
+  services: string[];
+}
+
+export interface ConnectedAccounts {
+  google: OAuthConnectionStatus;
+  microsoft: OAuthConnectionStatus;
 }
 
 // Permissions types

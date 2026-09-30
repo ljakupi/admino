@@ -137,7 +137,8 @@ make docker-down              # stop everything
 
 **Optional local model.** `make start-local` also starts the vLLM CPU container. On the
 first run it downloads the model weights (~8 GB) into a Docker volume, and it skips the
-download once they're cached. Then pick **vLLM** in **Settings → Agent**.
+download once they're cached. Then switch the provider to `vllm` (see
+[Switching providers](configuration.md#llm-providers)).
 
 The API is published on **http://localhost:8000** (bound to `127.0.0.1` only, by
 `docker-compose.local.yml`). No host directory is mounted into the container, so the
@@ -224,9 +225,10 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
    [Accounts and sessions](configuration.md#accounts-and-sessions).
 3. With `INFOMANIAK_API_TOKEN` set, the default Infomaniak model answers right away.
    If the token is missing, admino still starts and the chat replies that Infomaniak
-   isn't configured. **Settings → Agent** switches to local **vLLM** (after
-   `make start-local`; allow a few minutes for the model to load), **Claude** or
-   **OpenAI** (set the matching API key in `.env` first).
+   isn't configured. To use local **vLLM** (after `make start-local`; allow a few
+   minutes for the model to load), **Claude** or **OpenAI** (set the matching API key in
+   `.env` first), switch the provider in `config.yaml` or as the Super Admin (see
+   [Switching providers](configuration.md#llm-providers)).
 4. Type a message and press **Enter**.
 5. The agent responds and may call a tool. **Read** actions run immediately; **write**
    actions pause for your approval; **destructive** actions are denied. See
@@ -320,8 +322,8 @@ security rules.
   `INFOMANIAK_PRODUCT_ID`, your token sees several AI products: set the one to use.
 - **"admino replies with 'model unavailable' or 'model starting'."** The vLLM container
   isn't ready yet. Either run `make start-local` and wait a few minutes for the model to
-  load (CPU inference takes time on first start), or switch back to Infomaniak in
-  **Settings → Agent**.
+  load (CPU inference takes time on first start), or switch back to Infomaniak (see
+  [Switching providers](configuration.md#llm-providers)).
 - **`PG_PASSWORD environment variable is required but not set`.** For local dev, load
   `.env` into your shell first: `set -a; source .env; set +a`.
 - **A tool says the account isn't connected.** Run `python -m admino.oauth_setup <google|microsoft>`

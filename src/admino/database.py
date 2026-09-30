@@ -16,18 +16,16 @@ Security notes:
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 from urllib.parse import quote_plus
 
 import asyncpg
 
 if TYPE_CHECKING:
-    from admino.config import AppConfig
     from admino.permissions import PermissionsConfig
 
 logger = logging.getLogger(__name__)
@@ -193,45 +191,6 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def seed_settings(pool: asyncpg.Pool, config: AppConfig) -> None:
-    """Seed the settings table from AppConfig if the table is empty.
-
-    Each config section (server, llm, limits, egress, database)
-    becomes a row with key=section_name and value=JSONB of the model dict.
-    The log_level string is stored as ``{"value": "INFO"}``. No ``files`` row
-    is seeded (the local files tool was removed in GH-143), no ``paths`` row
-    (the NDJSON audit log path was removed in GH-147), and no ``auth`` row
-    (the auth modes were removed in GH-149).
-
-    Args:
-        pool: The asyncpg connection pool.
-        config: The validated application config to seed from.
-    """
-    async with pool.acquire() as conn:
-        count = await conn.fetchval("SELECT count(*) FROM settings")
-        if count and int(count) > 0:
-            logger.info("Settings table already has %d rows, skipping seed.", count)
-            return
-
-    sections: dict[str, object] = {
-        "server": config.server.model_dump(mode="json"),
-        "llm": config.llm.model_dump(mode="json"),
-        "limits": config.limits.model_dump(mode="json"),
-        "egress": config.egress.model_dump(mode="json"),
-        "database": config.database.model_dump(mode="json"),
-        "log_level": {"value": config.log_level},
-    }
-
-    async with pool.acquire() as conn:
-        for key, value in sections.items():
-            await conn.execute(
-                "INSERT INTO settings (key, value) VALUES ($1, $2::jsonb)",
-                key,
-                json.dumps(value),
-            )
-    logger.info("Seeded %d settings rows from AppConfig.", len(sections))
-
-
 async def seed_permissions(
     pool: asyncpg.Pool,
     permissions: PermissionsConfig,
@@ -270,26 +229,6 @@ async def seed_permissions(
 # ---------------------------------------------------------------------------
 
 
-async def update_setting(pool: asyncpg.Pool, key: str, value: dict[str, Any]) -> None:
-    """Upsert a single settings row by key.
-
-    Inserts the row if it does not exist, updates it otherwise.
-    Uses parameterized query — no string interpolation.
-
-    Args:
-        pool: The asyncpg connection pool.
-        key: The settings section key (e.g. "llm", "appearance").
-        value: The new JSONB value for the settings row.
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO settings (key, value) VALUES ($1, $2::jsonb) "
-            "ON CONFLICT (key) DO UPDATE SET value = $2::jsonb, updated_at = now()",
-            key,
-            json.dumps(value),
-        )
-
-
 async def update_permission(
     pool: asyncpg.Pool,
     tool: str,
@@ -315,48 +254,6 @@ async def update_permission(
             action,
             permission,
         )
-
-
-async def load_settings_from_db(
-    pool: asyncpg.Pool,
-) -> dict[str, Any]:
-    """Load all settings rows and return a dict suitable for AppConfig.model_validate().
-
-    Each row has key (section name) and value (JSONB). The log_level
-    section stores ``{"value": "INFO"}`` and is unwrapped to a plain string.
-
-    Args:
-        pool: The asyncpg connection pool.
-
-    Returns:
-        A dict like ``{"server": {...}, "llm": {...}, ...}``.
-    """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT key, value FROM settings")
-
-    result: dict[str, Any] = {}
-    for row in rows:
-        key: str = row["key"]
-        value: Any = row["value"]
-        # asyncpg returns JSONB as str when the default codec is not active
-        # (e.g. certain pool configurations). Parse if needed.
-        if isinstance(value, str):
-            value = json.loads(value)
-        # A persisted NULL means "not set" — drop the whole section so the
-        # config model's section default applies.
-        if value is None:
-            continue
-        if key == "log_level" and isinstance(value, dict):
-            result[key] = value.get("value", "INFO")
-        elif isinstance(value, dict):
-            # Drop NULL-valued fields within a section. Pydantic only applies a
-            # field default when the key is ABSENT, not when it is explicitly
-            # None, so a persisted null would otherwise fail validation for
-            # non-optional fields (e.g. llm.openai_model). See test_database.
-            result[key] = {k: v for k, v in value.items() if v is not None}
-        else:
-            result[key] = value
-    return result
 
 
 async def load_permissions_from_db(

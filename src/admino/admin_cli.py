@@ -43,8 +43,9 @@ order:
    the invitation email is queued; without it nothing is queued and the
    one-time link is shown on stdout, so stdout must be a terminal.
 4. Opens a small pool, applies pending migrations, reads ``server.public_url``
-   (the settings table plus ADMINO_PUBLIC_URL) as the link base, and creates
-   the org, its ``org.create`` event and the invitation in one transaction.
+   (``$CONFIG_DIR/config.yaml`` plus ADMINO_PUBLIC_URL, like the server's
+   startup) as the link base, and creates the org, its ``org.create`` event
+   and the invitation in one transaction.
 5. Prints the new org's id and either that the email is queued or the link
    and its expiry date.
 
@@ -68,7 +69,7 @@ Security notes:
 - No secrets or content in output or logs: the password, its hash, the
   emails, the names and the link (except as above) are never printed or
   logged. Messages are fixed text that never repeats the input; a driver's
-  or a stored config's error (which can repeat the failing row) is never
+  or a config error (which can repeat the failing row or value) is never
   shown.
 - Only this module builds an ``access.Operator`` (tests/test_access.py
   enforces it): being at the server's terminal is what authorizes
@@ -85,10 +86,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import os
 import signal
 import sys
 import unicodedata
 from datetime import UTC
+from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Final
 
 import asyncpg
@@ -104,7 +107,7 @@ from pydantic import (
 from admino import accounts, organizations, passwords
 from admino.access import Operator
 from admino.audit_events import AuditRecordError
-from admino.config import load_app_config_from_db
+from admino.config import load_app_config
 from admino.database import close_pool, database_url_from_env, init_pool, run_migrations
 from admino.mailer import load_smtp_config
 from admino.models import OrgCreateRequest
@@ -118,6 +121,8 @@ _MAX_ATTEMPTS: Final = 3
 _FIRST_PROMPT: Final = "Password: "
 _REPEAT_PROMPT: Final = "Repeat password: "
 _GIB: Final = 1024**3
+# config.yaml, found like the server's startup does (main.py): $CONFIG_DIR, default "config".
+_CONFIG_PATH: Final[Path] = Path(os.environ.get("CONFIG_DIR", "config")) / "config.yaml"
 
 # The users_email_format_check (migration 0004): no whitespace, and an '@'
 # after a non-empty local part.
@@ -161,7 +166,8 @@ _NO_TTY_FOR_LINK: Final = (
 )
 _NO_DSN: Final = "Error: the PG_PASSWORD environment variable is not set."
 _DATABASE_UNAVAILABLE: Final = "Error: the database is unavailable; nothing was created."
-_INVALID_CONFIG: Final = "Error: the stored configuration is invalid; nothing was created."
+_INVALID_CONFIG: Final = "Error: the configuration is invalid; nothing was created."
+_CONFIG_UNREADABLE: Final = "Error: the configuration can't be read; nothing was created."
 _DUPLICATE: Final = "Error: a user with this email already exists."
 _MISMATCH: Final = "Error: the passwords don't match."
 _TOO_MANY_ATTEMPTS: Final = "Error: too many failed attempts; nothing was created."
@@ -354,12 +360,12 @@ async def _create_org_with_pool(
         _error(_DATABASE_UNAVAILABLE)
         return 1
     try:
-        app_config = await load_app_config_from_db(pool)
-    except _DATABASE_ERRORS:
-        _error(_DATABASE_UNAVAILABLE)
+        app_config = load_app_config(_CONFIG_PATH)
+    except OSError:
+        _error(_CONFIG_UNREADABLE)
         return 1
     except ValueError:
-        # Includes pydantic's ValidationError, whose text repeats the stored value.
+        # Includes pydantic's ValidationError, whose text repeats the value.
         _error(_INVALID_CONFIG)
         return 1
     try:

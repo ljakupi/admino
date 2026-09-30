@@ -19,8 +19,9 @@ What these tests pin (the GH-154 "CLI" decisions and spec):
   2. PG_PASSWORD is checked.
   3. ``load_smtp_config()`` picks the delivery. Without SMTP, stdout must be a terminal.
   4. Only then the database: ``init_pool(dsn, min_size=1, max_size=2)``,
-     ``run_migrations``, ``load_app_config_from_db`` (``server.public_url``, the link
-     base), ``organizations.create_org`` and ``close_pool``.
+     ``run_migrations``, ``load_app_config`` (config.yaml plus its env overrides:
+     ``server.public_url``, the link base; GH-159 dropped the settings table the
+     CLI used to read it from), ``organizations.create_org`` and ``close_pool``.
 - The service call gets the pool, an ``Operator`` actor and the validated request:
   the stripped name and email, the seats, a Decimal budget, GiB x 1024**3 bytes and the
   status ``active``. It also gets the language, the stored public URL, ``ip=None`` and
@@ -35,10 +36,11 @@ What these tests pin (the GH-154 "CLI" decisions and spec):
 - ``create-superadmin`` still dispatches as before.
 
 Inputs: argv and the PG_* env vars. These are patched: ``load_smtp_config``,
-``load_app_config_from_db``, ``init_pool``, ``run_migrations``, ``close_pool`` (all
-looked up on ``admino.admin_cli``) and ``admino.organizations.create_org`` (called
-through the module attribute). stdout and stderr are stand-in streams whose
-``isatty()`` answers what the test says.
+``load_app_config``, ``init_pool``, ``run_migrations``, ``close_pool`` (all
+looked up on ``admino.admin_cli``; ``load_app_config`` is admino.config's config.yaml
+loader, called with ``$CONFIG_DIR/config.yaml`` like main.py) and
+``admino.organizations.create_org`` (called through the module attribute). stdout
+and stderr are stand-in streams whose ``isatty()`` answers what the test says.
 Outputs: the exit code, the recorded calls and their order, stdout/stderr and log
 records.
 
@@ -72,6 +74,7 @@ from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -147,7 +150,7 @@ _DB_STEPS: list[str] = [
     "load_smtp_config",
     "init_pool",
     "run_migrations",
-    "load_app_config_from_db",
+    "load_app_config",
     "create_org",
     "close_pool",
 ]
@@ -256,7 +259,7 @@ class _Deps:
     load_smtp_config: MagicMock
     init_pool: AsyncMock
     run_migrations: AsyncMock
-    load_app_config: AsyncMock
+    load_app_config: MagicMock
     create_org: AsyncMock
     close_pool: AsyncMock
 
@@ -377,15 +380,28 @@ def deps(cli: ModuleType, created_org: Any, monkeypatch: pytest.MonkeyPatch) -> 
     )
     init_pool = AsyncMock(return_value=pool, side_effect=_logging(events, "init_pool"))
     run_migrations = AsyncMock(side_effect=_logging(events, "run_migrations"))
-    load_app_config = AsyncMock(
-        return_value=app_config, side_effect=_logging(events, "load_app_config_from_db")
+    load_app_config = MagicMock(
+        return_value=app_config, side_effect=_logging(events, "load_app_config")
     )
     create_org = AsyncMock(return_value=created_org, side_effect=_logging(events, "create_org"))
     close_pool = AsyncMock(side_effect=_logging(events, "close_pool"))
 
     with ExitStack() as stack:
         stack.enter_context(patch("admino.admin_cli.load_smtp_config", new=load_smtp_config))
-        stack.enter_context(patch("admino.admin_cli.load_app_config_from_db", new=load_app_config))
+        # GH-159: config.yaml's loader. create=True keeps the tests that never reach the
+        # config step running before the CLI imports it; the removed DB-backed loader
+        # must not be called (test_admin_cli_create_org_uses_the_config_yaml_loader
+        # pins the import).
+        stack.enter_context(
+            patch("admino.admin_cli.load_app_config", new=load_app_config, create=True)
+        )
+        if hasattr(cli, "load_app_config_from_db"):
+            stack.enter_context(
+                patch(
+                    "admino.admin_cli.load_app_config_from_db",
+                    new=AsyncMock(side_effect=AssertionError("the settings table is gone")),
+                )
+            )
         stack.enter_context(patch("admino.admin_cli.init_pool", new=init_pool))
         stack.enter_context(patch("admino.admin_cli.run_migrations", new=run_migrations))
         stack.enter_context(patch("admino.admin_cli.close_pool", new=close_pool))
@@ -591,11 +607,21 @@ class TestCreateOrgServiceCall:
 
         deps.run_migrations.assert_awaited_once_with(deps.pool)
 
-    def test_admin_cli_create_org_loads_the_stored_config_from_the_pool(self, deps: _Deps) -> None:
-        """load_app_config_from_db(pool) provides server.public_url."""
+    def test_admin_cli_create_org_loads_config_yaml(self, deps: _Deps) -> None:
+        """load_app_config($CONFIG_DIR/config.yaml) provides server.public_url (GH-159:
+        the settings table it used to come from is dropped)."""
         _run(deps, _argv())
 
-        deps.load_app_config.assert_awaited_once_with(deps.pool)
+        deps.load_app_config.assert_called_once_with(
+            Path(os.environ.get("CONFIG_DIR", "config")) / "config.yaml"
+        )
+
+    def test_admin_cli_create_org_uses_the_config_yaml_loader(self, cli: ModuleType) -> None:
+        """The CLI imports admino.config.load_app_config; the DB-backed loader is gone."""
+        from admino import config
+
+        assert getattr(cli, "load_app_config", None) is config.load_app_config
+        assert not hasattr(cli, "load_app_config_from_db")
 
     def test_admin_cli_create_org_calls_the_service_with_the_pool(self, deps: _Deps) -> None:
         """create_org gets the pool init_pool returned, and nothing else positionally."""
@@ -1353,7 +1379,7 @@ class TestCreateOrgSetupFailures:
 
         _run(deps, _argv())
 
-        deps.load_app_config.assert_not_awaited()
+        deps.load_app_config.assert_not_called()
         deps.create_org.assert_not_awaited()
         deps.close_pool.assert_awaited_once()
 
@@ -1370,7 +1396,7 @@ class TestCreateOrgSetupFailures:
     def test_admin_cli_create_org_invalid_stored_config_returns_one(
         self, deps: _Deps, make_error: Callable[[], Exception]
     ) -> None:
-        """load_app_config_from_db raises → exit 1, a fixed 'configuration is invalid'
+        """load_app_config raises → exit 1, a fixed 'configuration is invalid'
         message without the error's text, no service call, the pool closed.
         """
         deps.load_app_config.side_effect = make_error()
@@ -1384,9 +1410,9 @@ class TestCreateOrgSetupFailures:
         deps.create_org.assert_not_awaited()
         deps.close_pool.assert_awaited_once()
 
-    def test_admin_cli_create_org_stored_config_read_failure_returns_one(self, deps: _Deps) -> None:
-        """A driver error while reading the settings → exit 1, fixed text, pool closed."""
-        deps.load_app_config.side_effect = _driver_error()
+    def test_admin_cli_create_org_config_read_failure_returns_one(self, deps: _Deps) -> None:
+        """config.yaml can't be read (OSError) → exit 1, fixed text, pool closed."""
+        deps.load_app_config.side_effect = PermissionError(f"{_DRIVER_MARKER}: config.yaml")
 
         assert _run(deps, _argv()) == 1
 

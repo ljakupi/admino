@@ -57,6 +57,16 @@ export function canSendChat(role: ShellRole | null): boolean {
   return role !== null && CHAT_SEND_ROLES.includes(role);
 }
 
+const ORG_SETTINGS_MANAGE_ROLES: readonly ShellRole[] = ['org_admin'];
+
+/**
+ * Mirrors the backend's `Capability.ORG_SETTINGS_MANAGE`: Org Admin only.
+ * Gates the Tools page's per-service toggles and `/api/org/settings`.
+ */
+export function canManageOrgSettings(role: ShellRole | null): boolean {
+  return role !== null && ORG_SETTINGS_MANAGE_ROLES.includes(role);
+}
+
 /** Where a role lands after login: `/platform` for a Super Admin, `/chat` for members, `/login` for `null`. */
 export function homePath(role: ShellRole | null): string {
   if (role === 'super_admin') return '/platform';

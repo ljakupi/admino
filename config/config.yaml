@@ -42,16 +42,19 @@ llm:
   # replies explain what to set.
   # "vllm" (opt-in, local) is a first-class, OpenAI-compatible local server that
   # runs as a docker-compose CPU container (Apple Silicon + Linux). Start it with
-  # `make start-local` (provisions the model on first run), then select vLLM in
-  # Settings → Agent. Until the model finishes loading, chat replies say it is
+  # `make start-local` (provisions the model on first run), then set provider to
+  # "vllm" here. Until the model finishes loading, chat replies say it is
   # starting or unavailable.
   # "anthropic" and "openai" are cloud opt-ins that send your messages to their
-  # servers. Switch to one in Settings → Agent and set its API key.
+  # servers. Switch to one here and set its API key in the environment.
+  # This section is applied at every start. The provider and model IDs are also
+  # platform settings: the Super Admin can switch them at runtime with
+  # PATCH /api/platform/settings, until the next restart.
   provider: "infomaniak"
 
   timeout_s: 120
 
-  # Infomaniak model ID (choose another one in Settings → Agent).
+  # Infomaniak model ID.
   infomaniak_model: "Qwen/Qwen3.5-397B-A17B-FP8"
 
   # vLLM (local, opt-in) settings. vllm_model is the served model ID;
@@ -70,6 +73,7 @@ llm:
   anthropic_model: "claude-sonnet-4-6"
   openai_model: "gpt-4o"
 
+# Seeds the platform settings on the first start; later edits here don't apply.
 limits:
   max_tool_calls_per_message: 10
   max_pending_confirmations: 3

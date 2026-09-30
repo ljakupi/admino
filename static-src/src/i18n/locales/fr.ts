@@ -72,14 +72,12 @@ export const fr: Record<MessageKey, Message> = {
   'toast.criticalPermissions.disabled': 'Désactivé : {permission}',
   'toast.criticalPermissions.disableFailed.title': 'Échec de la désactivation',
 
-  // --- settings (fallback error strings, agent trust note) -----------------
+  // --- settings (fallback error strings) ------------------------------------
   'settings.error.loadFailed': 'Impossible de charger les paramètres',
   'settings.error.saveFailed': "Impossible d'enregistrer les paramètres",
   'settings.error.unexpectedRedirect': 'URL de redirection OAuth inattendue.',
   'settings.error.oauthStartFailed': 'Impossible de démarrer le processus OAuth',
   'settings.error.disconnectFailed': 'Échec de la déconnexion',
-  'settings.agent.trustNote':
-    'Les paramètres, le journal d’audit et la mémoire sont stockés sur votre serveur admino. Seul {provider} traite le contenu de la conversation.',
 
   // --- permissions (fallback error strings, critical permission copy) ------
   'permissions.error.loadFailed': 'Impossible de charger les autorisations',
@@ -265,7 +263,6 @@ export const fr: Record<MessageKey, Message> = {
   'settings.nav.group.app': 'Application',
   'settings.nav.group.system': 'Système',
   'settings.nav.session': 'Session',
-  'settings.nav.agent': 'Agent',
   'settings.nav.appearance': 'Apparence',
   'settings.nav.notifications': 'Notifications',
   'settings.nav.about': 'À propos',
@@ -275,31 +272,6 @@ export const fr: Record<MessageKey, Message> = {
   'settings.session.id.hint': 'Lettres, chiffres, tirets, traits de soulignement. 64 caractères max.',
   'settings.session.new.label': 'Nouvelle session',
   'settings.session.new.hint': 'Vide le fil de discussion.',
-  'settings.agent.subtitle':
-    'Le LLM avec lequel admino communique. Infomaniak est utilisé par défaut; vLLM (conteneur CPU local), Claude et OpenAI sont des alternatives optionnelles.',
-  'settings.agent.provider.label': 'Fournisseur',
-  'settings.agent.provider.hint':
-    'Infomaniak, Claude et OpenAI envoient vos messages à leurs serveurs pour traitement. vLLM est une alternative locale et optionnelle que vous exécutez vous-même.',
-  'settings.agent.model.label': 'Modèle',
-  'settings.agent.model.placeholder': 'p. ex. {example}',
-  'settings.agent.model.emptyError': 'Le nom du modèle ne doit pas être vide',
-  'settings.agent.model.exactIdHint': 'ID exact du modèle, p. ex. {example}. Voir {link}.',
-  'settings.agent.anthropic.modelList': "la liste des modèles d'Anthropic",
-  'settings.agent.openai.modelList': "la liste des modèles d'OpenAI",
-  'settings.agent.infomaniak.noModels':
-    'Aucun modèle répertorié — définissez {env} sur le serveur pour les charger.',
-  'settings.agent.infomaniak.privacy':
-    "Traitement en Suisse; les requêtes ne sont ni enregistrées ni utilisées pour l'entraînement (Infomaniak).",
-  'settings.agent.vllm.noModels':
-    'Aucun modèle servi détecté — le conteneur vLLM local est optionnel : démarrez-le avec {cmd}.',
-  'settings.agent.vllm.modelHint':
-    "L'ID du dépôt HuggingFace du modèle servi par le conteneur CPU vLLM local.",
-  'settings.agent.apiToken.label': "Jeton d'API",
-  'settings.agent.apiKey.label': "Clé d'API",
-  'settings.agent.secretHint':
-    "{env} · Défini sur le serveur comme variable d'environnement. Jamais envoyé à votre navigateur.",
-  'settings.agent.secret.configured': 'Configuré',
-  'settings.agent.secret.notConfigured': 'Non configuré',
   'settings.appearance.subtitle':
     "L'apparence de l'interface. Les modifications s'appliquent immédiatement.",
   'settings.appearance.theme.label': 'Thème',
@@ -323,7 +295,6 @@ export const fr: Record<MessageKey, Message> = {
   'settings.about.versionValue': 'admino {version} (Alpha)',
   'settings.about.sourceCode': 'Code source',
   'settings.about.license': 'Licence',
-  'settings.about.trustTitle': 'Votre serveur admino',
   'settings.danger.subtitle': 'Ces actions sont irréversibles. Chacune demande une confirmation.',
   'settings.danger.clear.label': 'Effacer la conversation',
   'settings.danger.clear.hint':

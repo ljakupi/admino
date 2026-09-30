@@ -16,10 +16,15 @@
  * - `canSendChat(role)` mirrors `Capability.CHAT_SEND`: Org Admin and Editor.
  * - `homePath(role)`: '/platform' for a Super Admin, '/chat' for members,
  *   '/login' for `null`.
+ * - `canManageOrgSettings(role)` (issue #159) mirrors
+ *   `Capability.ORG_SETTINGS_MANAGE`: Org Admin only. It gates the Tools
+ *   page's service toggles and `/api/org/settings`; every other role, `null`
+ *   and unknown or prototype-key strings are refused (never a thrown error).
  */
 import { describe, it, expect } from 'vitest';
 import {
   canAccessArea,
+  canManageOrgSettings,
   canSendChat,
   homePath,
   shellRole,
@@ -158,6 +163,31 @@ describe('access canSendChat', () => {
       expect(canSendChat(role as ShellRole)).toBe(false);
     },
   );
+});
+
+// --- canManageOrgSettings (issue #159) ------------------------------------
+
+describe('access canManageOrgSettings', () => {
+  it.each([
+    ['org_admin', true],
+    ['editor', false],
+    ['viewer', false],
+    ['super_admin', false],
+    [null, false],
+  ] as Array<[ShellRole | null, boolean]>)('%s may manage the org settings: %s', (role, expected) => {
+    expect(canManageOrgSettings(role)).toBe(expected);
+  });
+
+  it.each(['owner', 'admin', 'Org_Admin', 'ORG_ADMIN', ' org_admin', '', '__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'refuses the org settings to the unknown role %j without throwing',
+    (role) => {
+      expect(canManageOrgSettings(role as ShellRole)).toBe(false);
+    },
+  );
+
+  it('grants the org settings only to roles that may open the Tools page', () => {
+    expect(ROLES.filter((role) => canManageOrgSettings(role) && !canAccessArea(role, 'tools'))).toEqual([]);
+  });
 });
 
 // --- homePath -------------------------------------------------------------

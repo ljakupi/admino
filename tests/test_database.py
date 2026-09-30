@@ -1,5 +1,8 @@
 """Tests for admino.database — pool lifecycle, migrations, seeds, and loaders.
 
+GH-159: the settings table helpers (seed_settings, update_setting,
+load_settings_from_db) are gone with the table.
+
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
 Security notes:
@@ -243,147 +246,17 @@ class TestRunMigrations:
 
 
 # ---------------------------------------------------------------------------
-# TestSeedSettings
+# The settings table helpers are gone (GH-159)
 # ---------------------------------------------------------------------------
 
 
-class TestSeedSettings:
-    """Tests for seed_settings()."""
+class TestSettingsTableHelpersRemoved:
+    """GH-159: migration 0013 drops the key/value settings table; its seed, update and
+    load helpers go with it (the scopes live in admino.scoped_settings)."""
 
-    async def test_seeds_when_table_is_empty(self, mock_pool: MagicMock) -> None:
-        """seed_settings() inserts rows when settings table is empty."""
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        mock_config = MagicMock()
-        for section in ("server", "llm", "limits", "egress", "database"):
-            getattr(mock_config, section).model_dump = MagicMock(return_value={"key": "val"})
-        mock_config.log_level = "INFO"
-        # GH-143: the files tool config is gone — seeding must never read it.
-        del mock_config.files
-        # GH-147: so is the paths section (its last field was the audit log path).
-        del mock_config.paths
-        # GH-149: and the auth section (auth.mode / AUTH_TOKEN were removed).
-        del mock_config.auth
-
-        await db_mod.seed_settings(mock_pool, mock_config)
-
-        # 6 sections: server, llm, limits, egress, database, log_level
-        insert_calls = [
-            c
-            for c in conn.execute.call_args_list
-            if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
-        ]
-        assert len(insert_calls) == 6
-
-    async def test_seed_settings_does_not_seed_files_row(
-        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A fresh install gets no 'files' settings row (GH-143) and no 'auth' row (GH-149)."""
-        from admino.config import AppConfig
-
-        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        await db_mod.seed_settings(mock_pool, AppConfig())
-
-        seeded_keys = {
-            c.args[1]
-            for c in conn.execute.call_args_list
-            if len(c.args) > 1 and "INSERT INTO settings" in c.args[0]
-        }
-        assert seeded_keys == {
-            "server",
-            "llm",
-            "limits",
-            "egress",
-            "database",
-            "log_level",
-        }
-
-    async def test_seed_settings_does_not_seed_auth_row(
-        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """GH-149: auth.mode is gone, so a fresh install gets no 'auth' settings row."""
-        from admino.config import AppConfig
-
-        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
-        monkeypatch.delenv("AUTH_TOKEN", raising=False)
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        await db_mod.seed_settings(mock_pool, AppConfig())
-
-        seeded_keys = [
-            c.args[1]
-            for c in conn.execute.call_args_list
-            if len(c.args) > 1 and "INSERT INTO settings" in c.args[0]
-        ]
-        assert seeded_keys != []
-        assert "auth" not in seeded_keys
-
-    async def test_seed_settings_seeds_cookie_secure_in_server_row(
-        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The server row carries the new cookie_secure flag (default True)."""
-        import json
-
-        from admino.config import AppConfig
-
-        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        await db_mod.seed_settings(mock_pool, AppConfig())
-
-        server_rows = [
-            json.loads(c.args[2])
-            for c in conn.execute.call_args_list
-            if len(c.args) > 2 and "INSERT INTO settings" in c.args[0] and c.args[1] == "server"
-        ]
-        assert len(server_rows) == 1
-        assert server_rows[0]["cookie_secure"] is True
-
-    async def test_seed_settings_default_llm_is_infomaniak(
-        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The settings seed from a default AppConfig selects Infomaniak (GH-142)."""
-        import json
-
-        from admino.config import AppConfig
-
-        monkeypatch.delenv("INFOMANIAK_API_TOKEN", raising=False)
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        await db_mod.seed_settings(mock_pool, AppConfig())
-
-        llm_rows = [
-            c.args[2]
-            for c in conn.execute.call_args_list
-            if len(c.args) > 2 and "INSERT INTO settings" in c.args[0] and c.args[1] == "llm"
-        ]
-        assert len(llm_rows) == 1
-        llm = json.loads(llm_rows[0])
-        assert llm["provider"] == "infomaniak"
-        assert llm["infomaniak_model"] == "Qwen/Qwen3.5-397B-A17B-FP8"
-
-    async def test_skips_when_table_has_rows(self, mock_pool: MagicMock) -> None:
-        """seed_settings() skips seeding when settings table already has rows."""
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=10)
-
-        mock_config = MagicMock()
-        await db_mod.seed_settings(mock_pool, mock_config)
-
-        insert_calls = [
-            c
-            for c in conn.execute.call_args_list
-            if len(c.args) > 0 and "INSERT INTO settings" in c.args[0]
-        ]
-        assert len(insert_calls) == 0
+    @pytest.mark.parametrize("name", ["seed_settings", "update_setting", "load_settings_from_db"])
+    def test_database_settings_table_helper_is_removed(self, name: str) -> None:
+        assert not hasattr(db_mod, name)
 
 
 # ---------------------------------------------------------------------------
@@ -450,121 +323,6 @@ class TestSeedPermissions:
         assert insert_calls[0].args[1] == "gmail"
         assert insert_calls[0].args[2] == "read"
         assert insert_calls[0].args[3] == "allow"
-
-
-# ---------------------------------------------------------------------------
-# TestLoadSettingsFromDb
-# ---------------------------------------------------------------------------
-
-
-class TestLoadSettingsFromDb:
-    """Tests for load_settings_from_db()."""
-
-    async def test_returns_correct_dict_structure(self, mock_pool: MagicMock) -> None:
-        """load_settings_from_db() returns a dict keyed by section name."""
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(
-            return_value=[
-                {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
-                {"key": "llm", "value": {"provider": "anthropic"}},
-            ]
-        )
-
-        result = await db_mod.load_settings_from_db(mock_pool)
-
-        assert result["server"] == {"host": "127.0.0.1", "port": 8000}
-        assert result["llm"] == {"provider": "anthropic"}
-
-    async def test_unwraps_log_level(self, mock_pool: MagicMock) -> None:
-        """load_settings_from_db() unwraps log_level from {"value": "X"} to "X"."""
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(
-            return_value=[
-                {"key": "log_level", "value": {"value": "DEBUG"}},
-            ]
-        )
-
-        result = await db_mod.load_settings_from_db(mock_pool)
-
-        assert result["log_level"] == "DEBUG"
-
-    async def test_strips_null_fields_within_section(self, mock_pool: MagicMock) -> None:
-        """A null field inside a section is dropped so the model default applies.
-
-        A persisted NULL means "not set" — Pydantic only applies a field
-        default when the key is absent, not when it is explicitly None. See
-        the openai_model startup-failure regression.
-        """
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(
-            return_value=[
-                {
-                    "key": "llm",
-                    "value": {"provider": "anthropic", "openai_model": None, "model": "x"},
-                },
-            ]
-        )
-
-        result = await db_mod.load_settings_from_db(mock_pool)
-
-        assert "openai_model" not in result["llm"]
-        assert result["llm"] == {"provider": "anthropic", "model": "x"}
-
-    async def test_drops_top_level_none_section(self, mock_pool: MagicMock) -> None:
-        """A top-level section persisted as NULL is dropped entirely."""
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(
-            return_value=[
-                {"key": "llm", "value": {"provider": "anthropic"}},
-                {"key": "appearance", "value": None},
-            ]
-        )
-
-        result = await db_mod.load_settings_from_db(mock_pool)
-
-        assert "appearance" not in result
-        assert result["llm"] == {"provider": "anthropic"}
-
-    async def test_app_config_loads_when_openai_model_is_null(
-        self, mock_pool: MagicMock, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Regression: a persisted null openai_model must not break startup.
-
-        Reproduces the container boot failure where the seeded llm row stored
-        ``openai_model: null`` (config.yaml omitted it after defaults were
-        dropped). load_app_config_from_db must fall back to the field default
-        rather than raising a validation error. Asserting against the declared
-        field default keeps this robust whether the default is a literal string
-        or None (it became optional in the LLM-config change).
-        """
-        from admino.config import LLMConfig, load_app_config_from_db
-
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(
-            return_value=[
-                {"key": "server", "value": {"host": "127.0.0.1", "port": 8000}},
-                {
-                    "key": "llm",
-                    "value": {
-                        "provider": "anthropic",
-                        "anthropic_model": "claude-sonnet-4-6",
-                        "openai_model": None,
-                    },
-                },
-                # A legacy row (migration 0007 deletes it); the loader ignores it.
-                {"key": "auth", "value": {"mode": "vpn"}},
-                {"key": "paths", "value": {}},
-                {"key": "limits", "value": {}},
-                {"key": "egress", "value": {}},
-                {"key": "database", "value": {}},
-                {"key": "log_level", "value": {"value": "INFO"}},
-            ]
-        )
-
-        config = await load_app_config_from_db(mock_pool)
-
-        assert config.llm.openai_model == LLMConfig.model_fields["openai_model"].default
-        assert config.llm.provider == "anthropic"
 
 
 # ---------------------------------------------------------------------------

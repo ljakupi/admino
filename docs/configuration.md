@@ -15,6 +15,7 @@ admino is configured by two things:
 - [Infomaniak AI Services (default)](#infomaniak-ai-services-default)
 - [Local vLLM (CPU container)](#local-vllm-cpu-container)
 - [`config.yaml` reference](#configyaml-reference)
+- [Settings: mine, organization, platform](#settings-mine-organization-platform)
 - [Accounts and sessions](#accounts-and-sessions)
 - [Email (SMTP)](#email-smtp)
 - [Production deployment (TLS reverse proxy)](#production-deployment-tls-reverse-proxy)
@@ -44,14 +45,16 @@ The chat replies with what's wrong and what to do (for example "Infomaniak isn't
 configured; set INFOMANIAK_API_TOKEN on the server"). Unexpected internal errors get a
 generic "try again" reply and are logged without message content.
 
-![Settings → Agent provider control](screenshots/settings-agent.png)
+**Switching providers.** The provider is a platform setting: it applies to every
+organization, and only the Super Admin can change it.
 
-<sub>Settings → Agent — pick the provider and its model.</sub>
-
-**Switching providers:**
-
-- In the UI: **Settings → Agent**, pick the provider.
-- Or set `LLM_PROVIDER` in the environment (overrides `config.yaml`).
+- Set `llm.provider` in `config.yaml`, or `LLM_PROVIDER` in the environment (it overrides
+  `config.yaml`), and restart. `config.yaml`'s `llm` section is applied again at every
+  start.
+- Or, as the Super Admin, `PATCH /api/platform/settings` with e.g.
+  `{"llm": {"provider": "vllm"}}` (see [Settings](#settings-mine-organization-platform)).
+  The switch applies at once, until the next restart. There's no page for it yet; the
+  Platform console adds one.
 - Model IDs live in `config.yaml` under `llm` (`infomaniak_model`, `vllm_model`,
   `anthropic_model`, `openai_model`); all stay set so switching needs no model edit. The
   API key still comes from the environment.
@@ -69,7 +72,7 @@ admino talks to Infomaniak's OpenAI-compatible endpoint
 
 **Models.** The default is `Qwen/Qwen3.5-397B-A17B-FP8` (`llm.infomaniak_model`), with
 `Qwen/Qwen3.5-122B-A10B-FP8` as the smaller alternative. Both take text and images, accept
-up to 200,000 input tokens and support function calling. **Settings → Agent** lists the
+up to 200,000 input tokens and support function calling. As the Super Admin, `GET /api/platform/settings` lists the
 models your product offers (`GET …/openai/v1/models`) and shows whether the token is
 configured.
 
@@ -120,7 +123,8 @@ make vllm-down   # stop just the vllm container (agent + postgres keep running)
 
 `make start` / `make docker-up` no longer start vllm. `make start-local` is the
 one-command path for the local model: it checks the volume first and skips the download
-if the model is already provisioned. Then pick **vLLM** in **Settings → Agent**.
+if the model is already provisioned. Then switch the provider to `vllm` (see
+[Switching providers](#llm-providers)).
 
 ### Override the model or endpoint
 
@@ -140,11 +144,32 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | --- | --- |
 | `server` | Bind `host` / `port` for the ASGI server, the session cookie's `cookie_secure` flag, the `public_url` users open admino at, and the `trusted_proxies` whose `X-Forwarded-*` headers are believed (see [Production deployment](#production-deployment-tls-reverse-proxy)). |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
-| `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. |
-| `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). |
+| `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. The provider and model IDs are also [platform settings](#settings-mine-organization-platform); this section is applied again at every start. |
+| `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 | `log_level` | Top-level key: `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. The `LOG_LEVEL` env var overrides it. |
 | `log_format` | Top-level key: `text` (default) or `json`, one JSON object per line (`ts`, `level`, `logger`, `message`, `request_id`) for a log collector. The `LOG_FORMAT` env var overrides it (`text` or `json`, any case; another value is ignored with a warning). Logs never hold content, see [Logs and error tracking](SECURITY.md#logs-and-error-tracking). |
+
+## Settings: mine, organization, platform
+
+Settings have three scopes. Each has an owner and its own route; any other role gets
+`403`.
+
+| Scope | Who changes it | Route | What it holds |
+| --- | --- | --- | --- |
+| **Mine** | every account | `GET` / `PATCH /api/me/settings` | Theme and notifications. The **Settings** page shows only these. |
+| **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. On the **Tools** page, Org Admins see the switches. |
+| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, and the platform limits (from `config.yaml`'s `limits`, read-only for now). |
+
+- The UI and response languages belong to your account, not to these settings.
+- Organization and platform changes are recorded in the audit log: which fields changed,
+  and a tool's old and new on/off state. Model names are never recorded.
+- **For now, a tool service one organization switches off is off for every organization**,
+  and no organization can switch it back on for the others. Per-organization tool
+  policies replace this in a later release.
+- Upgrading from a version with the single `settings` table drops it: everyone starts from
+  the defaults (light theme, notifications on, every tool service on), and the platform
+  settings start from `config.yaml`.
 
 ## Accounts and sessions
 
@@ -424,7 +449,8 @@ certificate authority instead of Let's Encrypt. Check it with curl, e.g.
 
 ## Data & storage
 
-PostgreSQL holds `settings`, `permissions`, `memory` notes, `oauth_tokens`, the
+PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, `permissions`,
+`memory` notes, `oauth_tokens`, the
 `audit_events` audit trail, and the `email_outbox` of queued transactional email.
 
 - **OAuth tokens** are stored as **encrypted ciphertext only**. The Fernet encryption key

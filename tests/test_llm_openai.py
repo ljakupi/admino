@@ -1018,7 +1018,7 @@ class TestOpenAIUserFacingErrors:
     async def test_openai_missing_model_chat_user_facing(
         self, monkeypatch: pytest.MonkeyPatch, model: str | None
     ) -> None:
-        """No model → "No OpenAI model is set … Settings → Agent", no API call."""
+        """No model → "No OpenAI model is set … ask your administrator", no API call."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test123")
         client, create = _mocked_client(model=model)
 
@@ -1029,7 +1029,8 @@ class TestOpenAIUserFacingErrors:
         assert exc_info.value.user_facing is True
         assert exc_info.value.status_code is None
         assert "No OpenAI model is set" in message
-        assert "Settings → Agent" in message
+        assert "ask your administrator" in message
+        assert "Settings → Agent" not in message  # GH-159: that section is gone
         create.assert_not_awaited()
 
     @pytest.mark.parametrize(
@@ -1037,7 +1038,7 @@ class TestOpenAIUserFacingErrors:
         [
             (openai.AuthenticationError, 401, ("OpenAI", "rejected the API", "OPENAI_API_KEY")),
             (openai.PermissionDeniedError, 403, ("OpenAI", "rejected the API", "OPENAI_API_KEY")),
-            (openai.NotFoundError, 404, ("OpenAI", "Settings → Agent")),
+            (openai.NotFoundError, 404, ("OpenAI", "ask your administrator")),
             (openai.RateLimitError, 429, ("OpenAI", "rate limit")),
             (openai.InternalServerError, 500, ("OpenAI", "temporarily unavailable")),
             (openai.InternalServerError, 502, ("OpenAI", "temporarily unavailable")),

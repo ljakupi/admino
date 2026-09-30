@@ -1456,7 +1456,7 @@ class TestInfomaniakMissingSetup:
     async def test_infomaniak_chat_missing_model_user_facing(
         self, ik: ModuleType, fake: FakeInfomaniak, model: str | None
     ) -> None:
-        """No model → "No Infomaniak model is set … Settings → Agent", no request."""
+        """No model → "No Infomaniak model is set … ask your administrator", no request."""
         instance = ik.InfomaniakClient(_config(infomaniak_model=model))
         with pytest.raises(LLMError) as exc_info:
             await instance.chat(_msgs())
@@ -1465,7 +1465,8 @@ class TestInfomaniakMissingSetup:
         assert exc_info.value.user_facing is True
         assert exc_info.value.status_code is None
         assert "No Infomaniak model is set" in message
-        assert "Settings → Agent" in message
+        assert "ask your administrator" in message
+        assert "Settings → Agent" not in message  # GH-159: that section is gone
         assert fake.chat_requests == []
 
 
@@ -1477,7 +1478,7 @@ class TestInfomaniakMissingSetup:
 _USER_FACING_STATUS_CASES: list[tuple[int, tuple[str, ...]]] = [
     (401, ("Infomaniak rejected the API token",)),
     (403, ("Infomaniak rejected the API token",)),
-    (404, ("Infomaniak", "Settings → Agent")),
+    (404, ("Infomaniak", "ask your administrator")),
     (429, ("Infomaniak", "rate limit")),
     (500, ("Infomaniak", "temporarily unavailable")),
     (502, ("Infomaniak", "temporarily unavailable")),

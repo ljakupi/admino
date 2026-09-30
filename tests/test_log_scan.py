@@ -38,8 +38,8 @@ the in-memory database tests/db_fakes.FakeDb:
    the title as subject and the file name as attachment. A second turn's LLM
    call raises an ``LLMError`` whose message holds fixture strings.
 7. The Google OAuth callback stores a token for the fixture Google account.
-8. ``GET /api/settings`` whose settings loader raises ``RuntimeError(<fixture
-   text>)``.
+8. ``GET /api/permissions`` whose permissions loader raises
+   ``RuntimeError(<fixture text>)`` (GH-159 removed ``/api/settings``).
 9. ``GET /health``.
 
 What these tests pin down:
@@ -751,13 +751,13 @@ def _connect_google(db: FakeDb, client: TestClient) -> None:
 
 
 def _crash(app: FastAPI, session: str) -> httpx.Response:
-    """Step 8: GET /api/settings, whose settings loader raises with fixture text."""
+    """Step 8: GET /api/permissions, whose permissions loader raises with fixture text."""
     client = TestClient(
         app, client=(_IP, 50000), follow_redirects=False, raise_server_exceptions=False
     )
     failing_loader = AsyncMock(side_effect=RuntimeError(_CRASH_TEXT))
-    with patch("admino.database.load_settings_from_db", failing_loader):
-        response = client.get("/api/settings", headers=_cookie(session))
+    with patch("admino.database.load_permissions_from_db", failing_loader):
+        response = client.get("/api/permissions", headers=_cookie(session))
     assert failing_loader.await_count == 1
     assert response.status_code == 500
     return response

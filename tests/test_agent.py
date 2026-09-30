@@ -1390,7 +1390,7 @@ class TestAgentErrorHandling:
         agent_config: AgentConfig,
     ) -> None:
         """The friendly message is the assistant turn in history; nothing is audited."""
-        message = "No Infomaniak model is set; choose one in Settings → Agent."
+        message = "No Infomaniak model is set; ask your administrator to choose one."
         fake = FakeLLM([])
         fake.raise_on_call = LLMError(message, None, user_facing=True)
         agent = _build_agent(fake, recorder, permissions_config, agent_config)

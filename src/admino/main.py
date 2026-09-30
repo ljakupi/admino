@@ -6,9 +6,12 @@ Startup sequence:
    (text, or structured JSON lines with a per-request ID).
 3. Load the bundled common-password list (the password policy's list check).
 4. Build the default permissions ruleset (seeds an empty DB on first run).
-5. Initialise the database: run migrations, seed, then load config,
-   permissions and per-tool enabled state from the DB. No organization is
-   created: a fresh install starts with none.
+5. Initialise the database: run migrations, seed the platform settings row
+   from config.yaml (its llm on every boot, its limits once) and the
+   permissions, then overlay the stored platform LLM and limits onto the
+   config, load the permissions and the interim tools gate (a service any
+   org turned off stays off, until #161). No organization is created: a
+   fresh install starts with none.
 6. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
@@ -63,13 +66,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, TextIO
 
 import uvicorn
-from pydantic import ValidationError
 
 from admino import passwords
 from admino.config import load_app_config
 from admino.llm import LLMError
 from admino.logs import JsonFormatter, RequestIdFilter, TextFormatter, safe_log
-from admino.models import AgentConfig, ToolsSettings
+from admino.models import AgentConfig
 from admino.permissions import build_default_permissions_config
 
 if TYPE_CHECKING:
@@ -359,45 +361,44 @@ async def _async_startup(
     config: AppConfig,
     permissions_config: PermissionsConfig,
 ) -> tuple[AppConfig, PermissionsConfig, dict[str, bool]]:
-    """Initialise database, run migrations, seed data, and load config from DB.
+    """Initialise the database, run migrations, seed, and load the runtime settings.
 
     Creates no organization: a fresh install starts with none.
 
-    Returns the DB-loaded config and permissions (which become the runtime
-    source of truth) plus the persisted per-tool enabled state.
+    In order: migrations; the platform settings row seeded from config.yaml
+    (its llm re-applied on every boot, its limits stored once); the permission
+    seed; the config overlaid with the stored platform LLM and limits (every
+    other section stays as config.yaml and its env overrides set it); the
+    permissions loaded; and the tools gate.
 
-    The tools-enabled map is loaded here, while the startup pool is still
-    open, so it can be passed into the ``Agent`` at construction time. This
-    is the security-critical fix for GH-80: a service the user toggled
-    **off** must stay off across a server restart — the gate has to be
-    active on the very first dispatch, before any PATCH arrives. Missing or
-    corrupt ``tools`` settings fall back to ``ToolsSettings`` defaults
-    (all enabled).
+    The tools gate is read here, while the startup pool is still open, so it
+    is active on the Agent's very first dispatch (GH-80: a service turned off
+    stays off across a restart). Until #161 it is the interim AND over every
+    org's ``org_settings`` row (``scoped_settings.all_orgs_tools_gate``): a
+    service is off when any org turned it off.
 
     Args:
-        config: The YAML-loaded application config (used for seeding).
-        permissions_config: The YAML-loaded permissions config (used for seeding).
+        config: The config.yaml-loaded application config (used for seeding).
+        permissions_config: The default permissions config (used for seeding).
 
     Returns:
-        A tuple of ``(db_config, db_permissions, tools_enabled)`` loaded from
-        the database. ``tools_enabled`` is a full ``ToolsSettings`` dump
-        (every tool name mapped to a bool).
+        A tuple of ``(config, db_permissions, tools_enabled)``: the config
+        overlaid with the platform row, the permissions loaded from the
+        database, and every tool name mapped to a bool.
 
     Raises:
         ValueError: If PG_PASSWORD is not set.
         RuntimeError: If the database health check fails.
     """
-    from admino.config import load_app_config_from_db, load_permissions_config_from_db
+    from admino import scoped_settings
+    from admino.config import load_permissions_config_from_db
     from admino.database import (
         check_health,
         close_pool,
         database_url_from_env,
         init_pool,
-        load_settings_from_db,
         run_migrations,
         seed_permissions,
-        seed_settings,
-        update_setting,
     )
 
     database_url = database_url_from_env()
@@ -417,37 +418,21 @@ async def _async_startup(
         raise RuntimeError(msg)
 
     await run_migrations(pool)
-    await seed_settings(pool, config)
+    await scoped_settings.seed_platform_settings(pool, config)
     await seed_permissions(pool, permissions_config)
 
-    # config.yaml is authoritative for the LLM section on every boot. The
-    # settings table is only seeded once (when empty), so without this the DB
-    # would keep a stale provider/model after config.yaml is edited. Re-apply
-    # the validated llm section from config.yaml so edits always take effect.
-    await update_setting(pool, "llm", config.llm.model_dump(mode="json"))
-
-    db_config = await load_app_config_from_db(pool)
+    runtime_config = scoped_settings.apply_platform_settings(
+        config, await scoped_settings.load_platform_settings(pool)
+    )
     db_permissions = await load_permissions_config_from_db(pool)
-
-    # GH-80: Load the persisted per-tool enabled state while the pool is open
-    # so the gate can be active at Agent construction time. A service the user
-    # toggled off must remain off across a restart — not silently re-enabled
-    # until the first PATCH. Corrupt/missing tools data falls back to defaults
-    # (all enabled) rather than failing startup.
-    db_settings = await load_settings_from_db(pool)
-    tools_data = db_settings.get("tools", {})
-    try:
-        tools_enabled = ToolsSettings.model_validate(tools_data).model_dump()
-    except ValidationError:
-        logger.warning("Corrupt tools settings in DB — defaulting to all enabled.")
-        tools_enabled = ToolsSettings().model_dump()
+    tools_enabled = await scoped_settings.all_orgs_tools_gate(pool)
 
     # Close the pool — it was created on asyncio.run()'s event loop which
     # will be destroyed when asyncio.run() returns.  The server lifespan
     # creates a fresh pool on uvicorn's event loop for runtime use.
     await close_pool()
 
-    return db_config, db_permissions, tools_enabled
+    return runtime_config, db_permissions, tools_enabled
 
 
 def main(
