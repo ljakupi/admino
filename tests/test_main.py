@@ -26,6 +26,12 @@ covering:
   so its own X-Forwarded-* handling (which trusts 127.0.0.1 or the
   FORWARDED_ALLOW_IPS env var) never runs; the app's ``server.trusted_proxies``
   is the only source of truth.
+- GH-158: main() calls ``_configure_logging(config.log_level, config.log_format)``
+  and runs uvicorn with ``log_config=None`` (and ``access_log=False``), so
+  uvicorn's own loggers install no handlers of their own and go through the
+  root handler (JSON or text, no tracebacks). A database startup failure is
+  logged by exception type only: a DSN or password in the exception message
+  never reaches the log.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -36,6 +42,7 @@ Security notes:
 from __future__ import annotations
 
 import ast
+import inspect
 import logging
 import uuid
 from pathlib import Path
@@ -69,6 +76,7 @@ def _make_mock_config() -> MagicMock:
     """Build a minimal mock AppConfig with all fields main.py accesses."""
     config = MagicMock()
     config.log_level = "INFO"
+    config.log_format = "text"
     # GH-147: AppConfig has no paths section any more (the NDJSON audit log path
     # was its last field), so main() must never read it.
     del config.paths
@@ -688,6 +696,79 @@ class TestUvicornProxyHeaders:
 
 
 # ---------------------------------------------------------------------------
+# GH-158: logging wiring (format, uvicorn's loggers)
+# ---------------------------------------------------------------------------
+
+_UVICORN_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi")
+
+
+class TestMainLoggingWiring:
+    """main() configures the chosen log format and leaves uvicorn's loggers to the root."""
+
+    @pytest.mark.parametrize("log_format", ["json", "text"])
+    def test_main_passes_log_format_to_configure_logging(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch, log_format: str
+    ) -> None:
+        mock_deps["config"].log_level = "WARNING"
+        mock_deps["config"].log_format = log_format
+        spy = MagicMock()
+        monkeypatch.setattr("admino.main._configure_logging", spy)
+
+        main(config_path=Path("c.yaml"))
+
+        spy.assert_called_once()
+        bound = inspect.signature(_configure_logging).bind(
+            *spy.call_args.args, **spy.call_args.kwargs
+        )
+        assert (bound.arguments.get("level_name"), bound.arguments.get("log_format")) == (
+            "WARNING",
+            log_format,
+        )
+
+    def test_uvicorn_log_config_is_none(self, mock_deps: dict[str, Any]) -> None:
+        """uvicorn's default LOGGING_CONFIG (its own formatter, tracebacks) is never applied."""
+        main(config_path=Path("c.yaml"))
+
+        kw = mock_deps["uvicorn_run"].call_args.kwargs
+        assert "log_config" in kw
+        assert kw["log_config"] is None
+
+    def test_uvicorn_config_from_main_leaves_its_loggers_to_the_root_handler(
+        self, mock_deps: dict[str, Any]
+    ) -> None:
+        """Fed into a real uvicorn.Config, main()'s arguments install no uvicorn handler:
+        uvicorn's error logger propagates to the root handler admino configured."""
+        main(config_path=Path("c.yaml"))
+        kwargs = {**mock_deps["uvicorn_run"].call_args.kwargs, "ws": "none"}
+        # Checked first, so uvicorn's dictConfig never runs in this process.
+        assert kwargs.get("log_config", "missing") is None
+
+        async def asgi_app(scope: Any, receive: Any, send: Any) -> None:
+            """A stand-in ASGI app (never called)."""
+
+        loggers = [logging.getLogger(name) for name in _UVICORN_LOGGERS]
+        saved = [(lg.handlers[:], lg.level, lg.propagate, lg.disabled) for lg in loggers]
+        try:
+            for lg in loggers:
+                lg.handlers = []
+                lg.propagate = True
+            uvicorn.Config(asgi_app, **kwargs)
+            state = [
+                (lg.name, lg.handlers, lg.propagate)
+                for lg in loggers
+                if lg.name in {"uvicorn", "uvicorn.error"}
+            ]
+        finally:
+            for lg, (handlers, level, propagate, disabled) in zip(loggers, saved, strict=True):
+                lg.handlers = handlers
+                lg.setLevel(level)
+                lg.propagate = propagate
+                lg.disabled = disabled
+
+        assert state == [("uvicorn", [], True), ("uvicorn.error", [], True)]
+
+
+# ---------------------------------------------------------------------------
 # Security invariant tests (AST scan)
 # ---------------------------------------------------------------------------
 
@@ -835,6 +916,41 @@ class TestMainDatabaseStartupFailures:
             main(config_path=Path("c.yaml"))
 
         assert exc_info.value.code == 1
+
+    @pytest.mark.parametrize("exc_type", [ValueError, RuntimeError, OSError])
+    def test_main_db_startup_failure_logs_the_exception_type_only(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        exc_type: type[Exception],
+    ) -> None:
+        """GH-158: "Database startup failed" names the exception type, never its message
+        (a DSN with the database password, a host name)."""
+        # Keep pytest's capture handler on the root logger.
+        monkeypatch.setattr("admino.main._configure_logging", MagicMock())
+
+        def _close_then_raise(coro: Any) -> None:
+            if hasattr(coro, "close"):
+                coro.close()
+            raise exc_type("postgres://admino:s3cretpw@db.internal/admino")
+
+        mock_deps["asyncio"].run = MagicMock(side_effect=_close_then_raise)
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit):
+            main(config_path=Path("c.yaml"))
+
+        failures = [
+            record
+            for record in caplog.records
+            if record.name == "admino.main" and "Database startup failed" in record.getMessage()
+        ]
+        assert len(failures) == 1
+        assert failures[0].levelno == logging.ERROR
+        assert exc_type.__name__ in failures[0].getMessage()
+        assert failures[0].exc_info is None
+        assert "s3cretpw" not in caplog.text
+        assert "db.internal" not in caplog.text
 
     def test_main_does_not_call_uvicorn_on_db_failure(self, mock_deps: dict[str, Any]) -> None:
         """uvicorn.run is never called when database startup fails."""

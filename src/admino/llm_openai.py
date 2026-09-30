@@ -41,6 +41,7 @@ from admino.llm import (
     strip_control_chars,
     validate_tools_payload,
 )
+from admino.logs import safe_log
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
@@ -182,6 +183,7 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
         call_id = strip_control_chars(raw_id)[:128] if isinstance(raw_id, str) else None
 
         name_safe = strip_control_chars(name)[:64]
+        log_name = safe_log(name)
 
         # OpenAI returns arguments as a JSON string
         raw_args = getattr(func, "arguments", "{}")
@@ -189,21 +191,21 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
             try:
                 arguments = json.loads(raw_args)
             except json.JSONDecodeError:
-                logger.warning("Skipping tool call '%s': malformed JSON arguments", name_safe)
+                logger.warning("Skipping tool call '%s': malformed JSON arguments", log_name)
                 continue
         elif isinstance(raw_args, dict):
             arguments = raw_args
         else:
-            logger.warning("Skipping tool call '%s': arguments is not a string or dict", name_safe)
+            logger.warning("Skipping tool call '%s': arguments is not a string or dict", log_name)
             continue
 
         if not isinstance(arguments, dict):
-            logger.warning("Skipping tool call '%s': parsed arguments is not a dict", name_safe)
+            logger.warning("Skipping tool call '%s': parsed arguments is not a dict", log_name)
             continue
 
         if not check_args_depth(arguments):
             logger.warning(
-                "Skipping tool call '%s': arguments exceed nesting depth limit", name_safe
+                "Skipping tool call '%s': arguments exceed nesting depth limit", log_name
             )
             continue
         # Quick pre-screen on top-level values only; nested strings are covered
@@ -211,22 +213,22 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
         if len(arguments) > 32 or any(
             isinstance(v, str) and len(v) > 2048 for v in arguments.values()
         ):
-            logger.warning("Skipping tool call '%s': arguments exceed size limits", name_safe)
+            logger.warning("Skipping tool call '%s': arguments exceed size limits", log_name)
             continue
         if len(json.dumps(arguments)) > 16384:
-            logger.warning("Skipping tool call '%s': arguments exceed size limits", name_safe)
+            logger.warning("Skipping tool call '%s': arguments exceed size limits", log_name)
             continue
 
         if "." not in name_safe:
             logger.warning(
                 "Skipping tool call '%s': name must use 'tool.action' dot notation",
-                name_safe,
+                log_name,
             )
             continue
 
         tool, action = name_safe.split(".", maxsplit=1)
         if not tool or not action:
-            logger.warning("Skipping tool call '%s': empty tool or action component", name_safe)
+            logger.warning("Skipping tool call '%s': empty tool or action component", log_name)
             continue
 
         try:
@@ -234,7 +236,7 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
         except ValidationError:
             logger.warning(
                 "Skipping tool call '%s': tool/action failed schema validation",
-                name_safe,
+                log_name,
             )
 
     return parsed

@@ -21,8 +21,9 @@ Security notes:
 - No credentials are stored or logged by this module.
 - LLM output is sanitized: control characters stripped, length bounded.
 - Tool call arguments are validated for size and nesting depth.
-- Callers must log only str(LLMError), never __cause__ or repr(),
-  to prevent leaking HTTP response bodies containing conversation context.
+- Callers log an LLMError by its type and status_code only (GH-158), never
+  its message, __cause__ or repr(), so no provider text or HTTP response body
+  (conversation context) reaches the log.
 - Only the configured provider's SDK is imported (lazy import in factory).
 """
 
@@ -34,6 +35,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
 
+from admino.logs import safe_log
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
@@ -57,8 +59,8 @@ _MAX_TOOLS_PAYLOAD: int = 65536
 class LLMError(Exception):
     """Base error for all LLM provider failures.
 
-    Callers must log only the .message attribute, never __cause__,
-    to prevent leaking HTTP response bodies.
+    Callers log only the type and ``status_code``, never ``message`` or
+    ``__cause__``, to keep provider text and HTTP response bodies out of logs.
 
     Attributes:
         message: Human-readable error description.
@@ -322,18 +324,20 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
             logger.warning("Skipping tool call with missing or non-string name")
             continue
 
-        # Sanitize the name before logging to strip control/ANSI characters
+        # Control/ANSI characters are stripped before parsing; log lines carry
+        # the name through safe_log (escaped and truncated).
         name_safe = name.translate(_CONTROL_CHAR_TABLE)[:64]
+        log_name = safe_log(name)
 
         arguments = func.get("arguments", {})
         if not isinstance(arguments, dict):
-            logger.warning("Skipping tool call '%s': arguments is not a dict", name_safe)
+            logger.warning("Skipping tool call '%s': arguments is not a dict", log_name)
             continue
 
         # Guard against deeply nested or pathologically large argument payloads
         if not check_args_depth(arguments):
             logger.warning(
-                "Skipping tool call '%s': arguments exceed nesting depth limit", name_safe
+                "Skipping tool call '%s': arguments exceed nesting depth limit", log_name
             )
             continue
         # Quick pre-screen on top-level values only; nested strings are covered
@@ -341,30 +345,30 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
         if len(arguments) > 32 or any(
             isinstance(v, str) and len(v) > 2048 for v in arguments.values()
         ):
-            logger.warning("Skipping tool call '%s': arguments exceed size limits", name_safe)
+            logger.warning("Skipping tool call '%s': arguments exceed size limits", log_name)
             continue
         if len(json.dumps(arguments)) > 16384:
-            logger.warning("Skipping tool call '%s': arguments exceed size limits", name_safe)
+            logger.warning("Skipping tool call '%s': arguments exceed size limits", log_name)
             continue
 
         # Require "tool.action" dot-notation; reject names without a dot
         if "." not in name_safe:
             logger.warning(
                 "Skipping tool call '%s': name must use 'tool.action' dot notation",
-                name_safe,
+                log_name,
             )
             continue
 
         tool, action = name_safe.split(".", maxsplit=1)
         if not tool or not action:
-            logger.warning("Skipping tool call '%s': empty tool or action component", name_safe)
+            logger.warning("Skipping tool call '%s': empty tool or action component", log_name)
             continue
         try:
             parsed.append(ToolCall(tool=tool, action=action, args=arguments))
         except ValidationError:
             logger.warning(
                 "Skipping tool call '%s': tool/action failed schema validation",
-                name_safe,
+                log_name,
             )
 
     return parsed

@@ -1,7 +1,9 @@
 """Comprehensive test suite for admino.server — HTTP layer, auth, SSE, confirmations.
 
 Tests the FastAPI application created by ``create_app()``, covering:
-- Health check (no session required)
+- Health check (no session required; GH-158: ``{status}`` only, the provider,
+  model and reachability are on the Super Admin diagnostics route, see
+  tests/test_health_api.py)
 - Session-cookie authentication (GH-149): every chat route answers 401
   ``{"detail": "Unauthorized"}`` without a valid ``admino_session`` cookie; the
   old bearer token / vpn mode is gone (an ``Authorization`` header authenticates
@@ -221,31 +223,19 @@ def _make_pending_confirmation(
 # ---------------------------------------------------------------------------
 
 
-def _set_health_config(
-    *, provider: str = "vllm", model: str = "mlx-community/gemma-4-12B-it-4bit"
-) -> None:
-    """Give server._config real (JSON-serializable) LLM identity fields for /health.
-
-    The default _make_config returns a MagicMock, whose attributes are not
-    JSON-serializable. The /health payload now echoes the active provider and
-    model (issue #134), so these must be concrete strings.
-    """
-    from admino import server
-
-    assert server._config is not None
-    server._config.llm.provider = provider
-    server._config.llm.active_model_name = model
-
-
 class TestHealthCheck:
-    """GET /health — no auth required. Reports DB + active LLM provider/model/reachability."""
+    """GET /health — public, and answers ``{status}`` only (GH-158).
+
+    The active provider, model and LLM reachability moved to
+    ``GET /api/platform/diagnostics`` (Super Admin); tests/test_health_api.py pins
+    that route, the per-IP rate limit and the request-ID header.
+    """
 
     pytestmark = pytest.mark.asyncio
 
     async def test_server_health_returns_200_ok(self) -> None:
-        """A healthy DB + reachable LLM returns 200 with status ok."""
+        """A healthy DB returns 200 with exactly ``{"status": "ok"}``."""
         app = _make_app()
-        _set_health_config()
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=True)),
             patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
@@ -253,51 +243,35 @@ class TestHealthCheck:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
-        assert resp.json()["status"] == "ok"
+        assert resp.json() == {"status": "ok"}
 
-    async def test_server_health_reports_active_provider_and_model(self) -> None:
-        """/health echoes the active provider and model (issue #134)."""
+    async def test_server_health_does_not_report_provider_or_model(self) -> None:
+        """GH-158: the public payload names no provider, model or reachability."""
         app = _make_app()
-        _set_health_config(provider="vllm", model="mlx-community/gemma-4-12B-it-4bit")
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=True)),
             patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
-        body = resp.json()
-        assert body["provider"] == "vllm"
-        assert body["model"] == "mlx-community/gemma-4-12B-it-4bit"
+        assert set(resp.json()) == {"status"}
 
-    async def test_server_health_reports_llm_reachable_true(self) -> None:
-        """llm_reachable is True (bool) when the LLM probe succeeds (issue #134)."""
+    async def test_server_health_never_probes_the_llm(self) -> None:
+        """GH-158: /health doesn't await the LLM reachability probe."""
         app = _make_app()
-        _set_health_config()
+        probe = AsyncMock(return_value=True)
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=True)),
-            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
-        ):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/health")
-        assert resp.json()["llm_reachable"] is True
-
-    async def test_server_health_reports_llm_reachable_false(self) -> None:
-        """llm_reachable is False when the LLM probe fails, but the DB is up → still 200."""
-        app = _make_app()
-        _set_health_config()
-        with (
-            patch("admino.database.check_health", new=AsyncMock(return_value=True)),
-            patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=False)),
+            patch("admino.server._check_llm_reachable", new=probe),
         ):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 200
-        assert resp.json()["llm_reachable"] is False
+        probe.assert_not_awaited()
 
     async def test_server_health_no_auth_required(self) -> None:
         """Health check is public: it succeeds with no session cookie."""
         app = _make_app(anonymous=True)
-        _set_health_config()
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=True)),
             patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
@@ -307,9 +281,8 @@ class TestHealthCheck:
         assert resp.status_code == 200
 
     async def test_server_health_returns_503_when_db_unreachable(self) -> None:
-        """Health check returns 503 when check_health() returns False (unchanged)."""
+        """check_health() False: 503 with exactly ``{"status": "degraded"}`` (no detail)."""
         app = _make_app()
-        _set_health_config()
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=False)),
             patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),
@@ -317,7 +290,7 @@ class TestHealthCheck:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.get("/health")
         assert resp.status_code == 503
-        assert resp.json()["detail"] == "Database unreachable"
+        assert resp.json() == {"status": "degraded"}
 
 
 _MESSAGE_BODY: dict[str, Any] = {"message": "hello", "session_id": "sess1"}
@@ -1487,7 +1460,6 @@ class TestStaticFiles:
         (static_dir / "index.html").write_text("<html>static</html>")
 
         app = _make_app()
-        _set_health_config()
         with (
             patch("admino.database.check_health", new=AsyncMock(return_value=True)),
             patch("admino.server._check_llm_reachable", new=AsyncMock(return_value=True)),

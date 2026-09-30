@@ -132,6 +132,37 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   the audit log (`login.failure`), and the password rules (at least 12 characters,
   common passwords refused) make that rate negligible.
 
+## Logs and error tracking
+
+Application logs hold IDs, counts, sizes, statuses and durations only. Message text,
+titles, file names, instructions, user and organization names, email addresses,
+passwords and tokens never reach them. `tests/test_log_scan.py` runs the app through its
+flows (org setup, invitations, logins, password resets, email delivery, chat with a tool
+call, an OAuth connection, a crash) and scans everything the log handler wrote.
+
+- **Request IDs.** Every HTTP response carries an `X-Request-ID` header, a fresh random
+  ID (one a client sends is ignored), and every log line written during the request
+  carries the same ID. With `LOG_FORMAT=json` each line is one JSON object (`ts`,
+  `level`, `logger`, `message`, `request_id`), ready for a log collector.
+- **No tracebacks.** An exception is logged by its class name only, never its message
+  or a traceback: either can hold a database password or part of an email. An
+  unhandled exception is one line, `Unhandled exception: <ClassName>` with the request
+  ID, and the client gets a generic 500 `{"detail": "Internal error"}` with the same
+  `X-Request-ID`, so a report can be matched to its log line.
+- **No query strings.** URLs are logged without their query string or fragment (a Gmail
+  search puts the search text in `?q=`, the OAuth callback its code in `?code=`).
+  uvicorn's access log stays off. The HTTP client and provider SDK loggers (httpx,
+  httpcore, urllib3, googleapiclient, openai, anthropic) are pinned at WARNING, even with
+  `LOG_LEVEL=DEBUG`: they log request URLs at INFO and whole request payloads, the
+  conversation included, at DEBUG.
+- **No error tracking or analytics.** admino ships no third-party error tracking or
+  analytics SDK: no Sentry, no APM agent, no product analytics, in the backend or the
+  PWA. Errors stay in your own logs. `tests/test_logs.py` fails if one is added.
+- **Health without details.** The public `GET /health` answers `{"status": "ok"}`, or
+  503 `{"status": "degraded"}` when the database is unreachable, and nothing else. The
+  LLM provider, the model and whether the provider is reachable are on
+  `GET /api/platform/diagnostics`, for the Super Admin only.
+
 ## Known limitations & tradeoffs
 
 We prefer to be transparent about what this does **not** guarantee:

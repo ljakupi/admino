@@ -44,6 +44,7 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from admino.logs import safe_log, safe_url
 from admino.permissions import PermissionsConfig, validate_permissions_config
 
 if TYPE_CHECKING:
@@ -383,8 +384,8 @@ class LLMConfig(BaseModel):
                 "LLM provider is 'vllm' (local) — serving '%s' from %s. "
                 "If the endpoint is still starting, chat replies will report it "
                 "as unavailable until the model finishes loading.",
-                self.vllm_model,
-                self.vllm_base_url,
+                safe_log(self.vllm_model, max_len=200),
+                safe_url(self.vllm_base_url),
             )
         elif self.provider == "anthropic":
             logger.warning(
@@ -531,6 +532,7 @@ class AppConfig(BaseModel):
     - ADMINO_PUBLIC_URL -> server.public_url
     - ADMINO_TRUSTED_PROXIES -> server.trusted_proxies
     - LOG_LEVEL         -> log_level
+    - LOG_FORMAT        -> log_format ("text" or "json", case-insensitive)
     """
 
     # Pydantic applies hide_input_in_errors from the model being validated, not
@@ -548,6 +550,10 @@ class AppConfig(BaseModel):
         default="INFO",
         description="Python logging level for the application.",
     )
+    log_format: Literal["text", "json"] = Field(
+        default="text",
+        description="Log line format: text, or JSON lines with a per-request ID (GH-158).",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -555,6 +561,7 @@ class AppConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+_VALID_LOG_FORMATS: Final = frozenset({"text", "json"})
 
 # COOKIE_SECURE values, compared case-insensitively.
 _TRUE_VALUES: Final = frozenset({"true", "1", "yes", "on"})
@@ -684,6 +691,8 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
     - ADMINO_TRUSTED_PROXIES -> server.trusted_proxies (comma-separated; an invalid
       value fails validation)
     - LOG_LEVEL          -> log_level
+    - LOG_FORMAT         -> log_format (text or json, case-insensitive; an invalid
+      value is ignored with a warning that doesn't repeat it)
 
     Args:
         data: Raw config dict parsed from YAML.
@@ -717,6 +726,14 @@ def _apply_env_overrides(data: dict[str, object]) -> dict[str, object]:
                 log_level,
                 ", ".join(sorted(_VALID_LOG_LEVELS)),
             )
+
+    log_format = os.environ.get("LOG_FORMAT")
+    if log_format:
+        lower = log_format.lower()
+        if lower in _VALID_LOG_FORMATS:
+            data["log_format"] = lower
+        else:
+            logger.warning("Ignoring invalid LOG_FORMAT value (use text or json).")
 
     return data
 
@@ -778,7 +795,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         for err in exc.errors(include_input=False):
             # Sanitize loc elements — adversarial YAML keys could inject non-printable
             # characters or overly long strings into the log.
-            safe_loc = tuple(repr(part)[:64] for part in err["loc"])
+            safe_loc = ".".join(safe_log(part) for part in err["loc"])
             logger.error("Config validation error at %s: %s", safe_loc, err["msg"])
         msg = (
             f"Invalid application config: validation failed on "

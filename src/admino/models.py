@@ -18,6 +18,8 @@ Security notes:
   ``OrgLimitsPatch`` hide their input from validation errors (an org name or
   admin email never reaches a log or a 422 body); seats, quotas and the
   residency switch are strict ints and bools.
+- ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
+  and statuses only, for the Super Admin; the public /health is status-only.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
@@ -1889,3 +1891,22 @@ class OrgCreateResponse(BaseModel):
 
     organization: OrgSummary
     invitation: InvitationSummary
+
+
+# ---------------------------------------------------------------------------
+# Platform diagnostics API model (GH-158): config metadata and statuses only
+# ---------------------------------------------------------------------------
+
+
+class PlatformDiagnosticsResponse(BaseModel):
+    """GET /api/platform/diagnostics response (Super Admin): what public /health hides.
+
+    ``status`` is the database check (``"ok"`` or ``"degraded"``), ``provider``
+    and ``model`` the active LLM configuration (``model`` is None when no model
+    is chosen), ``llm_reachable`` the provider probe. No content.
+    """
+
+    status: Literal["ok", "degraded"]
+    provider: Literal["infomaniak", "anthropic", "openai", "vllm"]
+    model: str | None = Field(max_length=200)
+    llm_reachable: bool

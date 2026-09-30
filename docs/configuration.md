@@ -143,6 +143,8 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
+| `log_level` | Top-level key: `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. The `LOG_LEVEL` env var overrides it. |
+| `log_format` | Top-level key: `text` (default) or `json`, one JSON object per line (`ts`, `level`, `logger`, `message`, `request_id`) for a log collector. The `LOG_FORMAT` env var overrides it (`text` or `json`, any case; another value is ignored with a warning). Logs never hold content, see [Logs and error tracking](SECURITY.md#logs-and-error-tracking). |
 
 ## Accounts and sessions
 
@@ -182,6 +184,11 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   and the OAuth callback. A deactivated account, or an account whose organization is
   deactivated or pending deletion, is refused on its next request, even with a session
   that's still open.
+- **`/health` only says up or degraded.** It answers `{"status": "ok"}`, or `503`
+  `{"status": "degraded"}` when the database is unreachable, and is rate-limited per IP
+  address. The active LLM provider, the model and whether the provider is reachable are
+  on `GET /api/platform/diagnostics`, for Super Admins only. Every response carries an
+  `X-Request-ID` header that matches the request's log lines.
 - **A failed login** always answers "Invalid email or password", whatever the reason.
   Successful and failed logins are recorded in the audit log, without the email address.
 - **Brute-force protection** counts failed logins per account and per IP address, and

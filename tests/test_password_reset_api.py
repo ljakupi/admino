@@ -182,10 +182,24 @@ def _session_set_cookie(response: httpx.Response) -> tuple[str, dict[str, str | 
     return value, attributes
 
 
+# GH-158: every response gets a fresh X-Request-ID (uuid4().hex), compared by shape only.
+_REQUEST_ID_SHAPE = re.compile(r"[0-9a-f]{32}")
+
+
+def _comparable_header(key: str, value: str) -> tuple[str, str]:
+    """A header for comparison: a well-formed X-Request-ID becomes a fixed placeholder."""
+    name = key.lower()
+    if name == "x-request-id" and _REQUEST_ID_SHAPE.fullmatch(value):
+        return name, "<request-id>"
+    return name, value
+
+
 def _comparable(response: httpx.Response) -> tuple[int, bytes, list[tuple[str, str]]]:
-    """Status, body and every header except Date."""
+    """Status, body and every header except Date (X-Request-ID by shape only)."""
     headers = sorted(
-        (key.lower(), value) for key, value in response.headers.multi_items() if key != "date"
+        _comparable_header(key, value)
+        for key, value in response.headers.multi_items()
+        if key != "date"
     )
     return response.status_code, response.content, headers
 

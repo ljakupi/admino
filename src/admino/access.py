@@ -139,6 +139,7 @@ class Capability(StrEnum):
     PLATFORM_DEFAULTS_MANAGE = "platform.defaults.manage"
     USAGE_VIEW_PLATFORM = "usage.view.platform"
     AUDIT_VIEW_PLATFORM = "audit.view.platform"
+    PLATFORM_DIAGNOSTICS_VIEW = "platform.diagnostics.view"
     ORG_USERS_VIEW = "org.users.view"
     ORG_USERS_INVITE = "org.users.invite"
     ORG_USERS_ROLE_CHANGE = "org.users.role_change"
@@ -185,6 +186,8 @@ _MATRIX: Final[MappingProxyType[Capability, frozenset[str]]] = MappingProxyType(
         Capability.USAGE_VIEW_PLATFORM: _SUPER_ADMIN_ONLY,
         # Platform audit log
         Capability.AUDIT_VIEW_PLATFORM: _SUPER_ADMIN_ONLY,
+        # Platform diagnostics: LLM provider, model and reachability (GH-158)
+        Capability.PLATFORM_DIAGNOSTICS_VIEW: _SUPER_ADMIN_ONLY,
         # Manage users and invitations in own org
         Capability.ORG_USERS_VIEW: _ORG_ADMIN_ONLY,
         Capability.ORG_USERS_INVITE: _ORG_ADMIN_ONLY,

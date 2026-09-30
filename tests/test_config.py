@@ -38,6 +38,13 @@ list; blank items ignored) replaces the YAML list; unset or blank changes
 nothing; an invalid value makes config loading fail without the value reaching
 the error or the log. A non-Secure session cookie (``cookie_secure=False``) is
 dev-only: it is refused with an https public URL.
+
+GH-158: ``AppConfig.log_format`` is ``"text"`` (default) or ``"json"``
+(structured JSON lines with a per-request ID). YAML ``log_format: json`` works;
+any other YAML value fails validation without the value reaching the error.
+``LOG_FORMAT`` overrides it case-insensitively (``JSON`` -> ``"json"``); an
+invalid value logs a WARNING naming the variable (never the value) and the
+YAML/default value stays.
 """
 
 from __future__ import annotations
@@ -82,6 +89,12 @@ def _no_public_url_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _no_trusted_proxies_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Start every test without an ADMINO_TRUSTED_PROXIES override from the developer's shell."""
     monkeypatch.delenv("ADMINO_TRUSTED_PROXIES", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_log_format_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test without a LOG_FORMAT override from the developer's shell."""
+    monkeypatch.delenv("LOG_FORMAT", raising=False)
 
 
 # A strong value of the removed AUTH_TOKEN env var (it must have no effect now).
@@ -2022,3 +2035,87 @@ class TestInsecureCookieIsDevOnly:
             await load_app_config_from_db(MagicMock())
 
         assert "cookiemarkerq5" not in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# GH-158: log_format (text or structured JSON lines)
+# ---------------------------------------------------------------------------
+
+# A distinctive invalid LOG_FORMAT value: it must never reach the log.
+_JUNK_LOG_FORMAT = "zebrafmt7731"
+
+
+class TestLogFormat:
+    """``log_format``: "text" by default, "json" from YAML or LOG_FORMAT."""
+
+    def test_config_log_format_defaults_to_text(self) -> None:
+        assert AppConfig().log_format == "text"
+
+    def test_config_loaded_log_format_defaults_to_text(self, tmp_path: Path) -> None:
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.log_format == "text"
+
+    @pytest.mark.parametrize("value", ["json", "text"])
+    def test_config_log_format_from_yaml(self, tmp_path: Path, value: str) -> None:
+        yaml_path = _write_yaml(tmp_path / "config.yaml", f"log_format: {value}\n")
+        assert load_app_config(yaml_path).log_format == value
+
+    def test_config_invalid_yaml_log_format_fails_validation(self, tmp_path: Path) -> None:
+        yaml_path = _write_yaml(tmp_path / "config.yaml", f"log_format: {_JUNK_LOG_FORMAT}\n")
+        with pytest.raises(ValueError, match=r"Invalid application config.*field\(s\)") as info:
+            load_app_config(yaml_path)
+        assert _JUNK_LOG_FORMAT not in str(info.value)
+
+    def test_config_invalid_log_format_is_a_validation_error_without_the_value(self) -> None:
+        with pytest.raises(ValidationError) as info:
+            AppConfig.model_validate({"log_format": _JUNK_LOG_FORMAT})
+        assert _JUNK_LOG_FORMAT not in str(info.value)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"), [("JSON", "json"), ("Json", "json"), ("json", "json")]
+    )
+    def test_config_log_format_env_is_case_insensitive(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str, expected: str
+    ) -> None:
+        monkeypatch.setenv("LOG_FORMAT", value)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert config.log_format == expected
+
+    def test_config_log_format_env_overrides_yaml(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("LOG_FORMAT", "TEXT")
+        yaml_path = _write_yaml(tmp_path / "config.yaml", "log_format: json\n")
+        assert load_app_config(yaml_path).log_format == "text"
+
+    @pytest.mark.parametrize(
+        ("yaml_text", "expected"), [("", "text"), ("log_format: json\n", "json")]
+    )
+    def test_config_invalid_log_format_env_keeps_yaml_or_default(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        yaml_text: str,
+        expected: str,
+    ) -> None:
+        """An invalid LOG_FORMAT is ignored: loading succeeds with the YAML/default value."""
+        monkeypatch.setenv("LOG_FORMAT", _JUNK_LOG_FORMAT)
+        config = load_app_config(_write_yaml(tmp_path / "config.yaml", yaml_text))
+        assert config.log_format == expected
+
+    def test_config_invalid_log_format_env_warns_without_the_value(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The WARNING names LOG_FORMAT; the value itself reaches no log record."""
+        monkeypatch.setenv("LOG_FORMAT", _JUNK_LOG_FORMAT)
+        with caplog.at_level(logging.DEBUG):
+            load_app_config(_write_yaml(tmp_path / "config.yaml", ""))
+        assert any(
+            "LOG_FORMAT" in record.getMessage()
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+        )
+        assert _JUNK_LOG_FORMAT not in caplog.text

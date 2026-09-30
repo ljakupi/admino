@@ -2,7 +2,8 @@
 
 Startup sequence:
 1. Load and validate config.yaml (with env var overrides).
-2. Configure Python logging from config.log_level.
+2. Configure Python logging from config.log_level and config.log_format
+   (text, or structured JSON lines with a per-request ID).
 3. Load the bundled common-password list (the password policy's list check).
 4. Build the default permissions ruleset (seeds an empty DB on first run).
 5. Initialise the database: run migrations, seed, then load config,
@@ -40,6 +41,15 @@ Security notes:
 - uvicorn runs with ``proxy_headers=False``: X-Forwarded-For/Proto are
   believed only from ``server.trusted_proxies`` (the app's middleware), never
   from uvicorn's own default trust of 127.0.0.1 or FORWARDED_ALLOW_IPS.
+- Logging (GH-158): one root handler with ``admino.logs``' formatters, which
+  never write a traceback (an exception is named by its type only) and cut
+  query strings off URLs. uvicorn runs with ``log_config=None`` (its loggers
+  go through that handler) and ``access_log=False`` (request paths and query
+  strings are never logged). The httpx, httpcore, openai, anthropic,
+  googleapiclient and urllib3 loggers are pinned at WARNING: they log request
+  URLs with query strings at INFO and whole request payloads at DEBUG.
+- Startup failures are logged by exception type with a fixed hint, never the
+  exception's message (a DSN carries the database password).
 """
 
 from __future__ import annotations
@@ -50,7 +60,7 @@ import os
 import sys
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, TextIO
 
 import uvicorn
 from pydantic import ValidationError
@@ -58,6 +68,7 @@ from pydantic import ValidationError
 from admino import passwords
 from admino.config import load_app_config
 from admino.llm import LLMError
+from admino.logs import JsonFormatter, RequestIdFilter, TextFormatter, safe_log
 from admino.models import AgentConfig, ToolsSettings
 from admino.permissions import build_default_permissions_config
 
@@ -85,6 +96,18 @@ _VALID_LOG_LEVELS: Final[frozenset[str]] = frozenset(
     {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 )
 
+# Third-party loggers pinned at WARNING: httpx/httpcore/urllib3/googleapiclient
+# log request URLs (query strings included) at INFO, and the openai/anthropic
+# SDKs log whole request payloads (conversation content) at DEBUG.
+_PINNED_THIRD_PARTY_LOGGERS: Final[tuple[str, ...]] = (
+    "httpx",
+    "httpcore",
+    "openai",
+    "anthropic",
+    "googleapiclient",
+    "urllib3",
+)
+
 # API host each cloud LLM provider must reach through the egress whitelist.
 # vLLM is served locally (no egress needed), so it has no entry.
 _PROVIDER_EGRESS_HOSTS: Final[dict[str, str]] = {
@@ -94,26 +117,35 @@ _PROVIDER_EGRESS_HOSTS: Final[dict[str, str]] = {
 }
 
 
-def _configure_logging(level_name: str) -> None:
-    """Configure root logger with a consistent format.
+def _configure_logging(
+    level_name: str,
+    log_format: str = "text",
+    *,
+    stream: TextIO | None = None,
+) -> None:
+    """Replace the root logger's handlers with one admino StreamHandler.
 
-    Only accepts the five standard Python log levels. Any other value
-    falls back to INFO. This avoids relying solely on upstream Pydantic
-    validation and prevents accidental acceptance of arbitrary
-    ``logging`` module attributes via ``getattr``.
+    The handler carries a ``RequestIdFilter`` and the ``JsonFormatter`` for
+    ``"json"`` or the ``TextFormatter`` for anything else; neither writes a
+    traceback. Only the five standard Python log levels are accepted; any
+    other value falls back to INFO (no ``getattr`` on arbitrary ``logging``
+    attributes). The chatty third-party loggers are pinned at WARNING, so
+    they log no URLs or payloads even at DEBUG.
 
     Args:
         level_name: Python log level name (DEBUG, INFO, WARNING, ERROR, CRITICAL).
+        log_format: ``"json"`` for JSON lines, otherwise text.
+        stream: Where the handler writes (stderr by default).
     """
     if level_name not in _VALID_LOG_LEVELS:
         level_name = "INFO"
     numeric_level = getattr(logging, level_name)  # safe: level_name is in allowlist
-    logging.basicConfig(
-        level=numeric_level,
-        format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S%z",
-        force=True,
-    )
+    handler = logging.StreamHandler(stream if stream is not None else sys.stderr)
+    handler.addFilter(RequestIdFilter())
+    handler.setFormatter(JsonFormatter() if log_format == "json" else TextFormatter())
+    logging.basicConfig(level=numeric_level, handlers=[handler], force=True)
+    for name in _PINNED_THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def _warn_missing_provider_egress(config: AppConfig) -> None:
@@ -144,9 +176,10 @@ async def _check_infomaniak_startup(client: InfomaniakClient) -> None:
     A missing INFOMANIAK_API_TOKEN logs a WARNING (no product discovery is
     attempted). Otherwise the product ID is resolved (INFOMANIAK_PRODUCT_ID or
     discovery via the Infomaniak API) and any failure — e.g. several products
-    and no INFOMANIAK_PRODUCT_ID — is logged as an ERROR with the client's fixed
-    message. Never raises and never exits: chat replies explain the same
-    problem to the user. The token value is never logged.
+    and no INFOMANIAK_PRODUCT_ID — is logged as an ERROR with its type and a
+    fixed hint (never the error's message). Never raises and never exits: chat
+    replies explain the same problem to the user. The token value is never
+    logged.
 
     Args:
         client: The Infomaniak client created for the active provider.
@@ -161,8 +194,11 @@ async def _check_infomaniak_startup(client: InfomaniakClient) -> None:
     try:
         await client.resolve_product_id()
     except LLMError as exc:
-        # exc.message is a fixed catalogue string (never a body or the token).
-        logger.error("Infomaniak startup check failed: %s", exc.message)
+        logger.error(
+            "Infomaniak startup check failed (%s): check INFOMANIAK_API_TOKEN, and set "
+            "INFOMANIAK_PRODUCT_ID when the token sees several AI products.",
+            type(exc).__name__,
+        )
         return
     logger.info("Infomaniak AI product resolved.")
 
@@ -439,7 +475,7 @@ def main(
     # ------------------------------------------------------------------
     # 2. Configure logging from validated config
     # ------------------------------------------------------------------
-    _configure_logging(config.log_level)
+    _configure_logging(config.log_level, config.log_format)
     logger.info("Configuration loaded successfully.")
 
     # ------------------------------------------------------------------
@@ -472,7 +508,12 @@ def main(
             _async_startup(config, permissions_config)
         )
     except (ValueError, RuntimeError, OSError) as exc:
-        logger.error("Database startup failed: %s", exc)
+        # The type only: the message can carry the DSN (the database password).
+        logger.error(
+            "Database startup failed (%s): check PG_PASSWORD, PG_HOST, PG_PORT, PG_USER "
+            "and PG_DATABASE, and that PostgreSQL is reachable.",
+            type(exc).__name__,
+        )
         sys.exit(1)
 
     logger.info("Database initialized, config loaded from DB.")
@@ -536,11 +577,9 @@ def main(
         # the user toggled off stay off immediately on boot.
         tools_enabled=tools_enabled,
     )
-    from admino.llm import strip_control_chars
-
     logger.info(
         "Agent initialized with model %s (provider=%s)",
-        strip_control_chars(model_name),
+        safe_log(model_name, max_len=200),
         config.llm.provider,
     )
 
@@ -566,8 +605,12 @@ def main(
         port=config.server.port,
         workers=1,
         log_level=config.log_level.lower(),
-        # Disable uvicorn's default access log to avoid double-logging.
+        # uvicorn's access log stays off: request paths (invitation tokens) and
+        # query strings (the OAuth code and state) are never logged.
         access_log=False,
+        # No uvicorn LOGGING_CONFIG: its loggers install no handlers and go
+        # through the root handler configured above (no tracebacks).
+        log_config=None,
         # uvicorn's own X-Forwarded-* handling (it trusts 127.0.0.1, or
         # FORWARDED_ALLOW_IPS, by default) must never run: the app's
         # server.trusted_proxies is the only source of truth.
