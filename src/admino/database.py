@@ -1,4 +1,4 @@
-"""PostgreSQL connection pool, migration runner, health check, and seed logic.
+"""PostgreSQL connection pool, migration runner and health check.
 
 Owns the asyncpg pool lifecycle. All database access in admino goes through
 the pool returned by get_pool(). Migrations are plain numbered SQL files
@@ -11,6 +11,8 @@ Security notes:
 - All SQL uses parameterized queries ($1, $2). No string interpolation.
 - Org-content repository functions take a TenantContext (admino.tenancy) as
   their first argument and filter by its org_id; there is no unscoped path.
+  The org-scoped permission matrix is seeded and read by
+  ``admino.org_permissions`` (GH-161), not here.
 - Does not import from agent.py, llm.py, or server.py.
 """
 
@@ -20,13 +22,9 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
 from urllib.parse import quote_plus
 
 import asyncpg
-
-if TYPE_CHECKING:
-    from admino.permissions import PermissionsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -184,98 +182,3 @@ async def run_migrations(pool: asyncpg.Pool) -> None:
                 path.name,
             )
         logger.info("Migration %04d applied successfully.", version)
-
-
-# ---------------------------------------------------------------------------
-# Seed helpers
-# ---------------------------------------------------------------------------
-
-
-async def seed_permissions(
-    pool: asyncpg.Pool,
-    permissions: PermissionsConfig,
-) -> None:
-    """Seed the permissions table from PermissionsConfig if the table is empty.
-
-    Iterates through all tools and their configured actions, inserting
-    one row per (tool, action, permission) tuple.
-
-    Args:
-        pool: The asyncpg connection pool.
-        permissions: The validated permissions config to seed from.
-    """
-    async with pool.acquire() as conn:
-        count = await conn.fetchval("SELECT count(*) FROM permissions")
-        if count and int(count) > 0:
-            logger.info("Permissions table already has %d rows, skipping seed.", count)
-            return
-
-    rows_inserted = 0
-    async with pool.acquire() as conn:
-        for tool_name, tool_perms in permissions.tools.items():
-            for action_name, state in tool_perms.actions.items():
-                await conn.execute(
-                    "INSERT INTO permissions (tool, action, permission) VALUES ($1, $2, $3)",
-                    tool_name,
-                    action_name,
-                    state,
-                )
-                rows_inserted += 1
-    logger.info("Seeded %d permission rows from PermissionsConfig.", rows_inserted)
-
-
-# ---------------------------------------------------------------------------
-# Loaders
-# ---------------------------------------------------------------------------
-
-
-async def update_permission(
-    pool: asyncpg.Pool,
-    tool: str,
-    action: str,
-    permission: str,
-) -> None:
-    """Upsert a single permission row.
-
-    Inserts the row if it does not exist, updates it otherwise.
-    Uses parameterized query — no string interpolation.
-
-    Args:
-        pool: The asyncpg connection pool.
-        tool: Tool identifier (e.g. "gmail").
-        action: Action identifier (e.g. "search").
-        permission: One of "allow", "confirm", "deny".
-    """
-    async with pool.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO permissions (tool, action, permission) VALUES ($1, $2, $3) "
-            "ON CONFLICT (tool, action) DO UPDATE SET permission = $3, updated_at = now()",
-            tool,
-            action,
-            permission,
-        )
-
-
-async def load_permissions_from_db(
-    pool: asyncpg.Pool,
-) -> dict[str, dict[str, str]]:
-    """Load all permission rows grouped by tool.
-
-    Args:
-        pool: The asyncpg connection pool.
-
-    Returns:
-        A dict like ``{"gmail": {"list": "allow", "read": "confirm"}, ...}``.
-    """
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("SELECT tool, action, permission FROM permissions")
-
-    result: dict[str, dict[str, str]] = {}
-    for row in rows:
-        tool: str = row["tool"]
-        action: str = row["action"]
-        permission: str = row["permission"]
-        if tool not in result:
-            result[tool] = {}
-        result[tool][action] = permission
-    return result

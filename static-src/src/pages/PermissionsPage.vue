@@ -1,94 +1,64 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue';
+/**
+ * Read-only permissions summary (issue #161): what the agent may do in the
+ * caller's organization, for Editors and Viewers (the Org Admin edits the
+ * matrix under Organization instead — no Permissions nav entry for them,
+ * see `services/access.ts`). Fed by `usePermissionsStore().loadSummary()`
+ * (`GET /api/permissions/summary`); states are allow / confirm / deny /
+ * disabled (a tool whose service is switched off for the org). No edit
+ * controls anywhere on this page.
+ */
+import { onMounted } from 'vue';
 import { usePermissionsStore } from '@/stores/permissions';
-import ToolRow from '@/components/ToolRow.vue';
-import type { PermissionState } from '@/api/types';
-import { useI18n } from '@/i18n';
+import { useI18n, type MessageKey } from '@/i18n';
 
 const { t } = useI18n();
-
 const store = usePermissionsStore();
 
-const activeFilter = ref<'all' | PermissionState>('all');
+const STATE_LABEL_KEYS: Record<string, MessageKey> = {
+  allow: 'permissionState.allow',
+  confirm: 'permissionState.confirm',
+  deny: 'permissionState.deny',
+  disabled: 'permissionState.disabled',
+};
 
-const filteredGroups = computed(() => {
-  if (activeFilter.value === 'all') {
-    return [...store.toolGroups.entries()];
-  }
-  const result: [string, typeof store.toolGroups extends Map<string, infer V> ? V : never][] = [];
-  for (const [tool, entries] of store.toolGroups.entries()) {
-    const filtered = entries.filter((e) => e.permission === activeFilter.value);
-    if (filtered.length > 0) {
-      result.push([tool, filtered]);
-    }
-  }
-  return result;
-});
-
-const toolCount = computed(() => store.toolGroups.size);
-const actionCount = computed(() => store.permissions.length);
-const statusCounts = computed(() => store.statusCounts);
-
-onMounted(() => store.loadPermissions());
+onMounted(() => store.loadSummary());
 </script>
 
 <template>
   <div class="permissions-page">
     <div class="page-content">
       <div class="toolbar">
-        <div>
-          <h2 class="title">{{ t('nav.permissions') }}</h2>
-          <div class="subtitle">
-            {{ t('permissions.page.toolCount', { count: toolCount }) }} · {{ t('permissions.page.actionCount', { count: actionCount }) }}
-          </div>
-        </div>
-        <div class="filters" role="tablist">
-          <button
-            :class="['filter-btn', activeFilter === 'all' && 'on']"
-            @click="activeFilter = 'all'"
-          >
-            {{ t('permissions.filter.all') }} <span class="count">{{ statusCounts.all }}</span>
-          </button>
-          <button
-            :class="['filter-btn', activeFilter === 'allow' && 'on', 'is-allow']"
-            @click="activeFilter = 'allow'"
-          >
-            {{ t('permissionState.allow') }} <span class="count">{{ statusCounts.allow }}</span>
-          </button>
-          <button
-            :class="['filter-btn', activeFilter === 'confirm' && 'on', 'is-approve']"
-            @click="activeFilter = 'confirm'"
-          >
-            {{ t('permissionState.confirm') }} <span class="count">{{ statusCounts.confirm }}</span>
-          </button>
-          <button
-            :class="['filter-btn', activeFilter === 'deny' && 'on', 'is-deny']"
-            @click="activeFilter = 'deny'"
-          >
-            {{ t('permissionState.deny') }} <span class="count">{{ statusCounts.deny }}</span>
-          </button>
-        </div>
+        <h2 class="title">{{ t('nav.permissions') }}</h2>
+        <div class="subtitle">{{ t('permissions.summary.subtitle') }}</div>
       </div>
 
       <!-- Loading state -->
-      <div v-if="store.loading" class="loading-state">
+      <div v-if="store.summaryLoading" class="loading-state">
         {{ t('permissions.page.loading') }}
       </div>
 
       <!-- Error state -->
-      <div v-else-if="store.error" class="error-state">
-        <p>{{ store.error }}</p>
-        <button @click="store.loadPermissions()">{{ t('common.retry') }}</button>
+      <div v-else-if="store.summaryError" class="error-state">
+        <p>{{ store.summaryError }}</p>
+        <button @click="store.loadSummary()">{{ t('common.retry') }}</button>
       </div>
 
-      <!-- Permissions list -->
+      <!-- Empty state -->
+      <div v-else-if="store.summaryGroups.size === 0" class="empty-state">
+        {{ t('permissions.summary.empty') }}
+      </div>
+
+      <!-- Summary list -->
       <div v-else class="tools">
-        <ToolRow
-          v-for="[tool, entries] in filteredGroups"
-          :key="tool"
-          :tool="tool"
-          :entries="entries"
-        />
+        <div v-for="[tool, entries] in store.summaryGroups" :key="tool" class="tool-group">
+          <div class="tool-head">{{ store.getToolMeta(tool).label }}</div>
+          <div v-for="entry in entries" :key="entry.action" class="summary-row">
+            <span class="a-name">{{ entry.action }}</span>
+            <span class="a-desc">{{ store.getActionDescription(entry.tool, entry.action) }}</span>
+            <span class="state-pill" :class="`is-${entry.state}`">{{ t(STATE_LABEL_KEYS[entry.state]) }}</span>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -116,103 +86,111 @@ onMounted(() => store.loadPermissions());
 
 .toolbar {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 2px;
 }
 
 .title {
-  font-family: 'Inter', sans-serif;
-  font-weight: 600;
+  font-family: var(--font-display);
+  font-weight: var(--fw-bold);
   font-size: 18px;
   letter-spacing: -0.01em;
-  color: #111B21;
+  color: var(--color-text);
   margin: 0;
 }
 
 .subtitle {
   font-size: 12.5px;
-  color: #667781;
-  margin-top: 2px;
-}
-
-.filters {
-  display: inline-flex;
-  /* Longer DE/FR labels must wrap, not push filters off a phone screen. */
-  flex-wrap: wrap;
-  max-width: 100%;
-  gap: 4px;
-  padding: 3px;
-  background: #FFFFFF;
-  border: 1px solid #E4E8EA;
-  border-radius: 8px;
-}
-
-.filter-btn {
-  font-family: inherit;
-  font-size: 12px;
-  font-weight: 500;
-  padding: 6px 12px;
-  border-radius: 6px;
-  border: 0;
-  background: transparent;
-  color: #475560;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.filter-btn.on {
-  background: #F5F7F5;
-  color: #111B21;
-}
-
-.count {
-  font-size: 10.5px;
-  padding: 1px 6px;
-  border-radius: 10px;
-  background: #E9EDEF;
-  color: #475560;
-  font-weight: 500;
-}
-
-.filter-btn.on.is-allow .count {
-  background: #DCF8C6;
-  color: #1F5C2F;
-}
-
-.filter-btn.on.is-approve .count {
-  background: #FFF4DC;
-  color: #8A5A14;
-}
-
-.filter-btn.on.is-deny .count {
-  background: #EDEFF0;
-  color: #475560;
+  color: var(--color-text-muted);
 }
 
 .tools {
-  background: #FFFFFF;
-  border: 1px solid #E4E8EA;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
   border-radius: 12px;
   overflow: hidden;
 }
 
+.tool-group {
+  border-bottom: 1px solid var(--color-border);
+}
+
+.tool-group:last-child {
+  border-bottom: 0;
+}
+
+.tool-head {
+  font-weight: var(--fw-semibold);
+  font-size: 13px;
+  color: var(--color-text);
+  padding: 12px 18px 4px;
+}
+
+.summary-row {
+  display: grid;
+  grid-template-columns: 120px 1fr auto;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 18px;
+  font-size: 13px;
+}
+
+.a-name {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--color-text);
+}
+
+.a-desc {
+  color: var(--color-text-muted);
+  font-size: 12.5px;
+}
+
+.state-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 10px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.state-pill.is-allow {
+  background: #DCF8C6;
+  color: #1F5C2F;
+}
+
+.state-pill.is-confirm {
+  background: #FFF4DC;
+  color: #8A5A14;
+}
+
+.state-pill.is-deny {
+  background: #EDEFF0;
+  color: #475560;
+}
+
+.state-pill.is-disabled {
+  background: var(--color-border);
+  color: var(--color-text-muted);
+}
+
 .loading-state,
-.error-state {
+.error-state,
+.empty-state {
   text-align: center;
   padding: 48px 24px;
-  color: #667781;
+  color: var(--color-text-muted);
 }
 
 .error-state button {
   margin-top: 12px;
   padding: 8px 16px;
+  min-height: 44px;
   border-radius: 8px;
-  border: 1px solid #E4E8EA;
-  background: #FFFFFF;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg-elevated);
   cursor: pointer;
 }
 </style>

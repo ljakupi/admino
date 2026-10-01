@@ -8,6 +8,10 @@ Admin platform routes (#167) use them as well as the org routes (#164).
 organization always keeps at least one active Org Admin. #164 and #167 call it
 before demoting, deactivating or deleting a user.
 
+``org_user_ids`` lists the ids of an organization's users: the server delivers
+a completed critical permission promotion's notice to that org's in-memory chats
+only (GH-161).
+
 ``email_exists`` and ``create_super_admin`` back the create-superadmin CLI (GH-150,
 ``admino.admin_cli``). ``email_exists`` is a case-insensitive lookup, like the
 users_email_lower_key unique index. ``create_super_admin`` inserts an active
@@ -17,11 +21,11 @@ transaction, so a failed audit write leaves no account behind.
 
 Inputs: an asyncpg connection inside the caller's transaction, plus the org_id
 and user_id of the account being changed (the guard) or the new Super Admin's
-email, name and password hash; or the pool (the email lookup). Outputs: None,
-LastAdminError, or UserNotInOrgError when the user
-isn't a member of that org (the guard); whether the email is taken
-(``email_exists``); the new user's id, or DuplicateEmailError when the email
-is already taken (``create_super_admin``).
+email, name and password hash; or the pool (the email and org user lookups).
+Outputs: None, LastAdminError, or UserNotInOrgError when the user
+isn't a member of that org (the guard); the org's user ids (``org_user_ids``);
+whether the email is taken (``email_exists``); the new user's id, or
+DuplicateEmailError when the email is already taken (``create_super_admin``).
 
 Concurrency: the caller must hold a transaction. The guard locks the target's
 row and the org's active Org Admin rows with SELECT ... FOR UPDATE, in id order
@@ -38,6 +42,8 @@ Security notes:
 - Parameterized SQL only: org_id and user_id travel as the $1 and $2 bind
   parameters, and the email, name and password hash as the $1, $2 and $3 bind
   parameters.
+- ``org_user_ids`` reads the ids of the given org's users only (org_id is its
+  single bind parameter), nothing else of the rows.
 - Content-free audit: the user.activate event names the new user's id only,
   never the email, the name or the hash.
 - No content in errors: the guard's errors carry no IDs, and
@@ -48,6 +54,7 @@ Security notes:
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
+from uuid import UUID
 
 import asyncpg
 
@@ -55,8 +62,6 @@ from admino import audit_events
 from admino.audit_events import AuditAction, TargetType
 
 if TYPE_CHECKING:
-    from uuid import UUID
-
     from asyncpg.pool import PoolConnectionProxy
 
 # The target's row (only when it belongs to the org) plus the org's active Org
@@ -71,6 +76,8 @@ _TARGET_AND_ACTIVE_ADMINS_SQL: Final = """
     ORDER BY id
     FOR UPDATE
 """
+
+_ORG_USER_IDS_SQL: Final = "SELECT id FROM users WHERE org_id = $1"
 
 # Case-insensitive, like the users_email_lower_key unique index.
 _EMAIL_EXISTS_SQL: Final = "SELECT EXISTS (SELECT 1 FROM users WHERE lower(email) = lower($1))"
@@ -102,6 +109,23 @@ class DuplicateEmailError(Exception):
 
     def __init__(self) -> None:
         super().__init__("A user with this email already exists.")
+
+
+async def org_user_ids(
+    executor: asyncpg.Pool | asyncpg.Connection, org_id: UUID
+) -> frozenset[UUID]:
+    """Return the ids of every user of an organization, whatever their status.
+
+    Args:
+        executor: The pool or a connection to read through.
+        org_id: The organization (the single bind parameter).
+
+    Returns:
+        The users' ids as plain ``uuid.UUID`` values (asyncpg's UUID type is
+        normalized, so they compare and hash like any other UUID).
+    """
+    rows = await executor.fetch(_ORG_USER_IDS_SQL, org_id)
+    return frozenset(UUID(str(row["id"])) for row in rows)
 
 
 async def email_exists(executor: asyncpg.Pool | asyncpg.Connection, email: str) -> bool:

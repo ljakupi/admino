@@ -17,13 +17,15 @@ What these tests pin down (the spec: the issue, its decisions, tracker #139 §5)
   (``org.create``, ``org.lifecycle.manage``, ``org.limits.manage``,
   ``org.residency.manage``); Org Admins, Editors and Viewers get
   ``PermissionError``; an ``access.Operator`` is accepted by ``create_org`` only.
-- create_org, in one committed transaction: the organizations row, ``org.create``
+- create_org, in one committed transaction: the organizations row, its tool
+  permission matrix (GH-161: ``org_permissions.seed_org_permissions``, the 34
+  default rows, right after the org INSERT), ``org.create``
   (exact content-free metadata, the budget in cents), the invited Org Admin
   (#153's rules: a SHA-256 token hash only, 72 h on the database clock,
   ``invitation.create`` by the same actor), the invitation email through the
   outbox unless ``queue_email`` is False, and a ``CreatedOrg`` whose one-time
   ``accept_link`` stays out of ``repr()``. A taken email or a failed audit
-  write leaves nothing behind at all.
+  write leaves nothing behind at all (no permission rows either).
 - Every status transition from every status (allowed ones change the status,
   the deletion dates and ``updated_at`` and write exactly one audit row;
   refused ones raise ``InvalidOrgStatusError`` and write nothing), the org row
@@ -41,7 +43,8 @@ What these tests pin down (the spec: the issue, its decisions, tracker #139 §5)
 - update_limits and set_residency: exact old/new metadata, refused while a
   deletion is pending.
 - purge_due_orgs: only due orgs, each in its own transaction; every row of the
-  org (users of every status and what cascades from them, the org row), its
+  org (users of every status and what cascades from them, the org row and,
+  GH-161, its permission rows through ON DELETE CASCADE), its
   audit events (only through ``purge_org_audit_events``) and its directory under
   the attachments root (never following a symlink) go; everything else stays;
   one platform ``org.purge`` record with counts. A failure rolls that org back
@@ -1047,6 +1050,133 @@ class TestCreateOrgRefusals:
             await _create(orgs, db, actor)
 
         assert _state(db) == before
+
+
+# ---------------------------------------------------------------------------
+# 4b. create_org seeds the new org's permission matrix (GH-161)
+# ---------------------------------------------------------------------------
+
+
+def _default_matrix() -> dict[str, dict[str, str]]:
+    """build_default_permissions_config() as tool -> {action: state} (34 rows)."""
+    from admino.permissions import build_default_permissions_config
+
+    config = build_default_permissions_config()
+    return {tool: dict(perms.actions) for tool, perms in config.tools.items()}
+
+
+def _permission_inserts(db: FakeDb) -> list[Call]:
+    return db.matching(r"^insert into permissions\b")
+
+
+class TestCreateOrgSeedsPermissions:
+    """A new org starts from the default matrix, seeded inside create_org's transaction;
+    a creation that rolls back leaves no permission row; the purge removes them."""
+
+    async def test_organizations_create_seeds_the_default_permission_matrix(
+        self, orgs: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _super_admin(db)
+
+        created = await _create(orgs, db, actor)
+
+        org_id = created.organization.id
+        assert db.org_permissions(org_id) == _default_matrix()
+        assert sum(len(actions) for actions in db.org_permissions(org_id).values()) == 34
+
+    async def test_organizations_create_seeds_permissions_in_the_org_insert_transaction(
+        self, orgs: ModuleType, db: FakeDb
+    ) -> None:
+        """Every seed INSERT runs in the committed transaction of the org INSERT, after it."""
+        actor = _super_admin(db)
+
+        await _create(orgs, db, actor)
+
+        org_insert = _one(db.matching(r"^insert into organizations\b"))
+        seeds = _permission_inserts(db)
+        assert seeds
+        assert {call.tx for call in seeds} == {org_insert.tx}
+        assert org_insert.tx is not None
+        assert (org_insert.tx, "commit") in db.transactions
+        assert db.calls.index(org_insert) < db.calls.index(seeds[0])
+
+    async def test_organizations_create_by_the_operator_seeds_the_matrix_too(
+        self, orgs: ModuleType, db: FakeDb
+    ) -> None:
+        created = await _create(orgs, db, _operator(), ip=None, queue_email=False)
+
+        assert db.org_permissions(created.organization.id) == _default_matrix()
+
+    async def test_organizations_create_leaves_other_orgs_permissions_alone(
+        self, orgs: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _super_admin(db)
+        db.add_org(ORG_ID)
+        db.add_permissions(ORG_ID, {"gmail": {"read": "deny"}})
+        before = copy.deepcopy(db.permissions)
+
+        created = await _create(orgs, db, actor)
+
+        new_org = created.organization.id
+        assert db.org_permissions(new_org) == _default_matrix()
+        kept = {key: row for key, row in db.permissions.items() if plain(key[0]) != new_org}
+        assert kept == before
+        assert db.org_permissions(ORG_ID) == {"gmail": {"read": "deny"}}
+
+    async def test_organizations_create_taken_email_leaves_no_permission_rows(
+        self, orgs: ModuleType, db: FakeDb
+    ) -> None:
+        """The seed ran inside the transaction (after the org INSERT, before the invited
+        admin's INSERT failed) and was rolled back with it."""
+        actor = _super_admin(db)
+        _existing(db, "active-other-org")
+        before = copy.deepcopy(db.permissions)
+
+        with pytest.raises(accounts.DuplicateEmailError):
+            await _create(orgs, db, actor, request=_request(primary_admin_email=_TAKEN))
+
+        seeds = _permission_inserts(db)
+        assert seeds
+        rolled_back = {tx for tx, outcome in db.transactions if outcome.startswith("rollback")}
+        assert {call.tx for call in seeds} <= rolled_back
+        assert db.permissions == before
+
+    async def test_organizations_create_audit_failure_leaves_no_permission_rows(
+        self, orgs: ModuleType, db: FakeDb
+    ) -> None:
+        """The invitation.create record fails after the seed: everything rolls back."""
+        actor = _super_admin(db)
+        before_orgs = set(db.orgs)
+        db.fail_audit_when = lambda row: row["action"] == "invitation.create"
+
+        with pytest.raises(AuditRecordError):
+            await _create(orgs, db, actor)
+
+        seeds = _permission_inserts(db)
+        assert seeds
+        rolled_back = {tx for tx, outcome in db.transactions if outcome.startswith("rollback")}
+        assert {call.tx for call in seeds} <= rolled_back
+        assert db.permissions == {}
+        assert set(db.orgs) == before_orgs
+
+    async def test_organizations_purge_removes_the_orgs_permission_rows(
+        self, orgs: ModuleType, db: FakeDb, root: Path
+    ) -> None:
+        """ON DELETE CASCADE: the purged org's matrix goes with it; another org's stays."""
+        actor = _super_admin(db)
+        db.add_org(ORG_ID)
+        db.add_permissions(ORG_ID)
+        kept = copy.deepcopy(db.org_permissions(ORG_ID))
+        created = await _create(orgs, db, actor)
+        org_id = created.organization.id
+        assert db.org_permissions(org_id) == _default_matrix()
+        _due(db, org_id)
+
+        assert await _purge(orgs, db, root) == 1
+
+        assert db.org_permissions(org_id) == {}
+        assert not any(plain(key[0]) == org_id for key in db.permissions)
+        assert db.org_permissions(ORG_ID) == kept
 
 
 # ---------------------------------------------------------------------------

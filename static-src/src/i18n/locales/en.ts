@@ -109,6 +109,15 @@ export const en = {
   'criticalPermissions.footer':
     'Disabling takes effect immediately. Enabling requires re-authentication and a 5-minute cooldown you can cancel.',
 
+  // --- reauth (password re-auth prompt, issue #161: promoting a critical ---
+  // permission needs the Org Admin's password)
+  'reauth.title': 'Confirm your password',
+  'reauth.body': 'Enter your password to let the agent propose {action} for {tool}.',
+  'reauth.passwordLabel': 'Password',
+  'reauth.submit': 'Confirm',
+  'reauth.error.wrongPassword': 'Incorrect password. Please try again.',
+  'reauth.error.failed': 'Something went wrong. Please try again.',
+
   // --- tools (tool metadata shown on the Permissions page) ------------------
   'tools.gmail.label': 'Gmail',
   'tools.gmail.description': 'Read, search, and send from your inbox',
@@ -206,6 +215,7 @@ export const en = {
   'permissionState.allow': 'Allowed',
   'permissionState.confirm': 'Needs approval',
   'permissionState.deny': 'Denied',
+  'permissionState.disabled': 'Service disabled',
   'permissionPill.promotableHint': 'This permission can be managed from Settings › Danger Zone',
   'permissionPill.hardcodedHint': 'This permission is enforced by security policy and cannot be changed',
 
@@ -232,6 +242,14 @@ export const en = {
     one: '{n} denied',
     other: '{n} denied',
   },
+
+  // --- permissions summary page (read-only, issue #161: Editor/Viewer) ----
+  'permissions.summary.subtitle': "What the agent may do in your organization's workspace.",
+  'permissions.summary.empty': 'No permissions configured yet.',
+
+  // --- organization permissions (editable matrix, Org Admin, issue #161) --
+  'organization.permissions.title': 'Permission matrix',
+  'organization.permissions.subtitle': 'Choose what the agent may do in this organization, per tool and action.',
 
   // --- toolsPage (connected accounts, local tools, OAuth callback) -------
   'toolsPage.accounts.title': 'Connected accounts',

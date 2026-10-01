@@ -52,7 +52,6 @@ from __future__ import annotations
 import logging
 import textwrap
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import ValidationError
@@ -65,7 +64,6 @@ from admino.config import (
     LLMConfig,
     ServerConfig,
     load_app_config,
-    load_permissions_config_from_db,
 )
 
 if TYPE_CHECKING:
@@ -1251,34 +1249,14 @@ class TestDatabaseBackedAppConfigRemoved:
         assert not hasattr(config_module, "load_app_config_from_db")
 
 
-class TestLoadPermissionsConfigFromDb:
-    """Tests for load_permissions_config_from_db()."""
+class TestGlobalPermissionsLoaderRemoved:
+    """GH-161: the org-scoped matrix is loaded per run by
+    ``org_permissions.load_tool_policy``; the global loader is dead code and gone."""
 
-    async def test_calls_load_permissions_from_db(self) -> None:
-        """load_permissions_config_from_db calls load_permissions_from_db and returns config."""
-        mock_pool = MagicMock()
-        mock_data = {
-            "gmail": {"read": "allow", "list": "allow"},
-            "memory": {"store": "allow", "recall": "allow", "list": "allow"},
-        }
-        mock_load = AsyncMock(return_value=mock_data)
+    def test_config_global_permissions_loader_is_removed(self) -> None:
+        import admino.config as config_module
 
-        with patch("admino.database.load_permissions_from_db", new=mock_load):
-            result = await load_permissions_config_from_db(mock_pool)
-
-        mock_load.assert_awaited_once_with(mock_pool)
-        assert result.tools["gmail"].actions["read"] == "allow"
-        assert result.tools["memory"].actions["store"] == "allow"
-
-    async def test_empty_permissions_returns_empty_config(self) -> None:
-        """load_permissions_config_from_db handles empty permissions dict."""
-        mock_pool = MagicMock()
-        mock_load = AsyncMock(return_value={})
-
-        with patch("admino.database.load_permissions_from_db", new=mock_load):
-            result = await load_permissions_config_from_db(mock_pool)
-
-        assert result.tools == {}
+        assert not hasattr(config_module, "load_permissions_config_from_db")
 
 
 class TestProviderCleanup:

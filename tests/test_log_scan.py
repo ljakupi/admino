@@ -32,14 +32,18 @@ the in-memory database tests/db_fakes.FakeDb:
    email_outbox statements from FakeDb's queued rows.
 6. Chat (``POST /api/message``) with a real ``Agent``, a scripted LLM, the
    real tool-call recorder and the real ``gmail.search`` tool (the only tool
-   registered). The tool runs over a real ``httpx.AsyncClient`` on an
+   registered). GH-161: the run's policy is the org's own matrix, seeded with
+   the defaults (gmail.search allowed) when the org was created in step 1.
+   The tool runs over a real ``httpx.AsyncClient`` on an
    ``httpx.MockTransport``, so httpx's own request logging, which prints the
    full URL including ``?q=``, is exercised. The mocked Gmail API answers with
    the title as subject and the file name as attachment. A second turn's LLM
    call raises an ``LLMError`` whose message holds fixture strings.
 7. The Google OAuth callback stores a token for the fixture Google account.
-8. ``GET /api/permissions`` whose permissions loader raises
-   ``RuntimeError(<fixture text>)`` (GH-159 removed ``/api/settings``).
+8. ``GET /api/org/permissions`` as the Org Admin, whose service call
+   (``org_permissions.get_org_permissions``) raises ``RuntimeError(<fixture
+   text>)`` (GH-159 removed ``/api/settings``; GH-161 moved the permission
+   matrix from ``/api/permissions`` to the Org Admin's ``/api/org/permissions``).
 9. ``GET /health``.
 
 What these tests pin down:
@@ -104,7 +108,6 @@ from admino.agent import Agent
 from admino.llm import LLMError, LLMResponse
 from admino.mailer import SmtpConfig
 from admino.models import AgentConfig, GmailSearchArgs, ToolCall
-from admino.permissions import PermissionsConfig, ToolPermissions
 from admino.server import create_app
 from admino.tools import gmail, registry
 from tests.db_fakes import PUBLIC_URL, FakeDb, fake_hash, norm, plain
@@ -526,13 +529,11 @@ def _config() -> MagicMock:
 
 
 def _agent(llm: _ScriptedLLM) -> Agent:
-    """A real Agent with the real tool-call recorder; gmail.search is allowed."""
+    """A real Agent with the real tool-call recorder (GH-161: no permission state of
+    its own — each chat run gets the org's policy, where gmail.search is allowed)."""
     return Agent(
         llm_client=llm,
         tool_call_recorder=main_module._build_tool_call_recorder(),
-        permissions_config=PermissionsConfig(
-            tools={"gmail": ToolPermissions(actions={"search": "allow"})}
-        ),
         agent_config=AgentConfig(
             max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0
         ),
@@ -751,14 +752,15 @@ def _connect_google(db: FakeDb, client: TestClient) -> None:
 
 
 def _crash(app: FastAPI, session: str) -> httpx.Response:
-    """Step 8: GET /api/permissions, whose permissions loader raises with fixture text."""
+    """Step 8: the Org Admin's GET /api/org/permissions, whose service call raises with
+    fixture text (GH-161; the route calls ``org_permissions.get_org_permissions``)."""
     client = TestClient(
         app, client=(_IP, 50000), follow_redirects=False, raise_server_exceptions=False
     )
-    failing_loader = AsyncMock(side_effect=RuntimeError(_CRASH_TEXT))
-    with patch("admino.database.load_permissions_from_db", failing_loader):
-        response = client.get("/api/permissions", headers=_cookie(session))
-    assert failing_loader.await_count == 1
+    failing_service = AsyncMock(side_effect=RuntimeError(_CRASH_TEXT))
+    with patch("admino.org_permissions.get_org_permissions", failing_service):
+        response = client.get("/api/org/permissions", headers=_cookie(session))
+    assert failing_service.await_count == 1
     assert response.status_code == 500
     return response
 

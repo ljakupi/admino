@@ -231,8 +231,9 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
    [Switching providers](configuration.md#llm-providers)).
 4. Type a message and press **Enter**.
 5. The agent responds and may call a tool. **Read** actions run immediately; **write**
-   actions pause for your approval; **destructive** actions are denied. See
-   [Permissions](permissions.md).
+   actions pause for your approval; **destructive** actions are denied. Each organization
+   starts from these defaults, and its Org Admins can change them under **Organization**.
+   See [Permissions](permissions.md).
 
 ## Connect your accounts
 

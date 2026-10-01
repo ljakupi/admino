@@ -24,8 +24,11 @@ What these tests pin down:
   refusals are 403 before authentication runs, the login included.
 - Rate limits are per caller (user id on session routes, client IP on public
   ones), idle buckets are evicted and the bucket map is bounded.
-- Critical promotions answer 403 until #161; the agent receives the caller's
-  Principal.
+- Critical promotions (GH-161) live under ``/api/org/critical-permissions``:
+  #149's 403 "temporarily unavailable" is gone, an Org Admin promotes with
+  their password, other roles get 403, the old bearer body grants nothing,
+  demotion and cancelling a cooldown work on the org's stored rows (the shared
+  tests/db_fakes.py database). The agent receives the caller's Principal.
 
 All database and LLM calls are faked. No network, no real PostgreSQL.
 
@@ -67,6 +70,7 @@ from admino.models import AgentConfig, AgentResult, LLMMessage, PendingConfirmat
 from admino.server import create_app
 from tests.db_fakes import FakeDb as SharedFakeDb
 from tests.db_fakes import NowPlus, insert_values
+from tests.db_fakes import fake_hash as shared_fake_hash
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -89,7 +93,9 @@ _CSRF_REFUSED = {"detail": "Cross-origin request refused"}
 _UNAUTHORIZED = {"detail": "Unauthorized"}
 _FORBIDDEN = {"detail": "Forbidden"}
 _LOGIN_FAILED = {"detail": "Invalid email or password"}
+# #149's interim refusal, which GH-161 retires (no route may answer it any more).
 _PROMOTE_REFUSED = {"detail": "Critical permission promotions are temporarily unavailable."}
+_CRITICAL = "/api/org/critical-permissions"
 _CHAT_BODY = {"message": "hello", "session_id": "chat-1"}
 
 # Routes that answer without a session: the health check, the login, the
@@ -124,11 +130,14 @@ _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         ("PATCH", "/api/org/settings"),
         ("GET", "/api/platform/settings"),
         ("PATCH", "/api/platform/settings"),
-        ("GET", "/api/permissions"),
-        ("PATCH", "/api/permissions"),
-        ("GET", "/api/critical-permissions"),
-        ("PATCH", "/api/critical-permissions/{tool}/{action}"),
-        ("DELETE", "/api/critical-permissions/{tool}/{action}/pending"),
+        # GH-161: the org's matrix and critical permissions (Org Admin), and the
+        # members' read-only summary (the old /api/permissions routes are gone).
+        ("GET", "/api/org/permissions"),
+        ("PATCH", "/api/org/permissions"),
+        ("GET", "/api/org/critical-permissions"),
+        ("PATCH", "/api/org/critical-permissions/{tool}/{action}"),
+        ("DELETE", "/api/org/critical-permissions/{tool}/{action}/pending"),
+        ("GET", "/api/permissions/summary"),
         ("GET", "/api/oauth/google/authorize"),
         ("GET", "/api/oauth/microsoft/authorize"),
         ("GET", "/api/oauth/google/status"),
@@ -430,6 +439,7 @@ class _FakeAgent:
         principal: Principal,
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
+        tool_policy: Any = None,
     ) -> AgentResult:
         self.run_calls.append(
             {
@@ -438,6 +448,8 @@ class _FakeAgent:
                 "principal": principal,
                 "pending_confirmation": pending_confirmation,
                 "agent_config": agent_config,
+                # GH-161: the run's own org policy (specified in tests/test_permissions_api.py).
+                "tool_policy": tool_policy,
             }
         )
         return AgentResult(
@@ -1302,11 +1314,11 @@ class TestCsrf:
         [
             (
                 "PATCH",
-                "/api/permissions",
-                {"tool": "memory", "action": "read", "permission": "allow"},
+                "/api/org/permissions",
+                {"tool": "memory", "action": "recall", "permission": "deny"},
             ),
-            ("PATCH", "/api/critical-permissions/gmail/send", None),
-            ("DELETE", "/api/critical-permissions/gmail/send/pending", None),
+            ("PATCH", "/api/org/critical-permissions/gmail/send", {"password": _PASSWORD}),
+            ("DELETE", "/api/org/critical-permissions/gmail/send/pending", None),
             ("DELETE", "/api/oauth/google", None),
             ("POST", "/api/auth/logout", None),
         ],
@@ -1425,8 +1437,10 @@ _EXPECTED_RATES: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
     "/api/events": (0.17, 3),
-    "/api/permissions/get": (1.0, 5),
-    "/api/permissions/patch": (0.2, 2),
+    # GH-161: the org's matrix, its critical permissions and the members' summary.
+    "/api/org/permissions/get": (1.0, 5),
+    "/api/org/permissions/patch": (0.2, 2),
+    "/api/permissions/summary/get": (1.0, 10),
     "/api/oauth/google/authorize": (0.2, 2),
     "/api/oauth/microsoft/authorize": (0.2, 2),
     "/api/oauth/callback": (0.2, 2),
@@ -1434,9 +1448,9 @@ _EXPECTED_RATES: dict[str, tuple[float, int]] = {
     "/api/oauth/microsoft/status": (1.0, 5),
     "/api/oauth/google/disconnect": (0.2, 2),
     "/api/oauth/microsoft/disconnect": (0.2, 2),
-    "/api/critical-permissions/get": (1.0, 5),
-    "/api/critical-permissions/promote": (5 / 60, 5),
-    "/api/critical-permissions/cancel": (0.5, 5),
+    "/api/org/critical-permissions/get": (1.0, 5),
+    "/api/org/critical-permissions/promote": (5 / 60, 5),
+    "/api/org/critical-permissions/cancel": (0.5, 5),
     "/api/auth/login": (0.2, 5),
     "/api/auth/logout": (0.5, 5),
     "/api/auth/me": (1.0, 10),
@@ -1594,11 +1608,13 @@ class TestUnresolvedSessionThrottle:
         client = _client(app, _IP_A)
 
         statuses = [
-            client.get("/api/permissions", headers=_cookie(secrets.token_urlsafe(32))).status_code
+            client.get(
+                "/api/permissions/summary", headers=_cookie(secrets.token_urlsafe(32))
+            ).status_code
             for _ in range(3)
         ]
         queries_before = _session_queries(db)
-        refused = client.get("/api/permissions", headers=_cookie(secrets.token_urlsafe(32)))
+        refused = client.get("/api/permissions/summary", headers=_cookie(secrets.token_urlsafe(32)))
 
         assert statuses == [401, 401, 401]
         assert refused.status_code == 429
@@ -1741,83 +1757,142 @@ class TestRateLimitEviction:
 
 
 # ---------------------------------------------------------------------------
-# 8. Critical permissions: promotion disabled until #161
+# 8. Critical permissions: per-org promotions with password re-auth (GH-161)
 # ---------------------------------------------------------------------------
 
 
-class TestCriticalPromotionDisabled:
-    """PATCH on a non-promoted permission is a 403 and starts no cooldown."""
+@pytest.fixture()
+def org_db(monkeypatch: pytest.MonkeyPatch) -> SharedFakeDb:
+    """The shared tests/db_fakes.py database (sessions, the org's permission rows, the
+    login throttle, audit rows): _ORG_ID with the default matrix; Argon2 replaced by the
+    fast fake."""
+    fake = SharedFakeDb()
+    fake.add_org(_ORG_ID)
+    fake.add_permissions(_ORG_ID)
+    monkeypatch.setattr("admino.database.get_pool", lambda: fake.pool)
+    monkeypatch.setattr(
+        "admino.passwords.verify_password",
+        lambda password, encoded: encoded == shared_fake_hash(password),
+    )
+    monkeypatch.setattr("admino.passwords.needs_rehash", lambda _encoded: False)
+    return fake
+
+
+def _org_session(db: SharedFakeDb, *, role: str | None = "org_admin", kind: str = "member") -> str:
+    """A session token of an account that knows _PASSWORD (a member of _ORG_ID by default)."""
+    if kind == "super_admin":
+        user_id = db.add_account(kind=kind, role=None, password_hash=shared_fake_hash(_PASSWORD))
+    else:
+        user_id = db.add_account(
+            role=role, org_id=_ORG_ID, password_hash=shared_fake_hash(_PASSWORD)
+        )
+    return db.open_session(user_id)
+
+
+def _pending_at(client: TestClient, token: str, tool: str, action: str) -> Any:
+    """The pending_at of one critical permission, read by an Org Admin."""
+    listed = client.get(_CRITICAL, headers=_cookie(token))
+    assert listed.status_code == 200, listed.text
+    entries = [
+        entry
+        for entry in listed.json()["permissions"]
+        if (entry["tool"], entry["action"]) == (tool, action)
+    ]
+    assert len(entries) == 1, listed.json()
+    return entries[0]["pending_at"]
+
+
+class TestCriticalPromotionSessions:
+    """#149's interim 403 is gone: an Org Admin re-authenticates with their password, other
+    roles are refused, the old bearer body grants nothing; demote and cancel still work."""
+
+    def test_auth_api_org_admin_can_promote_again_with_the_password(
+        self, org_db: SharedFakeDb
+    ) -> None:
+        """The issue's test: an Org Admin with the right password starts the cooldown."""
+        token = _org_session(org_db)
+
+        response = _client(_app()).patch(
+            f"{_CRITICAL}/gmail/send", headers=_cookie(token), json={"password": _PASSWORD}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() != _PROMOTE_REFUSED
+        body = response.json()
+        assert (body["tool"], body["action"], body["state"]) == ("gmail", "send", "deny")
+        assert body["pending_at"] is not None
+        assert [row["action"] for row in org_db.audit] == ["org.permission_promote"]
 
     @pytest.mark.parametrize(
         "who",
         [
-            pytest.param({"role": "org_admin"}, id="org-admin"),
             pytest.param({"role": "editor"}, id="editor"),
-            pytest.param({"kind": "super_admin", "role": None, "org_status": None}, id="sa"),
+            pytest.param({"role": "viewer"}, id="viewer"),
+            pytest.param({"kind": "super_admin", "role": None}, id="sa"),
         ],
     )
-    def test_auth_api_promote_is_refused(self, db: _FakeDb, who: dict[str, Any]) -> None:
-        """Any session reaches the handler, which answers 403 with the fixed message."""
-        token = db.open_session(db.add_account(**who))
-
-        response = _client(_app()).patch(
-            "/api/critical-permissions/gmail/send", headers=_cookie(token)
-        )
-
-        assert response.status_code == 403
-        assert response.json() == _PROMOTE_REFUSED
-        assert server._pending_promotions == {}
-
-    def test_auth_api_promote_with_an_old_bearer_body_is_refused(self, db: _FakeDb) -> None:
-        """The removed re-auth body grants nothing either."""
-        token = db.open_session(db.add_account(role="org_admin"))
-
-        response = _client(_app()).patch(
-            "/api/critical-permissions/gmail/send",
-            json={"bearer_token": "a" * 48},
-            headers=_cookie(token),
-        )
-
-        assert response.status_code == 403
-        assert response.json() == _PROMOTE_REFUSED
-        assert server._pending_promotions == {}
-
-    def test_auth_api_demote_still_works(
-        self, db: _FakeDb, monkeypatch: pytest.MonkeyPatch
+    def test_auth_api_promote_is_forbidden_below_the_org_admin(
+        self, org_db: SharedFakeDb, who: dict[str, Any]
     ) -> None:
-        """PATCH on a promoted permission demotes it to deny."""
-        monkeypatch.setattr("admino.database.update_permission", AsyncMock())
-        monkeypatch.setattr(
-            "admino.config.load_permissions_config_from_db", AsyncMock(return_value=MagicMock())
-        )
-        token = db.open_session(db.add_account(role="org_admin"))
-        app = _app()
-        server._promoted_permissions.add(("gmail", "send"))
+        token = _org_session(org_db, **who)
 
-        response = _client(app).patch(
-            "/api/critical-permissions/gmail/send", headers=_cookie(token)
+        response = _client(_app()).patch(
+            f"{_CRITICAL}/gmail/send", headers=_cookie(token), json={"password": _PASSWORD}
         )
 
-        assert response.status_code == 200
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert org_db.audit == []
+        assert org_db.org_permissions(_ORG_ID)["gmail"]["send"] == "deny"
+
+    def test_auth_api_promote_with_an_old_bearer_body_is_refused(
+        self, org_db: SharedFakeDb
+    ) -> None:
+        """The removed re-auth body grants nothing: refused without echo, no cooldown."""
+        token = _org_session(org_db)
+        bearer = "b" * 48
+        client = _client(_app())
+
+        response = client.patch(
+            f"{_CRITICAL}/gmail/send", json={"bearer_token": bearer}, headers=_cookie(token)
+        )
+
+        assert response.status_code in {400, 422}, response.text
+        assert bearer not in response.text
+        assert org_db.audit == []
+        assert _pending_at(client, token, "gmail", "send") is None
+
+    def test_auth_api_demote_works_on_the_orgs_stored_promotion(self, org_db: SharedFakeDb) -> None:
+        """PATCH on a promoted permission (stored 'confirm') demotes it to deny."""
+        org_db.add_permissions(_ORG_ID, {"gmail": {"send": "confirm"}})
+        token = _org_session(org_db)
+
+        response = _client(_app()).patch(f"{_CRITICAL}/gmail/send", headers=_cookie(token))
+
+        assert response.status_code == 200, response.text
         assert response.json()["state"] == "deny"
-        assert ("gmail", "send") not in server._promoted_permissions
+        assert org_db.org_permissions(_ORG_ID)["gmail"]["send"] == "deny"
 
-    def test_auth_api_cancel_pending_still_works(self, db: _FakeDb) -> None:
-        """DELETE .../pending still cancels a cooldown."""
-        token = db.open_session(db.add_account(role="org_admin"))
-        app = _app()
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC)
+    def test_auth_api_cancel_pending_still_works(self, org_db: SharedFakeDb) -> None:
+        """DELETE .../pending cancels the cooldown the password re-auth started."""
+        token = _org_session(org_db)
+        client = _client(_app())
 
-        response = _client(app).delete(
-            "/api/critical-permissions/gmail/send/pending", headers=_cookie(token)
+        promoted = client.patch(
+            f"{_CRITICAL}/gmail/send", headers=_cookie(token), json={"password": _PASSWORD}
         )
+        cancelled = client.delete(f"{_CRITICAL}/gmail/send/pending", headers=_cookie(token))
 
-        assert response.status_code == 200
-        assert server._pending_promotions == {}
+        assert promoted.status_code == 200, promoted.text
+        assert cancelled.status_code == 200, cancelled.text
+        assert (cancelled.json()["state"], cancelled.json()["pending_at"]) == ("deny", None)
+        assert _pending_at(client, token, "gmail", "send") is None
 
-    def test_auth_api_promote_model_is_removed(self) -> None:
-        """models.CriticalPermissionPromote (and its bearer_token) is gone."""
-        assert not hasattr(models, "CriticalPermissionPromote")
+    def test_auth_api_promote_model_takes_only_a_password(self) -> None:
+        """models.CriticalPermissionPromote is back with a password (no bearer_token)."""
+        model = getattr(models, "CriticalPermissionPromote", None)
+
+        assert model is not None
+        assert set(model.model_fields) == {"password"}
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,9 @@
 """Tests for admino.database — pool lifecycle, migrations, seeds, and loaders.
 
 GH-159: the settings table helpers (seed_settings, update_setting,
-load_settings_from_db) are gone with the table.
+load_settings_from_db) are gone with the table. GH-161: so are the global
+permission helpers (seed_permissions, update_permission, load_permissions_from_db);
+the org-scoped matrix lives in admino.org_permissions.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -260,105 +262,20 @@ class TestSettingsTableHelpersRemoved:
 
 
 # ---------------------------------------------------------------------------
-# TestSeedPermissions
+# TestGlobalPermissionHelpersRemoved (GH-161)
 # ---------------------------------------------------------------------------
 
 
-class TestSeedPermissions:
-    """Tests for seed_permissions()."""
+class TestGlobalPermissionHelpersRemoved:
+    """GH-161: the permissions table is org-scoped (migration 0016) and its rows are
+    seeded, read and written by admino.org_permissions; the global seed, update and
+    load helpers are dead code and gone."""
 
-    async def test_seeds_when_table_is_empty(self, mock_pool: MagicMock) -> None:
-        """seed_permissions() inserts rows when permissions table is empty."""
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        mock_perms = MagicMock()
-        mock_perms.tools = {
-            "gmail": MagicMock(actions={"read": "allow", "send": "confirm"}),
-            "memory": MagicMock(actions={"store": "allow"}),
-        }
-
-        await db_mod.seed_permissions(mock_pool, mock_perms)
-
-        insert_calls = [
-            c
-            for c in conn.execute.call_args_list
-            if len(c.args) > 0 and "INSERT INTO permissions" in c.args[0]
-        ]
-        assert len(insert_calls) == 3
-
-    async def test_skips_when_table_has_rows(self, mock_pool: MagicMock) -> None:
-        """seed_permissions() skips seeding when permissions table has rows."""
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=5)
-
-        mock_perms = MagicMock()
-        await db_mod.seed_permissions(mock_pool, mock_perms)
-
-        insert_calls = [
-            c
-            for c in conn.execute.call_args_list
-            if len(c.args) > 0 and "INSERT INTO permissions" in c.args[0]
-        ]
-        assert len(insert_calls) == 0
-
-    async def test_inserts_correct_tool_action_permission(self, mock_pool: MagicMock) -> None:
-        """seed_permissions() inserts correct (tool, action, permission) tuples."""
-        conn = mock_pool._mock_conn
-        conn.fetchval = AsyncMock(return_value=0)
-
-        mock_perms = MagicMock()
-        mock_perms.tools = {
-            "gmail": MagicMock(actions={"read": "allow"}),
-        }
-
-        await db_mod.seed_permissions(mock_pool, mock_perms)
-
-        insert_calls = [
-            c
-            for c in conn.execute.call_args_list
-            if len(c.args) > 0 and "INSERT INTO permissions" in c.args[0]
-        ]
-        assert len(insert_calls) == 1
-        assert insert_calls[0].args[1] == "gmail"
-        assert insert_calls[0].args[2] == "read"
-        assert insert_calls[0].args[3] == "allow"
-
-
-# ---------------------------------------------------------------------------
-# TestLoadPermissionsFromDb
-# ---------------------------------------------------------------------------
-
-
-class TestLoadPermissionsFromDb:
-    """Tests for load_permissions_from_db()."""
-
-    async def test_groups_by_tool(self, mock_pool: MagicMock) -> None:
-        """load_permissions_from_db() groups rows by tool name."""
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(
-            return_value=[
-                {"tool": "gmail", "action": "read", "permission": "allow"},
-                {"tool": "gmail", "action": "send", "permission": "confirm"},
-                {"tool": "memory", "action": "store", "permission": "allow"},
-            ]
-        )
-
-        result = await db_mod.load_permissions_from_db(mock_pool)
-
-        assert result == {
-            "gmail": {"read": "allow", "send": "confirm"},
-            "memory": {"store": "allow"},
-        }
-
-    async def test_empty_permissions_table(self, mock_pool: MagicMock) -> None:
-        """load_permissions_from_db() returns empty dict when table is empty."""
-        conn = mock_pool._mock_conn
-        conn.fetch = AsyncMock(return_value=[])
-
-        result = await db_mod.load_permissions_from_db(mock_pool)
-
-        assert result == {}
+    @pytest.mark.parametrize(
+        "name", ["seed_permissions", "update_permission", "load_permissions_from_db"]
+    )
+    def test_database_global_permission_helper_is_removed(self, name: str) -> None:
+        assert not hasattr(db_mod, name)
 
 
 # ---------------------------------------------------------------------------

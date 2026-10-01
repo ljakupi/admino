@@ -147,6 +147,7 @@ class Capability(StrEnum):
     ORG_SETTINGS_MANAGE = "org.settings.manage"
     ORG_INSTRUCTIONS_MANAGE = "org.instructions.manage"
     ORG_PERMISSIONS_MANAGE = "org.permissions.manage"
+    ORG_PERMISSIONS_VIEW = "org.permissions.view"
     ORG_MODELS_MANAGE = "org.models.manage"
     TEMPLATE_ORG_MANAGE = "template.org.manage"
     ORG_LETTERHEAD_MANAGE = "org.letterhead.manage"
@@ -218,6 +219,8 @@ _MATRIX: Final[MappingProxyType[Capability, frozenset[str]]] = MappingProxyType(
         Capability.TEMPLATE_PERSONAL_MANAGE: _ORG_ADMIN_AND_EDITOR,
         # Read projects shared with them
         Capability.PROJECT_READ_SHARED: _ALL_MEMBERS,
+        # Read the summary of their org's tool permissions (GH-161)
+        Capability.ORG_PERMISSIONS_VIEW: _ALL_MEMBERS,
         # Export what they can read
         Capability.EXPORT_CREATE: _ALL_MEMBERS,
         # Own usage

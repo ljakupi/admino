@@ -1,6 +1,7 @@
 """Tests for admino.scoped_settings — the platform, org and user settings scopes
-(GH-159), the cached, editable platform defaults (GH-160) and the task-done pings
-and "reset my settings" of the Settings page (GH-35).
+(GH-159), the cached, editable platform defaults (GH-160), the task-done pings
+and "reset my settings" of the Settings page (GH-35), and the per-org
+tool switches a chat run reads (GH-161, ``org_tools_enabled``).
 
 The old key/value ``settings`` table is dropped (migration 0013). Each value
 now has an owner: ``user_settings`` (each user: theme and notifications),
@@ -12,7 +13,7 @@ the startup and every consumer of a platform default.
 
 What these tests pin down (the GH-159 and GH-160 implementation contracts):
 - Surface: ``get_user_settings`` / ``update_user_settings`` /
-  ``get_org_settings`` / ``update_org_settings`` / ``all_orgs_tools_gate`` /
+  ``get_org_settings`` / ``update_org_settings`` / ``org_tools_enabled`` /
   ``seed_platform_settings`` / ``load_platform_settings`` /
   ``current_platform_settings`` / ``session_policy_for`` /
   ``update_platform_settings`` are coroutines, ``apply_platform_settings`` is
@@ -65,8 +66,12 @@ What these tests pin down (the GH-159 and GH-160 implementation contracts):
   ``platform.settings_change`` (actor super_admin, no org, no target,
   metadata ``{<changed field>: True}`` with field names only, never a
   provider or model value).
-- ``all_orgs_tools_gate``: one aggregate statement; a tool is off when ANY
-  org turned it off; no rows means all seven on.
+- GH-161 retires the interim all-orgs gate (``all_orgs_tools_gate`` is
+  gone: one org's switch never disables another org's service).
+  ``org_tools_enabled(executor, tenant)`` returns the tenant org's seven
+  switches (its org_settings row; a missing row means all seven on), reads
+  only that org's row, needs no capability (an internal read for a chat run)
+  and writes nothing.
 - ``seed_platform_settings``: one upsert; the first boot stores config.yaml's
   llm and limits; later boots re-apply the llm (an empty model is NULL) and
   keep the stored limits. ``load_platform_settings`` raises RuntimeError
@@ -675,7 +680,7 @@ class TestModuleSurface:
             "update_user_settings",
             "get_org_settings",
             "update_org_settings",
-            "all_orgs_tools_gate",
+            "org_tools_enabled",
             "seed_platform_settings",
             "load_platform_settings",
             "update_platform_settings",
@@ -686,6 +691,12 @@ class TestModuleSurface:
     )
     def test_scoped_settings_function_is_a_coroutine(self, svc: ModuleType, name: str) -> None:
         assert inspect.iscoroutinefunction(getattr(svc, name))
+
+    def test_scoped_settings_all_orgs_tools_gate_is_gone(self, svc: ModuleType) -> None:
+        """GH-161's cleanup criterion: the interim gate (a tool off when ANY org turned it
+        off) is retired; each run reads its own org's switches."""
+        assert not hasattr(svc, "all_orgs_tools_gate")
+        assert not hasattr(svc, "_GATE_SQL")
 
     def test_scoped_settings_update_platform_llm_is_gone(self, svc: ModuleType) -> None:
         """GH-160: update_platform_settings replaces the LLM-only update."""
@@ -1672,75 +1683,106 @@ class TestOrgSettings:
 
 
 # ---------------------------------------------------------------------------
-# 5. The interim enabled-services gate (until #161)
+# 5. The tenant org's tool switches for a chat run (GH-161)
 # ---------------------------------------------------------------------------
 
 
-class TestToolsGate:
-    """A tool is off when ANY org turned it off; no org row means every tool is on."""
+def _tenant(principal: Principal) -> Any:
+    from admino.tenancy import TenantContext
 
-    async def test_scoped_settings_gate_without_rows_enables_every_tool(
+    return TenantContext.from_principal(principal)
+
+
+class TestOrgToolsEnabled:
+    """org_tools_enabled: the tenant org's own switches; another org's never count."""
+
+    async def test_scoped_settings_org_tools_enabled_returns_the_stored_switches(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        gate = await svc.all_orgs_tools_gate(db.pool)
+        editor = _actor(db, "editor")
+        db.add_org_settings(ORG_ID, gmail=False, onedrive=False)
 
-        assert dict(gate) == _ALL_ON
-        assert all(type(value) is bool for value in gate.values())
+        tools = await svc.org_tools_enabled(db.pool, _tenant(editor))
 
-    async def test_scoped_settings_gate_one_org_disabling_wins_over_another_enabling(
+        assert dict(tools) == {**_ALL_ON, "gmail": False, "onedrive": False}
+        assert all(type(value) is bool for value in tools.values())
+
+    async def test_scoped_settings_org_tools_enabled_without_a_row_enables_every_tool(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        db.add_org_settings(ORG_ID, gmail=False)
-        db.add_org_settings(OTHER_ORG_ID, gmail=True)
+        """A missing row reads as all seven on, and the read writes nothing."""
+        viewer = _actor(db, "viewer")
 
-        gate = await svc.all_orgs_tools_gate(db.pool)
+        tools = await svc.org_tools_enabled(db.pool, _tenant(viewer))
 
-        assert dict(gate) == {**_ALL_ON, "gmail": False}
+        assert dict(tools) == _ALL_ON
+        assert db.org_settings == {}
+        assert db.matching(r"^(?:insert into|update|delete from) org_settings\b") == []
 
-    async def test_scoped_settings_gate_ands_every_tool_across_orgs(
+    async def test_scoped_settings_org_tools_enabled_reads_only_the_tenants_org(
         self, svc: ModuleType, db: FakeDb
     ) -> None:
-        third = db.add_org()
-        db.add_org_settings(ORG_ID, outlook=False)
-        db.add_org_settings(OTHER_ORG_ID, memory=False, onedrive=False)
-        db.add_org_settings(third)
-
-        gate = await svc.all_orgs_tools_gate(db.pool)
-
-        assert dict(gate) == {**_ALL_ON, "outlook": False, "memory": False, "onedrive": False}
-
-    async def test_scoped_settings_gate_all_rows_enabled_is_all_on(
-        self, svc: ModuleType, db: FakeDb
-    ) -> None:
-        db.add_org_settings(ORG_ID)
-        db.add_org_settings(OTHER_ORG_ID)
-
-        assert dict(await svc.all_orgs_tools_gate(db.pool)) == _ALL_ON
-
-    async def test_scoped_settings_gate_is_one_aggregate_statement(
-        self, svc: ModuleType, db: FakeDb
-    ) -> None:
-        db.add_org_settings(ORG_ID, gmail=False)
-
-        await svc.all_orgs_tools_gate(db.pool)
-
-        call = _one(db.calls)
-        assert re.search(r"\bbool_and\b", call.normalized), call.sql
-        assert re.search(r"\bfrom org_settings\b", call.normalized), call.sql
-
-    async def test_scoped_settings_gate_follows_an_org_update(
-        self, svc: ModuleType, db: FakeDb
-    ) -> None:
-        admin = _actor(db, "org_admin", OTHER_ORG_ID)
+        """Org A's tenant sees A's row; B's id is never bound."""
+        editor = _actor(db, "editor", ORG_ID)
         db.add_org_settings(ORG_ID, memory=False)
+        db.add_org_settings(OTHER_ORG_ID, gmail=False, outlook=False)
+
+        tools = await svc.org_tools_enabled(db.pool, _tenant(editor))
+
+        assert dict(tools) == {**_ALL_ON, "memory": False}
+        assert _bound(db, ORG_ID)
+        assert not _bound(db, OTHER_ORG_ID)
+
+    async def test_scoped_settings_another_orgs_disabled_service_stays_on_for_mine(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """GH-161's cleanup criterion: org A's disabled gmail doesn't disable org B's."""
+        db.add_org_settings(ORG_ID, gmail=False)
+        other = _actor(db, "editor", OTHER_ORG_ID)
+
+        tools = await svc.org_tools_enabled(db.pool, _tenant(other))
+
+        assert dict(tools) == _ALL_ON
+
+    async def test_scoped_settings_org_tools_enabled_follows_an_org_update(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        admin = _actor(db, "org_admin", ORG_ID)
+        other = _actor(db, "org_admin", OTHER_ORG_ID)
 
         await svc.update_org_settings(db.pool, actor=admin, patch=_org_patch(gmail=False), ip=_IP)
 
-        assert dict(await svc.all_orgs_tools_gate(db.pool)) == {
+        assert dict(await svc.org_tools_enabled(db.pool, _tenant(admin))) == {
             **_ALL_ON,
             "gmail": False,
-            "memory": False,
         }
+        assert dict(await svc.org_tools_enabled(db.pool, _tenant(other))) == _ALL_ON
+
+    async def test_scoped_settings_org_tools_enabled_runs_on_a_connection(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """An executor: the pool or a connection (the caller's transaction)."""
+        editor = _actor(db, "editor")
+        db.add_org_settings(ORG_ID, google_drive=False)
+
+        async with db.pool.acquire() as conn:
+            tools = await svc.org_tools_enabled(conn, _tenant(editor))
+
+        assert dict(tools) == {**_ALL_ON, "google_drive": False}
+        assert db.calls
+        assert all(call.via != "pool" for call in db.calls)
+
+    async def test_scoped_settings_org_tools_enabled_needs_no_capability(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An internal read for a chat run: it never asks access.can (a Viewer's run
+        reads its org's switches too)."""
+        viewer = _actor(db, "viewer")
+        spy = _CanSpy(monkeypatch, svc)
+
+        await svc.org_tools_enabled(db.pool, _tenant(viewer))
+
+        assert spy.capabilities == []
 
 
 # ---------------------------------------------------------------------------
@@ -3099,12 +3141,12 @@ class TestEachScopeSeededWithDefaults:
         org = await svc.get_org_settings(db.pool, actor=admin)
         mine = await svc.get_user_settings(db.pool, actor=admin)
         platform_admin = await svc.get_user_settings(db.pool, actor=super_admin)
-        gate = await svc.all_orgs_tools_gate(db.pool)
+        run_tools = await svc.org_tools_enabled(db.pool, _tenant(admin))
 
         assert _tools(org) == _ALL_ON
         assert mine.model_dump() == _USER_DEFAULTS
         assert platform_admin.model_dump() == _USER_DEFAULTS
-        assert dict(gate) == _ALL_ON
+        assert dict(run_tools) == _ALL_ON
 
 
 # ---------------------------------------------------------------------------

@@ -10,10 +10,12 @@
  * tagged with its access `area`, and `navItemsFor(role)` filters it by the
  * role matrix while keeping the order:
  *
- * - Editor: Chat, Tools, Settings.
- * - Org Admin: Chat, Tools, Permissions, Organization, Settings (Permissions
- *   stays a separate top-level page until #161 moves it into Organization).
- * - Viewer: Chat, Settings (no Tools).
+ * - Editor: Chat, Tools, Permissions, Settings (issue #161: Permissions is
+ *   the read-only summary of the org's effective permissions).
+ * - Org Admin: Chat, Tools, Organization, Settings (issue #161: the Org Admin
+ *   edits the permission matrix and the critical permissions under
+ *   Organization, so there is no Permissions entry).
+ * - Viewer: Chat, Permissions, Settings (no Tools).
  * - Super Admin: Platform only (no chat UI).
  * - Logged out: nothing.
  *
@@ -96,9 +98,9 @@ describe('navigation NAV_ITEMS', () => {
 
 describe('navigation navItemsFor (issue #155)', () => {
   it.each([
-    ['editor', ['/chat', '/tools', '/settings']],
-    ['org_admin', ['/chat', '/tools', '/permissions', '/organization', '/settings']],
-    ['viewer', ['/chat', '/settings']],
+    ['editor', ['/chat', '/tools', '/permissions', '/settings']],
+    ['org_admin', ['/chat', '/tools', '/organization', '/settings']],
+    ['viewer', ['/chat', '/permissions', '/settings']],
     ['super_admin', ['/platform']],
     [null, []],
   ] as Array<[ShellRole | null, string[]]>)('shows %s exactly %j, in NAV_ITEMS order', (role, expected) => {
@@ -113,6 +115,15 @@ describe('navigation navItemsFor (issue #155)', () => {
       expect(items.length > 0 && items.every((item) => NAV_ITEMS.includes(item))).toBe(true);
     },
   );
+
+  it('offers the Permissions entry to Editors and Viewers only, never to the Org Admin (issue #161)', () => {
+    const roles: ShellRole[] = ['super_admin', 'org_admin', 'editor', 'viewer'];
+
+    expect(roles.filter((role) => navItemsFor(role).some((item) => item.area === 'permissions'))).toEqual([
+      'editor',
+      'viewer',
+    ]);
+  });
 
   it('never offers Tools to a Viewer or the chat to a Super Admin', () => {
     expect({

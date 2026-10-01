@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { ShieldAlert, Mail, Calendar, Clock, Check, Info } from 'lucide-vue-next';
 import { t } from '@/i18n';
+import ReAuthDialog from './ReAuthDialog.vue';
 import {
   useCriticalPermissionsStore,
   CRIT_PERMS,
@@ -93,12 +94,7 @@ function toggleClass(tool: string, action: string): string {
 }
 
 function handleToggle(row: CritPermDef) {
-  if (isOn(row.tool, row.action) || isPending(row.tool, row.action)) {
-    store.demote(row.tool, row.action);
-  } else {
-    // Toast already shown by the store on failure (backend refuses until #161).
-    store.promote(row.tool, row.action).catch(() => undefined);
-  }
+  store.toggle(row.tool, row.action);
 }
 </script>
 
@@ -171,6 +167,16 @@ function handleToggle(row: CritPermDef) {
       <Info :size="12" :stroke-width="2" />
       <span>{{ t('criticalPermissions.footer') }}</span>
     </div>
+
+    <ReAuthDialog
+      v-if="store.reauthTarget"
+      :tool="store.reauthTarget.tool"
+      :action="store.reauthTarget.action"
+      :error="store.reauthError"
+      :busy="store.reauthBusy"
+      @confirm="store.confirmReauth($event)"
+      @cancel="store.cancelReauth()"
+    />
   </div>
 </template>
 

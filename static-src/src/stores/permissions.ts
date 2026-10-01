@@ -1,10 +1,10 @@
 import { defineStore } from 'pinia';
 import { ref, computed } from 'vue';
-import { getPermissions, patchPermission } from '@/api/permissions';
+import { getPermissions, getPermissionsSummary, patchPermission } from '@/api/permissions';
 import { useToastStore } from '@/stores/toasts';
 import { t } from '@/i18n';
 import type { MessageKey } from '@/i18n';
-import type { PermissionEntry, PermissionState } from '@/api/types';
+import type { PermissionEntry, PermissionState, PermissionSummaryEntry } from '@/api/types';
 
 // Tier-1: truly immutable denials — cannot be overridden by any config.
 // Must mirror HARDCODED_DENIALS in src/admino/permissions.py (minus promotable entries).
@@ -129,6 +129,24 @@ export const usePermissionsStore = defineStore('permissions', () => {
   const error = ref<string | null>(null);
   const savingKey = ref<string | null>(null);
 
+  // Read-only summary (issue #161): every member role (Org Admin, Editor,
+  // Viewer) sees the org's effective permission states through this,
+  // independent of `permissions`/`loadPermissions` (the editable matrix,
+  // Org Admin only).
+  const summary = ref<PermissionSummaryEntry[]>([]);
+  const summaryLoading = ref(false);
+  const summaryError = ref<string | null>(null);
+
+  const summaryGroups = computed(() => {
+    const map = new Map<string, PermissionSummaryEntry[]>();
+    for (const entry of summary.value) {
+      const group = map.get(entry.tool) ?? [];
+      group.push(entry);
+      map.set(entry.tool, group);
+    }
+    return map;
+  });
+
   const toolGroups = computed(() => {
     const map = new Map<string, PermissionEntry[]>();
     for (const entry of permissions.value) {
@@ -221,6 +239,19 @@ export const usePermissionsStore = defineStore('permissions', () => {
     }
   }
 
+  async function loadSummary() {
+    summaryLoading.value = true;
+    summaryError.value = null;
+    try {
+      const data = await getPermissionsSummary();
+      summary.value = data.permissions;
+    } catch (e) {
+      summaryError.value = e instanceof Error ? e.message : t('permissions.error.loadFailed');
+    } finally {
+      summaryLoading.value = false;
+    }
+  }
+
   return {
     permissions,
     loading,
@@ -235,5 +266,10 @@ export const usePermissionsStore = defineStore('permissions', () => {
     getActionDescription,
     loadPermissions,
     updatePermission,
+    summary,
+    summaryLoading,
+    summaryError,
+    summaryGroups,
+    loadSummary,
   };
 });

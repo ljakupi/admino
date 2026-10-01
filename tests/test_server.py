@@ -26,6 +26,11 @@ Tests the FastAPI application created by ``create_app()``, covering:
 - Error handling (validation errors, agent exceptions, malformed JSON)
 - Security invariants (AST scans, no forbidden imports)
 - Static file serving
+- GH-161: each chat run (POST /api/message, POST /api/confirm) gets the
+  requesting org's ``tool_policy``, loaded per request through
+  ``org_permissions.load_tool_policy`` (stubbed here: the pool is a MagicMock);
+  the rate-limit table carries the /api/org/permissions*,
+  /api/org/critical-permissions* and /api/permissions/summary keys.
 
 Callers are logged in through ``tests.auth_helpers.login`` (a dependency
 override of ``server.require_session``); ``resolved_session`` drives the real
@@ -39,6 +44,7 @@ Security notes:
 from __future__ import annotations
 
 import ast
+import importlib.util
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -81,6 +87,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from admino.access import MemberRole, Principal
+    from admino.models import ToolPolicy
     from admino.sessions import AuthenticatedSession
 
 
@@ -156,17 +163,20 @@ class FakeAgent:
         *,
         history: list[LLMMessage],
         principal: Principal,
+        tool_policy: ToolPolicy,
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
     ) -> AgentResult:
         """Record the call (GH-149: ``principal`` is a required keyword; GH-160: the
-        run's ``agent_config`` from the stored platform limits) and reply."""
+        run's ``agent_config`` from the stored platform limits; GH-161: the requesting
+        org's ``tool_policy`` is a required keyword too) and reply."""
         self.run_calls.append(
             {
                 "user_message": user_message,
                 "session_id": session_id,
                 "history": history,
                 "principal": principal,
+                "tool_policy": tool_policy,
                 "pending_confirmation": pending_confirmation,
                 "agent_config": agent_config,
             }
@@ -176,6 +186,33 @@ class FakeAgent:
         result = self._results[self._call_index]
         self._call_index += 1
         return result
+
+
+# The org policy the stubbed per-run load returns (GH-161): echo.write needs a
+# confirmation, every service is on (the real-Agent GH-140 tests rely on it).
+_STUB_ORG_PERMISSIONS = PermissionsConfig(
+    tools={"echo": ToolPermissions(actions={"write": "confirm"})}
+)
+
+
+@pytest.fixture(autouse=True)
+def org_tool_policy(monkeypatch: pytest.MonkeyPatch) -> AsyncMock | None:
+    """Stub the per-run org policy load of the chat routes (GH-161).
+
+    POST /api/message and POST /api/confirm load the requesting org's
+    ``ToolPolicy`` through ``org_permissions.load_tool_policy(pool, tenant)``;
+    this suite's pool is a MagicMock, so the load returns a fixed policy
+    (``_STUB_ORG_PERMISSIONS``). Until ``admino.org_permissions`` exists there is
+    nothing to stub (None): the chat routes then fail on FakeAgent's required
+    ``tool_policy`` keyword.
+    """
+    if importlib.util.find_spec("admino.org_permissions") is None:
+        return None
+    from admino.models import ToolPolicy
+
+    load = AsyncMock(return_value=ToolPolicy(permissions=_STUB_ORG_PERMISSIONS))
+    monkeypatch.setattr("admino.org_permissions.load_tool_policy", load)
+    return load
 
 
 @pytest.fixture(autouse=True)
@@ -576,6 +613,58 @@ class TestAgentReceivesPrincipal:
         assert [call["principal"] for call in agent.run_calls] == [
             first.principal,
             second.principal,
+        ]
+
+    async def test_server_post_message_runs_with_the_loaded_org_policy(
+        self, org_tool_policy: AsyncMock | None
+    ) -> None:
+        """GH-161: the run gets the policy loaded for the caller's own org."""
+        assert org_tool_policy is not None, "admino.org_permissions.load_tool_policy is missing"
+        agent = FakeAgent([_make_agent_result()])
+        session = member_session("editor")
+        app = _make_app(agent, session=session)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/message", json={"message": "hi", "session_id": "sess1"})
+
+        assert resp.status_code == 200
+        org_tool_policy.assert_awaited_once()
+        tenant = org_tool_policy.await_args.args[1]
+        assert tenant.org_id == session.principal.org_id
+        assert agent.run_calls[0]["tool_policy"] is org_tool_policy.return_value
+
+    async def test_server_post_confirm_runs_with_the_loaded_org_policy(
+        self, org_tool_policy: AsyncMock | None
+    ) -> None:
+        """GH-161: the resumed run gets the org's policy loaded again (never cached)."""
+        assert org_tool_policy is not None, "admino.org_permissions.load_tool_policy is missing"
+        pending = _make_pending_confirmation(session_id="sess1")
+        awaiting = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Requires confirmation.",
+            pending_confirmation=pending,
+        )
+        agent = FakeAgent([awaiting, _make_agent_result(response="Done.")])
+        session = member_session("org_admin", user_id=_OTHER_USER_ID)
+        app = _make_app(agent, session=session)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "create", "session_id": "sess1"})
+            resp = await c.post(
+                f"/api/confirm/{pending.confirmation_id}",
+                json={
+                    "session_id": "sess1",
+                    "confirmation_id": pending.confirmation_id,
+                    "approved": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        assert org_tool_policy.await_count == 2
+        assert {call.args[1].org_id for call in org_tool_policy.await_args_list} == {
+            session.principal.org_id
+        }
+        assert [call["tool_policy"] for call in agent.run_calls] == [
+            org_tool_policy.return_value,
+            org_tool_policy.return_value,
         ]
 
 
@@ -2397,8 +2486,11 @@ _EXPECTED_RATE_LIMITS: list[tuple[str, float, int]] = [
     ("/api/org/settings/patch", 0.5, 5),
     ("/api/platform/settings/get", 1.0, 10),
     ("/api/platform/settings/patch", 0.2, 5),
-    ("/api/permissions/get", 1.0, 5),
-    ("/api/permissions/patch", 0.2, 2),
+    # GH-161: the Org Admin's matrix and the members' read-only summary (the old
+    # /api/permissions/* and /api/critical-permissions/* keys are gone).
+    ("/api/org/permissions/get", 1.0, 5),
+    ("/api/org/permissions/patch", 0.2, 2),
+    ("/api/permissions/summary/get", 1.0, 10),
     ("/api/oauth/google/authorize", 0.2, 2),
     ("/api/oauth/microsoft/authorize", 0.2, 2),
     ("/api/oauth/callback", 0.2, 2),
@@ -2406,9 +2498,9 @@ _EXPECTED_RATE_LIMITS: list[tuple[str, float, int]] = [
     ("/api/oauth/microsoft/status", 1.0, 5),
     ("/api/oauth/google/disconnect", 0.2, 2),
     ("/api/oauth/microsoft/disconnect", 0.2, 2),
-    ("/api/critical-permissions/get", 1.0, 5),
-    ("/api/critical-permissions/promote", 5 / 60, 5),
-    ("/api/critical-permissions/cancel", 0.5, 5),
+    ("/api/org/critical-permissions/get", 1.0, 5),
+    ("/api/org/critical-permissions/promote", 5 / 60, 5),
+    ("/api/org/critical-permissions/cancel", 0.5, 5),
     ("/api/auth/login", 0.2, 5),
     ("/api/auth/logout", 0.5, 5),
     ("/api/auth/me", 1.0, 10),
@@ -2583,6 +2675,11 @@ class TestSessionLocks:
 
 _GH140_SESSION = "sess-gh140"
 _GH140_SYSTEM_PROMPT = "SYS"
+# GH-161: the agent's per-run system message = its prompt + "\n\n" + the run's tools line.
+_GH140_NO_TOOLS_SYSTEM = f"{_GH140_SYSTEM_PROMPT}\n\nYou have no tools available."
+_GH140_ECHO_WRITE_SYSTEM = (
+    f"{_GH140_SYSTEM_PROMPT}\n\nYou have access to the following tools: echo (write)."
+)
 
 
 class _RecordingLLM:
@@ -2645,12 +2742,11 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
 
     @staticmethod
     def _make_real_agent(llm: _RecordingLLM, tool_call_recorder: AsyncMock) -> Agent:
+        """GH-161: no permission state on the agent; each run gets the org policy the
+        ``org_tool_policy`` stub loads (echo.write = confirm)."""
         return Agent(
             llm_client=llm,  # type: ignore[arg-type]
             tool_call_recorder=tool_call_recorder,
-            permissions_config=PermissionsConfig(
-                tools={"echo": ToolPermissions(actions={"write": "confirm"})}
-            ),
             agent_config=AgentConfig(
                 max_tool_calls=5,
                 max_context_messages=20,
@@ -2691,7 +2787,7 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         assert statuses == [200] * 25
         assert len(llm.received_messages) == 25
         for i, call in enumerate(llm.received_messages):
-            assert _system_pairs(call) == [("system", _GH140_SYSTEM_PROMPT)], f"turn {i}"
+            assert _system_pairs(call) == [("system", _GH140_NO_TOOLS_SYSTEM)], f"turn {i}"
             assert call[0].role == "system", f"turn {i}"
 
     async def test_server_message_25_turns_each_llm_call_ends_with_posted_message(
@@ -2763,7 +2859,7 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         assert resp2.json()["status"] == "final"
         assert len(llm.received_messages) == 2
         resume_call = llm.received_messages[1]
-        assert _system_pairs(resume_call) == [("system", _GH140_SYSTEM_PROMPT)]
+        assert _system_pairs(resume_call) == [("system", _GH140_ECHO_WRITE_SYSTEM)]
         assert resume_call[0].role == "system"
         assert (
             _system_pairs(server._sessions[server._chat_key(TEST_MEMBER_ID, _GH140_SESSION)]) == []

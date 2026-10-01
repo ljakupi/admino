@@ -5,7 +5,9 @@ role changes, activations, sharing changes, deletions and restores, exports,
 Org Admin access to other users' projects, org and platform settings, every
 Super Admin action, residency policy, break-glass sessions, agent tool calls,
 since GH-152 a user revoking one of their sessions and an Org Admin's forced
-logout, and since GH-153 an invitation sent again) is recorded through one
+logout, since GH-153 an invitation sent again, and since GH-161 an Org Admin
+changing, promoting, demoting or cancelling the promotion of one of the org's
+tool permissions) is recorded through one
 service function, record(), as a row in the append-only audit_events table
 (migration 0005, tests/test_migration_0005.py).
 
@@ -34,6 +36,13 @@ What these tests pin down:
   platform settings' retention.audit_months. (The
   lifespan helper here also stubs GH-152's session purge job, which
   tests/test_session_management_api.py covers.)
+- GH-161: four org-scoped actions, ``org.permission_change``,
+  ``org.permission_promote``, ``org.permission_promote_cancel`` and
+  ``org.permission_demote`` (47 in all). Their metadata is tokens only:
+  ``{"tool", "action", "old", "new"}`` for a change, a promotion (deny ->
+  confirm) and a demotion (confirm -> deny), ``{"tool", "action"}`` for a
+  cancelled promotion. A tool or action name outside the vocabulary (free
+  text such as "Gmail Send") is refused like any other content.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -89,13 +98,12 @@ from admino.audit_events import (
     record,
     run_retention_job,
 )
-from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS
+from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS, PROMOTABLE_DENIALS
 from admino.server import _lifespan, create_app
 from tests.conftest import default_test_platform_settings
 from tests.lifespan_stubs import (
     patch_login_throttle_purge_job,
     patch_org_purge_job,
-    patch_tools_gate,
 )
 
 if TYPE_CHECKING:
@@ -178,6 +186,12 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         "invitation.resend",
         # GH-153: a refused send (email taken, no free seat), so probing shows in the log.
         "invitation.refuse",
+        # GH-161: an Org Admin changes, promotes, demotes or cancels the promotion of
+        # one of the org's tool permissions.
+        "org.permission_change",
+        "org.permission_promote",
+        "org.permission_promote_cancel",
+        "org.permission_demote",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -255,6 +269,15 @@ _ISSUE_CATEGORIES: list[Any] = [
     pytest.param({"audit.purge"}, id="retention-purge"),
     pytest.param(
         {"session.revoke", "session.force_logout"}, id="session-revocations-and-forced-logouts"
+    ),
+    pytest.param(
+        {
+            "org.permission_change",
+            "org.permission_promote",
+            "org.permission_promote_cancel",
+            "org.permission_demote",
+        },
+        id="org-tool-permission-changes",
     ),
 ]
 
@@ -625,11 +648,12 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 43 actions of the spec (GH-146's 39, GH-152's
+        """The catalog has exactly the 47 actions of the spec (GH-146's 39, GH-152's
         session.revoke and session.force_logout, GH-153's invitation.resend and
-        invitation.refuse): nothing missing, nothing extra."""
+        invitation.refuse, GH-161's four org.permission_* actions): nothing missing,
+        nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 43
+        assert len(AuditAction) == 47
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:
@@ -2280,9 +2304,6 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
         patch("admino.database.init_pool", fake_init_pool),
         patch("admino.database.close_pool", fake_close_pool),
         patch("admino.database.get_pool", fake_get_pool),
-        patch("admino.database.load_permissions_from_db", AsyncMock(return_value={})),
-        # GH-159: the tools gate reload never reads the MagicMock pool.
-        patch_tools_gate(),
         patch("admino.audit_events.run_retention_job", probe.job),
         patch("admino.sessions.run_session_purge_job", session_purge.job, create=True),
         patch_org_purge_job(org_purge.job),
@@ -2685,3 +2706,255 @@ class TestRecordToolCall:
         assert params[0].name == "executor"
         assert {p.name for p in params[1:]} == set(_tool_call_kwargs())
         assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params[1:])
+
+
+# ---------------------------------------------------------------------------
+# GH-161: the org tool permission actions
+# ---------------------------------------------------------------------------
+
+# Member name -> value. Looked up at call time: the members are new in GH-161.
+_PERMISSION_ACTIONS: dict[str, str] = {
+    "ORG_PERMISSION_CHANGE": "org.permission_change",
+    "ORG_PERMISSION_PROMOTE": "org.permission_promote",
+    "ORG_PERMISSION_PROMOTE_CANCEL": "org.permission_promote_cancel",
+    "ORG_PERMISSION_DEMOTE": "org.permission_demote",
+}
+_PERMISSION_VALUES: list[str] = sorted(_PERMISSION_ACTIONS.values())
+
+# The contract's metadata shape of each action (gmail.send, a promotable pair).
+_PERMISSION_METADATA: dict[str, dict[str, Any]] = {
+    "org.permission_change": {"tool": "gmail", "action": "send", "old": "deny", "new": "confirm"},
+    "org.permission_promote": {"tool": "gmail", "action": "send", "old": "deny", "new": "confirm"},
+    "org.permission_demote": {"tool": "gmail", "action": "send", "old": "confirm", "new": "deny"},
+    "org.permission_promote_cancel": {"tool": "gmail", "action": "send"},
+}
+
+_DEFAULT_PAIRS: list[tuple[str, str]] = sorted(
+    (tool, action) for tool, actions in DEFAULT_PERMISSIONS.items() for action in actions
+)
+_STATE_CHANGES: list[tuple[str, str]] = [
+    (old, new)
+    for old in ("allow", "confirm", "deny")
+    for new in ("allow", "confirm", "deny")
+    if old != new
+]
+
+# Metadata a permission event must refuse: free text and lookalikes where the
+# contract allows tool, action and state tokens only.
+_FREE_TEXT_PERMISSION_METADATA: list[Any] = [
+    pytest.param(
+        {"tool": "Gmail Send", "action": "send", "old": "deny", "new": "confirm"},
+        id="tool-free-text",
+    ),
+    pytest.param(
+        {"tool": "slack", "action": "send", "old": "deny", "new": "confirm"},
+        id="tool-not-in-vocabulary",
+    ),
+    pytest.param(
+        {"tool": "gmail.send", "action": "send", "old": "deny", "new": "confirm"},
+        id="tool-dotted-pair",
+    ),
+    pytest.param(
+        {"tool": "gmail" + _NEWLINE, "action": "send", "old": "deny", "new": "confirm"},
+        id="tool-trailing-newline",
+    ),
+    pytest.param(
+        {"tool": "GMAIL", "action": "send", "old": "deny", "new": "confirm"},
+        id="tool-upper-case",
+    ),
+    pytest.param(
+        {"tool": b"gmail", "action": "send", "old": "deny", "new": "confirm"},
+        id="tool-bytes",
+    ),
+    pytest.param(
+        {"tool": "gmail", "action": "send an email to bob", "old": "deny", "new": "confirm"},
+        id="action-free-text",
+    ),
+    pytest.param(
+        {"tool": "gmail", "action": "s" + _CYRILLIC_IE + "nd", "old": "deny", "new": "confirm"},
+        id="action-lookalike",
+    ),
+    pytest.param(
+        {"tool": "gmail", "action": "send", "old": "denied", "new": "confirm"},
+        id="old-state-not-a-token",
+    ),
+    pytest.param(
+        {"tool": "gmail", "action": "send", "old": "deny", "new": "Confirm"},
+        id="new-state-case-variant",
+    ),
+    pytest.param(
+        {"tool": "gmail", "action": "send", "reason": "Bob asked for it"},
+        id="free-text-reason",
+    ),
+    pytest.param(
+        {"tool": "gmail", "action": "send", "email": "alice@example.com"},
+        id="email",
+    ),
+]
+
+
+def _permission_action(value: str) -> AuditAction:
+    """The AuditAction for a GH-161 value (raises ValueError until it exists)."""
+    return AuditAction(value)
+
+
+def _permission_record_kwargs(value: str, **overrides: Any) -> dict[str, Any]:
+    """record() keyword arguments for a GH-161 row: an Org Admin acting on their org."""
+    kwargs: dict[str, Any] = {
+        "action": _permission_action(value),
+        "actor_kind": "member",
+        "actor_user_id": _USER,
+        "org_id": _ORG,
+        "target_type": TargetType.ORGANIZATION,
+        "target_ids": [_ORG],
+        "ip": _IP,
+        "metadata": _PERMISSION_METADATA[value],
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestOrgPermissionActions:
+    """GH-161's four org-scoped actions and their token-only metadata."""
+
+    @pytest.mark.parametrize(("name", "value"), sorted(_PERMISSION_ACTIONS.items()))
+    def test_audit_events_permission_action_member_has_contract_value(
+        self, name: str, value: str
+    ) -> None:
+        """AuditAction.ORG_PERMISSION_CHANGE is "org.permission_change", and so on."""
+        member = getattr(AuditAction, name)
+
+        assert member.value == value
+        assert AuditAction(value) is member
+
+    @pytest.mark.parametrize("value", _PERMISSION_VALUES)
+    def test_audit_events_permission_action_is_org_scoped(self, value: str) -> None:
+        """Every permission event belongs to the org's log."""
+        assert ACTION_SCOPES[_permission_action(value)] == "org"
+
+    @pytest.mark.parametrize("value", _PERMISSION_VALUES)
+    async def test_audit_events_record_permission_action_with_org_is_stored(
+        self, conn: MagicMock, value: str
+    ) -> None:
+        """The contract's row: the Org Admin as a member actor, their org, the org as the
+        target, the client IP and the token metadata."""
+        await record(conn, **_permission_record_kwargs(value))
+
+        row = _inserted_row(conn)
+        assert row["action"] == value
+        assert row["org_id"] == _ORG
+        assert (row["actor_kind"], row["actor_user_id"]) == ("member", _USER)
+        assert row["target_type"] == "organization"
+        assert json.loads(row["target_ids"]) == [str(_ORG)]
+        assert str(row["ip"]) == _IP
+        assert json.loads(row["metadata"]) == _PERMISSION_METADATA[value]
+
+    @pytest.mark.parametrize("value", _PERMISSION_VALUES)
+    @pytest.mark.parametrize(
+        ("actor_kind", "actor_user_id"),
+        [
+            pytest.param("super_admin", _SUPER_ADMIN, id="super-admin"),
+            pytest.param("system", None, id="system"),
+        ],
+    )
+    async def test_audit_events_record_permission_action_without_org_is_refused(
+        self, conn: MagicMock, value: str, actor_kind: str, actor_user_id: UUID | None
+    ) -> None:
+        """Without an org_id the event has no log to land in: refused before any SQL."""
+        kwargs = _permission_record_kwargs(
+            value, actor_kind=actor_kind, actor_user_id=actor_user_id, org_id=None
+        )
+
+        with pytest.raises(AuditRecordError):
+            await record(conn, **kwargs)
+
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.parametrize(
+        ("tool", "action"), [pytest.param(t, a, id=f"{t}.{a}") for t, a in _DEFAULT_PAIRS]
+    )
+    def test_audit_events_change_metadata_of_every_default_pair_is_valid(
+        self, tool: str, action: str
+    ) -> None:
+        """Every (tool, action) of DEFAULT_PERMISSIONS is a pair of vocabulary tokens."""
+        metadata = {"tool": tool, "action": action, "old": "allow", "new": "deny"}
+
+        event = _event(
+            action=_permission_action("org.permission_change"),
+            target_type=TargetType.ORGANIZATION,
+            target_ids=(_ORG,),
+            metadata=metadata,
+        )
+
+        assert event.metadata == metadata
+
+    @pytest.mark.parametrize(
+        ("old", "new"), [pytest.param(o, n, id=f"{o}-to-{n}") for o, n in _STATE_CHANGES]
+    )
+    def test_audit_events_change_metadata_of_every_state_change_is_valid(
+        self, old: str, new: str
+    ) -> None:
+        metadata = {"tool": "google_calendar", "action": "create", "old": old, "new": new}
+
+        event = _event(
+            action=_permission_action("org.permission_change"),
+            target_type=TargetType.ORGANIZATION,
+            target_ids=(_ORG,),
+            metadata=metadata,
+        )
+
+        assert event.metadata == metadata
+
+    @pytest.mark.parametrize(
+        "value",
+        ["org.permission_promote", "org.permission_demote", "org.permission_promote_cancel"],
+    )
+    @pytest.mark.parametrize(
+        ("tool", "action"),
+        [pytest.param(t, a, id=f"{t}.{a}") for t, a in sorted(PROMOTABLE_DENIALS)],
+    )
+    def test_audit_events_critical_metadata_of_every_promotable_pair_is_valid(
+        self, value: str, tool: str, action: str
+    ) -> None:
+        """Promote (deny -> confirm), demote (confirm -> deny) and cancel ({tool, action})
+        validate for each of the four promotable denials."""
+        metadata = {**_PERMISSION_METADATA[value], "tool": tool, "action": action}
+
+        event = _event(
+            action=_permission_action(value),
+            target_type=TargetType.ORGANIZATION,
+            target_ids=(_ORG,),
+            metadata=metadata,
+        )
+
+        assert event.metadata == metadata
+
+    @pytest.mark.parametrize("value", _PERMISSION_VALUES)
+    @pytest.mark.parametrize("metadata", _FREE_TEXT_PERMISSION_METADATA)
+    async def test_audit_events_record_permission_action_free_text_is_refused(
+        self, conn: MagicMock, value: str, metadata: dict[str, Any]
+    ) -> None:
+        """A tool or action name outside the vocabulary, a state that isn't a token or a
+        free-text field is refused (AuditRecordError) and nothing is written."""
+        kwargs = _permission_record_kwargs(value, metadata=metadata)
+
+        with pytest.raises(AuditRecordError):
+            await record(conn, **kwargs)
+
+        conn.execute.assert_not_awaited()
+
+    async def test_audit_events_record_permission_action_error_repeats_no_free_text(
+        self, conn: MagicMock
+    ) -> None:
+        """The refusal carries none of the rejected text or the IDs."""
+        kwargs = _permission_record_kwargs(
+            "org.permission_change",
+            metadata={"tool": "Gmail Send", "action": "send", "old": "deny", "new": "confirm"},
+        )
+
+        with pytest.raises(AuditRecordError) as caught:
+            await record(conn, **kwargs)
+
+        _assert_no_content(str(caught.value), "Gmail Send", _ORG, _USER)
+        _assert_no_content(repr(caught.value), "Gmail Send", _ORG, _USER)
+        assert caught.value.__cause__ is None

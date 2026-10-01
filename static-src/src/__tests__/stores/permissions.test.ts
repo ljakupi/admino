@@ -9,19 +9,64 @@
  * their permission rows remain (the actions come back with attachments, #192).
  * Issue #144 translates the UI: tool labels and action descriptions come from
  * the i18n catalogs and follow the active locale, while the unknown-tool
- * fallback keeps the raw tool name. The network layer (`@/api/permissions`)
- * is mocked; nothing touches `fetch`.
+ * fallback keeps the raw tool name.
+ *
+ * Issue #161 (permissions per organization): the store also loads the
+ * read-only summary every member role sees (`GET /api/permissions/summary`
+ * through `getPermissionsSummary()`):
+ * - new state `summary` (the summary entries, `[]` at first),
+ *   `summaryLoading` (false at first) and `summaryError` (null at first);
+ * - `loadSummary()` fills `summary` with the response's entries (states
+ *   allow / confirm / deny / disabled kept as given); `summaryLoading` is true
+ *   only while the request is in flight; a failure sets `summaryError` to a
+ *   non-empty message and a later successful load clears it;
+ * - `summaryGroups`: a Map tool -> entries, keyed in the order the tools first
+ *   appear in the response, each group keeping the response order.
+ * `loadPermissions()` keeps reading the org matrix through `getPermissions()`
+ * (whose path, `/api/org/permissions`, is pinned in `api/permissions.test.ts`).
+ *
+ * The network layer (`@/api/permissions`) is mocked; nothing touches `fetch`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createPinia, setActivePinia } from 'pinia';
+import { ApiError } from '@/api/client';
+import { getPermissions, getPermissionsSummary } from '@/api/permissions';
 import { setLocale } from '@/i18n';
 import { de } from '@/i18n/locales/de';
 import { usePermissionsStore } from '@/stores/permissions';
+import type { PermissionsResponse, PermissionsSummaryResponse } from '@/api/types';
 
 vi.mock('@/api/permissions', () => ({
   getPermissions: vi.fn(),
   patchPermission: vi.fn(),
+  getPermissionsSummary: vi.fn(),
 }));
+
+const mockedGetPermissions = vi.mocked(getPermissions);
+const mockedGetSummary = vi.mocked(getPermissionsSummary);
+
+type SummaryEntry = PermissionsSummaryResponse['permissions'][number];
+
+const SUMMARY_ENTRIES: SummaryEntry[] = [
+  { tool: 'memory', action: 'get', state: 'allow' },
+  { tool: 'gmail', action: 'delete', state: 'deny' },
+  { tool: 'gmail', action: 'list', state: 'allow' },
+  { tool: 'gmail', action: 'send', state: 'confirm' },
+  { tool: 'onedrive', action: 'read', state: 'disabled' },
+  { tool: 'memory', action: 'set', state: 'confirm' },
+];
+
+/** A promise the test settles by hand. Pre-implementation nobody may consume it. */
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  promise.catch(() => undefined);
+  return { promise, resolve, reject };
+}
 
 /** Mirror of IMMUTABLE_DENIALS in src/admino/permissions.py after #143. */
 const BACKEND_IMMUTABLE_DENIALS: ReadonlyArray<readonly [string, string]> = [
@@ -37,6 +82,8 @@ const BACKEND_IMMUTABLE_DENIALS: ReadonlyArray<readonly [string, string]> = [
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  mockedGetPermissions.mockReset();
+  mockedGetSummary.mockReset();
 });
 
 afterEach(() => {
@@ -149,5 +196,142 @@ describe('permissionsStore tool copy follows the locale', () => {
       description: '',
       actions: {},
     });
+  });
+});
+
+// --- Read-only summary (issue #161) ----------------------------------------
+
+describe('permissionsStore summary state', () => {
+  it('starts with an empty summary, not loading and no error', () => {
+    const store = usePermissionsStore();
+
+    expect({
+      summary: store.summary,
+      summaryLoading: store.summaryLoading,
+      summaryError: store.summaryError,
+      groups: store.summaryGroups instanceof Map ? store.summaryGroups.size : 'not a Map',
+    }).toStrictEqual({ summary: [], summaryLoading: false, summaryError: null, groups: 0 });
+  });
+});
+
+describe('permissionsStore loadSummary', () => {
+  it('requests the summary once and fills summary with its entries, disabled ones included', async () => {
+    mockedGetSummary.mockResolvedValueOnce({ permissions: SUMMARY_ENTRIES });
+    const store = usePermissionsStore();
+
+    await store.loadSummary();
+
+    expect({
+      calls: mockedGetSummary.mock.calls.length,
+      matrixCalls: mockedGetPermissions.mock.calls.length,
+      summary: store.summary,
+      summaryError: store.summaryError,
+    }).toStrictEqual({ calls: 1, matrixCalls: 0, summary: SUMMARY_ENTRIES, summaryError: null });
+  });
+
+  it('groups the summary by tool in the order the tools first appear in the response', async () => {
+    mockedGetSummary.mockResolvedValueOnce({ permissions: SUMMARY_ENTRIES });
+    const store = usePermissionsStore();
+
+    await store.loadSummary();
+
+    expect([...store.summaryGroups.entries()]).toStrictEqual([
+      [
+        'memory',
+        [
+          { tool: 'memory', action: 'get', state: 'allow' },
+          { tool: 'memory', action: 'set', state: 'confirm' },
+        ],
+      ],
+      [
+        'gmail',
+        [
+          { tool: 'gmail', action: 'delete', state: 'deny' },
+          { tool: 'gmail', action: 'list', state: 'allow' },
+          { tool: 'gmail', action: 'send', state: 'confirm' },
+        ],
+      ],
+      ['onedrive', [{ tool: 'onedrive', action: 'read', state: 'disabled' }]],
+    ]);
+  });
+
+  it('does not touch the org matrix (permissions) state', async () => {
+    const matrix: PermissionsResponse = { permissions: [{ tool: 'gmail', action: 'list', permission: 'allow' }] };
+    mockedGetPermissions.mockResolvedValueOnce(matrix);
+    mockedGetSummary.mockResolvedValueOnce({ permissions: SUMMARY_ENTRIES });
+    const store = usePermissionsStore();
+    await store.loadPermissions();
+
+    await store.loadSummary();
+
+    expect({ permissions: store.permissions, summaryCount: store.summary.length }).toStrictEqual({
+      permissions: matrix.permissions,
+      summaryCount: SUMMARY_ENTRIES.length,
+    });
+  });
+
+  it('is loading while the request is in flight and not loading after it succeeds', async () => {
+    const pending = deferred<PermissionsSummaryResponse>();
+    mockedGetSummary.mockReturnValueOnce(pending.promise);
+    const store = usePermissionsStore();
+
+    const run = store.loadSummary();
+    const during = store.summaryLoading;
+    pending.resolve({ permissions: SUMMARY_ENTRIES });
+    await run;
+
+    expect({ during, after: store.summaryLoading }).toStrictEqual({ during: true, after: false });
+  });
+
+  it('sets summaryError and stops loading when the request fails', async () => {
+    mockedGetSummary.mockRejectedValueOnce(new ApiError(403, 'Forbidden', 'Forbidden'));
+    const store = usePermissionsStore();
+
+    await store.loadSummary();
+
+    expect({
+      calls: mockedGetSummary.mock.calls.length,
+      hasError: typeof store.summaryError === 'string' && store.summaryError.trim() !== '',
+      summaryLoading: store.summaryLoading,
+      summary: store.summary,
+    }).toStrictEqual({ calls: 1, hasError: true, summaryLoading: false, summary: [] });
+  });
+
+  it('sets summaryError on a network failure (non-ApiError) too', async () => {
+    mockedGetSummary.mockRejectedValueOnce('boom');
+    const store = usePermissionsStore();
+
+    await store.loadSummary();
+
+    expect({
+      calls: mockedGetSummary.mock.calls.length,
+      hasError: typeof store.summaryError === 'string' && store.summaryError.trim() !== '',
+      summaryLoading: store.summaryLoading,
+    }).toStrictEqual({ calls: 1, hasError: true, summaryLoading: false });
+  });
+
+  it('clears an earlier summaryError when a later load succeeds', async () => {
+    mockedGetSummary
+      .mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'))
+      .mockResolvedValueOnce({ permissions: SUMMARY_ENTRIES });
+    const store = usePermissionsStore();
+    await store.loadSummary();
+    if (store.summaryError === null) throw new Error('test setup: expected a summary error');
+
+    await store.loadSummary();
+
+    expect({ summaryError: store.summaryError, summaryCount: store.summary.length }).toStrictEqual({
+      summaryError: null,
+      summaryCount: SUMMARY_ENTRIES.length,
+    });
+  });
+
+  it('does not let the summary failure touch the matrix error', async () => {
+    mockedGetSummary.mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'));
+    const store = usePermissionsStore();
+
+    await store.loadSummary();
+
+    expect({ calls: mockedGetSummary.mock.calls.length, error: store.error }).toStrictEqual({ calls: 1, error: null });
   });
 });

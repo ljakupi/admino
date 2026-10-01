@@ -1,1107 +1,1681 @@
-"""Tests for the Critical Permissions API (tier-2 promotable denials).
+"""HTTP spec for per-org critical permission promotions with password re-auth (GH-161).
 
-Covers:
-- GET /api/critical-permissions: returns 4 promotable permissions with state
-- PATCH /api/critical-permissions/{tool}/{action}:
-  - GH-149 (decision 1): promotions are disabled until #161 brings password
-    re-auth. PATCH on a promotable permission that is NOT currently promoted
-    answers 403 ``{"detail": "Critical permission promotions are temporarily
-    unavailable."}`` and starts no cooldown. The ``bearer_token`` request body
-    (``CriticalPermissionPromote``) is gone.
-  - demote (PATCH on a promoted permission) keeps working, with no body
-- DELETE /api/critical-permissions/{tool}/{action}/pending: cancel cooldown
-- Session enforcement on all endpoints (401 without a valid session cookie)
-- Rate limiting on promotion attempts (429 after burst, per caller)
-- Lazy cooldown resolution (pending -> confirm after 5 min)
-- Adversarial inputs: invalid tool names, immutable denials, unknown pairs
+Replaces the tests of the removed ``/api/critical-permissions*`` routes and of
+#149's interim 403 ("Critical permission promotions are temporarily
+unavailable."). The FastAPI app from ``create_app()`` runs against the
+in-memory database of tests/db_fakes.py (what ``admino.database.get_pool``
+returns; both orgs seeded with ``DEFAULT_PERMISSIONS``) with a real
+``AppConfig``. The real ``require_session``, ``admino.org_permissions``,
+``admino.auth.reauthenticate``, ``admino.login_throttle`` and
+``admino.audit_events`` code runs; only ``admino.passwords`` (a fast fake
+hash), the throttle's sleeps (``login_delays``) and the agent's ``run`` are
+stubbed. Time is moved with the contract's clock seam,
+``admino.org_permissions.current_time``.
+
+What these tests pin down (the GH-161 contract, "Critical promotions", "auth.py
+reauthenticate" and "server.py routes"):
+- Routes: ``GET /api/org/critical-permissions``, ``PATCH
+  /api/org/critical-permissions/{tool}/{action}`` (optional body
+  ``{"password": ...}``) and ``DELETE .../{tool}/{action}/pending``. Order in
+  each: session (401) -> per-user rate limit (429, keys
+  ``/api/org/critical-permissions/{get,promote,cancel}`` with (1.0, 5),
+  (5/60, 5), (0.5, 5), before any database work) -> ``org.permissions.manage``
+  (403 ``{"detail": "Forbidden"}`` for an Editor, a Viewer and the Super Admin,
+  before any database work) -> work. Cross-origin PATCH / DELETE -> 403.
+- The old ``/api/critical-permissions*`` routes and rate-limit keys are gone,
+  and so are ``server._pending_promotions``, ``_promoted_permissions``,
+  ``_resolve_pending_promotions`` and ``_PROMOTION_COOLDOWN_S``.
+- GET: the 4 promotable pairs sorted by (tool, action), ``state`` from the
+  org's own stored row, ``pending_at`` from the org's own pending entry.
+- Promote (the pair isn't stored 'confirm'): the admin's OWN password, checked
+  by ``auth.reauthenticate`` through ``login_throttle``. Right -> 200 ``state``
+  'deny' + ``pending_at`` = now, one ``org.permission_promote`` audit row
+  (tokens only, client IP), no session created. Wrong -> 403 ``{"detail":
+  "Re-authentication failed."}``, nothing pending, no audit row, the failure
+  counted on the account and IP subjects; a locked account refuses even the
+  right password (never checked). No body -> 400 ``{"detail": "Password
+  re-authentication is required."}``; extra keys or a bad password -> 422 that
+  never echoes the password; a non-promotable pair -> 404 ``{"detail": "Not a
+  promotable permission"}`` without a password check; invalid path
+  identifiers -> 422. A repeat while pending keeps the first ``pending_at``
+  and writes no second audit row. An audit failure is a 500 with nothing
+  pending.
+- The 5-minute cooldown: at 4:59 still pending; from 5:00 the org's next GET,
+  PATCH or POST /api/message stores 'confirm' for THAT org only (no audit
+  row). Another org's requests never resolve it, and another org's GET shows
+  neither the pending entry nor the promotion.
+- Demote (PATCH on a pair stored 'confirm'): no password (a body is ignored),
+  200 'deny', ``org.permission_demote`` audit row; the admin can promote again
+  afterwards with the right password.
+- Cancel: drops the org's own pending entry, ``org.permission_promote_cancel``
+  audit row; without a pending entry (or another org's) -> 404 ``{"detail":
+  "No pending promotion for this permission"}``.
+- GH-66 notice: a completed promotion appends ONE user-role message with the
+  contract's exact text to every in-memory chat of the promoting org's users,
+  none to other orgs' chats, never twice; it survives ``_trim_context``.
+- The agent run of an org's member gets ``tool_policy`` (a ``ToolPolicy``)
+  whose ``promoted`` holds that org's completed promotions only.
+- The server lifespan no longer loads promoted permissions or a tools gate
+  into the agent; ``main._build_system_prompt(config)`` has no static tool line.
+
+All database calls are faked. No network, no real PostgreSQL, no LLM.
 
 Security notes:
-- All tests use mocked database -- no real DB or API calls.
-- Callers are logged in with tests.auth_helpers (an Org Admin by default); the
-  session token is a known fake value, never a real secret.
-- Only 4 defined promotable pairs are accepted; all others return 404.
+- Tenant isolation: every read and write is the principal's own org; another
+  org's admin can neither see nor cancel nor complete a promotion.
+- Least privilege: only Org Admins promote; promotion needs the admin's own
+  password, and a wrong one counts against the brute-force throttle like a
+  failed login. Demotion only reduces privilege, so it needs no password.
+- No password in any response (422s included); audit metadata is tokens only.
+- The passwords used here are fixed fake values, never real secrets.
 """
 
 from __future__ import annotations
 
+import inspect
+import re
+import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
 
+from admino import server
+from admino.config import AppConfig, LLMConfig
+from admino.login_throttle import ip_subject
+from admino.models import AgentResult, LLMMessage
 from admino.server import create_app
-from tests.auth_helpers import login, member_session, resolved_session, session_cookie
-from tests.lifespan_stubs import (
-    patch_login_throttle_purge_job,
-    patch_org_purge_job,
-    patch_tools_gate,
-)
+from tests.db_fakes import ORG_ID, OTHER_ORG_ID, PUBLIC_URL, FakeDb, account_subject, fake_hash
+from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
+
+if TYPE_CHECKING:
+    import httpx
+    from fastapi import FastAPI
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-_UNAUTHORIZED = {"detail": "Unauthorized"}
-_PROMOTIONS_UNAVAILABLE = {"detail": "Critical permission promotions are temporarily unavailable."}
+_COOKIE: Final = "admino_session"
+_IP_A: Final = "203.0.113.5"
+_BASE: Final = "/api/org/critical-permissions"
+_OLD_BASE: Final = "/api/critical-permissions"
 
-_PROMOTABLE_PAIRS: list[tuple[str, str]] = [
+_UNAUTHORIZED: Final = {"detail": "Unauthorized"}
+_FORBIDDEN: Final = {"detail": "Forbidden"}
+_CSRF_REFUSED: Final = {"detail": "Cross-origin request refused"}
+_RATE_LIMITED: Final = {"detail": "Rate limit exceeded"}
+_REAUTH_FAILED: Final = {"detail": "Re-authentication failed."}
+_REAUTH_REQUIRED: Final = {"detail": "Password re-authentication is required."}
+_NOT_PROMOTABLE: Final = {"detail": "Not a promotable permission"}
+_NO_PENDING: Final = {"detail": "No pending promotion for this permission"}
+_PROMOTIONS_UNAVAILABLE: Final = {
+    "detail": "Critical permission promotions are temporarily unavailable."
+}
+
+# The 4 promotable denials, sorted by (tool, action).
+_PROMOTABLE: Final[list[tuple[str, str]]] = [
     ("gmail", "send"),
-    ("outlook", "send"),
     ("google_calendar", "update"),
+    ("outlook", "send"),
     ("outlook_calendar", "update"),
+]
+_GMAIL_SEND: Final = ("gmail", "send")
+_OUTLOOK_SEND: Final = ("outlook", "send")
+
+_ADMIN_PASSWORD: Final = "admin correct horse battery staple"
+_OTHER_PASSWORD: Final = "editor tr0ub4dor and three more"
+_WRONG_PASSWORD: Final = "definitely not the stored password"
+
+_COOLDOWN: Final = timedelta(minutes=5)
+_JUST_BEFORE: Final = _COOLDOWN - timedelta(seconds=1)
+
+_NOTICE_GMAIL: Final = (
+    "PERMISSION UPDATE: The following actions are now available with user confirmation: "
+    "gmail.send. Earlier denials for these actions no longer apply."
+)
+_NOTICE_GMAIL_OUTLOOK: Final = (
+    "PERMISSION UPDATE: The following actions are now available with user confirmation: "
+    "gmail.send, outlook.send. Earlier denials for these actions no longer apply."
+)
+
+_GET_KEY: Final = "/api/org/critical-permissions/get"
+_PROMOTE_KEY: Final = "/api/org/critical-permissions/promote"
+_CANCEL_KEY: Final = "/api/org/critical-permissions/cancel"
+_EXPECTED_LIMITS: Final[dict[str, tuple[float, int]]] = {
+    _GET_KEY: (1.0, 5),
+    _PROMOTE_KEY: (5 / 60, 5),
+    _CANCEL_KEY: (0.5, 5),
+}
+# Read at import, before any fixture patches the limits.
+_CONFIGURED_LIMITS: Final = {key: server._RATE_LIMITS.get(key) for key in _EXPECTED_LIMITS}
+_OLD_RATE_KEYS: Final = [
+    "/api/critical-permissions/get",
+    "/api/critical-permissions/promote",
+    "/api/critical-permissions/cancel",
+]
+_REMOVED_SERVER_GLOBALS: Final = [
+    "_pending_promotions",
+    "_promoted_permissions",
+    "_resolve_pending_promotions",
+    "_PROMOTION_COOLDOWN_S",
+]
+_NON_ADMIN_ROLES: Final = ["editor", "viewer", "super_admin"]
+# SQL a refused or rate-limited request must never run (session lookups are fine).
+_WORK_SQL: Final = re.compile(r"\b(?:permissions|audit_events|login_throttle)\b")
+_PERMISSION_AUDIT_PREFIX: Final = "org.permission"
+_ECHO_MARKER: Final = "ECHOMARK42"
+
+_NON_PROMOTABLE_PAIRS: Final = [
+    pytest.param("gmail", "delete", id="immutable-gmail-delete"),
+    pytest.param("outlook_calendar", "delete", id="immutable-outlook-calendar-delete"),
+    pytest.param("gmail", "read", id="ordinary-gmail-read"),
+    pytest.param("google_calendar", "create", id="stored-confirm-calendar-create"),
+    pytest.param("nosuchtool", "send", id="unknown-pair"),
+]
+_BAD_IDENTIFIERS: Final = [
+    pytest.param("GMAIL", "send", id="uppercase-tool"),
+    pytest.param("gmail", "SEND", id="uppercase-action"),
+    pytest.param("gmail<script>", "send", id="markup-tool"),
+    pytest.param("gm..ail", "send", id="dots-tool"),
+    pytest.param("9gmail", "send", id="leading-digit"),
+    pytest.param("a" * 64, "send", id="64-chars"),
+    pytest.param("gmail", "send;drop", id="semicolon-action"),
+]
+_BAD_BODIES: Final = [
+    pytest.param({"password": ""}, id="empty-password"),
+    pytest.param(
+        {"password": _ADMIN_PASSWORD, "bearer_token": _ECHO_MARKER + "-legacy-token"},
+        id="legacy-bearer-token-key",
+    ),
+    pytest.param(
+        {"password": _ADMIN_PASSWORD, "tool": _ECHO_MARKER + "-tool"}, id="extra-tool-key"
+    ),
+    pytest.param({"password": _ECHO_MARKER + "x" * 119}, id="129-chars"),
+    pytest.param({"password": 123456789012345}, id="int-password"),
+    pytest.param({"password": [_ECHO_MARKER + "-in-a-list"]}, id="list-password"),
+    pytest.param({"password": {"value": _ECHO_MARKER + "-nested"}}, id="object-password"),
+    pytest.param(_ECHO_MARKER + "-bare-string", id="string-body"),
 ]
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Fixtures and helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_config() -> MagicMock:
-    """Build a minimal mock AppConfig (no ``auth`` section: GH-149 removed it)."""
-    config = MagicMock()
-    del config.auth
-    config.limits.max_message_length = 4000
-    config.server.host = "0.0.0.0"  # noqa: S104
-    config.server.port = 8000
-    return config
+@dataclass
+class _User:
+    """A stored account with a live session."""
+
+    id: uuid.UUID
+    token: str
+    email: str
+    password: str
 
 
-def _make_app(agent: Any = None, *, anonymous: bool = False) -> Any:
-    """Create a FastAPI app with mock agent and config; log an Org Admin in unless anonymous."""
-    if agent is None:
-        agent = MagicMock()
-    app = create_app(agent=agent, config=_make_config())
-    if not anonymous:
-        login(app, member_session("org_admin"))
-    return app
+@dataclass
+class _Verify:
+    """How often the fake ``passwords.verify_password`` ran."""
+
+    count: int = 0
 
 
-def _mock_get_pool() -> MagicMock:
-    """Return a mock for database.get_pool."""
-    return MagicMock(return_value=MagicMock())
+class _Clock:
+    """Moves ``admino.org_permissions.current_time`` (the contract's clock seam).
 
-
-def _mock_load_permissions() -> AsyncMock:
-    """Return an AsyncMock for load_permissions_from_db."""
-    return AsyncMock(return_value={})
-
-
-def _clear_critical_state() -> None:
-    """Reset module-level critical permissions state for test isolation."""
-    from admino import server
-
-    server._pending_promotions.clear()
-    server._promoted_permissions.clear()
-
-
-# ---------------------------------------------------------------------------
-# GET /api/critical-permissions
-# ---------------------------------------------------------------------------
-
-
-class TestGetCriticalPermissions:
-    """GET /api/critical-permissions -- returns 4 promotable permissions."""
-
-    pytestmark = pytest.mark.asyncio
-
-    async def test_get_critical_permissions_returns_4_entries(self) -> None:
-        """Response contains exactly 4 promotable permission entries."""
-        app = _make_app()
-        _clear_critical_state()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions")
-
-        assert resp.status_code == 200
-        body = resp.json()
-        assert len(body["permissions"]) == 4
-
-    async def test_get_critical_permissions_default_state_all_deny(self) -> None:
-        """All entries have state='deny' and pending_at=None by default."""
-        app = _make_app()
-        _clear_critical_state()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions")
-
-        for entry in resp.json()["permissions"]:
-            assert entry["state"] == "deny"
-            assert entry["pending_at"] is None
-
-    async def test_get_critical_permissions_entry_structure(self) -> None:
-        """Each entry has tool, action, state, and pending_at keys."""
-        app = _make_app()
-        _clear_critical_state()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions")
-
-        for entry in resp.json()["permissions"]:
-            assert "tool" in entry
-            assert "action" in entry
-            assert "state" in entry
-            assert "pending_at" in entry
-
-    async def test_get_critical_permissions_contains_expected_pairs(self) -> None:
-        """Response contains exactly the 4 expected tool/action pairs."""
-        app = _make_app()
-        _clear_critical_state()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions")
-
-        pairs = {(e["tool"], e["action"]) for e in resp.json()["permissions"]}
-        assert pairs == set(_PROMOTABLE_PAIRS)
-
-    async def test_get_critical_permissions_requires_auth(self) -> None:
-        """GET without a session cookie returns 401."""
-        app = _make_app(anonymous=True)
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/critical-permissions")
-        assert resp.status_code == 401
-        assert resp.json() == _UNAUTHORIZED
-
-    async def test_get_critical_permissions_unknown_session_returns_401(self) -> None:
-        """GET with a cookie that resolves to no session returns 401."""
-        app = _make_app(anonymous=True)
-        with resolved_session(None):
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/critical-permissions", headers=session_cookie())
-        assert resp.status_code == 401
-        assert resp.json() == _UNAUTHORIZED
-
-    async def test_get_critical_permissions_shows_pending_promotion(self) -> None:
-        """After setting a pending promotion, GET shows pending_at timestamp."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        now = datetime.now(UTC)
-        server._pending_promotions[("gmail", "send")] = now
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/critical-permissions")
-
-            entries = resp.json()["permissions"]
-            gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
-            assert gmail_send["pending_at"] is not None
-            assert gmail_send["state"] == "deny"
-        finally:
-            _clear_critical_state()
-
-    async def test_get_critical_permissions_shows_promoted_state(self) -> None:
-        """After adding to _promoted_permissions, GET shows state='confirm'."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        server._promoted_permissions.add(("gmail", "send"))
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.get("/api/critical-permissions")
-
-            entries = resp.json()["permissions"]
-            gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
-            assert gmail_send["state"] == "confirm"
-        finally:
-            _clear_critical_state()
-
-    async def test_get_critical_permissions_resolves_expired_cooldown(self) -> None:
-        """Expired cooldown (>5 min) is lazily resolved to state='confirm'."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        # Set pending_at to 6 minutes ago to simulate expired cooldown
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
-        mock_update = AsyncMock()
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.get("/api/critical-permissions")
-
-            entries = resp.json()["permissions"]
-            gmail_send = next(e for e in entries if e["tool"] == "gmail" and e["action"] == "send")
-            assert gmail_send["state"] == "confirm"
-            # Verify the DB was updated to persist the promotion
-            mock_update.assert_called_once()
-        finally:
-            _clear_critical_state()
-
-
-# ---------------------------------------------------------------------------
-# PATCH /api/critical-permissions/{tool}/{action} -- promote
-# ---------------------------------------------------------------------------
-
-
-class TestPromoteCriticalPermission:
-    """PATCH /api/critical-permissions/{tool}/{action} -- promotion is disabled (GH-149).
-
-    Until #161 adds password re-auth, a PATCH on a promotable permission that is
-    not currently promoted answers 403 and starts no cooldown.
+    The module is looked up on the first ``at`` call (in the test body), so
+    each test that needs time fails on its own until the module exists.
     """
 
-    pytestmark = pytest.mark.asyncio
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self._monkeypatch = monkeypatch
+        self.t0 = datetime.now(UTC).replace(microsecond=0)
 
-    @pytest.mark.parametrize(("tool", "action"), _PROMOTABLE_PAIRS)
-    async def test_promote_returns_403_temporarily_unavailable(
-        self, tool: str, action: str
-    ) -> None:
-        """PATCH on a non-promoted promotable permission -> 403 with the fixed message."""
-        app = _make_app()
-        _clear_critical_state()
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch(f"/api/critical-permissions/{tool}/{action}")
-
-            assert resp.status_code == 403
-            assert resp.json() == _PROMOTIONS_UNAVAILABLE
-        finally:
-            _clear_critical_state()
-
-    async def test_promote_starts_no_cooldown(self) -> None:
-        """A refused promotion leaves no pending cooldown behind."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                await c.patch("/api/critical-permissions/gmail/send")
-                listing = await c.get("/api/critical-permissions")
-
-            assert server._pending_promotions == {}
-            assert server._promoted_permissions == set()
-            gmail_send = next(
-                e
-                for e in listing.json()["permissions"]
-                if (e["tool"], e["action"]) == ("gmail", "send")
-            )
-            assert (gmail_send["state"], gmail_send["pending_at"]) == ("deny", None)
-        finally:
-            _clear_critical_state()
-
-    async def test_promote_does_not_touch_the_database(self) -> None:
-        """A refused promotion writes nothing."""
-        app = _make_app()
-        _clear_critical_state()
-        mock_update = AsyncMock()
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.patch("/api/critical-permissions/gmail/send")
-
-            assert resp.status_code == 403
-            mock_update.assert_not_awaited()
-        finally:
-            _clear_critical_state()
-
-    async def test_promote_legacy_bearer_token_body_still_refused(self) -> None:
-        """The removed re-auth body no longer unlocks anything: still 403, no cooldown."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch(
-                    "/api/critical-permissions/gmail/send",
-                    json={"bearer_token": "a" * 48 + "BcDeFgHiJkLmNoPqRsTuVwXyZ"},
-                )
-
-            assert resp.status_code == 403
-            assert resp.json() == _PROMOTIONS_UNAVAILABLE
-            assert server._pending_promotions == {}
-        finally:
-            _clear_critical_state()
-
-    async def test_promote_already_pending_returns_403_and_keeps_pending(self) -> None:
-        """A cooldown started before GH-149 is not promoted; PATCH is refused and leaves it."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        pending_at = datetime.now(UTC) - timedelta(minutes=1)
-        server._pending_promotions[("gmail", "send")] = pending_at
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch("/api/critical-permissions/gmail/send")
-
-            assert resp.status_code == 403
-            assert resp.json() == _PROMOTIONS_UNAVAILABLE
-            assert server._pending_promotions == {("gmail", "send"): pending_at}
-        finally:
-            _clear_critical_state()
-
-    async def test_promote_requires_auth(self) -> None:
-        """PATCH without a session cookie returns 401 (authentication comes first)."""
-        app = _make_app(anonymous=True)
-        _clear_critical_state()
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch("/api/critical-permissions/gmail/send")
-        assert resp.status_code == 401
-        assert resp.json() == _UNAUTHORIZED
-
-    async def test_models_critical_permission_promote_removed(self) -> None:
-        """The bearer_token request model is gone (replaced by password re-auth in #161)."""
-        from admino import models
-
-        assert not hasattr(models, "CriticalPermissionPromote")
-
-    async def test_promote_unknown_permission_returns_404(self) -> None:
-        """PATCH on non-promotable pair (gmail/delete) returns 404."""
-        app = _make_app()
-        _clear_critical_state()
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch("/api/critical-permissions/gmail/delete")
-        assert resp.status_code == 404
-
-    async def test_promote_rate_limited(self) -> None:
-        """6th rapid promotion request returns 429 (the first five are refused with 403)."""
-        app = _make_app()
-        _clear_critical_state()
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                statuses = []
-                for _ in range(6):
-                    resp = await c.patch("/api/critical-permissions/gmail/send")
-                    statuses.append(resp.status_code)
-
-            # First 5 are refused (promotions disabled), 6th is rate-limited
-            assert statuses[0] == 403
-            assert 429 in statuses
-            assert statuses[-1] == 429
-        finally:
-            _clear_critical_state()
+    def at(self, offset: timedelta = timedelta(0)) -> datetime:
+        when = self.t0 + offset
+        self._monkeypatch.setattr("admino.org_permissions.current_time", lambda: when)
+        return when
 
 
-# ---------------------------------------------------------------------------
-# PATCH /api/critical-permissions/{tool}/{action} -- demote
-# ---------------------------------------------------------------------------
+@pytest.fixture()
+def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
+    """The fake database get_pool() returns: two active orgs, each with the default matrix."""
+    fake = FakeDb()
+    fake.add_org(ORG_ID)
+    fake.add_org(OTHER_ORG_ID)
+    fake.add_platform_settings()
+    fake.add_permissions(ORG_ID)
+    fake.add_permissions(OTHER_ORG_ID)
+    monkeypatch.setattr("admino.database.get_pool", lambda: fake.pool)
+    return fake
 
 
-class TestDemoteCriticalPermission:
-    """PATCH /api/critical-permissions/{tool}/{action} -- demote (confirm -> deny)."""
+@pytest.fixture(autouse=True)
+def verify(monkeypatch: pytest.MonkeyPatch) -> _Verify:
+    """Replace Argon2 with a fast fake and count the password checks."""
+    spy = _Verify()
 
-    pytestmark = pytest.mark.asyncio
+    def fake_verify(password: str, encoded: str) -> bool:
+        spy.count += 1
+        return encoded == fake_hash(password)
 
-    async def test_demote_requires_auth(self) -> None:
-        """Demoting also needs a session: no cookie -> 401 and the promotion stays."""
-        from admino import server
-
-        app = _make_app(anonymous=True)
-        _clear_critical_state()
-        server._promoted_permissions.add(("gmail", "send"))
-
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.patch("/api/critical-permissions/gmail/send")
-
-            assert resp.status_code == 401
-            assert ("gmail", "send") in server._promoted_permissions
-        finally:
-            _clear_critical_state()
-
-    async def test_demote_promoted_permission_immediate(self) -> None:
-        """Demoting a promoted permission returns state='deny' immediately."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        server._promoted_permissions.add(("gmail", "send"))
-        mock_update = AsyncMock()
-        mock_load_config = AsyncMock(return_value=MagicMock())
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-                patch("admino.config.load_permissions_config_from_db", mock_load_config),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.patch(
-                        "/api/critical-permissions/gmail/send",
-                    )
-
-            assert resp.status_code == 200
-            assert resp.json()["state"] == "deny"
-        finally:
-            _clear_critical_state()
-
-    async def test_demote_clears_pending_promotion(self) -> None:
-        """Demoting clears both pending and promoted state."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        server._promoted_permissions.add(("gmail", "send"))
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC)
-        mock_update = AsyncMock()
-        mock_load_config = AsyncMock(return_value=MagicMock())
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-                patch("admino.config.load_permissions_config_from_db", mock_load_config),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.patch(
-                        "/api/critical-permissions/gmail/send",
-                    )
-
-            assert resp.status_code == 200
-            assert resp.json()["state"] == "deny"
-            assert ("gmail", "send") not in server._pending_promotions
-            assert ("gmail", "send") not in server._promoted_permissions
-        finally:
-            _clear_critical_state()
-
-    async def test_demote_needs_no_request_body(self) -> None:
-        """Demoting a promoted permission succeeds with no request body."""
-        from admino import server
-
-        app = _make_app()
-        _clear_critical_state()
-        server._promoted_permissions.add(("outlook", "send"))
-        mock_update = AsyncMock()
-        mock_load_config = AsyncMock(return_value=MagicMock())
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-                patch("admino.config.load_permissions_config_from_db", mock_load_config),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.patch(
-                        "/api/critical-permissions/outlook/send",
-                    )
-
-            assert resp.status_code == 200
-            assert resp.json()["state"] == "deny"
-        finally:
-            _clear_critical_state()
+    monkeypatch.setattr("admino.passwords.verify_password", fake_verify)
+    monkeypatch.setattr("admino.passwords.needs_rehash", lambda _encoded: False)
+    monkeypatch.setattr("admino.passwords.hash_password", fake_hash)
+    return spy
 
 
-# ---------------------------------------------------------------------------
-# DELETE /api/critical-permissions/{tool}/{action}/pending
-# ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _roomy_rate_limits(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Functional tests aren't about rate limits (the rate-limit tests set their own)."""
+    for key in (*_EXPECTED_LIMITS, "/api/message"):
+        monkeypatch.setitem(server._RATE_LIMITS, key, (1000.0, 1000))
 
 
-class TestCancelPendingPromotion:
-    """DELETE /api/critical-permissions/{tool}/{action}/pending -- cancel cooldown."""
+@pytest.fixture()
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    return _Clock(monkeypatch)
 
-    pytestmark = pytest.mark.asyncio
 
-    async def test_cancel_pending_returns_deny_state(self) -> None:
-        """Cancelling an active cooldown returns state='deny'."""
-        from admino import server
+def _agent_result() -> AgentResult:
+    return AgentResult(
+        status="final",
+        response="Done.",
+        history=[
+            LLMMessage(role="user", content="hi"),
+            LLMMessage(role="assistant", content="Done."),
+        ],
+        tool_calls=[],
+        pending_confirmation=None,
+    )
 
-        app = _make_app()
-        _clear_critical_state()
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC)
 
-        try:
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                resp = await c.delete(
-                    "/api/critical-permissions/gmail/send/pending",
-                )
+@pytest.fixture()
+def agent() -> MagicMock:
+    stub = MagicMock(name="agent")
+    stub.run = AsyncMock(return_value=_agent_result())
+    return stub
 
-            assert resp.status_code == 200
-            assert resp.json()["state"] == "deny"
-            assert ("gmail", "send") not in server._pending_promotions
-        finally:
-            _clear_critical_state()
 
-    async def test_cancel_no_pending_returns_404(self) -> None:
-        """DELETE when no cooldown is active returns 404."""
-        app = _make_app()
-        _clear_critical_state()
+def _config() -> AppConfig:
+    return AppConfig.model_validate(
+        {
+            "server": {"host": "127.0.0.1", "port": 8000, "public_url": PUBLIC_URL},
+            "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
+        }
+    )
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.delete(
-                "/api/critical-permissions/gmail/send/pending",
-            )
-        assert resp.status_code == 404
 
-    async def test_cancel_unknown_permission_returns_404(self) -> None:
-        """DELETE on non-promotable pair returns 404."""
-        app = _make_app()
-        _clear_critical_state()
+@pytest.fixture()
+def app(agent: MagicMock) -> FastAPI:
+    """create_app with the stub agent and a real config (no lifespan under TestClient)."""
+    return create_app(agent=agent, config=_config())  # type: ignore[arg-type]
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.delete(
-                "/api/critical-permissions/gmail/delete/pending",
-            )
-        assert resp.status_code == 404
 
-    async def test_cancel_requires_auth(self) -> None:
-        """DELETE without a session cookie returns 401."""
-        app = _make_app(anonymous=True)
+def _client(app: FastAPI, *, raise_server_exceptions: bool = True) -> TestClient:
+    return TestClient(
+        app,
+        client=(_IP_A, 50000),
+        follow_redirects=False,
+        raise_server_exceptions=raise_server_exceptions,
+    )
 
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.delete(
-                "/api/critical-permissions/gmail/send/pending",
-            )
-        assert resp.status_code == 401
+
+def _account(
+    db: FakeDb,
+    role: str,
+    org_id: uuid.UUID = ORG_ID,
+    *,
+    password: str = _ADMIN_PASSWORD,
+) -> _User:
+    """An account with this role (or a Super Admin), its password and a live session."""
+    email = f"{role.replace('_', '-')}-{uuid.uuid4().hex[:8]}@example.ch"
+    if role == "super_admin":
+        user_id = db.add_account(
+            kind="super_admin", role=None, email=email, password_hash=fake_hash(password)
+        )
+    else:
+        user_id = db.add_account(
+            role=role, org_id=org_id, email=email, password_hash=fake_hash(password)
+        )
+    return _User(id=user_id, token=db.open_session(user_id), email=email, password=password)
+
+
+def _headers(user: _User | None, **extra: str) -> dict[str, str]:
+    cookie = {} if user is None else {"Cookie": f"{_COOKIE}={user.token}"}
+    return {**cookie, **extra}
+
+
+def _path(pair: tuple[str, str]) -> str:
+    return f"{_BASE}/{pair[0]}/{pair[1]}"
+
+
+def _get(client: TestClient, user: _User | None, **extra: str) -> httpx.Response:
+    return client.get(_BASE, headers=_headers(user, **extra))
+
+
+def _promote(
+    client: TestClient,
+    user: _User | None,
+    pair: tuple[str, str] = _GMAIL_SEND,
+    *,
+    password: str | None = None,
+    **extra: str,
+) -> httpx.Response:
+    """PATCH with a password body (the user's own password unless one is given)."""
+    if password is None:
+        password = user.password if user is not None else _ADMIN_PASSWORD
+    return client.patch(_path(pair), headers=_headers(user, **extra), json={"password": password})
+
+
+def _patch_without_body(
+    client: TestClient, user: _User | None, pair: tuple[str, str] = _GMAIL_SEND, **extra: str
+) -> httpx.Response:
+    return client.patch(_path(pair), headers=_headers(user, **extra))
+
+
+def _cancel(
+    client: TestClient, user: _User | None, pair: tuple[str, str] = _GMAIL_SEND, **extra: str
+) -> httpx.Response:
+    return client.delete(f"{_path(pair)}/pending", headers=_headers(user, **extra))
+
+
+def _entry(response: httpx.Response, pair: tuple[str, str]) -> dict[str, Any]:
+    assert response.status_code == 200, response.text
+    matches = [
+        entry
+        for entry in response.json()["permissions"]
+        if (entry["tool"], entry["action"]) == pair
+    ]
+    assert len(matches) == 1, response.json()
+    return matches[0]
+
+
+def _ts(value: Any) -> datetime | None:
+    """A response timestamp as an aware datetime (None stays None)."""
+    if value is None:
+        return None
+    assert isinstance(value, str), value
+    parsed = datetime.fromisoformat(value)
+    assert parsed.tzinfo is not None, value
+    return parsed
+
+
+def _state_of(response: httpx.Response, pair: tuple[str, str]) -> tuple[str, datetime | None]:
+    entry = _entry(response, pair)
+    return entry["state"], _ts(entry["pending_at"])
+
+
+def _stored(db: FakeDb, org_id: uuid.UUID, pair: tuple[str, str]) -> str | None:
+    return db.org_permissions(org_id).get(pair[0], {}).get(pair[1])
+
+
+def _permission_audit(db: FakeDb) -> list[str]:
+    """The org.permission_* audit actions, in order."""
+    return [row["action"] for row in db.audit if row["action"].startswith(_PERMISSION_AUDIT_PREFIX)]
+
+
+def _work_sql(db: FakeDb, mark: int) -> list[str]:
+    """Statements since ``mark`` that touch permissions, audit_events or login_throttle."""
+    return [call.normalized for call in db.calls[mark:] if _WORK_SQL.search(call.normalized)]
+
+
+def _one(items: list[Any]) -> Any:
+    assert len(items) == 1, items
+    return items[0]
+
+
+def _plain_uuid(value: Any) -> uuid.UUID | None:
+    return None if value is None else uuid.UUID(str(value))
+
+
+def _assert_permission_event(
+    event: dict[str, Any],
+    *,
+    action: str,
+    actor: _User,
+    org_id: uuid.UUID,
+    metadata: dict[str, str],
+) -> None:
+    assert event["action"] == action
+    assert (event["actor_kind"], _plain_uuid(event["actor_user_id"])) == ("member", actor.id)
+    assert _plain_uuid(event["org_id"]) == org_id
+    assert (event["target_type"], event["target_ids"]) == ("organization", [str(org_id)])
+    assert event["ip"] == _IP_A
+    assert event["metadata"] == metadata
+
+
+def _api_route(app: FastAPI, method: str, path: str) -> APIRoute:
+    matches = [
+        route
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path == path and method in route.methods
+    ]
+    assert len(matches) == 1, f"{method} {path} is not registered"
+    return matches[0]
+
+
+def _old_routes(app: FastAPI) -> list[str]:
+    return [
+        route.path
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path.startswith(_OLD_BASE)
+    ]
+
+
+def _limited(monkeypatch: pytest.MonkeyPatch, key: str) -> None:
+    """One request per key, then nothing for a long time."""
+    monkeypatch.setitem(server._RATE_LIMITS, key, (0.001, 1))
+
+
+def _lockout_after() -> int:
+    """The stored lockout threshold the throttle applies (the primed platform cache)."""
+    from admino import scoped_settings
+
+    cache = scoped_settings._platform_cache
+    assert cache is not None
+    return int(cache.security.lockout_after_failures)
+
+
+def _seed_chat(user: _User, chat_id: str) -> tuple[uuid.UUID, str]:
+    """Store an in-memory chat of the user (after create_app, which clears them)."""
+    key = server._chat_key(user.id, chat_id)
+    server._sessions[key] = [
+        LLMMessage(role="user", content="send an email to the auditor"),
+        LLMMessage(role="assistant", content="I can't send email."),
+    ]
+    return key
+
+
+def _added(key: tuple[uuid.UUID, str]) -> list[tuple[str, str]]:
+    """(role, content) of every message appended after the two seeded ones."""
+    return [(message.role, message.content) for message in server._sessions[key][2:]]
+
+
+def _post_message(client: TestClient, user: _User, chat_id: str = "chat-161") -> httpx.Response:
+    return client.post(
+        "/api/message",
+        headers=_headers(user),
+        json={"message": "please send the report", "session_id": chat_id},
+    )
+
+
+def _policy_of(agent: MagicMock) -> Any:
+    """The ToolPolicy the last agent run received."""
+    from admino.models import ToolPolicy
+
+    kwargs = agent.run.await_args.kwargs
+    assert "tool_policy" in kwargs, sorted(kwargs)
+    policy = kwargs["tool_policy"]
+    assert isinstance(policy, ToolPolicy), policy
+    return policy
+
+
+def _complete(client: TestClient, clock: _Clock, admin: _User, *pairs: tuple[str, str]) -> None:
+    """Promote the pairs at T0 and let the cooldown pass (the next request resolves them)."""
+    clock.at()
+    for pair in pairs or (_GMAIL_SEND,):
+        response = _promote(client, admin, pair)
+        assert response.status_code == 200, response.text
+    clock.at(_COOLDOWN)
+
+
+def _fresh_listing() -> dict[str, Any]:
+    return {
+        "permissions": [
+            {"tool": tool, "action": action, "state": "deny", "pending_at": None}
+            for tool, action in _PROMOTABLE
+        ]
+    }
 
 
 # ---------------------------------------------------------------------------
-# Adversarial inputs
+# 1. Routes, rate-limit keys and removed state
 # ---------------------------------------------------------------------------
 
 
-class TestCriticalPermissionsAdversarial:
-    """Adversarial inputs to critical permissions endpoints."""
-
-    pytestmark = pytest.mark.asyncio
+class TestRoutes:
+    """The three /api/org/critical-permissions routes replace /api/critical-permissions."""
 
     @pytest.mark.parametrize(
-        "tool",
+        ("method", "path"),
         [
-            "GMAIL",
-            "gmail<script>",
-            "gmail; DROP TABLE",
-            "gm..ail",
-        ],
-        ids=[
-            "uppercase",
-            "xss_injection",
-            "sql_injection",
-            "double_dot",
+            ("GET", _BASE),
+            ("PATCH", _BASE + "/{tool}/{action}"),
+            ("DELETE", _BASE + "/{tool}/{action}/pending"),
         ],
     )
-    async def test_promote_with_invalid_tool_identifier_returns_422(self, tool: str) -> None:
-        """PATCH with invalid tool identifier returns 422."""
-        app = _make_app()
-        _clear_critical_state()
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch(f"/api/critical-permissions/{tool}/send")
-        # Invalid tool identifiers should be rejected (404 for non-promotable
-        # or 422 for validation failure -- either is acceptable)
-        assert resp.status_code in (404, 422)
-
-    async def test_promote_immutable_denial_returns_404(self) -> None:
-        """PATCH on tier-1 immutable denial (gmail/delete) returns 404."""
-        app = _make_app()
-        _clear_critical_state()
-
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.patch("/api/critical-permissions/gmail/delete")
-        assert resp.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Bug-fix regression: _resolve_pending_promotions called on POST /api/message
-# ---------------------------------------------------------------------------
-
-
-class TestPostMessageResolvesPromotions:
-    """POST /api/message must call _resolve_pending_promotions so expired
-    cooldowns are resolved before the agent processes the request."""
-
-    pytestmark = pytest.mark.asyncio
-
-    async def test_post_message_resolves_expired_cooldown(self) -> None:
-        """An expired pending promotion is resolved when POST /api/message fires."""
-        from admino import server
-        from admino.models import AgentResult, LLMMessage
-
-        result = AgentResult(
-            status="final",
-            response="ok",
-            history=[
-                LLMMessage(role="user", content="hi"),
-                LLMMessage(role="assistant", content="ok"),
-            ],
-            tool_calls=[],
-            pending_confirmation=None,
-        )
-
-        agent = MagicMock()
-        agent.run = AsyncMock(return_value=result)
-        agent._promoted = frozenset()
-        agent._tools_enabled = {}
-
-        app = _make_app(agent=agent)
-        _clear_critical_state()
-
-        # Set a pending promotion that expired 6 minutes ago.
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
-        mock_update = AsyncMock()
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.post(
-                        "/api/message",
-                        json={"message": "hello", "session_id": "sess-1"},
-                    )
-
-            assert resp.status_code == 200
-            assert ("gmail", "send") in server._promoted_permissions
-            assert ("gmail", "send") not in server._pending_promotions
-            # Agent's _promoted field should also be updated.
-            assert ("gmail", "send") in agent._promoted
-            mock_update.assert_called_once()
-        finally:
-            _clear_critical_state()
-
-    async def test_post_message_no_resolution_when_cooldown_not_expired(self) -> None:
-        """A pending promotion whose cooldown has NOT expired stays pending."""
-        from admino import server
-        from admino.models import AgentResult, LLMMessage
-
-        result = AgentResult(
-            status="final",
-            response="ok",
-            history=[
-                LLMMessage(role="user", content="hi"),
-                LLMMessage(role="assistant", content="ok"),
-            ],
-            tool_calls=[],
-            pending_confirmation=None,
-        )
-
-        agent = MagicMock()
-        agent.run = AsyncMock(return_value=result)
-        agent._promoted = frozenset()
-        agent._tools_enabled = {}
-
-        app = _make_app(agent=agent)
-        _clear_critical_state()
-
-        # Set a pending promotion that is only 1 minute old (not expired).
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=1)
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", AsyncMock()),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.post(
-                        "/api/message",
-                        json={"message": "hello", "session_id": "sess-2"},
-                    )
-
-            assert resp.status_code == 200
-            # Still pending — not yet promoted.
-            assert ("gmail", "send") in server._pending_promotions
-            assert ("gmail", "send") not in server._promoted_permissions
-        finally:
-            _clear_critical_state()
-
-    async def test_post_message_promotes_multiple_expired_cooldowns(self) -> None:
-        """Multiple expired cooldowns are all resolved in a single request."""
-        from admino import server
-        from admino.models import AgentResult, LLMMessage
-
-        result = AgentResult(
-            status="final",
-            response="ok",
-            history=[
-                LLMMessage(role="user", content="hi"),
-                LLMMessage(role="assistant", content="ok"),
-            ],
-            tool_calls=[],
-            pending_confirmation=None,
-        )
-
-        agent = MagicMock()
-        agent.run = AsyncMock(return_value=result)
-        agent._promoted = frozenset()
-        agent._tools_enabled = {}
-
-        app = _make_app(agent=agent)
-        _clear_critical_state()
-
-        expired_time = datetime.now(UTC) - timedelta(minutes=6)
-        server._pending_promotions[("gmail", "send")] = expired_time
-        server._pending_promotions[("outlook", "send")] = expired_time
-        mock_update = AsyncMock()
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-            ):
-                async with AsyncClient(
-                    transport=ASGITransport(app=app), base_url="http://test"
-                ) as c:
-                    resp = await c.post(
-                        "/api/message",
-                        json={"message": "hello", "session_id": "sess-3"},
-                    )
-
-            assert resp.status_code == 200
-            assert ("gmail", "send") in server._promoted_permissions
-            assert ("outlook", "send") in server._promoted_permissions
-            assert mock_update.call_count == 2
-        finally:
-            _clear_critical_state()
-
-
-# ---------------------------------------------------------------------------
-# Bug-fix regression: _promoted_permissions loaded from DB on startup
-# ---------------------------------------------------------------------------
-
-
-class TestLifespanLoadsPromotedPermissions:
-    """The lifespan startup must load previously-promoted permissions from the
-    database so that tier-2 promotions survive server restarts."""
-
-    pytestmark = pytest.mark.asyncio
-
-    async def test_lifespan_loads_promoted_permission_from_db(self) -> None:
-        """When the DB has gmail.send as 'confirm', lifespan populates the
-        _promoted_permissions set and the agent's _promoted field."""
-        from admino import server
-        from admino.server import _lifespan
-
-        agent = MagicMock()
-        agent._promoted = frozenset()
-        agent._tools_enabled = {}
-
-        app = _make_app(agent=agent)
-        _clear_critical_state()
-
-        # Mock DB to return gmail.send as promoted.
-        db_perms: dict[str, dict[str, str]] = {
-            "gmail": {"send": "confirm"},
-        }
-        mock_load_perms = AsyncMock(return_value=db_perms)
-        mock_init = AsyncMock()
-        mock_close = AsyncMock()
-
-        try:
-            with (
-                patch("admino.database.init_pool", mock_init),
-                patch("admino.database.close_pool", mock_close),
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.load_permissions_from_db", mock_load_perms),
-                # GH-159: the tools gate reload never reads the MagicMock pool.
-                patch_tools_gate(),
-                # GH-154's org purge job never runs against the MagicMock pool.
-                patch_org_purge_job(AsyncMock()),
-                # GH-157: nor does the login throttle purge.
-                patch_login_throttle_purge_job(AsyncMock()),
-            ):
-                # Drive the lifespan context manager directly.
-                async with _lifespan(app):
-                    assert ("gmail", "send") in server._promoted_permissions
-                    assert ("gmail", "send") in agent._promoted
-        finally:
-            _clear_critical_state()
-
-    async def test_lifespan_ignores_non_promotable_permissions_from_db(self) -> None:
-        """Only PROMOTABLE_DENIALS pairs are loaded; other DB rows are ignored."""
-        from admino import server
-        from admino.server import _lifespan
-
-        agent = MagicMock()
-        agent._promoted = frozenset()
-        agent._tools_enabled = {}
-
-        app = _make_app(agent=agent)
-        _clear_critical_state()
-
-        # gmail.delete is an immutable denial, not promotable — must be ignored.
-        db_perms: dict[str, dict[str, str]] = {
-            "gmail": {"send": "confirm", "delete": "confirm"},
-        }
-        mock_load_perms = AsyncMock(return_value=db_perms)
-        mock_init = AsyncMock()
-        mock_close = AsyncMock()
-
-        try:
-            with (
-                patch("admino.database.init_pool", mock_init),
-                patch("admino.database.close_pool", mock_close),
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.load_permissions_from_db", mock_load_perms),
-                # GH-159: the tools gate reload never reads the MagicMock pool.
-                patch_tools_gate(),
-                # GH-154's org purge job never runs against the MagicMock pool.
-                patch_org_purge_job(AsyncMock()),
-                # GH-157: nor does the login throttle purge.
-                patch_login_throttle_purge_job(AsyncMock()),
-            ):
-                async with _lifespan(app):
-                    # gmail.send is promotable — should be loaded.
-                    assert ("gmail", "send") in server._promoted_permissions
-                    # gmail.delete is NOT promotable — must not appear.
-                    assert ("gmail", "delete") not in server._promoted_permissions
-        finally:
-            _clear_critical_state()
-
-
-# ---------------------------------------------------------------------------
-# Bug-fix regression: session notification on promotion resolution
-# ---------------------------------------------------------------------------
-
-
-class TestPromotionSessionNotification:
-    """When _resolve_pending_promotions() resolves expired cooldowns, a
-    notification message must be injected into every active session in
-    _sessions so the LLM knows the permission changed and won't refuse based
-    on stale denials.
-
-    GH-66: the notification must use a non-system role so it survives the
-    agent's ``_filter_mid_system`` prompt-injection defence, which drops every
-    mid-conversation ``system``-role message. A ``system``-role notification
-    would be silently discarded before reaching the LLM.
-    """
-
-    pytestmark = pytest.mark.asyncio
-
-    async def test_resolve_promotions_injects_notification_into_sessions(
-        self,
+    def test_critical_permissions_route_is_registered(
+        self, app: FastAPI, method: str, path: str
     ) -> None:
-        """Expired cooldown resolution appends a notification LLMMessage to all sessions."""
-        from admino import server
-        from admino.models import LLMMessage
-        from admino.server import _resolve_pending_promotions
+        _api_route(app, method, path)
 
-        _clear_critical_state()
+    def test_critical_permissions_old_routes_are_not_registered(self, app: FastAPI) -> None:
+        assert _old_routes(app) == []
 
-        # Populate two active sessions with some existing history.
-        sess1_history: list[LLMMessage] = [
-            LLMMessage(role="user", content="hello"),
+    def test_critical_permissions_old_get_is_404(self, db: FakeDb, app: FastAPI) -> None:
+        admin = _account(db, "org_admin")
+
+        response = _client(app).get(_OLD_BASE, headers=_headers(admin))
+
+        assert response.status_code == 404
+        assert _old_routes(app) == []
+
+    def test_critical_permissions_old_patch_is_refused_and_changes_nothing(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        """404 (or the static files' 405), no password check, nothing pending or stored."""
+        admin = _account(db, "org_admin")
+        db.add_permissions(ORG_ID, {"outlook": {"send": "confirm"}})
+        client = _client(app)
+
+        promote = client.patch(
+            f"{_OLD_BASE}/gmail/send",
+            headers=_headers(admin),
+            json={"password": _ADMIN_PASSWORD},
+        )
+        demote = client.patch(f"{_OLD_BASE}/outlook/send", headers=_headers(admin))
+
+        assert promote.status_code in {404, 405}
+        assert demote.status_code in {404, 405}
+        assert verify.count == 0
+        assert _stored(db, ORG_ID, _OUTLOOK_SEND) == "confirm"
+        assert _old_routes(app) == []
+
+    def test_critical_permissions_old_delete_is_refused(self, db: FakeDb, app: FastAPI) -> None:
+        admin = _account(db, "org_admin")
+
+        response = _client(app).delete(f"{_OLD_BASE}/gmail/send/pending", headers=_headers(admin))
+
+        assert response.status_code in {404, 405}
+        assert _old_routes(app) == []
+
+    @pytest.mark.parametrize("key", list(_EXPECTED_LIMITS))
+    def test_critical_permissions_rate_limit_values(self, key: str) -> None:
+        assert _CONFIGURED_LIMITS[key] == pytest.approx(_EXPECTED_LIMITS[key])
+
+    @pytest.mark.parametrize("key", _OLD_RATE_KEYS)
+    def test_critical_permissions_old_rate_limit_keys_are_removed(self, key: str) -> None:
+        assert key not in server._RATE_LIMITS
+
+    @pytest.mark.parametrize("name", _REMOVED_SERVER_GLOBALS)
+    def test_critical_permissions_server_promotion_state_is_gone(self, name: str) -> None:
+        assert not hasattr(server, name)
+
+    def test_critical_permissions_cooldown_is_five_minutes(self) -> None:
+        from admino import org_permissions
+
+        assert timedelta(minutes=5) == org_permissions.PROMOTION_COOLDOWN
+
+
+# ---------------------------------------------------------------------------
+# 2. Session, role gate, rate limits and cross-origin protection
+# ---------------------------------------------------------------------------
+
+
+class TestAccess:
+    """401 without a session; 403 for every role but the Org Admin; 429 per user."""
+
+    @pytest.mark.parametrize("route", ["get", "promote", "demote", "cancel"])
+    def test_critical_permissions_without_session_is_401(
+        self, db: FakeDb, app: FastAPI, route: str, verify: _Verify
+    ) -> None:
+        _api_route(app, "GET", _BASE)
+        client = _client(app)
+        calls = {
+            "get": lambda: _get(client, None),
+            "promote": lambda: _promote(client, None),
+            "demote": lambda: _patch_without_body(client, None),
+            "cancel": lambda: _cancel(client, None),
+        }
+
+        response = calls[route]()
+
+        assert (response.status_code, response.json()) == (401, _UNAUTHORIZED)
+        assert _work_sql(db, 0) == []
+        assert verify.count == 0
+
+    @pytest.mark.parametrize("role", _NON_ADMIN_ROLES)
+    def test_critical_permissions_get_by_non_admin_is_403_without_db_work(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        user = _account(db, role)
+        mark = len(db.calls)
+
+        response = _get(_client(app), user)
+
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert _work_sql(db, mark) == []
+
+    @pytest.mark.parametrize("role", _NON_ADMIN_ROLES)
+    def test_critical_permissions_promote_by_non_admin_is_403_before_reauth(
+        self, db: FakeDb, app: FastAPI, verify: _Verify, clock: _Clock, role: str
+    ) -> None:
+        """A non-admin's own right password unlocks nothing: 403, no check, nothing counted."""
+        user = _account(db, role)
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        mark = len(db.calls)
+
+        response = _promote(client, user)
+
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert _work_sql(db, mark) == []
+        assert verify.count == 0
+        assert db.throttle == []
+        clock.at(_COOLDOWN)
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+
+    @pytest.mark.parametrize("role", _NON_ADMIN_ROLES)
+    def test_critical_permissions_demote_by_non_admin_is_403_and_keeps_the_promotion(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        user = _account(db, role)
+        mark = len(db.calls)
+
+        response = _patch_without_body(_client(app), user)
+
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert _work_sql(db, mark) == []
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
+
+    @pytest.mark.parametrize("role", _NON_ADMIN_ROLES)
+    def test_critical_permissions_cancel_by_non_admin_is_403_and_keeps_the_pending(
+        self, db: FakeDb, app: FastAPI, clock: _Clock, role: str
+    ) -> None:
+        admin = _account(db, "org_admin")
+        user = _account(db, role)
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin).status_code == 200
+        mark = len(db.calls)
+
+        response = _cancel(client, user)
+
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert _work_sql(db, mark) == []
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", clock.t0)
+
+    def test_critical_permissions_get_rate_limit_is_per_user_and_before_db_work(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _limited(monkeypatch, _GET_KEY)
+        admin = _account(db, "org_admin")
+        other_admin = _account(db, "org_admin")
+        client = _client(app)
+
+        first = _get(client, admin)
+        mark = len(db.calls)
+        second = _get(client, admin)
+        work = _work_sql(db, mark)
+        other = _get(client, other_admin)
+
+        assert first.status_code == 200, first.text
+        assert (second.status_code, second.json()) == (429, _RATE_LIMITED)
+        assert work == []
+        assert other.status_code == 200, other.text
+
+    def test_critical_permissions_rate_limit_runs_before_the_role_gate(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An Editor's refused calls spend its own bucket: 403, then 429."""
+        _limited(monkeypatch, _GET_KEY)
+        editor = _account(db, "editor")
+        client = _client(app)
+
+        first = _get(client, editor)
+        second = _get(client, editor)
+
+        assert (first.status_code, first.json()) == (403, _FORBIDDEN)
+        assert (second.status_code, second.json()) == (429, _RATE_LIMITED)
+
+    def test_critical_permissions_promote_rate_limit_is_before_reauth(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        monkeypatch: pytest.MonkeyPatch,
+        verify: _Verify,
+    ) -> None:
+        """The second attempt is 429: its password is never checked, nothing is pending."""
+        _limited(monkeypatch, _PROMOTE_KEY)
+        admin = _account(db, "org_admin")
+        client = _client(app)
+
+        first = _promote(client, admin, password=_WRONG_PASSWORD)
+        mark = len(db.calls)
+        second = _promote(client, admin)
+        work = _work_sql(db, mark)
+
+        assert (first.status_code, first.json()) == (403, _REAUTH_FAILED)
+        assert (second.status_code, second.json()) == (429, _RATE_LIMITED)
+        assert work == []
+        assert verify.count == 1
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+
+    def test_critical_permissions_cancel_rate_limit_is_before_db_work(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _limited(monkeypatch, _CANCEL_KEY)
+        admin = _account(db, "org_admin")
+        client = _client(app)
+
+        first = _cancel(client, admin)
+        mark = len(db.calls)
+        second = _cancel(client, admin)
+
+        assert (first.status_code, first.json()) == (404, _NO_PENDING)
+        assert (second.status_code, second.json()) == (429, _RATE_LIMITED)
+        assert _work_sql(db, mark) == []
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            pytest.param({"Sec-Fetch-Site": "cross-site"}, id="sfs-cross-site"),
+            pytest.param({"Origin": "https://evil.example"}, id="origin-foreign"),
+        ],
+    )
+    def test_critical_permissions_cross_origin_promote_is_403(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        verify: _Verify,
+        clock: _Clock,
+        headers: dict[str, str],
+    ) -> None:
+        _api_route(app, "PATCH", _BASE + "/{tool}/{action}")
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+
+        response = _promote(client, admin, **headers)
+
+        assert (response.status_code, response.json()) == (403, _CSRF_REFUSED)
+        assert verify.count == 0
+        assert db.audit_rows() == []
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+
+    def test_critical_permissions_cross_origin_cancel_is_403(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        _api_route(app, "DELETE", _BASE + "/{tool}/{action}/pending")
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin).status_code == 200
+
+        response = _cancel(client, admin, **{"Sec-Fetch-Site": "cross-site"})
+
+        assert (response.status_code, response.json()) == (403, _CSRF_REFUSED)
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", clock.t0)
+        assert _permission_audit(db) == ["org.permission_promote"]
+
+
+# ---------------------------------------------------------------------------
+# 3. GET: the org's own state
+# ---------------------------------------------------------------------------
+
+
+class TestGet:
+    """The 4 promotable pairs, sorted, with the org's stored state and pending entry."""
+
+    def test_critical_permissions_get_lists_four_sorted_denied_entries(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        admin = _account(db, "org_admin")
+
+        response = _get(_client(app), admin)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _fresh_listing()
+
+    def test_critical_permissions_get_reads_the_own_orgs_stored_state(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        db.add_permissions(OTHER_ORG_ID, {"outlook_calendar": {"update": "confirm"}})
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+
+        listing_a = _get(client, admin_a)
+        listing_b = _get(client, admin_b)
+
+        states_a = {pair: _state_of(listing_a, pair)[0] for pair in _PROMOTABLE}
+        states_b = {pair: _state_of(listing_b, pair)[0] for pair in _PROMOTABLE}
+        assert states_a == {
+            **dict.fromkeys(_PROMOTABLE, "deny"),
+            _GMAIL_SEND: "confirm",
+        }
+        assert states_b == {
+            **dict.fromkeys(_PROMOTABLE, "deny"),
+            ("outlook_calendar", "update"): "confirm",
+        }
+
+    def test_critical_permissions_get_shows_only_the_own_orgs_pending_entry(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin_a).status_code == 200
+
+        listing_a = _get(client, admin_a)
+        listing_b = _get(client, admin_b)
+
+        assert _state_of(listing_a, _GMAIL_SEND) == ("deny", clock.t0)
+        assert listing_b.json() == _fresh_listing()
+
+
+# ---------------------------------------------------------------------------
+# 4. PATCH: promotion with password re-auth
+# ---------------------------------------------------------------------------
+
+
+class TestPromote:
+    """Password re-auth, then a 5-minute cooldown; #149's interim 403 is gone."""
+
+    @pytest.mark.parametrize("pair", _PROMOTABLE)
+    def test_critical_permissions_promote_with_right_password_starts_the_cooldown(
+        self, db: FakeDb, app: FastAPI, clock: _Clock, pair: tuple[str, str]
+    ) -> None:
+        admin = _account(db, "org_admin")
+        clock.at()
+
+        response = _promote(_client(app), admin, pair)
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body != _PROMOTIONS_UNAVAILABLE
+        assert {key: body[key] for key in ("tool", "action", "state")} == {
+            "tool": pair[0],
+            "action": pair[1],
+            "state": "deny",
+        }
+        assert _ts(body["pending_at"]) == clock.t0
+        assert _stored(db, ORG_ID, pair) == "deny"
+
+    def test_critical_permissions_promote_writes_one_audit_row_and_no_session(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        clock.at()
+
+        response = _promote(_client(app), admin)
+
+        assert response.status_code == 200, response.text
+        event = _one(db.audit_rows("org.permission_promote"))
+        _assert_permission_event(
+            event,
+            action="org.permission_promote",
+            actor=admin,
+            org_id=ORG_ID,
+            metadata={"tool": "gmail", "action": "send", "old": "deny", "new": "confirm"},
+        )
+        assert [row["action"] for row in db.audit] == ["org.permission_promote"]
+        assert len(db.sessions_of(admin.id)) == 1
+
+    def test_critical_permissions_promote_with_wrong_password_is_403_and_changes_nothing(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+
+        response = _promote(client, admin, password=_WRONG_PASSWORD)
+
+        assert (response.status_code, response.json()) == (403, _REAUTH_FAILED)
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _permission_audit(db) == []
+        assert db.audit_rows("login.failure") == []
+        assert db.audit_rows("login.success") == []
+        clock.at(_COOLDOWN)
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+
+    def test_critical_permissions_wrong_password_counts_in_the_login_throttle(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """Like a failed login: one failure on the account's subject and on the client IP."""
+        admin = _account(db, "org_admin")
+
+        response = _promote(_client(app), admin, password=_WRONG_PASSWORD)
+
+        assert response.status_code == 403
+        account_row = db.throttle_row("account", account_subject(admin.email))
+        ip_row = db.throttle_row("ip", ip_subject(_IP_A))
+        assert account_row is not None
+        assert account_row["failures"] == 1
+        assert ip_row is not None
+        assert ip_row["failures"] == 1
+
+    def test_critical_permissions_another_members_password_is_refused(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        """Re-auth is the admin's OWN password: a colleague's valid password fails."""
+        admin = _account(db, "org_admin")
+        _account(db, "editor", password=_OTHER_PASSWORD)
+        client = _client(app)
+
+        response = _promote(client, admin, password=_OTHER_PASSWORD)
+
+        assert (response.status_code, response.json()) == (403, _REAUTH_FAILED)
+        assert verify.count == 1
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+
+    def test_critical_permissions_locked_account_refuses_the_right_password(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        admin = _account(db, "org_admin")
+        limit = _lockout_after()
+        db.add_throttle(
+            "account",
+            account_subject(admin.email),
+            failures=limit,
+            locked_until=datetime.now(UTC) + timedelta(minutes=15),
+        )
+        client = _client(app)
+
+        response = _promote(client, admin)
+
+        assert (response.status_code, response.json()) == (403, _REAUTH_FAILED)
+        assert verify.count == 0
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _permission_audit(db) == []
+
+    @pytest.mark.usefixtures("login_delays")
+    def test_critical_permissions_lockout_after_wrong_passwords_refuses_the_right_one(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        limit = _lockout_after()
+
+        wrong = [_promote(client, admin, password=_WRONG_PASSWORD) for _ in range(limit)]
+        right = _promote(client, admin)
+
+        assert [response.status_code for response in wrong] == [403] * limit
+        assert (right.status_code, right.json()) == (403, _REAUTH_FAILED)
+        assert verify.count == limit
+        # The Nth failure locks like a failed login does: a login.lockout event
+        # carrying the admin's actor columns.
+        lockouts = db.audit_rows("login.lockout")
+        assert any(
+            (_plain_uuid(row["actor_user_id"]), _plain_uuid(row["org_id"])) == (admin.id, ORG_ID)
+            for row in lockouts
+        ), lockouts
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _permission_audit(db) == []
+
+    def test_critical_permissions_promote_without_body_is_400(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+
+        response = _patch_without_body(client, admin)
+
+        assert (response.status_code, response.json()) == (400, _REAUTH_REQUIRED)
+        assert verify.count == 0
+        assert db.throttle == []
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _permission_audit(db) == []
+
+    @pytest.mark.parametrize("body", _BAD_BODIES)
+    def test_critical_permissions_bad_body_is_422_without_echo(
+        self, db: FakeDb, app: FastAPI, verify: _Verify, body: Any
+    ) -> None:
+        _api_route(app, "PATCH", _BASE + "/{tool}/{action}")
+        admin = _account(db, "org_admin")
+        client = _client(app)
+
+        response = client.patch(_path(_GMAIL_SEND), headers=_headers(admin), json=body)
+
+        assert response.status_code == 422, response.text
+        assert _ECHO_MARKER not in response.text
+        assert _ADMIN_PASSWORD not in response.text
+        assert "123456789012345" not in response.text
+        detail = response.json()["detail"]
+        assert isinstance(detail, list)
+        assert all("input" not in error for error in detail), detail
+        assert verify.count == 0
+        assert db.throttle == []
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+
+    @pytest.mark.parametrize(("tool", "action"), _NON_PROMOTABLE_PAIRS)
+    def test_critical_permissions_non_promotable_pair_is_404_without_reauth(
+        self, db: FakeDb, app: FastAPI, verify: _Verify, tool: str, action: str
+    ) -> None:
+        _api_route(app, "PATCH", _BASE + "/{tool}/{action}")
+        admin = _account(db, "org_admin")
+        before = db.org_permissions(ORG_ID)
+
+        response = _promote(_client(app), admin, (tool, action))
+
+        assert (response.status_code, response.json()) == (404, _NOT_PROMOTABLE)
+        assert verify.count == 0
+        assert db.throttle == []
+        assert db.audit_rows() == []
+        assert db.org_permissions(ORG_ID) == before
+
+    @pytest.mark.parametrize(("tool", "action"), _BAD_IDENTIFIERS)
+    def test_critical_permissions_invalid_path_identifier_is_422(
+        self, db: FakeDb, app: FastAPI, verify: _Verify, tool: str, action: str
+    ) -> None:
+        _api_route(app, "PATCH", _BASE + "/{tool}/{action}")
+        admin = _account(db, "org_admin")
+
+        response = _promote(_client(app), admin, (tool, action))
+
+        assert response.status_code == 422, response.text
+        assert verify.count == 0
+        assert db.audit_rows() == []
+
+    def test_critical_permissions_repeat_while_pending_keeps_the_first_pending_at(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+        first = _promote(client, admin)
+        clock.at(timedelta(minutes=2))
+
+        second = _promote(client, admin)
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert (second.json()["state"], _ts(second.json()["pending_at"])) == ("deny", clock.t0)
+        assert _permission_audit(db) == ["org.permission_promote"]
+
+    def test_critical_permissions_repeat_while_pending_does_not_restart_the_cooldown(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin).status_code == 200
+        clock.at(timedelta(minutes=3))
+        assert _promote(client, admin).status_code == 200
+        clock.at(_COOLDOWN)
+
+        listing = _get(client, admin)
+
+        assert _state_of(listing, _GMAIL_SEND) == ("confirm", None)
+
+    def test_critical_permissions_audit_failure_is_500_with_nothing_pending(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app, raise_server_exceptions=False)
+        clock.at()
+        db.fail_audit = True
+
+        response = _promote(client, admin)
+
+        db.fail_audit = False
+        assert response.status_code == 500
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        clock.at(_COOLDOWN + timedelta(minutes=1))
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+        assert _permission_audit(db) == []
+
+
+# ---------------------------------------------------------------------------
+# 5. The cooldown and per-org isolation
+# ---------------------------------------------------------------------------
+
+
+class TestCooldown:
+    """Pending for 5 minutes; then the promoting org's next request completes it."""
+
+    def test_critical_permissions_still_pending_one_second_before_the_cooldown(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin).status_code == 200
+        clock.at(_JUST_BEFORE)
+
+        listing = _get(client, admin)
+
+        assert _state_of(listing, _GMAIL_SEND) == ("deny", clock.t0)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+
+    def test_critical_permissions_get_after_the_cooldown_completes_the_promotion(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        _complete(client, clock, admin)
+
+        listing = _get(client, admin)
+
+        assert _state_of(listing, _GMAIL_SEND) == ("confirm", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
+        assert _permission_audit(db) == ["org.permission_promote"]
+
+    def test_critical_permissions_promotion_is_isolated_to_one_org(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """Org A's completed promotion: A's row 'confirm'; B's row, listing, pending untouched."""
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        listing_a = _get(client, admin_a)
+        listing_b = _get(client, admin_b)
+
+        assert _state_of(listing_a, _GMAIL_SEND) == ("confirm", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
+        assert _stored(db, OTHER_ORG_ID, _GMAIL_SEND) == "deny"
+        assert listing_b.json() == _fresh_listing()
+
+    def test_critical_permissions_another_orgs_request_never_completes_it(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """Org B's GET after A's cooldown resolves only B's entries: A's row stays 'deny'."""
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        listing_b = _get(client, admin_b)
+
+        assert listing_b.json() == _fresh_listing()
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+        assert _stored(db, OTHER_ORG_ID, _GMAIL_SEND) == "deny"
+        assert _state_of(_get(client, admin_a), _GMAIL_SEND) == ("confirm", None)
+
+    def test_critical_permissions_each_org_promotes_on_its_own(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """Both orgs promote the same pair: two pending entries, two audit rows, one per org."""
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin_a).status_code == 200
+        clock.at(timedelta(minutes=2))
+        assert _promote(client, admin_b).status_code == 200
+        clock.at(_COOLDOWN)
+
+        listing_a = _get(client, admin_a)
+        listing_b = _get(client, admin_b)
+
+        assert _state_of(listing_a, _GMAIL_SEND) == ("confirm", None)
+        assert _state_of(listing_b, _GMAIL_SEND) == ("deny", clock.t0 + timedelta(minutes=2))
+        orgs = sorted(str(_plain_uuid(row["org_id"])) for row in db.audit)
+        assert orgs == sorted([str(ORG_ID), str(OTHER_ORG_ID)])
+
+
+# ---------------------------------------------------------------------------
+# 6. PATCH on a promoted permission: demotion
+# ---------------------------------------------------------------------------
+
+
+class TestDemote:
+    """A pair stored 'confirm' is demoted at once, without a password."""
+
+    def test_critical_permissions_demote_needs_no_password(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        admin = _account(db, "org_admin")
+
+        response = _patch_without_body(_client(app), admin)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "tool": "gmail",
+            "action": "send",
+            "state": "deny",
+            "pending_at": None,
+        }
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+        assert verify.count == 0
+
+    def test_critical_permissions_demote_writes_a_demote_audit_row(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        admin = _account(db, "org_admin")
+
+        response = _patch_without_body(_client(app), admin)
+
+        assert response.status_code == 200, response.text
+        _assert_permission_event(
+            _one(db.audit_rows("org.permission_demote")),
+            action="org.permission_demote",
+            actor=admin,
+            org_id=ORG_ID,
+            metadata={"tool": "gmail", "action": "send", "old": "confirm", "new": "deny"},
+        )
+        assert _permission_audit(db) == ["org.permission_demote"]
+
+    def test_critical_permissions_demote_ignores_a_password_body(
+        self, db: FakeDb, app: FastAPI, verify: _Verify
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        admin = _account(db, "org_admin")
+
+        response = _promote(_client(app), admin, password=_WRONG_PASSWORD)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["state"] == "deny"
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+        assert verify.count == 0
+        assert db.throttle == []
+
+    def test_critical_permissions_demote_changes_only_the_own_org(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        db.add_permissions(OTHER_ORG_ID, {"gmail": {"send": "confirm"}})
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+
+        response = _patch_without_body(client, admin_a)
+
+        assert response.status_code == 200, response.text
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+        assert _stored(db, OTHER_ORG_ID, _GMAIL_SEND) == "confirm"
+        assert _state_of(_get(client, admin_b), _GMAIL_SEND) == ("confirm", None)
+
+    def test_critical_permissions_demote_audit_failure_is_500_and_keeps_the_promotion(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        admin = _account(db, "org_admin")
+        db.fail_audit = True
+
+        response = _patch_without_body(_client(app, raise_server_exceptions=False), admin)
+
+        db.fail_audit = False
+        assert response.status_code == 500
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
+        assert _permission_audit(db) == []
+
+    def test_critical_permissions_admin_with_right_password_can_promote_again(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """Promote -> complete -> demote -> promote again with the right password -> complete."""
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        _complete(client, clock, admin)
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("confirm", None)
+        demoted = _patch_without_body(client, admin)
+        assert (demoted.status_code, demoted.json()["state"]) == (200, "deny")
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        second_start = clock.at(_COOLDOWN + timedelta(minutes=1))
+
+        again = _promote(client, admin)
+
+        assert again.status_code == 200, again.text
+        assert (again.json()["state"], _ts(again.json()["pending_at"])) == ("deny", second_start)
+        clock.at(_COOLDOWN + timedelta(minutes=1) + _COOLDOWN)
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("confirm", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
+        assert _permission_audit(db) == [
+            "org.permission_promote",
+            "org.permission_demote",
+            "org.permission_promote",
         ]
-        sess2_history: list[LLMMessage] = [
-            LLMMessage(role="user", content="send an email"),
-            LLMMessage(role="assistant", content="I cannot do that yet."),
+
+
+# ---------------------------------------------------------------------------
+# 7. DELETE .../pending: cancelling a cooldown
+# ---------------------------------------------------------------------------
+
+
+class TestCancel:
+    """Cancel drops the org's own pending entry only."""
+
+    def test_critical_permissions_cancel_drops_the_pending_entry(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin).status_code == 200
+        clock.at(timedelta(minutes=1))
+
+        response = _cancel(client, admin)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "tool": "gmail",
+            "action": "send",
+            "state": "deny",
+            "pending_at": None,
+        }
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        clock.at(_COOLDOWN + timedelta(minutes=1))
+        assert _state_of(_get(client, admin), _GMAIL_SEND) == ("deny", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+
+    def test_critical_permissions_cancel_writes_a_cancel_audit_row(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin = _account(db, "org_admin")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin).status_code == 200
+
+        response = _cancel(client, admin)
+
+        assert response.status_code == 200, response.text
+        _assert_permission_event(
+            _one(db.audit_rows("org.permission_promote_cancel")),
+            action="org.permission_promote_cancel",
+            actor=admin,
+            org_id=ORG_ID,
+            metadata={"tool": "gmail", "action": "send"},
+        )
+        assert _permission_audit(db) == [
+            "org.permission_promote",
+            "org.permission_promote_cancel",
         ]
-        server._sessions["sess-a"] = sess1_history
-        server._sessions["sess-b"] = sess2_history
 
-        # Set an expired pending promotion (6 minutes ago).
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
+    def test_critical_permissions_cancel_without_pending_is_404(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        _api_route(app, "DELETE", _BASE + "/{tool}/{action}/pending")
+        admin = _account(db, "org_admin")
 
-        mock_update = AsyncMock()
-        agent_mock = MagicMock()
-        agent_mock._promoted = frozenset()
-        server._agent = agent_mock
+        response = _cancel(_client(app), admin)
 
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-            ):
-                await _resolve_pending_promotions()
+        assert (response.status_code, response.json()) == (404, _NO_PENDING)
+        assert db.audit_rows() == []
 
-            # Both sessions should have gained exactly one new message.
-            assert len(sess1_history) == 2
-            assert len(sess2_history) == 3
+    @pytest.mark.parametrize(("tool", "action"), _NON_PROMOTABLE_PAIRS)
+    def test_critical_permissions_cancel_non_promotable_pair_is_404(
+        self, db: FakeDb, app: FastAPI, tool: str, action: str
+    ) -> None:
+        _api_route(app, "DELETE", _BASE + "/{tool}/{action}/pending")
+        admin = _account(db, "org_admin")
 
-            injected_1 = sess1_history[-1]
-            injected_2 = sess2_history[-1]
+        response = _cancel(_client(app), admin, (tool, action))
 
-            # GH-66: must NOT be a system message — those are dropped mid-conversation
-            # by the agent's prompt-injection filter, silently discarding the notice.
-            assert injected_1.role != "system"
-            assert injected_2.role != "system"
-            assert "gmail.send" in injected_1.content
-            assert "gmail.send" in injected_2.content
-        finally:
-            server._sessions.clear()
-            server._agent = None
-            _clear_critical_state()
+        assert (response.status_code, response.json()) == (404, _NOT_PROMOTABLE)
+        assert db.audit_rows() == []
 
-    async def test_promotion_notification_survives_filter_mid_system(self) -> None:
-        """GH-66 end-to-end: the injected notification must survive _trim_context.
+    @pytest.mark.parametrize(("tool", "action"), _BAD_IDENTIFIERS)
+    def test_critical_permissions_cancel_invalid_path_identifier_is_422(
+        self, db: FakeDb, app: FastAPI, tool: str, action: str
+    ) -> None:
+        _api_route(app, "DELETE", _BASE + "/{tool}/{action}/pending")
+        admin = _account(db, "org_admin")
 
-        ``_trim_context`` runs ``_filter_mid_system`` over the non-leading
-        history, which drops every mid-conversation ``system``-role message.
-        The promotion notification must reach the LLM, so it must still be
-        present after trimming.
-        """
-        from admino import server
+        response = _cancel(_client(app), admin, (tool, action))
+
+        assert response.status_code == 422, response.text
+
+    def test_critical_permissions_cancel_keeps_the_other_orgs_pending_entry(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin_a).status_code == 200
+        assert _promote(client, admin_b).status_code == 200
+
+        response = _cancel(client, admin_a)
+
+        assert response.status_code == 200, response.text
+        assert _state_of(_get(client, admin_a), _GMAIL_SEND) == ("deny", None)
+        assert _state_of(_get(client, admin_b), _GMAIL_SEND) == ("deny", clock.t0)
+        clock.at(_COOLDOWN)
+        assert _state_of(_get(client, admin_b), _GMAIL_SEND) == ("confirm", None)
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
+
+    def test_critical_permissions_other_orgs_admin_cannot_cancel(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin_a).status_code == 200
+
+        response = _cancel(client, admin_b)
+
+        assert (response.status_code, response.json()) == (404, _NO_PENDING)
+        assert _state_of(_get(client, admin_a), _GMAIL_SEND) == ("deny", clock.t0)
+        assert _permission_audit(db) == ["org.permission_promote"]
+        clock.at(_COOLDOWN)
+        assert _state_of(_get(client, admin_a), _GMAIL_SEND) == ("confirm", None)
+
+
+# ---------------------------------------------------------------------------
+# 8. GH-66: the promotion notice reaches the promoting org's chats only
+# ---------------------------------------------------------------------------
+
+
+class TestPromotionNotice:
+    """One user-role notice per completed resolution, in the promoting org's chats only."""
+
+    def test_critical_permissions_notice_reaches_only_the_promoting_orgs_chats(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        editor_b = _account(db, "editor", OTHER_ORG_ID)
+        chat_admin_a = _seed_chat(admin_a, "chat-admin-a")
+        chat_editor_a = _seed_chat(editor_a, "chat-editor-a")
+        chat_editor_b = _seed_chat(editor_b, "chat-editor-b")
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        response = _get(client, admin_a)
+
+        assert response.status_code == 200, response.text
+        assert _added(chat_admin_a) == [("user", _NOTICE_GMAIL)]
+        assert _added(chat_editor_a) == [("user", _NOTICE_GMAIL)]
+        assert _added(chat_editor_b) == []
+
+    def test_critical_permissions_notice_is_not_repeated(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        chat = _seed_chat(editor_a, "chat-editor-a")
+        client = _client(app)
+        _complete(client, clock, admin_a)
+        assert _get(client, admin_a).status_code == 200
+        clock.at(_COOLDOWN + timedelta(minutes=3))
+
+        assert _get(client, admin_a).status_code == 200
+        assert _post_message(client, editor_a, "another-chat").status_code == 200
+
+        assert _added(chat) == [("user", _NOTICE_GMAIL)]
+
+    def test_critical_permissions_notice_names_every_completed_pair_once(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        chat = _seed_chat(editor_a, "chat-editor-a")
+        client = _client(app)
+        _complete(client, clock, admin_a, _OUTLOOK_SEND, _GMAIL_SEND)
+
+        assert _get(client, admin_a).status_code == 200
+
+        assert _added(chat) == [("user", _NOTICE_GMAIL_OUTLOOK)]
+
+    def test_critical_permissions_no_notice_before_the_cooldown(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        chat = _seed_chat(editor_a, "chat-editor-a")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin_a).status_code == 200
+        clock.at(_JUST_BEFORE)
+
+        assert _get(client, admin_a).status_code == 200
+
+        assert _added(chat) == []
+
+    def test_critical_permissions_another_orgs_request_delivers_no_notice(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        admin_b = _account(db, "org_admin", OTHER_ORG_ID)
+        editor_a = _account(db, "editor")
+        chat = _seed_chat(editor_a, "chat-editor-a")
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        assert _get(client, admin_b).status_code == 200
+        before_own_request = _added(chat)
+        assert _get(client, admin_a).status_code == 200
+
+        assert before_own_request == []
+        assert _added(chat) == [("user", _NOTICE_GMAIL)]
+
+    def test_critical_permissions_notice_survives_the_agents_context_trim(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """GH-66: a user-role notice survives _filter_mid_system (a system one would not)."""
         from admino.agent import _trim_context
-        from admino.models import LLMMessage
-        from admino.server import _resolve_pending_promotions
 
-        _clear_critical_state()
+        admin_a = _account(db, "org_admin")
+        chat = _seed_chat(admin_a, "chat-admin-a")
+        client = _client(app)
+        _complete(client, clock, admin_a)
+        assert _get(client, admin_a).status_code == 200
 
-        history: list[LLMMessage] = [
-            LLMMessage(role="system", content="leading system prompt"),
-            LLMMessage(role="user", content="send an email"),
-            LLMMessage(role="assistant", content="I cannot do that yet."),
-        ]
-        server._sessions["sess-e2e"] = history
+        trimmed = _trim_context(server._sessions[chat], max_messages=40)
 
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=6)
-
-        mock_update = AsyncMock()
-        agent_mock = MagicMock()
-        agent_mock._promoted = frozenset()
-        server._agent = agent_mock
-
-        try:
-            with (
-                patch("admino.database.get_pool", _mock_get_pool()),
-                patch("admino.database.update_permission", mock_update),
-            ):
-                await _resolve_pending_promotions()
-
-            trimmed = _trim_context(history, max_messages=40)
-
-            # The notification mentioning gmail.send must survive the filter.
-            assert any("gmail.send" in m.content for m in trimmed)
-        finally:
-            server._sessions.clear()
-            server._agent = None
-            _clear_critical_state()
-
-    async def test_resolve_promotions_no_injection_when_no_expired(self) -> None:
-        """When no pending promotions have expired, sessions remain unchanged."""
-        from admino import server
-        from admino.models import LLMMessage
-        from admino.server import _resolve_pending_promotions
-
-        _clear_critical_state()
-
-        # Populate a session.
-        sess_history: list[LLMMessage] = [
-            LLMMessage(role="user", content="hello"),
-        ]
-        server._sessions["sess-x"] = sess_history
-
-        # Set a pending promotion only 1 minute old (not expired).
-        server._pending_promotions[("gmail", "send")] = datetime.now(UTC) - timedelta(minutes=1)
-
-        try:
-            await _resolve_pending_promotions()
-
-            # Session should be untouched — still just the one user message.
-            assert len(sess_history) == 1
-            assert sess_history[0].role == "user"
-        finally:
-            server._sessions.clear()
-            _clear_critical_state()
+        assert [message.content for message in trimmed].count(_NOTICE_GMAIL) == 1
 
 
 # ---------------------------------------------------------------------------
-# Bug-fix regression: system prompt includes dynamic permission guidance
+# 9. The agent run gets the org's own tool policy
 # ---------------------------------------------------------------------------
 
 
-class TestSystemPromptDynamicPermissionGuidance:
-    """The system prompt built by _build_system_prompt() must tell the LLM
-    that permissions can change during a conversation so it doesn't refuse
-    tool calls based on stale denial messages in the history."""
+class TestAgentPolicy:
+    """POST /api/message resolves the sender's org and passes that org's ToolPolicy."""
 
-    pytestmark = pytest.mark.asyncio
+    def test_critical_permissions_completed_promotion_reaches_the_orgs_run(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        client = _client(app)
+        _complete(client, clock, admin_a)
 
-    async def test_system_prompt_includes_dynamic_permission_guidance(self) -> None:
-        """System prompt contains guidance about permissions changing mid-conversation."""
-        from admino.config import AppConfig, LLMConfig
-        from admino.main import _build_system_prompt
-        from admino.tools.registry import ToolDescription
+        response = _post_message(client, editor_a)
 
-        fake_tool = ToolDescription(
-            tool="gmail",
-            action="send",
-            description="Send an email.",
-            parameters_schema={"type": "object", "properties": {}},
-        )
+        assert response.status_code == 200, response.text
+        assert _GMAIL_SEND in _policy_of(agent).promoted
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
 
-        with patch(
-            "admino.tools.registry.get_registered_tools",
-            return_value=[fake_tool],
-        ):
-            config = AppConfig(
-                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
-            )
-            prompt = _build_system_prompt(config)
+    def test_critical_permissions_another_orgs_run_is_not_promoted(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_b = _account(db, "editor", OTHER_ORG_ID)
+        client = _client(app)
+        _complete(client, clock, admin_a)
+        assert _get(client, admin_a).status_code == 200
 
-        assert "permissions can change during a conversation" in prompt.lower()
-        assert "never refuse based on earlier" in prompt.lower()
+        response = _post_message(client, editor_b)
 
-    async def test_system_prompt_includes_no_substitution_guardrail(self) -> None:
-        """System prompt forbids substituting a different tool when one is unavailable.
+        assert response.status_code == 200, response.text
+        assert _GMAIL_SEND not in _policy_of(agent).promoted
+        assert _stored(db, OTHER_ORG_ID, _GMAIL_SEND) == "deny"
 
-        GH-77 defence-in-depth: the prompt must instruct the LLM never to
-        substitute a different action (e.g. create instead of update) when the
-        requested tool is not available. The existing dynamic-permission
-        guidance must remain alongside this new guardrail.
-        """
-        from admino.config import AppConfig, LLMConfig
-        from admino.main import _build_system_prompt
-        from admino.tools.registry import ToolDescription
+    def test_critical_permissions_pending_promotion_is_not_in_the_run(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, clock: _Clock
+    ) -> None:
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        client = _client(app)
+        clock.at()
+        assert _promote(client, admin_a).status_code == 200
+        clock.at(_JUST_BEFORE)
 
-        fake_tool = ToolDescription(
-            tool="google_calendar",
-            action="read",
-            description="Read events.",
-            parameters_schema={"type": "object", "properties": {}},
-        )
+        response = _post_message(client, editor_a)
 
-        with patch(
-            "admino.tools.registry.get_registered_tools",
-            return_value=[fake_tool],
-        ):
-            config = AppConfig(
-                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
-            )
-            prompt = _build_system_prompt(config)
+        assert response.status_code == 200, response.text
+        assert _GMAIL_SEND not in _policy_of(agent).promoted
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "deny"
 
-        lowered = prompt.lower()
-        assert "never substitute" in lowered
-        assert "not available" in lowered or "isn't available" in lowered
-        # The pre-existing dynamic-permission guidance must remain.
-        assert "permissions can change during a conversation" in lowered
+    def test_critical_permissions_demoted_pair_leaves_the_next_run(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        client = _client(app)
+        assert _post_message(client, editor_a, "chat-before").status_code == 200
+        promoted_before = _policy_of(agent).promoted
+        assert _patch_without_body(client, admin_a).status_code == 200
 
-    async def test_system_prompt_tool_summary_excludes_denied_actions(self) -> None:
-        """The tool summary must not advertise permission-denied actions.
+        response = _post_message(client, editor_a, "chat-after")
 
-        GH-77 security follow-up: when a permissions config is supplied, the
-        summary in the system prompt is filtered through the permission engine
-        so it matches the per-turn tool payload. A hardcoded-denied action
-        (``gmail.delete``) must never appear as available, while an allowed
-        sibling (``gmail.read``) must.
-        """
+        assert response.status_code == 200, response.text
+        assert _GMAIL_SEND in promoted_before
+        assert _GMAIL_SEND not in _policy_of(agent).promoted
+
+
+# ---------------------------------------------------------------------------
+# 10. The lifespan and the system prompt no longer carry a global policy
+# ---------------------------------------------------------------------------
+
+
+class _PlainAgent:
+    """A stub agent whose attribute assignments stay visible in ``vars()``."""
+
+    def __init__(self) -> None:
+        self.run = AsyncMock(return_value=_agent_result())
+
+
+class TestNoGlobalPolicy:
+    """Startup loads no promoted permissions and no tools gate into the agent."""
+
+    async def test_critical_permissions_lifespan_loads_no_promoted_permissions(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        db.add_org_settings(ORG_ID, gmail=False)
+        stub = _PlainAgent()
+        app = create_app(agent=stub, config=_config())  # type: ignore[arg-type]
+        monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=db.pool))
+        monkeypatch.setattr("admino.database.close_pool", AsyncMock())
+        monkeypatch.setattr("admino.audit_events.run_retention_job", AsyncMock())
+        monkeypatch.setattr("admino.sessions.run_session_purge_job", AsyncMock())
+        monkeypatch.setattr("admino.mailer.load_smtp_config", MagicMock(return_value=None))
+
+        with patch_org_purge_job(AsyncMock()), patch_login_throttle_purge_job(AsyncMock()):
+            async with server._lifespan(app):
+                attributes = set(vars(stub))
+                permission_reads = db.matching(r"^select\b.*\bfrom permissions\b")
+
+        assert attributes == {"run"}
+        assert permission_reads == []
+        assert not hasattr(server, "_promoted_permissions")
+
+    def test_critical_permissions_system_prompt_has_no_static_tool_line(self) -> None:
+        """The agent adds the tool line per run (from that run's policy), not main."""
         from pydantic import BaseModel, Field
 
-        from admino.config import AppConfig, LLMConfig
         from admino.main import _build_system_prompt
-        from admino.permissions import PermissionsConfig, ToolPermissions
         from admino.tools.registry import clear_registry, register_tool
 
         class _Args(BaseModel):
@@ -1113,16 +1687,61 @@ class TestSystemPromptDynamicPermissionGuidance:
         clear_registry()
         try:
             register_tool("gmail", "read", "Read mail", _Args)(_handler)
-            register_tool("gmail", "delete", "Delete mail", _Args)(_handler)
-            permissions = PermissionsConfig(
-                tools={"gmail": ToolPermissions(actions={"read": "allow"})}
-            )
             config = AppConfig(
                 llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
             )
-            prompt = _build_system_prompt(config, permissions)
+            prompt = _build_system_prompt(config)
+            parameters = list(inspect.signature(_build_system_prompt).parameters)
         finally:
             clear_registry()
 
-        assert "read" in prompt
-        assert "delete" not in prompt
+        assert "You have access to the following tools" not in prompt
+        assert parameters == ["config"]
+
+
+class TestSystemPromptDynamicPermissionGuidance:
+    """The system prompt tells the LLM that permissions can change mid-conversation
+    (kept from GH-66 / GH-77: the per-org promotions of GH-161 rely on it)."""
+
+    def test_system_prompt_includes_dynamic_permission_guidance(self) -> None:
+        from admino.main import _build_system_prompt
+        from admino.tools.registry import ToolDescription
+
+        fake_tool = ToolDescription(
+            tool="gmail",
+            action="send",
+            description="Send an email.",
+            parameters_schema={"type": "object", "properties": {}},
+        )
+
+        with patch("admino.tools.registry.get_registered_tools", return_value=[fake_tool]):
+            config = AppConfig(
+                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+            )
+            prompt = _build_system_prompt(config)
+
+        assert "permissions can change during a conversation" in prompt.lower()
+        assert "never refuse based on earlier" in prompt.lower()
+
+    def test_system_prompt_includes_no_substitution_guardrail(self) -> None:
+        """GH-77: never substitute a different action when the requested one isn't available."""
+        from admino.main import _build_system_prompt
+        from admino.tools.registry import ToolDescription
+
+        fake_tool = ToolDescription(
+            tool="google_calendar",
+            action="read",
+            description="Read events.",
+            parameters_schema={"type": "object", "properties": {}},
+        )
+
+        with patch("admino.tools.registry.get_registered_tools", return_value=[fake_tool]):
+            config = AppConfig(
+                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
+            )
+            prompt = _build_system_prompt(config)
+
+        lowered = prompt.lower()
+        assert "never substitute" in lowered
+        assert "not available" in lowered or "isn't available" in lowered
+        assert "permissions can change during a conversation" in lowered

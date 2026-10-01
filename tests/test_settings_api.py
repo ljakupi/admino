@@ -29,10 +29,12 @@ What these tests pin down (the GH-159 implementation contract):
 - /api/me/settings: each user's own row (two users keep different themes).
 - /api/org/settings: the principal's own org only (two orgs' admins never see
   each other's row); each change is an ``org.settings_change`` audit row with
-  the client IP; a no-op writes none; after a successful PATCH the running
-  agent's ``_tools_enabled`` is the AND gate over every org
-  (``scoped_settings.all_orgs_tools_gate``). An audit failure is a 500 with
-  nothing written and the gate unchanged.
+  the client IP; a no-op writes none. GH-161 retired #159's interim AND gate
+  (``scoped_settings.all_orgs_tools_gate``): a PATCH sets no attribute on the
+  running agent, and each chat run takes its own org's enabled services
+  (``tool_policy.enabled_tools`` of ``_agent.run``), so one org's switch
+  never reaches another org's runs. An audit failure is a 500 with nothing
+  written.
 - /api/platform/settings: GET returns ``llm`` (the stored provider and models,
   ``""`` for NULL; the available models from the two probe helpers, filtered
   by ``SettingsLLM``; key flags that are booleans of env presence, never
@@ -47,8 +49,9 @@ What these tests pin down (the GH-159 implementation contract):
   500, the new client is closed and the old one kept. Each change is a
   ``platform.settings_change`` audit row naming the changed fields only.
 - Cross-origin PATCH → 403 before any database call.
-- The server lifespan recomputes the gate with ``all_orgs_tools_gate``; a
-  failure keeps the construction-time gate (logged by class name).
+- The server lifespan computes no tools gate and reloads no promoted
+  permissions (GH-161): it reads no org_settings row and sets nothing on the
+  agent; ``scoped_settings.all_orgs_tools_gate`` is gone.
 - No email, name or model name in any log record; no provider or model value
   in any audit row.
 
@@ -594,13 +597,23 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture()
 def agent() -> MagicMock:
-    """A stub agent: its live LLM client (closable) and its construction-time gate."""
+    """A stub agent with its live LLM client (closable). GH-161: the server never sets
+    ``_tools_enabled`` (or ``_permissions`` / ``_promoted``) on it, which
+    ``_assert_no_agent_gate`` checks through ``vars()``."""
     stub = MagicMock(name="agent")
     old_client = MagicMock(name="old-llm-client")
     old_client.close = AsyncMock()
     stub._llm = old_client
-    stub._tools_enabled = dict(_ALL_ON)
     return stub
+
+
+_AGENT_POLICY_ATTRS: Final = ("_tools_enabled", "_permissions", "_promoted")
+
+
+def _assert_no_agent_gate(agent: MagicMock) -> None:
+    """Nothing assigned the retired gate or policy attributes on the agent (GH-161)."""
+    assigned = [name for name in _AGENT_POLICY_ATTRS if name in vars(agent)]
+    assert assigned == [], f"the server set {assigned} on the shared agent"
 
 
 def _config() -> AppConfig:
@@ -1009,7 +1022,7 @@ class TestAuthorization:
         self, db: FakeDb, app: FastAPI, agent: MagicMock
     ) -> None:
         """The issue's AC: an Editor can't patch org settings: 403, no org_settings row, no
-        audit row, the running agent's gate unchanged."""
+        audit row, nothing set on the running agent."""
         _route_of(app, "org_patch")
         _, token = _login(db, "editor")
 
@@ -1018,7 +1031,7 @@ class TestAuthorization:
         assert (response.status_code, response.json()) == (403, _FORBIDDEN)
         assert db.org_settings == {}
         assert db.audit == []
-        assert agent._tools_enabled == _ALL_ON
+        _assert_no_agent_gate(agent)
 
     def test_settings_api_org_admin_cannot_patch_platform_settings(
         self, db: FakeDb, app: FastAPI, agent: MagicMock, probes: _Probes
@@ -1222,19 +1235,17 @@ class TestMySettings:
 # ---------------------------------------------------------------------------
 
 
-def _expected_gate(db: FakeDb) -> dict[str, bool]:
-    """The AND over every stored org_settings row (all on without rows)."""
-    gate = dict(_ALL_ON)
-    for org_id in db.org_settings:
-        tools = db.org_tools(org_id)
-        assert tools is not None
-        for tool, enabled in tools.items():
-            gate[tool] = gate[tool] and enabled
-    return gate
+def _enabled_tools_of_runs(agent: MagicMock) -> list[dict[str, bool]]:
+    """The enabled services each agent run received (``tool_policy.enabled_tools``)."""
+    enabled: list[dict[str, bool]] = []
+    for call in agent.run.await_args_list:
+        assert "tool_policy" in call.kwargs, f"the run got no tool_policy: {sorted(call.kwargs)}"
+        enabled.append(dict(call.kwargs["tool_policy"].enabled_tools))
+    return enabled
 
 
 class TestOrgSettings:
-    """The Org Admin's own org: its tool services, audited, and the agent's gate follows."""
+    """The Org Admin's own org: its tool services, audited; only that org's runs follow."""
 
     def test_settings_api_org_get_defaults_without_a_row(self, db: FakeDb, app: FastAPI) -> None:
         _, token = _login(db, "org_admin")
@@ -1291,45 +1302,57 @@ class TestOrgSettings:
         assert OTHER_ORG_ID not in db.org_settings
         assert _uuid(_one(db.audit)["org_id"]) == ORG_ID
 
-    def test_settings_api_org_patch_sets_the_agent_gate_to_the_and_over_orgs(
+    def test_settings_api_org_patch_sets_nothing_on_the_agent(
         self, db: FakeDb, app: FastAPI, agent: MagicMock
     ) -> None:
-        """Another org already turned memory off: after org A turns gmail off, the running
-        agent's gate has both off."""
+        """GH-161: the PATCH no longer recomputes a gate on the running agent."""
         db.add_org_settings(OTHER_ORG_ID, memory=False)
         _, token = _login(db, "org_admin", ORG_ID)
 
         response = _call(_client(app), "org_patch", token, body={"tools": {"gmail": False}})
 
         assert response.status_code == 200, response.text
-        assert dict(agent._tools_enabled) == {**_ALL_ON, "gmail": False, "memory": False}
-        assert dict(agent._tools_enabled) == _expected_gate(db)
+        _assert_no_agent_gate(agent)
 
-    def test_settings_api_org_patch_reenabling_reopens_the_gate(
-        self, db: FakeDb, app: FastAPI, agent: MagicMock
+    def test_settings_api_org_patch_reaches_only_its_own_orgs_runs(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
     ) -> None:
-        """Org A was the only org with gmail off: turning it back on reopens it for all."""
+        """Another org already turned memory off: after org A turns gmail off, org A's next
+        run has gmail off (memory on), org B's has memory off (gmail on)."""
+        db.add_org_settings(OTHER_ORG_ID, memory=False)
+        _, admin_a = _login(db, "org_admin", ORG_ID)
+        _, editor_a = _login(db, "editor", ORG_ID)
+        _, editor_b = _login(db, "editor", OTHER_ORG_ID)
+        client = _client(app)
+
+        response = _call(client, "org_patch", admin_a, body={"tools": {"gmail": False}})
+        _post_message(client, editor_a, "hello")
+        _post_message(client, editor_b, "hello")
+
+        assert response.status_code == 200, response.text
+        assert _enabled_tools_of_runs(chat_agent) == [
+            {**_ALL_ON, "gmail": False},
+            {**_ALL_ON, "memory": False},
+        ]
+
+    def test_settings_api_org_patch_reenabling_reopens_it_for_that_org_only(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
+    ) -> None:
+        """Both orgs had gmail off: org A turning it back on reopens it for org A's runs
+        only; org B's stays off."""
         db.add_org_settings(ORG_ID, gmail=False)
-        db.add_org_settings(OTHER_ORG_ID)
-        agent._tools_enabled = {**_ALL_ON, "gmail": False}
-        _, token = _login(db, "org_admin", ORG_ID)
-
-        response = _call(_client(app), "org_patch", token, body={"tools": {"gmail": True}})
-
-        assert response.status_code == 200, response.text
-        assert dict(agent._tools_enabled) == _ALL_ON
-
-    def test_settings_api_org_patch_one_org_cant_reenable_what_another_disabled(
-        self, db: FakeDb, app: FastAPI, agent: MagicMock
-    ) -> None:
         db.add_org_settings(OTHER_ORG_ID, gmail=False)
-        agent._tools_enabled = {**_ALL_ON, "gmail": False}
-        _, token = _login(db, "org_admin", ORG_ID)
+        _, admin_a = _login(db, "org_admin", ORG_ID)
+        _, editor_a = _login(db, "editor", ORG_ID)
+        _, editor_b = _login(db, "editor", OTHER_ORG_ID)
+        client = _client(app)
 
-        response = _call(_client(app), "org_patch", token, body={"tools": {"gmail": True}})
+        response = _call(client, "org_patch", admin_a, body={"tools": {"gmail": True}})
+        _post_message(client, editor_a, "hello")
+        _post_message(client, editor_b, "hello")
 
         assert response.status_code == 200, response.text
-        assert dict(agent._tools_enabled) == {**_ALL_ON, "gmail": False}
+        assert _enabled_tools_of_runs(chat_agent) == [_ALL_ON, {**_ALL_ON, "gmail": False}]
 
     def test_settings_api_org_patch_audit_failure_is_500_and_writes_nothing(
         self, db: FakeDb, app: FastAPI, agent: MagicMock
@@ -1337,7 +1360,6 @@ class TestOrgSettings:
         _route_of(app, "org_patch")
         _, token = _login(db, "org_admin")
         before = _state(db)
-        gate = dict(agent._tools_enabled)
         db.fail_audit = True
 
         response = _call(
@@ -1349,7 +1371,7 @@ class TestOrgSettings:
 
         assert response.status_code == 500
         assert _state(db) == before
-        assert agent._tools_enabled == gate
+        _assert_no_agent_gate(agent)
 
 
 # ---------------------------------------------------------------------------
@@ -1805,7 +1827,7 @@ class TestRateLimitsAndCsrf:
 
 
 # ---------------------------------------------------------------------------
-# 9. The lifespan's gate reload
+# 9. The lifespan computes no gate (GH-161)
 # ---------------------------------------------------------------------------
 
 
@@ -1814,7 +1836,6 @@ def _lifespan_patches(db: FakeDb, monkeypatch: pytest.MonkeyPatch) -> Any:
     """The lifespan runs on the fake pool; every background job is a no-op."""
     monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=db.pool))
     monkeypatch.setattr("admino.database.close_pool", AsyncMock())
-    monkeypatch.setattr("admino.database.load_permissions_from_db", AsyncMock(return_value={}))
     monkeypatch.setattr("admino.audit_events.run_retention_job", AsyncMock())
     monkeypatch.setattr("admino.sessions.run_session_purge_job", AsyncMock())
     monkeypatch.setattr("admino.mailer.load_smtp_config", MagicMock(return_value=None))
@@ -1822,10 +1843,11 @@ def _lifespan_patches(db: FakeDb, monkeypatch: pytest.MonkeyPatch) -> Any:
         yield
 
 
-class TestLifespanGate:
-    """At startup the lifespan sets the agent's gate to the AND over every org."""
+class TestLifespanComputesNoGate:
+    """GH-161 retires #159's interim gate: startup reads no org_settings row and sets no
+    gate, promoted set or matrix on the agent (each run loads its own org's policy)."""
 
-    async def test_settings_api_lifespan_sets_the_and_gate(
+    async def test_settings_api_lifespan_sets_no_gate_on_the_agent(
         self, db: FakeDb, app: FastAPI, agent: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         db.add_org_settings(ORG_ID, gmail=False)
@@ -1833,37 +1855,23 @@ class TestLifespanGate:
 
         with _lifespan_patches(db, monkeypatch):
             async with server._lifespan(app):
-                gate = dict(agent._tools_enabled)
+                _assert_no_agent_gate(agent)
 
-        assert gate == {**_ALL_ON, "gmail": False, "outlook": False}
+        assert db.matching(r"\borg_settings\b") == []
 
-    async def test_settings_api_lifespan_failure_keeps_the_construction_gate(
-        self,
-        db: FakeDb,
-        app: FastAPI,
-        agent: MagicMock,
-        monkeypatch: pytest.MonkeyPatch,
-        caplog: pytest.LogCaptureFixture,
+    async def test_settings_api_lifespan_reloads_no_promoted_permissions(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The org_settings read fails: the gate stays as constructed and the failure is
-        logged by exception class name."""
-        caplog.set_level(logging.WARNING)
-        db.add_org_settings(ORG_ID, gmail=False)
-        construction_gate = {**_ALL_ON, "memory": False}
-        agent._tools_enabled = dict(construction_gate)
-        db.fail_sql = r"\borg_settings\b"
+        """An org's stored promotion stays in its own rows: nothing reaches the agent."""
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        db.add_permissions(OTHER_ORG_ID)
 
         with _lifespan_patches(db, monkeypatch):
             async with server._lifespan(app):
-                gate = dict(agent._tools_enabled)
+                _assert_no_agent_gate(agent)
 
-        assert gate == construction_gate
-        assert db.matching(r"\borg_settings\b"), "the gate was never read from org_settings"
-        assert any(
-            "DeadlockDetectedError" in record.getMessage()
-            for record in caplog.records
-            if record.levelno >= logging.WARNING
-        )
+    def test_settings_api_all_orgs_tools_gate_is_removed(self) -> None:
+        assert not hasattr(scoped_settings, "all_orgs_tools_gate")
 
 
 # ---------------------------------------------------------------------------

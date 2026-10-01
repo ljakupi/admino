@@ -37,11 +37,14 @@ export function shellRole(me: MeResponse | null | undefined): ShellRole | null {
   return null;
 }
 
+// Issue #161: the Org Admin edits the permission matrix and critical
+// permissions under Organization (no separate Permissions entry); Editors
+// and Viewers get the read-only Permissions summary instead.
 const AREA_MATRIX: Record<ShellRole, readonly Area[]> = {
   super_admin: ['platform'],
-  org_admin: ['chat', 'tools', 'permissions', 'organization', 'settings'],
-  editor: ['chat', 'tools', 'settings'],
-  viewer: ['chat', 'settings'],
+  org_admin: ['chat', 'tools', 'organization', 'settings'],
+  editor: ['chat', 'tools', 'permissions', 'settings'],
+  viewer: ['chat', 'permissions', 'settings'],
 };
 
 /** Super Admin -> Platform only; Org Admin/Editor/Viewer per the matrix above; `null` -> nothing. */
@@ -65,6 +68,17 @@ const ORG_SETTINGS_MANAGE_ROLES: readonly ShellRole[] = ['org_admin'];
  */
 export function canManageOrgSettings(role: ShellRole | null): boolean {
   return role !== null && ORG_SETTINGS_MANAGE_ROLES.includes(role);
+}
+
+const ORG_PERMISSIONS_MANAGE_ROLES: readonly ShellRole[] = ['org_admin'];
+
+/**
+ * Mirrors the backend's `Capability.ORG_PERMISSIONS_MANAGE`: Org Admin only.
+ * Gates the permission matrix and the critical permissions under
+ * Organization (issue #161).
+ */
+export function canManageOrgPermissions(role: ShellRole | null): boolean {
+  return role !== null && ORG_PERMISSIONS_MANAGE_ROLES.includes(role);
 }
 
 /** Where a role lands after login: `/platform` for a Super Admin, `/chat` for members, `/login` for `null`. */

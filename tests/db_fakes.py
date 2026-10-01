@@ -1,8 +1,8 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-159).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-161).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
-platform_settings, org_settings and user_settings tables behind a pool-shaped
+platform_settings, org_settings, user_settings and permissions tables behind a pool-shaped
 object (``FakeDb.pool``). The real ``admino.auth``, ``admino.sessions``,
 ``admino.session_management``, ``admino.password_reset``,
 ``admino.invitations``, ``admino.organizations``, ``admino.email_outbox``,
@@ -20,7 +20,7 @@ Inputs: organizations, accounts and sessions added with ``add_org`` /
 audit events, throttle counters and settings rows seeded with
 ``add_invitation`` / ``add_reset_token`` / ``add_email`` / ``add_audit`` /
 ``add_throttle`` / ``add_platform_settings`` / ``add_org_settings`` /
-``add_user_settings``.
+``add_user_settings`` / ``add_permissions``.
 Outputs: the recorded calls (``calls``: method, SQL, args, which pool or
 connection ran it and inside which transaction), the table state, the
 outcome of every transaction (``transactions``: commit or rollback) and how
@@ -58,6 +58,16 @@ The settings scopes (GH-159, migration 0013):
   UniqueViolationError and an org or user that doesn't exist a
   ForeignKeyViolationError. Deleting a users row deletes its user_settings
   row; deleting an organizations row deletes its org_settings row (CASCADE).
+- ``permissions`` (GH-161, the org-scoped tool permission matrix): ``org_id``
+  (UUID NOT NULL, references organizations ON DELETE CASCADE), ``tool`` and
+  ``action`` (TEXT NOT NULL, CHECK ``~ '^[a-z][a-z0-9_]{0,62}$'``),
+  ``permission`` (TEXT NOT NULL, one of allow / confirm / deny) and
+  ``updated_at`` (NOT NULL, default now()); primary key (org_id, tool,
+  action). It runs through the same settings-table reader (the conflict
+  target of ON CONFLICT is the three-column key). Deleting an organizations
+  row deletes its permissions rows. ``add_permissions(org_id)`` seeds an
+  org's matrix (``DEFAULT_PERMISSIONS`` unless rows are given) and
+  ``org_permissions(org_id)`` reads it back as tool -> {action: state}.
 - The SQL forms the reader runs on these tables (``$n`` bind parameters,
   optionally cast, literals, ``DEFAULT``, ``now()`` and ``coalesce(...)``
   anywhere a value goes):
@@ -430,12 +440,21 @@ _ORG_SETTINGS_COLUMNS: Final = frozenset(
 _USER_SETTINGS_COLUMNS: Final = frozenset(
     {"user_id", "theme", "notifications_enabled", "notifications_task_done", "updated_at"}
 )
-_SETTINGS_TABLES: Final = frozenset({"platform_settings", "org_settings", "user_settings"})
+# GH-161: the org-scoped permission matrix (the recreated permissions table).
+_PERMISSIONS_COLUMNS: Final = frozenset({"org_id", "tool", "action", "permission", "updated_at"})
+PERMISSION_STATES: Final = frozenset({"allow", "confirm", "deny"})
+# The identifier CHECK on permissions.tool and permissions.action, read the way
+# PostgreSQL reads '^[a-z][a-z0-9_]{0,62}$' (a trailing newline doesn't match).
+IDENTIFIER_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,62}")
+_SETTINGS_TABLES: Final = frozenset(
+    {"platform_settings", "org_settings", "user_settings", "permissions"}
+)
 # The primary key of every table an INSERT ... ON CONFLICT may name.
 _CONFLICT_KEYS: Final[dict[str, tuple[str, ...]]] = {
     "platform_settings": ("id",),
     "org_settings": ("org_id",),
     "user_settings": ("user_id",),
+    "permissions": ("org_id", "tool", "action"),
     "login_throttle": ("scope", "subject"),
 }
 # Column types of the settings tables (for asyncpg's encoders and the NOT NULLs).
@@ -460,11 +479,19 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
         "notifications_task_done": "bool",
         "updated_at": "timestamptz",
     },
+    "permissions": {
+        "org_id": "uuid",
+        "tool": "text",
+        "action": "text",
+        "permission": "text",
+        "updated_at": "timestamptz",
+    },
 }
 _SETTINGS_NULLABLE: Final[dict[str, frozenset[str]]] = {
     "platform_settings": frozenset(MODEL_COLUMNS),
     "org_settings": frozenset(),
     "user_settings": frozenset(),
+    "permissions": frozenset(),
 }
 # A statement on the old key/value settings table (dropped by migration 0013).
 _OLD_SETTINGS_RE: Final = re.compile(
@@ -482,6 +509,7 @@ _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "platform_settings": _PLATFORM_SETTINGS_COLUMNS,
     "org_settings": _ORG_SETTINGS_COLUMNS,
     "user_settings": _USER_SETTINGS_COLUMNS,
+    "permissions": _PERMISSIONS_COLUMNS,
 }
 # The tables the SQL reader writes (INSERT, UPDATE, DELETE).
 _WRITABLE: Final = frozenset(
@@ -644,6 +672,8 @@ class FakeDb:
         self.platform_settings: list[dict[str, Any]] = []
         self.org_settings: dict[uuid.UUID, dict[str, Any]] = {}
         self.user_settings: dict[uuid.UUID, dict[str, Any]] = {}
+        # GH-161: the org-scoped permission matrix, keyed by (org_id, tool, action).
+        self.permissions: dict[tuple[uuid.UUID, str, str], dict[str, Any]] = {}
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
         self.open_transactions = 0
@@ -980,6 +1010,43 @@ class FakeDb:
         self.user_settings[user_id] = row
         return row
 
+    def add_permissions(
+        self,
+        org_id: uuid.UUID,
+        rows: dict[str, dict[str, str]] | None = None,
+        *,
+        updated_at: datetime | None = None,
+    ) -> dict[str, dict[str, str]]:
+        """Store an org's permission matrix (GH-161); ``DEFAULT_PERMISSIONS`` unless rows are given.
+
+        ``rows`` is tool -> {action: state}. Rows already stored for the org are
+        replaced one by one (a given key overwrites, the others stay).
+        """
+        from admino.permissions import DEFAULT_PERMISSIONS
+
+        matrix = DEFAULT_PERMISSIONS if rows is None else rows
+        for tool, actions in matrix.items():
+            for action, state in actions.items():
+                row: dict[str, Any] = {
+                    "org_id": org_id,
+                    "tool": tool,
+                    "action": action,
+                    "permission": state,
+                    "updated_at": updated_at or datetime.now(UTC),
+                }
+                existing = self.permissions.get((_canonical(org_id), tool, action))
+                self.check_settings("permissions", row, original=existing)
+                self.permissions[(row["org_id"], tool, action)] = row
+        return {tool: dict(actions) for tool, actions in matrix.items()}
+
+    def org_permissions(self, org_id: uuid.UUID) -> dict[str, dict[str, str]]:
+        """The stored matrix of an org as tool -> {action: state} (empty without rows)."""
+        matrix: dict[str, dict[str, str]] = {}
+        for (row_org, tool, action), row in sorted(self.permissions.items(), key=str):
+            if row_org == _canonical(org_id):
+                matrix.setdefault(tool, {})[action] = row["permission"]
+        return matrix
+
     def platform_row(self) -> dict[str, Any] | None:
         """The platform_settings row, if there is one."""
         return self.platform_settings[0] if self.platform_settings else None
@@ -1102,6 +1169,7 @@ class FakeDb:
                 "platform_settings": self.platform_settings,
                 "org_settings": self.org_settings,
                 "user_settings": self.user_settings,
+                "permissions": self.permissions,
             }
         )
 
@@ -1118,6 +1186,7 @@ class FakeDb:
         self.platform_settings = state["platform_settings"]
         self.org_settings = state["org_settings"]
         self.user_settings = state["user_settings"]
+        self.permissions = state["permissions"]
 
     def new_connection(self) -> FakeConnection:
         """A new connection on this database."""
@@ -1246,6 +1315,8 @@ class FakeDb:
             return list(self.org_settings.values())
         if table == "user_settings":
             return list(self.user_settings.values())
+        if table == "permissions":
+            return list(self.permissions.values())
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
 
@@ -1259,7 +1330,7 @@ class FakeDb:
             row.update({column: default for column, (default, _, _) in PLATFORM_DEFAULTS.items()})
         elif table == "org_settings":
             row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
-        else:
+        elif table == "user_settings":
             row.update(theme="light", notifications_enabled=True, notifications_task_done=False)
         row["updated_at"] = now
         row.update(given)
@@ -1267,9 +1338,9 @@ class FakeDb:
 
     def settings_by_key(self, table: str, row: dict[str, Any]) -> dict[str, Any] | None:
         """The stored settings row with the same primary key, if any."""
-        (key,) = _CONFLICT_KEYS[table]
+        keys = _CONFLICT_KEYS[table]
         for other in self.table_rows(table):
-            if _canonical(other[key]) == _canonical(row[key]):
+            if all(_canonical(other[key]) == _canonical(row[key]) for key in keys):
                 return other
         return None
 
@@ -1279,6 +1350,8 @@ class FakeDb:
             self.platform_settings.append(row)
         elif table == "org_settings":
             self.org_settings[row["org_id"]] = row
+        elif table == "permissions":
+            self.permissions[(row["org_id"], row["tool"], row["action"])] = row
         else:
             self.user_settings[row["user_id"]] = row
 
@@ -1345,17 +1418,26 @@ class FakeDb:
             rules.append(("trash_bounds", row["trash_min_days"] <= row["trash_max_days"]))
         elif table == "user_settings":
             rules.append(("theme", row["theme"] in THEMES))
+        elif table == "permissions":
+            rules.append(("permission", row["permission"] in PERMISSION_STATES))
+            rules.append(("tool", IDENTIFIER_RE.fullmatch(row["tool"]) is not None))
+            rules.append(("action", IDENTIFIER_RE.fullmatch(row["action"]) is not None))
         for name, valid in rules:
             if not valid:
                 msg = f'new row for relation "{table}" violates the {name} check'
                 raise asyncpg.exceptions.CheckViolationError(msg)
         if not keys:
             return
-        (key,) = _CONFLICT_KEYS[table]
+        key_columns = _CONFLICT_KEYS[table]
         for other in self.table_rows(table):
-            if other is not original and _canonical(other[key]) == _canonical(row[key]):
+            if other is not original and all(
+                _canonical(other[key]) == _canonical(row[key]) for key in key_columns
+            ):
                 msg = f'duplicate key value violates unique constraint "{table}_pkey"'
                 raise asyncpg.exceptions.UniqueViolationError(msg)
+        if table == "permissions" and _canonical(row["org_id"]) not in self.orgs:
+            msg = 'insert or update on table "permissions" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
         if table == "org_settings" and _canonical(row["org_id"]) not in self.orgs:
             msg = 'insert or update on table "org_settings" violates foreign key constraint'
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
@@ -1694,6 +1776,10 @@ class FakeDb:
             del self.orgs[row["id"]]
             # GH-159: org_settings.org_id REFERENCES organizations ON DELETE CASCADE.
             self.org_settings.pop(row["id"], None)
+            # GH-161: permissions.org_id REFERENCES organizations ON DELETE CASCADE.
+            self.permissions = {
+                key: value for key, value in self.permissions.items() if key[0] != row["id"]
+            }
             return
         if table == "platform_settings":
             self.platform_settings = [other for other in self.platform_settings if other is not row]
@@ -1703,6 +1789,9 @@ class FakeDb:
             return
         if table == "user_settings":
             del self.user_settings[row["user_id"]]
+            return
+        if table == "permissions":
+            del self.permissions[(row["org_id"], row["tool"], row["action"])]
             return
         assert table == "users", f"the fake never deletes from {table}"
         user_id = row["id"]
@@ -2090,6 +2179,9 @@ class FakeDb:
             "role": account["role"],
             "status": account["status"],
             "deleted_at": account["deleted_at"],
+            # GH-161: the password re-auth of a critical promotion reads these.
+            "email": account["email"],
+            "password_hash": account["password_hash"],
         }
 
     def _account_by_email(self, args: tuple[Any, ...]) -> dict[str, Any] | None:
@@ -2259,8 +2351,8 @@ def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
     """True for the statements the SQL reader runs (see the module docstring)."""
     if re.search(r"\binvitations\b", n) or re.search(r"\blogin_throttle\b", n):
         return True
-    if re.search(r"\b(?:platform|org|user)_settings\b", n):
-        # GH-159: the settings scopes of migration 0013.
+    if re.search(r"\b(?:platform|org|user)_settings\b", n) or re.search(r"\bpermissions\b", n):
+        # GH-159: the settings scopes of migration 0013; GH-161: the org permission matrix.
         return True
     table = _primary_table(n)
     if table is None and n.startswith("select") and re.search(r"\bsha256 ?\(", n):
@@ -2688,7 +2780,7 @@ class _Statement:
         return rows
 
     def insert(self, n: str) -> tuple[list[dict[str, Any]], int]:
-        if re.search(r"\b(?:platform|org|user)_settings\b", n.split("(", 1)[0]):
+        if re.search(r"\b(?:(?:platform|org|user)_settings|permissions)\b", n.split("(", 1)[0]):
             return self.insert_settings(n)
         clauses = _clauses(n, ("insert into", "values", "on conflict", "returning"))
         head = re.fullmatch(r"(\w+) ?\((.*)\)", clauses["insert into"])
@@ -2782,11 +2874,11 @@ class _Statement:
                 new = {
                     column: _store(self.value(expr, ctx)) for column, expr in conflict.assignments
                 }
-                self.db.check_settings(table, {**existing, **new}, original=existing)
-                existing.update(new)
-                if "org_id" in new or "user_id" in new or "id" in new:
+                if set(new) & {"org_id", "user_id", "id", *_CONFLICT_KEYS[table]}:
                     msg = "the fake never changes a settings row's key"
                     raise AssertionError(msg)
+                self.db.check_settings(table, {**existing, **new}, original=existing)
+                existing.update(new)
                 target = existing
             count += 1
             if "returning" in clauses:
