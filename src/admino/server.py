@@ -3480,7 +3480,7 @@ async def oauth_google_status(
     Reads the Google token row from the database.
 
     Returns:
-        OAuthConnectionStatus indicating whether Google is connected.
+        OAuthConnectionStatus indicating whether Google is connected and healthy.
 
     Security notes:
         - Requires a session.
@@ -3493,10 +3493,11 @@ async def oauth_google_status(
 
     from admino.database import get_pool
 
-    connected, _healthy = await get_connection_status(get_pool(), "google")
+    connected, healthy = await get_connection_status(get_pool(), "google")
     if connected:
         return OAuthConnectionStatus(
             connected=True,
+            healthy=healthy,
             services=["gmail", "google_calendar", "google_drive"],
         )
     return OAuthConnectionStatus(connected=False)
@@ -3510,7 +3511,7 @@ async def oauth_microsoft_status(
     Reads the Microsoft token row from the database.
 
     Returns:
-        OAuthConnectionStatus indicating whether Microsoft is connected.
+        OAuthConnectionStatus indicating whether Microsoft is connected and healthy.
 
     Security notes:
         - Requires a session.
@@ -3523,10 +3524,11 @@ async def oauth_microsoft_status(
 
     from admino.database import get_pool
 
-    connected, _healthy = await get_connection_status(get_pool(), "microsoft")
+    connected, healthy = await get_connection_status(get_pool(), "microsoft")
     if connected:
         return OAuthConnectionStatus(
             connected=True,
+            healthy=healthy,
             services=["outlook", "outlook_calendar", "onedrive"],
         )
     return OAuthConnectionStatus(connected=False)

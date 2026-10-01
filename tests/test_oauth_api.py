@@ -12,6 +12,11 @@ Covers:
   valid ``admino_session`` cookie). The callback stays public: it is the
   provider's cross-site redirect (SameSite=Strict cookies are not sent on it)
   and is protected by the OAuth state token, so its tests run with no session.
+- GH-237: GET /api/oauth/{google,microsoft}/status report ``healthy`` from the
+  stored token (``get_connection_status``): true for a working connection,
+  false after a terminal refresh failure (the row's ``healthy`` flag is false)
+  and false when not connected. The status is not admin-only: an Editor and a
+  Viewer get the same answer as the Org Admin.
 
 Security notes:
 - All tests use mocked OAuth functions — no real Google API calls.
@@ -23,21 +28,37 @@ Security notes:
 from __future__ import annotations
 
 import time
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from cryptography.fernet import Fernet
 from httpx import ASGITransport, AsyncClient
 
-from admino.oauth import OAuthError
+from admino.oauth import OAuthError, OAuthToken, encrypt_refresh_token
 from admino.server import create_app
 from tests.auth_helpers import login, member_session, resolved_session, session_cookie
+
+if TYPE_CHECKING:
+    from admino.access import MemberRole
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 _UNAUTHORIZED = {"detail": "Unauthorized"}
+
+# GH-237: the services each status route lists for a connected account (as today).
+_GOOGLE_SERVICES: list[str] = ["gmail", "google_calendar", "google_drive"]
+_MICROSOFT_SERVICES: list[str] = ["outlook", "outlook_calendar", "onedrive"]
+_PROVIDER_SERVICES: dict[str, list[str]] = {
+    "google": _GOOGLE_SERVICES,
+    "microsoft": _MICROSOFT_SERVICES,
+}
+
+# An obviously fake refresh token; only its Fernet ciphertext is put in a token row.
+_FAKE_REFRESH_TOKEN = "fake-refresh-token-for-gh237-tests-only"
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +88,45 @@ def _make_app(agent: Any = None, *, anonymous: bool = False) -> Any:
     if not anonymous:
         login(app, member_session("org_admin"))
     return app
+
+
+def _status_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """The GH-237 fields of a status response: connected, healthy and services."""
+    return {key: data.get(key) for key in ("connected", "healthy", "services")}
+
+
+@pytest.fixture()
+def oauth_encryption_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Set OAUTH_ENCRYPTION_KEY to a fresh Fernet key, so a stored token really decrypts."""
+    monkeypatch.setenv("OAUTH_ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+
+def _stored_token(provider: str, *, healthy: bool) -> OAuthToken:
+    """A token row of ``provider`` as ``load_token`` returns it (GH-237).
+
+    The refresh token is real Fernet ciphertext of a fake value under the
+    ``oauth_encryption_key`` key, so the row decrypts and only its ``healthy``
+    flag decides the health.
+    """
+    stamp = datetime(2026, 1, 1, tzinfo=UTC)
+    return OAuthToken(
+        provider=provider,
+        scopes=[f"fake.{provider}.scope.read"],
+        encrypted_refresh_token=encrypt_refresh_token(_FAKE_REFRESH_TOKEN),
+        email=None,
+        healthy=healthy,
+        created_at=stamp,
+        last_refreshed_at=stamp,
+    )
+
+
+def _load_token_returning(token: OAuthToken) -> AsyncMock:
+    """A ``load_token`` stand-in: ``token`` for its own provider, no row for any other."""
+
+    def _load(pool: Any, provider: str = "google") -> OAuthToken | None:
+        return token if provider == token.provider else None
+
+    return AsyncMock(side_effect=_load)
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +532,78 @@ class TestOAuthStatus:
         assert resp.status_code == 401
         assert resp.json() == _UNAUTHORIZED
 
+    @pytest.mark.parametrize(
+        ("connected", "healthy", "expected"),
+        [
+            pytest.param(
+                True,
+                True,
+                {"connected": True, "healthy": True, "services": _GOOGLE_SERVICES},
+                id="connected-healthy",
+            ),
+            pytest.param(
+                True,
+                False,
+                {"connected": True, "healthy": False, "services": _GOOGLE_SERVICES},
+                id="connected-unhealthy",
+            ),
+            pytest.param(
+                False,
+                False,
+                {"connected": False, "healthy": False, "services": []},
+                id="not-connected",
+            ),
+        ],
+    )
+    async def test_oauth_status_connection_state_returns_stored_healthy_flag(
+        self, connected: bool, healthy: bool, expected: dict[str, Any]
+    ) -> None:
+        """GH-237: ``healthy`` mirrors the stored token's health, services listed as today."""
+        app = _make_app()
+
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch(
+                "admino.server.get_connection_status",
+                new=AsyncMock(return_value=(connected, healthy)),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/google/status")
+
+        assert resp.status_code == 200
+        assert _status_fields(resp.json()) == expected
+
+    @pytest.mark.usefixtures("oauth_encryption_key")
+    @pytest.mark.parametrize(
+        "healthy",
+        [pytest.param(True, id="healthy-token"), pytest.param(False, id="unhealthy-token")],
+    )
+    async def test_oauth_status_stored_token_returns_its_healthy_flag(self, healthy: bool) -> None:
+        """GH-237: through the real get_connection_status, the row's healthy flag is reported.
+
+        The token decrypts in both cases, so a false ``healthy`` comes only from
+        the row's flag (set by a terminal refresh failure, #64).
+        """
+        app = _make_app()
+
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch(
+                "admino.oauth.load_token",
+                new=_load_token_returning(_stored_token("google", healthy=healthy)),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/google/status")
+
+        assert resp.status_code == 200
+        assert _status_fields(resp.json()) == {
+            "connected": True,
+            "healthy": healthy,
+            "services": _GOOGLE_SERVICES,
+        }
+
 
 # ---------------------------------------------------------------------------
 # DELETE /api/oauth/google
@@ -714,6 +846,114 @@ class TestMicrosoftOAuthStatus:
 
         assert resp.status_code == 401
         assert resp.json() == _UNAUTHORIZED
+
+    @pytest.mark.parametrize(
+        ("connected", "healthy", "expected"),
+        [
+            pytest.param(
+                True,
+                True,
+                {"connected": True, "healthy": True, "services": _MICROSOFT_SERVICES},
+                id="connected-healthy",
+            ),
+            pytest.param(
+                True,
+                False,
+                {"connected": True, "healthy": False, "services": _MICROSOFT_SERVICES},
+                id="connected-unhealthy",
+            ),
+            pytest.param(
+                False,
+                False,
+                {"connected": False, "healthy": False, "services": []},
+                id="not-connected",
+            ),
+        ],
+    )
+    async def test_microsoft_status_connection_state_returns_stored_healthy_flag(
+        self, connected: bool, healthy: bool, expected: dict[str, Any]
+    ) -> None:
+        """GH-237: ``healthy`` mirrors the stored token's health, services listed as today."""
+        app = _make_app()
+
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch(
+                "admino.server.get_connection_status",
+                new=AsyncMock(return_value=(connected, healthy)),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/microsoft/status")
+
+        assert resp.status_code == 200
+        assert _status_fields(resp.json()) == expected
+
+    @pytest.mark.usefixtures("oauth_encryption_key")
+    @pytest.mark.parametrize(
+        "healthy",
+        [pytest.param(True, id="healthy-token"), pytest.param(False, id="unhealthy-token")],
+    )
+    async def test_microsoft_status_stored_token_returns_its_healthy_flag(
+        self, healthy: bool
+    ) -> None:
+        """GH-237: through the real get_connection_status, the row's healthy flag is reported.
+
+        The token decrypts in both cases, so a false ``healthy`` comes only from
+        the row's flag (set by a terminal refresh failure, #64).
+        """
+        app = _make_app()
+
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch(
+                "admino.oauth.load_token",
+                new=_load_token_returning(_stored_token("microsoft", healthy=healthy)),
+            ),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get("/api/oauth/microsoft/status")
+
+        assert resp.status_code == 200
+        assert _status_fields(resp.json()) == {
+            "connected": True,
+            "healthy": healthy,
+            "services": _MICROSOFT_SERVICES,
+        }
+
+
+# ---------------------------------------------------------------------------
+# GH-237: the status routes are not admin-only
+# ---------------------------------------------------------------------------
+
+
+class TestOAuthStatusMemberRoles:
+    """GET /api/oauth/{provider}/status — every member role reads the same status."""
+
+    pytestmark = pytest.mark.asyncio
+
+    @pytest.mark.parametrize("provider", ["google", "microsoft"])
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_oauth_status_member_role_returns_same_connection_state(
+        self, role: MemberRole, provider: str
+    ) -> None:
+        """GH-237: an Editor and a Viewer get the Org Admin's connected/healthy answer."""
+        app = create_app(agent=MagicMock(), config=_make_config())
+        login(app, member_session(role))
+
+        with (
+            patch("admino.database.get_pool", MagicMock(return_value=MagicMock())),
+            patch("admino.server.get_connection_status", new=AsyncMock(return_value=(True, True))),
+        ):
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+                resp = await c.get(f"/api/oauth/{provider}/status")
+
+        assert resp.status_code == 200
+        assert _status_fields(resp.json()) == {
+            "connected": True,
+            "healthy": True,
+            "services": _PROVIDER_SERVICES[provider],
+        }
 
 
 # ---------------------------------------------------------------------------

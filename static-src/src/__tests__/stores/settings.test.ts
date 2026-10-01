@@ -905,6 +905,26 @@ describe('settingsStore loadConnections', () => {
     expect(store.connectedAccounts).toEqual({ google: GOOGLE_CONNECTED, microsoft: DISCONNECTED });
   });
 
+  // Issue #237: a connected-but-unhealthy account must stay distinguishable
+  // from a healthy one, so the store keeps each response's `healthy` verbatim.
+  it.each([
+    { google: true, microsoft: false },
+    { google: false, microsoft: true },
+  ])('keeps the healthy flag of each status response (google $google, microsoft $microsoft)', async (healthy) => {
+    statusesAre({
+      google: { ...GOOGLE_CONNECTED, healthy: healthy.google },
+      microsoft: { ...MICROSOFT_CONNECTED, healthy: healthy.microsoft },
+    });
+    const store = useSettingsStore();
+
+    await store.loadConnections();
+
+    expect(store.connectedAccounts).toEqual({
+      google: { ...GOOGLE_CONNECTED, healthy: healthy.google },
+      microsoft: { ...MICROSOFT_CONNECTED, healthy: healthy.microsoft },
+    });
+  });
+
   it('never throws and shows both disconnected when both status requests fail', async () => {
     statusesAre({ google: new Error('down'), microsoft: new Error('down') });
     const store = useSettingsStore();
