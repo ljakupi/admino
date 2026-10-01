@@ -10,8 +10,9 @@ schedules it for deletion and cancels that (``schedule_deletion`` /
 whose grace period is over (``purge_due_orgs``): rows, audit events and files.
 
 What these tests pin down (the spec: the issue, its decisions, tracker #139 §5):
-- Constants and errors: a 30-day grace period, the attachments root, an hourly
-  purge, fixed input-free error messages; keyword-only signatures.
+- Constants and errors: the attachments root, an hourly purge, fixed
+  input-free error messages; keyword-only signatures. GH-160: the grace period
+  is no module constant any more (``DELETION_GRACE_PERIOD`` is gone).
 - Authorization through ``access.can`` before any query: a Super Admin only
   (``org.create``, ``org.lifecycle.manage``, ``org.limits.manage``,
   ``org.residency.manage``); Org Admins, Editors and Viewers get
@@ -29,8 +30,13 @@ What these tests pin down (the spec: the issue, its decisions, tracker #139 §5)
   locked ``FOR UPDATE`` first, change and audit in one transaction.
 - Deactivating and scheduling delete every session of every user of the org
   (only that org), keep its content, and count them in the audit row.
-  Scheduling sets ``purge_after = now() + 30 days`` on the database clock and
-  emails every active, non-deleted Org Admin of the org in their language.
+  Scheduling sets ``purge_after = now() + <grace days>`` on the database clock
+  and emails every active, non-deleted Org Admin of the org in their language.
+  GH-160: the grace days are the stored platform default
+  ``retention.org_deletion_grace_days`` (30 by default, 7 to 90), read through
+  ``scoped_settings.current_platform_settings`` after the authorization; the
+  ``org.deletion_schedule`` metadata's ``grace_days`` is that value; a change
+  applies to the next scheduling only (a scheduled deletion keeps its date).
   Cancelling always lands on ``deactivated``.
 - update_limits and set_residency: exact old/new metadata, refused while a
   deletion is pending.
@@ -89,6 +95,7 @@ import pytest
 from admino import accounts, models
 from admino.access import Principal
 from admino.audit_events import AuditRecordError
+from tests.conftest import default_test_platform_settings
 from tests.db_fakes import (
     INVITE_LINK_PREFIX,
     ORG_ID,
@@ -392,6 +399,26 @@ def _assert_org_event(
         assert type(row["metadata"][key]) is type(value), key
 
 
+def _scoped_settings() -> ModuleType:
+    """admino.scoped_settings (its platform settings cache, GH-160)."""
+    from admino import scoped_settings
+
+    return scoped_settings
+
+
+def _store_grace_days(monkeypatch: pytest.MonkeyPatch, grace_days: int) -> None:
+    """Make the cached platform settings carry this org deletion grace period (GH-160).
+
+    Built from a dict at call time: StoredPlatformSettings' retention section is
+    new in #160.
+    """
+    scoped_settings = _scoped_settings()
+    data = default_test_platform_settings().model_dump()
+    data["retention"] = {**data.get("retention", {}), "org_deletion_grace_days": grace_days}
+    stored = scoped_settings.StoredPlatformSettings.model_validate(data)
+    monkeypatch.setattr(scoped_settings, "_platform_cache", stored)
+
+
 def _log_text(caplog: pytest.LogCaptureFixture) -> str:
     return "\n".join(
         f"{record.name} {record.getMessage()} {record.exc_text or ''}" for record in caplog.records
@@ -429,8 +456,10 @@ def _sessions(db: FakeDb, *user_ids: uuid.UUID) -> list[str]:
 class TestConstantsAndErrors:
     """The fixed values and the input-free errors."""
 
-    def test_organizations_grace_period_is_30_days(self, orgs: ModuleType) -> None:
-        assert timedelta(days=30) == orgs.DELETION_GRACE_PERIOD
+    def test_organizations_grace_period_constant_is_retired(self, orgs: ModuleType) -> None:
+        """GH-160: the grace period is a stored platform default (retention
+        org_deletion_grace_days), no longer a module constant."""
+        assert not hasattr(orgs, "DELETION_GRACE_PERIOD")
 
     def test_organizations_attachments_root(self, orgs: ModuleType) -> None:
         assert Path("/app/data/attachments") == orgs.ATTACHMENTS_ROOT
@@ -1479,6 +1508,93 @@ class TestScheduleDeletion:
             org_id=ORG_ID,
             metadata={"sessions_revoked": 3, "emails_queued": 1, "grace_days": 30},
         )
+
+
+class TestScheduleDeletionGracePeriod:
+    """GH-160: purge_after = now() + the stored retention.org_deletion_grace_days."""
+
+    @pytest.mark.parametrize("grace_days", [7, 45, 90])
+    async def test_organizations_schedule_uses_the_stored_grace_period(
+        self, orgs: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, grace_days: int
+    ) -> None:
+        """purge_after is exactly the stored number of days after deletion_requested_at,
+        and the org.deletion_schedule metadata's grace_days is that number."""
+        _store_grace_days(monkeypatch, grace_days)
+        db.add_org(ORG_ID)
+        actor = _super_admin(db)
+
+        await _transition(orgs, db, "schedule_deletion", actor)
+
+        row = db.orgs[ORG_ID]
+        assert row["purge_after"] - row["deletion_requested_at"] == timedelta(days=grace_days)
+        _assert_org_event(
+            _audit_for(db, "org.deletion_schedule"),
+            action="org.deletion_schedule",
+            actor=actor,
+            org_id=ORG_ID,
+            metadata={"sessions_revoked": 0, "emails_queued": 0, "grace_days": grace_days},
+        )
+
+    async def test_organizations_schedule_reads_the_grace_period_from_the_row(
+        self, orgs: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With an empty cache the grace period comes from the platform_settings row."""
+        monkeypatch.setattr(_scoped_settings(), "_platform_cache", None)
+        db.add_platform_settings(org_deletion_grace_days=60)
+        db.add_org(ORG_ID)
+
+        await _transition(orgs, db, "schedule_deletion", _super_admin(db))
+
+        row = db.orgs[ORG_ID]
+        assert row["purge_after"] - row["deletion_requested_at"] == timedelta(days=60)
+        assert _audit_for(db, "org.deletion_schedule")["metadata"]["grace_days"] == 60
+
+    async def test_organizations_schedule_after_a_change_uses_the_new_grace_period(
+        self, orgs: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC: a deletion scheduled after the change gets the new grace period; one
+        scheduled before keeps its purge_after."""
+        db.add_org(ORG_ID)
+        db.add_org(OTHER_ORG_ID)
+        actor = _super_admin(db)
+        _store_grace_days(monkeypatch, 7)
+        await _transition(orgs, db, "schedule_deletion", actor, ORG_ID)
+        earlier = dict(db.orgs[ORG_ID])
+
+        _store_grace_days(monkeypatch, 90)
+        await _transition(orgs, db, "schedule_deletion", actor, OTHER_ORG_ID)
+
+        later = db.orgs[OTHER_ORG_ID]
+        assert later["purge_after"] - later["deletion_requested_at"] == timedelta(days=90)
+        assert db.orgs[ORG_ID]["purge_after"] == earlier["purge_after"]
+        assert earlier["purge_after"] - earlier["deletion_requested_at"] == timedelta(days=7)
+        grace = [row["metadata"]["grace_days"] for row in db.audit_rows("org.deletion_schedule")]
+        assert grace == [7, 90]
+
+    async def test_organizations_schedule_reads_the_settings_only_once_authorized(
+        self, orgs: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The grace period is read through scoped_settings.current_platform_settings
+        (once, with the pool) after the authorization: a refused Org Admin reads
+        nothing."""
+        scoped_settings = _scoped_settings()
+        real = scoped_settings.current_platform_settings
+        executors: list[Any] = []
+
+        async def spy(executor: Any) -> Any:
+            executors.append(executor)
+            return await real(executor)
+
+        monkeypatch.setattr(scoped_settings, "current_platform_settings", spy)
+        db.add_org(ORG_ID)
+
+        with pytest.raises(PermissionError):
+            await _transition(orgs, db, "schedule_deletion", _member(db, "org_admin"))
+        refused = list(executors)
+        await _transition(orgs, db, "schedule_deletion", _super_admin(db))
+
+        assert refused == []
+        assert executors == [db.pool]
 
 
 # ---------------------------------------------------------------------------

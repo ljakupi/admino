@@ -13,6 +13,10 @@ Covers:
 - GH-142: a user-facing ``LLMError`` is shown verbatim as the error reply;
   internal ``LLMError``s and other exceptions keep the generic reply.
 - Context trimming with preserved system prefix.
+- GH-160: ``Agent.run(..., agent_config=AgentConfig(...))`` (keyword-only,
+  default None) sets that run's limits (max_tool_calls, max_context_messages,
+  confirmation_timeout_s) over the construction-time config, for that run
+  only; without it the construction-time config applies.
 - GH-140: the agent owns the system prompt — it is sent exactly once per LLM
   call, never returned in history, never duplicated across turns; the current
   user message is always in context; caller-supplied system messages are
@@ -1586,6 +1590,152 @@ class TestAgentContextTrimming:
         ]
         trimmed = _trim_context(history, 10)
         assert any("PERMISSION UPDATE: gmail.send" in m.content for m in trimmed)
+
+
+# ===========================================================================
+# 8b. Per-run limits (GH-160: Agent.run(..., agent_config=...))
+# ===========================================================================
+
+
+def _limits(
+    *, max_tool_calls: int = 10, max_context_messages: int = 40, timeout_s: float = 60.0
+) -> AgentConfig:
+    return AgentConfig(
+        max_tool_calls=max_tool_calls,
+        max_context_messages=max_context_messages,
+        confirmation_timeout_s=timeout_s,
+    )
+
+
+def _endless_echo(count: int = 20) -> FakeLLM:
+    """An LLM that asks for echo.say on every turn."""
+    call = ToolCall(tool="echo", action="say", args={"text": "x"})
+    return FakeLLM([_tool_response(call) for _ in range(count)])
+
+
+class TestAgentRunConfigOverride:
+    """The run's agent_config (the stored platform limits, read per request by the server)
+    overrides the construction-time limits for that run only; None keeps them."""
+
+    def test_agent_run_agent_config_is_an_optional_keyword(self) -> None:
+        parameter = inspect.signature(Agent.run).parameters["agent_config"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+    async def test_agent_run_config_lowers_the_tool_call_limit(
+        self, recorder: RecordingRecorder, permissions_config: PermissionsConfig
+    ) -> None:
+        """Built with max_tool_calls=10, a run with max_tool_calls=1 stops after one call."""
+        register_tool("echo", "say", "Echo text", EchoArgs)(echo_handler)
+        agent = _build_agent(
+            _endless_echo(), recorder, permissions_config, _limits(max_tool_calls=10)
+        )
+
+        result = await agent.run(
+            "loop",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            agent_config=_limits(max_tool_calls=1),
+        )
+
+        assert (len(result.tool_calls), result.status) == (1, "limit_reached")
+        assert len(recorder.calls) == 1
+
+    async def test_agent_run_config_raises_the_tool_call_limit(
+        self, recorder: RecordingRecorder, permissions_config: PermissionsConfig
+    ) -> None:
+        """Built with max_tool_calls=1, a run with max_tool_calls=4 makes four calls."""
+        register_tool("echo", "say", "Echo text", EchoArgs)(echo_handler)
+        agent = _build_agent(
+            _endless_echo(), recorder, permissions_config, _limits(max_tool_calls=1)
+        )
+
+        result = await agent.run(
+            "loop",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            agent_config=_limits(max_tool_calls=4),
+        )
+
+        assert (len(result.tool_calls), result.status) == (4, "limit_reached")
+
+    async def test_agent_run_config_trims_the_context_to_the_runs_budget(
+        self, recorder: RecordingRecorder, permissions_config: PermissionsConfig
+    ) -> None:
+        """Built with max_context_messages=40, a run with 6 sends at most 6 messages."""
+        history = [LLMMessage(role="user", content=f"u-{i}") for i in range(50)]
+        fake = FakeLLM([_text_response("ok")])
+        agent = _build_agent(
+            fake,
+            recorder,
+            permissions_config,
+            _limits(max_context_messages=40),
+            system_prompt="sys",
+        )
+
+        await agent.run(
+            "latest",
+            session_id="s",
+            history=history,
+            principal=_PRINCIPAL,
+            agent_config=_limits(max_context_messages=6),
+        )
+
+        sent = fake.received_messages[0]
+        assert len(sent) == 6
+        _assert_gh140_context_invariants(
+            sent, system_prompt="sys", current_user="latest", max_context_messages=6
+        )
+
+    async def test_agent_run_config_sets_the_confirmation_expiry(
+        self, recorder: RecordingRecorder, permissions_config: PermissionsConfig
+    ) -> None:
+        """Built with a 60 s timeout, a run with 240 s issues a confirmation that expires
+        240 seconds later."""
+        register_tool("echo", "write", "write", EchoArgs)(echo_handler)
+        call = ToolCall(tool="echo", action="write", args={"text": "x"})
+        agent = _build_agent(
+            FakeLLM([_tool_response(call)]), recorder, permissions_config, _limits(timeout_s=60.0)
+        )
+
+        before = datetime.now(UTC)
+        result = await agent.run(
+            "do",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            agent_config=_limits(timeout_s=240.0),
+        )
+        after = datetime.now(UTC)
+
+        pending = result.pending_confirmation
+        assert pending is not None
+        assert before + timedelta(seconds=240) <= pending.expires_at
+        assert pending.expires_at <= after + timedelta(seconds=240)
+
+    async def test_agent_run_without_config_keeps_the_construction_limits(
+        self, recorder: RecordingRecorder, permissions_config: PermissionsConfig
+    ) -> None:
+        """A run's config applies to that run only: the next run without one uses the
+        construction-time max_tool_calls (3) again."""
+        register_tool("echo", "say", "Echo text", EchoArgs)(echo_handler)
+        agent = _build_agent(
+            _endless_echo(), recorder, permissions_config, _limits(max_tool_calls=3)
+        )
+
+        first = await agent.run(
+            "loop",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            agent_config=_limits(max_tool_calls=1),
+        )
+        second = await agent.run("loop", session_id="s", history=[], principal=_PRINCIPAL)
+
+        assert (len(first.tool_calls), len(second.tool_calls)) == (1, 3)
 
 
 # ===========================================================================

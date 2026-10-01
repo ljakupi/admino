@@ -47,8 +47,8 @@ Routes:
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - GET/PATCH /api/org/settings — The Org Admin's own org's tool services; audited.
-- GET/PATCH /api/platform/settings — The platform LLM (PATCH) and limits
-  (read-only until #160) (Super Admin); audited.
+- GET/PATCH /api/platform/settings — The platform defaults: LLM, limits,
+  files, retention and security (Super Admin); audited.
 - /api/permissions, /api/critical-permissions, /api/oauth/* — permissions and
   account connections.
 - GET  /health            — Health check (public): ``{"status": "ok"}``, or 503
@@ -117,13 +117,21 @@ Security notes:
   row only), ``org.settings.manage`` for /api/org/settings (the principal's
   own org only, never a request value), ``platform.defaults.manage`` for
   /api/platform/settings. Org and platform changes share one transaction with
-  their audit event (a failed audit write is a 500 with nothing written); the
-  platform events name the changed fields, never a provider or model value.
-  A platform LLM switch builds the new client before anything is written
-  (400 with nothing written when it can't be built) and closes the old one
-  best-effort. The platform response carries key presence flags, never a
-  key. After an org change, and at lifespan start, the agent's tools gate is
-  the interim AND over every org (retired by #161).
+  their audit events (a failed audit write is a 500 with nothing written); the
+  platform llm event names the changed fields, never a provider or model
+  value, the other sections' events carry old/new ints. A platform LLM switch
+  builds the new client before anything is written (400 with nothing written
+  when it can't be built) and closes the old one best-effort. A trash
+  retention minimum above the maximum (merged with the stored values) is a
+  400 with nothing written. The platform response carries key presence
+  flags, never a key. After an org change, and at lifespan start, the agent's
+  tools gate is the interim AND over every org (retired by #161).
+- Platform defaults apply without a restart (GH-160): the chat routes read
+  the stored limits through the settings cache on every request (the message
+  length, and each agent run's tool-call, context and confirmation limits),
+  logins the Super Admin session policy, the login throttle its lockout
+  thresholds, an org deletion its grace period and the audit retention job
+  its months.
 - CSRF: ``CrossOriginProtectionMiddleware`` implements Go's
   CrossOriginProtection check on every non-GET/HEAD/OPTIONS request, before
   authentication and handlers (the login included): ``Sec-Fetch-Site`` must be
@@ -133,13 +141,16 @@ Security notes:
   the email, password and session token are never logged or echoed.
 - Brute-force protection (GH-157, ``admino.login_throttle``): failed logins
   are counted per account and per client IP in PostgreSQL. From the third
-  failure in 15 minutes an attempt waits (1, 2, 4, then 8 seconds) before its
-  check; the 10th locks the account or IP for 15 minutes (audited as
-  ``login.lockout``). A locked login is the same 401 as a wrong password. The
-  password reset confirm and the two invitation link routes share the login's
-  per-IP counter: a locked IP gets 429 "Too many attempts. Try again later."
-  before any lookup, an unusable link counts as a failure, and a usable one
-  (a password-policy 422 included) releases its reservation. A reset request
+  failure in the window (15 minutes by default) an attempt waits (1, 2, 4,
+  then 8 seconds) before its check; the 10th (by default) locks the account
+  or IP for 15 minutes (by default; audited as ``login.lockout``). The
+  window, the threshold and the lock duration are the stored platform
+  security settings (GH-160). A locked login is the same 401 as a wrong
+  password. The password reset confirm and the two invitation link routes
+  share the login's per-IP counter: a locked IP gets 429 "Too many
+  attempts. Try again later." before any lookup, an unusable link counts as
+  a failure, and a usable one (a password-policy 422 included) releases its
+  reservation. A reset request
   from a locked IP gets the same 429 before anything is queued; otherwise it
   waits out the IP's delay and never counts. The throttle runs after the
   route's token bucket and after body validation.
@@ -244,6 +255,7 @@ from admino import (
 from admino.access import Capability, Principal, can
 from admino.logs import request_id_var
 from admino.models import (
+    AgentConfig,
     AgentResult,
     ChatRequest,
     ChatResponse,
@@ -315,6 +327,7 @@ if TYPE_CHECKING:
     from admino.agent import Agent
     from admino.config import AppConfig
     from admino.llm import LLMClient
+    from admino.models import PlatformLimits, SettingsPatchLLM
 
 logger = logging.getLogger(__name__)
 
@@ -1314,13 +1327,13 @@ async def post_login(request: Request, body: LoginRequest) -> Response:
     """Handle POST /api/auth/login — email/password login (public).
 
     Rate-limited per client IP, then throttled per account and per client IP
-    (``auth.login``: a progressive delay from the third failure, a 15-minute
-    lockout at the 10th). On success opens a server-side session and answers
-    204 with the ``admino_session`` cookie (HttpOnly, SameSite=Strict, Path=/,
-    Max-Age = the lifetime of the account's session policy, Secure iff
-    ``server.cookie_secure``). Every failure cause (unknown email, wrong
-    password, inactive account or organization, a locked account or IP) is
-    the same 401, and no cookie is set.
+    (``auth.login``: a progressive delay from the third failure, a lockout at
+    the stored threshold, GH-160). On success opens a server-side session and
+    answers 204 with the ``admino_session`` cookie (HttpOnly,
+    SameSite=Strict, Path=/, Max-Age = the lifetime of the account's session
+    policy, Secure iff ``server.cookie_secure``). Every failure cause
+    (unknown email, wrong password, inactive account or organization, a
+    locked account or IP) is the same 401, and no cookie is set.
 
     Args:
         request: The incoming request (client IP and User-Agent for the session).
@@ -1431,10 +1444,10 @@ async def _throttled_link[T](
     ``work`` runs, so no token or account is looked up and nothing is written.
     Otherwise the attempt reserves one failure and waits out the progressive
     delay first. ``unusable`` (a link that can't be used) keeps the failure,
-    and the 10th locks the IP (audited as ``login.lockout``); a result, or a
-    password-policy refusal (the link was usable), releases it. Any other
-    error keeps it (fail closed). Every exception is re-raised for the route
-    to map.
+    and the one at the lockout threshold locks the IP (audited as
+    ``login.lockout``); a result, or a password-policy refusal (the link was
+    usable), releases it. Any other error keeps it (fail closed). Every
+    exception is re-raised for the route to map.
 
     Args:
         request: The incoming request (the client IP).
@@ -2311,6 +2324,22 @@ async def patch_platform_org_residency(
     )
 
 
+async def _platform_limits() -> PlatformLimits:
+    """The stored platform limits (GH-160), read through the settings cache."""
+    from admino.database import get_pool
+
+    return (await scoped_settings.current_platform_settings(get_pool())).limits
+
+
+def _run_config(limits: PlatformLimits) -> AgentConfig:
+    """The AgentConfig of one agent run: the stored tool-call, context and timeout limits."""
+    return AgentConfig(
+        max_tool_calls=limits.max_tool_calls_per_message,
+        max_context_messages=limits.max_context_messages,
+        confirmation_timeout_s=float(limits.confirmation_timeout_s),
+    )
+
+
 async def post_message(
     body: ChatRequest,
     principal: _ChatSenderDep,
@@ -2319,7 +2348,9 @@ async def post_message(
 
     Validates the request, retrieves or creates the caller's chat, runs the
     agent with the caller's principal, updates chat state, and returns the
-    response.
+    response. The message length and the run's limits are the stored platform
+    limits, read on every request (GH-160: a change applies without a
+    restart).
 
     Args:
         body: Validated ChatRequest with message and session_id.
@@ -2335,8 +2366,9 @@ async def post_message(
     _reap_expired_confirmations()
     await _resolve_pending_promotions()
 
-    # Enforce max_message_length from config (tighter than Pydantic's 32768).
-    max_len = _config.limits.max_message_length
+    # Enforce the stored max_message_length (tighter than Pydantic's 32768).
+    limits = await _platform_limits()
+    max_len = limits.max_message_length
     if len(body.message) > max_len:
         raise HTTPException(
             status_code=422,
@@ -2374,6 +2406,7 @@ async def post_message(
                 session_id=session_id,
                 history=history,
                 principal=principal,
+                agent_config=_run_config(limits),
             )
         except (MemoryError, RecursionError):
             raise
@@ -2481,8 +2514,9 @@ async def post_confirm(
 
     Looks up the caller's pending confirmation by session_id, verifies the
     confirmation_id matches, checks expiry, and if approved, resumes the agent
-    run with the caller's principal. Another user's pending confirmation is
-    never found (404).
+    run with the caller's principal and the stored platform limits (read on
+    every request, GH-160). Another user's pending confirmation is never
+    found (404).
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -2502,6 +2536,7 @@ async def post_confirm(
     _check_rate_limit("/api/confirm", _user_caller(principal))
     _reap_expired_confirmations()
     await _resolve_pending_promotions()
+    limits = await _platform_limits()
 
     session_id = body.session_id
     key = _chat_key(principal.user_id, session_id)
@@ -2562,6 +2597,7 @@ async def post_confirm(
                 history=history,
                 principal=principal,
                 pending_confirmation=pending,
+                agent_config=_run_config(limits),
             )
         except (MemoryError, RecursionError):
             raise
@@ -2621,6 +2657,9 @@ async def _platform_settings_response(
             infomaniak_token_configured=bool(os.environ.get("INFOMANIAK_API_TOKEN")),
         ),
         limits=stored.limits,
+        files=stored.files,
+        retention=stored.retention,
+        security=stored.security,
     )
 
 
@@ -2740,14 +2779,16 @@ async def patch_org_settings(
 
 
 async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsResponse:
-    """Handle GET /api/platform/settings — the platform LLM and limits (Super Admin).
+    """Handle GET /api/platform/settings — the platform defaults (Super Admin).
+
+    Reads the platform row as stored, which also refreshes the settings cache.
 
     Args:
         principal: The logged-in principal (401 without a session).
 
     Returns:
         PlatformSettingsResponse: the stored LLM (with the probed model lists
-        and key presence flags) and the limits (read-only until #160).
+        and key presence flags), limits, files, retention and security.
 
     Raises:
         HTTPException: 429 when rate-limited, 403 without
@@ -2763,18 +2804,75 @@ async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsRes
     return await _platform_settings_response(stored)
 
 
+# The 400 of a patch whose merged trash retention minimum exceeds the maximum.
+_TRASH_ORDER_REFUSED: Final = "The trash retention minimum can't exceed the maximum."
+
+
+async def _new_platform_llm_client(
+    pool: sessions.Executor, config: AppConfig, patch: SettingsPatchLLM
+) -> LLMClient | None:
+    """Validate a platform LLM patch and build the client it needs, before anything is written.
+
+    The given fields are merged over the stored LLM (read from the row, which
+    refreshes the settings cache) and validated as an ``LLMConfig`` (the
+    config's other llm fields kept). A provider change always needs a new
+    client; so does a model change of the vllm or infomaniak provider when it
+    is the active one.
+
+    Returns:
+        The new client, or None when the running one stays.
+
+    Raises:
+        HTTPException: 400 when the merged LLM config is invalid or its client
+            can't be built.
+    """
+    from admino.config import LLMConfig
+    from admino.llm import create_llm_client
+
+    current = (await scoped_settings.load_platform_settings(pool)).llm.model_dump()
+    merged = {**current, **patch.model_dump(exclude_none=True)}
+    try:
+        new_llm_config = LLMConfig.model_validate({**config.llm.model_dump(mode="json"), **merged})
+    except ValidationError as exc:
+        safe_errors = [
+            {"loc": [str(loc) for loc in err["loc"]], "msg": err["msg"], "type": err["type"]}
+            for err in exc.errors(include_input=False)
+        ]
+        raise HTTPException(status_code=400, detail=safe_errors) from None
+
+    provider = new_llm_config.provider
+    model_field = f"{provider}_model"
+    reinit = provider != current["provider"] or (
+        provider in ("vllm", "infomaniak") and merged[model_field] != current[model_field]
+    )
+    if not reinit:
+        return None
+    try:
+        return create_llm_client(new_llm_config)
+    except (ValueError, ImportError) as exc:
+        logger.error("Failed to create LLM client: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=400,
+            detail="Failed to create LLM client for the selected provider",
+        ) from None
+
+
 async def patch_platform_settings(
     request: Request, principal: _PrincipalDep, body: PlatformSettingsPatch
 ) -> PlatformSettingsResponse:
-    """Handle PATCH /api/platform/settings — change the platform LLM (Super Admin).
+    """Handle PATCH /api/platform/settings — change the platform defaults (Super Admin).
 
-    The given fields are merged over the stored LLM and validated as an
-    ``LLMConfig`` (the config's other llm fields kept). A provider change, or
-    a model change of the active vllm/infomaniak provider, builds the new
-    client BEFORE anything is written; a no-op never does. The change and its
-    ``platform.settings_change`` audit event share one transaction. Only then
-    is the new client swapped in and the old one closed (best-effort). The
-    limits are read-only until #160.
+    Any of the five sections (llm, limits, files, retention, security). When
+    ``llm`` is given, its fields are merged over the stored LLM and validated
+    as an ``LLMConfig`` (the config's other llm fields kept); a provider
+    change, or a model change of the active vllm/infomaniak provider, builds
+    the new client BEFORE anything is written (a no-op never does). The
+    changes, the re-timed Super Admin sessions and the
+    ``platform.settings_change`` audit events share one transaction
+    (``scoped_settings.update_platform_settings``). Only then is the new
+    client swapped in and the old one closed (best-effort); if nothing was
+    written, a newly built client is closed and the running one kept. The
+    stored limits apply to the next chat request (no restart).
 
     Args:
         request: The incoming request (the client IP for the audit event).
@@ -2788,7 +2886,8 @@ async def patch_platform_settings(
         HTTPException: 429 when rate-limited, 403 without
             ``Capability.PLATFORM_DEFAULTS_MANAGE`` (both before any database
             work), 400 when the merged LLM config is invalid or its client
-            can't be built (nothing written).
+            can't be built, or when the merged trash retention minimum exceeds
+            the maximum (nothing written either way).
     """
     global _config
     if _agent is None or _config is None:
@@ -2796,51 +2895,26 @@ async def patch_platform_settings(
     _check_rate_limit("/api/platform/settings/patch", _user_caller(principal))
     _require_capability(principal, Capability.PLATFORM_DEFAULTS_MANAGE)
 
-    from admino.config import LLMConfig
     from admino.database import get_pool
-    from admino.llm import create_llm_client
 
     pool = get_pool()
-    current = (await scoped_settings.load_platform_settings(pool)).llm.model_dump()
-    merged = {**current, **body.llm.model_dump(exclude_none=True)}
-    try:
-        new_llm_config = LLMConfig.model_validate({**_config.llm.model_dump(mode="json"), **merged})
-    except ValidationError as exc:
-        safe_errors = [
-            {"loc": [str(loc) for loc in err["loc"]], "msg": err["msg"], "type": err["type"]}
-            for err in exc.errors(include_input=False)
-        ]
-        raise HTTPException(status_code=400, detail=safe_errors) from None
-
-    # A provider change always needs a new client; so does a model change of
-    # the vllm or infomaniak provider when it is the active one.
-    provider = new_llm_config.provider
-    model_field = f"{provider}_model"
-    reinit = provider != current["provider"] or (
-        provider in ("vllm", "infomaniak") and merged[model_field] != current[model_field]
+    new_client = (
+        None if body.llm is None else await _new_platform_llm_client(pool, _config, body.llm)
     )
-    new_client: LLMClient | None = None
-    if reinit:
-        try:
-            new_client = create_llm_client(new_llm_config)
-        except (ValueError, ImportError) as exc:
-            logger.error("Failed to create LLM client: %s", type(exc).__name__)
-            raise HTTPException(
-                status_code=400,
-                detail="Failed to create LLM client for the selected provider",
-            ) from None
 
     try:
-        stored = await scoped_settings.update_platform_llm(
+        stored = await scoped_settings.update_platform_settings(
             pool,
             actor=principal,
-            patch=body.llm,
+            patch=body,
             ip=request.client.host if request.client is not None else None,
         )
-    except Exception:
+    except Exception as exc:
         # Nothing was written: the running client stays, the new one is retired.
         if new_client is not None:
             await _close_llm_client(new_client)
+        if isinstance(exc, scoped_settings.InvalidPlatformSettingsError):
+            raise HTTPException(status_code=400, detail=_TRASH_ORDER_REFUSED) from None
         raise
 
     # The live config follows the stored row, so diagnostics and the
@@ -3625,7 +3699,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # GH-146: the daily audit retention purge runs while the app is up. The
     # task stays referenced here and is cancelled before the pool closes.
-    retention_task = asyncio.create_task(run_retention_job(get_pool()))
+    # GH-160: each run reads the stored retention.audit_months (the cached
+    # platform settings), so a change applies to the next run.
+    async def audit_months() -> int:
+        return (await scoped_settings.current_platform_settings(get_pool())).retention.audit_months
+
+    retention_task = asyncio.create_task(
+        run_retention_job(get_pool(), retention_months=audit_months)
+    )
 
     # GH-152: expired and idle session rows are purged hourly while the app is
     # up. Looked up at call time, like the retention job; cancelled before the

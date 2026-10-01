@@ -737,7 +737,10 @@ class TestUnhandledExceptions:
         agent.run = AsyncMock(side_effect=ValueError(_SECRET))
         app = create_app(agent=agent, config=_config())
         login(app, member_session("editor"))
-        with configured_logging() as logs:
+        # GH-160: the route reads the platform limits through the settings cache
+        # (primed by conftest), so the pool is never queried.
+        pool = patch("admino.database.get_pool", MagicMock(return_value=MagicMock(name="pool")))
+        with pool, configured_logging() as logs:
             async with _client(app) as client:
                 response = await client.post(
                     "/api/message", json={"message": "hello", "session_id": "chat-1"}

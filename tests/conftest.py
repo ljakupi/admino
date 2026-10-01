@@ -1,8 +1,8 @@
 """Shared pytest fixtures for the admino test suite.
 
 Provides common mocks for the PostgreSQL connection pool (asyncpg.Pool),
-the recorder of the login throttle's progressive delays (GH-157) and other
-shared test infrastructure.
+the recorder of the login throttle's progressive delays (GH-157), the primed
+platform settings cache (GH-160) and other shared test infrastructure.
 
 Security notes:
 - All fixtures use mocks — no real database connections are made.
@@ -21,6 +21,59 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+
+def default_test_platform_settings() -> Any:
+    """The StoredPlatformSettings of a default platform row (GH-160).
+
+    Equal to what ``db_fakes.FakeDb.add_platform_settings()`` stores without
+    arguments: Infomaniak with its model and vLLM's set, the Anthropic and
+    OpenAI models unset, the LimitsConfig defaults (10, 3, 300, 4000, 20) and
+    the section defaults of migration 0014.
+    """
+    from admino import scoped_settings
+
+    return scoped_settings.StoredPlatformSettings.model_validate(
+        {
+            "llm": {
+                "provider": "infomaniak",
+                "infomaniak_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+                "vllm_model": "Qwen/Qwen3-4B-Instruct-2507",
+                "anthropic_model": None,
+                "openai_model": None,
+            },
+            "limits": {
+                "max_tool_calls_per_message": 10,
+                "max_pending_confirmations": 3,
+                "confirmation_timeout_s": 300,
+                "max_message_length": 4000,
+                "max_context_messages": 20,
+            },
+        }
+    )
+
+
+@pytest.fixture(autouse=True)
+def _platform_settings_cache() -> Generator[None, None, None]:
+    """Prime the platform settings cache before every test, restore it after (GH-160).
+
+    Consumers (login, the login throttle, the org deletion schedule, the
+    message routes) read the platform settings through
+    ``scoped_settings.current_platform_settings``, which answers from
+    ``scoped_settings._platform_cache`` without a query. Startup primes it in
+    production; here every test starts from ``default_test_platform_settings()``.
+    A test of the loading path sets the cache to None first; a test that needs
+    other values sets the cache directly, or adds a FakeDb row and sets it to
+    None. Plain attribute access (not monkeypatch), like the fixture above.
+    """
+    from admino import scoped_settings
+
+    previous = getattr(scoped_settings, "_platform_cache", None)
+    scoped_settings._platform_cache = default_test_platform_settings()
+    try:
+        yield
+    finally:
+        scoped_settings._platform_cache = previous
 
 
 @pytest.fixture()

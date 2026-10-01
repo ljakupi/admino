@@ -86,7 +86,7 @@ whether it succeeded, and how long it took. The row never holds the arguments, t
 output or any message text.
 
 The table is append-only: a database trigger refuses edits and deletions, except the daily
-retention purge of rows older than 12 months. If a row can't be written, the agent stops
+retention purge of rows older than the audit retention (12 months by default). If a row can't be written, the agent stops
 the run instead of carrying on unaudited. See
 [Configuration → Data & storage](configuration.md#data--storage).
 

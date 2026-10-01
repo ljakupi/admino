@@ -9,6 +9,9 @@ Covers every model in models.py:
   that still use it: ChatResponse, ToolCallRecord, PendingConfirmationSummary
 - GH-147: the NDJSON audit entry models (ConversationAuditEntry, ToolCallAuditEntry and
   the AuditEntry union) are gone
+- GH-160: AgentConfig's bounds widen so every stored platform limit fits
+  (max_tool_calls 1-100, confirmation_timeout_s 1.0-3600.0; max_context_messages
+  unchanged at 1-200)
 """
 
 from __future__ import annotations
@@ -28,6 +31,7 @@ from admino.models import (
     LLMMessage,
     PendingConfirmation,
     PendingConfirmationSummary,
+    PlatformLimits,
     SettingsLLM,
     SettingsPatchLLM,
     SSEEvent,
@@ -393,12 +397,13 @@ class TestAgentConfig:
         assert cfg.max_context_messages == 40
         assert cfg.confirmation_timeout_s == 30.0
 
-    def test_max_tool_calls_boundaries(self) -> None:
-        assert AgentConfig(max_tool_calls=1).max_tool_calls == 1
-        assert AgentConfig(max_tool_calls=50).max_tool_calls == 50
+    @pytest.mark.parametrize("val", [1, 50, 51, 100])
+    def test_agent_config_max_tool_calls_within_1_to_100_is_accepted(self, val: int) -> None:
+        """GH-160: widened to 1-100 so every stored max_tool_calls_per_message fits."""
+        assert AgentConfig(max_tool_calls=val).max_tool_calls == val
 
-    @pytest.mark.parametrize("val", [0, -1, 51, 100])
-    def test_max_tool_calls_out_of_range(self, val: int) -> None:
+    @pytest.mark.parametrize("val", [0, -1, 101, 1000])
+    def test_agent_config_max_tool_calls_outside_1_to_100_is_rejected(self, val: int) -> None:
         with pytest.raises(ValidationError):
             AgentConfig(max_tool_calls=val)
 
@@ -411,14 +416,39 @@ class TestAgentConfig:
         with pytest.raises(ValidationError):
             AgentConfig(max_context_messages=val)
 
-    def test_confirmation_timeout_boundaries(self) -> None:
-        assert AgentConfig(confirmation_timeout_s=1.0).confirmation_timeout_s == 1.0
-        assert AgentConfig(confirmation_timeout_s=300.0).confirmation_timeout_s == 300.0
+    @pytest.mark.parametrize("val", [1.0, 300.0, 300.1, 1000.0, 3600.0])
+    def test_agent_config_confirmation_timeout_within_1_to_3600_is_accepted(
+        self, val: float
+    ) -> None:
+        """GH-160: widened to 1.0-3600.0 so every stored confirmation_timeout_s fits."""
+        assert AgentConfig(confirmation_timeout_s=val).confirmation_timeout_s == val
 
-    @pytest.mark.parametrize("val", [0.0, 0.5, -1.0, 300.1, 1000.0])
-    def test_confirmation_timeout_out_of_range(self, val: float) -> None:
+    @pytest.mark.parametrize("val", [0.0, 0.5, -1.0, 3600.1, 10000.0])
+    def test_agent_config_confirmation_timeout_outside_1_to_3600_is_rejected(
+        self, val: float
+    ) -> None:
         with pytest.raises(ValidationError):
             AgentConfig(confirmation_timeout_s=val)
+
+    @pytest.mark.parametrize(
+        ("limits_field", "agent_field"),
+        [
+            ("max_tool_calls_per_message", "max_tool_calls"),
+            ("confirmation_timeout_s", "confirmation_timeout_s"),
+            ("max_context_messages", "max_context_messages"),
+        ],
+    )
+    def test_agent_config_accepts_every_stored_platform_limit(
+        self, limits_field: str, agent_field: str
+    ) -> None:
+        """GH-160: each run builds an AgentConfig from the stored limits; both ends fit."""
+        metadata = PlatformLimits.model_fields[limits_field].metadata
+        low = next(item.ge for item in metadata if hasattr(item, "ge"))
+        high = next(item.le for item in metadata if hasattr(item, "le"))
+
+        for value in (low, high):
+            config = AgentConfig.model_validate({agent_field: value})
+            assert getattr(config, agent_field) == value
 
 
 # ===========================================================================

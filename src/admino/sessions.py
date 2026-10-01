@@ -8,20 +8,23 @@ session, re-reading the user's row, and builds the ``Principal`` from that row
 
 Session policies (GH-152): a session ends after an idle timeout (15 to 480
 minutes, default 60) or at the end of its lifetime (1 to 72 hours, default
-12), whichever comes first. A member gets their org's policy, a Super Admin
-the platform policy (both the defaults until #169 and #160 store them). Each
-row stores its own idle timeout and expiry, set at login, so a later policy
-change doesn't alter open sessions. Ending a session deletes its row, and a
+12), whichever comes first. A member gets their org's policy (the default
+until #169 stores it), a Super Admin the platform policy stored in
+``platform_settings`` (GH-160; ``scoped_settings.session_policy_for`` picks a
+kind's policy). Each row stores its own idle timeout and expiry, set at
+login, so a later org policy change doesn't alter open sessions; a changed
+platform policy re-times every open Super Admin session
+(``apply_super_admin_policy``). Ending a session deletes its row, and a
 background job purges the rows that expired or went idle.
 
 Inputs: a database executor (the pool or a connection) plus a raw session
 token; the user id, policy, client IP and user agent of a new session; the
-user or org whose sessions all end; an account kind (``session_policy_for``).
+user or org whose sessions all end; the new Super Admin policy.
 Outputs: the raw token of a new session (``create_session``), the
 ``AuthenticatedSession`` of a usable session or None (``resolve_session``),
 nothing (``revoke_session``), the number of rows deleted
 (``revoke_user_sessions``, ``revoke_org_sessions``,
-``purge_expired_sessions``), the ``SessionPolicy`` of an account kind.
+``purge_expired_sessions``) or re-timed (``apply_super_admin_policy``).
 
 Security notes:
 - The one Principal builder: this is the only module that builds an
@@ -40,6 +43,9 @@ Security notes:
 - The expiry is computed on the database clock (``now() + $n::interval``),
   like ``created_at``, so the 72-hour CHECK of migration 0009 holds exactly.
   The policy bounds mirror that migration's CHECKs.
+- A Super Admin policy change applies at once: the expiry becomes
+  ``created_at`` plus the new lifetime, so a session older than it, or idle
+  past the new timeout, stops resolving. Members' sessions are never touched.
 - Only the token's hash is stored or queried; the raw token is never logged
   and never sent to the database. A token that can't be a
   ``secrets.token_urlsafe(32)`` value is refused without a query. Logs carry
@@ -128,6 +134,15 @@ _REVOKE_ORG_SQL: Final = """
     WHERE user_id IN (SELECT id FROM users WHERE org_id = $1)
 """
 
+# Every open Super Admin session takes the new platform policy (GH-160). The
+# expiry counts from the session's start, so an old one ends at once.
+_SUPER_ADMIN_POLICY_SQL: Final = """
+    UPDATE sessions
+    SET idle_timeout_minutes = $1,
+        expires_at = created_at + make_interval(hours => $2)
+    WHERE user_id IN (SELECT id FROM users WHERE kind = 'super_admin')
+"""
+
 # The same boundaries resolve_session applies: "<=" means gone.
 _PURGE_SQL: Final = """
     DELETE FROM sessions
@@ -172,10 +187,8 @@ class SessionPolicy(SealedModel):
         return timedelta(hours=self.max_lifetime_hours)
 
 
-# The policies new sessions get until #169 (org policy) and #160 (platform
-# policy) store them.
+# The policy a member's new session gets until #169 stores org policies.
 DEFAULT_ORG_SESSION_POLICY: Final = SessionPolicy()
-PLATFORM_SESSION_POLICY: Final = SessionPolicy()
 
 
 class AuthenticatedSession(SealedModel):
@@ -185,27 +198,6 @@ class AuthenticatedSession(SealedModel):
     principal: Principal
     ui_language: Literal["de", "fr", "en"]
     response_language: Literal["de", "fr", "it", "en"] | None
-
-
-def session_policy_for(kind: str) -> SessionPolicy:
-    """Return the policy a new session of an account kind gets.
-
-    Args:
-        kind: The account's kind: "member" (the org policy) or "super_admin"
-            (the platform policy).
-
-    Returns:
-        The SessionPolicy, read when called.
-
-    Raises:
-        ValueError: For any other kind (there is no default policy).
-    """
-    if kind == "member":
-        return DEFAULT_ORG_SESSION_POLICY
-    if kind == "super_admin":
-        return PLATFORM_SESSION_POLICY
-    msg = "No session policy for this account kind."
-    raise ValueError(msg)
 
 
 def new_session_token() -> str:
@@ -228,8 +220,8 @@ def _is_aware(value: object) -> bool:
     return isinstance(value, datetime) and value.tzinfo is not None
 
 
-def _deleted_count(status: str) -> int:
-    """The row count of asyncpg's status string ("DELETE <count>")."""
+def _row_count(status: str) -> int:
+    """The row count of asyncpg's status string ("DELETE <count>", "UPDATE <count>")."""
     return int(status.rpartition(" ")[2])
 
 
@@ -265,7 +257,8 @@ async def create_session(
     Args:
         executor: The pool or a connection (inside the caller's transaction).
         user_id: The account the session belongs to.
-        policy: The session policy of the account (``session_policy_for``).
+        policy: The session policy of the account
+            (``scoped_settings.session_policy_for``).
         ip: The client address, if known.
         user_agent: The client's User-Agent header, if any.
 
@@ -370,7 +363,7 @@ async def revoke_user_sessions(executor: Executor, user_id: UUID) -> int:
     Returns:
         The number of session rows deleted.
     """
-    return _deleted_count(await executor.execute(_REVOKE_USER_SQL, user_id))
+    return _row_count(await executor.execute(_REVOKE_USER_SQL, user_id))
 
 
 async def revoke_org_sessions(executor: Executor, org_id: UUID) -> int:
@@ -385,7 +378,28 @@ async def revoke_org_sessions(executor: Executor, org_id: UUID) -> int:
     Returns:
         The number of session rows deleted.
     """
-    return _deleted_count(await executor.execute(_REVOKE_ORG_SQL, org_id))
+    return _row_count(await executor.execute(_REVOKE_ORG_SQL, org_id))
+
+
+async def apply_super_admin_policy(executor: Executor, policy: SessionPolicy) -> int:
+    """Give every open Super Admin session a new policy with one UPDATE (GH-160).
+
+    Each Super Admin session takes the policy's idle timeout and expires at
+    its ``created_at`` plus the policy's lifetime (on the database clock), so
+    a session older than the new lifetime, or idle past the new timeout, ends
+    at once. Members' sessions are untouched.
+
+    Args:
+        executor: The pool or a connection (inside the caller's transaction).
+        policy: The new platform session policy.
+
+    Returns:
+        The number of session rows updated.
+    """
+    status = await executor.execute(
+        _SUPER_ADMIN_POLICY_SQL, policy.idle_timeout_minutes, policy.max_lifetime_hours
+    )
+    return _row_count(status)
 
 
 async def purge_expired_sessions(executor: Executor) -> int:
@@ -397,7 +411,7 @@ async def purge_expired_sessions(executor: Executor) -> int:
     Returns:
         The number of session rows deleted.
     """
-    return _deleted_count(await executor.execute(_PURGE_SQL))
+    return _row_count(await executor.execute(_PURGE_SQL))
 
 
 async def run_session_purge_job(

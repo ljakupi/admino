@@ -22,7 +22,7 @@ What these tests pin down (the GH-159 implementation contract):
   settings; an Org Admin can't patch platform settings.
 - ``GET`` / ``PATCH /api/settings`` and their rate-limit keys are gone.
 - Bodies: 422 without echoing the input for extra keys at any level (``llm``
-  / ``tools`` / ``limits`` on /api/me/settings, ``limits`` on
+  / ``tools`` / ``limits`` on /api/me/settings, ``tools`` on
   /api/platform/settings, the removed ``files`` tool), non-JSON-bool values,
   empty patches, a bad theme and a model name with a trailing newline, shell
   characters, 201 characters or a non-string value.
@@ -33,29 +33,63 @@ What these tests pin down (the GH-159 implementation contract):
   agent's ``_tools_enabled`` is the AND gate over every org
   (``scoped_settings.all_orgs_tools_gate``). An audit failure is a 500 with
   nothing written and the gate unchanged.
-- /api/platform/settings: GET returns ``llm`` (the stored provider and
-  models, ``""`` for NULL; the available models from the two probe helpers,
-  filtered by ``SettingsLLM``; key flags that are booleans of env presence,
-  never values) and ``limits`` (the stored five). PATCH takes ``llm`` only;
-  a provider change, or a model change of the active vllm/infomaniak
-  provider, builds a new client with ``create_llm_client`` BEFORE writing
-  (from the merged ``LLMConfig``, the config's other llm fields kept), swaps
-  ``_agent._llm`` and closes the old client best-effort. A no-op never
-  re-inits. A client that can't be built is a 400 ``{"detail": "Failed to
-  create LLM client for the selected provider"}`` with nothing written and no
-  audit row; an audit failure is a 500, the new client is closed and the old
-  one kept. Each change is a ``platform.settings_change`` audit row naming
-  the changed fields only.
+- /api/platform/settings: GET returns ``llm`` (the stored provider and models,
+  ``""`` for NULL; the available models from the two probe helpers, filtered
+  by ``SettingsLLM``; key flags that are booleans of env presence, never
+  values) and ``limits`` (the stored five). PATCH of ``llm`` (#159; GH-160
+  adds the other sections, below): a provider change, or a model change of the
+  active vllm/infomaniak provider, builds a new client with
+  ``create_llm_client`` BEFORE writing (from the merged ``LLMConfig``, the
+  config's other llm fields kept), swaps ``_agent._llm`` and closes the old
+  client best-effort. A no-op never re-inits. A client that can't be built is
+  a 400 ``{"detail": "Failed to create LLM client for the selected
+  provider"}`` with nothing written and no audit row; an audit failure is a
+  500, the new client is closed and the old one kept. Each change is a
+  ``platform.settings_change`` audit row naming the changed fields only.
 - Cross-origin PATCH → 403 before any database call.
 - The server lifespan recomputes the gate with ``all_orgs_tools_gate``; a
   failure keeps the construction-time gate (logged by class name).
 - No email, name or model name in any log record; no provider or model value
   in any audit row.
 
+GH-160 (platform defaults) adds, over the same routes:
+- ``GET /api/platform/settings`` returns five sections, ``llm``, ``limits``,
+  ``files``, ``retention`` and ``security``, from the stored row (read with
+  ``scoped_settings.load_platform_settings``, which also replaces
+  ``scoped_settings._platform_cache``).
+- ``PATCH /api/platform/settings`` takes any of the five sections (``limits``
+  is no longer refused). Each field is a strict int within the issue's bounds:
+  a bool, float, numeric string, out-of-bounds value, unknown field or empty
+  patch (only empty or null sections) is a 422 whose error points at the
+  field, without echoing the input. Every changed section is one
+  ``platform.settings_change`` audit row with ``<field>_old`` /
+  ``<field>_new`` ints and the client IP (``llm`` stays names only); an
+  unchanged section writes none, a no-op writes nothing at all. A mixed patch
+  (``llm`` + others) is one request with the #159 LLM path unchanged. Merged
+  retention with ``trash_min_days`` above ``trash_max_days`` is a 400 ``{"detail":
+  "The trash retention minimum can't exceed the maximum."}`` with nothing
+  written, no audit row and any newly built LLM client closed. An audit
+  failure is a 500 with nothing written and the cache unchanged. The
+  response has all five sections after the change and the cache equals it.
+- Without a restart: after a ``limits`` change, ``POST /api/message`` refuses
+  a message over the new ``max_message_length`` (422 "Message exceeds maximum
+  length of N characters") and both ``POST /api/message`` and ``POST
+  /api/confirm`` pass ``agent_config`` (max_tool_calls, max_context_messages,
+  confirmation_timeout_s from the stored limits) to ``_agent.run``. After a
+  ``security`` session change a new Super Admin login stores the new idle
+  timeout and lifetime, every open Super Admin session follows (idle timeout
+  updated, ``expires_at = created_at + lifetime``; one older than the new
+  lifetime is 401 on its next request), members' sessions are untouched and
+  the audit row carries ``sessions_updated``. After a ``retention`` change the
+  next org deletion uses the new grace period.
+- A member role's PATCH of any section is 403 with nothing read or written.
+
 Contract notes for the implementation: ``admino.llm.create_llm_client`` is
 looked up at call time (as today); the lifespan and the handlers reach
 ``admino.scoped_settings`` functions at call time (module attribute or a
-lazy import).
+lazy import). The conftest primes ``scoped_settings._platform_cache`` with the
+default row; tests whose consumers must see this file's FakeDb row set it to
+None (or load it through a GET or PATCH first).
 
 All database calls are faked. No network, no real PostgreSQL, no LLM.
 
@@ -74,7 +108,9 @@ import contextlib
 import copy
 import json
 import logging
+import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock, MagicMock
 
@@ -82,9 +118,10 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from admino import server
+from admino import scoped_settings, server
 from admino.access import Capability
 from admino.config import AppConfig
+from admino.models import AgentConfig, AgentResult, LLMMessage, PendingConfirmation, ToolCall
 from admino.server import create_app
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, PUBLIC_URL, TOOL_NAMES, FakeDb, fake_hash, plain
 from tests.lifespan_stubs import patch_login_throttle_purge_job, patch_org_purge_job
@@ -235,11 +272,8 @@ _BAD_ORG_BODIES = [
     pytest.param({"tools": ["gmail"]}, id="tools-list"),
     pytest.param("ECHOMARK42", id="string"),
 ]
+# GH-160: a ``limits`` section is accepted now (see _BAD_SECTION_BODIES for its bad values).
 _BAD_PLATFORM_BODIES = [
-    pytest.param({"limits": {"max_message_length": 5}}, id="limits-only"),
-    pytest.param(
-        {"llm": {"provider": "openai"}, "limits": {"max_message_length": 5}}, id="llm-and-limits"
-    ),
     pytest.param({"llm": {"provider": "openai"}, "tools": {"gmail": False}}, id="extra-tools"),
     pytest.param({"llm": {}}, id="empty-llm"),
     pytest.param({"llm": {"provider": None}}, id="only-null"),
@@ -262,6 +296,168 @@ _BAD_PLATFORM_BODIES = [
     pytest.param({"llm": {"api_key": "sk-ECHOMARK42-secret"}}, id="extra-api-key"),
     pytest.param("ECHOMARK42", id="string"),
 ]
+
+# GH-160: the editable sections, section -> field -> (default, low, high) (the issue's
+# Decisions; the limits' defaults are LimitsConfig's).
+_SECTION_FIELDS: dict[str, dict[str, tuple[int, int, int]]] = {
+    "limits": {
+        "max_tool_calls_per_message": (10, 1, 100),
+        "max_pending_confirmations": (3, 1, 50),
+        "confirmation_timeout_s": (300, 10, 3600),
+        "max_message_length": (4000, 1, 100000),
+        "max_context_messages": (20, 1, 200),
+    },
+    "files": {
+        "max_file_size_mb": (50, 1, 500),
+        "max_files_per_message": (10, 1, 50),
+        "max_pages_per_file": (100, 1, 1000),
+        "render_dpi": (150, 72, 300),
+    },
+    "retention": {
+        "trash_min_days": (0, 0, 90),
+        "trash_max_days": (90, 0, 90),
+        "audit_months": (12, 6, 84),
+        "org_deletion_grace_days": (30, 7, 90),
+    },
+    "security": {
+        "rate_limit_per_minute": (20, 1, 600),
+        "lockout_after_failures": (10, 3, 100),
+        "lockout_window_minutes": (15, 1, 1440),
+        "lockout_minutes": (15, 1, 1440),
+        "session_idle_timeout_minutes": (60, 15, 480),
+        "session_max_lifetime_hours": (12, 1, 72),
+    },
+}
+_EDITABLE = tuple(_SECTION_FIELDS)
+_SECTIONS = frozenset({"llm", *_EDITABLE})
+# What the db fixture's row holds: its limits and the defaults of every new section.
+_STORED_SECTIONS: dict[str, dict[str, int]] = {
+    "limits": dict(_STORED_LIMITS),
+    **{
+        section: {field: default for field, (default, _, _) in fields.items()}
+        for section, fields in _SECTION_FIELDS.items()
+        if section != "limits"
+    },
+}
+_TRASH_REFUSED = {"detail": "The trash retention minimum can't exceed the maximum."}
+_FIELDS = [
+    (section, field, low, high)
+    for section, fields in _SECTION_FIELDS.items()
+    for field, (_, low, high) in fields.items()
+]
+_BOUNDARY_VALUES = [
+    pytest.param(section, field, value, id=f"{field}-{name}")
+    for section, field, low, high in _FIELDS
+    for name, value in (("low", low), ("high", high))
+]
+# (body, the loc an error must start with)
+_BAD_SECTION_BODIES = [
+    *(
+        pytest.param({section: {field: value}}, ["body", section, field], id=f"{field}-{name}")
+        for section, field, low, high in _FIELDS
+        for name, value in (("below", low - 1), ("above", high + 1))
+    ),
+    *(
+        pytest.param({section: {field: value}}, ["body", section, field], id=f"{section}-{name}")
+        for section, field in (
+            ("limits", "max_message_length"),
+            ("files", "render_dpi"),
+            ("retention", "audit_months"),
+            ("security", "lockout_minutes"),
+        )
+        for name, value in (
+            ("true", True),
+            ("false", False),
+            ("float", 100.0),
+            ("fraction", 100.5),
+            ("numeric-string", "100"),
+            ("string", "ECHOMARK42"),
+            ("list", [100]),
+            ("object", {"value": 100}),
+            ("huge", 9876543210),
+            ("negative-huge", -9876543210),
+        )
+    ),
+    pytest.param(
+        {"files": {"render_dpi": 200, "virus_scan": "ECHOMARK42"}},
+        ["body", "files", "virus_scan"],
+        id="files-unknown-field",
+    ),
+    pytest.param(
+        {"limits": {"max_message_length": 10, "max_file_size_mb": 5}},
+        ["body", "limits", "max_file_size_mb"],
+        id="limits-field-of-another-section",
+    ),
+    pytest.param(
+        {"retention": {"trash_days": 5}},
+        ["body", "retention", "trash_days"],
+        id="retention-unknown",
+    ),
+    pytest.param(
+        {"security": {"session_idle_timeout_minutes": 30, "delay_after_failures": 5}},
+        ["body", "security", "delay_after_failures"],
+        id="security-delay-is-a-constant",
+    ),
+    pytest.param(
+        {"security": {"lockout_minutes": 30}, "storage": {"quota_gb": 5}},
+        ["body", "storage"],
+        id="unknown-section-beside-a-valid-one",
+    ),
+    pytest.param(
+        {"llm": {"provider": "openai"}, "files": {"render_dpi": 301}},
+        ["body", "files", "render_dpi"],
+        id="valid-llm-bad-files",
+    ),
+    pytest.param(
+        {"llm": {"provider": "ECHOMARK42"}, "limits": {"max_message_length": 10}},
+        ["body", "llm", "provider"],
+        id="bad-llm-valid-limits",
+    ),
+    pytest.param({"files": 5}, ["body", "files"], id="files-int"),
+    pytest.param({"security": ["lockout_minutes"]}, ["body", "security"], id="security-list"),
+    pytest.param({"retention": "ECHOMARK42"}, ["body", "retention"], id="retention-string"),
+    pytest.param({"files": {}}, ["body"], id="empty-files"),
+    pytest.param({"limits": {}}, ["body"], id="empty-limits"),
+    pytest.param({"files": {"render_dpi": None}}, ["body"], id="only-null-field"),
+    pytest.param({"files": None, "retention": None}, ["body"], id="null-sections"),
+    pytest.param({"llm": {}, "security": {}}, ["body"], id="empty-llm-and-security"),
+    pytest.param(
+        {"llm": {}, "limits": {}, "files": {}, "retention": {}, "security": {}},
+        ["body"],
+        id="every-section-empty",
+    ),
+]
+# One valid change per section: (section, fields), against the db fixture's row.
+_SECTION_PATCHES = [
+    pytest.param(
+        "limits",
+        {"max_message_length": 10, "max_tool_calls_per_message": 60, "confirmation_timeout_s": 900},
+        id="limits",
+    ),
+    pytest.param(
+        "files",
+        {"max_file_size_mb": 200, "max_files_per_message": 20, "max_pages_per_file": 500},
+        id="files",
+    ),
+    pytest.param(
+        "retention",
+        {"trash_min_days": 7, "trash_max_days": 60, "audit_months": 24},
+        id="retention",
+    ),
+    pytest.param(
+        "security",
+        {"rate_limit_per_minute": 30, "lockout_after_failures": 5, "lockout_window_minutes": 30},
+        id="security",
+    ),
+]
+_MEMBER_SECTION_BODIES = [
+    pytest.param({"limits": {"max_message_length": 10}}, id="limits"),
+    pytest.param({"files": {"render_dpi": 300}}, id="files"),
+    pytest.param({"retention": {"org_deletion_grace_days": 7}}, id="retention"),
+    pytest.param({"security": {"session_max_lifetime_hours": 1}}, id="security"),
+]
+_PASSWORD = "correct horse battery staple"
+_METADATA_KEY = re.compile(r"[a-z][a-z_]*_(?:old|new)|sessions_updated")
 
 
 # ---------------------------------------------------------------------------
@@ -514,6 +710,125 @@ class _CanSpy:
 
             if hasattr(scoped_settings, "can"):
                 monkeypatch.setattr(scoped_settings, "can", spy)
+
+
+def _editable(body: dict[str, Any]) -> dict[str, Any]:
+    """The four editable sections of a platform settings response (GH-160)."""
+    return {section: body.get(section) for section in _EDITABLE}
+
+
+def _after(changes: dict[str, dict[str, int]]) -> dict[str, dict[str, int]]:
+    """The db fixture's sections with the given changes applied."""
+    sections = copy.deepcopy(_STORED_SECTIONS)
+    for section, fields in changes.items():
+        sections[section].update(fields)
+    return sections
+
+
+def _cached_sections() -> dict[str, Any]:
+    """The editable sections of scoped_settings._platform_cache, as plain dicts."""
+    cache = scoped_settings._platform_cache
+    assert cache is not None
+    return {section: getattr(cache, section).model_dump() for section in _EDITABLE}
+
+
+def _cache_the_row(app: FastAPI, token: str) -> None:
+    """GET /api/platform/settings: the cache holds the stored row (GH-160). A failed
+    PATCH may re-read the row into the cache, but never its own uncommitted values."""
+    response = _call(_client(app), "platform_get", token)
+    assert response.status_code == 200, response.text
+
+
+def _row_without_updated_at(db: FakeDb) -> dict[str, Any]:
+    return {key: value for key, value in _row(db).items() if key != "updated_at"}
+
+
+def _settings_changes(db: FakeDb) -> list[dict[str, Any]]:
+    """The metadata of every platform.settings_change audit row, in order."""
+    return [row["metadata"] for row in db.audit if row["action"] == "platform.settings_change"]
+
+
+def _old_new(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+    """The ``<field>_old`` / ``<field>_new`` metadata of the fields that changed."""
+    metadata: dict[str, int] = {}
+    for field, new in after.items():
+        if before[field] != new:
+            metadata[f"{field}_old"] = before[field]
+            metadata[f"{field}_new"] = new
+    return metadata
+
+
+def _agent_result(pending: PendingConfirmation | None = None) -> AgentResult:
+    return AgentResult(
+        status="final" if pending is None else "awaiting_confirmation",
+        response="Done.",
+        history=[
+            LLMMessage(role="user", content="hi"),
+            LLMMessage(role="assistant", content="Done."),
+        ],
+        tool_calls=[],
+        pending_confirmation=pending,
+    )
+
+
+def _pending(session_id: str) -> PendingConfirmation:
+    now = datetime.now(UTC)
+    return PendingConfirmation(
+        confirmation_id="confirm-160",
+        session_id=session_id,
+        tool_call=ToolCall(tool="calendar", action="create", args={}),
+        created_at=now,
+        expires_at=now + timedelta(seconds=300),
+    )
+
+
+def _post_message(
+    client: TestClient, token: str, message: str, session_id: str = "chat-160"
+) -> httpx.Response:
+    return client.post(
+        "/api/message",
+        headers=_headers(token),
+        json={"message": message, "session_id": session_id},
+    )
+
+
+def _agent_config_of(agent: MagicMock, index: int = -1) -> tuple[int, int, float]:
+    """(max_tool_calls, max_context_messages, confirmation_timeout_s) of one agent run."""
+    config = agent.run.await_args_list[index].kwargs["agent_config"]
+    assert isinstance(config, AgentConfig), config
+    return (config.max_tool_calls, config.max_context_messages, config.confirmation_timeout_s)
+
+
+def _with_password(db: FakeDb, email: str, *, kind: str = "member") -> uuid.UUID:
+    """An account that can log in with _PASSWORD (a Super Admin, or an Editor of ORG_ID)."""
+    if kind == "super_admin":
+        return db.add_account(
+            kind="super_admin", role=None, email=email, password_hash=fake_hash(_PASSWORD)
+        )
+    return db.add_account(role="editor", email=email, password_hash=fake_hash(_PASSWORD))
+
+
+def _log_in(client: TestClient, email: str) -> tuple[str, dict[str, str | None]]:
+    """POST /api/auth/login; return (token, cookie attributes) of the one session cookie."""
+    response = client.post("/api/auth/login", json={"email": email, "password": _PASSWORD})
+    assert response.status_code == 204, response.text
+    client.cookies.clear()
+    headers = [
+        header
+        for header in response.headers.get_list("set-cookie")
+        if header.lower().startswith(f"{_COOKIE}=")
+    ]
+    assert len(headers) == 1, response.headers.get_list("set-cookie")
+    parts = [part.strip() for part in headers[0].split(";")]
+    attributes: dict[str, str | None] = {}
+    for part in parts[1:]:
+        key, sep, value = part.partition("=")
+        attributes[key.strip().lower()] = value.strip() if sep else None
+    return parts[0].split("=", 1)[1], attributes
+
+
+def _lifetime(row: dict[str, Any]) -> timedelta:
+    return row["expires_at"] - row["created_at"]
 
 
 # ---------------------------------------------------------------------------
@@ -1002,9 +1317,11 @@ class TestPlatformGet:
 
         assert response.status_code == 200, response.text
         body = response.json()
-        assert set(body) == {"llm", "limits"}
+        # GH-160: five sections (was llm and limits only in #159).
+        assert set(body) == _SECTIONS
         assert set(body["llm"]) == _LLM_RESPONSE_KEYS
         assert body["limits"] == _STORED_LIMITS
+        assert {section: body[section] for section in _EDITABLE} == _STORED_SECTIONS
         assert {key: body["llm"][key] for key in _LLM_RESPONSE_KEYS} == {
             "provider": "anthropic",
             "anthropic_model": "claude-sonnet-4-6",
@@ -1566,3 +1883,870 @@ class TestNoContentInLogs:
         assert "zephyrmarker" not in stored
         for row in db.audit:
             assert all(type(value) is bool for value in row["metadata"].values()), row
+
+
+# ---------------------------------------------------------------------------
+# 11. GH-160: the platform defaults, validation
+# ---------------------------------------------------------------------------
+
+
+class TestPlatformDefaultsValidation:
+    """Every field of limits, files, retention and security is a strict int within the
+    issue's bounds. A bad value, an unknown field or section, or a patch of only empty or
+    null sections is a 422 whose error points at the field (the sections themselves are
+    known keys), never echoing the input; nothing is written, the cache is unchanged and
+    no LLM client is built."""
+
+    @pytest.mark.parametrize(("body", "loc"), _BAD_SECTION_BODIES)
+    def test_settings_api_platform_patch_bad_section_is_422_at_the_field_without_echo(
+        self, db: FakeDb, app: FastAPI, probes: _Probes, body: dict[str, Any], loc: list[str]
+    ) -> None:
+        _route_of(app, "platform_patch")
+        _, token = _login(db, "super_admin")
+        before = _state(db)
+        cache = scoped_settings._platform_cache
+
+        response = _call(_client(app), "platform_patch", token, body=body)
+
+        assert response.status_code == 422, response.text
+        for marker in _echo_markers(body):
+            assert marker not in response.text, marker
+        errors = response.json()["detail"]
+        assert all(isinstance(error, dict) and "input" not in error for error in errors)
+        known = [["body", section] for section in body if section in _EDITABLE]
+        refused_sections = [
+            error
+            for error in errors
+            if error["type"] == "extra_forbidden" and error["loc"] in known
+        ]
+        assert refused_sections == [], errors
+        assert any(error["loc"][: len(loc)] == loc for error in errors), errors
+        assert _state(db) == before
+        assert scoped_settings._platform_cache is cache
+        probes.create.assert_not_called()
+
+    @pytest.mark.parametrize(("section", "field", "value"), _BOUNDARY_VALUES)
+    def test_settings_api_platform_patch_boundary_value_is_accepted(
+        self, db: FakeDb, app: FastAPI, section: str, field: str, value: int
+    ) -> None:
+        _, token = _login(db, "super_admin")
+
+        response = _call(_client(app), "platform_patch", token, body={section: {field: value}})
+
+        assert response.status_code == 200, response.text
+        assert response.json()[section][field] == value
+        assert _row(db)[field] == value
+
+
+# ---------------------------------------------------------------------------
+# 12. GH-160: GET /api/platform/settings, five sections
+# ---------------------------------------------------------------------------
+
+_CUSTOM_SECTIONS: dict[str, dict[str, int]] = {
+    "files": {
+        "max_file_size_mb": 10,
+        "max_files_per_message": 3,
+        "max_pages_per_file": 40,
+        "render_dpi": 200,
+    },
+    "retention": {
+        "trash_min_days": 5,
+        "trash_max_days": 45,
+        "audit_months": 36,
+        "org_deletion_grace_days": 60,
+    },
+    "security": {
+        "rate_limit_per_minute": 100,
+        "lockout_after_failures": 4,
+        "lockout_window_minutes": 90,
+        "lockout_minutes": 120,
+        "session_idle_timeout_minutes": 240,
+        "session_max_lifetime_hours": 24,
+    },
+}
+
+
+class TestPlatformDefaultsGet:
+    """GET reads the whole row: the five sections, and the cache is replaced with it."""
+
+    def test_settings_api_platform_get_returns_every_section_from_the_row(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        for fields in _CUSTOM_SECTIONS.values():
+            _row(db).update(fields)
+        _, token = _login(db, "super_admin")
+
+        response = _call(_client(app), "platform_get", token)
+
+        assert response.status_code == 200, response.text
+        assert set(response.json()) == _SECTIONS
+        assert _editable(response.json()) == _after(_CUSTOM_SECTIONS)
+
+    @pytest.mark.parametrize("primed", [True, False], ids=["primed-cache", "empty-cache"])
+    def test_settings_api_platform_get_replaces_the_cache_with_the_row(
+        self, db: FakeDb, app: FastAPI, primed: bool
+    ) -> None:
+        """Primed with the conftest's default row or empty: after a GET the cache is this
+        row (the Anthropic provider, the stored limits and the custom sections)."""
+        for fields in _CUSTOM_SECTIONS.values():
+            _row(db).update(fields)
+        if not primed:
+            scoped_settings._platform_cache = None
+        _, token = _login(db, "super_admin")
+
+        response = _call(_client(app), "platform_get", token)
+
+        assert response.status_code == 200, response.text
+        assert _cached_sections() == _after(_CUSTOM_SECTIONS)
+        assert scoped_settings._platform_cache is not None
+        assert scoped_settings._platform_cache.llm.provider == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# 13. GH-160: PATCH /api/platform/settings, the new sections
+# ---------------------------------------------------------------------------
+
+
+class TestPlatformDefaultsPatch:
+    """A section change is stored, returned with all five sections, cached and audited as
+    one platform.settings_change row per changed section (``<field>_old`` /
+    ``<field>_new`` ints and the client IP); unchanged sections and no-ops record
+    nothing. A mixed patch runs the #159 LLM path in the same request."""
+
+    @pytest.mark.parametrize(("section", "fields"), _SECTION_PATCHES)
+    def test_settings_api_platform_patch_section_is_stored_and_returned(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        agent: MagicMock,
+        probes: _Probes,
+        section: str,
+        fields: dict[str, int],
+    ) -> None:
+        _, token = _login(db, "super_admin")
+        old_client = agent._llm
+        before = _row_without_updated_at(db)
+
+        response = _call(_client(app), "platform_patch", token, body={section: fields})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert set(body) == _SECTIONS
+        assert _editable(body) == _after({section: fields})
+        assert body["llm"]["provider"] == "anthropic"
+        assert _row_without_updated_at(db) == {**before, **fields}
+        probes.create.assert_not_called()
+        assert agent._llm is old_client
+
+    @pytest.mark.parametrize(("section", "fields"), _SECTION_PATCHES)
+    def test_settings_api_platform_patch_section_change_is_audited_with_old_and_new(
+        self, db: FakeDb, app: FastAPI, section: str, fields: dict[str, int]
+    ) -> None:
+        admin_id, token = _login(db, "super_admin")
+
+        response = _call(_client(app), "platform_patch", token, body={section: fields})
+
+        assert response.status_code == 200, response.text
+        event = _one(db.audit)
+        assert event["action"] == "platform.settings_change"
+        assert (event["actor_kind"], _uuid(event["actor_user_id"])) == ("super_admin", admin_id)
+        assert event["org_id"] is None
+        assert (event["target_type"], event["target_ids"]) == (None, [])
+        assert event["ip"] == _IP_A
+        assert event["metadata"] == _old_new(_STORED_SECTIONS[section], fields)
+        assert all(type(value) is int for value in event["metadata"].values())
+
+    @pytest.mark.parametrize(("section", "fields"), _SECTION_PATCHES)
+    def test_settings_api_platform_patch_section_change_updates_the_cache(
+        self, db: FakeDb, app: FastAPI, section: str, fields: dict[str, int]
+    ) -> None:
+        _, token = _login(db, "super_admin")
+
+        response = _call(_client(app), "platform_patch", token, body={section: fields})
+
+        assert response.status_code == 200, response.text
+        assert _cached_sections() == _after({section: fields})
+        assert _cached_sections() == _editable(response.json())
+
+    def test_settings_api_platform_patch_audits_only_the_changed_fields(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """max_file_size_mb is given with its stored value: only render_dpi is recorded."""
+        _, token = _login(db, "super_admin")
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={"files": {"max_file_size_mb": 50, "render_dpi": 300}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert _settings_changes(db) == [{"render_dpi_old": 150, "render_dpi_new": 300}]
+
+    def test_settings_api_platform_patch_one_row_per_changed_section_in_order(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """files and security change (given in another order), retention is given with its
+        stored value: two rows, files then security."""
+        _, token = _login(db, "super_admin")
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={
+                "security": {"lockout_minutes": 30},
+                "retention": {"audit_months": 12},
+                "files": {"render_dpi": 300},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert _settings_changes(db) == [
+            {"render_dpi_old": 150, "render_dpi_new": 300},
+            {"lockout_minutes_old": 15, "lockout_minutes_new": 30},
+        ]
+
+    def test_settings_api_platform_patch_mixed_with_llm_is_one_request(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, probes: _Probes
+    ) -> None:
+        """llm + limits + security (+ an unchanged files value): the client is rebuilt and
+        swapped as in #159, every section is stored, and the audit rows are llm (names
+        only), limits and security, in that order."""
+        _, token = _login(db, "super_admin")
+        old_client = agent._llm
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={
+                "llm": {"provider": "openai"},
+                "limits": {"max_message_length": 10},
+                "security": {"lockout_minutes": 30},
+                "files": {"render_dpi": 150},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        changes = {"limits": {"max_message_length": 10}, "security": {"lockout_minutes": 30}}
+        assert response.json()["llm"]["provider"] == "openai"
+        assert _editable(response.json()) == _after(changes)
+        probes.create.assert_called_once()
+        assert agent._llm is probes.new_client
+        old_client.close.assert_awaited_once()
+        assert server._config is not None
+        assert server._config.llm.provider == "openai"
+        row = _row(db)
+        assert (row["llm_provider"], row["max_message_length"], row["lockout_minutes"]) == (
+            "openai",
+            10,
+            30,
+        )
+        assert _settings_changes(db) == [
+            {"provider": True},
+            {"max_message_length_old": 5000, "max_message_length_new": 10},
+            {"lockout_minutes_old": 15, "lockout_minutes_new": 30},
+        ]
+
+    def test_settings_api_platform_patch_mixed_client_failure_writes_nothing(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, probes: _Probes
+    ) -> None:
+        _, token = _login(db, "super_admin")
+        old_client = agent._llm
+        probes.create.side_effect = ValueError("no client")
+        _cache_the_row(app, token)
+        before = _state(db)
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={"llm": {"provider": "openai"}, "limits": {"max_message_length": 10}},
+        )
+
+        assert (response.status_code, response.json()) == (400, _CLIENT_FAILED)
+        assert _state(db) == before
+        assert _cached_sections() == _STORED_SECTIONS
+        assert agent._llm is old_client
+
+    def test_settings_api_platform_patch_noop_writes_and_records_nothing(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, probes: _Probes
+    ) -> None:
+        """Every given value equals the stored one: 200 with the stored sections, no UPDATE,
+        no audit row, no session policy change, no client."""
+        _, token = _login(db, "super_admin")
+        other_admin, _ = _login(db, "super_admin")
+        db.open_session(other_admin, expires_in=timedelta(hours=5))
+        sessions = copy.deepcopy(db.sessions_of(other_admin))
+        row = copy.deepcopy(_row(db))
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={
+                "limits": dict(_STORED_LIMITS),
+                "files": {"render_dpi": 150},
+                "retention": {"trash_max_days": 90},
+                "security": {"session_idle_timeout_minutes": 60, "session_max_lifetime_hours": 12},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert _editable(response.json()) == _STORED_SECTIONS
+        assert _row(db) == row
+        assert db.audit == []
+        assert db.matching(r"\bupdate platform_settings\b") == []
+        assert db.sessions_of(other_admin) == sessions
+        probes.create.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("stored", "retention"),
+        [
+            pytest.param({}, {"trash_min_days": 60, "trash_max_days": 30}, id="both-given"),
+            pytest.param({"trash_max_days": 30}, {"trash_min_days": 45}, id="min-over-stored-max"),
+            pytest.param({"trash_min_days": 20}, {"trash_max_days": 10}, id="max-under-stored-min"),
+            pytest.param({"trash_max_days": 30}, {"trash_min_days": 31}, id="one-over"),
+        ],
+    )
+    def test_settings_api_platform_patch_trash_min_over_max_is_400_and_writes_nothing(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        stored: dict[str, int],
+        retention: dict[str, int],
+    ) -> None:
+        _row(db).update(stored)
+        _, token = _login(db, "super_admin")
+        _cache_the_row(app, token)
+        before = _state(db)
+
+        response = _call(_client(app), "platform_patch", token, body={"retention": retention})
+
+        assert (response.status_code, response.json()) == (400, _TRASH_REFUSED)
+        assert _state(db) == before
+        assert db.audit == []
+        assert db.matching(r"\bupdate platform_settings\b") == []
+        assert _cached_sections() == _after({"retention": stored})
+
+    def test_settings_api_platform_patch_trash_refusal_drops_the_whole_patch(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """A valid security change in the same patch is not written either."""
+        _, token = _login(db, "super_admin")
+        before = _state(db)
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={
+                "retention": {"trash_min_days": 60, "trash_max_days": 30},
+                "security": {"lockout_minutes": 30},
+            },
+        )
+
+        assert (response.status_code, response.json()) == (400, _TRASH_REFUSED)
+        assert _state(db) == before
+        assert _row(db)["lockout_minutes"] == 15
+
+    def test_settings_api_platform_patch_trash_refusal_with_llm_closes_the_new_client(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, probes: _Probes
+    ) -> None:
+        """With a provider switch in the same patch: 400, the running client kept (never
+        closed), any client built for the switch closed, the live config unchanged."""
+        _, token = _login(db, "super_admin")
+        old_client = agent._llm
+        before = _state(db)
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={
+                "llm": {"provider": "openai"},
+                "retention": {"trash_min_days": 60, "trash_max_days": 30},
+            },
+        )
+
+        assert (response.status_code, response.json()) == (400, _TRASH_REFUSED)
+        assert _state(db) == before
+        assert agent._llm is old_client
+        old_client.close.assert_not_awaited()
+        assert probes.new_client.close.await_count == probes.create.call_count
+        assert server._config is not None
+        assert server._config.llm.provider == "anthropic"
+
+    @pytest.mark.parametrize(
+        ("stored", "retention"),
+        [
+            pytest.param({}, {"trash_min_days": 30, "trash_max_days": 30}, id="both-given"),
+            pytest.param({"trash_max_days": 30}, {"trash_min_days": 30}, id="min-to-stored-max"),
+        ],
+    )
+    def test_settings_api_platform_patch_trash_min_equal_to_max_is_accepted(
+        self,
+        db: FakeDb,
+        app: FastAPI,
+        stored: dict[str, int],
+        retention: dict[str, int],
+    ) -> None:
+        _row(db).update(stored)
+        _, token = _login(db, "super_admin")
+
+        response = _call(_client(app), "platform_patch", token, body={"retention": retention})
+
+        assert response.status_code == 200, response.text
+        assert (_row(db)["trash_min_days"], _row(db)["trash_max_days"]) == (30, 30)
+
+    def test_settings_api_platform_patch_audit_failure_is_500_and_changes_nothing(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """limits + a session policy change with a failing audit write: 500, the row, the
+        other Super Admin's session and the cache are all unchanged."""
+        _, token = _login(db, "super_admin")
+        other_admin, _ = _login(db, "super_admin")
+        sessions = copy.deepcopy(db.sessions_of(other_admin))
+        _cache_the_row(app, token)
+        before = _state(db)
+        db.fail_audit = True
+
+        response = _call(
+            _client(app, raise_server_exceptions=False),
+            "platform_patch",
+            token,
+            body={
+                "limits": {"max_message_length": 10},
+                "security": {"session_idle_timeout_minutes": 30},
+            },
+        )
+
+        assert response.status_code == 500
+        assert _state(db) == before
+        assert db.sessions_of(other_admin) == sessions
+        assert _cached_sections() == _STORED_SECTIONS
+
+
+# ---------------------------------------------------------------------------
+# 14. GH-160: a limits change applies without a restart
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def chat_agent(agent: MagicMock) -> MagicMock:
+    """The stub agent answers every run with a final result."""
+    agent.run = AsyncMock(return_value=_agent_result())
+    return agent
+
+
+class TestLimitsApplyWithoutRestart:
+    """POST /api/message and POST /api/confirm read the stored limits on every request:
+    the message length check and the agent_config passed to the agent run."""
+
+    def test_settings_api_message_length_change_applies_to_the_next_message(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
+    ) -> None:
+        _, admin = _login(db, "super_admin")
+        _, editor = _login(db, "editor")
+        client = _client(app)
+
+        patched = _call(
+            client, "platform_patch", admin, body={"limits": {"max_message_length": 10}}
+        )
+        too_long = _post_message(client, editor, "x" * 11)
+        fits = _post_message(client, editor, "y" * 10)
+
+        assert patched.status_code == 200, patched.text
+        assert (too_long.status_code, too_long.json()) == (
+            422,
+            {"detail": "Message exceeds maximum length of 10 characters"},
+        )
+        assert fits.status_code == 200, fits.text
+        call = _one(chat_agent.run.await_args_list)
+        assert call.kwargs["user_message"] == "y" * 10
+
+    def test_settings_api_message_length_is_read_from_the_row_when_not_cached(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
+    ) -> None:
+        """The cache is empty: the route loads the row (max_message_length 12) and caches it."""
+        _row(db)["max_message_length"] = 12
+        scoped_settings._platform_cache = None
+        _, editor = _login(db, "editor")
+
+        response = _post_message(_client(app), editor, "z" * 13)
+
+        assert (response.status_code, response.json()) == (
+            422,
+            {"detail": "Message exceeds maximum length of 12 characters"},
+        )
+        chat_agent.run.assert_not_awaited()
+        assert scoped_settings._platform_cache is not None
+        assert scoped_settings._platform_cache.limits.max_message_length == 12
+
+    def test_settings_api_message_run_gets_the_cached_limits(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
+    ) -> None:
+        """Without a change: the conftest's default row (10 tool calls, 20 context
+        messages, 300 s)."""
+        _, editor = _login(db, "editor")
+
+        response = _post_message(_client(app), editor, "hello")
+
+        assert response.status_code == 200, response.text
+        assert _agent_config_of(chat_agent) == (10, 20, 300.0)
+
+    def test_settings_api_limits_change_applies_to_the_next_agent_run(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
+    ) -> None:
+        """Values past #159's AgentConfig bounds (60 tool calls, 900 s) reach the run."""
+        _, admin = _login(db, "super_admin")
+        _, editor = _login(db, "editor")
+        client = _client(app)
+
+        patched = _call(
+            client,
+            "platform_patch",
+            admin,
+            body={
+                "limits": {
+                    "max_tool_calls_per_message": 60,
+                    "max_context_messages": 150,
+                    "confirmation_timeout_s": 900,
+                }
+            },
+        )
+        response = _post_message(client, editor, "hello")
+
+        assert patched.status_code == 200, patched.text
+        assert response.status_code == 200, response.text
+        assert _agent_config_of(chat_agent) == (60, 150, 900.0)
+
+    def test_settings_api_limits_change_applies_to_a_confirmed_run(
+        self, db: FakeDb, app: FastAPI, chat_agent: MagicMock
+    ) -> None:
+        """The message awaits a confirmation; a limits change lands in between; the
+        resumed run gets the new limits."""
+        session_id = "chat-160"
+        pending = _pending(session_id)
+        chat_agent.run = AsyncMock(side_effect=[_agent_result(pending), _agent_result()])
+        _, admin = _login(db, "super_admin")
+        _, editor = _login(db, "editor")
+        client = _client(app)
+
+        asked = _post_message(client, editor, "book it", session_id)
+        patched = _call(
+            client,
+            "platform_patch",
+            admin,
+            body={"limits": {"max_tool_calls_per_message": 5, "confirmation_timeout_s": 60}},
+        )
+        confirmed = client.post(
+            f"/api/confirm/{pending.confirmation_id}",
+            headers=_headers(editor),
+            json={
+                "session_id": session_id,
+                "confirmation_id": pending.confirmation_id,
+                "approved": True,
+            },
+        )
+
+        assert asked.status_code == 200, asked.text
+        assert patched.status_code == 200, patched.text
+        assert confirmed.status_code == 200, confirmed.text
+        assert chat_agent.run.await_count == 2
+        assert chat_agent.run.await_args_list[1].kwargs["pending_confirmation"] is not None
+        assert _agent_config_of(chat_agent, 1) == (5, 30, 60.0)
+
+
+# ---------------------------------------------------------------------------
+# 15. GH-160: the Super Admin session policy
+# ---------------------------------------------------------------------------
+
+
+class TestSuperAdminSessionPolicy:
+    """security.session_idle_timeout_minutes / session_max_lifetime_hours: new Super Admin
+    logins take them, every open Super Admin session follows at once (expires_at =
+    created_at + lifetime), members keep theirs, and the audit row counts the sessions."""
+
+    _POLICY: Final = {"session_idle_timeout_minutes": 30, "session_max_lifetime_hours": 8}
+
+    def test_settings_api_session_policy_applies_to_a_new_super_admin_login(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        _, token = _login(db, "super_admin")
+        _with_password(db, "root.two@example.ch", kind="super_admin")
+        _with_password(db, "editor.one@example.ch")
+        client = _client(app)
+
+        patched = _call(client, "platform_patch", token, body={"security": self._POLICY})
+        admin_token, admin_cookie = _log_in(client, "root.two@example.ch")
+        member_token, member_cookie = _log_in(client, "editor.one@example.ch")
+
+        assert patched.status_code == 200, patched.text
+        admin_row = db.session(admin_token)
+        assert admin_row["idle_timeout_minutes"] == 30
+        assert _lifetime(admin_row) == timedelta(hours=8)
+        assert admin_cookie.get("max-age") == "28800"
+        member_row = db.session(member_token)
+        assert (member_row["idle_timeout_minutes"], _lifetime(member_row)) == (
+            60,
+            timedelta(hours=12),
+        )
+        assert member_cookie.get("max-age") == "43200"
+
+    def test_settings_api_session_policy_login_reads_the_row_when_not_cached(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """No PATCH: the row holds 45 minutes / 6 hours and the cache is empty."""
+        _row(db).update(session_idle_timeout_minutes=45, session_max_lifetime_hours=6)
+        scoped_settings._platform_cache = None
+        _with_password(db, "root.two@example.ch", kind="super_admin")
+
+        token, cookie = _log_in(_client(app), "root.two@example.ch")
+
+        row = db.session(token)
+        assert (row["idle_timeout_minutes"], _lifetime(row)) == (45, timedelta(hours=6))
+        assert cookie.get("max-age") == str(6 * 3600)
+
+    def test_settings_api_session_policy_applies_to_open_super_admin_sessions(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """The acting Super Admin's own session and another Super Admin's follow; a
+        member's session is untouched; the audit row counts the two sessions."""
+        actor, token = _login(db, "super_admin")
+        other_admin, _ = _login(db, "super_admin")
+        member, _ = _login(db, "editor")
+        db.open_session(member, idle_timeout_minutes=45, expires_in=timedelta(hours=5))
+        member_sessions = copy.deepcopy(db.sessions_of(member))
+
+        response = _call(_client(app), "platform_patch", token, body={"security": self._POLICY})
+
+        assert response.status_code == 200, response.text
+        for admin in (actor, other_admin):
+            row = _one(db.sessions_of(admin))
+            assert (row["idle_timeout_minutes"], _lifetime(row)) == (30, timedelta(hours=8))
+        assert db.sessions_of(member) == member_sessions
+        assert _settings_changes(db) == [
+            {
+                "session_idle_timeout_minutes_old": 60,
+                "session_idle_timeout_minutes_new": 30,
+                "session_max_lifetime_hours_old": 12,
+                "session_max_lifetime_hours_new": 8,
+                "sessions_updated": 2,
+            }
+        ]
+
+    def test_settings_api_idle_only_change_keeps_the_stored_lifetime(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """Only the idle timeout changes: every Super Admin session takes it and
+        created_at + the stored 12 hours as its expiry."""
+        _, token = _login(db, "super_admin")
+        other_admin, _ = _login(db, "super_admin")
+        db.open_session(other_admin, expires_in=timedelta(hours=5))
+
+        response = _call(
+            _client(app),
+            "platform_patch",
+            token,
+            body={"security": {"session_idle_timeout_minutes": 20}},
+        )
+
+        assert response.status_code == 200, response.text
+        rows = db.sessions_of(other_admin)
+        assert len(rows) == 2
+        assert all(
+            (row["idle_timeout_minutes"], _lifetime(row)) == (20, timedelta(hours=12))
+            for row in rows
+        ), rows
+        assert _settings_changes(db) == [
+            {
+                "session_idle_timeout_minutes_old": 60,
+                "session_idle_timeout_minutes_new": 20,
+                "sessions_updated": 3,
+            }
+        ]
+
+    def test_settings_api_shorter_lifetime_ends_an_older_super_admin_session(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """Another Super Admin's session is 3 hours old (seen just now): with a 2-hour
+        lifetime its next request is 401; the acting session (just opened) goes on."""
+        _, token = _login(db, "super_admin")
+        other_admin, other_token = _login(db, "super_admin")
+        db.session(other_token)["created_at"] = datetime.now(UTC) - timedelta(hours=3)
+        client = _client(app)
+
+        patched = _call(
+            client, "platform_patch", token, body={"security": {"session_max_lifetime_hours": 2}}
+        )
+        other = _call(client, "me_get", other_token)
+        own = _call(client, "me_get", token)
+
+        assert patched.status_code == 200, patched.text
+        assert (other.status_code, other.json()) == (401, _UNAUTHORIZED)
+        assert own.status_code == 200, own.text
+        assert db.sessions_of(other_admin) == [] or all(
+            row["expires_at"] <= datetime.now(UTC) for row in db.sessions_of(other_admin)
+        )
+
+    def test_settings_api_other_security_change_leaves_sessions_alone(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """A lockout change applies no session policy: no sessions_updated, no row
+        changed."""
+        _, token = _login(db, "super_admin")
+        other_admin, _ = _login(db, "super_admin")
+        db.open_session(other_admin, expires_in=timedelta(hours=5))
+        sessions = copy.deepcopy(db.sessions_of(other_admin))
+
+        response = _call(
+            _client(app), "platform_patch", token, body={"security": {"lockout_minutes": 30}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert db.sessions_of(other_admin) == sessions
+        assert _settings_changes(db) == [{"lockout_minutes_old": 15, "lockout_minutes_new": 30}]
+
+
+# ---------------------------------------------------------------------------
+# 16. GH-160: the org deletion grace period
+# ---------------------------------------------------------------------------
+
+
+class TestGracePeriodFollowsTheSetting:
+    """The next scheduled org deletion uses the changed grace period."""
+
+    def test_settings_api_grace_period_change_applies_to_the_next_deletion(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        _, token = _login(db, "super_admin")
+        client = _client(app)
+
+        patched = _call(
+            client, "platform_patch", token, body={"retention": {"org_deletion_grace_days": 45}}
+        )
+        scheduled = client.post(
+            f"/api/platform/orgs/{OTHER_ORG_ID}/deletion", headers=_headers(token)
+        )
+
+        assert patched.status_code == 200, patched.text
+        assert scheduled.status_code == 200, scheduled.text
+        org = db.orgs[OTHER_ORG_ID]
+        assert org["purge_after"] - org["deletion_requested_at"] == timedelta(days=45)
+        assert _one(db.audit_rows("org.deletion_schedule"))["metadata"]["grace_days"] == 45
+
+
+# ---------------------------------------------------------------------------
+# 17. GH-160: access, rate limit and content-free records
+# ---------------------------------------------------------------------------
+
+
+class TestPlatformDefaultsAccess:
+    """Member roles never read or change a platform default; the section patches spend the
+    one PATCH bucket."""
+
+    @pytest.mark.parametrize("body", _MEMBER_SECTION_BODIES)
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    def test_settings_api_member_patch_of_a_section_is_403_and_touches_nothing(
+        self, db: FakeDb, app: FastAPI, role: str, body: dict[str, Any]
+    ) -> None:
+        _, token = _login(db, role)
+        before = _state(db)
+        cache = scoped_settings._platform_cache
+
+        response = _call(_client(app), "platform_patch", token, body=body)
+
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert _state(db) == before
+        assert db.matching(r"\bplatform_settings\b") == []
+        assert scoped_settings._platform_cache is cache
+
+    def test_settings_api_section_patches_share_the_patch_bucket(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _limited(monkeypatch, _ROUTE_KEYS["platform_patch"])
+        user_id, token = _login(db, "super_admin")
+        client = _client(app)
+
+        first = _call(client, "platform_patch", token, body={"files": {"render_dpi": 300}})
+        second = _call(client, "platform_patch", token, body={"security": {"lockout_minutes": 30}})
+
+        assert first.status_code == 200, first.text
+        assert (second.status_code, second.json()) == (429, _RATE_LIMITED)
+        assert (_row(db)["render_dpi"], _row(db)["lockout_minutes"]) == (300, 15)
+        assert (_ROUTE_KEYS["platform_patch"], f"user:{user_id}") in server._rate_buckets
+
+
+class TestPlatformDefaultsContentFree:
+    """No email, name or model name in a log record; the section rows hold field names and
+    ints only, never a provider or model value."""
+
+    def _flow(self, db: FakeDb, app: FastAPI) -> None:
+        _, root = _login(
+            db, "super_admin", email="zephyrmarker.root@example.ch", name="Zephyrmarker Root"
+        )
+        _with_password(db, "zephyrmarker.two@example.ch", kind="super_admin")
+        client = _client(app, raise_server_exceptions=False)
+        mixed = _call(
+            client,
+            "platform_patch",
+            root,
+            body={
+                "llm": {"provider": "infomaniak", "infomaniak_model": _MODEL_MARKER},
+                "limits": {"max_message_length": 10},
+                "files": {"render_dpi": 300},
+            },
+        )
+        assert mixed.status_code == 200, mixed.text
+        retention = _call(
+            client, "platform_patch", root, body={"retention": {"org_deletion_grace_days": 45}}
+        )
+        assert retention.status_code == 200, retention.text
+        security = _call(
+            client,
+            "platform_patch",
+            root,
+            body={"security": {"session_idle_timeout_minutes": 30, "lockout_minutes": 30}},
+        )
+        assert security.status_code == 200, security.text
+        refused = _call(
+            client,
+            "platform_patch",
+            root,
+            body={
+                "llm": {"anthropic_model": "Zephyrmarker-a2"},
+                "retention": {"trash_min_days": 60, "trash_max_days": 30},
+            },
+        )
+        assert refused.status_code == 400, refused.text
+        bad = _call(
+            client, "platform_patch", root, body={"files": {"render_dpi": "Zephyrmarker-dpi"}}
+        )
+        assert bad.status_code == 422, bad.text
+        _log_in(client, "zephyrmarker.two@example.ch")
+        assert _call(client, "platform_get", root).status_code == 200
+
+    def test_settings_api_section_flow_logs_no_content(
+        self, db: FakeDb, app: FastAPI, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+
+        self._flow(db, app)
+
+        assert "zephyrmarker" not in _log_text(caplog).lower()
+
+    def test_settings_api_section_audit_rows_hold_field_names_and_ints_only(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        self._flow(db, app)
+
+        changes = _settings_changes(db)
+        assert changes[0] == {"provider": True, "infomaniak_model": True}
+        assert len(changes) == 5
+        for metadata in changes[1:]:
+            assert all(_METADATA_KEY.fullmatch(key) for key in metadata), metadata
+            assert all(type(value) is int for value in metadata.values()), metadata
+        assert "zephyrmarker" not in json.dumps(db.audit, default=str).lower()

@@ -26,7 +26,12 @@ What these tests pin down:
 - purge_expired() validates the retention (6 to 84 months, default 12), runs
   purge_audit_events($1) and records one audit.purge event in the same
   transaction. run_retention_job() runs it daily and survives failures, and the
-  server lifespan starts it and cancels it before closing the pool. (The
+  server lifespan starts it and cancels it before closing the pool. GH-160:
+  run_retention_job(pool, *, retention_months, interval_seconds) takes a
+  required zero-argument async callable, awaited before each purge (a changed
+  value applies to the next run; a failing lookup is logged by class name and
+  retried next interval); the lifespan passes one that returns the cached
+  platform settings' retention.audit_months. (The
   lifespan helper here also stubs GH-152's session purge job, which
   tests/test_session_management_api.py covers.)
 
@@ -67,6 +72,7 @@ import pytest
 from pydantic import SecretStr, ValidationError
 
 import admino.audit_events as audit_events_mod
+from admino import scoped_settings
 from admino.access import SealedModel
 from admino.audit_events import (
     ACTION_SCOPES,
@@ -85,6 +91,7 @@ from admino.audit_events import (
 )
 from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS
 from admino.server import _lifespan, create_app
+from tests.conftest import default_test_platform_settings
 from tests.lifespan_stubs import (
     patch_login_throttle_purge_job,
     patch_org_purge_job,
@@ -1931,8 +1938,17 @@ class TestPurgeExpired:
 # ---------------------------------------------------------------------------
 
 
+def _months(value: int = 12) -> AsyncMock:
+    """A retention_months callable (GH-160): awaited without arguments, returns value."""
+    return AsyncMock(return_value=value)
+
+
 class TestRetentionJob:
-    """run_retention_job() purges now, then once per interval, and survives failures."""
+    """run_retention_job() purges now, then once per interval, and survives failures.
+
+    GH-160: the retention is a zero-argument async callable (the stored
+    retention.audit_months), awaited before each purge.
+    """
 
     async def test_audit_events_job_purges_then_sleeps_in_a_loop(self) -> None:
         """Purge, sleep, purge, sleep, ... until cancelled."""
@@ -1946,7 +1962,7 @@ class TestRetentionJob:
             _patched_job(AsyncMock(side_effect=fake_purge), _cancelling_sleep(3, events)),
             pytest.raises(asyncio.CancelledError),
         ):
-            await run_retention_job(MagicMock())
+            await run_retention_job(MagicMock(), retention_months=_months())
 
         assert events == ["purge", "sleep", "purge", "sleep", "purge", "sleep"]
 
@@ -1962,33 +1978,150 @@ class TestRetentionJob:
             _patched_job(AsyncMock(side_effect=fake_purge), _cancelling_sleep(1, events)),
             pytest.raises(asyncio.CancelledError),
         ):
-            await run_retention_job(MagicMock())
+            await run_retention_job(MagicMock(), retention_months=_months())
 
         assert events == ["purge", "sleep"]
 
-    async def test_audit_events_job_defaults_to_daily_twelve_month_purge(self) -> None:
-        """By default the job purges the given pool with 12 months, every 86400 seconds."""
+    async def test_audit_events_job_defaults_to_a_daily_purge_of_the_callables_months(
+        self,
+    ) -> None:
+        """By default the job purges the given pool with the callable's months (12 here),
+        every 86400 seconds."""
         pool = MagicMock()
         purge = AsyncMock(return_value=0)
         sleep = _cancelling_sleep(2)
 
         with _patched_job(purge, sleep), pytest.raises(asyncio.CancelledError):
-            await run_retention_job(pool)
+            await run_retention_job(pool, retention_months=_months(12))
 
         assert [_purge_pool(call) for call in purge.await_args_list] == [pool, pool]
         assert [_purge_months(call) for call in purge.await_args_list] == [12, 12]
         assert [_sleep_delay(call) for call in sleep.await_args_list] == [86400, 86400]
 
     async def test_audit_events_job_passes_custom_retention_and_interval(self) -> None:
-        """retention_months and interval_seconds are passed through."""
+        """The callable's months (24) and interval_seconds are passed through."""
         purge = AsyncMock(return_value=0)
         sleep = _cancelling_sleep(1)
 
         with _patched_job(purge, sleep), pytest.raises(asyncio.CancelledError):
-            await run_retention_job(MagicMock(), retention_months=24, interval_seconds=5)
+            await run_retention_job(MagicMock(), retention_months=_months(24), interval_seconds=5)
 
         assert _purge_months(purge.await_args_list[0]) == 24
         assert _sleep_delay(sleep.await_args_list[0]) == 5
+
+    def test_audit_events_job_retention_months_is_a_required_keyword(self) -> None:
+        """GH-160: retention_months is keyword-only with no default (the caller passes the
+        callable of the stored value)."""
+        parameter = inspect.signature(run_retention_job).parameters["retention_months"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+
+    async def test_audit_events_job_awaits_the_retention_before_each_purge(self) -> None:
+        """GH-160: every run awaits retention_months() (no arguments) first, then purges
+        with its value."""
+        events: list[str] = []
+
+        async def months() -> int:
+            events.append("months")
+            return 36
+
+        async def fake_purge(*_args: Any, **_kwargs: Any) -> int:
+            events.append("purge")
+            return 0
+
+        purge = AsyncMock(side_effect=fake_purge)
+        with (
+            _patched_job(purge, _cancelling_sleep(2, events)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_retention_job(MagicMock(), retention_months=months)
+
+        assert events == ["months", "purge", "sleep", "months", "purge", "sleep"]
+        assert [_purge_months(call) for call in purge.await_args_list] == [36, 36]
+
+    async def test_audit_events_job_uses_a_changed_retention_on_the_next_run(self) -> None:
+        """AC (GH-160): the stored value changes between two runs (12 to 60 months): the
+        next purge uses the new value, without a restart."""
+        stored = {"months": 12}
+
+        async def months() -> int:
+            return stored["months"]
+
+        async def changing_sleep(_delay: float) -> None:
+            stored["months"] = 60
+            if purge.await_count >= 2:
+                raise asyncio.CancelledError
+
+        purge = AsyncMock(return_value=0)
+        with (
+            _patched_job(purge, AsyncMock(side_effect=changing_sleep)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_retention_job(MagicMock(), retention_months=months)
+
+        assert [_purge_months(call) for call in purge.await_args_list] == [12, 60]
+
+    @pytest.mark.parametrize(
+        "make_error",
+        [
+            pytest.param(lambda: RuntimeError("boom"), id="runtime-error"),
+            pytest.param(lambda: OSError("connection refused"), id="os-error"),
+            pytest.param(lambda: asyncpg.exceptions.RaiseError("refused"), id="postgres-error"),
+            pytest.param(lambda: ValueError("bad retention"), id="value-error"),
+        ],
+    )
+    async def test_audit_events_job_survives_a_failed_retention_lookup(
+        self, make_error: Callable[[], Exception]
+    ) -> None:
+        """GH-160: a failing retention_months() skips that run's purge; the job sleeps and
+        tries again next interval."""
+        months = AsyncMock(side_effect=[make_error(), 24])
+        purge = AsyncMock(return_value=0)
+        sleep = _cancelling_sleep(2)
+
+        with _patched_job(purge, sleep), pytest.raises(asyncio.CancelledError):
+            await run_retention_job(MagicMock(), retention_months=months)
+
+        assert months.await_count == 2
+        assert [_purge_months(call) for call in purge.await_args_list] == [24]
+        assert [_sleep_delay(call) for call in sleep.await_args_list] == [86400, 86400]
+
+    async def test_audit_events_job_logs_a_failed_retention_lookup_by_class_name(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """GH-160: the failed lookup is one admino WARNING naming the exception class and
+        carrying none of its text."""
+        caplog.set_level(logging.DEBUG)
+        months = AsyncMock(side_effect=RuntimeError(_failing_row_message()))
+
+        with (
+            _patched_job(AsyncMock(return_value=0), _cancelling_sleep(1)),
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await run_retention_job(MagicMock(), retention_months=months)
+
+        warnings = [
+            entry
+            for entry in caplog.records
+            if entry.levelno == logging.WARNING and entry.name.startswith("admino")
+        ]
+        assert len(warnings) == 1
+        assert "RuntimeError" in warnings[0].getMessage()
+        _assert_no_content(caplog.text, _ORG, _USER, _PROJECT, _MARKER, _IP, _MARKER_COUNT)
+
+    async def test_audit_events_job_cancelled_retention_lookup_propagates(self) -> None:
+        """GH-160: cancellation while awaiting retention_months() stops the job (no purge,
+        no sleep)."""
+        months = AsyncMock(side_effect=asyncio.CancelledError)
+        purge = AsyncMock(return_value=0)
+        sleep = _cancelling_sleep(5)
+
+        with _patched_job(purge, sleep), pytest.raises(asyncio.CancelledError):
+            await run_retention_job(MagicMock(), retention_months=months)
+
+        purge.assert_not_awaited()
+        sleep.assert_not_awaited()
 
     @pytest.mark.parametrize(
         "make_error",
@@ -2008,7 +2141,7 @@ class TestRetentionJob:
         sleep = _cancelling_sleep(2)
 
         with _patched_job(purge, sleep), pytest.raises(asyncio.CancelledError):
-            await run_retention_job(MagicMock())
+            await run_retention_job(MagicMock(), retention_months=_months())
 
         assert purge.await_count == 2
         assert [_sleep_delay(call) for call in sleep.await_args_list] == [86400, 86400]
@@ -2021,7 +2154,7 @@ class TestRetentionJob:
         purge = AsyncMock(side_effect=RuntimeError("boom"))
 
         with _patched_job(purge, _cancelling_sleep(1)), pytest.raises(asyncio.CancelledError):
-            await run_retention_job(MagicMock())
+            await run_retention_job(MagicMock(), retention_months=_months())
 
         assert any(
             entry.levelno == logging.WARNING and entry.name.startswith("admino")
@@ -2036,7 +2169,7 @@ class TestRetentionJob:
         purge = AsyncMock(side_effect=asyncpg.exceptions.RaiseError(_failing_row_message()))
 
         with _patched_job(purge, _cancelling_sleep(1)), pytest.raises(asyncio.CancelledError):
-            await run_retention_job(MagicMock())
+            await run_retention_job(MagicMock(), retention_months=_months())
 
         _assert_no_content(caplog.text, _ORG, _USER, _PROJECT, _MARKER, _IP, _MARKER_COUNT)
 
@@ -2046,7 +2179,7 @@ class TestRetentionJob:
         sleep = _cancelling_sleep(5)
 
         with _patched_job(purge, sleep), pytest.raises(asyncio.CancelledError):
-            await run_retention_job(MagicMock())
+            await run_retention_job(MagicMock(), retention_months=_months())
 
         assert purge.await_count == 1
         sleep.assert_not_awaited()
@@ -2061,7 +2194,7 @@ class TestRetentionJob:
 
         purge = AsyncMock(return_value=0)
         with _patched_job(purge, AsyncMock(side_effect=blocking_sleep)):
-            task = asyncio.create_task(run_retention_job(MagicMock()))
+            task = asyncio.create_task(run_retention_job(MagicMock(), retention_months=_months()))
             async with asyncio.timeout(5):
                 await sleeping.wait()
             task.cancel()
@@ -2093,15 +2226,17 @@ class _JobProbe:
     def __init__(self) -> None:
         self.events: list[str] = []
         self.pools: list[Any] = []
+        self.kwargs: list[dict[str, Any]] = []
         self.tasks: list[asyncio.Task[Any]] = []
         self.pool: Any = MagicMock(name="pool")
 
-    async def job(self, pool: Any, *_args: Any, **_kwargs: Any) -> None:
+    async def job(self, pool: Any, *_args: Any, **kwargs: Any) -> None:
         """The fake job: blocks until cancelled, then finishes after one more loop turn."""
         task = asyncio.current_task()
         assert task is not None
         self.tasks.append(task)
         self.pools.append(pool)
+        self.kwargs.append(dict(kwargs))
         self.events.append("job-started")
         try:
             await asyncio.Event().wait()
@@ -2157,6 +2292,18 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
         yield
 
 
+def _store_audit_months(monkeypatch: pytest.MonkeyPatch, months: int) -> None:
+    """Make the cached platform settings carry this audit retention (GH-160).
+
+    Built from a dict at call time: StoredPlatformSettings' retention section is
+    new in #160.
+    """
+    data = default_test_platform_settings().model_dump()
+    data["retention"] = {**data.get("retention", {}), "audit_months": months}
+    stored = scoped_settings.StoredPlatformSettings.model_validate(data)
+    monkeypatch.setattr(scoped_settings, "_platform_cache", stored)
+
+
 async def _let_tasks_run() -> None:
     """Give scheduled tasks a few loop turns to start."""
     for _ in range(5):
@@ -2175,6 +2322,27 @@ class TestLifespanStartsRetentionJob:
             async with asyncio.timeout(5), _lifespan(app):
                 await _let_tasks_run()
                 assert probe.pools == [probe.pool]
+
+    async def test_audit_events_lifespan_passes_the_stored_audit_months(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-160: the job gets retention_months, a zero-argument async callable returning
+        the cached retention.audit_months, read on every call (36, then 60 after a
+        change) and never through the MagicMock pool."""
+        _store_audit_months(monkeypatch, 36)
+        probe = _JobProbe()
+        app = create_app(agent=MagicMock(), config=_make_config())
+
+        with _patched_lifespan(probe):
+            async with asyncio.timeout(5), _lifespan(app):
+                await _let_tasks_run()
+                months = probe.kwargs[0]["retention_months"]
+                first = await months()
+                _store_audit_months(monkeypatch, 60)
+                second = await months()
+
+        assert (first, second) == (36, 60)
+        assert probe.pool.mock_calls == []
 
     async def test_audit_events_lifespan_starts_job_after_init_pool(self) -> None:
         """The job starts only once the pool exists."""

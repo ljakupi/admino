@@ -53,6 +53,9 @@ Security notes:
   never crashes the loop.
 - ``max_tool_calls`` is a hard cap enforced per-call inside the dispatch
   batch — the loop breaks the moment it is reached, even mid-batch.
+- A run's limits come from its own ``agent_config`` (the server builds it
+  from the stored platform limits on every request, GH-160) or, without
+  one, from the construction-time config; a run's config never outlives it.
 """
 
 from __future__ import annotations
@@ -183,7 +186,8 @@ class Agent:
                 dispatch on every tool call. The agent itself never inspects
                 it.
             agent_config: Runtime limits (``max_tool_calls``,
-                ``max_context_messages``).
+                ``max_context_messages``, ``confirmation_timeout_s``) of a run
+                that is given none.
             system_prompt: Optional system message sent once, first, on every
                 LLM call. Used to communicate available file paths,
                 operator constraints, and other static context to the LLM.
@@ -213,6 +217,7 @@ class Agent:
         history: list[LLMMessage],
         principal: Principal,
         pending_confirmation: PendingConfirmation | None = None,
+        agent_config: AgentConfig | None = None,
     ) -> AgentResult:
         """Run the agent loop for a single user message.
 
@@ -236,12 +241,17 @@ class Agent:
                 being resumed. The first tool call in this turn is dispatched
                 with this value so ``registry.dispatch_tool_call`` can verify
                 identity/expiry.
+            agent_config: This run's limits (``max_tool_calls``,
+                ``max_context_messages``, ``confirmation_timeout_s``; GH-160:
+                the stored platform limits). None: the construction-time
+                config. Applies to this run only.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
             history (user/assistant/tool messages only — never the system
             prompt), and a summary of tool calls made during the run.
         """
+        config = self._config if agent_config is None else agent_config
         # Work on a local copy so we never mutate the caller's list. The
         # system prompt is NOT stored here: it is added per LLM call by
         # _build_context, so the returned history never carries it and it
@@ -327,13 +337,13 @@ class Agent:
 
         # Bounded loop. Each iteration = one LLM round trip, possibly followed
         # by a batch of tool dispatches.
-        for _iteration in range(self._config.max_tool_calls + 1):
+        for _iteration in range(config.max_tool_calls + 1):
             # 1. Call the LLM with the system prompt + a trimmed context window.
             context = _build_context(
                 working_history,
                 system_prompt=self._system_prompt,
                 current_idx=current_idx,
-                max_messages=self._config.max_context_messages,
+                max_messages=config.max_context_messages,
             )
             try:
                 response = await self._llm.chat(context, tools=tools_payload)
@@ -401,7 +411,7 @@ class Agent:
             )
 
             for tool_call in batch:
-                if tool_calls_used >= self._config.max_tool_calls:
+                if tool_calls_used >= config.max_tool_calls:
                     # Hard cap reached mid-batch — stop immediately.
                     return self._terminal_limit(
                         history=working_history,
@@ -454,7 +464,7 @@ class Agent:
                     pending = _build_pending_confirmation(
                         tool_call=tool_call,
                         session_id=session_id,
-                        timeout_s=self._config.confirmation_timeout_s,
+                        timeout_s=config.confirmation_timeout_s,
                     )
                     return AgentResult(
                         status="awaiting_confirmation",
@@ -477,7 +487,7 @@ class Agent:
 
             # After the batch, loop back for another LLM turn unless the cap
             # has been reached.
-            if tool_calls_used >= self._config.max_tool_calls:
+            if tool_calls_used >= config.max_tool_calls:
                 # Give the LLM one final chance to summarise, OR, if we have
                 # already done so once, terminate. The simplest safe choice
                 # is to terminate here — the LLM may otherwise issue more

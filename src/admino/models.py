@@ -26,6 +26,11 @@ Security notes:
   one value and hide their input from validation errors. Model names must
   fully match the model-name rule, the same as migration 0013's CHECK.
   ``SettingsLLM`` shows key presence flags only, never a key.
+- Platform defaults (GH-160): the section patch models of
+  ``PlatformSettingsPatch`` take strict ints only (a bool, float or numeric
+  string is refused, never coerced) within bounds that mirror migration
+  0014's CHECKs; the session and audit retention bounds are the
+  ``admino.sessions`` and ``admino.audit_events`` constants.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
   Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
@@ -70,6 +75,7 @@ from pydantic import (
     model_validator,
 )
 
+from admino import audit_events, sessions
 from admino.access import (  # noqa: TC001 — Pydantic resolves field annotations at runtime
     MemberRole,
     PlainUUID,
@@ -519,13 +525,14 @@ class AgentConfig(BaseModel):
     """Runtime configuration for the agent loop.
 
     Separate from AppConfig (which covers the full application). AgentConfig
-    controls agent-specific behavior limits.
+    controls agent-specific behavior limits. Its bounds hold every stored
+    platform limit (GH-160), so a run's config can be built from them.
     """
 
     max_tool_calls: int = Field(
         default=10,
         ge=1,
-        le=50,
+        le=100,
         description="Maximum tool calls the agent may make per user message.",
     )
     max_context_messages: int = Field(
@@ -540,7 +547,7 @@ class AgentConfig(BaseModel):
     confirmation_timeout_s: float = Field(
         default=30.0,
         ge=1.0,
-        le=300.0,
+        le=3600.0,
         description="Seconds before an unconfirmed action is automatically denied.",
     )
 
@@ -1500,42 +1507,176 @@ class OrgSettingsPatch(BaseModel):
         return self
 
 
-class PlatformLimits(BaseModel):
-    """The platform limits (read-only until #160), with ``LimitsConfig``'s bounds."""
+# The bounds of each platform default (GH-160), shared by its response and
+# patch fields and mirrored by migration 0013's (limits) and 0014's CHECKs.
+_ToolCallsPerMessage = Annotated[int, Field(ge=1, le=100)]
+_PendingConfirmations = Annotated[int, Field(ge=1, le=50)]
+_ConfirmationTimeoutS = Annotated[int, Field(ge=10, le=3600)]
+_MessageLength = Annotated[int, Field(ge=1, le=100_000)]
+_ContextMessages = Annotated[int, Field(ge=1, le=200)]
+_FileSizeMb = Annotated[int, Field(ge=1, le=500)]
+_FilesPerMessage = Annotated[int, Field(ge=1, le=50)]
+_PagesPerFile = Annotated[int, Field(ge=1, le=1000)]
+_RenderDpi = Annotated[int, Field(ge=72, le=300)]
+_TrashDays = Annotated[int, Field(ge=0, le=90)]
+_AuditMonths = Annotated[
+    int,
+    Field(ge=audit_events.MIN_RETENTION_MONTHS, le=audit_events.MAX_RETENTION_MONTHS),
+]
+_GraceDays = Annotated[int, Field(ge=7, le=90)]
+_RequestsPerMinute = Annotated[int, Field(ge=1, le=600)]
+_LockoutFailures = Annotated[int, Field(ge=3, le=100)]
+_LockoutMinutes = Annotated[int, Field(ge=1, le=1440)]
+_IdleTimeoutMinutes = Annotated[
+    int,
+    Field(ge=sessions.MIN_IDLE_TIMEOUT_MINUTES, le=sessions.MAX_IDLE_TIMEOUT_MINUTES),
+]
+_LifetimeHours = Annotated[
+    int, Field(ge=sessions.MIN_LIFETIME_HOURS, le=sessions.MAX_LIFETIME_HOURS)
+]
+_TRASH_ORDER_ERROR: Final = "The trash retention minimum can't exceed the maximum."
 
-    max_tool_calls_per_message: int = Field(ge=1, le=100)
-    max_pending_confirmations: int = Field(ge=1, le=50)
-    confirmation_timeout_s: int = Field(ge=10, le=3600)
-    max_message_length: int = Field(ge=1, le=100_000)
-    max_context_messages: int = Field(ge=1, le=200)
+
+class PlatformLimits(BaseModel):
+    """The platform limits, with ``LimitsConfig``'s bounds (editable since GH-160)."""
+
+    max_tool_calls_per_message: _ToolCallsPerMessage
+    max_pending_confirmations: _PendingConfirmations
+    confirmation_timeout_s: _ConfirmationTimeoutS
+    max_message_length: _MessageLength
+    max_context_messages: _ContextMessages
+
+
+class PlatformFiles(BaseModel):
+    """The platform file limits (GH-160): size in MB, files per message, pages, render DPI."""
+
+    max_file_size_mb: _FileSizeMb = 50
+    max_files_per_message: _FilesPerMessage = 10
+    max_pages_per_file: _PagesPerFile = 100
+    render_dpi: _RenderDpi = 150
+
+
+class PlatformRetention(BaseModel):
+    """The platform retention (GH-160): trash bounds in days, audit months, grace days.
+
+    The trash minimum can't exceed the maximum; the message never repeats the
+    values.
+    """
+
+    trash_min_days: _TrashDays = 0
+    trash_max_days: _TrashDays = 90
+    audit_months: _AuditMonths = audit_events.DEFAULT_RETENTION_MONTHS
+    org_deletion_grace_days: _GraceDays = 30
+
+    @model_validator(mode="after")
+    def _check_trash_order(self) -> PlatformRetention:
+        """Refuse a trash minimum above the trash maximum."""
+        if self.trash_min_days > self.trash_max_days:
+            raise ValueError(_TRASH_ORDER_ERROR)
+        return self
+
+
+class PlatformSecurity(BaseModel):
+    """The platform security (GH-160): rate limit, login lockout, Super Admin sessions.
+
+    The session bounds are ``admino.sessions``' (migration 0009's CHECKs).
+    """
+
+    rate_limit_per_minute: _RequestsPerMinute = 20
+    lockout_after_failures: _LockoutFailures = 10
+    lockout_window_minutes: _LockoutMinutes = 15
+    lockout_minutes: _LockoutMinutes = 15
+    session_idle_timeout_minutes: _IdleTimeoutMinutes = sessions.DEFAULT_IDLE_TIMEOUT_MINUTES
+    session_max_lifetime_hours: _LifetimeHours = sessions.DEFAULT_LIFETIME_HOURS
 
 
 class PlatformSettingsResponse(BaseModel):
-    """GET/PATCH /api/platform/settings response (Super Admin): the LLM and the limits.
+    """GET/PATCH /api/platform/settings response (Super Admin): the five sections.
 
     No content and no secret: key presence flags only.
     """
 
     llm: SettingsLLM
     limits: PlatformLimits
+    files: PlatformFiles
+    retention: PlatformRetention
+    security: PlatformSecurity
+
+
+class PlatformLimitsPatch(BaseModel):
+    """The platform limits to change: strict ints within the bounds, a null not given."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    max_tool_calls_per_message: _ToolCallsPerMessage | None = None
+    max_pending_confirmations: _PendingConfirmations | None = None
+    confirmation_timeout_s: _ConfirmationTimeoutS | None = None
+    max_message_length: _MessageLength | None = None
+    max_context_messages: _ContextMessages | None = None
+
+
+class PlatformFilesPatch(BaseModel):
+    """The platform file limits to change: strict ints within the bounds, a null not given."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    max_file_size_mb: _FileSizeMb | None = None
+    max_files_per_message: _FilesPerMessage | None = None
+    max_pages_per_file: _PagesPerFile | None = None
+    render_dpi: _RenderDpi | None = None
+
+
+class PlatformRetentionPatch(BaseModel):
+    """The platform retention to change: strict ints within the bounds, a null not given.
+
+    The trash order isn't checked here: the service checks the patch merged
+    into the stored values.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    trash_min_days: _TrashDays | None = None
+    trash_max_days: _TrashDays | None = None
+    audit_months: _AuditMonths | None = None
+    org_deletion_grace_days: _GraceDays | None = None
+
+
+class PlatformSecurityPatch(BaseModel):
+    """The platform security to change: strict ints within the bounds, a null not given."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    rate_limit_per_minute: _RequestsPerMinute | None = None
+    lockout_after_failures: _LockoutFailures | None = None
+    lockout_window_minutes: _LockoutMinutes | None = None
+    lockout_minutes: _LockoutMinutes | None = None
+    session_idle_timeout_minutes: _IdleTimeoutMinutes | None = None
+    session_max_lifetime_hours: _LifetimeHours | None = None
 
 
 class PlatformSettingsPatch(BaseModel):
-    """PATCH /api/platform/settings request body: the platform LLM only.
+    """PATCH /api/platform/settings request body: the platform defaults to change.
 
-    A ``limits`` key is refused until #160 makes the limits editable. At least
-    one llm field must be given. Validation errors never repeat the input.
+    Five optional sections (llm, limits, files, retention, security); any
+    other key, top-level or nested, is refused. At least one value must be
+    given: an empty section or a null counts as not given. Validation errors
+    never repeat the input.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    llm: SettingsPatchLLM
+    llm: SettingsPatchLLM | None = None
+    limits: PlatformLimitsPatch | None = None
+    files: PlatformFilesPatch | None = None
+    retention: PlatformRetentionPatch | None = None
+    security: PlatformSecurityPatch | None = None
 
     @model_validator(mode="after")
     def _check_something_given(self) -> PlatformSettingsPatch:
-        """Refuse a patch that names no llm field."""
-        if not self.llm.model_dump(exclude_none=True):
-            msg = "Give at least one LLM setting to change."
+        """Refuse a patch that gives no value in any section."""
+        sections = (self.llm, self.limits, self.files, self.retention, self.security)
+        if not any(section.model_dump(exclude_none=True) for section in sections if section):
+            msg = "Give at least one setting to change."
             raise ValueError(msg)
         return self
 

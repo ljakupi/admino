@@ -10,6 +10,9 @@ What these tests pin down:
 - ``POST /api/auth/login``: the cookie's Max-Age is the session policy's lifetime
   (43200 by default; a Super Admin gets the platform policy, a member the org
   policy), and the stored row carries that policy's idle timeout and expiry.
+  GH-160: the platform policy is the stored one (the platform settings'
+  security section, read through the cache or, when it is empty, from the
+  platform_settings row); a change applies to the next Super Admin login.
 - ``POST /api/auth/logout`` deletes the session row (unaudited, as before).
 - Enforcement on every request: a session idle past its own timeout, or expired,
   is 401; a live session last seen minutes ago is 200 and its ``last_seen_at`` is
@@ -56,10 +59,11 @@ import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from admino import server
+from admino import scoped_settings, server
 from admino import sessions as sessions_mod
 from admino.access import Capability
 from admino.server import _lifespan, create_app
+from tests.conftest import default_test_platform_settings
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, fake_hash, sha256
 from tests.lifespan_stubs import (
     patch_login_throttle_purge_job,
@@ -254,6 +258,22 @@ def _policy(idle: int, lifetime: int) -> Any:
     return sessions_mod.SessionPolicy(idle_timeout_minutes=idle, max_lifetime_hours=lifetime)
 
 
+def _store_session_policy(monkeypatch: pytest.MonkeyPatch, *, idle: int, lifetime: int) -> None:
+    """Make the cached platform settings carry this Super Admin session policy (GH-160).
+
+    Built from a dict at call time: StoredPlatformSettings' security section is
+    new in #160.
+    """
+    data = default_test_platform_settings().model_dump()
+    data["security"] = {
+        **data.get("security", {}),
+        "session_idle_timeout_minutes": idle,
+        "session_max_lifetime_hours": lifetime,
+    }
+    stored = scoped_settings.StoredPlatformSettings.model_validate(data)
+    monkeypatch.setattr(scoped_settings, "_platform_cache", stored)
+
+
 def _template_of(url: str) -> str:
     """The route template a concrete URL of the new routes belongs to."""
     if url == _ME_SESSIONS:
@@ -356,9 +376,10 @@ class TestLoginPolicy:
     def test_session_management_api_platform_policy_applies_to_super_admins_only(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With an 8-hour, 30-minute platform policy a Super Admin gets Max-Age=28800 and a
-        30-minute row expiring after 8 hours; a member keeps 43200 / 60 minutes / 12 h."""
-        monkeypatch.setattr(sessions_mod, "PLATFORM_SESSION_POLICY", _policy(30, 8))
+        """With a stored 8-hour, 30-minute platform policy a Super Admin gets Max-Age=28800
+        and a 30-minute row expiring after 8 hours; a member keeps 43200 / 60 minutes /
+        12 h (GH-160: the cached platform settings' security section)."""
+        _store_session_policy(monkeypatch, idle=30, lifetime=8)
         admin = _super_admin(db)
         member = _member(db)
         client = _client(_app())
@@ -374,6 +395,41 @@ class TestLoginPolicy:
         member_row = db.session(member_token)
         assert member_row["idle_timeout_minutes"] == 60
         assert member_row["expires_at"] - member_row["created_at"] == timedelta(hours=12)
+
+    def test_session_management_api_super_admin_login_reads_the_stored_row(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With an empty cache the policy comes from the platform_settings row (45 minutes,
+        6 hours): Max-Age=21600 and a 45-minute row expiring after 6 hours (GH-160)."""
+        monkeypatch.setattr(scoped_settings, "_platform_cache", None)
+        db.add_platform_settings(session_idle_timeout_minutes=45, session_max_lifetime_hours=6)
+        admin = _super_admin(db)
+
+        token, cookie = _session_set_cookie(_login(_client(_app()), db.users[admin]["email"]))
+
+        assert cookie.get("max-age") == "21600"
+        row = db.session(token)
+        assert row["idle_timeout_minutes"] == 45
+        assert row["expires_at"] - row["created_at"] == timedelta(hours=6)
+
+    def test_session_management_api_new_super_admin_login_gets_a_changed_policy(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC (GH-160): after the stored policy changes (30 min / 8 h to 120 min / 2 h),
+        the next Super Admin login gets the new values without a restart."""
+        _store_session_policy(monkeypatch, idle=30, lifetime=8)
+        admin = _super_admin(db)
+        client = _client(_app())
+        first_token, first_cookie = _session_set_cookie(_login(client, db.users[admin]["email"]))
+
+        _store_session_policy(monkeypatch, idle=120, lifetime=2)
+        token, cookie = _session_set_cookie(_login(client, db.users[admin]["email"]))
+
+        assert (first_cookie.get("max-age"), cookie.get("max-age")) == ("28800", "7200")
+        row = db.session(token)
+        assert row["idle_timeout_minutes"] == 120
+        assert row["expires_at"] - row["created_at"] == timedelta(hours=2)
+        assert db.session(first_token)["idle_timeout_minutes"] == 30
 
     def test_session_management_api_org_policy_applies_to_members_only(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch

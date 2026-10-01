@@ -63,7 +63,7 @@ from starlette.routing import Route
 
 from admino import models, server
 from admino.access import Principal
-from admino.models import AgentResult, LLMMessage, PendingConfirmation, ToolCall
+from admino.models import AgentConfig, AgentResult, LLMMessage, PendingConfirmation, ToolCall
 from admino.server import create_app
 from tests.db_fakes import FakeDb as SharedFakeDb
 from tests.db_fakes import NowPlus, insert_values
@@ -427,6 +427,7 @@ class _FakeAgent:
         history: list[LLMMessage],
         principal: Principal,
         pending_confirmation: PendingConfirmation | None = None,
+        agent_config: AgentConfig | None = None,
     ) -> AgentResult:
         self.run_calls.append(
             {
@@ -434,6 +435,7 @@ class _FakeAgent:
                 "session_id": session_id,
                 "principal": principal,
                 "pending_confirmation": pending_confirmation,
+                "agent_config": agent_config,
             }
         )
         return AgentResult(

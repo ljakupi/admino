@@ -1,21 +1,48 @@
-"""Tests for admino.scoped_settings — the platform, org and user settings scopes (GH-159).
+"""Tests for admino.scoped_settings — the platform, org and user settings scopes
+(GH-159) and the cached, editable platform defaults (GH-160).
 
 The old key/value ``settings`` table is dropped (migration 0013). Each value
 now has an owner: ``user_settings`` (each user: theme and notifications),
 ``org_settings`` (each org: the enabled tool services) and one
-``platform_settings`` row (the Super Admin: the LLM provider and models, and
-the limits). ``admino.scoped_settings`` is the service behind the three
-routes and the startup.
+``platform_settings`` row (the Super Admin: the LLM provider and models, the
+limits and, since migration 0014, the files, retention and security
+defaults). ``admino.scoped_settings`` is the service behind the three routes,
+the startup and every consumer of a platform default.
 
-What these tests pin down (the GH-159 implementation contract):
+What these tests pin down (the GH-159 and GH-160 implementation contracts):
 - Surface: ``get_user_settings`` / ``update_user_settings`` /
   ``get_org_settings`` / ``update_org_settings`` / ``all_orgs_tools_gate`` /
   ``seed_platform_settings`` / ``load_platform_settings`` /
-  ``update_platform_llm`` are coroutines, ``apply_platform_settings`` is
+  ``current_platform_settings`` / ``session_policy_for`` /
+  ``update_platform_settings`` are coroutines, ``apply_platform_settings`` is
   pure; ``actor``, ``patch`` and ``ip`` are keyword-only;
-  ``StoredPlatformSettings`` (``llm`` + ``limits``) is importable from the
-  module; the module imports only access, tenancy, audit_events, models and
-  config from admino.
+  ``update_platform_llm`` is gone (GH-160); ``InvalidPlatformSettingsError``
+  is a ValueError; ``StoredPlatformSettings`` (``llm``, ``limits``,
+  ``files``, ``retention``, ``security``, the last three defaulting to the
+  table defaults) is importable from the module; the module imports only
+  access, tenancy, audit_events, models, config and sessions from admino.
+- The cache (GH-160): ``current_platform_settings`` answers from
+  ``_platform_cache`` without a query; on a miss it reads the row once (one
+  fetchrow, through a pool or a connection) and caches it; no row is a
+  RuntimeError and the cache stays empty. ``load_platform_settings`` always
+  reads the row (every column) and replaces the cache.
+- ``update_platform_settings`` (GH-160, replacing ``update_platform_llm``):
+  ``platform.defaults.manage`` before any statement; one transaction that
+  locks the row, writes only the changed fields in one UPDATE (the patch
+  merged into the stored row), applies a changed session policy to every
+  open Super Admin session (``sessions.apply_super_admin_policy``, members
+  untouched, an old or idle session ends at once) and records one
+  ``platform.settings_change`` event per changed section in the order llm,
+  limits, files, retention, security (llm: field names only; the others:
+  ``<field>_old`` / ``<field>_new`` ints, security adding
+  ``sessions_updated`` iff a session field changed). Retention is validated
+  on the merged values (trash min <= max) before any write
+  (``InvalidPlatformSettingsError``). A no-op writes nothing; an audit failure
+  rolls the row and the sessions back and keeps the cache; the cache takes
+  the new settings only after the commit and equals the return value.
+- ``session_policy_for``: "member" is ``sessions.DEFAULT_ORG_SESSION_POLICY``
+  (read at call time, no query), "super_admin" is the stored security
+  policy (cached), anything else a ValueError without a query.
 - Authorization through ``access.can`` before any statement:
   ``account.manage`` for the user scope (every role, the Super Admin
   included), ``org.settings.manage`` for the org scope (Org Admin only),
@@ -33,9 +60,10 @@ What these tests pin down (the GH-159 implementation contract):
   the org, the org as target, the client IP, one ``<tool>_old`` /
   ``<tool>_new`` bool pair per CHANGED tool). A no-op records nothing; an
   audit failure raises ``AuditRecordError`` and rolls the change back.
-- ``update_platform_llm``: the same for ``platform.settings_change`` (actor
-  super_admin, no org, no target, metadata ``{<changed field>: True}`` with
-  field names only, never a provider or model value).
+- ``update_platform_settings`` with an llm patch: the same for
+  ``platform.settings_change`` (actor super_admin, no org, no target,
+  metadata ``{<changed field>: True}`` with field names only, never a
+  provider or model value).
 - ``all_orgs_tools_gate``: one aggregate statement; a tool is off when ANY
   org turned it off; no rows means all seven on.
 - ``seed_platform_settings``: one upsert; the first boot stores config.yaml's
@@ -59,9 +87,10 @@ own until the module exists.
 
 Security notes:
 - Least privilege: an Editor can't change org settings, an Org Admin can't
-  change the platform LLM, and the Super Admin reaches no org's settings.
+  change any platform default, and the Super Admin reaches no org's settings.
 - Fail closed: every org or platform change shares one transaction with its
-  audit event.
+  audit events (and the Super Admin sessions it re-times); an invalid merge
+  writes nothing.
 - No content in audit rows or logs: IDs, bools and field names only.
 """
 
@@ -110,6 +139,106 @@ _LIMIT_FIELDS = (
     "max_message_length",
     "max_context_messages",
 )
+# The limits _platform() stores (GH-159).
+_STORED_LIMITS: dict[str, int] = {
+    "max_tool_calls_per_message": 7,
+    "max_pending_confirmations": 4,
+    "confirmation_timeout_s": 120,
+    "max_message_length": 5000,
+    "max_context_messages": 30,
+}
+# GH-160: the sections of migration 0014 and their defaults (the issue's Decisions).
+_DEFAULT_SECTIONS = ("files", "retention", "security")
+_SECTION_DEFAULTS: dict[str, dict[str, int]] = {
+    "files": {
+        "max_file_size_mb": 50,
+        "max_files_per_message": 10,
+        "max_pages_per_file": 100,
+        "render_dpi": 150,
+    },
+    "retention": {
+        "trash_min_days": 0,
+        "trash_max_days": 90,
+        "audit_months": 12,
+        "org_deletion_grace_days": 30,
+    },
+    "security": {
+        "rate_limit_per_minute": 20,
+        "lockout_after_failures": 10,
+        "lockout_window_minutes": 15,
+        "lockout_minutes": 15,
+        "session_idle_timeout_minutes": 60,
+        "session_max_lifetime_hours": 12,
+    },
+}
+# What _platform() stores in each int section.
+_STORED_SECTIONS: dict[str, dict[str, int]] = {"limits": _STORED_LIMITS, **_SECTION_DEFAULTS}
+# Non-default values (inside the bounds, trash min <= max) for every GH-160 column.
+_CUSTOM_SECTIONS: dict[str, dict[str, int]] = {
+    "files": {
+        "max_file_size_mb": 200,
+        "max_files_per_message": 20,
+        "max_pages_per_file": 500,
+        "render_dpi": 300,
+    },
+    "retention": {
+        "trash_min_days": 7,
+        "trash_max_days": 60,
+        "audit_months": 24,
+        "org_deletion_grace_days": 14,
+    },
+    "security": {
+        "rate_limit_per_minute": 90,
+        "lockout_after_failures": 5,
+        "lockout_window_minutes": 30,
+        "lockout_minutes": 45,
+        "session_idle_timeout_minutes": 120,
+        "session_max_lifetime_hours": 24,
+    },
+}
+_CUSTOM_COLUMNS: dict[str, int] = {
+    column: value for section in _CUSTOM_SECTIONS.values() for column, value in section.items()
+}
+# (section, patch, {changed field: (old, new)}) against _platform(): each patch also
+# repeats one stored value, which is no change.
+_SECTION_CHANGES = [
+    pytest.param(
+        "limits",
+        {
+            "max_tool_calls_per_message": 25,
+            "max_pending_confirmations": 4,
+            "confirmation_timeout_s": 900,
+        },
+        {"max_tool_calls_per_message": (7, 25), "confirmation_timeout_s": (120, 900)},
+        id="limits",
+    ),
+    pytest.param(
+        "files",
+        {"max_file_size_mb": 200, "render_dpi": 150, "max_pages_per_file": 1000},
+        {"max_file_size_mb": (50, 200), "max_pages_per_file": (100, 1000)},
+        id="files",
+    ),
+    pytest.param(
+        "retention",
+        {"audit_months": 24, "org_deletion_grace_days": 30, "trash_min_days": 7},
+        {"audit_months": (12, 24), "trash_min_days": (0, 7)},
+        id="retention",
+    ),
+    pytest.param(
+        "security",
+        {"rate_limit_per_minute": 60, "lockout_minutes": 15, "lockout_after_failures": 5},
+        {"rate_limit_per_minute": (20, 60), "lockout_after_failures": (10, 5)},
+        id="security",
+    ),
+]
+# One change per int section (security: a session field).
+_ONE_CHANGE: dict[str, dict[str, int]] = {
+    "limits": {"max_context_messages": 50},
+    "files": {"render_dpi": 300},
+    "retention": {"audit_months": 24},
+    "security": {"session_idle_timeout_minutes": 30},
+}
+_SESSION_POLICY_CHANGE = {"session_idle_timeout_minutes": 30, "session_max_lifetime_hours": 4}
 _ORG_FUNCTIONS = ["get_org_settings", "update_org_settings"]
 _USER_FUNCTIONS = ["get_user_settings", "update_user_settings"]
 _CAPABILITIES: dict[str, Capability] = {
@@ -117,7 +246,7 @@ _CAPABILITIES: dict[str, Capability] = {
     "update_user_settings": Capability.ACCOUNT_MANAGE,
     "get_org_settings": Capability.ORG_SETTINGS_MANAGE,
     "update_org_settings": Capability.ORG_SETTINGS_MANAGE,
-    "update_platform_llm": Capability.PLATFORM_DEFAULTS_MANAGE,
+    "update_platform_settings": Capability.PLATFORM_DEFAULTS_MANAGE,
 }
 # (function, role) pairs that must be refused before any statement.
 _REFUSED = [
@@ -127,14 +256,16 @@ _REFUSED = [
         for role in ("editor", "viewer", "super_admin")
     ),
     *(
-        pytest.param("update_platform_llm", role, id=f"update_platform_llm-{role}")
+        pytest.param("update_platform_settings", role, id=f"update_platform_settings-{role}")
         for role in ("org_admin", "editor", "viewer")
     ),
 ]
 _ALLOWED = [
     *(pytest.param(name, role, id=f"{name}-{role}") for name in _USER_FUNCTIONS for role in _ROLES),
     *(pytest.param(name, "org_admin", id=f"{name}-org_admin") for name in _ORG_FUNCTIONS),
-    pytest.param("update_platform_llm", "super_admin", id="update_platform_llm-super_admin"),
+    pytest.param(
+        "update_platform_settings", "super_admin", id="update_platform_settings-super_admin"
+    ),
 ]
 
 
@@ -188,10 +319,16 @@ def _org_patch(**tools: bool) -> Any:
     return OrgSettingsPatch.model_validate({"tools": tools})
 
 
-def _llm_patch(**fields: str) -> Any:
-    from admino.models import SettingsPatchLLM
+def _settings_patch(**sections: dict[str, Any]) -> Any:
+    """A PlatformSettingsPatch of these sections (llm, limits, files, retention, security)."""
+    from admino.models import PlatformSettingsPatch
 
-    return SettingsPatchLLM.model_validate(fields)
+    return PlatformSettingsPatch.model_validate(sections)
+
+
+def _llm_patch(**fields: str) -> Any:
+    """A PlatformSettingsPatch that names only these llm fields."""
+    return _settings_patch(llm=fields)
 
 
 def _config(
@@ -243,8 +380,10 @@ def _stored(svc: ModuleType, **overrides: Any) -> Any:
     }
     llm.update(overrides.pop("llm", {}))
     limits.update(overrides.pop("limits", {}))
+    # GH-160: files / retention / security only when given (the defaults otherwise).
+    sections = {name: overrides.pop(name) for name in _DEFAULT_SECTIONS if name in overrides}
     assert not overrides
-    return svc.StoredPlatformSettings.model_validate({"llm": llm, "limits": limits})
+    return svc.StoredPlatformSettings.model_validate({"llm": llm, "limits": limits, **sections})
 
 
 def _platform(db: FakeDb, **columns: Any) -> dict[str, Any]:
@@ -280,8 +419,8 @@ async def _invoke(svc: ModuleType, db: FakeDb, name: str, actor: Principal) -> A
         return await svc.update_org_settings(
             pool, actor=actor, patch=_org_patch(gmail=False), ip=_IP
         )
-    assert name == "update_platform_llm"
-    return await svc.update_platform_llm(
+    assert name == "update_platform_settings"
+    return await svc.update_platform_settings(
         pool, actor=actor, patch=_llm_patch(provider="openai"), ip=_IP
     )
 
@@ -356,6 +495,49 @@ def _log_text(caplog: pytest.LogCaptureFixture) -> str:
     return "\n".join(formatter.format(record) for record in caplog.records)
 
 
+def _section(stored: Any, name: str) -> dict[str, Any]:
+    """One section of a StoredPlatformSettings as a plain dict."""
+    return dict(getattr(stored, name).model_dump())
+
+
+def _without_updated_at(row: dict[str, Any] | None) -> dict[str, Any]:
+    """A platform_settings row (it must exist) without its updated_at."""
+    assert row is not None
+    return {column: value for column, value in row.items() if column != "updated_at"}
+
+
+def _platform_updates(db: FakeDb) -> list[Any]:
+    """The UPDATE platform_settings statements."""
+    return db.matching(r"^update platform_settings\b")
+
+
+def _session_updates(db: FakeDb) -> list[Any]:
+    """The UPDATE sessions statements (the Super Admin policy statement among them)."""
+    return db.matching(r"^update sessions\b")
+
+
+def _old_new(changed: dict[str, tuple[int, int]]) -> dict[str, int]:
+    """The audit metadata of changed int fields: ``<field>_old`` / ``<field>_new``."""
+    metadata: dict[str, int] = {}
+    for field, (old, new) in changed.items():
+        metadata[f"{field}_old"] = old
+        metadata[f"{field}_new"] = new
+    return metadata
+
+
+def _new_values(changed: dict[str, tuple[int, int]]) -> dict[str, int]:
+    return {field: new for field, (_, new) in changed.items()}
+
+
+def _super_admin_sessions(db: FakeDb, actor: Principal) -> tuple[list[str], str]:
+    """Open three Super Admin sessions (the actor's and two of another Super Admin) and
+    one member session; return the Super Admin tokens and the member token."""
+    other = db.add_account(kind="super_admin", role=None)
+    member = db.add_account(role="org_admin")
+    tokens = [db.open_session(actor.user_id), db.open_session(other), db.open_session(other)]
+    return tokens, db.open_session(member)
+
+
 class _CanSpy:
     """Wraps admino.access.can wherever the service looks it up; records the capabilities
     asked for and refuses the chosen ones."""
@@ -411,11 +593,43 @@ class TestModuleSurface:
             "all_orgs_tools_gate",
             "seed_platform_settings",
             "load_platform_settings",
-            "update_platform_llm",
+            "update_platform_settings",
+            "current_platform_settings",
+            "session_policy_for",
         ],
     )
     def test_scoped_settings_function_is_a_coroutine(self, svc: ModuleType, name: str) -> None:
         assert inspect.iscoroutinefunction(getattr(svc, name))
+
+    def test_scoped_settings_update_platform_llm_is_gone(self, svc: ModuleType) -> None:
+        """GH-160: update_platform_settings replaces the LLM-only update."""
+        assert not hasattr(svc, "update_platform_llm")
+
+    def test_scoped_settings_invalid_platform_settings_error_is_a_value_error(
+        self, svc: ModuleType
+    ) -> None:
+        assert issubclass(svc.InvalidPlatformSettingsError, ValueError)
+
+    def test_scoped_settings_stored_platform_settings_sections_default_to_the_table_defaults(
+        self, svc: ModuleType
+    ) -> None:
+        """StoredPlatformSettings gains files, retention and security; each defaults to
+        migration 0014's defaults (a StoredPlatformSettings of llm + limits only)."""
+        from admino.models import PlatformFiles, PlatformRetention, PlatformSecurity
+
+        stored = _stored(svc)
+
+        assert isinstance(stored.files, PlatformFiles)
+        assert isinstance(stored.retention, PlatformRetention)
+        assert isinstance(stored.security, PlatformSecurity)
+        assert {name: _section(stored, name) for name in _DEFAULT_SECTIONS} == _SECTION_DEFAULTS
+
+    def test_scoped_settings_stored_platform_settings_keeps_given_sections(
+        self, svc: ModuleType
+    ) -> None:
+        stored = _stored(svc, **_CUSTOM_SECTIONS)
+
+        assert {name: _section(stored, name) for name in _DEFAULT_SECTIONS} == _CUSTOM_SECTIONS
 
     def test_scoped_settings_apply_platform_settings_is_pure_and_sync(
         self, svc: ModuleType
@@ -430,7 +644,7 @@ class TestModuleSurface:
             ("update_user_settings", {"actor", "patch"}),
             ("get_org_settings", {"actor"}),
             ("update_org_settings", {"actor", "patch", "ip"}),
-            ("update_platform_llm", {"actor", "patch", "ip"}),
+            ("update_platform_settings", {"actor", "patch", "ip"}),
         ],
     )
     def test_scoped_settings_actor_patch_and_ip_are_keyword_only(
@@ -462,8 +676,9 @@ class TestModuleSurface:
         }
 
     def test_scoped_settings_imports_only_the_allowed_admino_modules(self, svc: ModuleType) -> None:
-        """access, tenancy, audit_events, models, config: never the server, agent, LLM,
-        tools, OAuth, database or permission engine modules."""
+        """access, tenancy, audit_events, models, config and (GH-160, for the Super Admin
+        session policy) sessions: never the server, agent, LLM, tools, OAuth, database or
+        permission engine modules."""
         tree = ast.parse(inspect.getsource(svc))
         imported: set[str] = set()
         for node in ast.walk(tree):
@@ -479,7 +694,8 @@ class TestModuleSurface:
                 elif node.module.startswith("admino."):
                     imported.add(node.module.split(".")[1])
 
-        assert imported <= {"access", "tenancy", "audit_events", "models", "config"}, imported
+        allowed = {"access", "tenancy", "audit_events", "models", "config", "sessions"}
+        assert imported <= allowed, imported
 
     def test_scoped_settings_module_docstring_has_security_notes(self, svc: ModuleType) -> None:
         assert svc.__doc__ is not None
@@ -531,7 +747,7 @@ class TestAuthorization:
         admin = _actor(db, "org_admin")
 
         with pytest.raises(PermissionError):
-            await svc.update_platform_llm(
+            await svc.update_platform_settings(
                 db.pool, actor=admin, patch=_llm_patch(provider="vllm"), ip=_IP
             )
 
@@ -556,7 +772,7 @@ class TestAuthorization:
         self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, name: str
     ) -> None:
         _platform(db)
-        role = "super_admin" if name == "update_platform_llm" else "org_admin"
+        role = "super_admin" if name == "update_platform_settings" else "org_admin"
         actor = _actor(db, role)
         spy = _CanSpy(monkeypatch, svc)
 
@@ -571,7 +787,7 @@ class TestAuthorization:
         """When can() refuses the function's capability, even the right role is refused
         before any statement."""
         _platform(db)
-        role = "super_admin" if name == "update_platform_llm" else "org_admin"
+        role = "super_admin" if name == "update_platform_settings" else "org_admin"
         actor = _actor(db, role)
         _CanSpy(monkeypatch, svc, deny=frozenset({_CAPABILITIES[name]}))
 
@@ -1115,6 +1331,133 @@ class TestLoadPlatformSettings:
         assert isinstance(stored.limits, PlatformLimits)
 
 
+class TestLoadPlatformDefaults:
+    """GH-160: the row's files, retention and security columns are read too."""
+
+    async def test_scoped_settings_load_reads_every_platform_default(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db, **_CUSTOM_COLUMNS)
+
+        stored = await svc.load_platform_settings(db.pool)
+
+        assert {name: _section(stored, name) for name in _DEFAULT_SECTIONS} == _CUSTOM_SECTIONS
+
+    async def test_scoped_settings_load_default_row_reads_as_the_section_defaults(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """A row that only took migration 0014's column defaults."""
+        _platform(db)
+
+        stored = await svc.load_platform_settings(db.pool)
+
+        assert {name: _section(stored, name) for name in _DEFAULT_SECTIONS} == _SECTION_DEFAULTS
+
+    async def test_scoped_settings_load_sections_are_their_models(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        from admino.models import PlatformFiles, PlatformRetention, PlatformSecurity
+
+        _platform(db)
+
+        stored = await svc.load_platform_settings(db.pool)
+
+        assert isinstance(stored.files, PlatformFiles)
+        assert isinstance(stored.retention, PlatformRetention)
+        assert isinstance(stored.security, PlatformSecurity)
+
+
+# ---------------------------------------------------------------------------
+# 6b. The in-process cache (GH-160)
+# ---------------------------------------------------------------------------
+
+
+class TestPlatformCache:
+    """current_platform_settings answers from the cache; a miss reads the row once;
+    load_platform_settings always reads and replaces the cache."""
+
+    async def test_scoped_settings_current_hit_issues_no_query(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
+        _platform(db)
+
+        result = await svc.current_platform_settings(db.pool)
+
+        assert result is cached
+        assert db.calls == []
+
+    async def test_scoped_settings_current_miss_reads_the_row_once_and_caches_it(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", None)
+        _platform(db, llm_provider="vllm", **_CUSTOM_COLUMNS)
+
+        first = await svc.current_platform_settings(db.pool)
+        second = await svc.current_platform_settings(db.pool)
+
+        assert isinstance(first, svc.StoredPlatformSettings)
+        assert first.llm.provider == "vllm"
+        assert first.limits.model_dump() == _STORED_LIMITS
+        assert {name: _section(first, name) for name in _DEFAULT_SECTIONS} == _CUSTOM_SECTIONS
+        assert second == first
+        assert svc._platform_cache == first
+        call = _one(db.calls)
+        assert call.method == "fetchrow"
+        assert re.search(r"\bfrom platform_settings\b", call.normalized)
+
+    async def test_scoped_settings_current_without_a_row_raises_and_keeps_the_cache_empty(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", None)
+
+        with pytest.raises(RuntimeError):
+            await svc.current_platform_settings(db.pool)
+
+        assert svc._platform_cache is None
+
+    async def test_scoped_settings_current_reads_through_a_connection(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The executor may be a connection (inside another service's transaction)."""
+        monkeypatch.setattr(svc, "_platform_cache", None)
+        _platform(db)
+
+        async with db.pool.acquire() as conn:
+            result = await svc.current_platform_settings(conn)
+
+        assert result.limits.model_dump() == _STORED_LIMITS
+        assert _one(db.calls).via == conn.name
+        assert svc._platform_cache == result
+
+    async def test_scoped_settings_load_always_reads_and_replaces_the_cache(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A primed (stale) cache doesn't stop the read; the cache then holds the row."""
+        monkeypatch.setattr(svc, "_platform_cache", _stored(svc))
+        _platform(db, llm_provider="vllm", render_dpi=300)
+
+        loaded = await svc.load_platform_settings(db.pool)
+
+        assert (loaded.llm.provider, loaded.files.render_dpi) == ("vllm", 300)
+        assert _one(db.calls).method == "fetchrow"
+        assert svc._platform_cache == loaded
+
+    async def test_scoped_settings_current_after_load_issues_no_query(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", _stored(svc))
+        _platform(db, llm_provider="vllm")
+        loaded = await svc.load_platform_settings(db.pool)
+        calls = len(db.calls)
+
+        current = await svc.current_platform_settings(db.pool)
+
+        assert current == loaded
+        assert len(db.calls) == calls
+
+
 class TestApplyPlatformSettings:
     """The stored provider, four models and five limits replace the config's; nothing else."""
 
@@ -1171,7 +1514,9 @@ class TestApplyPlatformSettings:
 
 
 class TestUpdatePlatformLlm:
-    """The Super Admin changes the platform LLM; each change is audited by field name."""
+    """The Super Admin changes the platform LLM through update_platform_settings with an
+    llm patch (GH-160; update_platform_llm is gone); each change is audited by field
+    name, as in #159."""
 
     async def test_scoped_settings_update_llm_changes_only_the_given_fields(
         self, svc: ModuleType, db: FakeDb
@@ -1179,7 +1524,7 @@ class TestUpdatePlatformLlm:
         before = copy.deepcopy(_platform(db))
         admin = _actor(db, "super_admin")
 
-        result = await svc.update_platform_llm(
+        result = await svc.update_platform_settings(
             db.pool,
             actor=admin,
             patch=_llm_patch(provider="infomaniak", infomaniak_model="mistralai/Small-3.2"),
@@ -1207,7 +1552,7 @@ class TestUpdatePlatformLlm:
         _platform(db)
         admin = _actor(db, "super_admin")
 
-        await svc.update_platform_llm(
+        await svc.update_platform_settings(
             db.pool, actor=admin, patch=_llm_patch(provider="vllm"), ip=_IP
         )
 
@@ -1221,7 +1566,7 @@ class TestUpdatePlatformLlm:
         _platform(db)
         admin = _actor(db, "super_admin")
 
-        await svc.update_platform_llm(
+        await svc.update_platform_settings(
             db.pool, actor=admin, patch=_llm_patch(provider="vllm"), ip=_IP
         )
 
@@ -1239,7 +1584,7 @@ class TestUpdatePlatformLlm:
         _platform(db)
         admin = _actor(db, "super_admin")
 
-        await svc.update_platform_llm(
+        await svc.update_platform_settings(
             db.pool,
             actor=admin,
             patch=_llm_patch(
@@ -1261,7 +1606,7 @@ class TestUpdatePlatformLlm:
         row = copy.deepcopy(_platform(db))
         admin = _actor(db, "super_admin")
 
-        await svc.update_platform_llm(
+        await svc.update_platform_settings(
             db.pool,
             actor=admin,
             patch=_llm_patch(provider="anthropic", anthropic_model="claude-sonnet-4-6"),
@@ -1272,21 +1617,41 @@ class TestUpdatePlatformLlm:
         current = db.platform_row()
         assert current is not None
         assert _platform_llm(current) == _platform_llm(row)
+        assert current == row
+        assert _platform_updates(db) == []
 
     async def test_scoped_settings_update_llm_audit_failure_rolls_the_change_back(
-        self, svc: ModuleType, db: FakeDb
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
         _platform(db)
         admin = _actor(db, "super_admin")
         before = _state(db)
         db.fail_audit = True
 
         with pytest.raises(AuditRecordError):
-            await svc.update_platform_llm(
+            await svc.update_platform_settings(
                 db.pool, actor=admin, patch=_llm_patch(provider="openai"), ip=_IP
             )
 
         assert _state(db) == before
+        assert svc._platform_cache is cached
+
+    async def test_scoped_settings_update_llm_replaces_the_cache(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", _stored(svc))
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        result = await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_llm_patch(provider="vllm"), ip=_IP
+        )
+
+        assert result.llm.provider == "vllm"
+        assert svc._platform_cache == result
+        assert result == await svc.load_platform_settings(db.pool)
 
     async def test_scoped_settings_update_llm_audit_row_holds_no_provider_or_model(
         self, svc: ModuleType, db: FakeDb
@@ -1294,7 +1659,7 @@ class TestUpdatePlatformLlm:
         _platform(db)
         admin = _actor(db, "super_admin")
 
-        await svc.update_platform_llm(
+        await svc.update_platform_settings(
             db.pool,
             actor=admin,
             patch=_llm_patch(provider="infomaniak", infomaniak_model=_MODEL_MARKER),
@@ -1306,6 +1671,806 @@ class TestUpdatePlatformLlm:
         assert "zephyrmarker" not in stored
         assert all(value is True for value in row["metadata"].values())
         assert "infomaniak" not in json.dumps(list(row["metadata"].values()))
+
+
+# ---------------------------------------------------------------------------
+# 6d. update_platform_settings: the limits, files, retention and security sections (GH-160)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdatePlatformSections:
+    """Each int section: only the changed fields are written, the stored result is cached
+    and returned, and one old/new event names the changed fields."""
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_stores_the_patch_merged_into_the_row(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        before = _without_updated_at(copy.deepcopy(_platform(db, updated_at=_OLD)))
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(**{section: patch}), ip=_IP
+        )
+
+        row = db.platform_row()
+        assert _without_updated_at(row) == {**before, **_new_values(changed)}
+        assert row is not None
+        assert row["updated_at"] > _OLD
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_binds_only_the_changed_values(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        """One UPDATE; a field given with its stored value is no change and isn't written
+        (its parameter is NULL, which keeps the stored column)."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(**{section: patch}), ip=_IP
+        )
+
+        call = _one(_platform_updates(db))
+        bound = [arg for arg in call.args if arg is not None and not isinstance(arg, bool)]
+        assert sorted(bound) == sorted(_new_values(changed).values())
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_returns_and_caches_the_stored_settings(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        monkeypatch: pytest.MonkeyPatch,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", None)
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        result = await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(**{section: patch}), ip=_IP
+        )
+
+        assert isinstance(result, svc.StoredPlatformSettings)
+        assert _section(result, section) == {
+            **_STORED_SECTIONS[section],
+            **_new_values(changed),
+        }
+        assert svc._platform_cache == result
+        assert result == await svc.load_platform_settings(db.pool)
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_records_one_old_new_event(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        """platform.settings_change: the Super Admin, no org, no target, the client IP,
+        ``<field>_old`` / ``<field>_new`` for each changed field only."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(**{section: patch}), ip=_IP
+        )
+
+        row = _one(db.audit)
+        assert row["action"] == "platform.settings_change"
+        assert (row["actor_kind"], _uuid(row["actor_user_id"])) == ("super_admin", admin.user_id)
+        assert row["org_id"] is None
+        assert (row["target_type"], row["target_ids"]) == (None, [])
+        assert row["ip"] == _IP
+        assert row["metadata"] == _old_new(changed)
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_locks_the_row_in_one_transaction(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(**{section: patch}), ip=_IP
+        )
+
+        _assert_locked_in_one_transaction(db, "platform_settings")
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_noop_writes_nothing(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        """The patch repeats the stored values: no UPDATE, no sessions statement, no audit
+        row; the stored settings are returned."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+        stored = _STORED_SECTIONS[section]
+        noop = {field: stored[field] for field in patch}
+        before = _state(db)
+        sessions_before = copy.deepcopy(db.sessions)
+
+        result = await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(**{section: noop}), ip=_IP
+        )
+
+        assert _platform_updates(db) == []
+        assert _session_updates(db) == []
+        assert _state(db) == before
+        assert db.sessions == sessions_before
+        assert _section(result, section) == stored
+
+    @pytest.mark.parametrize(("section", "patch", "changed"), _SECTION_CHANGES)
+    async def test_scoped_settings_update_section_audit_failure_changes_nothing(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        monkeypatch: pytest.MonkeyPatch,
+        section: str,
+        patch: dict[str, int],
+        changed: dict[str, tuple[int, int]],
+    ) -> None:
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        before = _state(db)
+        db.fail_audit = True
+
+        with pytest.raises(AuditRecordError):
+            await svc.update_platform_settings(
+                db.pool, actor=admin, patch=_settings_patch(**{section: patch}), ip=_IP
+            )
+
+        assert _state(db) == before
+        assert svc._platform_cache is cached
+
+    async def test_scoped_settings_update_replaces_the_cache_only_after_the_commit(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """While the transaction is still open (its audit INSERT, the last statement
+        before the commit) the cache holds the old settings; after it, the new ones."""
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        seen: list[tuple[Any, int]] = []
+
+        def watch(_row: dict[str, Any]) -> bool:
+            seen.append((svc._platform_cache, db.open_transactions))
+            return False
+
+        db.fail_audit_when = watch
+
+        result = await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(files={"render_dpi": 300}), ip=_IP
+        )
+
+        assert len(seen) == 1
+        assert seen[0][0] is cached
+        assert seen[0][1] == 1
+        assert result.files.render_dpi == 300
+        assert svc._platform_cache == result
+
+    async def test_scoped_settings_update_compares_with_the_locked_row_not_the_cache(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stale cache that already shows the new value doesn't hide the change."""
+        monkeypatch.setattr(svc, "_platform_cache", _stored(svc, files={"max_file_size_mb": 200}))
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(files={"max_file_size_mb": 200}), ip=_IP
+        )
+
+        row = db.platform_row()
+        assert row is not None
+        assert row["max_file_size_mb"] == 200
+        assert _one(db.audit)["metadata"] == {
+            "max_file_size_mb_old": 50,
+            "max_file_size_mb_new": 200,
+        }
+
+
+class TestUpdatePlatformEvents:
+    """One platform.settings_change per changed section, in the order llm, limits, files,
+    retention, security; an unchanged section records nothing; any failure undoes all."""
+
+    async def test_scoped_settings_update_records_one_event_per_section_in_order(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        before = _without_updated_at(copy.deepcopy(_platform(db)))
+        admin = _actor(db, "super_admin")
+        db.open_session(admin.user_id)
+        patch = _settings_patch(
+            security={"lockout_minutes": 30, "session_idle_timeout_minutes": 90},
+            retention={"org_deletion_grace_days": 60},
+            files={"render_dpi": 300},
+            limits={"max_context_messages": 50},
+            llm={"provider": "vllm"},
+        )
+
+        await svc.update_platform_settings(db.pool, actor=admin, patch=patch, ip=_IP)
+
+        assert [row["metadata"] for row in db.audit] == [
+            {"provider": True},
+            {"max_context_messages_old": 30, "max_context_messages_new": 50},
+            {"render_dpi_old": 150, "render_dpi_new": 300},
+            {"org_deletion_grace_days_old": 30, "org_deletion_grace_days_new": 60},
+            {
+                "lockout_minutes_old": 15,
+                "lockout_minutes_new": 30,
+                "session_idle_timeout_minutes_old": 60,
+                "session_idle_timeout_minutes_new": 90,
+                "sessions_updated": 1,
+            },
+        ]
+        assert {row["action"] for row in db.audit} == {"platform.settings_change"}
+        assert all(row["org_id"] is None and row["ip"] == _IP for row in db.audit)
+        assert _without_updated_at(db.platform_row()) == {
+            **before,
+            "llm_provider": "vllm",
+            "max_context_messages": 50,
+            "render_dpi": 300,
+            "org_deletion_grace_days": 60,
+            "lockout_minutes": 30,
+            "session_idle_timeout_minutes": 90,
+        }
+        assert len(_platform_updates(db)) == 1
+        _assert_locked_in_one_transaction(db, "platform_settings")
+
+    async def test_scoped_settings_update_unchanged_sections_record_no_event(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+        patch = _settings_patch(
+            llm={"provider": "anthropic"},
+            limits={"max_tool_calls_per_message": 7},
+            files={"max_files_per_message": 25},
+            retention={"audit_months": 12},
+            security={"rate_limit_per_minute": 20, "session_max_lifetime_hours": 12},
+        )
+
+        await svc.update_platform_settings(db.pool, actor=admin, patch=patch, ip=_IP)
+
+        assert [row["metadata"] for row in db.audit] == [
+            {"max_files_per_message_old": 10, "max_files_per_message_new": 25}
+        ]
+        assert _session_updates(db) == []
+
+    async def test_scoped_settings_update_later_event_failure_rolls_everything_back(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The security event fails after the limits and files events were written: the
+        row, those events and the re-timed sessions are all rolled back."""
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+        before = _state(db)
+        sessions_before = copy.deepcopy(db.sessions)
+        db.fail_audit_when = lambda row: "session_idle_timeout_minutes_new" in row["metadata"]
+
+        with pytest.raises(AuditRecordError):
+            await svc.update_platform_settings(
+                db.pool,
+                actor=admin,
+                patch=_settings_patch(
+                    limits={"max_context_messages": 50},
+                    files={"render_dpi": 300},
+                    security=_SESSION_POLICY_CHANGE,
+                ),
+                ip=_IP,
+            )
+
+        assert _state(db) == before
+        assert db.sessions == sessions_before
+        assert svc._platform_cache is cached
+
+    async def test_scoped_settings_update_audit_rows_hold_field_names_and_ints_only(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """No provider or model value in any row; the int sections hold ints (never a
+        bool or a string) under ``<field>_old`` / ``<field>_new`` / ``sessions_updated``."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(
+                llm={"provider": "infomaniak", "infomaniak_model": _MODEL_MARKER},
+                **_ONE_CHANGE,
+            ),
+            ip=_IP,
+        )
+
+        rows = db.audit
+        assert len(rows) == 5
+        assert "zephyrmarker" not in json.dumps(rows, default=str).lower()
+        assert rows[0]["metadata"] == {"provider": True, "infomaniak_model": True}
+        values = json.dumps([list(row["metadata"].values()) for row in rows])
+        assert "infomaniak" not in values
+        for row in rows[1:]:
+            metadata = row["metadata"]
+            assert all(type(value) is int for value in metadata.values()), metadata
+            assert all(
+                re.fullmatch(r"[a-z_]+_(?:old|new)|sessions_updated", key) for key in metadata
+            ), metadata
+
+
+# (stored trash columns, retention patch): the merged minimum exceeds the maximum.
+_INVALID_TRASH = [
+    pytest.param({"trash_max_days": 30}, {"trash_min_days": 60}, id="min-above-the-stored-max"),
+    pytest.param({"trash_min_days": 40}, {"trash_max_days": 20}, id="max-below-the-stored-min"),
+    pytest.param({}, {"trash_min_days": 50, "trash_max_days": 10}, id="both-given"),
+]
+
+
+class TestRetentionMergedValidation:
+    """trash_min_days <= trash_max_days is checked on the patch merged into the stored
+    row, before any write."""
+
+    @pytest.mark.parametrize(("stored", "patch"), _INVALID_TRASH)
+    async def test_scoped_settings_update_trash_min_above_max_is_refused_before_any_write(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        monkeypatch: pytest.MonkeyPatch,
+        stored: dict[str, int],
+        patch: dict[str, int],
+    ) -> None:
+        """InvalidPlatformSettingsError (a ValueError); no UPDATE, no sessions statement,
+        no audit row, the cache unchanged, even with valid changes in other sections."""
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
+        _platform(db, **stored)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+        before = _state(db)
+        sessions_before = copy.deepcopy(db.sessions)
+
+        with pytest.raises(svc.InvalidPlatformSettingsError) as caught:
+            await svc.update_platform_settings(
+                db.pool,
+                actor=admin,
+                patch=_settings_patch(
+                    llm={"provider": "vllm"},
+                    files={"render_dpi": 300},
+                    retention=patch,
+                    security=_SESSION_POLICY_CHANGE,
+                ),
+                ip=_IP,
+            )
+
+        assert isinstance(caught.value, ValueError)
+        assert _platform_updates(db) == []
+        assert _session_updates(db) == []
+        assert _state(db) == before
+        assert db.sessions == sessions_before
+        assert svc._platform_cache is cached
+
+    async def test_scoped_settings_update_trash_min_equal_to_max_is_accepted(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db, trash_max_days=30)
+        admin = _actor(db, "super_admin")
+
+        result = await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(retention={"trash_min_days": 30}), ip=_IP
+        )
+
+        row = db.platform_row()
+        assert row is not None
+        assert (row["trash_min_days"], row["trash_max_days"]) == (30, 30)
+        assert (result.retention.trash_min_days, result.retention.trash_max_days) == (30, 30)
+        assert _one(db.audit)["metadata"] == {"trash_min_days_old": 0, "trash_min_days_new": 30}
+
+    async def test_scoped_settings_update_trash_bounds_checked_on_the_merged_values(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """A new minimum above the stored maximum is fine when the same patch raises the
+        maximum."""
+        _platform(db, trash_max_days=30)
+        admin = _actor(db, "super_admin")
+
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(retention={"trash_min_days": 60, "trash_max_days": 80}),
+            ip=_IP,
+        )
+
+        row = db.platform_row()
+        assert row is not None
+        assert (row["trash_min_days"], row["trash_max_days"]) == (60, 80)
+        assert _one(db.audit)["metadata"] == {
+            "trash_min_days_old": 0,
+            "trash_min_days_new": 60,
+            "trash_max_days_old": 30,
+            "trash_max_days_new": 80,
+        }
+
+
+# ---------------------------------------------------------------------------
+# 6e. Open Super Admin sessions follow a session-policy change (GH-160)
+# ---------------------------------------------------------------------------
+
+
+class TestSuperAdminSessionsFollowThePolicy:
+    """A changed idle timeout or lifetime reaches every open Super Admin session in the
+    same transaction; members' sessions keep theirs."""
+
+    async def test_scoped_settings_session_policy_change_retimes_every_super_admin_session(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        tokens, member_token = _super_admin_sessions(db, admin)
+        member_before = copy.deepcopy(db.session(member_token))
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(security=_SESSION_POLICY_CHANGE), ip=_IP
+        )
+
+        for token in tokens:
+            row = db.session(token)
+            assert row["idle_timeout_minutes"] == 30
+            assert row["expires_at"] == row["created_at"] + timedelta(hours=4)
+        assert db.session(member_token) == member_before
+
+    async def test_scoped_settings_session_policy_change_counts_the_sessions(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(security=_SESSION_POLICY_CHANGE), ip=_IP
+        )
+
+        assert _one(db.audit)["metadata"] == {
+            "session_idle_timeout_minutes_old": 60,
+            "session_idle_timeout_minutes_new": 30,
+            "session_max_lifetime_hours_old": 12,
+            "session_max_lifetime_hours_new": 4,
+            "sessions_updated": 3,
+        }
+
+    @pytest.mark.parametrize(
+        ("change", "policy"),
+        [
+            pytest.param({"session_idle_timeout_minutes": 90}, (90, 12), id="idle-only"),
+            pytest.param({"session_max_lifetime_hours": 24}, (60, 24), id="lifetime-only"),
+        ],
+    )
+    async def test_scoped_settings_one_session_field_applies_the_whole_new_policy(
+        self, svc: ModuleType, db: FakeDb, change: dict[str, int], policy: tuple[int, int]
+    ) -> None:
+        """$1 = the new idle timeout, $2 = the new lifetime (the stored one when unchanged)."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        tokens, _ = _super_admin_sessions(db, admin)
+        idle, hours = policy
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(security=change), ip=_IP
+        )
+
+        assert _one(_session_updates(db)).args == policy
+        for token in tokens:
+            row = db.session(token)
+            assert row["idle_timeout_minutes"] == idle
+            assert row["expires_at"] == row["created_at"] + timedelta(hours=hours)
+        assert _one(db.audit)["metadata"]["sessions_updated"] == 3
+
+    async def test_scoped_settings_session_statement_shares_the_update_transaction(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(security=_SESSION_POLICY_CHANGE), ip=_IP
+        )
+
+        statement = _one(_session_updates(db))
+        update = _one(_platform_updates(db))
+        audit = _one(db.matching(r"^insert into audit_events\b"))
+        assert statement.tx is not None
+        assert statement.tx == update.tx == audit.tx
+        assert (statement.tx, "commit") in db.transactions
+
+    async def test_scoped_settings_other_security_change_leaves_the_sessions_alone(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """No session field changed: no sessions statement, no ``sessions_updated``."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+        sessions_before = copy.deepcopy(db.sessions)
+
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(security={"lockout_minutes": 30, "rate_limit_per_minute": 60}),
+            ip=_IP,
+        )
+
+        assert _session_updates(db) == []
+        assert db.sessions == sessions_before
+        assert "sessions_updated" not in _one(db.audit)["metadata"]
+
+    async def test_scoped_settings_unchanged_session_policy_writes_nothing(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _super_admin_sessions(db, admin)
+        sessions_before = copy.deepcopy(db.sessions)
+
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(
+                security={"session_idle_timeout_minutes": 60, "session_max_lifetime_hours": 12}
+            ),
+            ip=_IP,
+        )
+
+        assert _session_updates(db) == []
+        assert _platform_updates(db) == []
+        assert db.audit == []
+        assert db.sessions == sessions_before
+
+    async def test_scoped_settings_session_policy_change_without_super_admin_sessions(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """``sessions_updated`` is 0; a member's session is untouched."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        member_token = db.open_session(db.add_account(role="editor"))
+        member_before = copy.deepcopy(db.session(member_token))
+
+        await svc.update_platform_settings(
+            db.pool, actor=admin, patch=_settings_patch(security=_SESSION_POLICY_CHANGE), ip=_IP
+        )
+
+        assert _one(db.audit)["metadata"]["sessions_updated"] == 0
+        assert db.session(member_token) == member_before
+
+    async def test_scoped_settings_super_admin_session_older_than_the_new_lifetime_ends(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        from admino import sessions
+
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        token = db.open_session(admin.user_id)
+        row = db.session(token)
+        row["created_at"] = datetime.now(UTC) - timedelta(hours=5)
+        row["expires_at"] = row["created_at"] + timedelta(hours=12)
+        assert await sessions.resolve_session(db.pool, token) is not None
+
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(security={"session_max_lifetime_hours": 4}),
+            ip=_IP,
+        )
+
+        assert db.session(token)["expires_at"] <= datetime.now(UTC)
+        assert await sessions.resolve_session(db.pool, token) is None
+
+    async def test_scoped_settings_super_admin_session_idle_past_the_new_timeout_ends(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Seen 40 minutes ago: live under 60 minutes, gone under 30; a member seen as
+        long ago keeps their session."""
+        from admino import sessions
+
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        token = db.open_session(admin.user_id, last_seen_ago=timedelta(minutes=40))
+        member_token = db.open_session(
+            db.add_account(role="editor"), last_seen_ago=timedelta(minutes=40)
+        )
+
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(security={"session_idle_timeout_minutes": 30}),
+            ip=_IP,
+        )
+
+        assert db.session(token)["idle_timeout_minutes"] == 30
+        assert await sessions.resolve_session(db.pool, token) is None
+        assert await sessions.resolve_session(db.pool, member_token) is not None
+
+
+# ---------------------------------------------------------------------------
+# 6f. session_policy_for (GH-160: moved here from sessions)
+# ---------------------------------------------------------------------------
+
+
+class TestSessionPolicyFor:
+    """Members: the org default (until #169); Super Admins: the stored platform policy."""
+
+    async def test_scoped_settings_policy_for_member_is_the_org_default_without_a_query(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from admino import sessions
+
+        monkeypatch.setattr(svc, "_platform_cache", None)
+
+        policy = await svc.session_policy_for(db.pool, "member")
+
+        assert policy is sessions.DEFAULT_ORG_SESSION_POLICY
+        assert db.calls == []
+
+    async def test_scoped_settings_policy_for_member_reads_the_org_default_at_call_time(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from admino import sessions
+
+        custom = sessions.SessionPolicy(idle_timeout_minutes=20, max_lifetime_hours=2)
+        monkeypatch.setattr(sessions, "DEFAULT_ORG_SESSION_POLICY", custom)
+
+        assert await svc.session_policy_for(db.pool, "member") is custom
+
+    async def test_scoped_settings_policy_for_super_admin_is_the_cached_platform_policy(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from admino import sessions
+
+        stored = _stored(
+            svc,
+            security={"session_idle_timeout_minutes": 45, "session_max_lifetime_hours": 8},
+        )
+        monkeypatch.setattr(svc, "_platform_cache", stored)
+
+        policy = await svc.session_policy_for(db.pool, "super_admin")
+
+        assert type(policy) is sessions.SessionPolicy
+        assert (policy.idle_timeout_minutes, policy.max_lifetime_hours) == (45, 8)
+        assert db.calls == []
+
+    async def test_scoped_settings_policy_for_super_admin_reads_the_row_on_a_cache_miss(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", None)
+        _platform(db, session_idle_timeout_minutes=90, session_max_lifetime_hours=24)
+
+        policy = await svc.session_policy_for(db.pool, "super_admin")
+
+        assert (policy.idle_timeout_minutes, policy.max_lifetime_hours) == (90, 24)
+        assert _one(db.calls).method == "fetchrow"
+
+    async def test_scoped_settings_policy_for_super_admin_follows_an_update(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """After a change the next Super Admin login gets the new policy, from the cache."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        await svc.update_platform_settings(
+            db.pool,
+            actor=admin,
+            patch=_settings_patch(
+                security={"session_idle_timeout_minutes": 120, "session_max_lifetime_hours": 48}
+            ),
+            ip=_IP,
+        )
+        calls = len(db.calls)
+
+        policy = await svc.session_policy_for(db.pool, "super_admin")
+
+        assert (policy.idle_timeout_minutes, policy.max_lifetime_hours) == (120, 48)
+        assert len(db.calls) == calls
+
+    @pytest.mark.parametrize(
+        "kind", ["admin", "", "Member", "SUPER_ADMIN", "org_admin", "system", None, 1]
+    )
+    async def test_scoped_settings_policy_for_unknown_kind_raises_without_a_query(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, kind: Any
+    ) -> None:
+        monkeypatch.setattr(svc, "_platform_cache", None)
+        _platform(db)
+
+        with pytest.raises(ValueError):
+            await svc.session_policy_for(db.pool, kind)
+
+        assert db.calls == []
+
+
+# ---------------------------------------------------------------------------
+# 6g. Only the Super Admin changes a platform default (GH-160)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdatePlatformSectionsAuthorization:
+    """platform.defaults.manage for every section: a member of any role is refused before
+    any statement; nothing is written and the cache is kept."""
+
+    @pytest.mark.parametrize("section", list(_ONE_CHANGE))
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_scoped_settings_member_cant_update_a_platform_section(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        monkeypatch: pytest.MonkeyPatch,
+        role: str,
+        section: str,
+    ) -> None:
+        cached = _stored(svc)
+        monkeypatch.setattr(svc, "_platform_cache", cached)
+        _platform(db)
+        actor = _actor(db, role)
+        _super_admin_sessions(db, _actor(db, "super_admin"))
+        before = _state(db)
+        sessions_before = copy.deepcopy(db.sessions)
+
+        with pytest.raises(PermissionError):
+            await svc.update_platform_settings(
+                db.pool,
+                actor=actor,
+                patch=_settings_patch(**{section: _ONE_CHANGE[section]}),
+                ip=_IP,
+            )
+
+        assert db.calls == []
+        assert _state(db) == before
+        assert db.sessions == sessions_before
+        assert svc._platform_cache is cached
+
+    @pytest.mark.parametrize("section", list(_ONE_CHANGE))
+    async def test_scoped_settings_platform_section_capability_refused_by_can(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, section: str
+    ) -> None:
+        """Even the Super Admin is refused before any statement when can() refuses
+        platform.defaults.manage."""
+        _platform(db)
+        admin = _actor(db, "super_admin")
+        _CanSpy(monkeypatch, svc, deny=frozenset({Capability.PLATFORM_DEFAULTS_MANAGE}))
+
+        with pytest.raises(PermissionError):
+            await svc.update_platform_settings(
+                db.pool,
+                actor=admin,
+                patch=_settings_patch(**{section: _ONE_CHANGE[section]}),
+                ip=_IP,
+            )
+
+        assert db.calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -1370,6 +2535,8 @@ class TestEachScopeSeededWithDefaults:
         assert stored.llm.provider == config.llm.provider
         assert stored.llm.anthropic_model == config.llm.anthropic_model
         assert stored.limits.model_dump() == config.limits.model_dump()
+        # GH-160: the files, retention and security columns take migration 0014's defaults.
+        assert {name: _section(stored, name) for name in _DEFAULT_SECTIONS} == _SECTION_DEFAULTS
 
     async def test_scoped_settings_seeded_scopes_read_as_the_defaults(
         self, svc: ModuleType, db: FakeDb, people: list[uuid.UUID]
@@ -1445,22 +2612,40 @@ class TestNoContentInLogs:
             db.pool, actor=admin, patch=_user_patch({"appearance": {"theme": "dark"}})
         )
         await svc.update_org_settings(db.pool, actor=admin, patch=_org_patch(gmail=False), ip=_IP)
-        await svc.update_platform_llm(
+        await svc.update_platform_settings(
             db.pool,
             actor=platform_admin,
             patch=_llm_patch(infomaniak_model=_MODEL_MARKER),
             ip=_IP,
         )
+        db.open_session(platform_admin.user_id)
+        await svc.update_platform_settings(
+            db.pool,
+            actor=platform_admin,
+            patch=_settings_patch(files={"render_dpi": 300}, security=_SESSION_POLICY_CHANGE),
+            ip=_IP,
+        )
+        await svc.session_policy_for(db.pool, "super_admin")
+        with pytest.raises(svc.InvalidPlatformSettingsError):
+            await svc.update_platform_settings(
+                db.pool,
+                actor=platform_admin,
+                patch=_settings_patch(
+                    llm={"vllm_model": "Zephyrmarker-vllm-3"},
+                    retention={"trash_min_days": 80, "trash_max_days": 5},
+                ),
+                ip=_IP,
+            )
         db.fail_audit = True
         with pytest.raises(AuditRecordError):
-            await svc.update_platform_llm(
+            await svc.update_platform_settings(
                 db.pool,
                 actor=platform_admin,
                 patch=_llm_patch(openai_model="Zephyrmarker-openai-9"),
                 ip=_IP,
             )
         with pytest.raises(PermissionError):
-            await svc.update_platform_llm(
+            await svc.update_platform_settings(
                 db.pool, actor=admin, patch=_llm_patch(anthropic_model="Zephyrmarker-x"), ip=_IP
             )
 

@@ -52,6 +52,7 @@ from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, Field
 
+from admino import scoped_settings
 from admino.agent import Agent
 from admino.llm import LLMResponse
 from admino.models import (
@@ -74,6 +75,7 @@ from tests.auth_helpers import (
     session_cookie,
     super_admin_session,
 )
+from tests.conftest import default_test_platform_settings
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -155,8 +157,10 @@ class FakeAgent:
         history: list[LLMMessage],
         principal: Principal,
         pending_confirmation: PendingConfirmation | None = None,
+        agent_config: AgentConfig | None = None,
     ) -> AgentResult:
-        """Record the call (GH-149: ``principal`` is a required keyword) and reply."""
+        """Record the call (GH-149: ``principal`` is a required keyword; GH-160: the
+        run's ``agent_config`` from the stored platform limits) and reply."""
         self.run_calls.append(
             {
                 "user_message": user_message,
@@ -164,6 +168,7 @@ class FakeAgent:
                 "history": history,
                 "principal": principal,
                 "pending_confirmation": pending_confirmation,
+                "agent_config": agent_config,
             }
         )
         if self._call_index >= len(self._results):
@@ -171,6 +176,17 @@ class FakeAgent:
         result = self._results[self._call_index]
         self._call_index += 1
         return result
+
+
+@pytest.fixture(autouse=True)
+def _settings_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stand-in pool for the chat routes' platform limits (GH-160).
+
+    POST /api/message and POST /api/confirm read the stored limits through
+    ``scoped_settings.current_platform_settings(get_pool())``. The conftest
+    primes the settings cache, so this pool is never queried.
+    """
+    monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock(name="pool")))
 
 
 def _make_app(
@@ -1958,17 +1974,31 @@ class TestConfirmationExpiry:
         assert srv._chat_key(TEST_MEMBER_ID, "sess-expired") not in srv._pending_confirmations
 
 
+def _stored_max_message_length(monkeypatch: pytest.MonkeyPatch, max_length: int) -> None:
+    """Store a platform max_message_length in the settings cache (GH-160)."""
+    stored = default_test_platform_settings()
+    limits = stored.limits.model_copy(update={"max_message_length": max_length})
+    monkeypatch.setattr(
+        scoped_settings, "_platform_cache", stored.model_copy(update={"limits": limits})
+    )
+
+
 class TestMaxMessageLength:
-    """L-5: max_message_length from config is enforced."""
+    """L-5: the stored platform max_message_length is enforced.
+
+    GH-160: the limit is read per request through the platform settings cache,
+    not from config.limits once at startup.
+    """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_message_exceeds_config_max_length_returns_422(self) -> None:
-        """Message longer than config.limits.max_message_length -> 422."""
+    async def test_server_message_exceeds_config_max_length_returns_422(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Message longer than the stored max_message_length -> 422."""
+        _stored_max_message_length(monkeypatch, 100)
         agent = FakeAgent([_make_agent_result()])
-        config = _make_config()
-        config.limits.max_message_length = 100
-        app = _make_app(agent, config=config)
+        app = _make_app(agent)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
@@ -1978,12 +2008,13 @@ class TestMaxMessageLength:
         assert resp.status_code == 422
         assert "maximum length" in resp.json()["detail"].lower()
 
-    async def test_server_message_within_config_max_length_succeeds(self) -> None:
-        """Message within config limit succeeds."""
+    async def test_server_message_within_config_max_length_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Message within the stored limit succeeds."""
+        _stored_max_message_length(monkeypatch, 100)
         agent = FakeAgent([_make_agent_result()])
-        config = _make_config()
-        config.limits.max_message_length = 100
-        app = _make_app(agent, config=config)
+        app = _make_app(agent)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(

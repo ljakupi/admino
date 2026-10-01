@@ -37,8 +37,11 @@ The settings scopes (GH-159, migration 0013):
   fully matches ``[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}``: no trailing newline),
   the five limits (NOT NULL, no default: ``max_tool_calls_per_message`` 1 to
   100, ``max_pending_confirmations`` 1 to 50, ``confirmation_timeout_s`` 10 to
-  3600, ``max_message_length`` 1 to 100000, ``max_context_messages`` 1 to 200)
-  and ``updated_at`` (NOT NULL, default now()).
+  3600, ``max_message_length`` 1 to 100000, ``max_context_messages`` 1 to 200),
+  the platform defaults of migration 0014 (GH-160, ``PLATFORM_DEFAULTS``: each
+  an INTEGER NOT NULL with a default and a BETWEEN CHECK, plus
+  ``trash_min_days <= trash_max_days``) and ``updated_at`` (NOT NULL, default
+  now()).
 - ``org_settings`` (``org_settings``, keyed by org id): ``org_id`` (primary
   key, references organizations ON DELETE CASCADE), the seven
   ``<tool>_enabled`` BOOLEANs (NOT NULL, default true) and ``updated_at``.
@@ -197,6 +200,11 @@ The sessions table is the schema after migration 0009 (GH-152):
   statement that names ``revoked_at`` fails with asyncpg's
   UndefinedColumnError, as it would against the migrated database.
 - ``created_at`` and ``last_seen_at`` default to the fake's now.
+- GH-160: ``UPDATE sessions SET idle_timeout_minutes = $a, expires_at =
+  created_at + make_interval(hours => $b) WHERE user_id IN (SELECT id FROM
+  users WHERE kind = 'super_admin')`` changes every Super Admin session (and
+  no member's), after checking both CHECKs on every row; it answers
+  ``UPDATE <count>``.
 
 Semantics the tests rely on:
 - ``pool.acquire()`` yields a new connection; ``conn.transaction()`` snapshots
@@ -302,6 +310,13 @@ _SESSION_COLUMNS: Final = frozenset(
     }
 )
 _MAX_LIFETIME: Final = timedelta(hours=72)
+# GH-160: the platform session policy applied to every open Super Admin session
+# (admino.sessions.apply_super_admin_policy), normalized.
+_SUPER_ADMIN_POLICY_RE: Final = re.compile(
+    r"update sessions set idle_timeout_minutes = \$(?P<idle>\d+)(?:::int(?:eger|4)?)?, "
+    r"expires_at = created_at \+ make_interval\(hours => \$(?P<hours>\d+)(?:::int(?:eger|4)?)?\) "
+    r"where user_id in \(select id from users where kind = 'super_admin'\)"
+)
 
 # The columns of the tables the SQL reader models (migrations 0004 and 0010).
 _USER_COLUMNS: Final = frozenset(
@@ -386,8 +401,27 @@ LIMIT_BOUNDS: Final[dict[str, tuple[int, int]]] = {
     "max_message_length": (1, 100000),
     "max_context_messages": (1, 200),
 }
+# GH-160: the platform defaults of migration 0014, column -> (default, low, high).
+# Every one is an INTEGER NOT NULL with a DEFAULT and a BETWEEN CHECK; the
+# trash bounds also CHECK (trash_min_days <= trash_max_days).
+PLATFORM_DEFAULTS: Final[dict[str, tuple[int, int, int]]] = {
+    "max_file_size_mb": (50, 1, 500),
+    "max_files_per_message": (10, 1, 50),
+    "max_pages_per_file": (100, 1, 1000),
+    "render_dpi": (150, 72, 300),
+    "trash_min_days": (0, 0, 90),
+    "trash_max_days": (90, 0, 90),
+    "audit_months": (12, 6, 84),
+    "org_deletion_grace_days": (30, 7, 90),
+    "rate_limit_per_minute": (20, 1, 600),
+    "lockout_after_failures": (10, 3, 100),
+    "lockout_window_minutes": (15, 1, 1440),
+    "lockout_minutes": (15, 1, 1440),
+    "session_idle_timeout_minutes": (60, 15, 480),
+    "session_max_lifetime_hours": (12, 1, 72),
+}
 _PLATFORM_SETTINGS_COLUMNS: Final = frozenset(
-    {"id", "llm_provider", *MODEL_COLUMNS, *LIMIT_BOUNDS, "updated_at"}
+    {"id", "llm_provider", *MODEL_COLUMNS, *LIMIT_BOUNDS, *PLATFORM_DEFAULTS, "updated_at"}
 )
 _ORG_SETTINGS_COLUMNS: Final = frozenset(
     {"org_id", *(f"{tool}_enabled" for tool in TOOL_NAMES), "updated_at"}
@@ -410,6 +444,7 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
         "llm_provider": "text",
         **dict.fromkeys(MODEL_COLUMNS, "text"),
         **dict.fromkeys(LIMIT_BOUNDS, "int"),
+        **dict.fromkeys(PLATFORM_DEFAULTS, "int"),
         "updated_at": "timestamptz",
     },
     "org_settings": {
@@ -878,7 +913,8 @@ class FakeDb:
 
         Defaults: the LLMConfig and LimitsConfig defaults (provider infomaniak,
         its model and vllm's set, the Anthropic and OpenAI models NULL; 10, 3,
-        300, 4000 and 20), updated now. Any column can be given.
+        300, 4000 and 20), migration 0014's column defaults for the platform
+        defaults (``PLATFORM_DEFAULTS``), updated now. Any column can be given.
         """
         unknown = set(columns) - _PLATFORM_SETTINGS_COLUMNS
         assert not unknown, f"platform_settings has no column {sorted(unknown)}"
@@ -895,6 +931,7 @@ class FakeDb:
             "confirmation_timeout_s": 300,
             "max_message_length": 4000,
             "max_context_messages": 20,
+            **{column: default for column, (default, _, _) in PLATFORM_DEFAULTS.items()},
             "updated_at": datetime.now(UTC),
         }
         row.update(columns)
@@ -1124,6 +1161,8 @@ class FakeDb:
             return self._insert_session(method, sql, args)
         if n.startswith("delete from sessions"):
             return self._delete_sessions(method, n, args)
+        if policy := _SUPER_ADMIN_POLICY_RE.fullmatch(n):
+            return self._apply_super_admin_policy(policy, args)
         if n.startswith("update sessions"):
             return self._touch_session(n, args)
         if method == "fetch" and re.search(r"\bfrom sessions\b", n):
@@ -1213,6 +1252,7 @@ class FakeDb:
         row: dict[str, Any] = dict.fromkeys(_COLUMNS[table])
         if table == "platform_settings":
             row["id"] = True
+            row.update({column: default for column, (default, _, _) in PLATFORM_DEFAULTS.items()})
         elif table == "org_settings":
             row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
         else:
@@ -1294,6 +1334,11 @@ class FakeDb:
             rules.extend(
                 (column, low <= row[column] <= high) for column, (low, high) in LIMIT_BOUNDS.items()
             )
+            rules.extend(
+                (column, low <= row[column] <= high)
+                for column, (_, low, high) in PLATFORM_DEFAULTS.items()
+            )
+            rules.append(("trash_bounds", row["trash_min_days"] <= row["trash_max_days"]))
         elif table == "user_settings":
             rules.append(("theme", row["theme"] in THEMES))
         for name, valid in rules:
@@ -1921,6 +1966,36 @@ class FakeDb:
         if method == "fetch":
             return [{"id": _pg(session_id)} for session_id in deleted]
         return f"DELETE {len(deleted)}"
+
+    def _apply_super_admin_policy(self, match: re.Match[str], args: tuple[Any, ...]) -> str:
+        """GH-160: every Super Admin session takes a new idle timeout and expiry.
+
+        ``expires_at = created_at + <lifetime hours>``. Migration 0009's CHECKs
+        run on every changed row before any row changes (one statement: all or
+        nothing); members' sessions are never touched.
+        """
+        idle = args[int(match["idle"]) - 1]
+        hours = args[int(match["hours"]) - 1]
+        if type(idle) is not int or type(hours) is not int:
+            msg = "invalid input for query argument: int expected"
+            raise asyncpg.exceptions.DataError(msg)
+        rows = [
+            row
+            for row in self.sessions.values()
+            if self.users.get(row["user_id"], {}).get("kind") == "super_admin"
+        ]
+        for row in rows:
+            if not 15 <= idle <= 480:
+                msg = "sessions idle_timeout_minutes check"
+                raise asyncpg.exceptions.CheckViolationError(msg)
+            expires_at = row["created_at"] + timedelta(hours=hours)
+            if not row["created_at"] < expires_at <= row["created_at"] + _MAX_LIFETIME:
+                msg = "sessions expiry check"
+                raise asyncpg.exceptions.CheckViolationError(msg)
+        for row in rows:
+            row["idle_timeout_minutes"] = idle
+            row["expires_at"] = row["created_at"] + timedelta(hours=hours)
+        return f"UPDATE {len(rows)}"
 
     def _touch_session(self, n: str, args: tuple[Any, ...]) -> str:
         assert re.match(rf"update\s+sessions\s+set\s+last_seen_at = {NOW_SQL}", n), n
