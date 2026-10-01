@@ -9,21 +9,23 @@ Outputs: ``login`` returns a ``LoginResult`` (the raw session token for the
 Every attempt first goes through the brute-force protection
 (``admino.login_throttle``, GH-157): the account (the typed email) and the
 client IP each count one failure before the password is checked, and from the
-third failure in 15 minutes the attempt waits (1, 2, 4, then 8 seconds). A
-locked account or IP (10 failures in 15 minutes lock it for 15 minutes) is
-refused without checking the password, with the same ``LoginFailedError``,
-and records ``login.failure`` with ``{"locked": true}``.
+third failure in the window the attempt waits (1, 2, 4, then 8 seconds). A
+locked account or IP (by default 10 failures in 15 minutes lock it for 15
+minutes; the stored platform security settings, GH-160) is refused without
+checking the password, with the same ``LoginFailedError``, and records
+``login.failure`` with ``{"locked": true}``.
 
 A login succeeds when the account exists, the password matches, the user is
 active and not deleted, and the user is a Super Admin or a member of an active
 organization. It then re-hashes a password stored with older Argon2
 parameters, stamps ``last_login_at``, opens a session with the account's
-session policy (``sessions.session_policy_for``: the org policy for a member,
-the platform policy for a Super Admin), resets the account's failure count,
-releases its own IP reservation and records ``login.success``, all in one
-transaction. Every other outcome records ``login.failure`` and raises the
-same ``LoginFailedError``; the 10th failure then locks the account and/or the
-IP and records a ``login.lockout`` per lock (account first, then IP).
+session policy (``scoped_settings.session_policy_for``: the org policy for a
+member, the stored platform policy for a Super Admin), resets the account's
+failure count, releases its own IP reservation and records ``login.success``,
+all in one transaction. Every other outcome records ``login.failure`` and
+raises the same ``LoginFailedError``; the failure at the lockout threshold
+then locks the account and/or the IP and records a ``login.lockout`` per lock
+(account first, then IP).
 
 Security notes:
 - No user enumeration: one message ("Invalid email or password") for every
@@ -57,7 +59,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from admino import audit_events, login_throttle, passwords, sessions
+from admino import audit_events, login_throttle, passwords, scoped_settings, sessions
 from admino.audit_events import AuditAction
 
 if TYPE_CHECKING:
@@ -208,7 +210,7 @@ async def login(
         raise LoginFailedError
 
     user_id = account["id"]
-    policy = sessions.session_policy_for(account["kind"])
+    policy = await scoped_settings.session_policy_for(pool, account["kind"])
     new_hash = None
     if passwords.needs_rehash(stored_hash):
         new_hash = await asyncio.to_thread(passwords.hash_password, password)

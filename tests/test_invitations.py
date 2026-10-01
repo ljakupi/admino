@@ -57,6 +57,10 @@ fast spy. No real PostgreSQL, no SMTP.
 Security notes:
 - The raw token lives only in the queued email's link: never in a table, a
   statement, an audit row, an error or a log line.
+- GH-160: acceptance takes its session policy from
+  ``scoped_settings.session_policy_for(<pool>, "member")`` (the org policy,
+  ``sessions.DEFAULT_ORG_SESSION_POLICY``); the stored Super Admin policy never
+  applies to it.
 - Content-free audit and logs: IDs, roles and the IP only; never an email,
   name, password, token or link.
 - Fail closed: a failed audit write rolls the whole change back.
@@ -79,10 +83,11 @@ import pytest
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 from pydantic import SecretStr, ValidationError
 
-from admino import accounts, auth, models, passwords
+from admino import accounts, auth, models, passwords, scoped_settings
 from admino import sessions as sessions_mod
 from admino.access import Principal
 from admino.audit_events import AuditRecordError
+from tests.conftest import default_test_platform_settings
 from tests.db_fakes import (
     INVITE_LINK_PREFIX,
     NOW_SQL,
@@ -1924,6 +1929,36 @@ class TestAcceptInvitation:
         row = db.session(result.token)
         assert row["idle_timeout_minutes"] == 20
         assert row["expires_at"] - row["created_at"] == timedelta(hours=2)
+
+    async def test_invitations_accept_asks_scoped_settings_for_the_member_policy(
+        self, inv: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-160: the policy comes from scoped_settings.session_policy_for(<pool>,
+        "member") (sessions.session_policy_for is retired); a stored Super Admin
+        policy (30 minutes / 8 hours) doesn't touch the member's session."""
+        real = scoped_settings.session_policy_for
+        kinds: list[str] = []
+
+        async def spy(executor: Any, kind: str) -> Any:
+            kinds.append(kind)
+            return await real(executor, kind)
+
+        monkeypatch.setattr(scoped_settings, "session_policy_for", spy)
+        data = default_test_platform_settings().model_dump()
+        data["security"] = {
+            **data.get("security", {}),
+            "session_idle_timeout_minutes": 30,
+            "session_max_lifetime_hours": 8,
+        }
+        stored = scoped_settings.StoredPlatformSettings.model_validate(data)
+        monkeypatch.setattr(scoped_settings, "_platform_cache", stored)
+        await _create(inv, db, _admin(db))
+
+        result = await _accept(inv, db, db.invitation_token())
+
+        assert kinds == ["member"]
+        assert result.max_age_seconds == 43200
+        assert db.session(result.token)["idle_timeout_minutes"] == 60
 
     async def test_invitations_accept_is_audited(self, inv: ModuleType, db: FakeDb) -> None:
         """One invitation.accept row: the new member as the actor, their org, target the

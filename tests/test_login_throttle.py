@@ -9,9 +9,16 @@ progressive delay recorded through the ``login_delays`` fixture (no test ever
 really sleeps).
 
 What these tests pin down:
-- Constants: a 15-minute failure window, a delay from 3 failures, a lockout of
-  15 minutes after 10 failures, delays doubling from 1 s up to 8 s, an hourly
-  purge and the message "Too many attempts. Try again later."
+- Constants: a delay from 3 failures, delays doubling from 1 s up to 8 s, an
+  hourly purge and the message "Too many attempts. Try again later."
+- Stored thresholds (GH-160): ``FAILURE_WINDOW``, ``LOCKOUT_AFTER_FAILURES`` and
+  ``LOCKOUT_DURATION`` are gone. ``begin``, ``fail`` and ``admit`` each read the
+  platform settings once through ``scoped_settings.current_platform_settings``
+  (with their pool) and use the security section: ``lockout_window_minutes``
+  (the failure window, 15 by default), ``lockout_after_failures`` (the Nth
+  failure locks, 10 by default) and ``lockout_minutes`` (the lock's duration,
+  15 by default; the ``login.lockout`` metadata's ``lockout_minutes``). A change
+  applies to the next attempt. The other sections run with these defaults.
   ``delay_seconds(failures)``: 0.0 below 3, then 1, 2, 4, 8, 8, ... (never an
   overflow). ``sleep`` is ``asyncio.sleep``.
 - ``ip_subject(ip)``: a 32-byte digest, the same in every process; IPv4 keys
@@ -72,9 +79,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import asyncpg
 import pytest
 
-from admino import auth, passwords
+from admino import auth, passwords, scoped_settings
 from admino.audit_events import AuditRecordError
 from admino.auth import LOGIN_FAILED_MESSAGE, LoginFailedError
+from tests.conftest import default_test_platform_settings
 from tests.db_fakes import ORG_ID, FakeDb, account_subject, fake_hash, plain
 
 if TYPE_CHECKING:
@@ -235,13 +243,17 @@ def _scope_of(call: Any) -> str | None:
 
 
 class TestConstants:
-    """The issue's defaults, as module constants (#160 makes them configurable)."""
+    """The constants that stay (GH-160 made the window and the lockout configurable)."""
 
-    def test_login_throttle_window_and_lockout_constants(self, throttle: ModuleType) -> None:
-        assert timedelta(minutes=15) == throttle.FAILURE_WINDOW
+    def test_login_throttle_delay_constant_stays_and_lockout_constants_are_retired(
+        self, throttle: ModuleType
+    ) -> None:
+        """GH-160: the failure window, the lockout threshold and the lockout duration are
+        stored platform defaults (the security section), no longer module constants; the
+        delay threshold stays a constant."""
         assert throttle.DELAY_AFTER_FAILURES == 3
-        assert throttle.LOCKOUT_AFTER_FAILURES == 10
-        assert timedelta(minutes=15) == throttle.LOCKOUT_DURATION
+        for name in ("FAILURE_WINDOW", "LOCKOUT_AFTER_FAILURES", "LOCKOUT_DURATION"):
+            assert not hasattr(throttle, name), name
 
     def test_login_throttle_delay_constants(self, throttle: ModuleType) -> None:
         assert throttle.DELAY_BASE_SECONDS == 1.0
@@ -1127,6 +1139,226 @@ class TestExpiry:
         row = _account_row(db)
         assert row is not None
         assert (row["failures"], row["window_started_at"] >= before) == (0, True)
+
+
+# ---------------------------------------------------------------------------
+# 7b. The stored thresholds (GH-160)
+# ---------------------------------------------------------------------------
+
+
+def _store_security(monkeypatch: pytest.MonkeyPatch, **security: int) -> None:
+    """Make the cached platform settings carry these security values (GH-160).
+
+    Built from a dict at call time: StoredPlatformSettings' security section is
+    new in #160.
+    """
+    data = default_test_platform_settings().model_dump()
+    data["security"] = {**data.get("security", {}), **security}
+    stored = scoped_settings.StoredPlatformSettings.model_validate(data)
+    monkeypatch.setattr(scoped_settings, "_platform_cache", stored)
+
+
+class TestStoredThresholds:
+    """begin, fail and admit use the stored lockout_after_failures, lockout_window_minutes
+    and lockout_minutes, read on every call (a change applies to the next attempt)."""
+
+    async def test_login_throttle_stored_threshold_locks_at_that_failure(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, login_delays: list[float]
+    ) -> None:
+        """lockout_after_failures=5: the 4th failure doesn't lock, the 5th does."""
+        _store_security(monkeypatch, lockout_after_failures=5)
+        _account(db)
+
+        await _fail(db, 4, ip=None)
+        fourth = copy.deepcopy(_account_row(db))
+        await _fail(db, 1, ip=None)
+
+        assert fourth is not None
+        assert (fourth["failures"], fourth["locked_until"]) == (4, None)
+        row = _account_row(db)
+        assert _locked(row)
+        assert row is not None
+        assert row["failures"] == 0
+        assert len(db.audit_rows("login.lockout")) == 1
+
+    async def test_login_throttle_stored_threshold_above_the_default_allows_more(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, login_delays: list[float]
+    ) -> None:
+        """lockout_after_failures=12: 10 failures don't lock (the default would), the
+        12th does."""
+        _store_security(monkeypatch, lockout_after_failures=12)
+        _account(db)
+
+        await _fail(db, 10, ip=None)
+        tenth = copy.deepcopy(_account_row(db))
+        await _fail(db, 2, ip=None)
+
+        assert tenth is not None
+        assert (tenth["failures"], tenth["locked_until"]) == (10, None)
+        assert _locked(_account_row(db))
+
+    async def test_login_throttle_stored_threshold_refuses_at_the_limit_unverified(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, verifier: _Verifier
+    ) -> None:
+        """lockout_after_failures=5 and 5 failures in the window without a lock: the
+        correct password is refused before any verification."""
+        _store_security(monkeypatch, lockout_after_failures=5)
+        _account(db)
+        _seed_account(db, failures=5, window_started_at=_now() - timedelta(minutes=1))
+
+        assert await _attempt(db, password=_PASSWORD, ip=None) is False
+        assert verifier.calls == []
+
+    async def test_login_throttle_stored_lockout_minutes_set_the_lock_duration(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, login_delays: list[float]
+    ) -> None:
+        """lockout_minutes=30: locked_until = now + 30 minutes, and the login.lockout
+        metadata carries lockout_minutes 30."""
+        _store_security(monkeypatch, lockout_minutes=30)
+        _account(db)
+        before = _now()
+
+        await _fail(db, 10, ip=None)
+
+        after = _now()
+        row = _account_row(db)
+        assert row is not None
+        lock = timedelta(minutes=30)
+        assert before + lock <= row["locked_until"] <= after + lock
+        assert row["expires_at"] == max(row["window_started_at"] + _WINDOW, row["locked_until"])
+        assert [event["metadata"] for event in db.audit_rows("login.lockout")] == [
+            {"per_ip": False, "lockout_minutes": 30}
+        ]
+
+    async def test_login_throttle_stored_window_drops_older_failures(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, login_delays: list[float]
+    ) -> None:
+        """lockout_window_minutes=5: 9 failures from 6 minutes ago no longer count (no
+        delay, no lock, a fresh window of 5 minutes)."""
+        _store_security(monkeypatch, lockout_window_minutes=5)
+        _account(db)
+        _seed_account(db, failures=9, window_started_at=_now() - timedelta(minutes=6))
+        before = _now()
+
+        assert await _attempt(db, ip=None) is False
+
+        row = _account_row(db)
+        assert row is not None
+        assert login_delays == []
+        assert (row["failures"], row["locked_until"]) == (1, None)
+        assert row["window_started_at"] >= before
+        assert row["expires_at"] == row["window_started_at"] + timedelta(minutes=5)
+
+    async def test_login_throttle_stored_window_keeps_failures_inside_it(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, login_delays: list[float]
+    ) -> None:
+        """lockout_window_minutes=30: 9 failures from 20 minutes ago still count (the
+        default window would have ended): the 8 s delay, then the lock."""
+        _store_security(monkeypatch, lockout_window_minutes=30)
+        _account(db)
+        started = _now() - timedelta(minutes=20)
+        _seed_account(
+            db, failures=9, window_started_at=started, expires_at=started + timedelta(minutes=30)
+        )
+
+        assert await _attempt(db, ip=None) is False
+
+        assert login_delays == [8.0]
+        assert _locked(_account_row(db))
+
+    async def test_login_throttle_new_row_expires_after_the_stored_window(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """lockout_window_minutes=5: a first failure's rows expire 5 minutes after their
+        window started."""
+        _store_security(monkeypatch, lockout_window_minutes=5)
+        _account(db)
+
+        await _attempt(db)
+
+        assert len(db.throttle) == 2
+        for row in db.throttle:
+            assert row["expires_at"] == row["window_started_at"] + timedelta(minutes=5)
+
+    async def test_login_throttle_stored_change_applies_to_the_next_attempt(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch, login_delays: list[float]
+    ) -> None:
+        """AC: 4 failures under the defaults; then the stored values change to 5 failures
+        and 45 minutes, and the very next failure locks for 45 minutes (no restart)."""
+        _account(db)
+        await _fail(db, 4, ip=None)
+        _store_security(monkeypatch, lockout_after_failures=5, lockout_minutes=45)
+        before = _now()
+
+        assert await _attempt(db, ip=None) is False
+
+        after = _now()
+        row = _account_row(db)
+        assert row is not None
+        assert row["locked_until"] is not None
+        assert before + timedelta(minutes=45) <= row["locked_until"]
+        assert row["locked_until"] <= after + timedelta(minutes=45)
+        assert db.audit_rows("login.lockout")[0]["metadata"]["lockout_minutes"] == 45
+
+    async def test_login_throttle_admit_uses_the_stored_threshold(
+        self,
+        db: FakeDb,
+        throttle: ModuleType,
+        monkeypatch: pytest.MonkeyPatch,
+        login_delays: list[float],
+    ) -> None:
+        """lockout_after_failures=5: an IP with 5 failures in the window isn't admitted
+        (and nothing is waited)."""
+        _store_security(monkeypatch, lockout_after_failures=5)
+        _seed_ip(db, throttle, failures=5, window_started_at=_now() - timedelta(minutes=1))
+
+        assert await throttle.admit(db.pool, ip=_IP) is False
+        assert login_delays == []
+
+    async def test_login_throttle_admit_uses_the_stored_window(
+        self,
+        db: FakeDb,
+        throttle: ModuleType,
+        monkeypatch: pytest.MonkeyPatch,
+        login_delays: list[float],
+    ) -> None:
+        """lockout_window_minutes=5: an IP's 9 failures from 6 minutes ago no longer count:
+        admitted without a delay."""
+        _store_security(monkeypatch, lockout_window_minutes=5)
+        _seed_ip(db, throttle, failures=9, window_started_at=_now() - timedelta(minutes=6))
+
+        assert await throttle.admit(db.pool, ip=_IP) is True
+        assert login_delays == []
+
+    async def test_login_throttle_begin_fail_and_admit_read_the_settings_once_each(
+        self,
+        db: FakeDb,
+        throttle: ModuleType,
+        monkeypatch: pytest.MonkeyPatch,
+        login_delays: list[float],
+    ) -> None:
+        """Each of begin, fail and admit reads the platform settings once, through
+        scoped_settings.current_platform_settings with its pool."""
+        real = scoped_settings.current_platform_settings
+        executors: list[Any] = []
+
+        async def spy(executor: Any) -> Any:
+            executors.append(executor)
+            return await real(executor)
+
+        monkeypatch.setattr(scoped_settings, "current_platform_settings", spy)
+        _account(db)
+        calls: list[int] = []
+
+        attempt = await throttle.begin(db.pool, email=_EMAIL, ip=_IP)
+        calls.append(len(executors))
+        await throttle.fail(db.pool, attempt, ip=_IP)
+        calls.append(len(executors))
+        await throttle.admit(db.pool, ip=_IP)
+        calls.append(len(executors))
+
+        assert calls == [1, 2, 3]
+        assert executors == [db.pool] * 3
 
 
 # ---------------------------------------------------------------------------

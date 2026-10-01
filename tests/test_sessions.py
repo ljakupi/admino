@@ -17,8 +17,18 @@ What these tests pin down:
   running at least hourly. ``SESSION_LIFETIME`` is gone.
 - ``SessionPolicy``: a SealedModel with strict int fields inside those bounds and
   ``idle_timeout`` / ``max_lifetime`` timedelta properties.
-  ``DEFAULT_ORG_SESSION_POLICY`` and ``PLATFORM_SESSION_POLICY`` are 60 min / 12 h;
-  ``session_policy_for(kind)`` reads them at call time.
+  ``DEFAULT_ORG_SESSION_POLICY`` (members, until #169) is 60 min / 12 h. GH-160
+  retires ``PLATFORM_SESSION_POLICY`` and ``session_policy_for`` from this module:
+  the Super Admin policy is stored in ``platform_settings`` and
+  ``scoped_settings.session_policy_for`` picks a kind's policy (tested in
+  tests/test_scoped_settings.py).
+- ``apply_super_admin_policy(executor, policy)`` (GH-160): a coroutine issuing one
+  ``UPDATE sessions SET idle_timeout_minutes = $1, expires_at = created_at +
+  make_interval(hours => $2) WHERE user_id IN (SELECT id FROM users WHERE kind =
+  'super_admin')`` with the policy's two ints bound (never inlined); it returns the
+  updated row count. Only Super Admin sessions change; one older than the new
+  lifetime, or idle past the new timeout, no longer resolves; members' sessions are
+  untouched.
 - ``create_session(executor, *, user_id, policy, ip, user_agent)``: one INSERT of
   token_hash, user_id, expires_at (``now() + $n::interval`` on the database clock,
   bound to the policy's lifetime), idle_timeout_minutes (the policy's), the client
@@ -515,63 +525,167 @@ class TestSessionPolicy:
 
 
 # ---------------------------------------------------------------------------
-# 3. The default policies and session_policy_for (GH-152)
+# 3. The org default policy; the platform policy moved out (GH-152, GH-160)
 # ---------------------------------------------------------------------------
 
 
 class TestDefaultPolicies:
-    """Members get the org policy, Super Admins the platform policy (defaults until
-    #169 / #160 store them)."""
+    """Members get the org default (until #169 stores org policies). Since GH-160 the
+    Super Admin policy is a stored platform default, picked by
+    scoped_settings.session_policy_for, so this module holds neither a platform policy
+    nor the per-kind lookup."""
 
-    @pytest.mark.parametrize("name", ["DEFAULT_ORG_SESSION_POLICY", "PLATFORM_SESSION_POLICY"])
-    def test_sessions_default_policies_are_60_minutes_and_12_hours(self, name: str) -> None:
-        """Both defaults are SessionPolicy instances of 60 minutes idle, 12 hours lifetime."""
-        policy = getattr(sessions_mod, name)
+    def test_sessions_default_org_policy_is_60_minutes_and_12_hours(self) -> None:
+        """DEFAULT_ORG_SESSION_POLICY is a SessionPolicy of 60 minutes idle, 12 hours."""
+        policy = sessions_mod.DEFAULT_ORG_SESSION_POLICY
 
         assert type(policy) is sessions_mod.SessionPolicy
         assert (policy.idle_timeout_minutes, policy.max_lifetime_hours) == (60, 12)
 
-    def test_sessions_policy_for_member_is_the_org_default(self) -> None:
-        """session_policy_for("member") is DEFAULT_ORG_SESSION_POLICY."""
-        assert sessions_mod.session_policy_for("member") is sessions_mod.DEFAULT_ORG_SESSION_POLICY
+    @pytest.mark.parametrize("name", ["PLATFORM_SESSION_POLICY", "session_policy_for"])
+    def test_sessions_platform_policy_lookup_is_gone(self, name: str) -> None:
+        """GH-160: both moved to the stored platform settings (scoped_settings)."""
+        assert not hasattr(sessions_mod, name)
 
-    def test_sessions_policy_for_super_admin_is_the_platform_default(self) -> None:
-        """session_policy_for("super_admin") is PLATFORM_SESSION_POLICY."""
-        assert (
-            sessions_mod.session_policy_for("super_admin") is sessions_mod.PLATFORM_SESSION_POLICY
-        )
 
-    def test_sessions_policy_for_reads_the_org_policy_at_call_time(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A changed DEFAULT_ORG_SESSION_POLICY is what members get next; Super Admins
-        keep the platform policy."""
-        custom = _policy(idle=20, lifetime=2)
-        monkeypatch.setattr(sessions_mod, "DEFAULT_ORG_SESSION_POLICY", custom)
+# ---------------------------------------------------------------------------
+# 3b. apply_super_admin_policy: open Super Admin sessions follow a change (GH-160)
+# ---------------------------------------------------------------------------
 
-        assert sessions_mod.session_policy_for("member") is custom
-        assert (
-            sessions_mod.session_policy_for("super_admin") is sessions_mod.PLATFORM_SESSION_POLICY
-        )
+# The one statement, normalized: $1 the idle timeout, $2 the lifetime in hours
+# (an int cast on either is fine).
+_SUPER_ADMIN_POLICY_SQL = re.compile(
+    r"update sessions set idle_timeout_minutes = \$1(?:::int(?:eger|4)?)?, "
+    r"expires_at = created_at \+ make_interval\(hours => \$2(?:::int(?:eger|4)?)?\) "
+    r"where user_id in \(select id from users where kind = 'super_admin'\)"
+)
 
-    def test_sessions_policy_for_reads_the_platform_policy_at_call_time(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """A changed PLATFORM_SESSION_POLICY is what Super Admins get next; members keep
-        the org policy."""
-        custom = _policy(idle=30, lifetime=8)
-        monkeypatch.setattr(sessions_mod, "PLATFORM_SESSION_POLICY", custom)
 
-        assert sessions_mod.session_policy_for("super_admin") is custom
-        assert sessions_mod.session_policy_for("member") is sessions_mod.DEFAULT_ORG_SESSION_POLICY
+def _super_admin(db: FakeDb) -> uuid.UUID:
+    """An active Super Admin account."""
+    return db.add_account(kind="super_admin", role=None)
+
+
+class TestApplySuperAdminPolicy:
+    """One parameterized UPDATE gives every open Super Admin session the new idle timeout
+    and ``expires_at = created_at + <lifetime>``; members' sessions are never touched."""
+
+    def test_sessions_apply_super_admin_policy_is_a_coroutine(self) -> None:
+        assert inspect.iscoroutinefunction(sessions_mod.apply_super_admin_policy)
+
+    async def test_sessions_apply_super_admin_policy_issues_the_exact_update(self) -> None:
+        """One execute(): the UPDATE of the issue, the policy's two ints bound as $1, $2."""
+        executor = _StatusExecutor("UPDATE 2")
+
+        await sessions_mod.apply_super_admin_policy(executor, _policy(idle=30, lifetime=4))
+
+        assert len(executor.calls) == 1, executor.calls
+        method, sql, args = executor.calls[0]
+        assert method == "execute"
+        assert _SUPER_ADMIN_POLICY_SQL.fullmatch(_norm(sql)), sql
+        assert args == (30, 4)
+        assert [type(arg) for arg in args] == [int, int]
 
     @pytest.mark.parametrize(
-        "kind", ["admin", "", "Member", "SUPER_ADMIN", "org_admin", "system", "operator", None, 1]
+        ("status", "count"), [("UPDATE 0", 0), ("UPDATE 1", 1), ("UPDATE 17", 17)]
     )
-    def test_sessions_policy_for_unknown_kind_raises(self, kind: Any) -> None:
-        """Anything but "member" or "super_admin" is a ValueError (no default policy)."""
-        with pytest.raises(ValueError):
-            sessions_mod.session_policy_for(kind)
+    async def test_sessions_apply_super_admin_policy_returns_the_updated_count(
+        self, status: str, count: int
+    ) -> None:
+        executor = _StatusExecutor(status)
+
+        result = await sessions_mod.apply_super_admin_policy(executor, _policy())
+
+        assert result == count
+        assert type(result) is int
+
+    async def test_sessions_apply_super_admin_policy_never_inlines_the_values(self) -> None:
+        executor = _StatusExecutor("UPDATE 1")
+
+        await sessions_mod.apply_super_admin_policy(executor, _policy(idle=437, lifetime=61))
+
+        _, sql, args = executor.calls[0]
+        assert "437" not in sql
+        assert "61" not in sql
+        assert args == (437, 61)
+
+    async def test_sessions_apply_super_admin_policy_retimes_only_super_admin_sessions(
+        self,
+    ) -> None:
+        db = FakeDb()
+        admin = _super_admin(db)
+        other = _super_admin(db)
+        member = db.add_account(role="org_admin")
+        tokens = [db.open_session(admin), db.open_session(other), db.open_session(other)]
+        member_token = db.open_session(member)
+        member_before = dict(db.session(member_token))
+
+        count = await sessions_mod.apply_super_admin_policy(db.pool, _policy(idle=30, lifetime=4))
+
+        assert count == 3
+        for token in tokens:
+            row = db.session(token)
+            assert row["idle_timeout_minutes"] == 30
+            assert row["expires_at"] == row["created_at"] + timedelta(hours=4)
+        assert db.session(member_token) == member_before
+
+    async def test_sessions_apply_super_admin_policy_without_super_admin_sessions_is_zero(
+        self,
+    ) -> None:
+        db = FakeDb()
+        _super_admin(db)
+        member_token = db.open_session(db.add_account(role="editor"))
+        member_before = dict(db.session(member_token))
+
+        count = await sessions_mod.apply_super_admin_policy(db.pool, _policy(idle=30, lifetime=4))
+
+        assert count == 0
+        assert db.session(member_token) == member_before
+
+    async def test_sessions_apply_super_admin_policy_ends_a_session_older_than_the_lifetime(
+        self,
+    ) -> None:
+        """Opened 5 hours ago: live under 12 hours, its expiry in the past under 4."""
+        db = FakeDb()
+        token = db.open_session(_super_admin(db))
+        row = db.session(token)
+        row["created_at"] = _ago(hours=5)
+        row["expires_at"] = row["created_at"] + timedelta(hours=12)
+        assert await resolve_session(db.pool, token) is not None
+
+        await sessions_mod.apply_super_admin_policy(db.pool, _policy(idle=60, lifetime=4))
+
+        assert db.session(token)["expires_at"] <= datetime.now(UTC)
+        assert await resolve_session(db.pool, token) is None
+
+    async def test_sessions_apply_super_admin_policy_ends_a_session_idle_past_the_timeout(
+        self,
+    ) -> None:
+        """Seen 40 minutes ago: gone under a 30-minute idle timeout; a member seen as long
+        ago keeps their session."""
+        db = FakeDb()
+        token = db.open_session(_super_admin(db), last_seen_ago=timedelta(minutes=40))
+        member_token = db.open_session(
+            db.add_account(role="editor"), last_seen_ago=timedelta(minutes=40)
+        )
+
+        await sessions_mod.apply_super_admin_policy(db.pool, _policy(idle=30, lifetime=12))
+
+        assert await resolve_session(db.pool, token) is None
+        assert await resolve_session(db.pool, member_token) is not None
+
+    async def test_sessions_apply_super_admin_policy_keeps_a_session_inside_the_policy(
+        self,
+    ) -> None:
+        db = FakeDb()
+        admin = _super_admin(db)
+        token = db.open_session(admin)
+
+        await sessions_mod.apply_super_admin_policy(db.pool, _policy(idle=30, lifetime=4))
+
+        resolved = await resolve_session(db.pool, token)
+        assert resolved is not None
+        assert resolved.principal.user_id == admin
 
 
 # ---------------------------------------------------------------------------

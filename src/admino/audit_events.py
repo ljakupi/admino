@@ -14,8 +14,11 @@ Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
 optional targets, the client IP and a small metadata dict.
 ``record_tool_call()`` takes an executor, the acting member's org and user
-IDs, the chat ID and one agent tool dispatch's outcome (GH-147, GH-149). ``purge_expired()`` and
-``run_retention_job()`` take the pool and a retention in months.
+IDs, the chat ID and one agent tool dispatch's outcome (GH-147, GH-149).
+``purge_expired()`` takes the pool and a retention in months;
+``run_retention_job()`` the pool and a zero-argument async callable that
+returns it, awaited before each purge (the server passes the stored platform
+default, GH-160, so a change applies to the next run).
 ``actor_columns()`` maps who acts (a ``Principal``, or the admin CLI's
 ``Operator``) to an event's actor_kind and actor_user_id.
 Outputs: one INSERT per event; the purge returns the number of rows removed.
@@ -63,6 +66,8 @@ from admino.access import MemberRole, Operator, SealedModel
 from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS, PermissionState
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     import asyncpg
 
     from admino.access import Principal
@@ -566,22 +571,24 @@ async def purge_expired(
 async def run_retention_job(
     pool: asyncpg.Pool,
     *,
-    retention_months: int = DEFAULT_RETENTION_MONTHS,
+    retention_months: Callable[[], Awaitable[int]],
     interval_seconds: float = PURGE_INTERVAL_SECONDS,
 ) -> None:
     """Purge expired audit events now and then once per interval, until cancelled.
 
-    A failed purge is logged (class name only) and retried at the next
-    interval; cancellation stops the job.
+    Each run awaits ``retention_months()`` first, so a changed retention
+    applies to the next run. A failed lookup or purge is logged (class name
+    only) and retried at the next interval; cancellation stops the job.
 
     Args:
         pool: The database pool.
-        retention_months: How many months of events to keep (6 to 84).
+        retention_months: Returns how many months of events to keep (6 to
+            84); called without arguments before each purge.
         interval_seconds: Seconds between purges (default: one day).
     """
     while True:
         try:
-            await purge_expired(pool, retention_months)
+            await purge_expired(pool, await retention_months())
         except Exception as exc:
             logger.warning(
                 "Audit retention purge failed (%s); retrying next interval.", type(exc).__name__

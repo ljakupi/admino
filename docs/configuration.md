@@ -145,7 +145,7 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | `server` | Bind `host` / `port` for the ASGI server, the session cookie's `cookie_secure` flag, the `public_url` users open admino at, and the `trusted_proxies` whose `X-Forwarded-*` headers are believed (see [Production deployment](#production-deployment-tls-reverse-proxy)). |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
 | `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. The provider and model IDs are also [platform settings](#settings-mine-organization-platform); this section is applied again at every start. |
-| `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. |
+| `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. Change them with `PATCH /api/platform/settings` instead. |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 | `log_level` | Top-level key: `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. The `LOG_LEVEL` env var overrides it. |
 | `log_format` | Top-level key: `text` (default) or `json`, one JSON object per line (`ts`, `level`, `logger`, `message`, `request_id`) for a log collector. The `LOG_FORMAT` env var overrides it (`text` or `json`, any case; another value is ignored with a warning). Logs never hold content, see [Logs and error tracking](SECURITY.md#logs-and-error-tracking). |
@@ -159,17 +159,56 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 | --- | --- | --- | --- |
 | **Mine** | every account | `GET` / `PATCH /api/me/settings` | Theme and notifications. The **Settings** page shows only these. |
 | **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. On the **Tools** page, Org Admins see the switches. |
-| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, and the platform limits (from `config.yaml`'s `limits`, read-only for now). |
+| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. |
 
 - The UI and response languages belong to your account, not to these settings.
 - Organization and platform changes are recorded in the audit log: which fields changed,
-  and a tool's old and new on/off state. Model names are never recorded.
+  a tool's old and new on/off state, and a platform number's old and new value. Model names
+  are never recorded.
 - **For now, a tool service one organization switches off is off for every organization**,
   and no organization can switch it back on for the others. Per-organization tool
   policies replace this in a later release.
 - Upgrading from a version with the single `settings` table drops it: everyone starts from
   the defaults (light theme, notifications on, every tool service on), and the platform
   settings start from `config.yaml`.
+
+### Platform defaults
+
+`PATCH /api/platform/settings` takes any of these sections. Each field is optional, and
+the response holds every section after the change.
+
+| Section | Field | Default | Range | Used by |
+| --- | --- | --- | --- | --- |
+| `limits` | `max_tool_calls_per_message` | from `config.yaml` (10) | 1–100 | every message |
+| `limits` | `max_pending_confirmations` | from `config.yaml` (3) | 1–50 | — |
+| `limits` | `confirmation_timeout_s` | from `config.yaml` (300) | 10–3600 | every message |
+| `limits` | `max_message_length` | from `config.yaml` (4000) | 1–100,000 | every message |
+| `limits` | `max_context_messages` | from `config.yaml` (20) | 1–200 | every message |
+| `files` | `max_file_size_mb` | 50 | 1–500 | attachments (later release) |
+| `files` | `max_files_per_message` | 10 | 1–50 | attachments (later release) |
+| `files` | `max_pages_per_file` | 100 | 1–1000 | attachments (later release) |
+| `files` | `render_dpi` | 150 | 72–300 | page images (later release) |
+| `retention` | `trash_min_days`, `trash_max_days` | 0, 90 | 0–90, min ≤ max | the bounds of each organization's trash retention (later release) |
+| `retention` | `audit_months` | 12 | 6–84 | the daily audit purge |
+| `retention` | `org_deletion_grace_days` | 30 | 7–90 | the next organization deletion you schedule |
+| `security` | `rate_limit_per_minute` | 20 | 1–600 | per-user request limit (later release) |
+| `security` | `lockout_after_failures` | 10 | 3–100 | brute-force protection |
+| `security` | `lockout_window_minutes` | 15 | 1–1440 | brute-force protection |
+| `security` | `lockout_minutes` | 15 | 1–1440 | brute-force protection |
+| `security` | `session_idle_timeout_minutes` | 60 | 15–480 | Super Admin sessions |
+| `security` | `session_max_lifetime_hours` | 12 | 1–72 | Super Admin sessions |
+
+- A change applies without a restart: the next message, login attempt, deletion schedule
+  or audit purge uses the new value.
+- **The Super Admin session policy applies to open sessions too.** Every open Super Admin
+  session takes the new idle timeout, and its end moves to its start plus the new
+  lifetime. A session older than a shortened lifetime ends at once, your own included.
+- A deletion that's already scheduled keeps its date.
+- A lock that's already set keeps its end. Lowering `lockout_window_minutes` lets failed
+  attempts older than the new window stop counting at once, so don't lower it during an
+  attack; raise `lockout_minutes` or lower `lockout_after_failures` instead.
+- A value out of range answers `422`. A trash minimum above the maximum, after merging
+  with the stored values, answers `400`. Nothing is changed in either case.
 
 ## Accounts and sessions
 
@@ -187,7 +226,8 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
 - **Sessions** end after 60 minutes without activity, and after 12 hours at most, even
   when you stay active. That's your organization's session policy; a later release lets
   Org Admins change it (15 to 480 minutes idle, 1 to 72 hours at most). Super Admins get
-  the platform's policy, with the same defaults. Your browser only holds a random token in
+  the platform's session policy, a [platform default](#platform-defaults) with the same
+  defaults. Your browser only holds a random token in
   the `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database
   only stores its SHA-256 hash.
 - **Ending a session** deletes it at once, and its cookie stops working on the next
@@ -219,7 +259,9 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
 - **Brute-force protection** counts failed logins per account and per IP address, and
   the counts survive a restart. After 3 failures in 15 minutes, each further attempt
   waits before the password is checked: 1, 2, 4, then 8 seconds. After 10 failures in
-  15 minutes, the account or the IP address is locked for 15 minutes. A locked login
+  15 minutes, the account or the IP address is locked for 15 minutes. The failure count,
+  the window and the lock duration are [platform defaults](#platform-defaults); the
+  numbers here are their defaults. A locked login
   gets the same "Invalid email or password" as a wrong password, even with the right
   password, and the lock expires on its own. Every lockout is recorded in the audit log
   (`login.lockout`). An address that was never registered is counted the same way, so
@@ -228,7 +270,7 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   as a failed attempt from that IP address. While the address is locked, confirming a
   reset, opening an invitation link, accepting an invitation and asking for a reset
   link answer `429` "Too many attempts. Try again later." Asking for a reset link never
-  counts as a failure. The limits above are fixed for now; they aren't configurable.
+  counts as a failure.
 - **Cross-site requests** that change something (`POST`, `PATCH`, `DELETE`) are refused
   with `403`.
 - **Rate limits** apply per user, and per IP address for the login, the password reset
@@ -332,7 +374,8 @@ the Super Admin did.
   data is kept.
 - **Delete, in two steps**:
   1. `POST /api/platform/orgs/{id}/deletion` schedules the deletion. The organization is
-     deactivated (everyone is logged out), its data is purged after **30 days**, and its
+     deactivated (everyone is logged out), its data is purged after the grace period
+     (**30 days** by default, a [platform default](#platform-defaults)), and its
      active Org Admins get an email with the date.
   2. Until the purge has run, `DELETE /api/platform/orgs/{id}/deletion` cancels it. The
      organization stays deactivated; reactivate it to let its members back in.
@@ -459,7 +502,8 @@ PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, `p
   re-running the [OAuth consent flow](getting-started.md#connect-your-accounts).
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the tool, the action, the permission decision, success and duration. Arguments,
-  tool output and message text are never stored. Rows are kept for 12 months, and a daily
+  tool output and message text are never stored. Rows are kept for 12 months by default
+  (6 to 84, a [platform default](#platform-defaults)), and a daily
   job purges older ones. See [Permissions](permissions.md#append-only-audit-log).
 
 ## Egress whitelist

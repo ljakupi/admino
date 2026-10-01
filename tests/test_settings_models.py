@@ -4,7 +4,8 @@ The single ``/api/settings`` body is split into three scopes, each with its own
 request and response models: user (``/api/me/settings``: theme and
 notifications), org (``/api/org/settings``: the enabled tool services) and
 platform (``/api/platform/settings``: the LLM provider and models, plus the
-limits, which stay read-only until #160).
+limits, which GH-160 makes editable next to the files, retention and security
+defaults; those sections are pinned in tests/test_platform_settings_models.py).
 
 What these tests pin down:
 - The old combined models are gone: ``SettingsResponse``, ``SettingsPatch``,
@@ -18,14 +19,17 @@ What these tests pin down:
   tool names of ``ToolsSettings`` only (an unknown tool such as ``files`` and
   an ``org_id`` in the body are refused, never ignored); strict bools; at least
   one tool given.
-- ``PlatformSettingsPatch``: ``llm`` is required; a ``limits`` key is refused
-  until #160; at least one llm field given. ``SettingsPatchLLM`` refuses
+- ``PlatformSettingsPatch``: ``llm`` is optional (GH-160 adds the ``limits``,
+  ``files``, ``retention`` and ``security`` sections, so a ``limits`` key is now
+  accepted); any other key is refused; an llm-only patch needs at least one llm
+  field. ``SettingsPatchLLM`` refuses
   unknown fields (so ``vllm_base_url``, ``timeout_s`` or a key can never be
   patched) and model names must fully match ``[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}``
   (a trailing newline is refused: the database CHECK would reject it with a 500).
 - ``PlatformLimits`` has exactly the ``LimitsConfig`` fields and bounds.
 - ``UserSettingsResponse``, ``OrgSettingsResponse`` and
-  ``PlatformSettingsResponse`` carry exactly their scope's sections.
+  ``PlatformSettingsResponse`` carry exactly their scope's sections (the
+  platform one: llm, limits, files, retention, security since GH-160).
 - Validation errors of the request models never repeat the rejected input.
 
 New symbols are looked up per test, so a missing model fails its own tests and
@@ -399,14 +403,15 @@ class TestOrgSettingsPatch:
 
 
 class TestPlatformSettingsPatch:
-    """The platform LLM (provider and models); limits are read-only until #160."""
+    """The platform LLM (provider and models); since GH-160 also the other sections."""
 
-    def test_platform_settings_patch_has_only_a_required_llm_field(self) -> None:
+    def test_platform_settings_patch_llm_is_an_optional_section(self) -> None:
+        """GH-160: llm is one of five optional sections (it was the only, required one)."""
         fields = _model("PlatformSettingsPatch").model_fields
 
-        assert set(fields) == {"llm"}
-        assert fields["llm"].annotation is SettingsPatchLLM
-        assert fields["llm"].is_required()
+        assert set(fields) == {"llm", "limits", "files", "retention", "security"}
+        assert SettingsPatchLLM in typing.get_args(fields["llm"].annotation)
+        assert not fields["llm"].is_required()
         assert set(SettingsPatchLLM.model_fields) == {"provider", *_MODEL_FIELDS}
 
     @pytest.mark.parametrize("provider", _PROVIDERS)
@@ -444,24 +449,39 @@ class TestPlatformSettingsPatch:
         _rejects(_model("PlatformSettingsPatch"), {"llm": {"provider": provider}})
 
     @pytest.mark.parametrize("payload", [{}, {"llm": None}])
-    def test_platform_settings_patch_llm_is_required(self, payload: dict[str, Any]) -> None:
+    def test_platform_settings_patch_without_any_section_is_rejected(
+        self, payload: dict[str, Any]
+    ) -> None:
         _rejects(_model("PlatformSettingsPatch"), payload)
 
     @pytest.mark.parametrize(
         ("key", "value"),
         [
-            ("limits", {"max_message_length": 100}),
             ("tools", {"gmail": False}),
             ("appearance", {"theme": "dark"}),
             ("notifications", {"enabled": False}),
             ("server", {"port": 1}),
+            ("org_id", "00000000-0000-4000-8000-000000000001"),
         ],
     )
     def test_platform_settings_patch_unknown_top_level_key_is_rejected(
         self, key: str, value: object
     ) -> None:
-        """A limits key is refused until #160 makes limits editable."""
+        """Another scope's key is refused, never silently dropped."""
         _rejects(_model("PlatformSettingsPatch"), {"llm": {"provider": "openai"}, key: value})
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"llm": {"provider": "openai"}, "limits": {"max_message_length": 100}},
+            {"limits": {"max_message_length": 100}},
+        ],
+    )
+    def test_platform_settings_patch_limits_key_is_accepted(self, payload: dict[str, Any]) -> None:
+        """GH-160 makes the limits editable: the key #159 refused is now accepted."""
+        patch = _model("PlatformSettingsPatch").model_validate(payload)
+
+        assert patch.model_dump(exclude_none=True) == payload
 
     @pytest.mark.parametrize(
         ("key", "value"),
@@ -597,19 +617,29 @@ class TestScopedSettingsResponses:
         assert body.model_dump() == {"tools": dict.fromkeys(_TOOLS, True)}
 
     def test_platform_settings_response_shape(self) -> None:
+        """GH-160 adds files, retention and security next to llm and limits."""
         fields = _model("PlatformSettingsResponse").model_fields
 
-        assert set(fields) == {"llm", "limits"}
+        assert set(fields) == {"llm", "limits", "files", "retention", "security"}
         assert fields["llm"].annotation is SettingsLLM
         assert fields["limits"].annotation is _model("PlatformLimits")
+        assert fields["files"].annotation is _model("PlatformFiles")
+        assert fields["retention"].annotation is _model("PlatformRetention")
+        assert fields["security"].annotation is _model("PlatformSecurity")
 
     def test_platform_settings_response_dump(self) -> None:
         limits = _model("PlatformLimits").model_validate(LimitsConfig().model_dump())
         llm = SettingsLLM(provider="infomaniak", anthropic_model="", openai_model="")
 
-        body = _model("PlatformSettingsResponse")(llm=llm, limits=limits)
+        body = _model("PlatformSettingsResponse")(
+            llm=llm,
+            limits=limits,
+            files=_model("PlatformFiles")(),
+            retention=_model("PlatformRetention")(),
+            security=_model("PlatformSecurity")(),
+        )
         dumped = json.loads(body.model_dump_json())
 
-        assert set(dumped) == {"llm", "limits"}
+        assert set(dumped) == {"llm", "limits", "files", "retention", "security"}
         assert dumped["limits"] == LimitsConfig().model_dump()
         assert dumped["llm"]["provider"] == "infomaniak"

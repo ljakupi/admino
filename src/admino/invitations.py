@@ -112,7 +112,15 @@ from typing import TYPE_CHECKING, Final
 
 import asyncpg
 
-from admino import accounts, audit_events, auth, email_outbox, passwords, sessions
+from admino import (
+    accounts,
+    audit_events,
+    auth,
+    email_outbox,
+    passwords,
+    scoped_settings,
+    sessions,
+)
 from admino.access import Capability, MemberRole, can
 from admino.audit_events import AuditAction, TargetType
 from admino.email_templates import EmailLanguage, EmailTemplate, InvitationParams
@@ -760,7 +768,7 @@ async def accept_invitation(
     new_hash = await asyncio.to_thread(passwords.hash_password, password)
 
     user_id = row["user_id"]
-    policy = sessions.session_policy_for("member")
+    policy = await scoped_settings.session_policy_for(pool, "member")
     async with pool.acquire() as conn, conn.transaction():
         invitation_id = await conn.fetchval(_MARK_ACCEPTED_SQL, token_hash)
         if invitation_id is None:

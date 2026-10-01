@@ -14,8 +14,10 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
   are refused while a deletion is pending.
 - Status transitions: ``deactivate_org`` (active -> deactivated),
   ``reactivate_org`` (deactivated -> active), ``schedule_deletion`` (active or
-  deactivated -> pending_deletion, ``purge_after = now() + 30 days``, the
-  active Org Admins emailed) and ``cancel_deletion`` (pending_deletion ->
+  deactivated -> pending_deletion, ``purge_after = now() +`` the stored
+  platform default ``retention.org_deletion_grace_days`` (GH-160, 30 days by
+  default; a change applies to the next scheduling only), the active Org
+  Admins emailed) and ``cancel_deletion`` (pending_deletion ->
   deactivated, never active: the Super Admin reactivates explicitly).
   Deactivating and scheduling end every session of the org's users; content
   is kept. Login, sessions, resets and invitation links already refuse an org
@@ -32,7 +34,8 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
 Inputs: the database pool; the acting ``Principal`` (a Super Admin; the
 Operator for ``create_org`` only), the org id, the validated request models
 (``OrgCreateRequest``, ``OrgLimitsPatch``), the invitee's language, the
-configured public URL and the client IP; the attachments root (purge).
+configured public URL and the client IP; the attachments root (purge); the
+stored grace period (``scoped_settings.current_platform_settings``).
 Outputs: ``OrgSummary`` (org metadata only), a list of them, ``CreatedOrg``,
 the number of orgs purged. Errors: ``PermissionError``, ``OrgNotFoundError``,
 ``InvalidOrgStatusError``, ``accounts.DuplicateEmailError`` (a taken admin
@@ -76,7 +79,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from admino import audit_events, email_outbox, invitations, sessions
+from admino import audit_events, email_outbox, invitations, scoped_settings, sessions
 from admino.access import Capability, Operator, Principal, can
 from admino.audit_events import AuditAction, TargetType
 from admino.email_templates import OrgDeletionScheduledParams
@@ -97,7 +100,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DELETION_GRACE_PERIOD: Final = timedelta(days=30)
 ATTACHMENTS_ROOT: Final = Path("/app/data/attachments")
 PURGE_INTERVAL_SECONDS: Final = 3600
 ORG_NOT_FOUND_MESSAGE: Final = "Organization not found"
@@ -526,9 +528,11 @@ async def schedule_deletion(
 ) -> OrgSummary:
     """Mark an active or deactivated organization for deletion after the grace period.
 
-    Sets ``deletion_requested_at = now()`` and ``purge_after = now() +
-    DELETION_GRACE_PERIOD``, ends every session of its users and queues an
-    ``org_deletion_scheduled`` email to each of its active Org Admins.
+    Sets ``deletion_requested_at = now()`` and ``purge_after = now() +`` the
+    stored ``retention.org_deletion_grace_days`` (read once, after the
+    authorization), ends every session of its users and queues an
+    ``org_deletion_scheduled`` email to each of its active Org Admins. The
+    ``org.deletion_schedule`` event's ``grace_days`` is that stored value.
 
     Args:
         pool: The database pool.
@@ -546,10 +550,14 @@ async def schedule_deletion(
         InvalidOrgStatusError: If a deletion is already pending.
         AuditRecordError: If the audit event can't be recorded; nothing
             changes.
+        RuntimeError: If the grace period can't be read (no platform row);
+            nothing changes.
     """
     _require(actor, Capability.ORG_LIFECYCLE_MANAGE)
+    retention = (await scoped_settings.current_platform_settings(pool)).retention
+    grace_days = retention.org_deletion_grace_days
     async with _locked_org(pool, org_id, allowed=_NOT_PENDING_DELETION) as (conn, _):
-        (row,) = await conn.fetch(_SCHEDULE_SQL, org_id, DELETION_GRACE_PERIOD)
+        (row,) = await conn.fetch(_SCHEDULE_SQL, org_id, timedelta(days=grace_days))
         revoked = await sessions.revoke_org_sessions(conn, org_id)
         admins = await conn.fetch(_ACTIVE_ADMINS_SQL, org_id)
         params = OrgDeletionScheduledParams(org_name=row["name"], purge_after=row["purge_after"])
@@ -564,7 +572,7 @@ async def schedule_deletion(
             metadata={
                 "sessions_revoked": revoked,
                 "emails_queued": len(admins),
-                "grace_days": DELETION_GRACE_PERIOD.days,
+                "grace_days": grace_days,
             },
         )
     return _summary(row)

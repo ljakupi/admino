@@ -11,11 +11,14 @@ What these tests pin down:
   org, the client IP), and a frozen ``LoginResult`` returned: the raw token (kept
   out of its repr) and the cookie's ``max_age_seconds``. A hash with older
   parameters is rehashed with the current ones; a current hash is left alone.
-- Session policy (GH-152): the session is opened with
-  ``sessions.session_policy_for(<the account's kind>)``: a member's row stores
-  the org policy's idle timeout and lifetime, a Super Admin's the platform
-  policy's, and ``max_age_seconds`` is that lifetime in seconds (43200 by
-  default).
+- Session policy (GH-152, GH-160): the session is opened with
+  ``scoped_settings.session_policy_for(<pool>, <the account's kind>)``: a
+  member's row stores the org policy's idle timeout and lifetime
+  (``sessions.DEFAULT_ORG_SESSION_POLICY``), a Super Admin's the stored
+  platform policy's (the cached platform settings' ``security``
+  ``session_idle_timeout_minutes`` / ``session_max_lifetime_hours``), and
+  ``max_age_seconds`` is that lifetime in seconds (43200 by default). A change
+  of the stored policy applies to the next Super Admin login.
 - Failure, for every cause (unknown email, wrong password, invited user without
   a password, deactivated or deleted user, user of a deactivated or
   pending-deletion org): the same ``LoginFailedError("Invalid email or password")``,
@@ -58,10 +61,11 @@ import pytest
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 
 from admino import auth as auth_mod
-from admino import passwords
+from admino import passwords, scoped_settings
 from admino import sessions as sessions_mod
 from admino.auth import LOGIN_FAILED_MESSAGE, LoginFailedError, login, logout
 from admino.sessions import hash_session_token
+from tests.conftest import default_test_platform_settings
 from tests.db_fakes import FakeDb, NowPlus, insert_values
 
 if TYPE_CHECKING:
@@ -522,6 +526,24 @@ def _policy(idle: int, lifetime: int) -> Any:
     return sessions_mod.SessionPolicy(idle_timeout_minutes=idle, max_lifetime_hours=lifetime)
 
 
+def _platform_settings(**sections: dict[str, Any]) -> Any:
+    """The default test platform settings with some fields of some sections replaced.
+
+    Built from a dict at call time (GH-160): the files, retention and security
+    sections of StoredPlatformSettings are new in #160.
+    """
+    data = default_test_platform_settings().model_dump()
+    for section, values in sections.items():
+        data[section] = {**data.get(section, {}), **values}
+    return scoped_settings.StoredPlatformSettings.model_validate(data)
+
+
+def _store_session_policy(monkeypatch: pytest.MonkeyPatch, *, idle: int, lifetime: int) -> None:
+    """Make the cached platform settings carry this Super Admin session policy (GH-160)."""
+    security = {"session_idle_timeout_minutes": idle, "session_max_lifetime_hours": lifetime}
+    monkeypatch.setattr(scoped_settings, "_platform_cache", _platform_settings(security=security))
+
+
 class TestLoginResult:
     """login returns a frozen LoginResult: the token and the cookie's Max-Age."""
 
@@ -558,7 +580,12 @@ class TestLoginResult:
 
 
 class TestLoginSessionPolicy:
-    """The session's idle timeout and lifetime come from sessions.session_policy_for."""
+    """The session's idle timeout and lifetime come from scoped_settings.session_policy_for.
+
+    GH-160: a Super Admin's policy is the stored platform policy (the security
+    section of the cached platform settings); a member keeps
+    sessions.DEFAULT_ORG_SESSION_POLICY.
+    """
 
     async def test_auth_login_member_session_uses_the_org_default(self, current_hash: str) -> None:
         """A member: idle 60 minutes, expires_at = now() + 12 hours, Max-Age 43200."""
@@ -574,7 +601,7 @@ class TestLoginSessionPolicy:
     async def test_auth_login_super_admin_session_uses_the_platform_default(
         self, current_hash: str
     ) -> None:
-        """A Super Admin: the platform default (also 60 minutes / 12 hours)."""
+        """A Super Admin: the stored platform default (also 60 minutes / 12 hours)."""
         pool = _FakePool(_super_admin(current_hash))
 
         result = await _login(pool)
@@ -584,13 +611,13 @@ class TestLoginSessionPolicy:
         assert row["expires_at"] == NowPlus(timedelta(hours=12))
         assert result.max_age_seconds == 43200
 
-    async def test_auth_login_platform_policy_applies_to_super_admins_only(
+    async def test_auth_login_stored_platform_policy_applies_to_super_admins_only(
         self, current_hash: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With a 30-minute / 8-hour platform policy the Super Admin's row stores 30 and
-        now() + 8 h and Max-Age is 28800; a member in the same test keeps 60 / 12 h /
-        43200."""
-        monkeypatch.setattr(sessions_mod, "PLATFORM_SESSION_POLICY", _policy(30, 8))
+        """With a stored 30-minute / 8-hour platform policy the Super Admin's row stores 30
+        and now() + 8 h and Max-Age is 28800; a member in the same test keeps 60 / 12 h /
+        43200 (GH-160)."""
+        _store_session_policy(monkeypatch, idle=30, lifetime=8)
         admin_pool = _FakePool(_super_admin(current_hash))
         member_pool = _FakePool(_member(current_hash))
 
@@ -609,6 +636,49 @@ class TestLoginSessionPolicy:
             NowPlus(timedelta(hours=12)),
         )
         assert member.max_age_seconds == 43200
+
+    @pytest.mark.parametrize(("idle", "lifetime"), [(15, 1), (480, 72)])
+    async def test_auth_login_super_admin_session_stores_the_stored_bounds(
+        self, current_hash: str, monkeypatch: pytest.MonkeyPatch, idle: int, lifetime: int
+    ) -> None:
+        """The stored policy's extremes (15 min / 1 h and 480 min / 72 h) land in the row
+        and the cookie unchanged (GH-160)."""
+        _store_session_policy(monkeypatch, idle=idle, lifetime=lifetime)
+        pool = _FakePool(_super_admin(current_hash))
+
+        result = await _login(pool)
+
+        row = _session_insert(pool)
+        assert (row["idle_timeout_minutes"], row["expires_at"]) == (
+            idle,
+            NowPlus(timedelta(hours=lifetime)),
+        )
+        assert result.max_age_seconds == lifetime * 3600
+
+    async def test_auth_login_after_a_stored_policy_change_super_admin_gets_the_new_values(
+        self, current_hash: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC (GH-160): after the stored policy changes, the next Super Admin login stores
+        the new values, without a restart; the earlier login's row keeps its own."""
+        _store_session_policy(monkeypatch, idle=30, lifetime=8)
+        before_pool = _FakePool(_super_admin(current_hash))
+        await _login(before_pool)
+
+        _store_session_policy(monkeypatch, idle=90, lifetime=24)
+        after_pool = _FakePool(_super_admin(current_hash))
+        after = await _login(after_pool)
+
+        after_row = _session_insert(after_pool)
+        assert (after_row["idle_timeout_minutes"], after_row["expires_at"]) == (
+            90,
+            NowPlus(timedelta(hours=24)),
+        )
+        assert after.max_age_seconds == 86400
+        before_row = _session_insert(before_pool)
+        assert (before_row["idle_timeout_minutes"], before_row["expires_at"]) == (
+            30,
+            NowPlus(timedelta(hours=8)),
+        )
 
     async def test_auth_login_org_policy_applies_to_members_only(
         self, current_hash: str, monkeypatch: pytest.MonkeyPatch
@@ -635,18 +705,19 @@ class TestLoginSessionPolicy:
         )
         assert admin.max_age_seconds == 43200
 
-    async def test_auth_login_asks_session_policy_for_the_accounts_kind(
+    async def test_auth_login_asks_scoped_settings_for_the_accounts_kind(
         self, current_hash: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The policy comes from sessions.session_policy_for(account kind)."""
-        real = sessions_mod.session_policy_for
+        """The policy comes from scoped_settings.session_policy_for(<pool>, account kind)
+        (GH-160; sessions.session_policy_for is retired)."""
+        real = scoped_settings.session_policy_for
         kinds: list[str] = []
 
-        def spy(kind: str) -> Any:
+        async def spy(executor: Any, kind: str) -> Any:
             kinds.append(kind)
-            return real(kind)
+            return await real(executor, kind)
 
-        monkeypatch.setattr(sessions_mod, "session_policy_for", spy)
+        monkeypatch.setattr(scoped_settings, "session_policy_for", spy)
 
         await _login(_FakePool(_member(current_hash)))
         await _login(_FakePool(_super_admin(current_hash)))
@@ -659,7 +730,12 @@ class TestLoginSessionPolicy:
     ) -> None:
         """A failed login opens no session, so it needs no policy."""
         calls: list[Any] = []
-        monkeypatch.setattr(sessions_mod, "session_policy_for", lambda kind: calls.append(kind))
+
+        async def spy(executor: Any, kind: str) -> Any:
+            calls.append(kind)
+            return _policy(60, 12)
+
+        monkeypatch.setattr(scoped_settings, "session_policy_for", spy)
         account, password = _failure_case(cause, current_hash)
 
         with pytest.raises(LoginFailedError):
