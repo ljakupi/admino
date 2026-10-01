@@ -17,7 +17,10 @@
  *      safe redirect or home); the other public pages are open to everyone.
  *   b) A protected page while logged out: to /login, preserving the target
  *      as `?redirect=` when it is safe.
- *   c) A protected page the role may not open: to the role's home.
+ *   c) A protected page the role may not open: to the role's home. Issue
+ *      #161: an Org Admin opening /permissions goes home (the matrix lives
+ *      under Organization); an Editor or Viewer may open the read-only
+ *      /permissions summary but not /organization.
  *   d) Otherwise the navigation proceeds (`true`).
  */
 import { describe, it, expect } from 'vitest';
@@ -39,9 +42,9 @@ const HOME: Record<ShellRole, string> = {
 
 const ALLOWED: Record<ShellRole, readonly Area[]> = {
   super_admin: ['platform'],
-  org_admin: ['chat', 'tools', 'permissions', 'organization', 'settings'],
-  editor: ['chat', 'tools', 'settings'],
-  viewer: ['chat', 'settings'],
+  org_admin: ['chat', 'tools', 'organization', 'settings'],
+  editor: ['chat', 'tools', 'permissions', 'settings'],
+  viewer: ['chat', 'permissions', 'settings'],
 };
 
 const DEL = String.fromCharCode(0x7f);
@@ -209,13 +212,21 @@ describe('guards resolveNavigation per role', () => {
   it.each([
     ['viewer', 'tools', '/chat'],
     ['editor', 'organization', '/chat'],
-    ['editor', 'permissions', '/chat'],
-    ['viewer', 'permissions', '/chat'],
+    ['viewer', 'organization', '/chat'],
+    ['org_admin', 'permissions', '/chat'],
     ['org_admin', 'platform', '/chat'],
     ['super_admin', 'chat', '/platform'],
     ['super_admin', 'settings', '/platform'],
     ['super_admin', 'tools', '/platform'],
   ] as Array<[ShellRole, Area, string]>)('sends %s from /%s to %s', (role, area, home) => {
     expect(resolveNavigation(areaTarget(area), role)).toEqual({ path: home });
+  });
+
+  it.each([
+    ['editor', 'permissions'],
+    ['viewer', 'permissions'],
+    ['org_admin', 'organization'],
+  ] as Array<[ShellRole, Area]>)('lets %s open /%s (issue #161)', (role, area) => {
+    expect(resolveNavigation(areaTarget(area), role)).toBe(true);
   });
 });

@@ -10,9 +10,10 @@ the ``audit_events`` table, validated by ``admino.audit_events``.
 Security notes:
 - No secrets, tokens, passwords, or credentials are stored in any model field,
   except ``LoginRequest.password``, ``PasswordResetConfirmRequest.token`` /
-  ``new_password`` and ``InvitationAcceptRequest.password``: ``SecretStr``
-  values (hidden from repr/str) that live only for their request and are never
-  logged or echoed. Invitation models carry no token, hash or link.
+  ``new_password``, ``InvitationAcceptRequest.password`` and
+  ``CriticalPermissionPromote.password``: ``SecretStr`` values (hidden from
+  repr/str) that live only for their request and are never logged or echoed.
+  Invitation models carry no token, hash or link.
 - Organization models (GH-154) carry org metadata only: no content, and
   ``OrgCreateResponse`` no token or link. ``OrgCreateRequest`` and
   ``OrgLimitsPatch`` hide their input from validation errors (an org name or
@@ -26,6 +27,12 @@ Security notes:
   one value and hide their input from validation errors. Model names must
   fully match the model-name rule, the same as migration 0013's CHECK.
   ``SettingsLLM`` shows key presence flags only, never a key.
+- Tool permissions per org (GH-161): ``PermissionPatch`` and
+  ``CriticalPermissionPromote`` refuse unknown keys (an org id included: the
+  org always comes from the session) and hide their input from validation
+  errors. ``ToolPolicy`` (one org's permissions for one agent run) is frozen,
+  so a loaded policy can't be changed. ``PermissionSummaryEntry`` carries a
+  (tool, action) pair and its effective state only.
 - Platform defaults (GH-160): the section patch models of
   ``PlatformSettingsPatch`` take strict ints only (a bool, float or numeric
   string is refused, never coerced) within bounds that mirror migration
@@ -80,6 +87,9 @@ from admino.access import (  # noqa: TC001 — Pydantic resolves field annotatio
     MemberRole,
     PlainUUID,
     UserKind,
+)
+from admino.permissions import (  # noqa: TC001 — Pydantic resolves field annotations at runtime
+    PermissionsConfig,
 )
 
 # Control characters to strip from free text shown to users (chat responses,
@@ -1693,6 +1703,24 @@ class PlatformSettingsPatch(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class ToolPolicy(BaseModel):
+    """One org's tool policy for one agent run (GH-161).
+
+    Loaded per run by ``admino.org_permissions.load_tool_policy`` from the
+    org's stored permission rows and tool switches, so concurrent runs of
+    different orgs never share a policy. Frozen: a loaded policy can't be
+    changed.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    permissions: PermissionsConfig
+    # The tier-2 (tool, action) pairs the org promoted from deny to confirm.
+    promoted: frozenset[tuple[str, str]] = frozenset()
+    # Every tool name -> whether the org enabled the service.
+    enabled_tools: dict[str, bool] = Field(default_factory=dict)
+
+
 class PermissionEntry(BaseModel):
     """A single permission row: (tool, action) → permission state."""
 
@@ -1702,22 +1730,59 @@ class PermissionEntry(BaseModel):
 
 
 class PermissionsResponse(BaseModel):
-    """GET /api/permissions response — full permission matrix."""
+    """GET and PATCH /api/org/permissions response — the org's full permission matrix."""
 
     permissions: list[PermissionEntry]
 
 
 class PermissionPatch(BaseModel):
-    """PATCH /api/permissions request body — update a single permission."""
+    """PATCH /api/org/permissions request body — update one permission of the caller's org.
+
+    Unknown keys (an org id included) are refused, and validation errors never
+    repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
     action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
     permission: Literal["allow", "confirm", "deny"]
 
 
+class PermissionSummaryEntry(BaseModel):
+    """One row of the read-only summary: a (tool, action) pair and its effective state.
+
+    ``disabled`` when the org switched the tool's service off; otherwise the
+    permission engine's decision for the org's policy.
+    """
+
+    tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
+    state: Literal["allow", "confirm", "deny", "disabled"]
+
+
+class PermissionsSummaryResponse(BaseModel):
+    """GET /api/permissions/summary response — the caller's org policy, read-only."""
+
+    permissions: list[PermissionSummaryEntry]
+
+
 # ---------------------------------------------------------------------------
 # Critical permissions (tier-2 promotable denials)
 # ---------------------------------------------------------------------------
+
+
+class CriticalPermissionPromote(BaseModel):
+    """PATCH /api/org/critical-permissions/{tool}/{action} body of a promotion.
+
+    The Org Admin's own password, re-checked before the cooldown starts. A
+    ``SecretStr``: ``repr()``/``str()`` never show it, validation errors never
+    repeat it, and unknown fields are refused.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    password: SecretStr = Field(min_length=1, max_length=128)
 
 
 class CriticalPermissionEntry(BaseModel):
@@ -1733,13 +1798,13 @@ class CriticalPermissionEntry(BaseModel):
 
 
 class CriticalPermissionsResponse(BaseModel):
-    """GET /api/critical-permissions response."""
+    """GET /api/org/critical-permissions response."""
 
     permissions: list[CriticalPermissionEntry]
 
 
 class CriticalPermissionState(BaseModel):
-    """Response after PATCH or DELETE on a critical permission."""
+    """Response after PATCH /api/org/critical-permissions/{tool}/{action} or DELETE .../pending."""
 
     tool: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)
     action: str = Field(pattern=r"^[a-z][a-z0-9_]{0,62}$", max_length=63)

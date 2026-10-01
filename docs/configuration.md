@@ -168,9 +168,10 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 - Organization and platform changes are recorded in the audit log: which fields changed,
   a tool's old and new on/off state, and a platform number's old and new value. Model names
   are never recorded.
-- **For now, a tool service one organization switches off is off for every organization**,
-  and no organization can switch it back on for the others. Per-organization tool
-  policies replace this in a later release.
+- A tool service an organization switches off is off for that organization only. Each
+  chat run reads its own organization's services, so other organizations aren't affected.
+- The tool permission matrix and critical promotions are per organization too. See
+  [Permissions → Per organization](permissions.md#per-organization).
 - Upgrading from a version with the single `settings` table drops it: everyone starts from
   the defaults (light theme, tool-approval pings on, task-done pings off, every tool
   service on), and the platform settings start from `config.yaml`.
@@ -342,14 +343,16 @@ What you see depends on your role:
 
 | Role | Pages |
 | --- | --- |
-| Org Admin | Chat, Tools, Permissions, Organization, Settings |
-| Editor | Chat, Tools, Settings |
-| Viewer | Chat (read-only: projects shared with you, with no message box) and Settings |
+| Org Admin | Chat, Tools, Organization, Settings |
+| Editor | Chat, Tools, Permissions (read-only), Settings |
+| Viewer | Chat (read-only: projects shared with you, with no message box), Permissions (read-only) and Settings |
 | Super Admin | Platform only (no chat) |
 
-The Organization and Platform pages are placeholders that later releases fill in. The
-server checks every request on its own, so a hidden page's API still refuses a role that
-isn't allowed to use it.
+The Organization page holds the organization's tool permissions and critical permissions.
+Later releases add users, settings and more. The Permissions page shows Editors and Viewers
+what the agent may do in their organization. The Platform page is a placeholder that a later
+release fills in. The server checks every request on its own, so a hidden page's API still
+refuses a role that isn't allowed to use it.
 
 ## Organizations (Super Admin)
 
@@ -495,7 +498,7 @@ certificate authority instead of Let's Encrypt. Check it with curl, e.g.
 
 ## Data & storage
 
-PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, `permissions`,
+PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, each organization's `permissions`,
 `memory` notes, `oauth_tokens`, the
 `audit_events` audit trail, and the `email_outbox` of queued transactional email.
 

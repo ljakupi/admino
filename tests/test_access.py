@@ -20,6 +20,12 @@ Security notes:
   ``admino.logs`` (the shared ``safe_log`` sanitizer, GH-158).
 - GH-158: ``platform.diagnostics.view`` (the LLM provider, model and
   reachability behind ``GET /api/platform/diagnostics``) is Super Admin only.
+- GH-161: ``org.permissions.view`` (the read-only summary of the org's tool
+  permissions behind ``GET /api/permissions/summary``) is granted to every
+  member role (Org Admin, Editor, Viewer) and refused to the Super Admin
+  (operator blindness: the platform operator doesn't read an org's settings).
+  Editing the matrix and the critical permissions stays
+  ``org.permissions.manage``, Org Admin only.
 """
 
 from __future__ import annotations
@@ -83,6 +89,8 @@ _EXPECTED_MATRIX: dict[str, frozenset[str]] = {
     "org.settings.manage": _ORG_ADMIN_ONLY,
     "org.instructions.manage": _ORG_ADMIN_ONLY,
     "org.permissions.manage": _ORG_ADMIN_ONLY,
+    # GH-161: read-only summary of the org's tool permissions (all member roles)
+    "org.permissions.view": _ALL_MEMBERS,
     "org.models.manage": _ORG_ADMIN_ONLY,
     "template.org.manage": _ORG_ADMIN_ONLY,
     "org.letterhead.manage": _ORG_ADMIN_ONLY,
@@ -301,6 +309,52 @@ class TestRoleInvariants:
         ]
 
         assert granted == []
+
+
+# ---------------------------------------------------------------------------
+# 3b. GH-161: viewing vs managing the org's tool permissions
+# ---------------------------------------------------------------------------
+
+
+def _org_permissions_view() -> Capability:
+    """Capability.ORG_PERMISSIONS_VIEW, looked up at call time (new in GH-161)."""
+    capability = getattr(Capability, "ORG_PERMISSIONS_VIEW", None)
+    assert capability is not None, "access.Capability must define ORG_PERMISSIONS_VIEW"
+    return capability
+
+
+class TestOrgPermissionsCapabilities:
+    """Every member can read the org's permission summary; only an Org Admin edits it."""
+
+    def test_access_org_permissions_view_has_contract_value(self) -> None:
+        assert _org_permissions_view().value == "org.permissions.view"
+
+    @pytest.mark.parametrize("role", _MEMBER_ROLES)
+    def test_access_org_permissions_view_is_granted_to_every_member_role(self, role: str) -> None:
+        """Org Admins, Editors and Viewers all see the summary of their org's permissions."""
+        assert can(_principal(role), _org_permissions_view()) is True
+
+    def test_access_org_permissions_view_is_refused_to_super_admin(self) -> None:
+        """The Super Admin has no org and doesn't read an org's settings."""
+        assert can(_principal(_SA), _org_permissions_view()) is False
+
+    @pytest.mark.parametrize("role", (_ED, _VI))
+    def test_access_editor_and_viewer_view_but_do_not_manage_permissions(self, role: str) -> None:
+        """Reading the summary never implies editing the matrix."""
+        principal = _principal(role)
+
+        assert can(principal, _org_permissions_view()) is True
+        assert can(principal, Capability.ORG_PERMISSIONS_MANAGE) is False
+
+    def test_access_managing_stays_org_admin_only_and_implies_viewing(self) -> None:
+        """Only the Org Admin edits the permissions, and whoever edits them may also read
+        the summary."""
+        managers = {r for r in _ROLES if can(_principal(r), Capability.ORG_PERMISSIONS_MANAGE)}
+        viewers = {r for r in _ROLES if can(_principal(r), _org_permissions_view())}
+
+        assert managers == {_OA}
+        assert managers <= viewers
+        assert viewers == set(_MEMBER_ROLES)
 
 
 # ---------------------------------------------------------------------------

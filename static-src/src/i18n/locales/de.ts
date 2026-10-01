@@ -107,6 +107,15 @@ export const de: Record<MessageKey, Message> = {
   'criticalPermissions.footer':
     'Das Deaktivieren wirkt sofort. Das Aktivieren erfordert eine erneute Anmeldung und eine Wartezeit von 5 Minuten, die Sie abbrechen können.',
 
+  // --- reauth (password re-auth prompt, issue #161: promoting a critical ---
+  // permission needs the Org Admin's password)
+  'reauth.title': 'Passwort bestätigen',
+  'reauth.body': 'Geben Sie Ihr Passwort ein, damit der Agent {action} für {tool} vorschlagen darf.',
+  'reauth.passwordLabel': 'Passwort',
+  'reauth.submit': 'Bestätigen',
+  'reauth.error.wrongPassword': 'Falsches Passwort. Bitte versuchen Sie es erneut.',
+  'reauth.error.failed': 'Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.',
+
   // --- tools (tool metadata shown on the Permissions page) ------------------
   'tools.gmail.label': 'Gmail',
   'tools.gmail.description': 'Lesen, durchsuchen und aus Ihrem Posteingang senden',
@@ -204,6 +213,7 @@ export const de: Record<MessageKey, Message> = {
   'permissionState.allow': 'Erlaubt',
   'permissionState.confirm': 'Genehmigung nötig',
   'permissionState.deny': 'Abgelehnt',
+  'permissionState.disabled': 'Dienst deaktiviert',
   'permissionPill.promotableHint':
     'Diese Berechtigung kann unter Einstellungen › Gefahrenzone verwaltet werden',
   'permissionPill.hardcodedHint':
@@ -232,6 +242,15 @@ export const de: Record<MessageKey, Message> = {
     one: '{n} abgelehnt',
     other: '{n} abgelehnt',
   },
+
+  // --- permissions summary page (read-only, issue #161: Editor/Viewer) ----
+  'permissions.summary.subtitle': 'Was der Agent im Arbeitsbereich Ihrer Organisation tun darf.',
+  'permissions.summary.empty': 'Noch keine Berechtigungen konfiguriert.',
+
+  // --- organization permissions (editable matrix, Org Admin, issue #161) --
+  'organization.permissions.title': 'Berechtigungsmatrix',
+  'organization.permissions.subtitle':
+    'Legen Sie fest, was der Agent in dieser Organisation tun darf, pro Tool und Aktion.',
 
   // --- toolsPage (connected accounts, local tools, OAuth callback) -------
   'toolsPage.accounts.title': 'Verbundene Konten',

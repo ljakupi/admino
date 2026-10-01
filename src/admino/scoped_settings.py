@@ -12,7 +12,9 @@ owner, and this module is the service behind their routes and the startup:
 - ``org_settings`` (each organization, its Org Admin): the enabled tool
   services. ``get_org_settings`` / ``update_org_settings`` read and change the
   caller's own org's row (``Capability.ORG_SETTINGS_MANAGE``); each real
-  change is an ``org.settings_change`` audit event.
+  change is an ``org.settings_change`` audit event. ``org_tools_enabled``
+  (GH-161) reads a tenant org's switches for a chat run, without a
+  capability check (an internal read: every member's run needs it).
 - ``platform_settings`` (one row, the Super Admin): the LLM provider, one
   model per provider, the limits and (GH-160) the files, retention and
   security defaults. ``seed_platform_settings`` stores config.yaml's llm and
@@ -29,9 +31,6 @@ owner, and this module is the service behind their routes and the startup:
   its commit. Consumers read every platform default through it;
   ``session_policy_for`` picks a new session's policy (a member: the org
   default until #169; a Super Admin: the stored platform policy).
-- ``all_orgs_tools_gate`` is the INTERIM enabled-services gate, retired by
-  #161 (per-org tool gating): the agent keeps one global gate, and a service
-  is off when ANY org turned it off (no org rows: every service on).
 
 A missing user or org row reads as the defaults (theme light, tool-approval
 pings on, task-done pings off, every tool on) and a read writes nothing; an
@@ -42,8 +41,8 @@ acting ``Principal`` (from the session), the validated patch models
 (``UserSettingsPatch``, ``OrgSettingsPatch``, ``PlatformSettingsPatch``) and
 the client IP; the ``AppConfig`` (startup); an account kind.
 Outputs: ``UserSettingsResponse``, ``OrgSettingsResponse``,
-``StoredPlatformSettings``, the gate (tool name -> bool), the overlaid
-``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
+``StoredPlatformSettings``, an org's switches (tool name -> bool), the
+overlaid ``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
 ``AuditRecordError``, ``InvalidPlatformSettingsError`` (the merged trash
 minimum exceeds the maximum), ``RuntimeError`` (no platform row: startup
 always seeds it first), ``ValueError`` (no session policy for the kind).
@@ -172,17 +171,6 @@ _ORG_UPDATE_SQL: Final = """
               google_drive_enabled AS google_drive, outlook_enabled AS outlook,
               outlook_calendar_enabled AS outlook_calendar, onedrive_enabled AS onedrive,
               memory_enabled AS memory
-"""
-# Interim gate (retired by #161): a tool is on only if no org turned it off.
-_GATE_SQL: Final = """
-    SELECT coalesce(bool_and(gmail_enabled), true) AS gmail,
-           coalesce(bool_and(google_calendar_enabled), true) AS google_calendar,
-           coalesce(bool_and(google_drive_enabled), true) AS google_drive,
-           coalesce(bool_and(outlook_enabled), true) AS outlook,
-           coalesce(bool_and(outlook_calendar_enabled), true) AS outlook_calendar,
-           coalesce(bool_and(onedrive_enabled), true) AS onedrive,
-           coalesce(bool_and(memory_enabled), true) AS memory
-    FROM org_settings
 """
 
 # The singleton row (id defaults to true). On a later boot config.yaml's llm
@@ -553,21 +541,22 @@ async def update_org_settings(
     return OrgSettingsResponse(tools=ToolsSettings.model_validate(dict(row)))
 
 
-async def all_orgs_tools_gate(pool: asyncpg.Pool) -> dict[str, bool]:
-    """Return the INTERIM global enabled-services gate (retired by #161).
+async def org_tools_enabled(executor: sessions.Executor, tenant: TenantContext) -> dict[str, bool]:
+    """Return the tenant org's tool switches, for a chat run (every tool on without a row).
 
-    One aggregate statement over every ``org_settings`` row: a service is off
-    when ANY org turned it off; without rows every service is on.
+    No capability check: an internal read (every member's run needs its org's
+    switches). Only the tenant's org row is read; nothing is written.
 
     Args:
-        pool: The database pool.
+        executor: The pool, or a connection.
+        tenant: The org scope of the run.
 
     Returns:
-        Every tool name mapped to whether the agent may dispatch it.
+        Every tool name mapped to whether the org enabled its service.
     """
-    # An aggregate without GROUP BY always yields exactly one row.
-    (row,) = await pool.fetch(_GATE_SQL)
-    return ToolsSettings.model_validate(dict(row)).model_dump()
+    row: Record | None = await executor.fetchrow(_ORG_SQL, tenant.org_id)
+    tools = ToolsSettings() if row is None else ToolsSettings.model_validate(dict(row))
+    return tools.model_dump()
 
 
 async def seed_platform_settings(pool: asyncpg.Pool, config: AppConfig) -> None:

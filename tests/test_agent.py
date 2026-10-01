@@ -34,6 +34,14 @@ Covers:
   (``access.Principal``, the logged-in user); the agent only passes it through.
   The recorder protocol gains it as a seventh keyword, and every recorder call
   carries the run's principal unchanged (the same object).
+- GH-161: the agent holds no permission state. ``Agent.__init__`` takes no
+  ``permissions_config`` / ``tools_enabled`` and has no ``_permissions``,
+  ``_promoted`` or ``_tools_enabled`` attributes; ``Agent.run`` takes a
+  required keyword-only ``tool_policy`` (``models.ToolPolicy``: the requesting
+  org's permissions, promoted tier-2 pairs and enabled services). The tools
+  payload, every dispatch and the per-run system message (configured prompt +
+  "\n\n" + the run's tools line) use that run's policy only — concurrent
+  runs with different policies never see each other's.
 - Security invariants: no forbidden imports (server, database, audit_events,
   the removed NDJSON audit module, asyncpg), no raw content in logs.
 
@@ -44,6 +52,7 @@ APIs are contacted.
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import logging
 from dataclasses import dataclass
@@ -72,6 +81,7 @@ from admino.models import (
     LLMMessage,
     PendingConfirmation,
     ToolCall,
+    ToolsSettings,
 )
 from admino.permissions import PermissionsConfig, ToolPermissions
 from admino.tools.registry import (
@@ -84,6 +94,7 @@ from admino.tools.registry import (
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+    from admino.models import ToolPolicy
     from admino.tools.registry import ToolHandler
 
 
@@ -237,6 +248,56 @@ def agent_config() -> AgentConfig:
     )
 
 
+def _policy(
+    permissions: PermissionsConfig,
+    *,
+    promoted: frozenset[tuple[str, str]] = frozenset(),
+    enabled_tools: dict[str, bool] | None = None,
+) -> ToolPolicy:
+    """A GH-161 ``ToolPolicy`` (imported lazily so each test fails on its own)."""
+    from admino.models import ToolPolicy
+
+    return ToolPolicy(
+        permissions=permissions,
+        promoted=promoted,
+        enabled_tools=dict(enabled_tools) if enabled_tools else {},
+    )
+
+
+def _new_agent(
+    fake_llm: Any,
+    recorder: RecordingRecorder,
+    config: AgentConfig,
+    *,
+    system_prompt: str = "",
+) -> Agent:
+    """Construct an Agent with the GH-161 constructor (no permission state)."""
+    return Agent(
+        llm_client=fake_llm,
+        tool_call_recorder=recorder,
+        agent_config=config,
+        system_prompt=system_prompt,
+    )
+
+
+class _PolicyBoundAgent:
+    """An :class:`Agent` plus the ``ToolPolicy`` its runs pass (GH-161).
+
+    The agent holds no permission state: every ``Agent.run`` call takes the
+    requesting org's policy as ``tool_policy=``. This harness forwards the
+    policy built from the test's permissions so the suite's many runs don't
+    repeat it; a run given an explicit ``tool_policy=`` uses that one instead.
+    """
+
+    def __init__(self, agent: Agent, tool_policy: ToolPolicy) -> None:
+        self.agent = agent
+        self.tool_policy = tool_policy
+
+    async def run(self, *args: Any, **kwargs: Any) -> AgentResult:
+        kwargs.setdefault("tool_policy", self.tool_policy)
+        return await self.agent.run(*args, **kwargs)
+
+
 def _build_agent(
     fake_llm: FakeLLM,
     recorder: RecordingRecorder,
@@ -245,15 +306,28 @@ def _build_agent(
     *,
     system_prompt: str = "",
     tools_enabled: dict[str, bool] | None = None,
-) -> Agent:
-    return Agent(
-        llm_client=fake_llm,  # type: ignore[arg-type]
-        tool_call_recorder=recorder,
-        permissions_config=permissions,
-        agent_config=config,
-        system_prompt=system_prompt,
-        tools_enabled=tools_enabled,
+    promoted: frozenset[tuple[str, str]] = frozenset(),
+) -> _PolicyBoundAgent:
+    """Build an Agent and bind the run policy made of ``permissions`` & co."""
+    agent = _new_agent(fake_llm, recorder, config, system_prompt=system_prompt)
+    return _PolicyBoundAgent(
+        agent, _policy(permissions, promoted=promoted, enabled_tools=tools_enabled)
     )
+
+
+def _system_content(system_prompt: str, tools: str | None) -> str:
+    """The expected per-run system message (GH-161).
+
+    ``tools`` is the expected tool listing (e.g. ``"echo (say/write), memory
+    (recall)"``: tools sorted, each tool's actions sorted and joined by "/"),
+    or None when the run advertises no tool.
+    """
+    line = (
+        f"You have access to the following tools: {tools}."
+        if tools
+        else "You have no tools available."
+    )
+    return f"{system_prompt}\n\n{line}" if system_prompt else line
 
 
 def _text_response(content: str) -> LLMResponse:
@@ -293,14 +367,15 @@ def _is_ordered_subsequence(sub: list[LLMMessage], full: list[LLMMessage]) -> bo
 def _assert_gh140_context_invariants(
     call: list[LLMMessage],
     *,
-    system_prompt: str,
+    expected_system: str,
     current_user: str,
     max_context_messages: int,
 ) -> None:
     """Assert the GH-140 context-window contract for ONE LLM call.
 
-    - Exactly one system message, at index 0, equal to the agent's configured
-      prompt — or zero system messages when no prompt is configured.
+    - Exactly one system message, at index 0, equal to ``expected_system`` —
+      the run's system message (GH-161: always present, since it carries the
+      run's tools line even when no prompt is configured).
     - The current user message is present exactly once.
     - The message right after the pinned current user message is never an
       orphaned ``tool`` result — and, more generally, no ``tool`` message is
@@ -310,11 +385,8 @@ def _assert_gh140_context_invariants(
       the whole call fits ``max_context_messages``.
     """
     systems = [(m.role, m.content) for m in _system_messages(call)]
-    if system_prompt:
-        assert systems == [("system", system_prompt)]
-        assert call[0].role == "system"
-    else:
-        assert systems == []
+    assert systems == [("system", expected_system)]
+    assert call[0].role == "system"
 
     positions = _user_indices(call, current_user)
     assert len(positions) == 1, f"current user message sent {len(positions)} times"
@@ -328,7 +400,7 @@ def _assert_gh140_context_invariants(
             assert i > 0, "context starts with an orphaned tool message"
             assert call[i - 1].role in ("assistant", "tool"), f"orphaned tool message at {i}"
 
-    floor = (1 if system_prompt else 0) + 1
+    floor = 2
     if floor <= max_context_messages:
         assert len(call) <= max_context_messages
 
@@ -1518,7 +1590,7 @@ class TestAgentContextTrimming:
 
         sent = fake.received_messages[0]
         assert sent[0].role == "system"
-        assert sent[0].content == "sys"
+        assert sent[0].content == _system_content("sys", None)
         assert len(_system_messages(sent)) == 1
         assert "latest" in [m.content for m in sent]
 
@@ -1687,7 +1759,10 @@ class TestAgentRunConfigOverride:
         sent = fake.received_messages[0]
         assert len(sent) == 6
         _assert_gh140_context_invariants(
-            sent, system_prompt="sys", current_user="latest", max_context_messages=6
+            sent,
+            expected_system=_system_content("sys", None),
+            current_user="latest",
+            max_context_messages=6,
         )
 
     async def test_agent_run_config_sets_the_confirmation_expiry(
@@ -1984,14 +2059,11 @@ async def test_agent_permission_state_parametrized(
             _text_response("done"),
         ]
     )
-    agent = Agent(
-        llm_client=fake,  # type: ignore[arg-type]
-        tool_call_recorder=recorder,
-        permissions_config=permissions,
-        agent_config=agent_config,
-    )
+    agent = _new_agent(fake, recorder, agent_config)
 
-    result = await agent.run("x", session_id="s", history=[], principal=_PRINCIPAL)
+    result = await agent.run(
+        "x", session_id="s", history=[], principal=_PRINCIPAL, tool_policy=_policy(permissions)
+    )
 
     assert result.tool_calls[0].success is expected_success
 
@@ -2695,11 +2767,20 @@ class TestAgentPermissionAwareToolPayload:
         permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
     ) -> None:
-        """A promoted promotable-deny tool (gmail.send) IS exposed to the LLM."""
+        """A promoted promotable-deny tool (gmail.send) IS exposed to the LLM.
+
+        GH-161: the promotion arrives in the run's ToolPolicy, not by mutating
+        ``agent._promoted``.
+        """
         register_tool("gmail", "send", "Send email", EchoArgs)(echo_handler)
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(fake, recorder, permissions_config, agent_config)
-        agent._promoted = frozenset({("gmail", "send")})
+        agent = _build_agent(
+            fake,
+            recorder,
+            permissions_config,
+            agent_config,
+            promoted=frozenset({("gmail", "send")}),
+        )
 
         await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
 
@@ -2708,10 +2789,11 @@ class TestAgentPermissionAwareToolPayload:
 
 
 class TestAgentToolsEnabledAllTrue:
-    """An all-True tools_enabled dict must behave like no filter (GH-80).
+    """An all-True enabled_tools dict must behave like no filter (GH-80).
 
     Passing a fully-True per-service map (e.g. nothing toggled off) must never
     accidentally block a tool: the service is advertised and dispatches.
+    GH-161: the map arrives as the run's ``ToolPolicy.enabled_tools``.
     """
 
     async def test_agent_all_true_dict_advertises_gmail(
@@ -2723,15 +2805,15 @@ class TestAgentToolsEnabledAllTrue:
         """gmail.read is advertised to the LLM when every service is enabled."""
         register_tool("gmail", "read", "Read emails", EchoArgs)(echo_handler)
         fake = FakeLLM([_text_response("ok")])
-        agent = Agent(
-            llm_client=fake,  # type: ignore[arg-type]
-            tool_call_recorder=recorder,
-            permissions_config=permissions_config,
-            agent_config=agent_config,
-            tools_enabled={"gmail": True, "google_drive": True, "memory": True},
+        agent = _new_agent(fake, recorder, agent_config)
+        policy = _policy(
+            permissions_config,
+            enabled_tools={"gmail": True, "google_drive": True, "memory": True},
         )
 
-        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
+        await agent.run(
+            "hi", session_id="sess-1", history=[], principal=_PRINCIPAL, tool_policy=policy
+        )
 
         names = _payload_tool_names(fake.received_tools[0])
         assert "gmail.read" in names
@@ -2752,15 +2834,15 @@ class TestAgentToolsEnabledAllTrue:
                 _text_response("done"),
             ]
         )
-        agent = Agent(
-            llm_client=fake,  # type: ignore[arg-type]
-            tool_call_recorder=recorder,
-            permissions_config=permissions_config,
-            agent_config=agent_config,
-            tools_enabled={"gmail": True, "google_drive": True, "memory": True},
+        agent = _new_agent(fake, recorder, agent_config)
+        policy = _policy(
+            permissions_config,
+            enabled_tools={"gmail": True, "google_drive": True, "memory": True},
         )
 
-        await agent.run("hi", session_id="sess-1", history=[], principal=_PRINCIPAL)
+        await agent.run(
+            "hi", session_id="sess-1", history=[], principal=_PRINCIPAL, tool_policy=policy
+        )
 
         assert [(c["tool"], c["decision"], c["success"]) for c in recorder.calls] == [
             ("gmail", "allow", True)
@@ -2772,6 +2854,8 @@ class TestAgentToolsEnabledAllTrue:
 # ===========================================================================
 
 _SYS = "SYS PROMPT"
+# GH-161: the per-run system message of a run that advertises no tool.
+_SYS_NO_TOOLS = _system_content(_SYS, None)
 _INJECTED_LEADING_SYS = "INJECTED-SYS-7f3a"
 _INJECTED_MID_SYS = "MID-SYS-9c2b"
 _PROMOTION_NOTICE = (
@@ -2927,7 +3011,8 @@ class TestAgentSystemPromptHistory:
     - ``AgentResult.history`` holds only user / assistant / tool messages, on
       every terminal path.
     - Every LLM call carries exactly one system message (the agent's own
-      prompt, at index 0) — or none when no prompt is configured.
+      prompt plus the run's tools line, at index 0 — GH-161: just the tools
+      line when no prompt is configured).
     - The system prompt and the current user message are always sent (the
       floor), the current user message exactly once; older messages fill the
       remaining budget, most recent first, in chronological order; the message
@@ -2949,7 +3034,9 @@ class TestAgentSystemPromptHistory:
 
         assert fake.calls == 25
         for i, call in enumerate(fake.received_messages):
-            assert _roles_and_contents(_system_messages(call)) == [("system", _SYS)], f"turn {i}"
+            assert _roles_and_contents(_system_messages(call)) == [("system", _SYS_NO_TOOLS)], (
+                f"turn {i}"
+            )
             assert call[0].role == "system", f"turn {i}"
             assert (call[-1].role, call[-1].content) == ("user", f"turn-{i}"), f"turn {i}"
             assert len(call) <= 20, f"turn {i}"
@@ -2986,7 +3073,7 @@ class TestAgentSystemPromptHistory:
                 for j in range(i)
                 for pair in (("user", f"turn-{j}"), ("assistant", f"reply-{j}"))
             ]
-            expected = [("system", _SYS), *prior[-18:], ("user", f"turn-{i}")]
+            expected = [("system", _SYS_NO_TOOLS), *prior[-18:], ("user", f"turn-{i}")]
             assert _roles_and_contents(call) == expected, f"turn {i}"
 
     async def test_agent_25_tool_turns_each_llm_call_has_one_system_and_current_user_once(
@@ -3023,7 +3110,7 @@ class TestAgentSystemPromptHistory:
             for call in fake.received_messages[first_call:]:
                 _assert_gh140_context_invariants(
                     call,
-                    system_prompt=_SYS,
+                    expected_system=_system_content(_SYS, "echo (say)"),
                     current_user=f"turn-{i}",
                     max_context_messages=agent_config.max_context_messages,
                 )
@@ -3100,7 +3187,7 @@ class TestAgentSystemPromptHistory:
         for call in fake.received_messages:
             _assert_gh140_context_invariants(
                 call,
-                system_prompt=_SYS,
+                expected_system=_system_content(_SYS, "echo (say)"),
                 current_user="CURRENT-REQUEST",
                 max_context_messages=max_context_messages,
             )
@@ -3111,10 +3198,14 @@ class TestAgentSystemPromptHistory:
         [
             pytest.param(
                 _SYS,
-                [("system", _SYS), ("user", "CURRENT-REQUEST")],
+                [("system", _system_content(_SYS, "echo (say)")), ("user", "CURRENT-REQUEST")],
                 id="with_system_prompt",
             ),
-            pytest.param("", [("user", "CURRENT-REQUEST")], id="without_system_prompt"),
+            pytest.param(
+                "",
+                [("system", _system_content("", "echo (say)")), ("user", "CURRENT-REQUEST")],
+                id="without_system_prompt",
+            ),
         ],
     )
     async def test_agent_max_context_one_sends_exactly_the_floor(
@@ -3124,10 +3215,12 @@ class TestAgentSystemPromptHistory:
         system_prompt: str,
         expected_floor: list[tuple[str, str]],
     ) -> None:
-        """``max_context_messages=1``: every call is exactly [system?, current user].
+        """``max_context_messages=1``: every call is exactly [system, current user].
 
-        The floor (system prompt + current user message) is always sent even
+        The floor (system message + current user message) is always sent even
         though it exceeds the budget — including on the post-tool LLM call.
+        GH-161: without a configured prompt the system message is the run's
+        tools line alone.
         """
         register_tool("echo", "say", "Echo text", EchoArgs)(echo_handler)
         config = AgentConfig(max_tool_calls=5, max_context_messages=1, confirmation_timeout_s=60.0)
@@ -3181,8 +3274,9 @@ class TestAgentSystemPromptHistory:
         )
 
         sent = fake.received_messages[0]
-        assert _roles_and_contents(_system_messages(sent)) == [("system", "REAL SYS")]
-        assert sent[0].content == "REAL SYS"
+        expected = _system_content("REAL SYS", None)
+        assert _roles_and_contents(_system_messages(sent)) == [("system", expected)]
+        assert sent[0].content == expected
 
     async def test_agent_caller_system_content_never_reaches_llm(
         self,
@@ -3227,13 +3321,18 @@ class TestAgentSystemPromptHistory:
             ("assistant", "ok"),
         ]
 
-    async def test_agent_without_system_prompt_sends_no_caller_system_messages(
+    async def test_agent_without_system_prompt_sends_only_the_tools_line_as_system(
         self,
         recorder: RecordingRecorder,
         permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
     ) -> None:
-        """With no configured prompt the LLM receives zero system messages."""
+        """With no configured prompt the only system message is the run's tools line.
+
+        GH-161 spec change: it used to be zero system messages; the agent now
+        always sends the run's tools line, and caller system messages are still
+        dropped.
+        """
         fake = FakeLLM([_text_response("ok")])
         agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
@@ -3241,7 +3340,9 @@ class TestAgentSystemPromptHistory:
             "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
         )
 
-        assert _system_messages(fake.received_messages[0]) == []
+        assert _roles_and_contents(_system_messages(fake.received_messages[0])) == [
+            ("system", "You have no tools available.")
+        ]
 
     async def test_agent_caller_leading_system_message_logs_content_free_warning(
         self,
@@ -3339,7 +3440,9 @@ class TestAgentSystemPromptHistory:
 
         assert fake.calls == 2
         resume_call = fake.received_messages[1]
-        assert _roles_and_contents(_system_messages(resume_call)) == [("system", "SYS")]
+        assert _roles_and_contents(_system_messages(resume_call)) == [
+            ("system", _system_content("SYS", "echo (write)"))
+        ]
         assert resume_call[0].role == "system"
         assert len(_user_indices(resume_call, "please write x")) == 1
 
@@ -3386,7 +3489,7 @@ class TestAgentSystemPromptHistory:
         assert second.status == "final"
         _assert_gh140_context_invariants(
             fake.received_messages[1],
-            system_prompt=system_prompt,
+            expected_system=_system_content(system_prompt, "echo (write)"),
             current_user="please write x",
             max_context_messages=max_context_messages,
         )
@@ -3422,8 +3525,711 @@ class TestAgentSystemPromptHistory:
         second = await agent.run("next", session_id="s", history=history, principal=_PRINCIPAL)
 
         call = fake.received_messages[1]
-        assert _roles_and_contents(_system_messages(call)) == [("system", "SYS")]
+        assert _roles_and_contents(_system_messages(call)) == [
+            ("system", _system_content("SYS", None))
+        ]
         assert call[0].role == "system"
         assert ("user", _PROMOTION_NOTICE) in _roles_and_contents(call)
         assert (call[-1].role, call[-1].content) == ("user", "next")
         assert ("user", _PROMOTION_NOTICE) in _roles_and_contents(second.history)
+
+
+# ===========================================================================
+# 16. Per-run tool policy — no cross-org agent state (GH-161)
+# ===========================================================================
+
+_ORG_A = UUID("a0a0a0a0-1111-4222-8333-444444444444")
+_ORG_B = UUID("b0b0b0b0-5555-4666-8777-888888888888")
+_ORG_A_PRINCIPAL = Principal(
+    user_id=UUID("a1a1a1a1-1111-4222-8333-444444444444"),
+    kind="member",
+    org_id=_ORG_A,
+    role="editor",
+)
+_ORG_B_PRINCIPAL = Principal(
+    user_id=UUID("b1b1b1b1-5555-4666-8777-888888888888"),
+    kind="member",
+    org_id=_ORG_B,
+    role="editor",
+)
+_STORE = ToolCall(tool="memory", action="store", args={"text": "note"})
+_SEND = ToolCall(tool="gmail", action="send", args={"text": "mail"})
+_NO_TOOLS_LINE = "You have no tools available."
+
+
+def _all_services(**overrides: bool) -> dict[str, bool]:
+    """Every ToolsSettings service switched on, except the given overrides."""
+    return {**ToolsSettings().model_dump(), **overrides}
+
+
+def _store_policy(state: str, **kwargs: Any) -> ToolPolicy:
+    """A run policy whose only configured pair is ``memory.store`` = ``state``."""
+    return _policy(_permissions({"memory": {"store": state}}), **kwargs)
+
+
+def _register_store_and_send() -> None:
+    register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+    register_tool("gmail", "send", "Send email", EchoArgs)(echo_handler)
+
+
+def _tool_then_text(call: ToolCall) -> list[LLMResponse]:
+    return [_tool_response(call), _text_response("done")]
+
+
+class TestAgentHoldsNoPermissionState:
+    """The agent is built without, and never stores, any org's permission state."""
+
+    @pytest.mark.parametrize("removed", ["permissions_config", "tools_enabled"])
+    def test_agent_init_has_no_permission_state_parameter(self, removed: str) -> None:
+        """Agent.__init__ no longer takes permissions_config / tools_enabled."""
+        assert removed not in inspect.signature(Agent.__init__).parameters
+
+    def test_agent_init_takes_exactly_the_stateless_collaborators(self) -> None:
+        """Agent(*, llm_client, tool_call_recorder, agent_config, system_prompt="")."""
+        params = dict(inspect.signature(Agent.__init__).parameters)
+        params.pop("self")
+
+        assert set(params) == {"llm_client", "tool_call_recorder", "agent_config", "system_prompt"}
+        assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
+        assert params["system_prompt"].default == ""
+
+    @pytest.mark.parametrize(
+        ("removed", "value"),
+        [
+            pytest.param(
+                "permissions_config",
+                PermissionsConfig(tools={"memory": ToolPermissions(actions={"store": "allow"})}),
+                id="permissions_config",
+            ),
+            pytest.param("tools_enabled", {"memory": True}, id="tools_enabled"),
+        ],
+    )
+    def test_agent_init_with_removed_keyword_raises_type_error(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        removed: str,
+        value: object,
+    ) -> None:
+        """Passing a removed permission-state keyword is a TypeError naming it."""
+        kwargs: dict[str, Any] = {
+            "llm_client": FakeLLM([]),
+            "tool_call_recorder": recorder,
+            "agent_config": agent_config,
+            removed: value,
+        }
+        agent_cls: Any = Agent
+
+        with pytest.raises(TypeError, match=removed):
+            agent_cls(**kwargs)
+
+    @pytest.mark.parametrize("attribute", ["_permissions", "_promoted", "_tools_enabled"])
+    def test_agent_has_no_permission_state_attribute(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig, attribute: str
+    ) -> None:
+        """No agent-wide _permissions / _promoted / _tools_enabled exists to mutate."""
+        agent = _new_agent(FakeLLM([]), recorder, agent_config, system_prompt="SYS")
+
+        assert not hasattr(agent, attribute)
+
+    @pytest.mark.parametrize("attribute", ["_permissions", "_promoted", "_tools_enabled"])
+    async def test_agent_run_leaves_no_permission_state_attribute(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig, attribute: str
+    ) -> None:
+        """A run doesn't park its policy on the agent either."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        agent = _new_agent(FakeLLM(_tool_then_text(_STORE)), recorder, agent_config)
+
+        await agent.run(
+            "go",
+            session_id="s",
+            history=[],
+            principal=_ORG_A_PRINCIPAL,
+            tool_policy=_store_policy("allow", promoted=frozenset({("gmail", "send")})),
+        )
+
+        assert not hasattr(agent, attribute)
+
+    def test_agent_run_takes_required_keyword_only_tool_policy(self) -> None:
+        """Agent.run(..., *, tool_policy) with no default."""
+        param = inspect.signature(Agent.run).parameters.get("tool_policy")
+
+        assert param is not None, "Agent.run must take a tool_policy"
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is inspect.Parameter.empty
+
+    async def test_agent_run_without_tool_policy_raises_type_error(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """A run never falls back to some agent-wide policy: no tool_policy, no run."""
+        fake = FakeLLM([_text_response("hi")])
+        agent = _new_agent(fake, recorder, agent_config)
+        run: Any = agent.run
+
+        with pytest.raises(TypeError, match="tool_policy"):
+            await run("hi", session_id="s", history=[], principal=_PRINCIPAL)
+        assert fake.calls == 0
+
+
+class TestAgentPerRunToolPolicy:
+    """The tools payload and every dispatch use the run's own ToolPolicy."""
+
+    async def test_agent_payload_follows_each_runs_permissions(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """Same agent: memory.store is advertised under allow, hidden under deny."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("a"), _text_response("b"), _text_response("c")])
+        agent = _new_agent(fake, recorder, agent_config)
+
+        for state in ("allow", "deny", "allow"):
+            await agent.run(
+                "hi",
+                session_id="s",
+                history=[],
+                principal=_PRINCIPAL,
+                tool_policy=_store_policy(state),
+            )
+
+        assert [_payload_tool_names(tools) for tools in fake.received_tools] == [
+            {"memory.store"},
+            set(),
+            {"memory.store"},
+        ]
+
+    @pytest.mark.parametrize(
+        "states", [("allow", "deny"), ("deny", "allow")], ids=["allow-then-deny", "deny-then-allow"]
+    )
+    async def test_agent_dispatch_follows_each_runs_permissions(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        states: tuple[str, str],
+    ) -> None:
+        """Same agent, two runs: each dispatch is decided by that run's matrix."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM([*_tool_then_text(_STORE), *_tool_then_text(_STORE)])
+        agent = _new_agent(fake, recorder, agent_config)
+        expected = {"allow": ("allow", True), "deny": ("deny", False)}
+
+        outcomes = []
+        for state in states:
+            result = await agent.run(
+                "store it",
+                session_id="s",
+                history=[],
+                principal=_PRINCIPAL,
+                tool_policy=_store_policy(state),
+            )
+            outcomes.append((result.tool_calls[0].permission, result.tool_calls[0].success))
+
+        assert outcomes == [expected[state] for state in states]
+        assert recorder.outcomes() == outcomes
+
+    async def test_agent_get_registered_tools_and_dispatch_receive_the_runs_policy(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The payload query and the dispatch get the run's permissions/promoted/services."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        listed: list[dict[str, Any]] = []
+        dispatched: list[tuple[PermissionsConfig, dict[str, Any]]] = []
+        real_list = agent_module.get_registered_tools
+        real_dispatch = agent_module.dispatch_tool_call
+
+        def spy_list(**kwargs: Any) -> list[ToolDescription]:
+            listed.append(dict(kwargs))
+            return real_list(**kwargs)
+
+        async def spy_dispatch(
+            tool_call: ToolCall, permissions: PermissionsConfig, **kwargs: Any
+        ) -> ToolCallResult:
+            dispatched.append((permissions, dict(kwargs)))
+            return await real_dispatch(tool_call, permissions, **kwargs)
+
+        monkeypatch.setattr(agent_module, "get_registered_tools", spy_list)
+        monkeypatch.setattr(agent_module, "dispatch_tool_call", spy_dispatch)
+        policy = _store_policy(
+            "allow",
+            promoted=frozenset({("gmail", "send")}),
+            enabled_tools=_all_services(onedrive=False),
+        )
+        agent = _new_agent(FakeLLM(_tool_then_text(_STORE)), recorder, agent_config)
+
+        await agent.run("go", session_id="s", history=[], principal=_PRINCIPAL, tool_policy=policy)
+
+        assert [
+            (call["permissions_config"], call["promoted"], call["enabled_tools"]) for call in listed
+        ] == [(policy.permissions, policy.promoted, policy.enabled_tools)]
+        assert [
+            (permissions, kwargs["promoted"], kwargs["enabled_tools"])
+            for permissions, kwargs in dispatched
+        ] == [(policy.permissions, policy.promoted, policy.enabled_tools)]
+
+    async def test_agent_promoted_pair_advertised_only_in_the_promoting_run(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """gmail.send (tier 2) is advertised only by runs whose policy promotes it."""
+        register_tool("gmail", "send", "Send email", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("a"), _text_response("b"), _text_response("c")])
+        agent = _new_agent(fake, recorder, agent_config)
+        permissions = _permissions({"gmail": {"send": "deny"}})
+
+        for promoted in (
+            frozenset({("gmail", "send")}),
+            frozenset(),
+            frozenset({("gmail", "send")}),
+        ):
+            await agent.run(
+                "hi",
+                session_id="s",
+                history=[],
+                principal=_PRINCIPAL,
+                tool_policy=_policy(permissions, promoted=promoted),
+            )
+
+        assert [_payload_tool_names(tools) for tools in fake.received_tools] == [
+            {"gmail.send"},
+            set(),
+            {"gmail.send"},
+        ]
+
+    async def test_agent_promoted_pair_dispatch_follows_each_runs_policy(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """Promoted in run 1 → confirm gate; not promoted in run 2 → deny."""
+        register_tool("gmail", "send", "Send email", EchoArgs)(echo_handler)
+        fake = FakeLLM([_tool_response(_SEND), *_tool_then_text(_SEND)])
+        agent = _new_agent(fake, recorder, agent_config)
+        permissions = _permissions({"gmail": {"send": "deny"}})
+
+        first = await agent.run(
+            "send it",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_policy(permissions, promoted=frozenset({("gmail", "send")})),
+        )
+        second = await agent.run(
+            "send it",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_policy(permissions),
+        )
+
+        assert (first.status, first.tool_calls[0].permission) == (
+            "awaiting_confirmation",
+            "confirm",
+        )
+        assert (second.status, second.tool_calls[0].permission) == ("final", "deny")
+        assert recorder.outcomes() == [("confirm", False), ("deny", False)]
+
+    async def test_agent_disabled_service_is_neither_advertised_nor_dispatched(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """memory switched off in the run's enabled_tools: hidden and refused."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM(_tool_then_text(_STORE))
+        agent = _new_agent(fake, recorder, agent_config)
+
+        result = await agent.run(
+            "store it",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_store_policy("allow", enabled_tools=_all_services(memory=False)),
+        )
+
+        assert _payload_tool_names(fake.received_tools[0]) == set()
+        assert (result.tool_calls[0].permission, result.tool_calls[0].success) == ("deny", False)
+        assert recorder.outcomes() == [("deny", False)]
+
+    async def test_agent_disabled_service_does_not_stick_to_the_next_run(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """A run with memory off, then one with memory on: only the first refuses it."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM([*_tool_then_text(_STORE), *_tool_then_text(_STORE)])
+        agent = _new_agent(fake, recorder, agent_config)
+
+        for memory_on in (False, True):
+            await agent.run(
+                "store it",
+                session_id="s",
+                history=[],
+                principal=_PRINCIPAL,
+                tool_policy=_store_policy("allow", enabled_tools=_all_services(memory=memory_on)),
+            )
+
+        assert [_payload_tool_names(fake.received_tools[i]) for i in (0, 2)] == [
+            set(),
+            {"memory.store"},
+        ]
+        assert recorder.outcomes() == [("deny", False), ("allow", True)]
+
+
+class _InterleavingLLM:
+    """LLM fake for concurrent runs: every run's first call waits for all the others.
+
+    A run is told apart by its user message. Its first call records what it got,
+    then blocks until every expected run has made its first call — so all runs
+    have built their payload and system message before any of them dispatches —
+    and returns that run's scripted tool call; later calls return text. A
+    serialised agent would deadlock here, so the wait is bounded.
+    """
+
+    def __init__(self, tool_calls: dict[str, ToolCall]) -> None:
+        self._tool_calls = tool_calls
+        self._first_calls = 0
+        self._everyone_called = asyncio.Event()
+        self.calls: dict[str, list[tuple[list[LLMMessage], list[dict[str, Any]] | None]]] = {}
+
+    async def chat(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        stream: bool = False,
+    ) -> LLMResponse:
+        label = next(m.content for m in messages if m.role == "user")
+        seen = self.calls.setdefault(label, [])
+        seen.append((list(messages), tools))
+        if len(seen) > 1:
+            return _text_response(f"done-{label}")
+        self._first_calls += 1
+        if self._first_calls == len(self._tool_calls):
+            self._everyone_called.set()
+        await asyncio.wait_for(self._everyone_called.wait(), timeout=5.0)
+        return _tool_response(self._tool_calls[label])
+
+
+# (dimension, org A policy kwargs, org B policy kwargs, the call both runs request,
+#  A's advertised tools line, A's (decision, success), B's (decision, success)).
+_ISOLATION_CASES: list[Any] = [
+    pytest.param(
+        ({"memory": {"store": "allow"}}, {}),
+        ({"memory": {"store": "deny"}}, {}),
+        _STORE,
+        "memory (store)",
+        ("allow", True),
+        ("deny", False),
+        id="permissions",
+    ),
+    pytest.param(
+        ({"memory": {"store": "allow"}}, {"enabled_tools": _all_services()}),
+        ({"memory": {"store": "allow"}}, {"enabled_tools": _all_services(memory=False)}),
+        _STORE,
+        "memory (store)",
+        ("allow", True),
+        ("deny", False),
+        id="enabled_tools",
+    ),
+    pytest.param(
+        ({"gmail": {"send": "deny"}}, {"promoted": frozenset({("gmail", "send")})}),
+        ({"gmail": {"send": "deny"}}, {}),
+        _SEND,
+        "gmail (send)",
+        ("confirm", False),
+        ("deny", False),
+        id="promoted",
+    ),
+]
+
+
+async def _run_orgs_concurrently(
+    recorder: RecordingRecorder,
+    config: AgentConfig,
+    org_a: tuple[dict[str, dict[str, str]], dict[str, Any]],
+    org_b: tuple[dict[str, dict[str, str]], dict[str, Any]],
+    call: ToolCall,
+    *,
+    a_first: bool,
+) -> tuple[_InterleavingLLM, AgentResult, AgentResult]:
+    """Run org A's and org B's requests concurrently on ONE agent; return both results."""
+    _register_store_and_send()
+    llm = _InterleavingLLM({"run-A": call, "run-B": call})
+    agent = _new_agent(llm, recorder, config, system_prompt="SYS")
+    policy_a = _policy(_permissions(org_a[0]), **org_a[1])
+    policy_b = _policy(_permissions(org_b[0]), **org_b[1])
+    run_a = agent.run(
+        "run-A", session_id="sess-a", history=[], principal=_ORG_A_PRINCIPAL, tool_policy=policy_a
+    )
+    run_b = agent.run(
+        "run-B", session_id="sess-b", history=[], principal=_ORG_B_PRINCIPAL, tool_policy=policy_b
+    )
+    if a_first:
+        result_a, result_b = await asyncio.gather(run_a, run_b)
+    else:
+        result_b, result_a = await asyncio.gather(run_b, run_a)
+    return llm, result_a, result_b
+
+
+@pytest.mark.parametrize("a_first", [True, False], ids=["a-first", "b-first"])
+@pytest.mark.parametrize(
+    ("org_a", "org_b", "call", "a_tools", "a_outcome", "b_outcome"), _ISOLATION_CASES
+)
+class TestAgentConcurrentRunsAreIsolated:
+    """Org A's matrix never affects org B's run, even when the runs interleave."""
+
+    async def test_agent_concurrent_runs_dispatch_under_their_own_policy(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        org_a: tuple[dict[str, dict[str, str]], dict[str, Any]],
+        org_b: tuple[dict[str, dict[str, str]], dict[str, Any]],
+        call: ToolCall,
+        a_tools: str,
+        a_outcome: tuple[str, bool],
+        b_outcome: tuple[str, bool],
+        a_first: bool,
+    ) -> None:
+        """Each org's dispatch decision comes from its own policy only."""
+        _, result_a, result_b = await _run_orgs_concurrently(
+            recorder, agent_config, org_a, org_b, call, a_first=a_first
+        )
+
+        assert (result_a.tool_calls[0].permission, result_a.tool_calls[0].success) == a_outcome
+        assert (result_b.tool_calls[0].permission, result_b.tool_calls[0].success) == b_outcome
+        assert sorted(
+            (c["principal"].org_id == _ORG_A, c["decision"], c["success"]) for c in recorder.calls
+        ) == sorted([(True, *a_outcome), (False, *b_outcome)])
+
+    async def test_agent_concurrent_runs_advertise_only_their_own_tools(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        org_a: tuple[dict[str, dict[str, str]], dict[str, Any]],
+        org_b: tuple[dict[str, dict[str, str]], dict[str, Any]],
+        call: ToolCall,
+        a_tools: str,
+        a_outcome: tuple[str, bool],
+        b_outcome: tuple[str, bool],
+        a_first: bool,
+    ) -> None:
+        """Every LLM call of org A's run lists A's tools; org B's lists none."""
+        llm, _, _ = await _run_orgs_concurrently(
+            recorder, agent_config, org_a, org_b, call, a_first=a_first
+        )
+
+        assert {
+            _payload_tool_names(tools) == {f"{call.tool}.{call.action}"}
+            for _, tools in llm.calls["run-A"]
+        } == {True}
+        assert {_payload_tool_names(tools) == set() for _, tools in llm.calls["run-B"]} == {True}
+
+    async def test_agent_concurrent_runs_system_message_lists_only_their_own_tools(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        org_a: tuple[dict[str, dict[str, str]], dict[str, Any]],
+        org_b: tuple[dict[str, dict[str, str]], dict[str, Any]],
+        call: ToolCall,
+        a_tools: str,
+        a_outcome: tuple[str, bool],
+        b_outcome: tuple[str, bool],
+        a_first: bool,
+    ) -> None:
+        """Org A's system message lists A's tools; org B's says none are available."""
+        llm, _, _ = await _run_orgs_concurrently(
+            recorder, agent_config, org_a, org_b, call, a_first=a_first
+        )
+
+        assert {
+            m.content for messages, _ in llm.calls["run-A"] for m in _system_messages(messages)
+        } == {_system_content("SYS", a_tools)}
+        assert {
+            m.content for messages, _ in llm.calls["run-B"] for m in _system_messages(messages)
+        } == {_system_content("SYS", None)}
+
+
+class TestAgentPerRunSystemMessage:
+    """The system message is the configured prompt plus the run's tools line."""
+
+    async def test_agent_system_message_is_prompt_blank_line_then_sorted_tools(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """Tools sorted by name, each tool's actions sorted and joined by "/"."""
+        for tool, action in (
+            ("memory", "store"),
+            ("echo", "write"),
+            ("gmail", "read"),
+            ("echo", "say"),
+            ("memory", "recall"),
+        ):
+            register_tool(tool, action, f"{tool} {action}", EchoArgs)(echo_handler)
+        permissions = _permissions(
+            {
+                "memory": {"store": "allow", "recall": "allow"},
+                "echo": {"write": "confirm", "say": "allow"},
+                "gmail": {"read": "allow"},
+            }
+        )
+        fake = FakeLLM([_text_response("ok")])
+        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+
+        await agent.run(
+            "hi", session_id="s", history=[], principal=_PRINCIPAL, tool_policy=_policy(permissions)
+        )
+
+        assert _roles_and_contents(_system_messages(fake.received_messages[0])) == [
+            (
+                "system",
+                "SYS\n\nYou have access to the following tools: "
+                "echo (say/write), gmail (read), memory (recall/store).",
+            )
+        ]
+
+    async def test_agent_system_message_lists_only_advertised_actions(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """Denied, un-promoted and disabled actions are left out of the tools line."""
+        for tool, action in (
+            ("gmail", "read"),
+            ("gmail", "send"),
+            ("gmail", "delete"),
+            ("memory", "store"),
+            ("echo", "say"),
+        ):
+            register_tool(tool, action, f"{tool} {action}", EchoArgs)(echo_handler)
+        permissions = _permissions(
+            {
+                "gmail": {"read": "allow", "send": "allow", "delete": "allow"},
+                "memory": {"store": "allow"},
+                "echo": {"say": "deny"},
+            }
+        )
+        fake = FakeLLM([_text_response("ok")])
+        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+
+        await agent.run(
+            "hi",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_policy(permissions, enabled_tools=_all_services(memory=False)),
+        )
+
+        assert fake.received_messages[0][0].content == (
+            "SYS\n\nYou have access to the following tools: gmail (read)."
+        )
+
+    @pytest.mark.parametrize(
+        "register", [False, True], ids=["nothing-registered", "everything-denied"]
+    )
+    async def test_agent_system_message_without_tools_says_none_are_available(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig, register: bool
+    ) -> None:
+        """A run that advertises nothing tells the LLM it has no tools."""
+        if register:
+            register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+
+        await agent.run(
+            "hi",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_store_policy("deny"),
+        )
+
+        assert _roles_and_contents(_system_messages(fake.received_messages[0])) == [
+            ("system", "SYS\n\nYou have no tools available.")
+        ]
+
+    @pytest.mark.parametrize(
+        ("state", "expected"),
+        [
+            ("allow", "You have access to the following tools: memory (store)."),
+            ("deny", _NO_TOOLS_LINE),
+        ],
+    )
+    async def test_agent_system_message_without_prompt_is_only_the_tools_line(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig, state: str, expected: str
+    ) -> None:
+        """system_prompt="" → the system message is the tools line alone, first."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("ok")])
+        agent = _new_agent(fake, recorder, agent_config)
+
+        await agent.run(
+            "hi",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_store_policy(state),
+        )
+
+        sent = fake.received_messages[0]
+        assert _roles_and_contents(_system_messages(sent)) == [("system", expected)]
+        assert sent[0].role == "system"
+
+    async def test_agent_system_message_follows_each_runs_policy(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """Same agent: the tools line is rebuilt per run, never carried over."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM([_text_response("a"), _text_response("b"), _text_response("c")])
+        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+
+        for state in ("allow", "deny", "allow"):
+            await agent.run(
+                "hi",
+                session_id="s",
+                history=[],
+                principal=_PRINCIPAL,
+                tool_policy=_store_policy(state),
+            )
+
+        assert [call[0].content for call in fake.received_messages] == [
+            "SYS\n\nYou have access to the following tools: memory (store).",
+            "SYS\n\nYou have no tools available.",
+            "SYS\n\nYou have access to the following tools: memory (store).",
+        ]
+
+    async def test_agent_system_message_is_the_same_on_every_call_of_a_run(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """A tool round trip re-sends the same single system message."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM(_tool_then_text(_STORE))
+        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+
+        await agent.run(
+            "store it",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_store_policy("allow"),
+        )
+
+        expected = "SYS\n\nYou have access to the following tools: memory (store)."
+        assert [_roles_and_contents(_system_messages(call)) for call in fake.received_messages] == [
+            [("system", expected)],
+            [("system", expected)],
+        ]
+
+    async def test_agent_per_run_system_message_never_in_returned_history(
+        self, recorder: RecordingRecorder, agent_config: AgentConfig
+    ) -> None:
+        """Neither the prompt nor the tools line leaks into AgentResult.history."""
+        register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
+        fake = FakeLLM(_tool_then_text(_STORE))
+        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+
+        result = await agent.run(
+            "store it",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_store_policy("allow"),
+        )
+
+        assert result.status == "final"
+        assert _system_messages(result.history) == []
+        assert not any(
+            "You have access to the following tools" in m.content for m in result.history
+        )

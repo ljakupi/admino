@@ -18,6 +18,9 @@
  *   the target; the public pages stay reachable.
  * - Per role: an area the role may not open sends it home (Super Admin →
  *   /platform, members → /chat); a logged-in user never sees /login.
+ *   Issue #161: an Org Admin pushing /permissions ends on /chat (the matrix
+ *   lives under Organization); Editors and Viewers open the read-only
+ *   /permissions summary.
  *
  * `@/api/auth` is mocked (only `getMe` answers); no app or component is
  * mounted. Page components are lazy imports the router resolves on
@@ -241,14 +244,15 @@ describe('router guards per role', () => {
     ['editor', '/chat', '/chat'],
     ['editor', '/settings', '/settings'],
     ['editor', '/organization', '/chat'],
-    ['editor', '/permissions', '/chat'],
+    ['editor', '/permissions', '/permissions'],
     ['editor', '/platform', '/chat'],
     ['viewer', '/tools', '/chat'],
     ['viewer', '/chat', '/chat'],
     ['viewer', '/settings', '/settings'],
     ['viewer', '/organization', '/chat'],
+    ['viewer', '/permissions', '/permissions'],
     ['org_admin', '/organization', '/organization'],
-    ['org_admin', '/permissions', '/permissions'],
+    ['org_admin', '/permissions', '/chat'],
     ['org_admin', '/tools', '/tools'],
     ['org_admin', '/platform', '/chat'],
     ['super_admin', '/chat', '/platform'],

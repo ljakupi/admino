@@ -3,12 +3,14 @@
 Every security-relevant action (logins and lockouts, password resets, session
 revocations and forced logouts, invitations, role changes, activations,
 sharing changes, deletions and restores, exports, Org Admin access to other
-users' projects, org and platform settings, Super Admin actions, residency
-policy, break-glass sessions, agent tool calls) is written through
-``record()`` as one row of the ``audit_events`` table (migration 0005; the
-action catalog CHECK is replaced by migration 0009 for GH-152's session
-actions and by migration 0010 for GH-153's invitation.resend and
-invitation.refuse).
+users' projects, org and platform settings, org tool permissions, Super
+Admin actions, residency policy, break-glass sessions, agent tool calls) is
+written through ``record()`` as one row of the ``audit_events`` table
+(migration 0005; the action catalog CHECK is replaced by migration 0009 for
+GH-152's session actions, by migration 0010 for GH-153's invitation.resend
+and invitation.refuse, and by migration 0016 for GH-161's
+org.permission_change, org.permission_promote, org.permission_promote_cancel
+and org.permission_demote).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -121,6 +123,12 @@ class AuditAction(StrEnum):
     EXPORT_CREATE = "export.create"
     # Org settings changes
     ORG_SETTINGS_CHANGE = "org.settings_change"
+    # Org tool permissions: a matrix change; a critical promotion requested,
+    # cancelled while pending, or reverted (GH-161)
+    ORG_PERMISSION_CHANGE = "org.permission_change"
+    ORG_PERMISSION_PROMOTE = "org.permission_promote"
+    ORG_PERMISSION_PROMOTE_CANCEL = "org.permission_promote_cancel"
+    ORG_PERMISSION_DEMOTE = "org.permission_demote"
     # Super Admin actions (org lifecycle, platform settings, model registry)
     ORG_CREATE = "org.create"
     ORG_LIMITS_CHANGE = "org.limits_change"
@@ -189,6 +197,10 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.PROJECT_ADMIN_ACCESS: "org",
         AuditAction.EXPORT_CREATE: "org",
         AuditAction.ORG_SETTINGS_CHANGE: "org",
+        AuditAction.ORG_PERMISSION_CHANGE: "org",
+        AuditAction.ORG_PERMISSION_PROMOTE: "org",
+        AuditAction.ORG_PERMISSION_PROMOTE_CANCEL: "org",
+        AuditAction.ORG_PERMISSION_DEMOTE: "org",
         AuditAction.ORG_CREATE: "org",
         AuditAction.ORG_LIMITS_CHANGE: "org",
         AuditAction.ORG_DEACTIVATE: "org",

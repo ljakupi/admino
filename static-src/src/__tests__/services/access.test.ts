@@ -9,10 +9,13 @@
  *   Super Admin only with kind 'super_admin' and no org and no role; a member
  *   role only with kind 'member', a non-empty org id and a known role.
  *   Anything else, including prototype keys as role names, is `null`.
- * - `canAccessArea(role, area)`: Super Admin → Platform only; Org Admin →
- *   Chat, Tools, Permissions, Organization, Settings; Editor → Chat, Tools,
- *   Settings; Viewer → Chat, Settings; `null` → nothing. Unknown areas and
- *   unknown roles are always refused (never a thrown error).
+ * - `canAccessArea(role, area)` (issue #161 moves the Org Admin's permission
+ *   editing under Organization and gives Editors and Viewers the read-only
+ *   Permissions summary): Super Admin → Platform only; Org Admin → Chat,
+ *   Tools, Organization, Settings (no Permissions page); Editor → Chat,
+ *   Tools, Permissions, Settings; Viewer → Chat, Permissions, Settings;
+ *   `null` → nothing. Unknown areas and unknown roles are always refused
+ *   (never a thrown error).
  * - `canSendChat(role)` mirrors `Capability.CHAT_SEND`: Org Admin and Editor.
  * - `homePath(role)`: '/platform' for a Super Admin, '/chat' for members,
  *   '/login' for `null`.
@@ -20,10 +23,15 @@
  *   `Capability.ORG_SETTINGS_MANAGE`: Org Admin only. It gates the Tools
  *   page's service toggles and `/api/org/settings`; every other role, `null`
  *   and unknown or prototype-key strings are refused (never a thrown error).
+ * - `canManageOrgPermissions(role)` (issue #161) mirrors
+ *   `Capability.ORG_PERMISSIONS_MANAGE`: Org Admin only. It gates the
+ *   permission matrix and the critical permissions under Organization; every
+ *   other role, `null` and unknown or prototype-key strings are refused.
  */
 import { describe, it, expect } from 'vitest';
 import {
   canAccessArea,
+  canManageOrgPermissions,
   canManageOrgSettings,
   canSendChat,
   homePath,
@@ -40,9 +48,9 @@ const AREAS: readonly Area[] = ['chat', 'tools', 'permissions', 'organization', 
 
 const ALLOWED: Record<ShellRole, readonly Area[]> = {
   super_admin: ['platform'],
-  org_admin: ['chat', 'tools', 'permissions', 'organization', 'settings'],
-  editor: ['chat', 'tools', 'settings'],
-  viewer: ['chat', 'settings'],
+  org_admin: ['chat', 'tools', 'organization', 'settings'],
+  editor: ['chat', 'tools', 'permissions', 'settings'],
+  viewer: ['chat', 'permissions', 'settings'],
 };
 
 function member(role: 'org_admin' | 'editor' | 'viewer'): MeResponse {
@@ -125,6 +133,19 @@ describe('access canAccessArea', () => {
     expect(canAccessArea(null, area)).toBe(false);
   });
 
+  it('gives each role exactly its issue #161 areas', () => {
+    expect(Object.fromEntries(ROLES.map((role) => [role, AREAS.filter((area) => canAccessArea(role, area))]))).toEqual({
+      super_admin: ['platform'],
+      org_admin: ['chat', 'tools', 'organization', 'settings'],
+      editor: ['chat', 'tools', 'permissions', 'settings'],
+      viewer: ['chat', 'permissions', 'settings'],
+    });
+  });
+
+  it('gives the read-only Permissions page to Editors and Viewers but not to the Org Admin or Super Admin', () => {
+    expect(ROLES.filter((role) => canAccessArea(role, 'permissions'))).toEqual(['editor', 'viewer']);
+  });
+
   it('gives a Super Admin nothing but the platform (no chat UI)', () => {
     expect(AREAS.filter((area) => canAccessArea('super_admin', area))).toEqual(['platform']);
   });
@@ -187,6 +208,44 @@ describe('access canManageOrgSettings', () => {
 
   it('grants the org settings only to roles that may open the Tools page', () => {
     expect(ROLES.filter((role) => canManageOrgSettings(role) && !canAccessArea(role, 'tools'))).toEqual([]);
+  });
+});
+
+// --- canManageOrgPermissions (issue #161) ---------------------------------
+
+describe('access canManageOrgPermissions', () => {
+  it.each([
+    ['org_admin', true],
+    ['editor', false],
+    ['viewer', false],
+    ['super_admin', false],
+    [null, false],
+  ] as Array<[ShellRole | null, boolean]>)('%s may manage the org permissions: %s', (role, expected) => {
+    expect(canManageOrgPermissions(role)).toBe(expected);
+  });
+
+  it.each(['owner', 'admin', 'Org_Admin', 'ORG_ADMIN', ' org_admin', 'org_admin ', '', '__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'refuses the org permissions to the unknown role %j without throwing',
+    (role) => {
+      expect(canManageOrgPermissions(role as ShellRole)).toBe(false);
+    },
+  );
+
+  it('refuses the org permissions to undefined without throwing', () => {
+    expect(canManageOrgPermissions(undefined as unknown as ShellRole | null)).toBe(false);
+  });
+
+  it('grants the org permissions only to roles that may open the Organization page', () => {
+    const managers = ROLES.filter((role) => canManageOrgPermissions(role));
+
+    expect({ managers, outsideOrganization: managers.filter((role) => !canAccessArea(role, 'organization')) }).toEqual({
+      managers: ['org_admin'],
+      outsideOrganization: [],
+    });
+  });
+
+  it('never gives a permission manager the read-only Permissions page as well', () => {
+    expect(ROLES.filter((role) => canManageOrgPermissions(role) && canAccessArea(role, 'permissions'))).toEqual([]);
   });
 });
 

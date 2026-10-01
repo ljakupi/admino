@@ -7,7 +7,6 @@ import {
 } from 'lucide-vue-next';
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
-import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
 import { useSettingsStore } from '@/stores/settings';
 import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
@@ -251,8 +250,6 @@ async function handleResetConfirmed() {
             <h2 class="section-title danger-title">{{ t('settings.nav.danger') }}</h2>
             <p class="section-sub">{{ t('settings.danger.subtitle') }}</p>
           </div>
-
-          <CriticalPermissionsCard />
 
           <div class="danger-card">
             <div class="s-row">

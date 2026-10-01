@@ -1,10 +1,12 @@
-"""Email/password login and logout (GH-149, GH-152, GH-157).
+"""Email/password login, logout and re-authentication (GH-149, GH-152, GH-157, GH-161).
 
 Inputs: the database pool, plus the email, password, client IP and user agent
-of a login attempt, or the raw session token of a logout.
+of a login attempt, the raw session token of a logout, or the ``Principal``,
+typed password and client IP of a re-authentication.
 Outputs: ``login`` returns a ``LoginResult`` (the raw session token for the
 ``admino_session`` cookie and the cookie's Max-Age), or raises
-``LoginFailedError``; ``logout`` deletes the session.
+``LoginFailedError``; ``logout`` deletes the session; ``reauthenticate``
+returns whether the password is the principal's own.
 
 Every attempt first goes through the brute-force protection
 (``admino.login_throttle``, GH-157): the account (the typed email) and the
@@ -27,6 +29,15 @@ raises the same ``LoginFailedError``; the failure at the lockout threshold
 then locks the account and/or the IP and records a ``login.lockout`` per lock
 (account first, then IP).
 
+``reauthenticate`` (GH-161: an Org Admin confirming their password before a
+critical permission promotion) checks the password of the signed-in
+principal's own account, read by its user id. It goes through the same
+throttle as a login, on the stored email's account counter and the client
+IP: a locked account or IP is refused without checking the password, and a
+wrong password is a counted failure (the Nth locks, with its
+``login.lockout`` event). It opens no session, stamps no ``last_login_at``
+and records no ``login.success`` / ``login.failure`` event.
+
 Security notes:
 - No user enumeration: one message ("Invalid email or password") for every
   failure cause, a lockout included, and exactly one Argon2 verification on
@@ -48,6 +59,9 @@ Security notes:
   reset with it), so no session is handed out unaudited.
 - ``LoginResult`` keeps the token out of its repr, so it can't end up in a
   log line or traceback.
+- Re-authentication can't guess faster than the login form: its failures
+  share the login's account and IP counters. A missing or deleted account is
+  refused after a dummy check. Neither the password nor the email is logged.
 - Parameterized SQL only: values travel as bind parameters.
 """
 
@@ -67,6 +81,7 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from admino.access import Principal
     from admino.audit_events import ActorKind
 
 LOGIN_FAILED_MESSAGE: Final = "Invalid email or password"
@@ -79,6 +94,12 @@ _LOOKUP_SQL: Final = """
     FROM users u
     LEFT JOIN organizations o ON o.id = u.org_id
     WHERE lower(u.email) = lower($1)
+"""
+# The re-authenticating principal's own account, by its id (never by a typed email).
+_REAUTH_LOOKUP_SQL: Final = """
+    SELECT email, password_hash, status
+    FROM users
+    WHERE id = $1 AND deleted_at IS NULL
 """
 _REHASH_SQL: Final = "UPDATE users SET password_hash = $1 WHERE id = $2"
 _LAST_LOGIN_SQL: Final = "UPDATE users SET last_login_at = now() WHERE id = $1"
@@ -231,6 +252,58 @@ async def login(
             ip=ip,
         )
     return LoginResult(token=token, max_age_seconds=int(policy.max_lifetime.total_seconds()))
+
+
+async def reauthenticate(
+    pool: asyncpg.Pool, *, principal: Principal, password: str, ip: str | None
+) -> bool:
+    """Check that a signed-in principal typed their own password, through the login throttle.
+
+    The account is the principal's own users row, read by its id. Its stored
+    email is the throttle's account subject, so failed re-authentications and
+    failed logins add up on one counter. No session is opened and no login
+    audit event is recorded.
+
+    Args:
+        pool: The database pool.
+        principal: The signed-in account (from the session).
+        password: The password the user typed.
+        ip: The client address, if known.
+
+    Returns:
+        True when the password matches; False for a wrong password, a locked
+        account or IP (the password isn't checked), or a missing, deleted or
+        inactive account (after a dummy check).
+
+    Raises:
+        AuditRecordError: If a lockout event can't be recorded.
+        asyncpg.PostgresError: If the failure counters can't be written; the
+            password is not checked.
+    """
+    account = await pool.fetchrow(_REAUTH_LOOKUP_SQL, principal.user_id)
+    if account is None or account["status"] != "active":
+        # The same Argon2 cost as a real check.
+        await asyncio.to_thread(passwords.verify_password, password, _DUMMY_HASH)
+        return False
+    attempt = await login_throttle.begin(pool, email=account["email"], ip=ip)
+    if attempt.locked:
+        return False
+    stored_hash = account["password_hash"]
+    matches = await asyncio.to_thread(
+        passwords.verify_password, password, stored_hash or _DUMMY_HASH
+    )
+    if not stored_hash or not matches:
+        await login_throttle.fail(
+            pool,
+            attempt,
+            ip=ip,
+            actor_kind=principal.kind,
+            actor_user_id=principal.user_id,
+            org_id=principal.org_id,
+        )
+        return False
+    await login_throttle.succeed(pool, attempt)
+    return True
 
 
 async def logout(pool: asyncpg.Pool, token: str) -> None:

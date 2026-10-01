@@ -207,3 +207,18 @@ export interface CriticalPermissionPatchResponse {
   state: 'deny' | 'confirm';
   pending_at: string | null;
 }
+
+// Permissions summary (read-only, issue #161: every member role sees the
+// org's effective permission states).
+
+export type PermissionSummaryState = 'allow' | 'confirm' | 'deny' | 'disabled';
+
+export interface PermissionSummaryEntry {
+  tool: string;
+  action: string;
+  state: PermissionSummaryState;
+}
+
+export interface PermissionsSummaryResponse {
+  permissions: PermissionSummaryEntry[];
+}

@@ -738,9 +738,17 @@ class TestUnhandledExceptions:
         app = create_app(agent=agent, config=_config())
         login(app, member_session("editor"))
         # GH-160: the route reads the platform limits through the settings cache
-        # (primed by conftest), so the pool is never queried.
+        # (primed by conftest). GH-161: the run's org policy is stubbed, so the
+        # MagicMock pool is never queried and the agent run is what fails.
+        from admino.models import ToolPolicy
+        from admino.permissions import PermissionsConfig
+
         pool = patch("admino.database.get_pool", MagicMock(return_value=MagicMock(name="pool")))
-        with pool, configured_logging() as logs:
+        policy = patch(
+            "admino.org_permissions.load_tool_policy",
+            AsyncMock(return_value=ToolPolicy(permissions=PermissionsConfig())),
+        )
+        with pool, policy, configured_logging() as logs:
             async with _client(app) as client:
                 response = await client.post(
                     "/api/message", json={"message": "hello", "session_id": "chat-1"}

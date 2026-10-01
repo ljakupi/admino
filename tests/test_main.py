@@ -22,6 +22,15 @@ covering:
   ``ensure_default_org`` (an empty database gets no organization), main.py
   doesn't reference ``DEFAULT_ORG_ID``, and startup loads the bundled
   common-password list once, so a missing list stops startup.
+- GH-161: no agent-wide permission state. ``_async_startup(config)`` takes only
+  the config and returns only the overlaid ``AppConfig``; after migrations and
+  the platform seed it awaits ``org_permissions.seed_missing_orgs(pool)`` (the
+  defaults for every org without permission rows) — no global permission seed
+  or load, no tools gate. main() builds ``Agent(llm_client, tool_call_recorder,
+  agent_config, system_prompt)`` without ``permissions_config`` /
+  ``tools_enabled`` and never builds the default permissions config;
+  ``_build_system_prompt(config)`` has no tool line (the agent adds the run's
+  tools line per run).
 - GH-156: uvicorn runs one process (``workers=1``) with ``proxy_headers=False``,
   so its own X-Forwarded-* handling (which trusts 127.0.0.1 or the
   FORWARDED_ALLOW_IPS env var) never runs; the app's ``server.trusted_proxies``
@@ -65,7 +74,7 @@ import admino.main as main_module
 from admino.config import AppConfig, LLMConfig
 from admino.llm import LLMError
 from admino.main import _async_startup, _configure_logging, _import_tool_modules, main
-from tests.db_fakes import TOOL_NAMES, FakeDb
+from tests.db_fakes import FakeDb
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -101,11 +110,6 @@ def _make_mock_config() -> MagicMock:
     return config
 
 
-def _make_mock_permissions() -> MagicMock:
-    """Build a minimal mock PermissionsConfig."""
-    return MagicMock()
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -118,14 +122,11 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     Returns a dict of all mocks for assertion in tests.
     """
     mock_config = _make_mock_config()
-    mock_perms = _make_mock_permissions()
-    mock_tools_enabled = {"gmail": False, "memory": True}
     mock_llm_client = MagicMock()
     mock_agent = MagicMock()
     mock_app = MagicMock()
 
     mock_load_app_config = MagicMock(return_value=mock_config)
-    mock_build_permissions = MagicMock(return_value=mock_perms)
     mock_llm_cls = MagicMock(return_value=mock_llm_client)
     mock_agent_cls = MagicMock(return_value=mock_agent)
     mock_create_app = MagicMock(return_value=mock_app)
@@ -134,23 +135,22 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     mock_import_tools = MagicMock()
 
     # _async_startup is called via asyncio.run() inside main().
-    # We mock asyncio.run to return (config, perms, tools_enabled) directly so
-    # the DB init path is bypassed without needing real asyncpg. The third
-    # element is the persisted per-service enabled state loaded on boot (GH-80).
+    # We mock asyncio.run to return the runtime config directly so the DB init
+    # path is bypassed without needing real asyncpg (GH-161: _async_startup
+    # returns only the overlaid config — no permissions, no tools gate).
     # The side_effect CLOSES the coroutine main() passes in so it is not left
     # "never awaited" — a leaked coroutine is GC'd at an arbitrary later point
     # and, when that coincides with another test's patched __import__, surfaces
     # as a spurious PytestUnraisableExceptionWarning failure.
-    def _fake_run(coro: Any) -> tuple[Any, Any, Any]:
+    def _fake_run(coro: Any) -> Any:
         if hasattr(coro, "close"):
             coro.close()
-        return (mock_config, mock_perms, mock_tools_enabled)
+        return mock_config
 
     mock_asyncio = MagicMock()
     mock_asyncio.run = MagicMock(side_effect=_fake_run)
 
     monkeypatch.setattr("admino.main.load_app_config", mock_load_app_config)
-    monkeypatch.setattr("admino.main.build_default_permissions_config", mock_build_permissions)
     monkeypatch.setattr("admino.main._import_tool_modules", mock_import_tools)
     monkeypatch.setattr("admino.main.asyncio", mock_asyncio)
 
@@ -163,13 +163,10 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     return {
         "config": mock_config,
-        "permissions": mock_perms,
-        "tools_enabled": mock_tools_enabled,
         "llm_client": mock_llm_client,
         "agent": mock_agent,
         "app": mock_app,
         "load_app_config": mock_load_app_config,
-        "build_default_permissions_config": mock_build_permissions,
         "create_llm_client": mock_llm_cls,
         "Agent": mock_agent_cls,
         "create_app": mock_create_app,
@@ -229,22 +226,35 @@ class TestMainHappyPath:
 
         mock_deps["load_app_config"].assert_called_once_with(test_path)
 
-    def test_main_builds_default_permissions_from_constant(self, mock_deps: dict[str, Any]) -> None:
-        """Permissions are seeded from the in-code default, not a YAML file (GH-85)."""
+    def test_main_never_builds_the_default_permissions_config(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-161: main() no longer builds (or logs) a global default permissions
+        config — each org's matrix is seeded in the database and loaded per run."""
+        build = MagicMock(name="build_default_permissions_config")
+        monkeypatch.setattr("admino.permissions.build_default_permissions_config", build)
+
         main(config_path=Path("c.yaml"))
 
-        mock_deps["build_default_permissions_config"].assert_called_once_with()
+        build.assert_not_called()
+        assert not hasattr(main_module, "build_default_permissions_config")
 
-    def test_main_passes_tools_enabled_to_agent(self, mock_deps: dict[str, Any]) -> None:
-        """Agent is constructed with the persisted tools_enabled from startup (GH-80).
-
-        The per-service enabled state loaded from the DB on boot must flow into
-        the Agent so toggled-off services stay gated across restarts.
-        """
+    def test_main_builds_the_agent_without_permission_state(
+        self, mock_deps: dict[str, Any]
+    ) -> None:
+        """GH-161 (replaces the GH-80 tools_enabled wiring): the Agent gets only its
+        stateless collaborators; the org's permissions, promotions and enabled services
+        arrive with each run's ToolPolicy."""
         main(config_path=Path("c.yaml"))
 
         mock_deps["Agent"].assert_called_once()
-        assert mock_deps["Agent"].call_args.kwargs["tools_enabled"] == mock_deps["tools_enabled"]
+        assert mock_deps["Agent"].call_args.args == ()
+        assert set(mock_deps["Agent"].call_args.kwargs) == {
+            "llm_client",
+            "tool_call_recorder",
+            "agent_config",
+            "system_prompt",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -340,9 +350,45 @@ class TestBuildSystemPromptWithoutFilesTool:
         """The 'When using file tools' guidance is gone."""
         assert "file tools" not in self._prompt().lower()
 
-    def test_system_prompt_still_lists_registered_tools(self) -> None:
-        """The dynamic tool summary is unaffected by the removal."""
-        assert "memory (recall)" in self._prompt()
+    def test_system_prompt_no_longer_lists_registered_tools(self) -> None:
+        """GH-161 spec change: the static tool summary is gone — the agent appends the
+        run's own tools line (from the org's policy) to every run instead."""
+        prompt = self._prompt()
+
+        assert "You have access to the following tools" not in prompt
+        assert "memory (recall)" not in prompt
+
+    def test_build_system_prompt_takes_only_the_config(self) -> None:
+        """GH-161: _build_system_prompt(config) — no permissions_config parameter."""
+        from admino.main import _build_system_prompt
+
+        assert list(inspect.signature(_build_system_prompt).parameters) == ["config"]
+
+    def test_system_prompt_keeps_the_rest_of_the_text(self) -> None:
+        """Only the tool line is removed; every other line is unchanged."""
+        assert self._prompt() == "\n".join(
+            [
+                "You are admino, a local personal AI assistant.",
+                "Some actions may require user confirmation before execution.",
+                "",
+                "IMPORTANT: Tool permissions can change during a conversation. If a tool "
+                "call was previously denied, the user may have since promoted it. Always "
+                "attempt the tool call when the user asks — never refuse based on earlier "
+                "denials in the conversation. The permission engine will re-evaluate each "
+                "call independently.",
+                "",
+                "CRITICAL — never substitute a different tool or action for the one the "
+                "user actually requested. If the exact capability the user asked for is "
+                "not available to you (not in your tool list, disabled, or not permitted), "
+                "STOP and tell the user that action is not available and why — for example, "
+                "that it needs to be enabled or promoted in Critical Permissions. Do NOT "
+                "approximate the request with a different tool. This is absolute for "
+                "mutating actions: never turn an update into a create, or send to a "
+                "different recipient/channel. A duplicate or wrong write is worse than "
+                "doing nothing.",
+                "",
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -595,12 +641,15 @@ class TestAgentConfigWiring:
         builder.assert_called_once_with()
         assert mock_deps["Agent"].call_args.kwargs["tool_call_recorder"] is sentinel
 
-    def test_agent_receives_permissions_config(self, mock_deps: dict[str, Any]) -> None:
-        """Agent is created with the PermissionsConfig instance."""
+    @pytest.mark.parametrize("removed", ["permissions_config", "tools_enabled"])
+    def test_agent_receives_no_permission_state(
+        self, mock_deps: dict[str, Any], removed: str
+    ) -> None:
+        """GH-161: neither a global PermissionsConfig nor a tools gate reaches the Agent."""
         main(config_path=Path("c.yaml"))
 
-        agent_call_kwargs = mock_deps["Agent"].call_args.kwargs
-        assert agent_call_kwargs["permissions_config"] is mock_deps["permissions"]
+        mock_deps["Agent"].assert_called_once()
+        assert removed not in mock_deps["Agent"].call_args.kwargs
 
 
 # ---------------------------------------------------------------------------
@@ -976,10 +1025,9 @@ class TestMainDatabaseStartupFailures:
 
 
 # ---------------------------------------------------------------------------
-# _async_startup direct tests (GH-159: the platform row and the org tools gate)
+# _async_startup direct tests (GH-159: the platform row; GH-161: per-org permission seed)
 # ---------------------------------------------------------------------------
 
-_ALL_TOOLS_ON: dict[str, bool] = dict.fromkeys(TOOL_NAMES, True)
 _STORED_LIMITS: dict[str, int] = {
     "max_tool_calls_per_message": 7,
     "max_pending_confirmations": 4,
@@ -992,6 +1040,14 @@ _REMOVED_STARTUP_HELPERS = (
     "update_setting",
     "load_settings_from_db",
     "load_app_config_from_db",
+)
+# GH-161: the global permission seed/load, the tools gate and the default permissions
+# config main() used to build are gone from main.py.
+_REMOVED_PERMISSION_HELPERS = (
+    "seed_permissions",
+    "load_permissions_config_from_db",
+    "all_orgs_tools_gate",
+    "build_default_permissions_config",
 )
 
 
@@ -1027,19 +1083,18 @@ class _Startup:
     db: FakeDb
     events: list[tuple[str, int]]
     init_pool: AsyncMock
-    seed_permissions: AsyncMock
-    load_permissions: AsyncMock
+    seed_missing_orgs: AsyncMock
     close_pool: AsyncMock
-    permissions: MagicMock
 
 
 def _patch_startup_db(monkeypatch: pytest.MonkeyPatch) -> _Startup:
     """Run _async_startup against tests/db_fakes.FakeDb (GH-159).
 
-    Migrations, the permission seed and load, the health check and the pool's
-    close are patched; the settings code (admino.scoped_settings) runs for real
-    against the fake's platform_settings and org_settings tables, and any
-    statement on the dropped ``settings`` table fails like PostgreSQL.
+    Migrations, the per-org permission seed (GH-161:
+    ``org_permissions.seed_missing_orgs``), the health check and the pool's close
+    are patched; the settings code (admino.scoped_settings) runs for real against
+    the fake's platform_settings and org_settings tables, and any statement on the
+    dropped ``settings`` table fails like PostgreSQL.
     """
     monkeypatch.setenv("PG_PASSWORD", "testpass")
     db = FakeDb()
@@ -1052,10 +1107,8 @@ def _patch_startup_db(monkeypatch: pytest.MonkeyPatch) -> _Startup:
 
         return _record
 
-    permissions = MagicMock(name="db-permissions")
     init_pool = AsyncMock(return_value=db.pool, side_effect=step("init_pool"))
-    seed_permissions = AsyncMock(side_effect=step("seed_permissions"))
-    load_permissions = AsyncMock(return_value=permissions, side_effect=step("load_permissions"))
+    seed_missing_orgs = AsyncMock(return_value=0, side_effect=step("seed_missing_orgs"))
     close_pool = AsyncMock(side_effect=step("close_pool"))
     monkeypatch.setattr("admino.database.init_pool", init_pool)
     monkeypatch.setattr("admino.database.get_pool", lambda: db.pool)
@@ -1063,17 +1116,14 @@ def _patch_startup_db(monkeypatch: pytest.MonkeyPatch) -> _Startup:
     monkeypatch.setattr(
         "admino.database.run_migrations", AsyncMock(side_effect=step("run_migrations"))
     )
-    monkeypatch.setattr("admino.database.seed_permissions", seed_permissions)
+    monkeypatch.setattr("admino.org_permissions.seed_missing_orgs", seed_missing_orgs)
     monkeypatch.setattr("admino.database.close_pool", close_pool)
-    monkeypatch.setattr("admino.config.load_permissions_config_from_db", load_permissions)
     return _Startup(
         db=db,
         events=events,
         init_pool=init_pool,
-        seed_permissions=seed_permissions,
-        load_permissions=load_permissions,
+        seed_missing_orgs=seed_missing_orgs,
         close_pool=close_pool,
-        permissions=permissions,
     )
 
 
@@ -1089,14 +1139,14 @@ def _platform_llm(row: dict[str, Any]) -> dict[str, Any]:
 
 class TestAsyncStartup:
     """_async_startup: migrations, the platform row seeded from config.yaml and overlaid
-    onto the config, permissions, and the interim tools gate over org_settings (GH-159)."""
+    onto the config (GH-159), and the per-org permission seed (GH-161)."""
 
     @pytest.mark.asyncio
     async def test_raises_when_pg_password_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """_async_startup raises ValueError when PG_PASSWORD is not set."""
         monkeypatch.delenv("PG_PASSWORD", raising=False)
         with pytest.raises(ValueError, match="PG_PASSWORD"):
-            await _async_startup(MagicMock(), MagicMock())
+            await _async_startup(MagicMock())
 
     @pytest.mark.asyncio
     async def test_raises_when_health_check_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1108,7 +1158,7 @@ class TestAsyncStartup:
         monkeypatch.setattr("admino.database.close_pool", AsyncMock())
 
         with pytest.raises(RuntimeError, match="health check failed"):
-            await _async_startup(MagicMock(), MagicMock())
+            await _async_startup(MagicMock())
 
     @pytest.mark.asyncio
     async def test_async_startup_first_boot_seeds_the_platform_row_from_the_config(
@@ -1118,7 +1168,7 @@ class TestAsyncStartup:
         startup = _patch_startup_db(monkeypatch)
         config = _startup_config(max_message_length=6000)
 
-        await _async_startup(config, MagicMock())
+        await _async_startup(config)
 
         row = startup.db.platform_row()
         assert row is not None
@@ -1141,7 +1191,7 @@ class TestAsyncStartup:
             llm_provider="openai", openai_model="gpt-4.1", **_STORED_LIMITS
         )
 
-        await _async_startup(_startup_config(), MagicMock())
+        await _async_startup(_startup_config())
 
         row = startup.db.platform_row()
         assert row is not None
@@ -1158,9 +1208,8 @@ class TestAsyncStartup:
         startup.db.add_platform_settings(**_STORED_LIMITS)
         config = _startup_config()
 
-        result = await _async_startup(config, MagicMock())
+        runtime = await _async_startup(config)
 
-        runtime = result[0]
         assert type(runtime) is AppConfig
         assert (runtime.llm.provider, runtime.llm.anthropic_model) == (
             "anthropic",
@@ -1172,48 +1221,69 @@ class TestAsyncStartup:
         assert runtime.database == config.database
         assert (runtime.log_level, runtime.llm.timeout_s) == ("WARNING", 77)
 
-    @pytest.mark.asyncio
-    async def test_async_startup_returns_the_loaded_permissions(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Permissions are seeded on the startup pool, then loaded from it."""
-        startup = _patch_startup_db(monkeypatch)
-        permissions_config = MagicMock(name="default-permissions")
-
-        result = await _async_startup(_startup_config(), permissions_config)
-
-        assert len(result) == 3
-        assert result[1] is startup.permissions
-        startup.seed_permissions.assert_awaited_once_with(startup.db.pool, permissions_config)
-        startup.load_permissions.assert_awaited_once_with(startup.db.pool)
+    def test_async_startup_takes_only_the_config(self) -> None:
+        """GH-161: _async_startup(config) — no permissions_config parameter."""
+        assert list(inspect.signature(_async_startup).parameters) == ["config"]
 
     @pytest.mark.asyncio
-    async def test_async_startup_tools_gate_is_the_and_over_every_org(
+    async def test_async_startup_returns_only_the_overlaid_config(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """GH-80 + GH-159: a service one org turned off stays off after a restart, even
-        when another org has it on."""
-        startup = _patch_startup_db(monkeypatch)
-        first = startup.db.add_org()
-        second = startup.db.add_org()
-        startup.db.add_org_settings(first, gmail=False)
-        startup.db.add_org_settings(second, gmail=True, memory=False)
-
-        result = await _async_startup(_startup_config(), MagicMock())
-
-        assert dict(result[2]) == {**_ALL_TOOLS_ON, "gmail": False, "memory": False}
-
-    @pytest.mark.asyncio
-    async def test_async_startup_tools_gate_all_on_without_org_rows(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """No org_settings row: every service is on (never accidentally disabled)."""
+        """GH-161: no (config, permissions, tools gate) tuple — just the AppConfig."""
         _patch_startup_db(monkeypatch)
 
-        result = await _async_startup(_startup_config(), MagicMock())
+        result = await _async_startup(_startup_config())
 
-        assert dict(result[2]) == _ALL_TOOLS_ON
-        assert all(type(value) is bool for value in result[2].values())
+        assert type(result) is AppConfig
+
+    @pytest.mark.asyncio
+    async def test_async_startup_seeds_missing_org_permissions_on_the_startup_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every org without permission rows gets the defaults, once, on the startup pool."""
+        startup = _patch_startup_db(monkeypatch)
+
+        await _async_startup(_startup_config())
+
+        startup.seed_missing_orgs.assert_awaited_once_with(startup.db.pool)
+
+    @pytest.mark.asyncio
+    async def test_async_startup_seeds_org_permissions_after_the_platform_seed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Order: migrations, the platform row seed, then the per-org permission seed,
+        all before the startup pool is closed."""
+        startup = _patch_startup_db(monkeypatch)
+
+        await _async_startup(_startup_config())
+
+        steps = dict(startup.events)
+        names = [name for name, _ in startup.events]
+        platform_seeds = [
+            i
+            for i, c in enumerate(startup.db.calls)
+            if c.normalized.startswith("insert into platform_settings")
+        ]
+        assert platform_seeds
+        assert steps["run_migrations"] == 0
+        assert platform_seeds[0] < steps["seed_missing_orgs"]
+        assert names.index("run_migrations") < names.index("seed_missing_orgs")
+        assert names.index("seed_missing_orgs") < names.index("close_pool")
+
+    @pytest.mark.asyncio
+    async def test_async_startup_reads_no_permission_matrix_and_no_tools_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-161: startup loads no global permission matrix and computes no tools gate
+        over org_settings (each run loads its own org's policy)."""
+        startup = _patch_startup_db(monkeypatch)
+        org = startup.db.add_org()
+        startup.db.add_org_settings(org, gmail=False)
+
+        await _async_startup(_startup_config())
+
+        assert startup.db.matching(r"\bfrom org_settings\b") == []
+        assert startup.db.matching(r"\bfrom permissions\b") == []
 
     @pytest.mark.asyncio
     async def test_async_startup_order_migrate_seed_read_then_close(
@@ -1223,7 +1293,7 @@ class TestAsyncStartup:
         read, and the startup pool is closed after the last statement."""
         startup = _patch_startup_db(monkeypatch)
 
-        await _async_startup(_startup_config(), MagicMock())
+        await _async_startup(_startup_config())
 
         calls = startup.db.calls
         steps = dict(startup.events)
@@ -1238,8 +1308,7 @@ class TestAsyncStartup:
             for i, c in enumerate(calls)
             if c.normalized.startswith("select") and "from platform_settings" in c.normalized
         ]
-        gates = [i for i, c in enumerate(calls) if "from org_settings" in c.normalized]
-        assert seeds and reads and gates
+        assert seeds and reads
         assert seeds[0] < reads[0]
         assert steps["close_pool"] == len(calls)
 
@@ -1250,7 +1319,7 @@ class TestAsyncStartup:
         """_async_startup passes pool size from config to init_pool."""
         startup = _patch_startup_db(monkeypatch)
 
-        await _async_startup(_startup_config(), MagicMock())
+        await _async_startup(_startup_config())
 
         startup.init_pool.assert_called_once()
         call_args = startup.init_pool.call_args
@@ -1267,6 +1336,24 @@ class TestAsyncStartup:
             if isinstance(node, ast.ImportFrom)
             for alias in node.names
         }
+
+        assert name not in used
+
+    @pytest.mark.parametrize("name", _REMOVED_PERMISSION_HELPERS)
+    def test_main_module_no_longer_uses_the_global_permission_helpers(self, name: str) -> None:
+        """GH-161: main.py neither imports nor calls the global permission seed/load, the
+        tools gate or the default permissions builder (as a name or an attribute)."""
+        tree = ast.parse(_MAIN_MODULE_PATH.read_text(encoding="utf-8"))
+        used = (
+            {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+            | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+            | {
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+            }
+        )
 
         assert name not in used
 
@@ -1499,7 +1586,7 @@ class TestAsyncStartupCreatesNoOrganization:
         ensure = AsyncMock()
         monkeypatch.setattr("admino.accounts.ensure_default_org", ensure, raising=False)
 
-        await _async_startup(_startup_config(), MagicMock())
+        await _async_startup(_startup_config())
 
         ensure.assert_not_called()
 
@@ -1510,7 +1597,7 @@ class TestAsyncStartupCreatesNoOrganization:
         """No statement issued at startup inserts into organizations."""
         startup = _patch_startup_db(monkeypatch)
 
-        await _async_startup(_startup_config(), MagicMock())
+        await _async_startup(_startup_config())
 
         assert startup.db.calls
         assert startup.db.matching(r"\binsert into organizations\b") == []
@@ -1551,7 +1638,7 @@ class TestStartupLoadsCommonPasswords:
         mock_deps["uvicorn_run"].side_effect = lambda *_a, **_k: events.append("uvicorn")
         _patch_startup_db(monkeypatch)
 
-        await _async_startup(_startup_config(), MagicMock())
+        await _async_startup(_startup_config())
         main()
 
         assert events.count("common_passwords") == 1
@@ -1571,7 +1658,7 @@ class TestStartupLoadsCommonPasswords:
 
         failed = False
         try:
-            await _async_startup(_startup_config(), MagicMock())
+            await _async_startup(_startup_config())
         except OSError:
             failed = True
         if not failed:

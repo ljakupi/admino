@@ -20,13 +20,16 @@ What these tests pin down:
 - CHECKs: ``sent_at >= created_at``; ``expires_at > sent_at`` and
   ``expires_at <= sent_at + interval '72 hours'``.
 - ``audit_events_action_check`` is replaced (dropped, then added) by a CHECK
-  whose action list is exactly the live ``AuditAction`` catalog: 0009's 41 plus
-  ``invitation.resend`` and ``invitation.refuse``.
+  whose action list is 0009's 41 plus ``invitation.resend`` and
+  ``invitation.refuse`` (43 actions, all still in ``AuditAction``; the exact
+  sync with the live catalog moved to tests/test_migration_0016.py when GH-161
+  added the ``org.permission_*`` actions).
 - Nothing else changes: one table created, none dropped, only ``audit_events``
   altered (and only its action check), no UPDATE / INSERT / DELETE / TRUNCATE,
   no function, trigger, view or type; an index, if any, is on invitations.
 - Python and SQL stay in sync: the 72-hour cap is
-  ``admino.invitations.INVITATION_LIFETIME``, the action list is ``AuditAction``.
+  ``admino.invitations.INVITATION_LIFETIME``, the action list is within
+  ``AuditAction``.
 
 Security notes:
 - Only the SHA-256 digest of a token can be stored (32 bytes, no raw column).
@@ -497,12 +500,18 @@ class TestMigration0010ActionCatalog:
         assert old <= new
         assert len(new) == 43
 
-    def test_migration_0010_action_check_matches_audit_action(self) -> None:
-        """The live catalog sync (moved here from test_migration_0009.py): the SQL action
-        list equals AuditAction's values."""
+    def test_migration_0010_action_check_is_still_in_audit_action(self) -> None:
+        """Every action 0010 allows is still an AuditAction (none was dropped).
+
+        A shipped migration never changes, so 0010's list stays its 43 actions
+        (test_migration_0010_action_check_adds_exactly_the_invitation_actions pins it). The
+        catalog grows by replacing the audit_events_action_check constraint in a later
+        migration (0016 for GH-161's org.permission_* actions), so the exact sync with the
+        live AuditAction lives in that migration's tests (tests/test_migration_0016.py).
+        """
         from admino.audit_events import AuditAction
 
-        assert _added_action_check() == {action.value for action in AuditAction}
+        assert _added_action_check() <= {action.value for action in AuditAction}
 
 
 # ---------------------------------------------------------------------------

@@ -106,6 +106,15 @@ export const fr: Record<MessageKey, Message> = {
   'criticalPermissions.footer':
     "La désactivation prend effet immédiatement. L'activation nécessite une réauthentification et un délai de 5 minutes que vous pouvez annuler.",
 
+  // --- reauth (password re-auth prompt, issue #161: promoting a critical ---
+  // permission needs the Org Admin's password)
+  'reauth.title': 'Confirmez votre mot de passe',
+  'reauth.body': "Saisissez votre mot de passe pour autoriser l'agent à proposer {action} pour {tool}.",
+  'reauth.passwordLabel': 'Mot de passe',
+  'reauth.submit': 'Confirmer',
+  'reauth.error.wrongPassword': 'Mot de passe incorrect. Veuillez réessayer.',
+  'reauth.error.failed': "Une erreur s'est produite. Veuillez réessayer.",
+
   // --- tools (tool metadata shown on the Permissions page) ------------------
   'tools.gmail.label': 'Gmail',
   'tools.gmail.description': 'Lire, rechercher et envoyer depuis votre boîte de réception',
@@ -203,6 +212,7 @@ export const fr: Record<MessageKey, Message> = {
   'permissionState.allow': 'Autorisé',
   'permissionState.confirm': 'Approbation requise',
   'permissionState.deny': 'Refusé',
+  'permissionState.disabled': 'Service désactivé',
   'permissionPill.promotableHint': 'Cette autorisation peut être gérée dans Paramètres › Zone de danger',
   'permissionPill.hardcodedHint':
     'Cette autorisation est imposée par la politique de sécurité et ne peut pas être modifiée',
@@ -230,6 +240,15 @@ export const fr: Record<MessageKey, Message> = {
     one: '{n} refusée',
     other: '{n} refusées',
   },
+
+  // --- permissions summary page (read-only, issue #161: Editor/Viewer) ----
+  'permissions.summary.subtitle': "Ce que l'agent peut faire dans l'espace de travail de votre organisation.",
+  'permissions.summary.empty': 'Aucune autorisation configurée pour le moment.',
+
+  // --- organization permissions (editable matrix, Org Admin, issue #161) --
+  'organization.permissions.title': 'Matrice des autorisations',
+  'organization.permissions.subtitle':
+    "Choisissez ce que l'agent peut faire dans cette organisation, par outil et par action.",
 
   // --- toolsPage (connected accounts, local tools, OAuth callback) -------
   'toolsPage.accounts.title': 'Comptes connectés',

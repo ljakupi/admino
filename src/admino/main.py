@@ -5,23 +5,24 @@ Startup sequence:
 2. Configure Python logging from config.log_level and config.log_format
    (text, or structured JSON lines with a per-request ID).
 3. Load the bundled common-password list (the password policy's list check).
-4. Build the default permissions ruleset (seeds an empty DB on first run).
-5. Initialise the database: run migrations, seed the platform settings row
-   from config.yaml (its llm on every boot, its limits once) and the
-   permissions, then overlay the stored platform LLM and limits onto the
-   config, load the permissions and the interim tools gate (a service any
-   org turned off stays off, until #161). No organization is created: a
-   fresh install starts with none.
-6. Create the LLM client, warn if the provider's API host is not in the egress
+4. Initialise the database: run migrations, seed the platform settings row
+   from config.yaml (its llm on every boot, its limits once), seed the
+   default permission matrix of every org that has none
+   (``org_permissions.seed_missing_orgs``), then overlay the stored platform
+   LLM and limits onto the config. No organization is created: a fresh
+   install starts with none.
+5. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
    — chat replies explain what to set.
-7. Import tool modules to trigger @register_tool decorators, then freeze the registry.
-8. Build the AgentConfig from the validated limits.
-9. Instantiate the Agent with all dependencies, including the tool-call
-   recorder that writes one ``tool.call`` audit event per dispatch.
-10. Create the FastAPI app via server.create_app().
-11. Start uvicorn with single-worker constraint.
+6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
+7. Build the AgentConfig from the validated limits.
+8. Instantiate the Agent with all dependencies, including the tool-call
+   recorder that writes one ``tool.call`` audit event per dispatch. The agent
+   holds no permission state: the server loads the requesting org's tool
+   policy for every run (GH-161).
+9. Create the FastAPI app via server.create_app().
+10. Start uvicorn with single-worker constraint.
 
 The module refuses to start on any configuration or validation error,
 printing a clear message and exiting with code 1. Internal paths and
@@ -72,14 +73,13 @@ from admino.config import load_app_config
 from admino.llm import LLMError
 from admino.logs import JsonFormatter, RequestIdFilter, TextFormatter, safe_log
 from admino.models import AgentConfig
-from admino.permissions import build_default_permissions_config
 
 if TYPE_CHECKING:
     from admino.access import Principal
     from admino.agent import ToolCallRecorder
     from admino.config import AppConfig
     from admino.llm_infomaniak import InfomaniakClient
-    from admino.permissions import PermissionsConfig, PermissionState
+    from admino.permissions import PermissionState
 
 logger = logging.getLogger(__name__)
 
@@ -239,24 +239,16 @@ def _import_tool_modules() -> None:
             raise
 
 
-def _build_system_prompt(
-    config: object,
-    permissions_config: PermissionsConfig | None = None,
-) -> str:
-    """Build a system prompt from the validated application config.
+def _build_system_prompt(config: object) -> str:
+    """Build the static system prompt from the validated application config.
 
-    Tells the LLM which tools and actions it can use, that some actions need
-    user confirmation, and that it must never substitute a different action
-    for the one the user asked for.
+    Tells the LLM that some actions need user confirmation and that it must
+    never substitute a different action for the one the user asked for. It
+    names no tools: the agent appends each run's tools line, built from the
+    requesting org's policy (GH-161).
 
     Args:
         config: Validated AppConfig instance.
-        permissions_config: When provided, the advertised tool summary is
-            filtered through the permission engine so it lists only actions
-            the agent can actually take (GH-77).  This keeps the summary
-            consistent with the permission-aware tool payload sent each turn
-            and avoids presenting hardcoded-denied or un-promoted actions as
-            available — which could otherwise invite tool substitution.
 
     Returns:
         A system prompt string, or empty string if nothing meaningful to say.
@@ -266,22 +258,8 @@ def _build_system_prompt(
     if not isinstance(config, AppConfig):
         return ""
 
-    from admino.tools.registry import get_registered_tools
-
-    # Build a dynamic tool summary from the registry so the LLM knows which
-    # tools are available, grouped by name with their actions listed. When a
-    # permissions config is supplied the list is permission-aware: denied and
-    # un-promoted actions are excluded so it matches the per-turn tool payload.
-    tool_actions: dict[str, list[str]] = {}
-    for desc in get_registered_tools(permissions_config=permissions_config):
-        tool_actions.setdefault(desc.tool, []).append(desc.action)
-    tool_summary = ", ".join(
-        f"{name} ({'/'.join(sorted(actions))})" for name, actions in sorted(tool_actions.items())
-    )
-
     lines: list[str] = [
         "You are admino, a local personal AI assistant.",
-        f"You have access to the following tools: {tool_summary}.",
         "Some actions may require user confirmation before execution.",
         "",
         "IMPORTANT: Tool permissions can change during a conversation. If a tool "
@@ -357,48 +335,36 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
     return record
 
 
-async def _async_startup(
-    config: AppConfig,
-    permissions_config: PermissionsConfig,
-) -> tuple[AppConfig, PermissionsConfig, dict[str, bool]]:
+async def _async_startup(config: AppConfig) -> AppConfig:
     """Initialise the database, run migrations, seed, and load the runtime settings.
 
     Creates no organization: a fresh install starts with none.
 
     In order: migrations; the platform settings row seeded from config.yaml
-    (its llm re-applied on every boot, its limits stored once); the permission
-    seed; the config overlaid with the stored platform LLM and limits (every
-    other section stays as config.yaml and its env overrides set it); the
-    permissions loaded; and the tools gate.
-
-    The tools gate is read here, while the startup pool is still open, so it
-    is active on the Agent's very first dispatch (GH-80: a service turned off
-    stays off across a restart). Until #161 it is the interim AND over every
-    org's ``org_settings`` row (``scoped_settings.all_orgs_tools_gate``): a
-    service is off when any org turned it off.
+    (its llm re-applied on every boot, its limits stored once); the default
+    permission matrix of every org that has no permission rows (GH-161; orgs
+    with rows are untouched); and the config overlaid with the stored platform
+    LLM and limits (every other section stays as config.yaml and its env
+    overrides set it). No permission matrix or tools switch is loaded here:
+    every run loads its own org's policy.
 
     Args:
         config: The config.yaml-loaded application config (used for seeding).
-        permissions_config: The default permissions config (used for seeding).
 
     Returns:
-        A tuple of ``(config, db_permissions, tools_enabled)``: the config
-        overlaid with the platform row, the permissions loaded from the
-        database, and every tool name mapped to a bool.
+        The config overlaid with the platform row.
 
     Raises:
         ValueError: If PG_PASSWORD is not set.
         RuntimeError: If the database health check fails.
     """
-    from admino import scoped_settings
-    from admino.config import load_permissions_config_from_db
+    from admino import org_permissions, scoped_settings
     from admino.database import (
         check_health,
         close_pool,
         database_url_from_env,
         init_pool,
         run_migrations,
-        seed_permissions,
     )
 
     database_url = database_url_from_env()
@@ -419,20 +385,18 @@ async def _async_startup(
 
     await run_migrations(pool)
     await scoped_settings.seed_platform_settings(pool, config)
-    await seed_permissions(pool, permissions_config)
+    await org_permissions.seed_missing_orgs(pool)
 
     runtime_config = scoped_settings.apply_platform_settings(
         config, await scoped_settings.load_platform_settings(pool)
     )
-    db_permissions = await load_permissions_config_from_db(pool)
-    tools_enabled = await scoped_settings.all_orgs_tools_gate(pool)
 
     # Close the pool — it was created on asyncio.run()'s event loop which
     # will be destroyed when asyncio.run() returns.  The server lifespan
     # creates a fresh pool on uvicorn's event loop for runtime use.
     await close_pool()
 
-    return runtime_config, db_permissions, tools_enabled
+    return runtime_config
 
 
 def main(
@@ -478,20 +442,10 @@ def main(
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 4. Build the default permissions ruleset (seeds an empty DB only)
-    # ------------------------------------------------------------------
-    # The database is the source of truth for permissions; this in-code default
-    # (GH-85) is used solely to seed an empty ``permissions`` table on first run.
-    permissions_config = build_default_permissions_config()
-    logger.info("Default permissions ruleset built for DB seeding.")
-
-    # ------------------------------------------------------------------
-    # 5. Initialize database, run migrations, seed and load from DB
+    # 4. Initialize database, run migrations, seed and load from DB
     # ------------------------------------------------------------------
     try:
-        config, permissions_config, tools_enabled = asyncio.run(
-            _async_startup(config, permissions_config)
-        )
+        config = asyncio.run(_async_startup(config))
     except (ValueError, RuntimeError, OSError) as exc:
         # The type only: the message can carry the DSN (the database password).
         logger.error(
@@ -504,7 +458,7 @@ def main(
     logger.info("Database initialized, config loaded from DB.")
 
     # ------------------------------------------------------------------
-    # 6. Create the LLM client, then run the provider setup checks
+    # 5. Create the LLM client, then run the provider setup checks
     # ------------------------------------------------------------------
     # The factory never raises for a missing key or model; these checks only
     # log (warnings/errors) so the app always boots and chat explains the fix.
@@ -522,7 +476,7 @@ def main(
             asyncio.run(_check_infomaniak_startup(llm_client))
 
     # ------------------------------------------------------------------
-    # 7. Import tool modules, then freeze the registry
+    # 6. Import tool modules, then freeze the registry
     # ------------------------------------------------------------------
     # Importing a tool module runs its @register_tool decorators; freezing
     # afterwards blocks any late or dynamic registration.
@@ -533,7 +487,7 @@ def main(
     logger.info("Tool registry frozen.")
 
     # ------------------------------------------------------------------
-    # 8. Build AgentConfig from the validated application config
+    # 7. Build AgentConfig from the validated application config
     # ------------------------------------------------------------------
     agent_config = AgentConfig(
         max_tool_calls=config.limits.max_tool_calls_per_message,
@@ -542,11 +496,13 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 9. Build system prompt from config and instantiate the Agent
+    # 8. Build system prompt from config and instantiate the Agent
     # ------------------------------------------------------------------
+    # GH-161: the Agent holds no permission state; the server passes the
+    # requesting org's ToolPolicy to every run.
     from admino.agent import Agent
 
-    system_prompt = _build_system_prompt(config, permissions_config)
+    system_prompt = _build_system_prompt(config)
     # Logged below; fall back to the provider name when no model is set (chat
     # then asks the user to choose one).
     model_name = config.llm.active_model_name or config.llm.provider
@@ -555,12 +511,8 @@ def main(
         llm_client=llm_client,
         # GH-147: every dispatch is recorded as a tool.call audit event.
         tool_call_recorder=_build_tool_call_recorder(),
-        permissions_config=permissions_config,
         agent_config=agent_config,
         system_prompt=system_prompt,
-        # GH-80: seed the per-tool gate from persisted DB state so services
-        # the user toggled off stay off immediately on boot.
-        tools_enabled=tools_enabled,
     )
     logger.info(
         "Agent initialized with model %s (provider=%s)",
@@ -569,14 +521,14 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 10. Create the FastAPI app
+    # 9. Create the FastAPI app
     # ------------------------------------------------------------------
     from admino.server import create_app
 
     app = create_app(agent=agent, config=config)
 
     # ------------------------------------------------------------------
-    # 11. Start uvicorn (single worker — required for in-memory session state)
+    # 10. Start uvicorn (single worker — required for in-memory session state)
     # ------------------------------------------------------------------
     logger.info(
         "Starting uvicorn on %s:%d (single worker)",

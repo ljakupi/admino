@@ -51,8 +51,18 @@ Routes:
 - GET/PATCH /api/org/settings — The Org Admin's own org's tool services; audited.
 - GET/PATCH /api/platform/settings — The platform defaults: LLM, limits,
   files, retention and security (Super Admin); audited.
-- /api/permissions, /api/critical-permissions, /api/oauth/* — permissions and
-  account connections.
+- GET/PATCH /api/org/permissions — The Org Admin's own org's tool permission
+  matrix; a change is audited.
+- GET  /api/org/critical-permissions — The org's four promotable (tier-2)
+  permissions, with their state and pending promotion.
+- PATCH /api/org/critical-permissions/{tool}/{action} — Demotes a promoted
+  pair at once, or (with the Org Admin's password) starts its 5-minute
+  promotion cooldown; audited.
+- DELETE /api/org/critical-permissions/{tool}/{action}/pending — Cancels a
+  pending promotion; audited.
+- GET  /api/permissions/summary — The effective state of each of the caller's
+  org's tool actions (read-only, every member role).
+- /api/oauth/* — account connections.
 - GET  /health            — Health check (public): ``{"status": "ok"}``, or 503
   ``{"status": "degraded"}`` when the database is unreachable; nothing else.
 - GET  /api/oauth/callback — The OAuth provider's redirect (public, state-checked).
@@ -126,9 +136,26 @@ Security notes:
   written (400 with nothing written when it can't be built) and closes the old
   one best-effort. A trash retention minimum above the maximum (merged with
   the stored values) is a 400 with nothing written. The platform response
-  carries key presence flags, never a key. After an org change, and at
-  lifespan start, the agent's tools gate is the interim AND over every org
-  (retired by #161).
+  carries key presence flags, never a key.
+- Tool permissions per org (GH-161, ``admino.org_permissions``): each route
+  spends a per-user bucket, then checks its capability before any database
+  work: ``org.permissions.manage`` (Org Admin) for the matrix and the critical
+  permissions, ``org.permissions.view`` (every member role, never the Super
+  Admin) for the summary. Every read and write is the principal's own org,
+  never a request value. A hardcoded denial (either tier, any value) and an
+  unknown pair are 400s with nothing read or written. A promotion needs the
+  Org Admin's own password (``auth.reauthenticate``: a wrong one counts in the
+  login throttle like a failed login, a locked account or IP is refused) and
+  then the cooldown; a demotion only reduces privilege, so it needs none. A
+  failed audit write is a 500 with nothing changed; a 422 never echoes the
+  password. Pending promotions live in process memory (a restart cancels
+  them); an org's due ones are completed by that org's next chat run, summary
+  or critical-permissions request, and a user-role notice (GH-66) is appended
+  to that org's in-memory chats only.
+- The agent holds no permission state (GH-161): every chat run loads the
+  requesting org's tool policy (its matrix, promoted tier-2 pairs and enabled
+  services) and passes it as ``tool_policy``, so one org's settings never
+  reach another org's runs.
 - Platform defaults apply without a restart (GH-160): the chat routes read
   the stored limits through the settings cache on every request (the message
   length, and each agent run's tool-call, context and confirmation limits),
@@ -199,11 +226,12 @@ Security notes:
   the resolved client address feeds the per-IP rate limits and the audit
   events. X-Forwarded-Host is never trusted.
 - Does NOT import check_permission — permission decisions live in agent/registry.
-- Does NOT import from permissions.py except PermissionsConfig type (via TYPE_CHECKING).
+- Imports only the ``PROMOTABLE_DENIALS`` constant from permissions.py.
 
 Deployment note:
 - This module uses module-level dicts (_sessions, _pending_confirmations,
-  _rate_buckets) for in-memory state. This requires a **single-worker** ASGI
+  _rate_buckets) for in-memory state, and ``admino.org_permissions`` keeps
+  the pending promotions in memory. This requires a **single-worker** ASGI
   deployment. Running multiple workers (e.g. uvicorn --workers 2) will silently
   split state across processes. Use ``--workers 1`` (the default).
 
@@ -248,6 +276,7 @@ from admino import (
     auth,
     invitations,
     login_throttle,
+    org_permissions,
     organizations,
     password_reset,
     passwords,
@@ -263,7 +292,7 @@ from admino.models import (
     ChatRequest,
     ChatResponse,
     ConfirmRequest,
-    CriticalPermissionEntry,
+    CriticalPermissionPromote,
     CriticalPermissionsResponse,
     CriticalPermissionState,
     InvitationAcceptRequest,
@@ -288,9 +317,9 @@ from admino.models import (
     PasswordResetRequest,
     PendingConfirmation,
     PendingConfirmationSummary,
-    PermissionEntry,
     PermissionPatch,
     PermissionsResponse,
+    PermissionsSummaryResponse,
     PlatformDiagnosticsResponse,
     PlatformSettingsPatch,
     PlatformSettingsResponse,
@@ -314,7 +343,9 @@ from admino.oauth import (
     revoke_and_delete_token,
     save_token,
 )
+from admino.permissions import PROMOTABLE_DENIALS
 from admino.proxy_headers import TrustedProxyHeadersMiddleware
+from admino.tenancy import TenantContext
 from admino.tools.gmail import clear_token_cache as _clear_gmail_cache
 from admino.tools.google_calendar import clear_token_cache as _clear_gcal_cache
 from admino.tools.google_drive import clear_token_cache as _clear_gdrive_cache
@@ -325,6 +356,7 @@ from admino.tools.outlook_calendar import clear_token_cache as _clear_outcal_cac
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
+    import asyncpg
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from admino.agent import Agent
@@ -618,8 +650,14 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/org/settings/patch": (0.5, 5),
     "/api/platform/settings/get": (1.0, 10),
     "/api/platform/settings/patch": (0.2, 5),
-    "/api/permissions/get": (1.0, 5),
-    "/api/permissions/patch": (0.2, 2),
+    # GH-161: the org's permission matrix and critical permissions (Org Admin),
+    # and the members' read-only summary, per user.
+    "/api/org/permissions/get": (1.0, 5),
+    "/api/org/permissions/patch": (0.2, 2),
+    "/api/org/critical-permissions/get": (1.0, 5),
+    "/api/org/critical-permissions/promote": (5 / 60, 5),
+    "/api/org/critical-permissions/cancel": (0.5, 5),
+    "/api/permissions/summary/get": (1.0, 10),
     "/api/oauth/google/authorize": (0.2, 2),
     "/api/oauth/microsoft/authorize": (0.2, 2),
     "/api/oauth/callback": (0.2, 2),
@@ -627,9 +665,6 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/oauth/microsoft/status": (1.0, 5),
     "/api/oauth/google/disconnect": (0.2, 2),
     "/api/oauth/microsoft/disconnect": (0.2, 2),
-    "/api/critical-permissions/get": (1.0, 5),
-    "/api/critical-permissions/promote": (5 / 60, 5),
-    "/api/critical-permissions/cancel": (0.5, 5),
     "/api/auth/login": (0.2, 5),
     # One reset email per minute per IP after a burst of 3 (limits inbox flooding).
     "/api/auth/password-reset": (1 / 60, 3),
@@ -800,21 +835,6 @@ _session_locks: dict[tuple[UUID, str], asyncio.Lock] = {}
 _OAUTH_STATE_TTL_S: int = 600  # 10 minutes
 _OAUTH_PENDING_STATES_MAX: int = 50
 _oauth_pending_states: dict[str, tuple[float, OAuthProvider, str]] = {}
-
-# ---------------------------------------------------------------------------
-# Critical permissions state (tier-2 promotable denials)
-# ---------------------------------------------------------------------------
-
-# Pending promotion cooldowns: (tool, action) -> pending_at datetime.
-# In-memory only — lost on restart (acceptable per spec). During cooldown,
-# the permission stays deny; it flips to confirm when the cooldown expires.
-_pending_promotions: dict[tuple[str, str], datetime] = {}
-
-# Completed promotions: set of (tool, action) pairs promoted to confirm.
-# Loaded from DB on startup, updated when cooldowns expire or demotions occur.
-_promoted_permissions: set[tuple[str, str]] = set()
-
-_PROMOTION_COOLDOWN_S: int = 300  # 5 minutes
 
 # Injected at app creation time by create_app().
 _agent: Agent | None = None
@@ -2351,10 +2371,12 @@ async def post_message(
     """Handle POST /api/message — send a user message to the agent.
 
     Validates the request, retrieves or creates the caller's chat, runs the
-    agent with the caller's principal, updates chat state, and returns the
-    response. The message length and the run's limits are the stored platform
-    limits, read on every request (GH-160: a change applies without a
-    restart).
+    agent with the caller's principal and their org's tool policy, updates
+    chat state, and returns the response. The message length and the run's
+    limits are the stored platform limits, read on every request (GH-160: a
+    change applies without a restart). The org's due critical permission
+    promotions are completed first, and the policy is loaded on every request
+    (GH-161), so a change applies to the next run.
 
     Args:
         body: Validated ChatRequest with message and session_id.
@@ -2368,7 +2390,11 @@ async def post_message(
 
     _check_rate_limit("/api/message", _user_caller(principal))
     _reap_expired_confirmations()
-    await _resolve_pending_promotions()
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    await _resolve_due_promotions(pool, principal)
 
     # Enforce the stored max_message_length (tighter than Pydantic's 32768).
     limits = await _platform_limits()
@@ -2378,6 +2404,7 @@ async def post_message(
             status_code=422,
             detail=f"Message exceeds maximum length of {max_len} characters",
         )
+    policy = await org_permissions.load_tool_policy(pool, TenantContext.from_principal(principal))
 
     session_id = body.session_id
     key = _chat_key(principal.user_id, session_id)
@@ -2410,6 +2437,7 @@ async def post_message(
                 session_id=session_id,
                 history=history,
                 principal=principal,
+                tool_policy=policy,
                 agent_config=_run_config(limits),
             )
         except (MemoryError, RecursionError):
@@ -2518,9 +2546,10 @@ async def post_confirm(
 
     Looks up the caller's pending confirmation by session_id, verifies the
     confirmation_id matches, checks expiry, and if approved, resumes the agent
-    run with the caller's principal and the stored platform limits (read on
-    every request, GH-160). Another user's pending confirmation is never
-    found (404).
+    run with the caller's principal, the stored platform limits (read on
+    every request, GH-160) and their org's tool policy as it is now (loaded
+    again, after completing the org's due promotions; GH-161). Another user's
+    pending confirmation is never found (404).
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -2539,8 +2568,13 @@ async def post_confirm(
 
     _check_rate_limit("/api/confirm", _user_caller(principal))
     _reap_expired_confirmations()
-    await _resolve_pending_promotions()
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    await _resolve_due_promotions(pool, principal)
     limits = await _platform_limits()
+    policy = await org_permissions.load_tool_policy(pool, TenantContext.from_principal(principal))
 
     session_id = body.session_id
     key = _chat_key(principal.user_id, session_id)
@@ -2600,6 +2634,7 @@ async def post_confirm(
                 session_id=session_id,
                 history=history,
                 principal=principal,
+                tool_policy=policy,
                 pending_confirmation=pending,
                 agent_config=_run_config(limits),
             )
@@ -2771,10 +2806,8 @@ async def patch_org_settings(
     """Handle PATCH /api/org/settings — switch tool services of the Org Admin's own org.
 
     Each real change is an ``org.settings_change`` audit event in the same
-    transaction (an audit failure is a 500 with nothing written). Afterwards
-    the running agent's gate is recomputed with the INTERIM AND over every
-    org (``scoped_settings.all_orgs_tools_gate``, retired by #161), so the
-    next dispatch respects the change.
+    transaction (an audit failure is a 500 with nothing written). The org's
+    next chat run loads the new switches with its tool policy (GH-161).
 
     Args:
         request: The incoming request (the client IP for the audit event).
@@ -2788,22 +2821,17 @@ async def patch_org_settings(
         HTTPException: 429 when rate-limited, 403 without
             ``Capability.ORG_SETTINGS_MANAGE`` (both before any database work).
     """
-    if _agent is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
     _check_rate_limit("/api/org/settings/patch", _user_caller(principal))
     _require_capability(principal, Capability.ORG_SETTINGS_MANAGE)
 
     from admino.database import get_pool
 
-    pool = get_pool()
-    result = await scoped_settings.update_org_settings(
-        pool,
+    return await scoped_settings.update_org_settings(
+        get_pool(),
         actor=principal,
         patch=body,
         ip=request.client.host if request.client is not None else None,
     )
-    _agent._tools_enabled = await scoped_settings.all_orgs_tools_gate(pool)
-    return result
 
 
 async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsResponse:
@@ -2960,290 +2988,286 @@ async def patch_platform_settings(
 
 
 # ---------------------------------------------------------------------------
-# Permissions route handlers
+# Tool permission route handlers (GH-161): /api/org/permissions,
+# /api/org/critical-permissions, /api/permissions/summary
 # ---------------------------------------------------------------------------
 
+_UNKNOWN_PERMISSION_DETAIL: Final = "Unknown tool action."
+_HARDCODED_DENIAL_DETAIL: Final = (
+    "This tool/action pair is a hardcoded denial and cannot be changed."
+)
+_NOT_PROMOTABLE_DETAIL: Final = "Not a promotable permission"
+_NO_PENDING_PROMOTION_DETAIL: Final = "No pending promotion for this permission"
+_REAUTH_REQUIRED_DETAIL: Final = "Password re-authentication is required."
+_REAUTH_FAILED_DETAIL: Final = "Re-authentication failed."
 
-async def get_permissions(
-    principal: _PrincipalDep,
-) -> PermissionsResponse:
-    """Handle GET /api/permissions — return full permission matrix.
 
-    Loads all permission rows from the database and returns them as a flat
-    list of (tool, action, permission) entries.
+async def _resolve_due_promotions(pool: asyncpg.Pool, principal: Principal) -> None:
+    """Complete the principal's org's due promotions and tell that org's chats.
+
+    ``org_permissions.resolve_due_promotions`` stores each pair whose cooldown
+    has passed as 'confirm'. Then ONE ``user``-role notice naming the pairs is
+    appended to every in-memory chat of the org's users (their ids read from
+    the database), and to no other org's chat, so the LLM doesn't refuse based
+    on earlier denials in the conversation.
+
+    GH-66: the notice MUST NOT be ``system``-role: the agent drops every
+    ``system`` message in caller-supplied history (prompt-injection defence,
+    GH-140). It is phrased as a neutral, factual notice, not a directive: it
+    occupies the human turn slot, so it must not read as a standing
+    instruction to act.
 
     Args:
-        principal: The logged-in principal (from the session).
-
-    Returns:
-        PermissionsResponse with all configured permissions.
+        pool: The database pool.
+        principal: A member of the org (the caller).
     """
-    from admino.database import get_pool, load_permissions_from_db
-
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-
-    _check_rate_limit("/api/permissions/get", _user_caller(principal))
-
-    pool = get_pool()
-    raw = await load_permissions_from_db(pool)
-
-    entries: list[PermissionEntry] = []
-    for tool, actions in sorted(raw.items()):
-        for action, permission in sorted(actions.items()):
-            entries.append(
-                PermissionEntry(tool=tool, action=action, permission=permission)  # type: ignore[arg-type]
-            )
-
-    return PermissionsResponse(permissions=entries)
-
-
-async def patch_permissions(
-    body: PermissionPatch,
-    principal: _PrincipalDep,
-) -> PermissionsResponse:
-    """Handle PATCH /api/permissions — update a single permission.
-
-    Validates that the update does not attempt to override a hardcoded denial,
-    persists the change to the database, reloads the permissions config into
-    the running agent, and returns the updated full permission matrix.
-
-    Args:
-        body: Validated PermissionPatch with tool, action, permission.
-        principal: The logged-in principal (from the session).
-
-    Returns:
-        Updated PermissionsResponse after applying the change.
-
-    Raises:
-        HTTPException: 400 if attempting to override a hardcoded denial,
-                       500 if server not configured.
-    """
-    from admino.config import load_permissions_config_from_db
-    from admino.database import get_pool, load_permissions_from_db, update_permission
-    from admino.permissions import HARDCODED_DENIALS
-
-    if _agent is None or _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-
-    _check_rate_limit("/api/permissions/patch", _user_caller(principal))
-
-    # Enforce hardcoded denials: these cannot be set to anything other than "deny".
-    if (body.tool, body.action) in HARDCODED_DENIALS and body.permission != "deny":
-        raise HTTPException(
-            status_code=400,
-            detail="This tool/action pair is a hardcoded denial and cannot be changed.",
-        )
-
-    pool = get_pool()
-
-    # Load old value for audit trail before mutation.
-    old_permissions = await load_permissions_from_db(pool)
-    old_value = old_permissions.get(body.tool, {}).get(body.action, "deny")
-
-    await update_permission(pool, body.tool, body.action, body.permission)
-
-    # Audit log: record the permission change at WARNING level (validated
-    # identifiers and states only).
-    changed_tool, changed_action, new_value = body.tool, body.action, body.permission
-    logger.warning(
-        "Permission changed: tool=%s action=%s old=%s new=%s",
-        changed_tool,
-        changed_action,
-        old_value,
-        new_value,
-    )
-
-    # Reload permissions config and update the running agent immediately.
-    new_permissions = await load_permissions_config_from_db(pool)
-    _agent._permissions = new_permissions
-
-    # Return updated full matrix.
-    raw = await load_permissions_from_db(pool)
-    entries: list[PermissionEntry] = []
-    for tool, actions in sorted(raw.items()):
-        for action, permission in sorted(actions.items()):
-            entries.append(
-                PermissionEntry(tool=tool, action=action, permission=permission)  # type: ignore[arg-type]
-            )
-
-    return PermissionsResponse(permissions=entries)
-
-
-# ---------------------------------------------------------------------------
-# Critical permissions route handlers (tier-2 promotable denials)
-# ---------------------------------------------------------------------------
-
-
-async def _resolve_pending_promotions() -> None:
-    """Check pending promotions and complete any whose cooldown has expired.
-
-    Mutates ``_pending_promotions`` and ``_promoted_permissions`` in place.
-    Persists completed promotions to the database. This is a lazy resolution
-    — called on GET and PATCH to avoid background asyncio tasks.
-
-    When promotions complete, a ``user``-role notification is injected into all
-    active sessions so the LLM is aware the permission changed and will not
-    refuse based on stale denial messages in the conversation history. A
-    ``user`` role (not ``system``) is required so the notice survives the
-    agent's ``_drop_system_messages`` prompt-injection defence (see GH-66,
-    GH-140).
-
-    Safety: builds a list of expired keys first, then mutates the dict in a
-    separate loop to avoid ``RuntimeError`` from modifying a dict during
-    iteration.
-    """
-    now = datetime.now(UTC)
-    expired: list[tuple[str, str]] = [
-        key
-        for key, pending_at in _pending_promotions.items()
-        if (now - pending_at).total_seconds() >= _PROMOTION_COOLDOWN_S
-    ]
-
-    if not expired:
+    tenant = TenantContext.from_principal(principal)
+    completed = await org_permissions.resolve_due_promotions(pool, tenant)
+    if not completed:
         return
-
-    from admino.database import get_pool, update_permission
-
-    pool = get_pool()
-    for key in expired:
-        tool, action = key
-        _pending_promotions.pop(key, None)
-        _promoted_permissions.add(key)
-        await update_permission(pool, tool, action, "confirm")
-        logger.warning(
-            "Critical permission promoted: tool=%s action=%s (cooldown expired)",
-            tool,
-            action,
-        )
-
-    # Update agent's promoted set so check_permission sees the change.
-    if _agent is not None:
-        _agent._promoted = frozenset(_promoted_permissions)
-
-    # Inject a notification into all active sessions so the LLM knows the
-    # permission changed and won't refuse based on stale denial messages in
-    # the conversation history.
-    #
-    # GH-66: this MUST use a non-system role. The agent's ``_drop_system_messages``
-    # prompt-injection defence drops every ``system``-role message in
-    # caller-supplied history (GH-140), so a ``system``-role notification would be
-    # silently discarded before reaching the LLM. A ``user``-role message is
-    # informational (not a trusted directive) and survives the filter.
-    promoted_names = ", ".join(f"{t}.{a}" for t, a in expired)
-    # Phrased as a neutral, factual notice rather than a directive: it occupies
-    # the human turn slot, so it must not read as a standing instruction to act
-    # (GH-66 security review, Finding 1).
-    notification = LLMMessage(
+    names = ", ".join(f"{tool}.{action}" for tool, action in completed)
+    notice = LLMMessage(
         role="user",
         content=(
-            f"PERMISSION UPDATE: The following actions are now available with "
-            f"user confirmation: {promoted_names}. Earlier denials for these "
-            f"actions no longer apply."
+            f"PERMISSION UPDATE: The following actions are now available with user "
+            f"confirmation: {names}. Earlier denials for these actions no longer apply."
         ),
     )
-    for history in _sessions.values():
-        history.append(notification)
+    members = await accounts.org_user_ids(pool, tenant.org_id)
+    for (user_id, _session_id), history in _sessions.items():
+        if UUID(str(user_id)) in members:
+            history.append(notice)
 
 
-async def get_critical_permissions(
-    principal: _PrincipalDep,
-) -> CriticalPermissionsResponse:
-    """Return the 4 promotable permissions with current state and cooldown info."""
-    from admino.permissions import PROMOTABLE_DENIALS
-
-    _check_rate_limit("/api/critical-permissions/get", _user_caller(principal))
-    await _resolve_pending_promotions()
-
-    entries: list[CriticalPermissionEntry] = []
-    for tool, action in sorted(PROMOTABLE_DENIALS):
-        key = (tool, action)
-        state: str = "confirm" if key in _promoted_permissions else "deny"
-        pending_at = _pending_promotions.get(key)
-        entries.append(
-            CriticalPermissionEntry(
-                tool=tool,
-                action=action,
-                state=state,  # type: ignore[arg-type]
-                pending_at=pending_at,
-            )
-        )
-    return CriticalPermissionsResponse(permissions=entries)
+def _require_promotable(tool: str, action: str) -> None:
+    """Raise 404 unless (tool, action) is a promotable (tier-2) denial."""
+    if (tool, action) not in PROMOTABLE_DENIALS:
+        raise HTTPException(status_code=404, detail=_NOT_PROMOTABLE_DETAIL)
 
 
-async def patch_critical_permission(
-    principal: _PrincipalDep,
-    tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
-    action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
-) -> CriticalPermissionState:
-    """Demote a promoted critical permission (confirm -> deny).
+async def get_org_permission_matrix(principal: _PrincipalDep) -> PermissionsResponse:
+    """Handle GET /api/org/permissions — the Org Admin's own org's permission matrix.
 
-    Promotion (deny -> confirm) is disabled until #161 adds password re-auth:
-    a PATCH on a permission that isn't currently promoted answers 403 and
-    starts no cooldown. Any request body is ignored.
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        PermissionsResponse: the org's stored rows, sorted by (tool, action).
 
     Raises:
-        HTTPException: 404 for a non-promotable pair, 403 for a promotion.
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_PERMISSIONS_MANAGE`` (both before any database work).
     """
-    from admino.permissions import PROMOTABLE_DENIALS
+    _check_rate_limit("/api/org/permissions/get", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_PERMISSIONS_MANAGE)
 
-    if (tool, action) not in PROMOTABLE_DENIALS:
-        raise HTTPException(status_code=404, detail="Not a promotable permission")
+    from admino.database import get_pool
 
-    key = (tool, action)
+    return await org_permissions.get_org_permissions(get_pool(), actor=principal)
 
-    # Rate-limit before any await to prevent concurrent requests from
-    # racing past the limiter while a coroutine is suspended.
-    _check_rate_limit("/api/critical-permissions/promote", _user_caller(principal))
 
-    # Resolve any expired cooldowns before deciding the current state.
-    await _resolve_pending_promotions()
+async def patch_org_permission_matrix(
+    request: Request, principal: _PrincipalDep, body: PermissionPatch
+) -> PermissionsResponse:
+    """Handle PATCH /api/org/permissions — change one permission of the Org Admin's org.
 
-    # PROMOTE path: disabled until #161 (password re-auth).
-    if key not in _promoted_permissions:
-        raise HTTPException(
-            status_code=403,
-            detail="Critical permission promotions are temporarily unavailable.",
+    A real change is an ``org.permission_change`` audit event in the same
+    transaction (an audit failure is a 500 with nothing written). The org's
+    next chat run loads the new matrix.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        body: Validated PermissionPatch (422 without echo otherwise).
+
+    Returns:
+        PermissionsResponse: the org's full matrix after the change.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_PERMISSIONS_MANAGE`` (both before any database
+            work); 400 for an unknown pair or a hardcoded denial (nothing read
+            or written).
+    """
+    _check_rate_limit("/api/org/permissions/patch", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_PERMISSIONS_MANAGE)
+
+    from admino.database import get_pool
+
+    try:
+        return await org_permissions.update_org_permission(
+            get_pool(),
+            actor=principal,
+            patch=body,
+            ip=request.client.host if request.client is not None else None,
         )
+    except org_permissions.UnknownPermissionError:
+        raise HTTPException(status_code=400, detail=_UNKNOWN_PERMISSION_DETAIL) from None
+    except org_permissions.HardcodedDenialError:
+        raise HTTPException(status_code=400, detail=_HARDCODED_DENIAL_DETAIL) from None
 
-    # DEMOTE path: currently promoted, revert to deny immediately.
-    _promoted_permissions.discard(key)
-    _pending_promotions.pop(key, None)
 
-    from admino.config import load_permissions_config_from_db
-    from admino.database import get_pool, update_permission
+async def get_org_critical_permissions(principal: _PrincipalDep) -> CriticalPermissionsResponse:
+    """Handle GET /api/org/critical-permissions — the org's four promotable permissions.
+
+    The org's due promotions are completed first.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        CriticalPermissionsResponse: each pair's state and pending time.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_PERMISSIONS_MANAGE`` (both before any database work).
+    """
+    _check_rate_limit("/api/org/critical-permissions/get", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_PERMISSIONS_MANAGE)
+
+    from admino.database import get_pool
 
     pool = get_pool()
-    await update_permission(pool, tool, action, "deny")
-    new_perms = await load_permissions_config_from_db(pool)
-    if _agent is not None:
-        _agent._permissions = new_perms
-        _agent._promoted = frozenset(_promoted_permissions)
-
-    logger.warning("Critical permission demoted: tool=%s action=%s", tool, action)
-    return CriticalPermissionState(tool=tool, action=action, state="deny")
+    await _resolve_due_promotions(pool, principal)
+    return await org_permissions.critical_permissions(pool, actor=principal)
 
 
-async def cancel_critical_permission_pending(
+async def patch_org_critical_permission(
+    request: Request,
+    principal: _PrincipalDep,
+    tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
+    action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
+    body: CriticalPermissionPromote | None = None,
+) -> CriticalPermissionState:
+    """Handle PATCH /api/org/critical-permissions/{tool}/{action} — demote or promote.
+
+    After the org's due promotions are completed: a promoted pair (stored
+    'confirm') is demoted at once, with no password (a body is ignored);
+    otherwise the body's password re-authenticates the Org Admin and starts
+    the pair's 5-minute promotion cooldown. Both are audited.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        tool: The tool name (identifier pattern; 422 otherwise).
+        action: The action name (identifier pattern; 422 otherwise).
+        body: The Org Admin's password; needed to promote (422 without echo
+            when malformed).
+
+    Returns:
+        CriticalPermissionState: 'deny' after a demotion or with the pending
+        time of a promotion; 'confirm' if it was already promoted.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_PERMISSIONS_MANAGE`` (both before any database
+            work); 404 for a pair that isn't promotable (no re-auth); 400 for
+            a promotion without a password; 403 when the re-authentication
+            fails (nothing pending or recorded).
+    """
+    _check_rate_limit("/api/org/critical-permissions/promote", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_PERMISSIONS_MANAGE)
+    _require_promotable(tool, action)
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    ip = request.client.host if request.client is not None else None
+    await _resolve_due_promotions(pool, principal)
+    try:
+        # A demotion checks the stored state under its row lock, so a
+        # concurrent change can't slip between the check and the write.
+        return await org_permissions.demote(pool, actor=principal, tool=tool, action=action, ip=ip)
+    except org_permissions.NotPromotedError:
+        pass  # Not promoted: this is a promotion request.
+    if body is None:
+        raise HTTPException(status_code=400, detail=_REAUTH_REQUIRED_DETAIL)
+    try:
+        return await org_permissions.request_promotion(
+            pool,
+            actor=principal,
+            tool=tool,
+            action=action,
+            password=body.password.get_secret_value(),
+            ip=ip,
+        )
+    except org_permissions.ReauthFailedError:
+        raise HTTPException(status_code=403, detail=_REAUTH_FAILED_DETAIL) from None
+
+
+async def cancel_org_critical_permission_pending(
+    request: Request,
     principal: _PrincipalDep,
     tool: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
     action: str = Path(pattern=r"^[a-z][a-z0-9_]{0,62}$"),
 ) -> CriticalPermissionState:
-    """Cancel a pending promotion cooldown and revert to deny."""
-    from admino.permissions import PROMOTABLE_DENIALS
+    """Handle DELETE /api/org/critical-permissions/{tool}/{action}/pending — cancel it.
 
-    _check_rate_limit("/api/critical-permissions/cancel", _user_caller(principal))
+    After the org's due promotions are completed (a completed one can't be
+    cancelled any more), the org's pending promotion of the pair is dropped
+    and ``org.permission_promote_cancel`` is recorded.
 
-    if (tool, action) not in PROMOTABLE_DENIALS:
-        raise HTTPException(status_code=404, detail="Not a promotable permission")
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        tool: The tool name (identifier pattern; 422 otherwise).
+        action: The action name (identifier pattern; 422 otherwise).
 
-    key = (tool, action)
-    if key not in _pending_promotions:
-        raise HTTPException(status_code=404, detail="No pending promotion for this permission")
+    Returns:
+        CriticalPermissionState: 'deny', no pending time.
 
-    del _pending_promotions[key]
-    logger.warning("Critical permission promotion cancelled: tool=%s action=%s", tool, action)
-    return CriticalPermissionState(tool=tool, action=action, state="deny")
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_PERMISSIONS_MANAGE`` (both before any database
+            work); 404 for a pair that isn't promotable, or without a pending
+            promotion in the org.
+    """
+    _check_rate_limit("/api/org/critical-permissions/cancel", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_PERMISSIONS_MANAGE)
+    _require_promotable(tool, action)
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    await _resolve_due_promotions(pool, principal)
+    try:
+        return await org_permissions.cancel_promotion(
+            pool,
+            actor=principal,
+            tool=tool,
+            action=action,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except org_permissions.NoPendingPromotionError:
+        raise HTTPException(status_code=404, detail=_NO_PENDING_PROMOTION_DETAIL) from None
+
+
+async def get_permissions_summary(principal: _PrincipalDep) -> PermissionsSummaryResponse:
+    """Handle GET /api/permissions/summary — the caller's org's effective permissions.
+
+    Read-only, for every member role. The org's due promotions are completed
+    first.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        PermissionsSummaryResponse: each stored (tool, action) of the org with
+        its effective state ("disabled" for a switched-off service).
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ORG_PERMISSIONS_VIEW`` (every member role has it, so
+            only the Super Admin is refused; both before any database work).
+    """
+    _check_rate_limit("/api/permissions/summary/get", _user_caller(principal))
+    _require_capability(principal, Capability.ORG_PERMISSIONS_VIEW)
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    await _resolve_due_promotions(pool, principal)
+    return await org_permissions.permissions_summary(pool, actor=principal)
 
 
 # ---------------------------------------------------------------------------
@@ -3765,42 +3789,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         else None
     )
 
-    # Defense-in-depth (GH-80): the Agent is already seeded with the tools gate
-    # at construction (main._async_startup). This recompute on the runtime pool
-    # is a redundant safety net so a disabled service stays gated even if the
-    # construction-time seed is ever bypassed. Until #161 the gate is the
-    # interim AND over every org's org_settings row (GH-159); a failure keeps
-    # the construction-time gate.
-    if _agent is not None:
-        try:
-            _agent._tools_enabled = await scoped_settings.all_orgs_tools_gate(get_pool())
-        except Exception as exc:
-            logger.warning(
-                "Lifespan tools-gate reload failed (%s); the construction-time gate remains "
-                "active.",
-                type(exc).__name__,
-            )
-
-    # Load previously-promoted critical permissions from the database so
-    # tier-2 promotions survive server restarts.
-    try:
-        from admino.database import get_pool, load_permissions_from_db
-        from admino.permissions import PROMOTABLE_DENIALS
-
-        pool = get_pool()
-        db_perms = await load_permissions_from_db(pool)
-        for tool, action in PROMOTABLE_DENIALS:
-            if db_perms.get(tool, {}).get(action) == "confirm":
-                _promoted_permissions.add((tool, action))
-        if _agent is not None and _promoted_permissions:
-            _agent._promoted = frozenset(_promoted_permissions)
-            logger.info(
-                "Loaded %d promoted permission(s) from database: %s",
-                len(_promoted_permissions),
-                sorted(f"{t}.{a}" for t, a in _promoted_permissions),
-            )
-    except Exception:
-        logger.warning("Failed to load promoted permissions on startup; defaulting to none.")
+    # GH-161: no tools gate or promoted permissions are loaded into the agent:
+    # every chat run loads its own org's tool policy.
 
     yield
     retention_task.cancel()
@@ -3848,8 +3838,8 @@ def create_app(
     _pending_confirmations.clear()
     _session_locks.clear()
     _oauth_pending_states.clear()
-    _pending_promotions.clear()
-    _promoted_permissions.clear()
+    # Pending critical permission promotions start empty, like a restart (GH-161).
+    org_permissions.clear_pending()
 
     # Rate-limit buckets start empty (fresh process state, test isolation).
     _rate_buckets.clear()
@@ -3983,19 +3973,24 @@ def create_app(
     app.patch("/api/platform/settings", response_model=PlatformSettingsResponse)(
         patch_platform_settings
     )
-    app.get("/api/permissions", response_model=PermissionsResponse)(get_permissions)
-    app.patch("/api/permissions", response_model=PermissionsResponse)(patch_permissions)
-    app.get("/api/critical-permissions", response_model=CriticalPermissionsResponse)(
-        get_critical_permissions
+    app.get("/api/org/permissions", response_model=PermissionsResponse)(get_org_permission_matrix)
+    app.patch("/api/org/permissions", response_model=PermissionsResponse)(
+        patch_org_permission_matrix
+    )
+    app.get("/api/org/critical-permissions", response_model=CriticalPermissionsResponse)(
+        get_org_critical_permissions
     )
     app.patch(
-        "/api/critical-permissions/{tool}/{action}",
+        "/api/org/critical-permissions/{tool}/{action}",
         response_model=CriticalPermissionState,
-    )(patch_critical_permission)
+    )(patch_org_critical_permission)
     app.delete(
-        "/api/critical-permissions/{tool}/{action}/pending",
+        "/api/org/critical-permissions/{tool}/{action}/pending",
         response_model=CriticalPermissionState,
-    )(cancel_critical_permission_pending)
+    )(cancel_org_critical_permission_pending)
+    app.get("/api/permissions/summary", response_model=PermissionsSummaryResponse)(
+        get_permissions_summary
+    )
 
     # OAuth routes.
     app.get("/api/oauth/google/authorize", response_model=OAuthAuthorizeResponse)(

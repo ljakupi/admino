@@ -3,11 +3,13 @@
 One service, two callers: the Super Admin's platform routes and the admin CLI
 (``create-org``, acting as ``access.Operator``) call the same functions.
 
-- ``create_org`` inserts the organization and records ``org.create``, then
-  invites its first Org Admin through #153's invitation code
-  (``invitations.send_first_admin_invitation``), all in one transaction. The
-  invitation email is queued unless ``queue_email`` is False (the CLI without
-  SMTP); the returned ``CreatedOrg`` carries the one-time accept link.
+- ``create_org`` inserts the organization, seeds its tool permission matrix
+  (GH-161: ``org_permissions.seed_org_permissions``, the default rows) and
+  records ``org.create``, then invites its first Org Admin through #153's
+  invitation code (``invitations.send_first_admin_invitation``), all in one
+  transaction. The invitation email is queued unless ``queue_email`` is False
+  (the CLI without SMTP); the returned ``CreatedOrg`` carries the one-time
+  accept link.
 - ``list_orgs`` returns every organization's metadata.
 - ``update_limits`` changes the given plan limits (seats, monthly budget,
   storage quota); ``set_residency`` switches the data residency policy. Both
@@ -26,7 +28,8 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
   over, each in its own transaction: its audit events (through the database
   function ``purge_org_audit_events`` of migration 0011), its users (the
   foreign keys cascade to their sessions, invitations, queued email and reset
-  tokens), the org row, then its directory under the attachments root. It
+  tokens), the org row (cascading to its settings and permission rows), then
+  its directory under the attachments root. It
   records one platform ``org.purge`` event (no org, counts only). A failure
   rolls that org back; the next run retries it. ``run_org_purge_job`` runs it
   at startup and then hourly from the server lifespan.
@@ -48,7 +51,7 @@ Security notes:
   Super Admin has them; every other function refuses the Operator.
 - Fail closed: every change and its audit event share one transaction, so a
   failed audit write rolls the change back. A taken admin email rolls the
-  whole creation back: no org, no account, no audit row.
+  whole creation back: no org, no permission rows, no account, no audit row.
 - Race-free transitions: the org row is locked (``FOR UPDATE``) before its
   status is checked. The purge re-checks each due org under that lock, so a
   concurrent cancel wins; the database function refuses an org that isn't
@@ -79,7 +82,14 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-from admino import audit_events, email_outbox, invitations, scoped_settings, sessions
+from admino import (
+    audit_events,
+    email_outbox,
+    invitations,
+    org_permissions,
+    scoped_settings,
+    sessions,
+)
 from admino.access import Capability, Operator, Principal, can
 from admino.audit_events import AuditAction, TargetType
 from admino.email_templates import OrgDeletionScheduledParams
@@ -309,6 +319,10 @@ async def create_org(
 ) -> CreatedOrg:
     """Create an organization and invite its first Org Admin, in one transaction.
 
+    The new org's permission matrix is seeded with the defaults right after
+    its INSERT, in the same transaction, so a rolled-back creation leaves no
+    permission rows.
+
     Args:
         pool: The database pool.
         actor: A Super Admin, or the Operator at the server's terminal (the
@@ -346,6 +360,7 @@ async def create_org(
             request.storage_quota,
         )
         organization = _summary(row)
+        await org_permissions.seed_org_permissions(conn, organization.id)
         await _record(
             conn,
             AuditAction.ORG_CREATE,

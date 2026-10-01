@@ -15,12 +15,20 @@ Architecture & boundaries:
   never calls ``check_permission`` directly — dispatch is the single
   enforcement point. The agent awaits the recorder exactly once after every
   dispatch, whatever its outcome, so every decision is recorded.
-- Conversation history is owned by the *caller*; the system prompt is owned
+- Conversation history is owned by the *caller*; the system message is owned
   by the *agent*. The agent copies the caller's history, mutates the local
   list, and returns it as part of :class:`admino.models.AgentResult` — it
-  only ever holds user/assistant/tool messages. The system prompt is added
-  to each LLM call's context and never returned in history, so it cannot
-  accumulate across turns (GH-140). There is no module-level state.
+  only ever holds user/assistant/tool messages. The system message (the
+  configured prompt plus the run's tools line) is added to each LLM call's
+  context and never returned in history, so it cannot accumulate across
+  turns (GH-140).
+- The agent holds no permission state and there is no module-level mutable
+  state (GH-161). Every run gets the requesting org's
+  :class:`admino.models.ToolPolicy` (its permissions, promoted tier-2 pairs
+  and enabled services) as a required ``tool_policy`` keyword; the tools
+  payload, every dispatch and the system message's tools line of that run
+  use it alone, so concurrent runs of different orgs never see each other's
+  policy.
 
 Security notes:
 - No ``eval``, ``exec``, ``compile``, ``importlib``, ``shell=True``, or
@@ -56,6 +64,9 @@ Security notes:
 - A run's limits come from its own ``agent_config`` (the server builds it
   from the stored platform limits on every request, GH-160) or, without
   one, from the construction-time config; a run's config never outlives it.
+- The tools line names only the tool/action pairs advertised in that run's
+  tools payload (the registry's names, never LLM output), so it can't reveal
+  a pair the run's policy denies or switches off.
 """
 
 from __future__ import annotations
@@ -81,7 +92,8 @@ from admino.tools.registry import dispatch_tool_call, get_registered_tools
 if TYPE_CHECKING:
     from admino.access import Principal
     from admino.llm import LLMClient
-    from admino.permissions import PermissionsConfig, PermissionState
+    from admino.models import ToolPolicy
+    from admino.permissions import PermissionState
     from admino.tools.registry import ToolCallResult, ToolDescription
 
 logger = logging.getLogger(__name__)
@@ -104,6 +116,7 @@ _LLM_ERROR_MESSAGE: str = (
     "I hit an error while processing your request. Please try again in a moment."
 )
 _AUDIT_UNAVAILABLE_MESSAGE: str = "Internal error: audit unavailable."
+_NO_TOOLS_LINE: str = "You have no tools available."
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +168,15 @@ class Agent:
 
     The agent is constructed once per process (or once per request — it is
     cheap and stateless) with its dependencies injected. :meth:`run` is the
-    single public entry point and is fully async.
+    single public entry point and is fully async. It holds no permission
+    state: each run brings its org's ``ToolPolicy`` (GH-161).
 
     Dependencies are injected rather than imported at module level so that:
     (a) tests can substitute fakes trivially, (b) there are no import-time
     side effects, and (c) the security boundary with ``permissions.py`` is
-    preserved — the agent only ever passes ``PermissionsConfig`` through to
-    ``dispatch_tool_call``; it never imports ``check_permission`` itself.
+    preserved — the agent only ever passes the run's ``PermissionsConfig``
+    through to ``dispatch_tool_call``; it never imports ``check_permission``
+    itself.
     """
 
     def __init__(
@@ -169,10 +184,8 @@ class Agent:
         *,
         llm_client: LLMClient,
         tool_call_recorder: ToolCallRecorder,
-        permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
         system_prompt: str = "",
-        tools_enabled: dict[str, bool] | None = None,
     ) -> None:
         """Initialise the agent with its collaborators.
 
@@ -182,28 +195,19 @@ class Agent:
             tool_call_recorder: Tool-call audit sink, awaited exactly once
                 after every ``dispatch_tool_call`` with the run's principal
                 and content-free metadata. If it raises, the run aborts (H-1).
-            permissions_config: Immutable permissions config, forwarded to
-                dispatch on every tool call. The agent itself never inspects
-                it.
             agent_config: Runtime limits (``max_tool_calls``,
                 ``max_context_messages``, ``confirmation_timeout_s``) of a run
                 that is given none.
-            system_prompt: Optional system message sent once, first, on every
-                LLM call. Used to communicate available file paths,
-                operator constraints, and other static context to the LLM.
-                It is never added to the history returned to the caller.
-            tools_enabled: Per-tool enabled/disabled state from settings.
-                Tools whose name maps to ``False`` are excluded from the
-                LLM tool list and rejected at dispatch time.  Hot-reloaded
-                by the server when settings change.
+            system_prompt: Optional static prompt (file paths, operator
+                constraints and other context). Each run sends it, followed by
+                a blank line and that run's tools line, as the one system
+                message, first, on every LLM call. It is never added to the
+                history returned to the caller.
         """
         self._llm = llm_client
         self._record_tool_call = tool_call_recorder
-        self._permissions = permissions_config
-        self._promoted: frozenset[tuple[str, str]] = frozenset()
         self._config = agent_config
         self._system_prompt = system_prompt
-        self._tools_enabled: dict[str, bool] = dict(tools_enabled) if tools_enabled else {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -216,6 +220,7 @@ class Agent:
         *,
         history: list[LLMMessage],
         principal: Principal,
+        tool_policy: ToolPolicy,
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
     ) -> AgentResult:
@@ -224,8 +229,9 @@ class Agent:
         The method appends the user message to a copy of ``history``, then
         enters the LLM/tool loop until the LLM produces plain text, a tool
         call needs confirmation, ``max_tool_calls`` is exhausted, or an error
-        occurs. Each LLM call gets the system prompt plus a trimmed window
-        of the history in which the current user message is always kept.
+        occurs. Each LLM call gets the run's system message (the configured
+        prompt plus the run's tools line) and a trimmed window of the
+        history in which the current user message is always kept.
 
         Args:
             user_message: The user's message text. Must already be validated
@@ -237,6 +243,10 @@ class Agent:
                 ``system``-role messages in it are dropped.
             principal: The logged-in user the run acts for (required). Passed
                 unchanged to the tool-call recorder with every dispatch.
+            tool_policy: The requesting org's tool policy (required, GH-161):
+                its permissions, promoted tier-2 pairs and enabled services
+                decide this run's tools payload, tools line and every
+                dispatch. It applies to this run only.
             pending_confirmation: If set, a previously-issued confirmation is
                 being resumed. The first tool call in this turn is dispatched
                 with this value so ``registry.dispatch_tool_call`` can verify
@@ -249,11 +259,11 @@ class Agent:
         Returns:
             :class:`AgentResult` with the terminal status, the updated
             history (user/assistant/tool messages only — never the system
-            prompt), and a summary of tool calls made during the run.
+            message), and a summary of tool calls made during the run.
         """
         config = self._config if agent_config is None else agent_config
         # Work on a local copy so we never mutate the caller's list. The
-        # system prompt is NOT stored here: it is added per LLM call by
+        # system message is NOT stored here: it is added per LLM call by
         # _build_context, so the returned history never carries it and it
         # cannot pile up when the caller feeds the history back (GH-140).
         working_history: list[LLMMessage] = _drop_system_messages(history)
@@ -295,17 +305,21 @@ class Agent:
         tool_records: list[ToolCallRecord] = []
         tool_calls_used: int = 0
         # GH-77: Advertise only tools the permission engine would NOT deny.
-        # Passing permissions + promoted state here (the same values forwarded
-        # to dispatch) drops hardcoded-denied and un-promoted tier-2 actions
-        # from the tool list, so the LLM cannot substitute a sibling action
-        # for an unavailable one. The agent still never imports check_permission
-        # itself — it only forwards PermissionsConfig, preserving the boundary.
-        tools_payload: list[dict[str, object]] = _tool_descriptions_to_payload(
-            get_registered_tools(
-                enabled_tools=self._tools_enabled or None,
-                permissions_config=self._permissions,
-                promoted=self._promoted,
-            )
+        # Passing the run's permissions + promoted state here (the same values
+        # forwarded to dispatch) drops hardcoded-denied and un-promoted tier-2
+        # actions from the tool list, so the LLM cannot substitute a sibling
+        # action for an unavailable one. The agent still never imports
+        # check_permission itself — it only forwards PermissionsConfig.
+        descriptions = get_registered_tools(
+            enabled_tools=tool_policy.enabled_tools or None,
+            permissions_config=tool_policy.permissions,
+            promoted=tool_policy.promoted,
+        )
+        tools_payload: list[dict[str, object]] = _tool_descriptions_to_payload(descriptions)
+        # GH-161: the run's system message names exactly what it advertises.
+        tools_line = _tools_line(descriptions)
+        system_message = (
+            f"{self._system_prompt}\n\n{tools_line}" if self._system_prompt else tools_line
         )
         # Carry a one-shot pending_confirmation that is applied to the FIRST
         # dispatch only, then cleared. This matches the server contract:
@@ -323,6 +337,7 @@ class Agent:
             pre_result = await self._resume_pending_dispatch(
                 pending_confirmation=pending_confirmation,
                 principal=principal,
+                tool_policy=tool_policy,
                 session_id=session_id,
                 working_history=working_history,
                 tool_records=tool_records,
@@ -338,10 +353,10 @@ class Agent:
         # Bounded loop. Each iteration = one LLM round trip, possibly followed
         # by a batch of tool dispatches.
         for _iteration in range(config.max_tool_calls + 1):
-            # 1. Call the LLM with the system prompt + a trimmed context window.
+            # 1. Call the LLM with the system message + a trimmed context window.
             context = _build_context(
                 working_history,
-                system_prompt=self._system_prompt,
+                system_message=system_message,
                 current_idx=current_idx,
                 max_messages=config.max_context_messages,
             )
@@ -421,6 +436,7 @@ class Agent:
                 dispatched = await self._dispatch_one(
                     tool_call=tool_call,
                     principal=principal,
+                    tool_policy=tool_policy,
                     session_id=session_id,
                     pending_confirmation=carry_confirmation,
                 )
@@ -513,13 +529,16 @@ class Agent:
         *,
         tool_call: ToolCall,
         principal: Principal,
+        tool_policy: ToolPolicy,
         session_id: str,
         pending_confirmation: PendingConfirmation | None,
     ) -> tuple[ToolCallResult, int] | None:
         """Dispatch a single tool call via the registry, then record it.
 
-        The one place that times a dispatch and awaits the recorder, so no
-        call site can dispatch without recording. The recorder gets the run's
+        The dispatch is decided by the run's ``tool_policy`` (permissions,
+        promoted pairs, enabled services). The one place that times a
+        dispatch and awaits the recorder, so no call site can dispatch
+        without recording. The recorder gets the run's
         principal, the raw tool/action names the LLM asked for, the final
         decision, the success flag and the duration — never arguments, output
         or error text.
@@ -533,11 +552,11 @@ class Agent:
         start = time.monotonic()
         result = await dispatch_tool_call(
             tool_call,
-            self._permissions,
+            tool_policy.permissions,
             session_id=session_id,
             pending_confirmation=pending_confirmation,
-            promoted=self._promoted,
-            enabled_tools=self._tools_enabled or None,
+            promoted=tool_policy.promoted,
+            enabled_tools=tool_policy.enabled_tools or None,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
         try:
@@ -562,6 +581,7 @@ class Agent:
         *,
         pending_confirmation: PendingConfirmation,
         principal: Principal,
+        tool_policy: ToolPolicy,
         session_id: str,
         working_history: list[LLMMessage],
         tool_records: list[ToolCallRecord],
@@ -585,6 +605,7 @@ class Agent:
         dispatched = await self._dispatch_one(
             tool_call=tool_call,
             principal=principal,
+            tool_policy=tool_policy,
             session_id=session_id,
             pending_confirmation=pending_confirmation,
         )
@@ -660,10 +681,11 @@ class Agent:
 def _drop_system_messages(history: list[LLMMessage]) -> list[LLMMessage]:
     """Return a copy of caller-supplied ``history`` without ``system`` messages.
 
-    The agent is the only source of system content (its configured prompt,
-    added per LLM call by :func:`_build_context`). A ``system`` message in
-    caller history — leading or mid-conversation — is either a stale copy of
-    that prompt or persisted prompt injection, so all of them are dropped.
+    The agent is the only source of system content (its configured prompt
+    plus the run's tools line, added per LLM call by :func:`_build_context`).
+    A ``system`` message in caller history — leading or mid-conversation — is
+    either a stale copy of that message or persisted prompt injection, so all
+    of them are dropped.
     When any are dropped, one WARNING with the count only is logged; message
     content is never logged.
     """
@@ -677,7 +699,7 @@ def _drop_system_messages(history: list[LLMMessage]) -> list[LLMMessage]:
 def _build_context(
     history: list[LLMMessage],
     *,
-    system_prompt: str,
+    system_message: str,
     current_idx: int | None,
     max_messages: int,
 ) -> list[LLMMessage]:
@@ -686,23 +708,23 @@ def _build_context(
     ``history`` must hold no ``system`` messages (see
     :func:`_drop_system_messages`). The result is:
 
-    - the agent's ``system_prompt`` once, at index 0 (omitted when empty);
+    - the run's ``system_message`` once, at index 0 (omitted when empty);
     - the current user message ``history[current_idx]``, exactly once — the
-      system prompt and this message are the floor and are always sent, even
+      system message and this message are the floor and are always sent, even
       when they alone exceed ``max_messages``;
     - the most recent other messages, in chronological order, filling the
       remaining budget via :func:`_trim_context` (which also drops leading
       orphaned ``tool`` results).
 
     ``current_idx`` is ``None`` only when the history holds no user message to
-    pin; the result is then the system prompt plus the trimmed history.
+    pin; the result is then the system message plus the trimmed history.
 
     The pinned message goes back to its chronological position: a window that
     reaches into the messages before it holds every message after it, and the
     first message after it is the assistant turn answering it, so no orphaned
     ``tool`` result can follow it.
     """
-    system = [LLMMessage(role="system", content=system_prompt)] if system_prompt else []
+    system = [LLMMessage(role="system", content=system_message)] if system_message else []
     if current_idx is None:
         budget = max_messages - len(system)
         # Guard budget <= 0 so _trim_context does not emit its L-5 warning.
@@ -780,6 +802,23 @@ def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:
         else:
             filtered.append(msg)
     return filtered
+
+
+def _tools_line(descriptions: list[ToolDescription]) -> str:
+    """Return the system message's line naming the tools a run advertises.
+
+    Built from the same descriptions as the run's tools payload: tools sorted
+    by name, each with its sorted actions joined by "/", e.g. ``"You have
+    access to the following tools: gmail (read/search), memory (store)."``.
+    Without any tool: ``"You have no tools available."``.
+    """
+    actions: dict[str, set[str]] = {}
+    for desc in descriptions:
+        actions.setdefault(desc.tool, set()).add(desc.action)
+    if not actions:
+        return _NO_TOOLS_LINE
+    listing = ", ".join(f"{tool} ({'/'.join(sorted(actions[tool]))})" for tool in sorted(actions))
+    return f"You have access to the following tools: {listing}."
 
 
 def _tool_descriptions_to_payload(

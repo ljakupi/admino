@@ -22,12 +22,29 @@ resolves to exactly one of three states:
 
 ![The permissions matrix](screenshots/permissions.png)
 
-<sub>The Permissions page — the full allow / needs-approval / denied matrix.</sub>
+<sub>The organization's permission matrix — the full allow / needs-approval / denied matrix.</sub>
+
+## Per organization
+
+Each organization has its own permission matrix:
+
+- A new organization starts from the default rules. Upgrading from an earlier version drops
+  the old install-wide matrix, and every organization starts from the defaults again.
+- Only **Org Admins** change it, on the **Organization** page (`GET` / `PATCH
+  /api/org/permissions`). Every change is recorded in the organization's audit log
+  (`org.permission_change`) with the tool, the action and the old and new state.
+- **Editors and Viewers** see a read-only summary of what the agent may do on the
+  **Permissions** page (`GET /api/permissions/summary`): what runs on its own, what asks
+  first, what is denied, and which services the organization switched off.
+- Every chat run uses its own organization's matrix, critical promotions and tool services.
+  One organization's changes never reach another organization's chats.
+- The hardcoded denials below are the same for every organization. No organization can
+  change them.
 
 ## Writes are never auto-allowed
 
-State-changing actions can only ever be **confirm** or **deny** — never **allow**. If a
-config file tries to set a write action to `allow`, it is **downgraded to `confirm`**. A
+State-changing actions can only ever be **confirm** or **deny** — never **allow**. If an
+Org Admin sets a write action to `allow`, it is stored as **`confirm`**. A
 prompt injection that convinces the model to "just send it" still can't turn a write into
 a silent action: the engine, which never sees that text, holds the line.
 
@@ -44,27 +61,32 @@ agent:
   Critical Permissions flow — and even then they only ever reach **confirm**, never silent
   **allow**.
 
-These hardcoded rules live in the permission engine and are enforced regardless of what
-`permissions.yaml` or the database says.
+These hardcoded rules live in the permission engine and are enforced regardless of what an
+organization's matrix says. The matrix routes refuse to change them (`400`).
 
 ## Promoting a critical permission
 
 ![Critical permissions](screenshots/critical-permissions.png)
 
-<sub>Settings → Danger zone → Critical permissions — the promotable denials.</sub>
+<sub>Organization → Critical permissions — the promotable denials.</sub>
 
 Promotable criticals (like `gmail.send`) are gated behind a deliberate, high-friction
-flow under **Settings → Danger zone**:
+flow under **Organization → Critical permissions**. Only Org Admins can use it, and a
+promotion applies to their own organization only:
 
-1. **Re-authentication** — you prove it's really you.
-2. **A 5-minute cooldown** — a built-in pause before the change takes effect.
-
-> Promoting is **temporarily unavailable**: the re-authentication step moves from the old
-> access token to your password. Until then a promotion is refused with `403`. Demoting a
-> promoted permission still works.
+1. **Re-authentication with your password** — you prove it's really you. A wrong password
+   counts toward the same lockout as a failed login, so a stolen session can't be used to
+   guess it.
+2. **A 5-minute cooldown** — a built-in pause before the change takes effect. You can
+   cancel the promotion while it's pending.
 
 After promotion the action reaches **confirm** — so it *still* asks before every send. You
-can never turn one of these into a silent `allow`.
+can never turn one of these into a silent `allow`. When the cooldown ends, the open chats of
+your organization get a short note that the action is now available.
+
+Turning a promoted permission off again takes effect at once and needs no password.
+Promotions, cancellations and demotions are each recorded in the organization's audit log
+(`org.permission_promote`, `org.permission_promote_cancel`, `org.permission_demote`).
 
 ## Isolation guarantees
 

@@ -15,7 +15,8 @@ mocked. What these tests pin down:
   in no bind parameter, and a principal without an organization (a Super Admin)
   can't write a tool.call row, so the run aborts (H-1) and nothing is written.
 - ``Agent.run`` takes the caller's ``principal`` as a required keyword and the
-  agent passes it to the recorder with the six content-free fields.
+  agent passes it to the recorder with the six content-free fields. GH-161: every
+  run also passes its org's ``tool_policy`` (the agent holds no permissions).
 - A turn without a tool call writes nothing (conversation entries are gone).
 - The NDJSON audit log is gone: ``admino.audit`` doesn't exist, no source file
   names an ``.ndjson`` file, and a full run with a tool call creates no
@@ -110,15 +111,24 @@ def pool(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 def _agent(responses: list[LLMResponse], recorder: Any = None) -> Agent:
+    """A real Agent (GH-161 constructor: no permission state of its own)."""
     register_tool("memory", "read", "Read a note", _ReadArgs)(_read_handler)
-    permissions = PermissionsConfig(tools={"memory": ToolPermissions(actions={"read": "allow"})})
     return Agent(
         llm_client=_ScriptedLLM(responses),
         tool_call_recorder=recorder or main_module._build_tool_call_recorder(),
-        permissions_config=permissions,
         agent_config=AgentConfig(
             max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0
         ),
+    )
+
+
+def _tool_policy() -> Any:
+    """The run's ToolPolicy (GH-161): memory.read allowed. Imported lazily so each test
+    fails on its own until models.ToolPolicy exists."""
+    from admino.models import ToolPolicy
+
+    return ToolPolicy(
+        permissions=PermissionsConfig(tools={"memory": ToolPermissions(actions={"read": "allow"})})
     )
 
 
@@ -136,7 +146,7 @@ class TestToolCallWritesOneRow:
     @pytest.mark.asyncio
     async def test_one_insert_per_tool_call(self, pool: MagicMock) -> None:
         result = await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         assert result.status == "final"
@@ -150,7 +160,7 @@ class TestToolCallWritesOneRow:
     ) -> None:
         """actor_kind member, the member's user id and org, the session's chat."""
         await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         params = pool.execute.await_args.args[1:]
@@ -170,8 +180,12 @@ class TestToolCallWritesOneRow:
         )
         agent = _agent([*_tool_then_text(), *_tool_then_text()])
 
-        await agent.run("go", session_id=_SESSION, history=[], principal=_MEMBER)
-        await agent.run("go", session_id="s-other", history=[], principal=other)
+        await agent.run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
+        )
+        await agent.run(
+            "go", session_id="s-other", history=[], principal=other, tool_policy=_tool_policy()
+        )
 
         rows = [call.args[1:3] for call in pool.execute.await_args_list]
         assert rows == [(_ORG_ID, _USER_ID), (other.org_id, other.user_id)]
@@ -187,7 +201,7 @@ class TestToolCallWritesOneRow:
         )
 
         result = await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=member
+            "go", session_id=_SESSION, history=[], principal=member, tool_policy=_tool_policy()
         )
 
         assert result.status == "final"
@@ -198,7 +212,7 @@ class TestToolCallWritesOneRow:
     async def test_default_org_is_in_no_bind_parameter(self, pool: MagicMock) -> None:
         """#147's bridge is retired: the default org's id never reaches the audit store."""
         await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         assert pool.execute.await_count == 1
@@ -209,7 +223,7 @@ class TestToolCallWritesOneRow:
     @pytest.mark.asyncio
     async def test_metadata_holds_exactly_the_five_decision_fields(self, pool: MagicMock) -> None:
         await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         metadata = json.loads(pool.execute.await_args.args[-1])
@@ -224,7 +238,7 @@ class TestToolCallWritesOneRow:
     @pytest.mark.asyncio
     async def test_no_argument_or_output_value_in_any_bind_parameter(self, pool: MagicMock) -> None:
         result = await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         # The tool really ran and produced the marked output...
@@ -239,7 +253,7 @@ class TestToolCallWritesOneRow:
     async def test_turn_without_tool_call_writes_nothing(self, pool: MagicMock) -> None:
         """Per-turn conversation entries are dropped without replacement."""
         result = await _agent([LLMResponse(content="Hello.")]).run(
-            "hi", session_id=_SESSION, history=[], principal=_MEMBER
+            "hi", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         assert result.status == "final"
@@ -254,7 +268,7 @@ class TestAuditFailureAbortsTheRun:
         pool.execute.side_effect = OSError("connection reset")
 
         result = await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         assert result.status == "error"
@@ -279,7 +293,7 @@ class TestPrincipalReachesTheRecorder:
         recorder = AsyncMock()
 
         await _agent(_tool_then_text(), recorder).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         recorder.assert_awaited_once()
@@ -310,7 +324,11 @@ class TestNoOrgNoToolCall:
         """A Super Admin has no TenantContext, so the recorder raises and the agent aborts
         the run (H-1) with the fixed message and no pending confirmation."""
         result = await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_SUPER_ADMIN
+            "go",
+            session_id=_SESSION,
+            history=[],
+            principal=_SUPER_ADMIN,
+            tool_policy=_tool_policy(),
         )
 
         assert result.status == "error"
@@ -321,7 +339,11 @@ class TestNoOrgNoToolCall:
     async def test_super_admin_run_writes_nothing(self, pool: MagicMock) -> None:
         """No row lands anywhere: not in a default org, not without an org."""
         await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_SUPER_ADMIN
+            "go",
+            session_id=_SESSION,
+            history=[],
+            principal=_SUPER_ADMIN,
+            tool_policy=_tool_policy(),
         )
 
         pool.execute.assert_not_awaited()
@@ -349,7 +371,7 @@ class TestNoNdjsonAuditLog:
         monkeypatch.chdir(tmp_path)
 
         await _agent(_tool_then_text()).run(
-            "go", session_id=_SESSION, history=[], principal=_MEMBER
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         assert list(tmp_path.rglob("*.ndjson")) == []

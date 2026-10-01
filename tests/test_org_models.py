@@ -1,4 +1,4 @@
-"""Tests for the organization lifecycle API models in admino.models (GH-154).
+"""Tests for the organization API models in admino.models (GH-154, GH-161).
 
 The Super Admin's org routes (``/api/platform/orgs``) and the ``create-org``
 CLI validate their input through these models; the responses carry org
@@ -22,6 +22,18 @@ What these tests pin down:
   budget as a decimal string; ``OrgListResponse`` and ``OrgCreateResponse``
   wrap it (the create response holds an ``InvitationSummary``: no token, no
   link).
+- GH-161 (tool permissions per org): ``ToolPolicy`` is frozen (assigning a
+  field raises) and holds one org's ``PermissionsConfig``, its promoted
+  (tool, action) pairs (a frozenset, empty by default) and its enabled tool
+  switches (empty by default); ``permissions`` is required.
+  ``CriticalPermissionPromote`` is the re-auth body of a promotion:
+  ``password`` a ``SecretStr`` of 1 to 128 characters, unknown fields refused
+  (the old ``bearer_token`` too), never shown by ``repr()``/``str()``/JSON,
+  and never echoed by a validation error. ``PermissionSummaryEntry`` (``tool``
+  and ``action`` with the permission engine's identifier pattern, ``state``
+  one of allow / confirm / deny / disabled) and
+  ``PermissionsSummaryResponse`` (``permissions``: a list of them) carry the
+  read-only summary and nothing else.
 
 Security notes:
 - Validation errors never contain the rejected input (``hide_input_in_errors``
@@ -31,6 +43,9 @@ Security notes:
   invisible characters are refused, not stripped.
 - Strict ints and bools: "10", 10.0 or true never pass as seats, and "true"
   or 1 never pass as a residency switch.
+- The re-auth password can't leak through a repr, a log line or a 422 body,
+  and a run's ToolPolicy can't be changed after it was loaded (one run never
+  sees another org's policy through a shared, mutated object).
 """
 
 from __future__ import annotations
@@ -39,11 +54,13 @@ import json
 import uuid
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from typing import Any
+from typing import Any, get_args
 
 import pytest
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
+
+from admino.permissions import PermissionsConfig, validate_permissions_config
 
 _MAX_STORAGE = 2**53 - 1
 _LONGEST_EMAIL = "a" * (254 - len("@example.ch")) + "@example.ch"
@@ -831,3 +848,318 @@ class TestOrgResponses:
         }
         assert "token" not in response.model_dump_json()
         assert "accept-invitation" not in response.model_dump_json()
+
+
+# ---------------------------------------------------------------------------
+# 9. GH-161: ToolPolicy (one org's permissions for one agent run)
+# ---------------------------------------------------------------------------
+
+_POLICY_FIELDS = frozenset({"permissions", "promoted", "enabled_tools"})
+_NEWLINE = chr(0x0A)
+_PASSWORD = "Correct-Horse-Battery-Staple-42"
+_PASSWORD_MARKER = "Pw-Marker-7f3a9c"
+
+
+def _org_permissions() -> PermissionsConfig:
+    return validate_permissions_config(
+        {"gmail": {"read": "allow", "send": "deny"}, "memory": {"store": "allow"}}
+    )
+
+
+def _policy(**overrides: Any) -> Any:
+    return _model("ToolPolicy")(**{"permissions": _org_permissions(), **overrides})
+
+
+class TestToolPolicy:
+    """ToolPolicy: frozen, holds a PermissionsConfig, promoted pairs and tool switches."""
+
+    def test_org_models_tool_policy_has_exactly_the_contract_fields(self) -> None:
+        assert set(_model("ToolPolicy").model_fields) == _POLICY_FIELDS
+
+    def test_org_models_tool_policy_holds_the_permissions_config(self) -> None:
+        config = _org_permissions()
+
+        policy = _model("ToolPolicy")(permissions=config)
+
+        assert isinstance(policy.permissions, PermissionsConfig)
+        assert policy.permissions == config
+        assert policy.permissions.tools["gmail"].actions["send"] == "deny"
+
+    def test_org_models_tool_policy_defaults_to_nothing_promoted_or_switched(self) -> None:
+        policy = _policy()
+
+        assert policy.promoted == frozenset()
+        assert type(policy.promoted) is frozenset
+        assert policy.enabled_tools == {}
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            pytest.param({}, id="missing"),
+            pytest.param({"permissions": None}, id="none"),
+            pytest.param({"permissions": "allow everything"}, id="text"),
+        ],
+    )
+    def test_org_models_tool_policy_requires_a_permissions_config(
+        self, overrides: dict[str, Any]
+    ) -> None:
+        with pytest.raises(ValidationError):
+            _model("ToolPolicy")(**overrides)
+
+    def test_org_models_tool_policy_keeps_promoted_pairs_as_a_frozenset(self) -> None:
+        promoted = {("gmail", "send"), ("outlook", "send")}
+
+        policy = _policy(promoted=promoted)
+
+        assert policy.promoted == frozenset(promoted)
+        assert type(policy.promoted) is frozenset
+
+    def test_org_models_tool_policy_keeps_the_enabled_tool_switches(self) -> None:
+        switches = {"gmail": False, "memory": True}
+
+        assert _policy(enabled_tools=switches).enabled_tools == switches
+
+    def test_org_models_tool_policy_is_configured_frozen(self) -> None:
+        assert _model("ToolPolicy").model_config.get("frozen") is True
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            pytest.param("permissions", PermissionsConfig(), id="permissions"),
+            pytest.param("promoted", frozenset({("gmail", "send")}), id="promoted"),
+            pytest.param("enabled_tools", {"gmail": False}, id="enabled_tools"),
+        ],
+    )
+    def test_org_models_tool_policy_assignment_raises(self, field: str, value: object) -> None:
+        """A loaded policy can't be changed: assigning any field raises, nothing changes."""
+        policy = _policy()
+        before = getattr(policy, field)
+
+        with pytest.raises(ValidationError):
+            setattr(policy, field, value)
+
+        assert getattr(policy, field) == before
+
+
+# ---------------------------------------------------------------------------
+# 10. GH-161: CriticalPermissionPromote (the promotion's re-auth body)
+# ---------------------------------------------------------------------------
+
+
+def _promote(data: object) -> Any:
+    return _model("CriticalPermissionPromote").model_validate(data)
+
+
+def _error_summary(exc: ValidationError) -> list[tuple[tuple[int | str, ...], str]]:
+    return [
+        (tuple(error["loc"]), error["type"])
+        for error in exc.errors(include_input=False, include_url=False)
+    ]
+
+
+class TestCriticalPermissionPromote:
+    """The password a promotion re-authenticates with: a bounded SecretStr, never shown."""
+
+    def test_org_models_promote_has_exactly_the_password_field(self) -> None:
+        assert set(_model("CriticalPermissionPromote").model_fields) == {"password"}
+
+    def test_org_models_promote_config_forbids_extra_and_hides_input(self) -> None:
+        config = _model("CriticalPermissionPromote").model_config
+
+        assert config.get("extra") == "forbid"
+        assert config.get("hide_input_in_errors") is True
+
+    def test_org_models_promote_password_is_a_secret_str(self) -> None:
+        body = _promote({"password": _PASSWORD})
+
+        assert isinstance(body.password, SecretStr)
+        assert body.password.get_secret_value() == _PASSWORD
+
+    @pytest.mark.parametrize("length", [1, 128], ids=["1", "128"])
+    def test_org_models_promote_password_length_bounds_are_accepted(self, length: int) -> None:
+        assert len(_promote({"password": "p" * length}).password.get_secret_value()) == length
+
+    @pytest.mark.parametrize(
+        ("password", "error_type"),
+        [
+            pytest.param("", "too_short", id="empty"),
+            pytest.param("p" * 129, "too_long", id="129"),
+            pytest.param("p" * 4096, "too_long", id="4096"),
+        ],
+    )
+    def test_org_models_promote_password_out_of_bounds_is_refused(
+        self, password: str, error_type: str
+    ) -> None:
+        """The length bound is the refusal (SecretStr reports too_short / too_long)."""
+        with pytest.raises(ValidationError) as caught:
+            _promote({"password": password})
+
+        [(loc, kind)] = _error_summary(caught.value)
+        assert loc == ("password",)
+        assert kind in {error_type, f"string_{error_type}"}
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="missing"),
+            pytest.param({"password": None}, id="none"),
+            pytest.param({"password": 12345678}, id="int"),
+            pytest.param({"password": ["hunter2"]}, id="list"),
+            pytest.param({"password": {"value": "hunter2"}}, id="object"),
+        ],
+    )
+    def test_org_models_promote_password_must_be_a_string(self, data: dict[str, Any]) -> None:
+        with pytest.raises(ValidationError) as caught:
+            _promote(data)
+
+        assert [loc for loc, _ in _error_summary(caught.value)] == [("password",)]
+
+    @pytest.mark.parametrize("extra", ["bearer_token", "tool", "confirm", "Password"])
+    def test_org_models_promote_unknown_field_is_refused(self, extra: str) -> None:
+        """Only the password: the old bearer_token (or anything else) is refused."""
+        with pytest.raises(ValidationError) as caught:
+            _promote({"password": _PASSWORD, extra: "x"})
+
+        assert _error_summary(caught.value) == [((extra,), "extra_forbidden")]
+
+    def test_org_models_promote_repr_and_str_never_show_the_password(self) -> None:
+        body = _promote({"password": _PASSWORD})
+
+        assert _PASSWORD not in repr(body)
+        assert _PASSWORD not in str(body)
+        assert _PASSWORD not in repr(body.password)
+        assert _PASSWORD not in body.model_dump_json()
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({"password": _PASSWORD_MARKER + "x" * 200}, id="too-long"),
+            pytest.param({"password": _PASSWORD, "note": _PASSWORD_MARKER}, id="extra-field"),
+            pytest.param({"password": [_PASSWORD_MARKER]}, id="wrong-type"),
+        ],
+    )
+    def test_org_models_promote_validation_error_never_echoes_the_input(
+        self, data: dict[str, Any]
+    ) -> None:
+        """A 422 or a log line built from the error carries none of the submitted text."""
+        with pytest.raises(ValidationError) as caught:
+            _promote(data)
+
+        assert _PASSWORD_MARKER not in str(caught.value)
+        assert _PASSWORD_MARKER not in repr(caught.value)
+        assert _PASSWORD not in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# 11. GH-161: PermissionSummaryEntry and PermissionsSummaryResponse
+# ---------------------------------------------------------------------------
+
+_SUMMARY_STATES = ("allow", "confirm", "deny", "disabled")
+_IDENTIFIER_CASES: list[Any] = [
+    pytest.param("gmail", True, id="gmail"),
+    pytest.param("google_calendar", True, id="snake"),
+    pytest.param("a", True, id="one-char"),
+    pytest.param("a" * 63, True, id="63-chars"),
+    pytest.param("a" * 64, False, id="64-chars"),
+    pytest.param("", False, id="empty"),
+    pytest.param("Gmail", False, id="upper-case"),
+    pytest.param("gmail" + _NEWLINE, False, id="trailing-newline"),
+    pytest.param("gmail.send", False, id="dotted"),
+    pytest.param("gmail send", False, id="space"),
+    pytest.param("1gmail", False, id="leading-digit"),
+    pytest.param("_gmail", False, id="leading-underscore"),
+]
+
+
+def _summary_entry(**overrides: Any) -> Any:
+    data = {"tool": "gmail", "action": "send", "state": "deny", **overrides}
+    return _model("PermissionSummaryEntry").model_validate(data)
+
+
+class TestPermissionSummary:
+    """The read-only summary rows: (tool, action) and the effective state, nothing else."""
+
+    def test_org_models_summary_entry_has_exactly_tool_action_state(self) -> None:
+        assert set(_model("PermissionSummaryEntry").model_fields) == {"tool", "action", "state"}
+
+    def test_org_models_summary_entry_state_literal_includes_disabled(self) -> None:
+        annotation = _model("PermissionSummaryEntry").model_fields["state"].annotation
+
+        assert set(get_args(annotation)) == set(_SUMMARY_STATES)
+
+    @pytest.mark.parametrize("state", _SUMMARY_STATES)
+    def test_org_models_summary_entry_accepts_each_state(self, state: str) -> None:
+        assert _summary_entry(state=state).state == state
+
+    @pytest.mark.parametrize(
+        "state", ["enabled", "Allow", "DISABLED", "disabled ", "", None, 1, True, "pending"]
+    )
+    def test_org_models_summary_entry_refuses_other_states(self, state: object) -> None:
+        with pytest.raises(ValidationError) as caught:
+            _summary_entry(state=state)
+
+        assert [loc for loc, _ in _error_summary(caught.value)] == [("state",)]
+
+    @pytest.mark.parametrize("field", ["tool", "action"])
+    @pytest.mark.parametrize(("value", "accepted"), _IDENTIFIER_CASES)
+    def test_org_models_summary_entry_identifier_pattern(
+        self, field: str, value: str, accepted: bool
+    ) -> None:
+        """tool and action follow the permission engine's identifier rule, like
+        PermissionEntry: ^[a-z][a-z0-9_]{0,62}$, no trailing newline."""
+        _summary_entry()  # the defaults are valid: a refusal below is the field's own
+        try:
+            entry = _summary_entry(**{field: value})
+        except ValidationError as exc:
+            assert not accepted, f"{value!r} must be accepted"
+            assert [loc for loc, _ in _error_summary(exc)] == [(field,)]
+        else:
+            assert accepted, f"{value!r} must be refused"
+            assert getattr(entry, field) == value
+
+    def test_org_models_summary_entry_json_has_exactly_the_three_keys(self) -> None:
+        dumped = json.loads(_summary_entry(state="disabled").model_dump_json())
+
+        assert dumped == {"tool": "gmail", "action": "send", "state": "disabled"}
+
+    def test_org_models_summary_response_wraps_the_entries_in_order(self) -> None:
+        rows = [
+            {"tool": "gmail", "action": "read", "state": "allow"},
+            {"tool": "gmail", "action": "send", "state": "confirm"},
+            {"tool": "memory", "action": "store", "state": "disabled"},
+        ]
+
+        response = _model("PermissionsSummaryResponse").model_validate({"permissions": rows})
+
+        assert json.loads(response.model_dump_json()) == {"permissions": rows}
+
+    def test_org_models_summary_response_has_exactly_the_permissions_field(self) -> None:
+        assert set(_model("PermissionsSummaryResponse").model_fields) == {"permissions"}
+
+    def test_org_models_summary_response_accepts_an_empty_list(self) -> None:
+        response = _model("PermissionsSummaryResponse").model_validate({"permissions": []})
+
+        assert response.permissions == []
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="missing"),
+            pytest.param({"permissions": None}, id="none"),
+            pytest.param(
+                {"permissions": [{"tool": "gmail", "action": "send", "state": "granted"}]},
+                id="bad-state",
+            ),
+            pytest.param(
+                {"permissions": [{"tool": "Gmail", "action": "send", "state": "deny"}]},
+                id="bad-tool",
+            ),
+            pytest.param(
+                {"permissions": [{"tool": "gmail", "action": "send"}]},
+                id="entry-without-state",
+            ),
+        ],
+    )
+    def test_org_models_summary_response_refuses_invalid_data(self, data: dict[str, Any]) -> None:
+        with pytest.raises(ValidationError):
+            _model("PermissionsSummaryResponse").model_validate(data)

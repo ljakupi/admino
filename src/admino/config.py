@@ -1,9 +1,9 @@
 """Configuration loading and validation for admino.
 
-Reads and validates the main application config (config.yaml) at startup, and
-provides the database-backed permissions loader. Tool permission rules live in
-permissions.py; their in-code defaults (DEFAULT_PERMISSIONS) seed an empty DB
-on first run. Deployment config (server, egress, database, log level and
+Reads and validates the main application config (config.yaml) at startup. Tool
+permission rules live in permissions.py; their in-code defaults
+(DEFAULT_PERMISSIONS) seed each organization's matrix (``admino.org_permissions``,
+GH-161). Deployment config (server, egress, database, log level and
 format) comes from config.yaml and its env overrides only; the platform LLM
 and limits are stored in ``platform_settings`` (``admino.scoped_settings``,
 GH-159), seeded from this config.
@@ -48,12 +48,9 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from admino.logs import safe_log, safe_url
-from admino.permissions import PermissionsConfig, validate_permissions_config
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import asyncpg
 
 logger = logging.getLogger(__name__)
 
@@ -805,27 +802,3 @@ def load_app_config(config_path: Path) -> AppConfig:
             f"{error_count} field(s) — check server logs for details"
         )
         raise ValueError(msg) from exc
-
-
-# ---------------------------------------------------------------------------
-# Database-backed config loaders
-# ---------------------------------------------------------------------------
-
-
-async def load_permissions_config_from_db(
-    pool: asyncpg.Pool,
-) -> PermissionsConfig:
-    """Load permissions config from the database.
-
-    Fetches permission rows and validates via validate_permissions_config().
-
-    Args:
-        pool: The asyncpg connection pool.
-
-    Returns:
-        A validated PermissionsConfig instance loaded from the database.
-    """
-    from admino.database import load_permissions_from_db
-
-    tools_dict = await load_permissions_from_db(pool)
-    return validate_permissions_config(tools_dict)

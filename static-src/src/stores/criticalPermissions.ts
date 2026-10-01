@@ -10,6 +10,7 @@ import { useToastStore } from '@/stores/toasts';
 import { t } from '@/i18n';
 import type { MessageKey } from '@/i18n';
 import { ApiError } from '@/api/client';
+import type { CriticalPermissionPatchResponse } from '@/api/types';
 
 export interface CritPermDef {
   tool: string;
@@ -60,10 +61,23 @@ interface PermState {
   pendingAt: number | null;
 }
 
+/** The (tool, action) pair the password re-auth prompt is open for. */
+export interface ReauthTarget {
+  tool: string;
+  action: string;
+}
+
 export const useCriticalPermissionsStore = defineStore('criticalPermissions', () => {
   const permissions = ref<Map<string, PermState>>(new Map());
   const loading = ref(false);
   const error = ref<string | null>(null);
+
+  // Password re-auth prompt (issue #161: promoting a critical permission
+  // needs the Org Admin's password). The password itself is never kept in
+  // any store state — it only ever lives as a function argument.
+  const reauthTarget = ref<ReauthTarget | null>(null);
+  const reauthError = ref<string | null>(null);
+  const reauthBusy = ref(false);
 
   function getState(tool: string, action: string): PermState {
     return permissions.value.get(critKey(tool, action)) ?? { state: 'deny', pendingAt: null };
@@ -89,21 +103,27 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
     }
   }
 
-  async function promote(tool: string, action: string) {
+  function applyState(tool: string, action: string, res: CriticalPermissionPatchResponse) {
+    permissions.value.set(critKey(tool, action), {
+      state: res.state,
+      pendingAt: res.pending_at ? new Date(res.pending_at).getTime() : null,
+    });
+    // Force reactivity
+    permissions.value = new Map(permissions.value);
+  }
+
+  /** Requests a promotion with the Org Admin's password. Rethrows on failure (used directly and by `confirmReauth`). */
+  async function promote(tool: string, action: string, password: string): Promise<CriticalPermissionPatchResponse> {
     const toasts = useToastStore();
     try {
-      const res = await promoteCriticalPermission(tool, action);
-      permissions.value.set(critKey(tool, action), {
-        state: res.state,
-        pendingAt: res.pending_at ? new Date(res.pending_at).getTime() : null,
-      });
-      // Force reactivity
-      permissions.value = new Map(permissions.value);
+      const res = await promoteCriticalPermission(tool, action, password);
+      applyState(tool, action, res);
       toasts.add(
         'success',
         t('toast.criticalPermissions.promotionScheduled.title'),
         t('toast.criticalPermissions.promotionScheduled.body', { time: formatCooldown(COOLDOWN_SEC) }),
       );
+      return res;
     } catch (e) {
       if (e instanceof ApiError) {
         toasts.add('error', t('toast.criticalPermissions.promotionFailed.title'), e.message);
@@ -140,14 +160,64 @@ export const useCriticalPermissionsStore = defineStore('criticalPermissions', ()
     }
   }
 
+  /**
+   * On an "on" (confirm, not pending) row, demotes it; on a pending row
+   * still inside the cooldown, cancels the pending promotion; otherwise
+   * opens the password re-auth prompt and makes no request.
+   */
+  async function toggle(tool: string, action: string, now: number = Date.now()) {
+    const row = getState(tool, action);
+    const pending = row.pendingAt !== null && now - row.pendingAt < COOLDOWN_SEC * 1000;
+    if (pending) {
+      await cancelPending(tool, action);
+    } else if (row.state === 'confirm') {
+      await demote(tool, action);
+    } else {
+      reauthTarget.value = { tool, action };
+      reauthError.value = null;
+    }
+  }
+
+  /** Confirms the open re-auth prompt with `password`. A no-op when no prompt is open. Never throws. */
+  async function confirmReauth(password: string): Promise<void> {
+    const target = reauthTarget.value;
+    if (!target) return;
+
+    reauthBusy.value = true;
+    try {
+      await promote(target.tool, target.action, password);
+      reauthTarget.value = null;
+      reauthError.value = null;
+    } catch (e) {
+      reauthError.value =
+        e instanceof ApiError && e.status === 403
+          ? t('reauth.error.wrongPassword' as MessageKey)
+          : t('reauth.error.failed' as MessageKey);
+    } finally {
+      reauthBusy.value = false;
+    }
+  }
+
+  /** Closes the re-auth prompt without a request. */
+  function cancelReauth(): void {
+    reauthTarget.value = null;
+    reauthError.value = null;
+  }
+
   return {
     permissions,
     loading,
     error,
+    reauthTarget,
+    reauthError,
+    reauthBusy,
     getState,
     load,
     promote,
     cancelPending,
     demote,
+    toggle,
+    confirmReauth,
+    cancelReauth,
   };
 });

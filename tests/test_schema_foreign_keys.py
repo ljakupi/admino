@@ -16,6 +16,8 @@ so this guard reads every shipped migration and pins the rule:
 - Every column named ``org_id`` references ``organizations``. The allowlist of
   FK-less ``org_id`` columns is empty today; #178 adds its retained billing
   aggregate table (monthly cost per org, kept by law after the purge).
+- GH-161: the per-org ``permissions`` table (migration 0016) has exactly one
+  foreign key, ``org_id`` -> ``organizations`` ON DELETE CASCADE.
 
 The parser reads the final schema across all migrations, in version order:
 inline column FKs, table-level ``FOREIGN KEY`` constraints, ``ALTER TABLE ...
@@ -367,6 +369,17 @@ class TestSchemaForeignKeyGuard:
             ("password_reset_tokens", ("user_id",), "users", "cascade"),
             ("invitations", ("user_id",), "users", "cascade"),
         }
+
+    def test_schema_fk_permissions_org_id_cascades_from_organizations(self) -> None:
+        """GH-161: tool permissions are per org; the org purge removes them through
+        permissions.org_id -> organizations ON DELETE CASCADE (migration 0016)."""
+        found = {
+            (fk.table, fk.columns, fk.referenced, fk.on_delete)
+            for fk in _shipped_schema().foreign_keys
+            if fk.table == "permissions"
+        }
+
+        assert found == {("permissions", ("org_id",), "organizations", "cascade")}
 
     def test_schema_fk_references_to_orgs_and_users_cascade(self) -> None:
         """Apart from users.org_id and audit_events.org_id, every foreign key to

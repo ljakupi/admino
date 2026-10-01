@@ -98,7 +98,6 @@ from admino.server import _lifespan, create_app
 from tests.lifespan_stubs import (
     patch_login_throttle_purge_job,
     patch_org_purge_job,
-    patch_tools_gate,
 )
 
 if TYPE_CHECKING:
@@ -1710,9 +1709,6 @@ def _patched_lifespan(probe: _LifespanProbe) -> Iterator[None]:
         patch("admino.database.init_pool", fake_init_pool),
         patch("admino.database.close_pool", fake_close_pool),
         patch("admino.database.get_pool", fake_get_pool),
-        patch("admino.database.load_permissions_from_db", AsyncMock(return_value={})),
-        # GH-159: the tools gate reload never reads the MagicMock pool.
-        patch_tools_gate(),
         patch("admino.audit_events.run_retention_job", probe.retention),
         patch("admino.mailer.load_smtp_config", probe.load_smtp_config),
         patch("admino.email_outbox.run_outbox_sender", probe.sender),
