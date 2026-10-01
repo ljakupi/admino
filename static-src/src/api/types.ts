@@ -117,6 +117,7 @@ export interface AppearanceSettings {
 
 export interface NotificationSettings {
   enabled: boolean;
+  task_done: boolean;
 }
 
 export interface ToolsSettings {
@@ -137,7 +138,7 @@ export interface UserSettingsResponse {
 
 export interface UserSettingsPatch {
   appearance?: { theme?: AppTheme };
-  notifications?: { enabled?: boolean };
+  notifications?: { enabled?: boolean; task_done?: boolean };
 }
 
 /** `GET`/`PATCH /api/org/settings` — Org Admin only: which tool services are enabled. */

@@ -46,6 +46,8 @@ Routes:
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation.
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
+- POST /api/me/settings/reset — Revert the caller's own settings to the
+  defaults (every role).
 - GET/PATCH /api/org/settings — The Org Admin's own org's tool services; audited.
 - GET/PATCH /api/platform/settings — The platform defaults: LLM, limits,
   files, retention and security (Super Admin); audited.
@@ -113,19 +115,20 @@ Security notes:
   name, the admin email, the token and the link are never logged.
 - Settings scopes (GH-159, ``admino.scoped_settings``): each route spends a
   per-user bucket, then checks its capability before any database work or
-  provider probe: ``account.manage`` for /api/me/settings (the caller's own
-  row only), ``org.settings.manage`` for /api/org/settings (the principal's
-  own org only, never a request value), ``platform.defaults.manage`` for
-  /api/platform/settings. Org and platform changes share one transaction with
-  their audit events (a failed audit write is a 500 with nothing written); the
-  platform llm event names the changed fields, never a provider or model
-  value, the other sections' events carry old/new ints. A platform LLM switch
-  builds the new client before anything is written (400 with nothing written
-  when it can't be built) and closes the old one best-effort. A trash
-  retention minimum above the maximum (merged with the stored values) is a
-  400 with nothing written. The platform response carries key presence
-  flags, never a key. After an org change, and at lifespan start, the agent's
-  tools gate is the interim AND over every org (retired by #161).
+  provider probe: ``account.manage`` for /api/me/settings and its reset (the
+  caller's own row only), ``org.settings.manage`` for /api/org/settings (the
+  principal's own org only, never a request value),
+  ``platform.defaults.manage`` for /api/platform/settings. Org and platform
+  changes share one transaction with their audit events (a failed audit write
+  is a 500 with nothing written); the platform llm event names the changed
+  fields, never a provider or model value, the other sections' events carry
+  old/new ints. A platform LLM switch builds the new client before anything is
+  written (400 with nothing written when it can't be built) and closes the old
+  one best-effort. A trash retention minimum above the maximum (merged with
+  the stored values) is a 400 with nothing written. The platform response
+  carries key presence flags, never a key. After an org change, and at
+  lifespan start, the agent's tools gate is the interim AND over every org
+  (retired by #161).
 - Platform defaults apply without a restart (GH-160): the chat routes read
   the stored limits through the settings cache on every request (the message
   length, and each agent run's tool-call, context and confirmation limits),
@@ -610,6 +613,7 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     # GH-159: the settings scopes, per user.
     "/api/me/settings/get": (1.0, 10),
     "/api/me/settings/patch": (0.5, 5),
+    "/api/me/settings/reset": (0.2, 3),
     "/api/org/settings/get": (1.0, 10),
     "/api/org/settings/patch": (0.5, 5),
     "/api/platform/settings/get": (1.0, 10),
@@ -2716,6 +2720,30 @@ async def patch_my_settings(
     return await scoped_settings.update_user_settings(get_pool(), actor=principal, patch=body)
 
 
+async def reset_my_settings(principal: _PrincipalDep) -> UserSettingsResponse:
+    """Handle POST /api/me/settings/reset — revert the caller's own settings (GH-35).
+
+    Only the caller's theme and notifications: never the account (names,
+    languages), the connected accounts or the org and platform settings.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        UserSettingsResponse: the defaults.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ACCOUNT_MANAGE`` (both before any database work).
+    """
+    _check_rate_limit("/api/me/settings/reset", _user_caller(principal))
+    _require_capability(principal, Capability.ACCOUNT_MANAGE)
+
+    from admino.database import get_pool
+
+    return await scoped_settings.reset_user_settings(get_pool(), actor=principal)
+
+
 async def get_org_settings(principal: _PrincipalDep) -> OrgSettingsResponse:
     """Handle GET /api/org/settings — the tool services of the Org Admin's own org.
 
@@ -3944,6 +3972,7 @@ def create_app(
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
     app.get("/api/me/settings", response_model=UserSettingsResponse)(get_my_settings)
     app.patch("/api/me/settings", response_model=UserSettingsResponse)(patch_my_settings)
+    app.post("/api/me/settings/reset", response_model=UserSettingsResponse)(reset_my_settings)
     app.get("/api/org/settings", response_model=OrgSettingsResponse)(get_org_settings)
     app.patch("/api/org/settings", response_model=OrgSettingsResponse)(patch_org_settings)
     app.get("/api/platform/settings", response_model=PlatformSettingsResponse)(

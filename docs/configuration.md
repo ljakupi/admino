@@ -157,11 +157,14 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 
 | Scope | Who changes it | Route | What it holds |
 | --- | --- | --- | --- |
-| **Mine** | every account | `GET` / `PATCH /api/me/settings` | Theme and notifications. The **Settings** page shows only these. |
+| **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows only these. |
 | **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. On the **Tools** page, Org Admins see the switches. |
 | **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. |
 
 - The UI and response languages belong to your account, not to these settings.
+- `POST /api/me/settings/reset` resets only your own settings to the defaults: light theme,
+  tool-approval pings on, task-done pings off. Your connected accounts and languages, and the
+  organization and platform settings, stay as they are.
 - Organization and platform changes are recorded in the audit log: which fields changed,
   a tool's old and new on/off state, and a platform number's old and new value. Model names
   are never recorded.
@@ -169,8 +172,8 @@ Settings have three scopes. Each has an owner and its own route; any other role 
   and no organization can switch it back on for the others. Per-organization tool
   policies replace this in a later release.
 - Upgrading from a version with the single `settings` table drops it: everyone starts from
-  the defaults (light theme, notifications on, every tool service on), and the platform
-  settings start from `config.yaml`.
+  the defaults (light theme, tool-approval pings on, task-done pings off, every tool
+  service on), and the platform settings start from `config.yaml`.
 
 ### Platform defaults
 

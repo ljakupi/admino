@@ -2391,6 +2391,8 @@ _EXPECTED_RATE_LIMITS: list[tuple[str, float, int]] = [
     # GH-159: the settings scopes, per user (the old /api/settings keys are gone).
     ("/api/me/settings/get", 1.0, 10),
     ("/api/me/settings/patch", 0.5, 5),
+    # GH-35: reset the caller's own settings, per user.
+    ("/api/me/settings/reset", 0.2, 3),
     ("/api/org/settings/get", 1.0, 10),
     ("/api/org/settings/patch", 0.5, 5),
     ("/api/platform/settings/get", 1.0, 10),

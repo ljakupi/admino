@@ -19,6 +19,16 @@
  * cookie (`credentials: 'same-origin'`) and a PATCH body is exactly the
  * JSON-encoded patch. No call ever targets `/api/settings`.
  *
+ * Issue #35 (Settings controls: task-done pings, reset my settings):
+ * - the user settings carry `notifications.task_done` next to `enabled`, and
+ *   `patchMySettings({ notifications: { task_done } })` sends exactly that
+ *   JSON body (no `enabled`, no `appearance`). These cases are a type change
+ *   only, so they are RED under `npm run typecheck`, not at runtime.
+ * - `resetMySettings()` -> `POST /api/me/settings/reset` with the session
+ *   cookie and no body. It resolves the parsed body (the defaults) and
+ *   rejects a non-2xx (429 rate limit, 403, 401) with an `ApiError` carrying
+ *   the status and the backend's `detail`.
+ *
  * `fetch` is stubbed; nothing touches the network.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -32,6 +42,7 @@ import {
   getOrgSettings,
   patchMySettings,
   patchOrgSettings,
+  resetMySettings,
 } from '@/api/settings';
 import type {
   OAuthConnectionStatus,
@@ -45,7 +56,13 @@ const fetchMock = vi.fn<typeof fetch>();
 
 const MY_SETTINGS: UserSettingsResponse = {
   appearance: { theme: 'dark' },
-  notifications: { enabled: false },
+  notifications: { enabled: false, task_done: true },
+};
+
+/** What `POST /api/me/settings/reset` returns: the user-scope defaults. */
+const DEFAULT_MY_SETTINGS: UserSettingsResponse = {
+  appearance: { theme: 'light' },
+  notifications: { enabled: true, task_done: false },
 };
 
 const ORG_SETTINGS: OrgSettingsResponse = {
@@ -193,6 +210,9 @@ describe('settings api patchMySettings', () => {
     ['a theme change', { appearance: { theme: 'system' } }],
     ['a notifications change', { notifications: { enabled: false } }],
     ['both scopes at once', { appearance: { theme: 'dark' }, notifications: { enabled: true } }],
+    ['task-done pings on', { notifications: { task_done: true } }],
+    ['task-done pings off', { notifications: { task_done: false } }],
+    ['both notification flags', { notifications: { enabled: false, task_done: true } }],
   ];
 
   it.each(patches)('sends PATCH /api/me/settings with exactly the patch as JSON (%s)', async (_label, patch) => {
@@ -223,6 +243,14 @@ describe('settings api patchMySettings', () => {
     expect(await patchMySettings({ appearance: { theme: 'dark' } })).toEqual(MY_SETTINGS);
   });
 
+  it('sends exactly { notifications: { task_done: true } } as the JSON body for a task-done change', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    await patchMySettings({ notifications: { task_done: true } });
+
+    expect(sent().init.body).toBe('{"notifications":{"task_done":true}}');
+  });
+
   it('rejects a 422 with an ApiError carrying the backend message', async () => {
     fetchMock.mockResolvedValueOnce(
       jsonResponse(422, { detail: [{ loc: ['body'], msg: 'Value error, Nothing to update', type: 'value_error' }] }),
@@ -235,6 +263,62 @@ describe('settings api patchMySettings', () => {
       status: 422,
       message: 'Nothing to update',
     });
+  });
+});
+
+// --- Reset my settings: POST /api/me/settings/reset (issue #35) -----------
+
+describe('settings api resetMySettings', () => {
+  it('sends POST /api/me/settings/reset with the session cookie', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, DEFAULT_MY_SETTINGS));
+
+    await resetMySettings();
+
+    const { url, init } = sent();
+    expect({ method: methodOf(init), url, credentials: init.credentials }).toEqual({
+      method: 'POST',
+      url: '/api/me/settings/reset',
+      credentials: 'same-origin',
+    });
+  });
+
+  it('sends no request body', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, DEFAULT_MY_SETTINGS));
+
+    await resetMySettings();
+
+    const { body } = sent().init;
+    expect(body === undefined || body === null || body === '').toBe(true);
+  });
+
+  it('resolves the parsed body the server returns (the defaults)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, DEFAULT_MY_SETTINGS));
+
+    expect(await resetMySettings()).toEqual(DEFAULT_MY_SETTINGS);
+  });
+
+  it('resolves whatever settings the server returns, not hard-coded defaults', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, MY_SETTINGS));
+
+    expect(await resetMySettings()).toEqual(MY_SETTINGS);
+  });
+
+  it.each([
+    [429, 'Too Many Requests', 'Rate limit exceeded'],
+    [403, 'Forbidden', 'Forbidden'],
+    [401, 'Unauthorized', 'Unauthorized'],
+    [500, 'Internal Server Error', 'Internal Server Error'],
+  ])('rejects a %i with an ApiError carrying the status and the backend detail', async (status, statusText, detail) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(status, { detail }, statusText));
+
+    const error = await thrownBy(() => resetMySettings());
+
+    expect({
+      isApiError: error instanceof ApiError,
+      status: (error as ApiError).status,
+      message: (error as ApiError).message,
+      requests: fetchMock.mock.calls.length,
+    }).toEqual({ isApiError: true, status, message: detail, requests: 1 });
   });
 });
 

@@ -62,6 +62,8 @@ export const fr: Record<MessageKey, Message> = {
   'toast.settings.googleDisconnected': 'Google déconnecté',
   'toast.settings.microsoftDisconnected': 'Microsoft déconnecté',
   'toast.settings.disconnectFailed.title': 'Déconnexion échouée',
+  'toast.settings.settingsReset': 'Paramètres réinitialisés',
+  'toast.settings.resetFailed.title': 'Réinitialisation échouée',
 
   // --- toast (critical permissions store) ---------------------------------
   'toast.criticalPermissions.promotionScheduled.title': 'Activation planifiée',
@@ -78,6 +80,7 @@ export const fr: Record<MessageKey, Message> = {
   'settings.error.unexpectedRedirect': 'URL de redirection OAuth inattendue.',
   'settings.error.oauthStartFailed': 'Impossible de démarrer le processus OAuth',
   'settings.error.disconnectFailed': 'Échec de la déconnexion',
+  'settings.error.resetFailed': 'Impossible de réinitialiser vos paramètres.',
 
   // --- permissions (fallback error strings, critical permission copy) ------
   'permissions.error.loadFailed': 'Impossible de charger les autorisations',
@@ -286,9 +289,6 @@ export const fr: Record<MessageKey, Message> = {
     "M'alerter quand admino a besoin de mon approbation pour exécuter un outil.",
   'settings.notifications.taskDone.label': 'Alertes de tâche terminée',
   'settings.notifications.taskDone.hint': "M'alerter quand une réponse longue est prête.",
-  'settings.notifications.sound.label': 'Son',
-  'settings.notifications.sound.hint':
-    'Carillon discret lors des alertes. Respecte le mode « Ne pas déranger » du système.',
   'settings.about.subtitle':
     "Un agent IA personnel axé sur la confidentialité et la sécurité, que vous hébergez vous-même, propulsé par défaut par l'IA d'Infomaniak hébergée en Suisse.",
   'settings.about.version': 'Version',
@@ -296,31 +296,15 @@ export const fr: Record<MessageKey, Message> = {
   'settings.about.sourceCode': 'Code source',
   'settings.about.license': 'Licence',
   'settings.danger.subtitle': 'Ces actions sont irréversibles. Chacune demande une confirmation.',
-  'settings.danger.clear.label': 'Effacer la conversation',
-  'settings.danger.clear.hint':
-    "Efface le fil de discussion actuel. Le journal d'audit est conservé par conception.",
-  'settings.danger.clear.button': 'Effacer le fil',
-  'settings.danger.disconnectAll.label': 'Déconnecter tous les comptes',
-  'settings.danger.disconnectAll.hint': "Révoque les jetons d'actualisation OAuth de Google et Microsoft.",
-  'settings.danger.disconnectAll.button': 'Tout déconnecter',
-  'settings.danger.reset.label': 'Réinitialiser les paramètres',
+  'settings.danger.reset.label': 'Réinitialiser mes paramètres',
   'settings.danger.reset.hint':
-    'Rétablit tous les paramètres par défaut. Les comptes connectés restent connectés.',
+    "Rétablit votre thème et vos notifications par défaut. Les comptes connectés, les langues et les paramètres de l'organisation restent inchangés.",
   'settings.danger.reset.button': 'Rétablir les valeurs par défaut',
-  'settings.danger.erase.label': 'Effacer toutes les données',
-  'settings.danger.erase.hint':
-    "Supprime le journal d'audit, la mémoire et le stockage de documents. Irrécupérable.",
-  'settings.danger.erase.button': 'Tout effacer',
-  'settings.danger.clearConfirm.heading': 'Effacer la conversation?',
-  'settings.danger.clearConfirm.subtext':
-    "Tous les messages et l'historique des appels d'outils de la session actuelle seront supprimés.",
-  'settings.danger.clearConfirm.confirm': 'Effacer',
-  'settings.toast.chatCleared': 'Discussion effacée',
+  'settings.danger.resetConfirm.heading': 'Réinitialiser vos paramètres ?',
+  'settings.danger.resetConfirm.subtext':
+    "Cela rétablit le thème clair, active les alertes d'approbation d'outil et désactive les alertes de tâche terminée. Les comptes connectés, les langues et les paramètres de l'organisation restent inchangés.",
+  'settings.danger.resetConfirm.confirm': 'Réinitialiser',
   'settings.toast.newSession': 'Nouvelle session démarrée',
-  'settings.comingSoon.title': 'Bientôt disponible',
-  'settings.comingSoon.resetSettings': "La réinitialisation des paramètres n'est pas encore disponible.",
-  'settings.comingSoon.eraseAll': "L'effacement de toutes les données n'est pas encore disponible.",
-  'settings.comingSoon.toggle': "Cette option n'est pas encore disponible.",
   'settings.session.logout.label': 'Se déconnecter',
   'settings.session.logout.hint': 'Met fin à votre session sur cet appareil.',
 

@@ -65,6 +65,8 @@ export const en = {
   'toast.settings.googleDisconnected': 'Google disconnected',
   'toast.settings.microsoftDisconnected': 'Microsoft disconnected',
   'toast.settings.disconnectFailed.title': 'Disconnect failed',
+  'toast.settings.settingsReset': 'Settings reset',
+  'toast.settings.resetFailed.title': 'Reset failed',
 
   // --- toast (critical permissions store) ---------------------------------
   'toast.criticalPermissions.promotionScheduled.title': 'Promotion scheduled',
@@ -81,6 +83,7 @@ export const en = {
   'settings.error.unexpectedRedirect': 'Unexpected OAuth redirect URL.',
   'settings.error.oauthStartFailed': 'Failed to start OAuth flow',
   'settings.error.disconnectFailed': 'Failed to disconnect',
+  'settings.error.resetFailed': "Couldn't reset your settings.",
 
   // --- permissions (fallback error strings, critical permission copy) ------
   'permissions.error.loadFailed': 'Failed to load permissions',
@@ -282,8 +285,6 @@ export const en = {
   'settings.notifications.approval.hint': 'Ping me when admino needs my approval to run a tool.',
   'settings.notifications.taskDone.label': 'Task-done pings',
   'settings.notifications.taskDone.hint': 'Ping me when a long-running response is ready.',
-  'settings.notifications.sound.label': 'Sound',
-  'settings.notifications.sound.hint': 'Subtle chime on pings. Respects system Do Not Disturb.',
   'settings.about.subtitle':
     "A privacy- and security-first personal AI agent you run yourself, powered by Infomaniak's Swiss-hosted AI by default.",
   'settings.about.version': 'Version',
@@ -291,28 +292,15 @@ export const en = {
   'settings.about.sourceCode': 'Source code',
   'settings.about.license': 'License',
   'settings.danger.subtitle': 'These actions cannot be undone. Each one prompts for confirmation.',
-  'settings.danger.clear.label': 'Clear conversation',
-  'settings.danger.clear.hint': 'Wipes the current chat thread. Audit log is preserved by design.',
-  'settings.danger.clear.button': 'Clear thread',
-  'settings.danger.disconnectAll.label': 'Disconnect all accounts',
-  'settings.danger.disconnectAll.hint': 'Revokes OAuth refresh tokens for Google and Microsoft.',
-  'settings.danger.disconnectAll.button': 'Disconnect all',
-  'settings.danger.reset.label': 'Reset settings',
-  'settings.danger.reset.hint': 'Resets all settings to defaults. Connected accounts stay connected.',
+  'settings.danger.reset.label': 'Reset my settings',
+  'settings.danger.reset.hint':
+    'Resets your theme and notifications to the defaults. Connected accounts, languages and organization settings stay unchanged.',
   'settings.danger.reset.button': 'Reset to defaults',
-  'settings.danger.erase.label': 'Erase all data',
-  'settings.danger.erase.hint': 'Deletes the audit log, memory, and document store. Cannot be recovered.',
-  'settings.danger.erase.button': 'Erase everything',
-  'settings.danger.clearConfirm.heading': 'Clear conversation?',
-  'settings.danger.clearConfirm.subtext':
-    'This will remove all messages and tool call history from the current session.',
-  'settings.danger.clearConfirm.confirm': 'Clear',
-  'settings.toast.chatCleared': 'Chat cleared',
+  'settings.danger.resetConfirm.heading': 'Reset your settings?',
+  'settings.danger.resetConfirm.subtext':
+    'Your theme goes back to light, tool-approval pings turn on and task-done pings turn off. Connected accounts, languages and organization settings stay unchanged.',
+  'settings.danger.resetConfirm.confirm': 'Reset',
   'settings.toast.newSession': 'New session started',
-  'settings.comingSoon.title': 'Coming soon',
-  'settings.comingSoon.resetSettings': 'Reset settings is not yet available.',
-  'settings.comingSoon.eraseAll': 'Erase all data is not yet available.',
-  'settings.comingSoon.toggle': 'This toggle is not yet available.',
   'settings.session.logout.label': 'Log out',
   'settings.session.logout.hint': 'End your session on this device.',
 

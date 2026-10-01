@@ -118,6 +118,8 @@ _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
         # GH-159: the settings scopes (the old /api/settings is gone).
         ("GET", "/api/me/settings"),
         ("PATCH", "/api/me/settings"),
+        # GH-35: reset the caller's own settings to the defaults.
+        ("POST", "/api/me/settings/reset"),
         ("GET", "/api/org/settings"),
         ("PATCH", "/api/org/settings"),
         ("GET", "/api/platform/settings"),

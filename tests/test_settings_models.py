@@ -31,6 +31,13 @@ What these tests pin down:
   ``PlatformSettingsResponse`` carry exactly their scope's sections (the
   platform one: llm, limits, files, retention, security since GH-160).
 - Validation errors of the request models never repeat the rejected input.
+- GH-35 (task-done pings): ``SettingsNotifications`` is ``{enabled: True,
+  task_done: False}`` by default (pings start off; neither is a master switch
+  for the other); ``SettingsPatchNotifications.task_done`` is a strict bool or
+  null, refused at its own loc with ``bool_type`` (not as an unknown key);
+  a task_done-only patch is valid, an all-null one is refused by the "at least
+  one value" rule; ``UserSettingsResponse`` dumps ``{appearance: {theme},
+  notifications: {enabled, task_done}}``.
 
 New symbols are looked up per test, so a missing model fails its own tests and
 not the whole module.
@@ -602,7 +609,7 @@ class TestScopedSettingsResponses:
 
         assert body.model_dump() == {
             "appearance": {"theme": "light"},
-            "notifications": {"enabled": True},
+            "notifications": {"enabled": True, "task_done": False},
         }
 
     def test_org_settings_response_shape(self) -> None:
@@ -643,3 +650,275 @@ class TestScopedSettingsResponses:
         assert set(dumped) == {"llm", "limits", "files", "retention", "security"}
         assert dumped["limits"] == LimitsConfig().model_dump()
         assert dumped["llm"]["provider"] == "infomaniak"
+
+
+# ---------------------------------------------------------------------------
+# 7. GH-35: task-done pings (notifications.task_done)
+# ---------------------------------------------------------------------------
+
+_ECHOMARK = "ECHOMARK-35-task-done"
+# The issue's list ("yes", 1, 0, "true", [1], {}) plus the other lax-bool lookalikes.
+_NOT_TASK_DONE_BOOLS: tuple[object, ...] = (
+    "yes",
+    1,
+    0,
+    "true",
+    [1],
+    {},
+    "false",
+    "1",
+    "on",
+    1.0,
+)
+
+
+def _locs_and_types(exc: ValidationError) -> list[tuple[tuple[int | str, ...], str]]:
+    return [
+        (tuple(error["loc"]), error["type"])
+        for error in exc.errors(include_input=False, include_url=False)
+    ]
+
+
+class TestSettingsNotificationsTaskDone:
+    """The response part: enabled (tool-approval pings) and task_done (task-done pings)."""
+
+    def test_settings_notifications_fields_are_enabled_and_task_done(self) -> None:
+        fields = models_module.SettingsNotifications.model_fields
+
+        assert set(fields) == {"enabled", "task_done"}
+        assert fields["task_done"].annotation is bool
+
+    def test_settings_notifications_defaults_pings_off_and_approvals_on(self) -> None:
+        """task_done starts off (#28 asks for permission when switched on); enabled stays on."""
+        notifications = models_module.SettingsNotifications()
+
+        assert notifications.model_dump() == {"enabled": True, "task_done": False}
+        assert notifications.task_done is False
+        assert notifications.enabled is True
+
+    @pytest.mark.parametrize(
+        ("enabled", "task_done"), [(True, True), (True, False), (False, True), (False, False)]
+    )
+    def test_settings_notifications_task_done_is_independent_of_enabled(
+        self, enabled: bool, task_done: bool
+    ) -> None:
+        """Neither value is a master switch for the other."""
+        notifications = models_module.SettingsNotifications(enabled=enabled, task_done=task_done)
+
+        assert notifications.model_dump() == {"enabled": enabled, "task_done": task_done}
+
+
+class TestSettingsPatchNotificationsTaskDone:
+    """task_done: a strict bool or null; unknown keys still refused."""
+
+    def test_settings_patch_notifications_fields_are_enabled_and_task_done(self) -> None:
+        fields = SettingsPatchNotifications.model_fields
+
+        assert set(fields) == {"enabled", "task_done"}
+        assert fields["task_done"].annotation == fields["enabled"].annotation
+        assert fields["task_done"].default is None
+        assert not fields["task_done"].is_required()
+
+    @pytest.mark.parametrize("value", [True, False, None])
+    def test_settings_patch_notifications_task_done_value_is_accepted(
+        self, value: bool | None
+    ) -> None:
+        patch = SettingsPatchNotifications.model_validate({"task_done": value})
+
+        assert patch.task_done is value
+        assert patch.enabled is None
+
+    def test_settings_patch_notifications_task_done_defaults_to_not_given(self) -> None:
+        patch = SettingsPatchNotifications.model_validate({"enabled": False})
+
+        assert patch.model_dump() == {"enabled": False, "task_done": None}
+
+    @pytest.mark.parametrize("value", _NOT_TASK_DONE_BOOLS, ids=repr)
+    def test_settings_patch_notifications_task_done_is_a_strict_bool(self, value: object) -> None:
+        """Refused as a non-bool at task_done itself, not as an unknown key."""
+        exc = _rejects(SettingsPatchNotifications, {"task_done": value})
+
+        assert _locs_and_types(exc) == [(("task_done",), "bool_type")]
+
+    def test_settings_patch_notifications_task_done_error_never_echoes_the_input(self) -> None:
+        exc = _rejects(SettingsPatchNotifications, {"task_done": _ECHOMARK})
+
+        assert _locs_and_types(exc) == [(("task_done",), "bool_type")]
+        assert _ECHOMARK not in str(exc)
+
+    @pytest.mark.parametrize("key", ["sound", "Task_done", "taskDone", "task_done_at", "all"])
+    def test_settings_patch_notifications_unknown_key_is_still_rejected(self, key: str) -> None:
+        """With a valid task_done next to it, only the unknown key is refused."""
+        exc = _rejects(SettingsPatchNotifications, {"task_done": True, key: _ECHOMARK})
+
+        assert _locs_and_types(exc) == [((key,), "extra_forbidden")]
+        assert _ECHOMARK not in str(exc)
+
+
+class TestUserSettingsPatchTaskDone:
+    """A task_done-only patch is valid; an all-null one is refused."""
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_user_settings_patch_task_done_only_is_accepted(self, value: bool) -> None:
+        payload = {"notifications": {"task_done": value}}
+
+        patch = _model("UserSettingsPatch").model_validate(payload)
+
+        assert patch.model_dump(exclude_none=True) == payload
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            ({"notifications": {"enabled": True, "task_done": False}}, (None, True, False)),
+            ({"notifications": {"enabled": None, "task_done": True}}, (None, None, True)),
+            ({"notifications": {"enabled": False, "task_done": None}}, (None, False, None)),
+            (
+                {"appearance": {"theme": "dark"}, "notifications": {"task_done": True}},
+                ("dark", None, True),
+            ),
+            (
+                {"appearance": {"theme": None}, "notifications": {"task_done": False}},
+                (None, None, False),
+            ),
+            ({"appearance": None, "notifications": {"task_done": True}}, (None, None, True)),
+            (
+                {"appearance": {"theme": "light"}, "notifications": {"task_done": None}},
+                ("light", None, None),
+            ),
+            (
+                {
+                    "appearance": {"theme": "system"},
+                    "notifications": {"enabled": False, "task_done": True},
+                },
+                ("system", False, True),
+            ),
+        ],
+    )
+    def test_user_settings_patch_any_mix_with_a_value_is_accepted(
+        self, payload: dict[str, Any], expected: tuple[str | None, bool | None, bool | None]
+    ) -> None:
+        """(theme, enabled, task_done) as given; a null or missing value stays None."""
+        patch = models_module.UserSettingsPatch.model_validate(payload)
+        appearance = patch.appearance
+        notifications = patch.notifications
+
+        assert (
+            None if appearance is None else appearance.theme,
+            None if notifications is None else notifications.enabled,
+            None if notifications is None else getattr(notifications, "task_done", "missing"),
+        ) == expected
+
+    def test_user_settings_patch_task_done_json_body_is_accepted(self) -> None:
+        patch = _model("UserSettingsPatch").model_validate_json(
+            '{"notifications": {"task_done": true}}'
+        )
+
+        assert patch.model_dump(exclude_none=True) == {"notifications": {"task_done": True}}
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"notifications": {"task_done": None}},
+            {"notifications": {"enabled": None, "task_done": None}},
+            {"appearance": {"theme": None}, "notifications": {"task_done": None}},
+            {"appearance": None, "notifications": {"enabled": None, "task_done": None}},
+            {"appearance": {}, "notifications": {"task_done": None}},
+        ],
+    )
+    def test_user_settings_patch_null_task_done_alone_is_refused_as_empty(
+        self, payload: dict[str, Any]
+    ) -> None:
+        """Refused by the 'at least one value' rule, not as an unknown key."""
+        exc = _rejects(_model("UserSettingsPatch"), payload)
+
+        errors = exc.errors(include_input=False, include_url=False)
+        assert _locs_and_types(exc) == [((), "value_error")]
+        assert "Give at least one setting to change." in errors[0]["msg"]
+
+    @pytest.mark.parametrize("value", _NOT_TASK_DONE_BOOLS, ids=repr)
+    def test_user_settings_patch_task_done_is_a_strict_bool(self, value: object) -> None:
+        exc = _rejects(_model("UserSettingsPatch"), {"notifications": {"task_done": value}})
+
+        assert _locs_and_types(exc) == [(("notifications", "task_done"), "bool_type")]
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            '{"notifications": {"task_done": 1}}',
+            '{"notifications": {"task_done": 0}}',
+            '{"notifications": {"task_done": "true"}}',
+            '{"notifications": {"task_done": "yes"}}',
+        ],
+    )
+    def test_user_settings_patch_task_done_json_bool_is_strict(self, body: str) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            _model("UserSettingsPatch").model_validate_json(body)
+
+        assert _locs_and_types(exc_info.value) == [(("notifications", "task_done"), "bool_type")]
+
+    @pytest.mark.parametrize(
+        ("payload", "expected"),
+        [
+            (
+                {"notifications": {"task_done": _ECHOMARK}},
+                [(("notifications", "task_done"), "bool_type")],
+            ),
+            (
+                {"notifications": {"task_done": [_ECHOMARK]}},
+                [(("notifications", "task_done"), "bool_type")],
+            ),
+            (
+                {"notifications": {"task_done": True, "sound": _ECHOMARK}},
+                [(("notifications", "sound"), "extra_forbidden")],
+            ),
+        ],
+    )
+    def test_user_settings_patch_task_done_errors_never_echo_the_input(
+        self, payload: dict[str, Any], expected: list[tuple[tuple[str, ...], str]]
+    ) -> None:
+        exc = _rejects(_model("UserSettingsPatch"), payload)
+
+        assert _locs_and_types(exc) == expected
+        assert _ECHOMARK not in str(exc)
+
+
+class TestUserSettingsResponseTaskDone:
+    """GET/PATCH /api/me/settings carry notifications.task_done."""
+
+    @pytest.mark.parametrize(
+        ("theme", "enabled", "task_done"),
+        [("dark", False, True), ("system", True, True), ("light", True, False)],
+    )
+    def test_user_settings_response_dumps_task_done(
+        self, theme: str, enabled: bool, task_done: bool
+    ) -> None:
+        body = _model("UserSettingsResponse").model_validate(
+            {
+                "appearance": {"theme": theme},
+                "notifications": {"enabled": enabled, "task_done": task_done},
+            }
+        )
+
+        assert body.model_dump() == {
+            "appearance": {"theme": theme},
+            "notifications": {"enabled": enabled, "task_done": task_done},
+        }
+
+    def test_user_settings_response_json_has_exactly_theme_enabled_and_task_done(self) -> None:
+        body = _model("UserSettingsResponse")(
+            appearance=SettingsAppearance(theme="dark"),
+            notifications=models_module.SettingsNotifications(enabled=False, task_done=True),
+        )
+
+        assert json.loads(body.model_dump_json()) == {
+            "appearance": {"theme": "dark"},
+            "notifications": {"enabled": False, "task_done": True},
+        }
+
+    def test_user_settings_response_without_task_done_reads_as_off(self) -> None:
+        """A notifications part without task_done takes the default (off), like a missing row."""
+        body = _model("UserSettingsResponse").model_validate(
+            {"appearance": {"theme": "light"}, "notifications": {"enabled": True}}
+        )
+
+        assert body.model_dump()["notifications"] == {"enabled": True, "task_done": False}

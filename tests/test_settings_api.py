@@ -84,6 +84,22 @@ GH-160 (platform defaults) adds, over the same routes:
   next org deletion uses the new grace period.
 - A member role's PATCH of any section is 403 with nothing read or written.
 
+GH-35 (settings page controls) adds, on the user scope:
+- ``notifications.task_done`` (the task-done pings toggle, default off,
+  independent of ``notifications.enabled``) on ``GET`` / ``PATCH
+  /api/me/settings``, stored in ``user_settings.notifications_task_done``. A
+  field not given keeps its stored value; a non-JSON-bool ``task_done`` is a 422
+  at that field, a ``task_done``-only null patch the "nothing given" 422, both
+  without echo.
+- ``POST /api/me/settings/reset``: behind a session (401), a per-user rate
+  limit (key ``/api/me/settings/reset``, (0.2, 3), 429 before any database
+  work), then ``account.manage`` (every role; 403 when ``can`` refuses, nothing
+  written). It reverts the caller's own ``user_settings`` row (absent or the
+  column defaults afterwards) and answers 200 with the defaults. Other users'
+  rows (same org or another), ``org_settings``, ``platform_settings`` and the
+  caller's ``users`` row (languages, name) are untouched; no audit row; no
+  email or name in a log record; cross-origin is a 403 before the database.
+
 Contract notes for the implementation: ``admino.llm.create_llm_client`` is
 looked up at call time (as today); the lifespan and the handlers reach
 ``admino.scoped_settings`` functions at call time (module attribute or a
@@ -143,6 +159,13 @@ _IP_A = "203.0.113.5"
 _ME = "/api/me/settings"
 _ORG = "/api/org/settings"
 _PLATFORM = "/api/platform/settings"
+_RESET = "/api/me/settings/reset"
+_RESET_KEY = "/api/me/settings/reset"
+# GH-35: the user scope's defaults (task-done pings start off).
+_ME_DEFAULTS: dict[str, Any] = {
+    "appearance": {"theme": "light"},
+    "notifications": {"enabled": True, "task_done": False},
+}
 _UNAUTHORIZED = {"detail": "Unauthorized"}
 _FORBIDDEN = {"detail": "Forbidden"}
 _CSRF_REFUSED = {"detail": "Cross-origin request refused"}
@@ -177,6 +200,8 @@ _EXPECTED_LIMITS: dict[str, tuple[float, int]] = {
     "/api/org/settings/patch": (0.5, 5),
     "/api/platform/settings/get": (1.0, 10),
     "/api/platform/settings/patch": (0.2, 5),
+    # GH-35: reset my settings, per user.
+    _RESET_KEY: (0.2, 3),
 }
 # Read at import, before any fixture patches the limits.
 _CONFIGURED_LIMITS = {key: server._RATE_LIMITS.get(key) for key in _EXPECTED_LIMITS}
@@ -226,6 +251,27 @@ _LLM_RESPONSE_KEYS = frozenset(
     }
 )
 
+# GH-35: values a strict-bool ``task_done`` refuses (id, value).
+_BAD_TASK_DONE_VALUES: list[tuple[str, Any]] = [
+    ("task-done-marker", "ECHOMARK42"),
+    ("task-done-yes", "yes"),
+    ("task-done-1", 1),
+    ("task-done-0", 0),
+    ("task-done-string-true", "true"),
+    ("task-done-list", [1]),
+    ("task-done-object", {}),
+]
+# GH-35: patches whose only task_done is null give nothing to change.
+_NULL_TASK_DONE_BODIES = [
+    pytest.param({"notifications": {"task_done": None}}, id="null-task-done"),
+    pytest.param(
+        {"notifications": {"enabled": None, "task_done": None}}, id="null-enabled-and-task-done"
+    ),
+    pytest.param(
+        {"appearance": None, "notifications": {"task_done": None}},
+        id="null-appearance-and-task-done",
+    ),
+]
 _BAD_ME_BODIES = [
     pytest.param({"llm": {"provider": "ECHOMARK42"}}, id="extra-llm"),
     pytest.param({"tools": {"gmail": False}}, id="extra-tools"),
@@ -255,6 +301,15 @@ _BAD_ME_BODIES = [
     pytest.param({"appearance": {}, "notifications": {}}, id="both-empty"),
     pytest.param([], id="list"),
     pytest.param("ECHOMARK42", id="string"),
+    *(
+        pytest.param({"notifications": {"task_done": value}}, id=name)
+        for name, value in _BAD_TASK_DONE_VALUES
+    ),
+    pytest.param(
+        {"appearance": {"theme": "dark"}, "notifications": {"task_done": "ECHOMARK42"}},
+        id="valid-theme-bad-task-done",
+    ),
+    *_NULL_TASK_DONE_BODIES,
 ]
 _BAD_ORG_BODIES = [
     pytest.param({"tools": {"files": False}}, id="removed-files-tool"),
@@ -506,7 +561,7 @@ def _fast_passwords(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture(autouse=True)
 def configured_keys(monkeypatch: pytest.MonkeyPatch) -> frozenset[str]:
-    """Functional tests aren't about rate limits: the six keys get a large bucket (the
+    """Functional tests aren't about rate limits: every key gets a large bucket (the
     rate-limit tests set their own). Returns the keys the server configured itself."""
     present = frozenset(key for key in _EXPECTED_LIMITS if key in server._RATE_LIMITS)
     for key in _EXPECTED_LIMITS:
@@ -1092,10 +1147,7 @@ class TestMySettings:
         response = _call(_client(app), "me_get", token)
 
         assert response.status_code == 200, response.text
-        assert response.json() == {
-            "appearance": {"theme": "light"},
-            "notifications": {"enabled": True},
-        }
+        assert response.json() == _ME_DEFAULTS
 
     def test_settings_api_me_patch_theme_is_stored_and_returned(
         self, db: FakeDb, app: FastAPI
@@ -1109,7 +1161,7 @@ class TestMySettings:
         assert patched.status_code == 200, patched.text
         assert patched.json() == {
             "appearance": {"theme": "dark"},
-            "notifications": {"enabled": True},
+            "notifications": {"enabled": True, "task_done": False},
         }
         assert read.json() == patched.json()
         row = db.user_settings[user_id]
@@ -1128,7 +1180,7 @@ class TestMySettings:
         assert response.status_code == 200, response.text
         assert response.json() == {
             "appearance": {"theme": "system"},
-            "notifications": {"enabled": False},
+            "notifications": {"enabled": False, "task_done": False},
         }
 
     def test_settings_api_two_users_keep_different_themes(self, db: FakeDb, app: FastAPI) -> None:
@@ -2750,3 +2802,490 @@ class TestPlatformDefaultsContentFree:
             assert all(_METADATA_KEY.fullmatch(key) for key in metadata), metadata
             assert all(type(value) is int for value in metadata.values()), metadata
         assert "zephyrmarker" not in json.dumps(db.audit, default=str).lower()
+
+
+# ---------------------------------------------------------------------------
+# 18. GH-35: task-done pings on /api/me/settings
+# ---------------------------------------------------------------------------
+
+
+def _me(theme: str = "light", *, enabled: bool = True, task_done: bool = False) -> dict[str, Any]:
+    """A /api/me/settings response body."""
+    return {
+        "appearance": {"theme": theme},
+        "notifications": {"enabled": enabled, "task_done": task_done},
+    }
+
+
+def _stored(db: FakeDb, user_id: uuid.UUID) -> tuple[str, bool, bool]:
+    """(theme, notifications_enabled, notifications_task_done) of a user's stored row."""
+    row = db.user_settings[user_id]
+    return (row["theme"], row["notifications_enabled"], row["notifications_task_done"])
+
+
+class TestTaskDonePings:
+    """GH-35: ``notifications.task_done`` (default off) is read, patched on its own and kept
+    by every other patch; it is independent of ``notifications.enabled``."""
+
+    def test_settings_api_me_get_returns_the_stored_task_done(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        user_id, token = _login(db, "viewer")
+        db.add_user_settings(user_id, theme="dark", notifications_task_done=True)
+
+        response = _call(_client(app), "me_get", token)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me("dark", task_done=True)
+
+    @pytest.mark.parametrize("role", _ROLES)
+    def test_settings_api_me_patch_task_done_on_is_stored_and_returned(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        """Without a row: task_done on, theme and tool-approval pings keep their defaults."""
+        user_id, token = _login(db, role)
+
+        response = _call(
+            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me(task_done=True)
+        assert _stored(db, user_id) == ("light", True, True)
+
+    def test_settings_api_me_patch_task_done_keeps_theme_and_enabled(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        user_id, token = _login(db, "editor")
+        db.add_user_settings(user_id, theme="dark", notifications_enabled=False)
+
+        response = _call(
+            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me("dark", enabled=False, task_done=True)
+        assert _stored(db, user_id) == ("dark", False, True)
+
+    def test_settings_api_me_patch_task_done_off_is_stored(self, db: FakeDb, app: FastAPI) -> None:
+        user_id, token = _login(db, "editor")
+        db.add_user_settings(user_id, theme="system", notifications_task_done=True)
+
+        response = _call(
+            _client(app), "me_patch", token, body={"notifications": {"task_done": False}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me("system", task_done=False)
+        assert _stored(db, user_id) == ("system", True, False)
+
+    def test_settings_api_me_task_done_persists_across_a_reload(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """A later GET from a fresh client (a page reload) still reads task_done on."""
+        _, token = _login(db, "editor")
+        patched = _call(
+            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+        )
+        assert patched.status_code == 200, patched.text
+
+        reloaded = _call(_client(app), "me_get", token)
+
+        assert reloaded.status_code == 200, reloaded.text
+        assert reloaded.json() == _me(task_done=True)
+
+    def test_settings_api_me_patch_theme_keeps_task_done(self, db: FakeDb, app: FastAPI) -> None:
+        user_id, token = _login(db, "viewer")
+        db.add_user_settings(user_id, notifications_task_done=True)
+
+        response = _call(_client(app), "me_patch", token, body={"appearance": {"theme": "dark"}})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me("dark", task_done=True)
+        assert _stored(db, user_id) == ("dark", True, True)
+
+    def test_settings_api_me_patch_enabled_keeps_task_done(self, db: FakeDb, app: FastAPI) -> None:
+        """Tool-approval pings off is not a master switch: task-done pings stay on."""
+        user_id, token = _login(db, "viewer")
+        db.add_user_settings(user_id, notifications_task_done=True)
+
+        response = _call(
+            _client(app), "me_patch", token, body={"notifications": {"enabled": False}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me(enabled=False, task_done=True)
+        assert _stored(db, user_id) == ("light", False, True)
+
+    def test_settings_api_me_patch_every_field_at_once(self, db: FakeDb, app: FastAPI) -> None:
+        user_id, token = _login(db, "org_admin")
+
+        response = _call(
+            _client(app),
+            "me_patch",
+            token,
+            body={
+                "appearance": {"theme": "dark"},
+                "notifications": {"enabled": False, "task_done": True},
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me("dark", enabled=False, task_done=True)
+        assert _stored(db, user_id) == ("dark", False, True)
+
+    def test_settings_api_me_patch_task_done_with_a_null_enabled_is_valid(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        user_id, token = _login(db, "editor")
+
+        response = _call(
+            _client(app),
+            "me_patch",
+            token,
+            body={"notifications": {"enabled": None, "task_done": True}},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _me(task_done=True)
+        assert _stored(db, user_id) == ("light", True, True)
+
+    def test_settings_api_me_task_done_is_per_user(self, db: FakeDb, app: FastAPI) -> None:
+        """One user's task-done pings never switch another user's on."""
+        user_a, token_a = _login(db, "editor")
+        user_b, token_b = _login(db, "editor")
+        client = _client(app)
+
+        patched = _call(client, "me_patch", token_a, body={"notifications": {"task_done": True}})
+        other = _call(client, "me_get", token_b)
+
+        assert patched.status_code == 200, patched.text
+        assert other.json() == _ME_DEFAULTS
+        assert db.user_settings[user_a]["notifications_task_done"] is True
+        assert user_b not in db.user_settings
+
+    def test_settings_api_me_patch_task_done_writes_no_audit_row(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        _, token = _login(db, "org_admin")
+
+        response = _call(
+            _client(app), "me_patch", token, body={"notifications": {"task_done": True}}
+        )
+
+        assert response.status_code == 200, response.text
+        assert db.audit == []
+
+    @pytest.mark.parametrize(
+        "value", [pytest.param(value, id=name) for name, value in _BAD_TASK_DONE_VALUES]
+    )
+    def test_settings_api_me_patch_bad_task_done_is_refused_at_the_field(
+        self, db: FakeDb, app: FastAPI, value: Any
+    ) -> None:
+        """A known field with a non-JSON-bool value: the 422 points at task_done (not an
+        unknown key), never echoes the input, and nothing is written."""
+        _, token = _login(db, "editor")
+        before = _state(db)
+
+        response = _call(
+            _client(app), "me_patch", token, body={"notifications": {"task_done": value}}
+        )
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert errors
+        assert all(error["loc"] == ["body", "notifications", "task_done"] for error in errors)
+        assert all(error["type"] != "extra_forbidden" for error in errors), errors
+        assert all("input" not in error for error in errors)
+        assert "ECHOMARK42" not in response.text
+        assert _state(db) == before
+
+    @pytest.mark.parametrize("body", _NULL_TASK_DONE_BODIES)
+    def test_settings_api_me_patch_null_task_done_gives_nothing_to_change(
+        self, db: FakeDb, app: FastAPI, body: dict[str, Any]
+    ) -> None:
+        """A patch whose only task_done is null is the "nothing given" 422 on the body."""
+        _, token = _login(db, "editor")
+        before = _state(db)
+
+        response = _call(_client(app), "me_patch", token, body=body)
+
+        assert response.status_code == 422, response.text
+        errors = response.json()["detail"]
+        assert all(error["type"] != "extra_forbidden" for error in errors), errors
+        assert [error["loc"] for error in errors] == [["body"]]
+        assert "Give at least one setting to change." in errors[0]["msg"]
+        assert _state(db) == before
+
+
+# ---------------------------------------------------------------------------
+# 19. GH-35: POST /api/me/settings/reset
+# ---------------------------------------------------------------------------
+
+
+def _reset(client: TestClient, token: str | None, **headers: str) -> httpx.Response:
+    """POST /api/me/settings/reset (no body)."""
+    return client.post(_RESET, headers=_headers(token, **headers))
+
+
+def _customized(db: FakeDb, user_id: uuid.UUID) -> None:
+    """A stored row that differs from the defaults in every column."""
+    db.add_user_settings(
+        user_id, theme="dark", notifications_enabled=False, notifications_task_done=True
+    )
+
+
+def _assert_reset_row(db: FakeDb, user_id: uuid.UUID) -> None:
+    """The caller's row is gone, or holds exactly the column defaults."""
+    row = db.user_settings.get(user_id)
+    if row is not None:
+        assert _stored(db, user_id) == ("light", True, False), row
+
+
+def _user_settings_calls(db: FakeDb, since: int) -> list[str]:
+    return [call.normalized for call in db.calls[since:] if "user_settings" in call.normalized]
+
+
+class TestResetMySettings:
+    """GH-35: the caller reverts their own user settings to the defaults; nothing else
+    changes."""
+
+    def test_settings_api_reset_route_is_registered(self, app: FastAPI) -> None:
+        _route(app, "POST", _RESET)
+
+    def test_settings_api_reset_route_depends_on_require_session(self, app: FastAPI) -> None:
+        assert _depends_on(_route(app, "POST", _RESET).dependant, server.require_session)
+
+    def test_settings_api_reset_without_a_session_is_401(self, db: FakeDb, app: FastAPI) -> None:
+        """No cookie → 401 and no database call."""
+        _route(app, "POST", _RESET)
+
+        response = _reset(_client(app), None)
+
+        assert (response.status_code, response.json()) == (401, _UNAUTHORIZED)
+        assert db.calls == []
+
+    def test_settings_api_reset_with_an_unknown_cookie_is_401(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        _route(app, "POST", _RESET)
+        user_id, _ = _login(db, "editor")
+        _customized(db, user_id)
+        before = _state(db)
+
+        response = _reset(_client(app), "not-a-session-token")
+
+        assert (response.status_code, response.json()) == (401, _UNAUTHORIZED)
+        assert _state(db) == before
+
+    @pytest.mark.parametrize("role", _ROLES)
+    def test_settings_api_reset_returns_the_defaults_for_every_role(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        user_id, token = _login(db, role)
+        _customized(db, user_id)
+
+        response = _reset(_client(app), token)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == _ME_DEFAULTS
+        _assert_reset_row(db, user_id)
+
+    @pytest.mark.parametrize("role", _ROLES)
+    def test_settings_api_reset_then_get_reads_the_defaults(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        user_id, token = _login(db, role)
+        _customized(db, user_id)
+        assert _call(_client(app), "me_get", token).json() == _me(
+            "dark", enabled=False, task_done=True
+        )
+
+        reset = _reset(_client(app), token)
+        reloaded = _call(_client(app), "me_get", token)
+
+        assert reset.status_code == 200, reset.text
+        assert (reloaded.status_code, reloaded.json()) == (200, _ME_DEFAULTS)
+
+    @pytest.mark.parametrize("role", _ROLES)
+    def test_settings_api_reset_touches_nothing_but_the_callers_row(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        """Other users' rows (same org, another org, a Super Admin), both orgs'
+        org_settings, the platform row, the caller's users row (languages, name) and the
+        audit log are exactly as before."""
+        user_id, token = _login(db, role, ui_language="fr", name="Reset Caller")
+        db.users[user_id]["response_language"] = "en"
+        _customized(db, user_id)
+        peer = db.add_account(role="editor")
+        db.add_user_settings(peer, theme="system", notifications_task_done=True)
+        stranger = db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
+        db.add_user_settings(stranger, theme="dark", notifications_enabled=False)
+        root = db.add_account(kind="super_admin", role=None)
+        db.add_user_settings(root, notifications_task_done=True)
+        db.add_org_settings(ORG_ID, gmail=False)
+        db.add_org_settings(OTHER_ORG_ID, outlook=False)
+        expected = _state(db)
+        del expected["user_settings"][user_id]
+
+        response = _reset(_client(app), token)
+
+        assert response.status_code == 200, response.text
+        _assert_reset_row(db, user_id)
+        after = _state(db)
+        after["user_settings"].pop(user_id, None)
+        assert after == expected
+
+    def test_settings_api_reset_writes_no_other_table(self, db: FakeDb, app: FastAPI) -> None:
+        """Every statement the reset adds that writes names user_settings (or the session's
+        own refresh), and no user_settings statement interpolates an id."""
+        user_id, token = _login(db, "editor")
+        _customized(db, user_id)
+        other = db.add_account(role="editor")
+        db.add_user_settings(other, theme="dark")
+        since = len(db.calls)
+
+        response = _reset(_client(app), token)
+
+        assert response.status_code == 200, response.text
+        writes = [
+            call.normalized
+            for call in db.calls[since:]
+            if re.match(r"\s*(?:with\b.*\b)?(?:insert|update|delete)\b", call.normalized)
+        ]
+        assert all(re.search(r"\b(?:user_settings|sessions)\b", sql) for sql in writes), writes
+        assert not [
+            sql
+            for sql in writes
+            if re.search(r"\b(?:users|org_settings|platform_settings|audit_events)\b", sql)
+        ]
+        statements = _user_settings_calls(db, since)
+        assert statements, "the reset never reached user_settings"
+        for sql in statements:
+            assert str(user_id) not in sql
+            assert str(other) not in sql
+
+    def test_settings_api_reset_writes_no_audit_row(self, db: FakeDb, app: FastAPI) -> None:
+        user_id, token = _login(db, "org_admin")
+        _customized(db, user_id)
+
+        response = _reset(_client(app), token)
+
+        assert response.status_code == 200, response.text
+        assert db.audit == []
+
+    def test_settings_api_reset_without_a_row_is_idempotent(self, db: FakeDb, app: FastAPI) -> None:
+        user_id, token = _login(db, "viewer")
+        client = _client(app)
+
+        first = _reset(client, token)
+        second = _reset(client, token)
+
+        assert (first.status_code, first.json()) == (200, _ME_DEFAULTS)
+        assert (second.status_code, second.json()) == (200, _ME_DEFAULTS)
+        _assert_reset_row(db, user_id)
+        assert db.audit == []
+
+    def test_settings_api_reset_asks_can_for_account_manage(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, token = _login(db, "editor")
+        spy = _CanSpy(monkeypatch)
+
+        response = _reset(_client(app), token)
+
+        assert response.status_code == 200, response.text
+        assert Capability.ACCOUNT_MANAGE in spy.capabilities
+
+    def test_settings_api_reset_refused_by_can_is_403_and_writes_nothing(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _route(app, "POST", _RESET)
+        user_id, token = _login(db, "editor")
+        _customized(db, user_id)
+        _CanSpy(monkeypatch, deny=frozenset({Capability.ACCOUNT_MANAGE}))
+        before = _state(db)
+        since = len(db.calls)
+
+        response = _reset(_client(app), token)
+
+        assert (response.status_code, response.json()) == (403, _FORBIDDEN)
+        assert _state(db) == before
+        assert _user_settings_calls(db, since) == []
+
+    @pytest.mark.parametrize("headers", _CROSS_ORIGIN)
+    def test_settings_api_reset_cross_origin_is_refused_before_the_database(
+        self, db: FakeDb, app: FastAPI, headers: dict[str, str]
+    ) -> None:
+        _route(app, "POST", _RESET)
+        user_id, token = _login(db, "editor")
+        _customized(db, user_id)
+        before = _state(db)
+
+        response = _reset(_client(app), token, **headers)
+
+        assert (response.status_code, response.json()) == (403, _CSRF_REFUSED)
+        assert db.calls == []
+        assert _state(db) == before
+
+    def test_settings_api_reset_rate_limit_is_per_user_after_the_burst(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The burst of 3 runs, the 4th call is 429 before any user_settings statement (the
+        row stays), another user's reset still runs; the bucket is (key, "user:<id>")."""
+        _route(app, "POST", _RESET)
+        _, burst = _EXPECTED_LIMITS[_RESET_KEY]
+        monkeypatch.setitem(server._RATE_LIMITS, _RESET_KEY, (0.001, burst))
+        user_a, token_a = _login(db, "editor")
+        user_b, token_b = _login(db, "editor", OTHER_ORG_ID)
+        _customized(db, user_b)
+        client = _client(app)
+
+        allowed = [_reset(client, token_a).status_code for _ in range(burst)]
+        _customized(db, user_a)
+        since = len(db.calls)
+        limited = _reset(client, token_a)
+        statements = _user_settings_calls(db, since)
+        other = _reset(client, token_b)
+
+        assert allowed == [200] * burst
+        assert (limited.status_code, limited.json()) == (429, _RATE_LIMITED)
+        assert statements == []
+        assert _stored(db, user_a) == ("dark", False, True)
+        assert other.status_code == 200, other.text
+        _assert_reset_row(db, user_b)
+        assert (_RESET_KEY, f"user:{user_a}") in server._rate_buckets
+
+    def test_settings_api_reset_rate_limit_runs_before_the_capability_check(
+        self, db: FakeDb, app: FastAPI, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refused caller's calls spend its own bucket: 403, then 429."""
+        _route(app, "POST", _RESET)
+        _limited(monkeypatch, _RESET_KEY)
+        _, token = _login(db, "editor")
+        _CanSpy(monkeypatch, deny=frozenset({Capability.ACCOUNT_MANAGE}))
+        client = _client(app)
+
+        first = _reset(client, token)
+        second = _reset(client, token)
+
+        assert (first.status_code, first.json()) == (403, _FORBIDDEN)
+        assert (second.status_code, second.json()) == (429, _RATE_LIMITED)
+
+    def test_settings_api_reset_logs_no_content(
+        self, db: FakeDb, app: FastAPI, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No email or name of the caller in any app log record."""
+        caplog.set_level(logging.DEBUG)
+        user_id, token = _login(
+            db, "editor", email="zephyrmarker.reset@example.ch", name="Zephyrmarker Reset"
+        )
+        _customized(db, user_id)
+        client = _client(app, raise_server_exceptions=False)
+
+        reset = _reset(client, token)
+        again = _reset(client, token)
+
+        assert reset.status_code == 200, reset.text
+        assert again.status_code == 200, again.text
+        assert "zephyrmarker" not in _log_text(caplog).lower()

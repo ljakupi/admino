@@ -1326,9 +1326,15 @@ class SettingsAppearance(BaseModel):
 
 
 class SettingsNotifications(BaseModel):
-    """Notification preferences (user scope)."""
+    """Notification preferences (user scope).
+
+    ``enabled``: the tool-approval pings (on by default). ``task_done``: the
+    task-done pings (GH-35), off by default because switching them on asks the
+    browser for notification permission. Neither is a master switch for the other.
+    """
 
     enabled: bool = True
+    task_done: bool = False
 
 
 class OAuthAuthorizeResponse(BaseModel):
@@ -1425,11 +1431,12 @@ class SettingsPatchAppearance(BaseModel):
 
 
 class SettingsPatchNotifications(BaseModel):
-    """Partial notification settings for PATCH /api/me/settings (a strict bool)."""
+    """Partial notification settings for PATCH /api/me/settings (strict bools)."""
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     enabled: StrictBool | None = None
+    task_done: StrictBool | None = None
 
 
 class UserSettingsResponse(BaseModel):
@@ -1456,8 +1463,8 @@ class UserSettingsPatch(BaseModel):
     def _check_something_given(self) -> UserSettingsPatch:
         """Refuse a patch that changes nothing."""
         theme = None if self.appearance is None else self.appearance.theme
-        enabled = None if self.notifications is None else self.notifications.enabled
-        if theme is None and enabled is None:
+        notifications = self.notifications or SettingsPatchNotifications()
+        if theme is None and notifications.enabled is None and notifications.task_done is None:
             msg = "Give at least one setting to change."
             raise ValueError(msg)
         return self
