@@ -1,5 +1,6 @@
 """Tests for admino.scoped_settings — the platform, org and user settings scopes
-(GH-159) and the cached, editable platform defaults (GH-160).
+(GH-159), the cached, editable platform defaults (GH-160) and the task-done pings
+and "reset my settings" of the Settings page (GH-35).
 
 The old key/value ``settings`` table is dropped (migration 0013). Each value
 now has an owner: ``user_settings`` (each user: theme and notifications),
@@ -79,6 +80,21 @@ What these tests pin down (the GH-159 and GH-160 implementation contracts):
   (ON DELETE CASCADE).
 - No email, name or model name in any log record; no provider or model value
   in any audit row.
+- GH-35, task-done pings: ``user_settings.notifications_task_done`` (default
+  false, migration 0015) is ``notifications.task_done`` of the response. A
+  read returns the stored value (False without a row) and writes nothing; a
+  patch changes only the fields it gives (a task_done-only patch keeps the
+  theme and ``enabled``, a theme or ``enabled`` patch keeps task_done:
+  neither switch is a master of the other); a later read (the "reload")
+  returns the stored value; another user's row is never touched.
+- GH-35, ``reset_user_settings(pool, *, actor)``: ``account.manage`` (every
+  role) before any statement; reverts only the actor's own ``user_settings``
+  row (afterwards absent or exactly the column defaults; the actor's id a
+  bind parameter, the statements constants) and returns the defaults. It is
+  idempotent, records no audit event, logs no email or name, and every
+  statement it issues names ``user_settings`` and no other table: other
+  users' rows, every org_settings row, the platform row, the actor's users
+  row (languages, name, email), sessions and audit events stay as they were.
 
 All database calls go to tests/db_fakes.FakeDb (which models migration
 0013's columns, defaults, CHECKs, keys and cascades). ``admino.scoped_settings``
@@ -125,7 +141,31 @@ if TYPE_CHECKING:
 _IP = "203.0.113.7"
 _MIGRATION = "0013_settings_scopes.sql"
 _ALL_ON: dict[str, bool] = dict.fromkeys(TOOL_NAMES, True)
-_USER_DEFAULTS = {"appearance": {"theme": "light"}, "notifications": {"enabled": True}}
+# GH-35: the notifications gain task_done (default off) — the response shape.
+_USER_DEFAULTS = {
+    "appearance": {"theme": "light"},
+    "notifications": {"enabled": True, "task_done": False},
+}
+# The user_settings column defaults (migrations 0013 and 0015), without the key and
+# updated_at: what a reset row may hold.
+_USER_COLUMN_DEFAULTS: dict[str, Any] = {
+    "theme": "light",
+    "notifications_enabled": True,
+    "notifications_task_done": False,
+}
+# A user_settings row where every setting differs from its default.
+_CUSTOM_USER_ROW: dict[str, Any] = {
+    "theme": "dark",
+    "notifications_enabled": False,
+    "notifications_task_done": True,
+}
+# Rows where exactly one setting differs from its default (a reset reverts each one).
+_ONE_CUSTOM_SETTING = [
+    pytest.param({"theme": "dark"}, id="theme-dark"),
+    pytest.param({"theme": "system"}, id="theme-system"),
+    pytest.param({"notifications_enabled": False}, id="enabled-off"),
+    pytest.param({"notifications_task_done": True}, id="task_done-on"),
+]
 _ROLES = ["super_admin", "org_admin", "editor", "viewer"]
 _MODEL_MARKER = "Zephyrmarker/Model-77"
 _EMAIL_MARKER = "zephyr.marker.person@example.ch"
@@ -240,10 +280,12 @@ _ONE_CHANGE: dict[str, dict[str, int]] = {
 }
 _SESSION_POLICY_CHANGE = {"session_idle_timeout_minutes": 30, "session_max_lifetime_hours": 4}
 _ORG_FUNCTIONS = ["get_org_settings", "update_org_settings"]
-_USER_FUNCTIONS = ["get_user_settings", "update_user_settings"]
+_USER_FUNCTIONS = ["get_user_settings", "update_user_settings", "reset_user_settings"]
 _CAPABILITIES: dict[str, Capability] = {
     "get_user_settings": Capability.ACCOUNT_MANAGE,
     "update_user_settings": Capability.ACCOUNT_MANAGE,
+    # GH-35: "reset my settings" is the user scope too (every role).
+    "reset_user_settings": Capability.ACCOUNT_MANAGE,
     "get_org_settings": Capability.ORG_SETTINGS_MANAGE,
     "update_org_settings": Capability.ORG_SETTINGS_MANAGE,
     "update_platform_settings": Capability.PLATFORM_DEFAULTS_MANAGE,
@@ -413,6 +455,8 @@ async def _invoke(svc: ModuleType, db: FakeDb, name: str, actor: Principal) -> A
         return await svc.update_user_settings(
             pool, actor=actor, patch=_user_patch({"appearance": {"theme": "dark"}})
         )
+    if name == "reset_user_settings":
+        return await svc.reset_user_settings(pool, actor=actor)
     if name == "get_org_settings":
         return await svc.get_org_settings(pool, actor=actor)
     if name == "update_org_settings":
@@ -462,6 +506,47 @@ def _tools(result: Any) -> dict[str, bool]:
 
 def _user_values(result: Any) -> tuple[str, bool]:
     return result.appearance.theme, result.notifications.enabled
+
+
+def _user_all(result: Any) -> tuple[str, bool, bool]:
+    """(theme, enabled, task_done) of a UserSettingsResponse (GH-35)."""
+    return result.appearance.theme, result.notifications.enabled, result.notifications.task_done
+
+
+def _user_row(db: FakeDb, user_id: uuid.UUID) -> tuple[str, bool, bool]:
+    """(theme, notifications_enabled, notifications_task_done) of a stored user_settings row."""
+    row = db.user_settings[user_id]
+    return row["theme"], row["notifications_enabled"], row["notifications_task_done"]
+
+
+def _custom_user_row(db: FakeDb, user_id: uuid.UUID) -> dict[str, Any]:
+    """Store a user_settings row where every setting differs from its default."""
+    return db.add_user_settings(user_id, **_CUSTOM_USER_ROW)
+
+
+def _assert_reset_row(db: FakeDb, user_id: uuid.UUID) -> None:
+    """After a reset (GH-35) the user's row is gone or holds exactly the column defaults."""
+    row = db.user_settings.get(user_id)
+    if row is None:
+        return
+    values = {
+        column: value for column, value in row.items() if column not in {"user_id", "updated_at"}
+    }
+    assert values == _USER_COLUMN_DEFAULTS
+
+
+def _migration_tables() -> set[str]:
+    """Every table a shipped migration creates (lowercase)."""
+    pattern = re.compile(r"create\s+table\s+(?:if\s+not\s+exists\s+)?(\w+)", re.IGNORECASE)
+    tables: set[str] = set()
+    for path in sorted(db_mod._MIGRATIONS_DIR.glob("*.sql")):
+        tables |= {name.lower() for name in pattern.findall(path.read_text(encoding="utf-8"))}
+    return tables
+
+
+def _tables_named(sql: str, tables: set[str]) -> set[str]:
+    """The tables whose name appears as a whole word in this (normalized) SQL."""
+    return {table for table in tables if re.search(rf"\b{table}\b", sql)}
 
 
 def _settings_calls(db: FakeDb, table: str) -> list[Any]:
@@ -596,6 +681,7 @@ class TestModuleSurface:
             "update_platform_settings",
             "current_platform_settings",
             "session_policy_for",
+            "reset_user_settings",
         ],
     )
     def test_scoped_settings_function_is_a_coroutine(self, svc: ModuleType, name: str) -> None:
@@ -642,6 +728,7 @@ class TestModuleSurface:
         [
             ("get_user_settings", {"actor"}),
             ("update_user_settings", {"actor", "patch"}),
+            ("reset_user_settings", {"actor"}),
             ("get_org_settings", {"actor"}),
             ("update_org_settings", {"actor", "patch", "ip"}),
             ("update_platform_settings", {"actor", "patch", "ip"}),
@@ -942,6 +1029,471 @@ class TestUserSettings:
         )
 
         assert db.audit == []
+
+
+# ---------------------------------------------------------------------------
+# 3b. Task-done pings (GH-35): notifications.task_done in the user scope
+# ---------------------------------------------------------------------------
+
+
+class TestUserTaskDone:
+    """``notifications.task_done`` (``user_settings.notifications_task_done``, default off)
+    is read, patched and kept like the other user settings, independent of ``enabled``."""
+
+    async def test_scoped_settings_get_user_without_a_row_has_task_done_off_and_writes_nothing(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _actor(db, "editor")
+
+        result = await svc.get_user_settings(db.pool, actor=actor)
+
+        assert result.notifications.task_done is False
+        assert db.user_settings == {}
+        assert db.matching(r"^(?:insert|update|delete)\b") == []
+
+    @pytest.mark.parametrize("stored", [True, False], ids=["stored-on", "stored-off"])
+    async def test_scoped_settings_get_user_returns_the_stored_task_done(
+        self, svc: ModuleType, db: FakeDb, stored: bool
+    ) -> None:
+        actor = _actor(db, "viewer")
+        db.add_user_settings(
+            actor.user_id,
+            theme="system",
+            notifications_enabled=False,
+            notifications_task_done=stored,
+        )
+
+        result = await svc.get_user_settings(db.pool, actor=actor)
+
+        assert _user_all(result) == ("system", False, stored)
+        assert db.matching(r"^(?:insert|update|delete)\b") == []
+
+    async def test_scoped_settings_get_user_response_has_the_full_notifications_shape(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The response is {appearance: {theme}, notifications: {enabled, task_done}}."""
+        actor = _actor(db, "org_admin")
+        _custom_user_row(db, actor.user_id)
+
+        result = await svc.get_user_settings(db.pool, actor=actor)
+
+        assert result.model_dump() == {
+            "appearance": {"theme": "dark"},
+            "notifications": {"enabled": False, "task_done": True},
+        }
+
+    @pytest.mark.parametrize("value", [True, False], ids=["switch-on", "switch-off"])
+    @pytest.mark.parametrize(
+        ("theme", "enabled"),
+        [("dark", False), ("system", True)],
+        ids=["dark-enabled-off", "system-enabled-on"],
+    )
+    async def test_scoped_settings_update_task_done_only_keeps_theme_and_enabled(
+        self, svc: ModuleType, db: FakeDb, theme: str, enabled: bool, value: bool
+    ) -> None:
+        """A task_done-only patch persists task_done; the theme and ``enabled`` stay."""
+        actor = _actor(db, "editor")
+        db.add_user_settings(
+            actor.user_id,
+            theme=theme,
+            notifications_enabled=enabled,
+            notifications_task_done=not value,
+        )
+
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": value}})
+        )
+
+        assert _user_row(db, actor.user_id) == (theme, enabled, value)
+        assert _user_all(result) == (theme, enabled, value)
+
+    async def test_scoped_settings_update_theme_keeps_a_stored_task_done(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _actor(db, "viewer")
+        db.add_user_settings(actor.user_id, theme="dark", notifications_task_done=True)
+
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"appearance": {"theme": "system"}})
+        )
+
+        assert _user_row(db, actor.user_id) == ("system", True, True)
+        assert _user_all(result) == ("system", True, True)
+
+    @pytest.mark.parametrize("enabled", [True, False], ids=["enabled-on", "enabled-off"])
+    async def test_scoped_settings_update_enabled_keeps_a_stored_task_done(
+        self, svc: ModuleType, db: FakeDb, enabled: bool
+    ) -> None:
+        """``enabled`` is no master switch: changing it leaves task_done as stored."""
+        actor = _actor(db, "editor")
+        db.add_user_settings(
+            actor.user_id, notifications_enabled=not enabled, notifications_task_done=True
+        )
+
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"enabled": enabled}})
+        )
+
+        assert _user_row(db, actor.user_id) == ("light", enabled, True)
+        assert _user_all(result) == ("light", enabled, True)
+
+    async def test_scoped_settings_task_done_on_with_enabled_off_both_persist(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Neither switch is a master of the other: task_done on with ``enabled`` off is
+        stored and returned as given."""
+        actor = _actor(db, "org_admin")
+
+        result = await svc.update_user_settings(
+            db.pool,
+            actor=actor,
+            patch=_user_patch({"notifications": {"enabled": False, "task_done": True}}),
+        )
+
+        assert _user_row(db, actor.user_id) == ("light", False, True)
+        assert _user_all(result) == ("light", False, True)
+
+    async def test_scoped_settings_update_all_three_settings_at_once(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        from admino.models import UserSettingsResponse
+
+        actor = _actor(db, "super_admin")
+
+        result = await svc.update_user_settings(
+            db.pool,
+            actor=actor,
+            patch=_user_patch(
+                {
+                    "appearance": {"theme": "dark"},
+                    "notifications": {"enabled": False, "task_done": True},
+                }
+            ),
+        )
+
+        assert isinstance(result, UserSettingsResponse)
+        assert result.model_dump() == {
+            "appearance": {"theme": "dark"},
+            "notifications": {"enabled": False, "task_done": True},
+        }
+        assert _user_row(db, actor.user_id) == ("dark", False, True)
+
+    async def test_scoped_settings_update_task_done_creates_a_missing_row_with_the_defaults(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Only task_done differs from the column defaults."""
+        actor = _actor(db, "viewer")
+
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+        )
+
+        assert _user_row(db, actor.user_id) == ("light", True, True)
+        assert _user_all(result) == ("light", True, True)
+
+    async def test_scoped_settings_task_done_survives_a_reload(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The issue's AC "persists across reload": a later read returns the stored value,
+        also after another setting changed."""
+        actor = _actor(db, "editor")
+
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+        )
+        reloaded = await svc.get_user_settings(db.pool, actor=actor)
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"appearance": {"theme": "dark"}})
+        )
+        reloaded_again = await svc.get_user_settings(db.pool, actor=actor)
+
+        assert _user_all(reloaded) == ("light", True, True)
+        assert _user_all(reloaded_again) == ("dark", True, True)
+
+    async def test_scoped_settings_task_done_update_never_touches_another_user(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Neither a colleague in the same org nor a user of another org is touched."""
+        actor = _actor(db, "editor")
+        colleague = _actor(db, "editor")
+        stranger = _actor(db, "viewer", OTHER_ORG_ID)
+        db.add_user_settings(actor.user_id)
+        others = {
+            colleague.user_id: copy.deepcopy(db.add_user_settings(colleague.user_id)),
+            stranger.user_id: copy.deepcopy(_custom_user_row(db, stranger.user_id)),
+        }
+
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+        )
+
+        assert {user_id: db.user_settings[user_id] for user_id in others} == others
+        assert not _bound(db, colleague.user_id)
+        assert not _bound(db, stranger.user_id)
+        assert _user_row(db, actor.user_id) == ("light", True, True)
+
+    async def test_scoped_settings_task_done_update_statements_are_constants(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Switching task_done on or off issues the same SQL text: the value is a bind
+        parameter, never part of the statement."""
+        first = _actor(db, "editor")
+        second = _actor(db, "editor")
+        db.add_user_settings(first.user_id)
+        db.add_user_settings(second.user_id, notifications_task_done=True)
+
+        await svc.update_user_settings(
+            db.pool, actor=first, patch=_user_patch({"notifications": {"task_done": True}})
+        )
+        on_count = len(db.calls)
+        await svc.update_user_settings(
+            db.pool, actor=second, patch=_user_patch({"notifications": {"task_done": False}})
+        )
+
+        on_sql = [call.sql for call in db.calls[:on_count]]
+        off_sql = [call.sql for call in db.calls[on_count:]]
+        assert on_sql == off_sql
+        assert _user_row(db, first.user_id)[2] is True
+        assert _user_row(db, second.user_id)[2] is False
+
+    async def test_scoped_settings_task_done_update_records_no_audit_event(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _actor(db, "editor")
+
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+        )
+
+        assert db.audit == []
+
+
+# ---------------------------------------------------------------------------
+# 3c. Reset my settings (GH-35): reset_user_settings
+# ---------------------------------------------------------------------------
+
+
+class TestResetUserSettings:
+    """``reset_user_settings(pool, *, actor)`` reverts the actor's own user_settings row to
+    the defaults (every role) and touches nothing else."""
+
+    def test_scoped_settings_reset_takes_only_the_pool_and_the_actor(self, svc: ModuleType) -> None:
+        parameters = inspect.signature(svc.reset_user_settings).parameters
+
+        assert list(parameters) == ["pool", "actor"]
+        assert parameters["actor"].kind is inspect.Parameter.KEYWORD_ONLY
+
+    @pytest.mark.parametrize("role", _ROLES)
+    async def test_scoped_settings_reset_reverts_the_actors_row_for_every_role(
+        self, svc: ModuleType, db: FakeDb, role: str
+    ) -> None:
+        """Every role (the Super Admin included) resets their own row and gets the
+        defaults back."""
+        from admino.models import UserSettingsResponse
+
+        actor = _actor(db, role)
+        _custom_user_row(db, actor.user_id)
+
+        result = await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert isinstance(result, UserSettingsResponse)
+        assert result.model_dump() == _USER_DEFAULTS
+        _assert_reset_row(db, actor.user_id)
+
+    @pytest.mark.parametrize("custom", _ONE_CUSTOM_SETTING)
+    async def test_scoped_settings_reset_reverts_each_setting(
+        self, svc: ModuleType, db: FakeDb, custom: dict[str, Any]
+    ) -> None:
+        """Every column is reverted, task_done included, not only some of them."""
+        actor = _actor(db, "editor")
+        db.add_user_settings(actor.user_id, **custom)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+
+        _assert_reset_row(db, actor.user_id)
+
+    @pytest.mark.parametrize("role", _ROLES)
+    async def test_scoped_settings_reset_then_get_returns_the_defaults(
+        self, svc: ModuleType, db: FakeDb, role: str
+    ) -> None:
+        """The following read (a reload of the Settings page) shows the defaults."""
+        actor = _actor(db, role)
+        _custom_user_row(db, actor.user_id)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+        result = await svc.get_user_settings(db.pool, actor=actor)
+
+        assert result.model_dump() == _USER_DEFAULTS
+        assert _user_all(result) == ("light", True, False)
+
+    async def test_scoped_settings_reset_without_a_row_returns_the_defaults(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Idempotent: no row is no error; the row stays absent or holds the defaults."""
+        actor = _actor(db, "viewer")
+
+        result = await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert result.model_dump() == _USER_DEFAULTS
+        _assert_reset_row(db, actor.user_id)
+        assert set(db.user_settings) <= {actor.user_id}
+
+    async def test_scoped_settings_reset_twice_returns_the_defaults_both_times(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        actor = _actor(db, "org_admin")
+        _custom_user_row(db, actor.user_id)
+
+        first = await svc.reset_user_settings(db.pool, actor=actor)
+        second = await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert first.model_dump() == _USER_DEFAULTS
+        assert second.model_dump() == _USER_DEFAULTS
+        _assert_reset_row(db, actor.user_id)
+
+    async def test_scoped_settings_update_after_reset_starts_from_the_defaults(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """After a reset only the newly given setting differs from the defaults."""
+        actor = _actor(db, "editor")
+        _custom_user_row(db, actor.user_id)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+        result = await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"appearance": {"theme": "system"}})
+        )
+
+        assert _user_all(result) == ("system", True, False)
+        assert _user_row(db, actor.user_id) == ("system", True, False)
+
+    @pytest.mark.parametrize("role", _ROLES)
+    async def test_scoped_settings_reset_refused_by_can_is_a_permission_error_before_any_query(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, role: str
+    ) -> None:
+        """``account.manage`` is checked first: refused, nothing is read or written."""
+        actor = _actor(db, role)
+        _custom_user_row(db, actor.user_id)
+        before = _state(db)
+        spy = _CanSpy(monkeypatch, svc, deny=frozenset({Capability.ACCOUNT_MANAGE}))
+
+        with pytest.raises(PermissionError):
+            await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert Capability.ACCOUNT_MANAGE in spy.capabilities
+        assert db.calls == []
+        assert _state(db) == before
+
+    async def test_scoped_settings_reset_asks_can_for_account_manage(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        actor = _actor(db, "viewer")
+        spy = _CanSpy(monkeypatch, svc)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert spy.capabilities == [Capability.ACCOUNT_MANAGE]
+
+    @pytest.mark.parametrize("has_row", [True, False], ids=["with-row", "without-row"])
+    async def test_scoped_settings_reset_touches_nothing_but_the_actors_row(
+        self, svc: ModuleType, db: FakeDb, has_row: bool
+    ) -> None:
+        """Other users' rows (same org, another org, a Super Admin), every org_settings row,
+        the platform row, the actor's account row (languages, name, email), the sessions
+        and the audit events stay exactly as they were."""
+        _platform(db)
+        db.add_org_settings(ORG_ID, gmail=False)
+        db.add_org_settings(OTHER_ORG_ID, **{TOOL_NAMES[-1]: False})
+        actor = _actor(db, "editor", email=_EMAIL_MARKER, name=_NAME_MARKER, ui_language="fr")
+        db.users[actor.user_id]["response_language"] = "it"
+        if has_row:
+            _custom_user_row(db, actor.user_id)
+        others = [_actor(db, "org_admin"), _actor(db, "viewer", OTHER_ORG_ID)]
+        others.append(_actor(db, "super_admin"))
+        for other in others:
+            _custom_user_row(db, other.user_id)
+        for user_id in [actor.user_id, *(other.user_id for other in others)]:
+            db.open_session(user_id)
+        before = _state(db)
+        sessions_before = copy.deepcopy(db.sessions)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+
+        after = _state(db)
+        user_settings_before = before.pop("user_settings")
+        user_settings_after = after.pop("user_settings")
+        assert after == before
+        assert db.sessions == sessions_before
+        assert {key: row for key, row in user_settings_after.items() if key != actor.user_id} == {
+            key: row for key, row in user_settings_before.items() if key != actor.user_id
+        }
+        _assert_reset_row(db, actor.user_id)
+
+    @pytest.mark.parametrize("has_row", [True, False], ids=["with-row", "without-row"])
+    async def test_scoped_settings_reset_statements_name_only_user_settings(
+        self, svc: ModuleType, db: FakeDb, has_row: bool
+    ) -> None:
+        """No statement of the reset names users, sessions, audit_events, oauth_tokens,
+        org_settings, platform_settings or any other table: user_settings only."""
+        tables = _migration_tables()
+        assert {"user_settings", "users", "sessions", "oauth_tokens"} <= tables
+        actor = _actor(db, "org_admin")
+        if has_row:
+            _custom_user_row(db, actor.user_id)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert db.calls
+        for call in db.calls:
+            assert _tables_named(call.normalized, tables) == {"user_settings"}, call.sql
+
+    async def test_scoped_settings_reset_binds_only_the_actors_id(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The actor's id is a bind parameter, never part of the SQL; another user's id is
+        never bound."""
+        actor = _actor(db, "editor")
+        other = _actor(db, "editor")
+        _custom_user_row(db, actor.user_id)
+        _custom_user_row(db, other.user_id)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert _bound(db, actor.user_id)
+        assert not _bound(db, other.user_id)
+        for call in db.calls:
+            assert str(actor.user_id) not in call.sql
+            assert actor.user_id.hex not in call.sql
+
+    async def test_scoped_settings_reset_statements_are_constants(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Two users' resets issue the same SQL text: only the bind arguments differ."""
+        first = _actor(db, "editor")
+        second = _actor(db, "viewer", OTHER_ORG_ID)
+        _custom_user_row(db, first.user_id)
+        _custom_user_row(db, second.user_id)
+
+        await svc.reset_user_settings(db.pool, actor=first)
+        first_count = len(db.calls)
+        await svc.reset_user_settings(db.pool, actor=second)
+
+        assert first_count > 0
+        assert [call.sql for call in db.calls[:first_count]] == [
+            call.sql for call in db.calls[first_count:]
+        ]
+
+    async def test_scoped_settings_reset_records_no_audit_event(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Like a user settings PATCH, the reset is not audited (the user scope is not in
+        the audit catalog)."""
+        actor = _actor(db, "org_admin")
+        _custom_user_row(db, actor.user_id)
+
+        await svc.reset_user_settings(db.pool, actor=actor)
+
+        assert db.audit == []
+        assert db.matching(r"\baudit_events\b") == []
 
 
 # ---------------------------------------------------------------------------
@@ -2648,5 +3200,28 @@ class TestNoContentInLogs:
             await svc.update_platform_settings(
                 db.pool, actor=admin, patch=_llm_patch(anthropic_model="Zephyrmarker-x"), ip=_IP
             )
+
+        assert "zephyrmarker" not in _log_text(caplog).lower()
+
+    async def test_scoped_settings_task_done_and_reset_log_no_content(
+        self,
+        svc: ModuleType,
+        db: FakeDb,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """GH-35: switching task_done, a reset (with a row and without one) and a refused
+        reset log no email or name."""
+        caplog.set_level(logging.DEBUG)
+        actor = _actor(db, "viewer", email=_EMAIL_MARKER, name=_NAME_MARKER)
+
+        await svc.update_user_settings(
+            db.pool, actor=actor, patch=_user_patch({"notifications": {"task_done": True}})
+        )
+        await svc.reset_user_settings(db.pool, actor=actor)
+        await svc.reset_user_settings(db.pool, actor=actor)
+        _CanSpy(monkeypatch, svc, deny=frozenset({Capability.ACCOUNT_MANAGE}))
+        with pytest.raises(PermissionError):
+            await svc.reset_user_settings(db.pool, actor=actor)
 
         assert "zephyrmarker" not in _log_text(caplog).lower()

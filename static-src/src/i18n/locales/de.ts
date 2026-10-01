@@ -63,6 +63,8 @@ export const de: Record<MessageKey, Message> = {
   'toast.settings.googleDisconnected': 'Google getrennt',
   'toast.settings.microsoftDisconnected': 'Microsoft getrennt',
   'toast.settings.disconnectFailed.title': 'Trennen fehlgeschlagen',
+  'toast.settings.settingsReset': 'Einstellungen zurückgesetzt',
+  'toast.settings.resetFailed.title': 'Zurücksetzen fehlgeschlagen',
 
   // --- toast (critical permissions store) ---------------------------------
   'toast.criticalPermissions.promotionScheduled.title': 'Aktivierung geplant',
@@ -79,6 +81,7 @@ export const de: Record<MessageKey, Message> = {
   'settings.error.unexpectedRedirect': 'Unerwartete OAuth-Weiterleitungs-URL.',
   'settings.error.oauthStartFailed': 'OAuth-Vorgang konnte nicht gestartet werden',
   'settings.error.disconnectFailed': 'Trennen fehlgeschlagen',
+  'settings.error.resetFailed': 'Ihre Einstellungen konnten nicht zurückgesetzt werden.',
 
   // --- permissions (fallback error strings, critical permission copy) ------
   'permissions.error.loadFailed': 'Berechtigungen konnten nicht geladen werden',
@@ -285,9 +288,6 @@ export const de: Record<MessageKey, Message> = {
     'Benachrichtigen, wenn admino meine Genehmigung für ein Tool braucht.',
   'settings.notifications.taskDone.label': 'Hinweise zu erledigten Aufgaben',
   'settings.notifications.taskDone.hint': 'Benachrichtigen, wenn eine länger dauernde Antwort bereit ist.',
-  'settings.notifications.sound.label': 'Ton',
-  'settings.notifications.sound.hint':
-    'Dezenter Ton bei Hinweisen. Beachtet den Modus «Nicht stören» des Systems.',
   'settings.about.subtitle':
     'Ein datenschutz- und sicherheitsorientierter persönlicher KI-Agent, den Sie selbst betreiben – standardmässig mit der in der Schweiz gehosteten KI von Infomaniak.',
   'settings.about.version': 'Version',
@@ -296,30 +296,15 @@ export const de: Record<MessageKey, Message> = {
   'settings.about.license': 'Lizenz',
   'settings.danger.subtitle':
     'Diese Aktionen können nicht rückgängig gemacht werden. Jede verlangt eine Bestätigung.',
-  'settings.danger.clear.label': 'Gespräch leeren',
-  'settings.danger.clear.hint': 'Löscht den aktuellen Chatverlauf. Das Audit-Log bleibt bewusst erhalten.',
-  'settings.danger.clear.button': 'Verlauf leeren',
-  'settings.danger.disconnectAll.label': 'Alle Konten trennen',
-  'settings.danger.disconnectAll.hint': 'Widerruft die OAuth-Refresh-Tokens für Google und Microsoft.',
-  'settings.danger.disconnectAll.button': 'Alle trennen',
-  'settings.danger.reset.label': 'Einstellungen zurücksetzen',
+  'settings.danger.reset.label': 'Meine Einstellungen zurücksetzen',
   'settings.danger.reset.hint':
-    'Setzt alle Einstellungen auf die Standardwerte zurück. Verbundene Konten bleiben verbunden.',
+    'Setzt Ihr Design und Ihre Benachrichtigungen auf die Standardwerte zurück. Verbundene Konten, Sprachen und Organisationseinstellungen bleiben unverändert.',
   'settings.danger.reset.button': 'Auf Standard zurücksetzen',
-  'settings.danger.erase.label': 'Alle Daten löschen',
-  'settings.danger.erase.hint':
-    'Löscht Audit-Log, Gedächtnis und Dokumentenspeicher. Nicht wiederherstellbar.',
-  'settings.danger.erase.button': 'Alles löschen',
-  'settings.danger.clearConfirm.heading': 'Gespräch leeren?',
-  'settings.danger.clearConfirm.subtext':
-    'Dadurch werden alle Nachrichten und der Tool-Aufrufverlauf der aktuellen Sitzung entfernt.',
-  'settings.danger.clearConfirm.confirm': 'Leeren',
-  'settings.toast.chatCleared': 'Chat geleert',
+  'settings.danger.resetConfirm.heading': 'Einstellungen zurücksetzen?',
+  'settings.danger.resetConfirm.subtext':
+    'Das Design wird wieder hell, Hinweise zu Tool-Genehmigungen werden eingeschaltet und Hinweise zu erledigten Aufgaben ausgeschaltet. Verbundene Konten, Sprachen und Organisationseinstellungen bleiben unverändert.',
+  'settings.danger.resetConfirm.confirm': 'Zurücksetzen',
   'settings.toast.newSession': 'Neue Sitzung gestartet',
-  'settings.comingSoon.title': 'Demnächst verfügbar',
-  'settings.comingSoon.resetSettings': 'Das Zurücksetzen der Einstellungen ist noch nicht verfügbar.',
-  'settings.comingSoon.eraseAll': 'Das Löschen aller Daten ist noch nicht verfügbar.',
-  'settings.comingSoon.toggle': 'Dieser Schalter ist noch nicht verfügbar.',
   'settings.session.logout.label': 'Abmelden',
   'settings.session.logout.hint': 'Beendet Ihre Sitzung auf diesem Gerät.',
 

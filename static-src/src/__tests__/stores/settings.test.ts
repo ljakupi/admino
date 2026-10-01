@@ -22,6 +22,22 @@
  * - `sessionId` / `newSession()`: unchanged (the chat store depends on them).
  * Toast copy and fallback messages come from the i18n catalogs.
  *
+ * Issue #35 (Settings controls: task-done pings, reset my settings):
+ * - `taskDoneNotifications` starts `false` (off by default) and every applied
+ *   user-settings response (`loadSettings`, `saveSetting`) sets it from
+ *   `notifications.task_done`, independently of `notificationsEnabled`.
+ * - `setTaskDoneNotifications(v)`: optimistic, sends ONLY
+ *   `{ notifications: { task_done: v } }`, toasts "Saved" on success, reverts
+ *   and toasts "Save failed" on failure, never throws.
+ * - `resetSettings()`: one `POST /api/me/settings/reset` (`resetMySettings`),
+ *   applies the returned theme / notifications / task-done flag and toasts
+ *   `toast.settings.settingsReset`. On failure it toasts
+ *   `toast.settings.resetFailed.title` with the error message (fallback
+ *   `settings.error.resetFailed`), keeps the state and never throws. It never
+ *   disconnects an account, patches the org or user settings, or asks for the
+ *   OAuth status, and leaves the connected accounts, org tools and session id
+ *   alone.
+ *
  * Issue #149 guards stay: no bearer-token state and no read of the old
  * `admino_auth_token` localStorage key.
  *
@@ -37,6 +53,7 @@ import {
   getOrgSettings,
   patchMySettings,
   patchOrgSettings,
+  resetMySettings,
 } from '@/api/settings';
 import { ApiError } from '@/api/client';
 import { setLocale } from '@/i18n';
@@ -60,6 +77,7 @@ vi.mock('@/api/settings', () => ({
   getOAuthStatus: vi.fn(),
   getOAuthAuthorizeUrl: vi.fn(),
   disconnectOAuth: vi.fn(),
+  resetMySettings: vi.fn(),
 }));
 
 const mockedGetMySettings = vi.mocked(getMySettings);
@@ -69,6 +87,7 @@ const mockedPatchOrgSettings = vi.mocked(patchOrgSettings);
 const mockedGetOAuthStatus = vi.mocked(getOAuthStatus);
 const mockedGetOAuthAuthorizeUrl = vi.mocked(getOAuthAuthorizeUrl);
 const mockedDisconnectOAuth = vi.mocked(disconnectOAuth);
+const mockedResetMySettings = vi.mocked(resetMySettings);
 
 /** localStorage key the store persists the session id under. */
 const SESSION_STORAGE_KEY = 'admino_session_id';
@@ -141,8 +160,8 @@ function tools(overrides: Partial<ToolsSettings> = {}): ToolsSettings {
   };
 }
 
-function mySettings(theme: AppTheme, enabled: boolean): UserSettingsResponse {
-  return { appearance: { theme }, notifications: { enabled } };
+function mySettings(theme: AppTheme, enabled: boolean, taskDone = false): UserSettingsResponse {
+  return { appearance: { theme }, notifications: { enabled, task_done: taskDone } };
 }
 
 function orgSettings(overrides: Partial<ToolsSettings> = {}): OrgSettingsResponse {
@@ -234,6 +253,7 @@ beforeEach(() => {
   mockedGetOAuthStatus.mockReset();
   mockedGetOAuthAuthorizeUrl.mockReset();
   mockedDisconnectOAuth.mockReset();
+  mockedResetMySettings.mockReset();
 });
 
 afterEach(() => {
@@ -515,6 +535,339 @@ describe('settingsStore setNotificationsEnabled', () => {
       patches: [[{ notifications: { enabled: true } }]],
     });
   });
+});
+
+// --- Task-done pings (issue #35) -------------------------------------------
+
+describe('settingsStore taskDoneNotifications state', () => {
+  it('starts off (false)', () => {
+    expect(useSettingsStore().taskDoneNotifications).toBe(false);
+  });
+
+  it('exports setTaskDoneNotifications and resetSettings as actions', () => {
+    const store = useSettingsStore();
+
+    expect([typeof store.setTaskDoneNotifications, typeof store.resetSettings]).toEqual(['function', 'function']);
+  });
+
+  it.each([
+    [true, true],
+    [true, false],
+    [false, true],
+    [false, false],
+  ])(
+    'loadSettings applies enabled=%s and task_done=%s independently',
+    async (enabled, taskDone) => {
+      mockedGetMySettings.mockResolvedValueOnce(mySettings('dark', enabled, taskDone));
+      const store = useSettingsStore();
+
+      await store.loadSettings();
+
+      expect({
+        notificationsEnabled: store.notificationsEnabled,
+        taskDoneNotifications: store.taskDoneNotifications,
+      }).toEqual({ notificationsEnabled: enabled, taskDoneNotifications: taskDone });
+    },
+  );
+
+  it('loadSettings replaces a previously loaded task-done flag', async () => {
+    mockedGetMySettings
+      .mockResolvedValueOnce(mySettings('light', true, true))
+      .mockResolvedValueOnce(mySettings('light', true, false));
+    const store = useSettingsStore();
+
+    await store.loadSettings();
+    const first = store.taskDoneNotifications;
+    await store.loadSettings();
+
+    expect({ first, second: store.taskDoneNotifications }).toEqual({ first: true, second: false });
+  });
+
+  it('keeps a loaded task-done flag when a later load fails', async () => {
+    mockedGetMySettings
+      .mockResolvedValueOnce(mySettings('light', true, true))
+      .mockRejectedValueOnce(new Error('Service unavailable'));
+    const store = useSettingsStore();
+
+    await store.loadSettings();
+    await store.loadSettings();
+
+    expect(store.taskDoneNotifications).toBe(true);
+  });
+
+  it('saveSetting applies the task-done flag of the stored result', async () => {
+    mockedPatchMySettings.mockResolvedValueOnce(mySettings('dark', true, true));
+    const store = useSettingsStore();
+
+    await store.saveSetting({ appearance: { theme: 'dark' } });
+
+    expect(store.taskDoneNotifications).toBe(true);
+  });
+});
+
+describe('settingsStore setTaskDoneNotifications', () => {
+  it('switches on optimistically, sends only { notifications: { task_done: true } } and applies the result', async () => {
+    const pending = deferred<UserSettingsResponse>();
+    mockedPatchMySettings.mockReturnValueOnce(pending.promise);
+    const store = useSettingsStore();
+
+    const done = outcomeOf(store.setTaskDoneNotifications(true));
+    const during = store.taskDoneNotifications;
+    pending.resolve(mySettings('light', true, true));
+    const outcome = await done;
+
+    expect({
+      during,
+      patches: mockedPatchMySettings.mock.calls,
+      outcome,
+      after: store.taskDoneNotifications,
+    }).toStrictEqual({
+      during: true,
+      patches: [[{ notifications: { task_done: true } }]],
+      outcome: 'resolved',
+      after: true,
+    });
+  });
+
+  it('switches a loaded "on" off optimistically and sends only { notifications: { task_done: false } }', async () => {
+    mockedGetMySettings.mockResolvedValueOnce(mySettings('light', true, true));
+    const pending = deferred<UserSettingsResponse>();
+    mockedPatchMySettings.mockReturnValueOnce(pending.promise);
+    const store = useSettingsStore();
+    await store.loadSettings();
+
+    const done = outcomeOf(store.setTaskDoneNotifications(false));
+    const during = store.taskDoneNotifications;
+    pending.resolve(mySettings('light', true, false));
+    await done;
+
+    expect({ during, patches: mockedPatchMySettings.mock.calls, after: store.taskDoneNotifications }).toStrictEqual({
+      during: false,
+      patches: [[{ notifications: { task_done: false } }]],
+      after: false,
+    });
+  });
+
+  it('flips only the task-done flag while the save is pending (theme and tool-approval pings stay)', async () => {
+    mockedGetMySettings.mockResolvedValueOnce(mySettings('dark', false, false));
+    const pending = deferred<UserSettingsResponse>();
+    mockedPatchMySettings.mockReturnValueOnce(pending.promise);
+    const store = useSettingsStore();
+    await store.loadSettings();
+
+    const done = outcomeOf(store.setTaskDoneNotifications(true));
+    const during = {
+      theme: store.theme,
+      notificationsEnabled: store.notificationsEnabled,
+      taskDoneNotifications: store.taskDoneNotifications,
+    };
+    pending.resolve(mySettings('dark', false, true));
+    await done;
+
+    expect(during).toEqual({ theme: 'dark', notificationsEnabled: false, taskDoneNotifications: true });
+  });
+
+  it('adds the translated "Saved" success toast', async () => {
+    mockedPatchMySettings.mockResolvedValueOnce(mySettings('light', true, true));
+
+    await useSettingsStore().setTaskDoneNotifications(true);
+
+    expect(toastSummary()).toEqual([{ kind: 'success', title: en['toast.common.saved'] }]);
+  });
+
+  it('titles the success toast with the fr catalog string under fr', async () => {
+    setLocale('fr');
+    mockedPatchMySettings.mockResolvedValueOnce(mySettings('light', true, true));
+
+    await useSettingsStore().setTaskDoneNotifications(true);
+
+    expect(toastSummary()).toEqual([{ kind: 'success', title: fr['toast.common.saved'] }]);
+  });
+
+  it('reverts to the default (off), shows a "Save failed" toast and never throws when the save fails', async () => {
+    mockedPatchMySettings.mockRejectedValueOnce(new ApiError(429, 'Too Many Requests', 'Rate limit exceeded'));
+    const store = useSettingsStore();
+
+    const outcome = await outcomeOf(store.setTaskDoneNotifications(true));
+
+    expect({ outcome, taskDone: store.taskDoneNotifications, toasts: toastSummary() }).toEqual({
+      outcome: 'resolved',
+      taskDone: false,
+      toasts: [{ kind: 'error', title: en['toast.common.saveFailed.title'], body: 'Rate limit exceeded' }],
+    });
+  });
+
+  it('reverts to a loaded "on" when switching off fails with a non-Error rejection', async () => {
+    mockedGetMySettings.mockResolvedValueOnce(mySettings('light', true, true));
+    mockedPatchMySettings.mockRejectedValueOnce('offline');
+    const store = useSettingsStore();
+    await store.loadSettings();
+
+    const outcome = await outcomeOf(store.setTaskDoneNotifications(false));
+
+    expect({
+      outcome,
+      taskDone: store.taskDoneNotifications,
+      patches: mockedPatchMySettings.mock.calls,
+      toasts: toastSummary(),
+    }).toStrictEqual({
+      outcome: 'resolved',
+      taskDone: true,
+      patches: [[{ notifications: { task_done: false } }]],
+      toasts: [{ kind: 'error', title: en['toast.common.saveFailed.title'], body: en['settings.error.saveFailed'] }],
+    });
+  });
+});
+
+// --- Reset my settings: POST /api/me/settings/reset (issue #35) ------------
+
+describe('settingsStore resetSettings', () => {
+  /** Loads non-default user settings: dark, tool-approval pings off, task-done pings on. */
+  async function loadCustomized(store: ReturnType<typeof useSettingsStore>): Promise<void> {
+    mockedGetMySettings.mockResolvedValueOnce(mySettings('dark', false, true));
+    await store.loadSettings();
+  }
+
+  function userState(store: ReturnType<typeof useSettingsStore>) {
+    return {
+      theme: store.theme,
+      notificationsEnabled: store.notificationsEnabled,
+      taskDoneNotifications: store.taskDoneNotifications,
+    };
+  }
+
+  it('calls resetMySettings once, with no arguments', async () => {
+    mockedResetMySettings.mockResolvedValueOnce(mySettings('light', true, false));
+    const store = useSettingsStore();
+
+    await store.resetSettings();
+
+    expect(mockedResetMySettings.mock.calls).toEqual([[]]);
+  });
+
+  it('applies the returned defaults over customized settings and adds the "settings reset" toast', async () => {
+    const store = useSettingsStore();
+    await loadCustomized(store);
+    mockedResetMySettings.mockResolvedValueOnce(mySettings('light', true, false));
+
+    const outcome = await outcomeOf(store.resetSettings());
+
+    expect({ outcome, state: userState(store), toasts: toastSummary() }).toEqual({
+      outcome: 'resolved',
+      state: { theme: 'light', notificationsEnabled: true, taskDoneNotifications: false },
+      toasts: [{ kind: 'success', title: en['toast.settings.settingsReset'] }],
+    });
+  });
+
+  it('applies exactly what the server returns, not hard-coded defaults', async () => {
+    const store = useSettingsStore();
+    mockedResetMySettings.mockResolvedValueOnce(mySettings('system', false, true));
+
+    await store.resetSettings();
+
+    expect(userState(store)).toEqual({ theme: 'system', notificationsEnabled: false, taskDoneNotifications: true });
+  });
+
+  it('titles the success toast with the fr catalog string under fr', async () => {
+    setLocale('fr');
+    mockedResetMySettings.mockResolvedValueOnce(mySettings('light', true, false));
+
+    await useSettingsStore().resetSettings();
+
+    expect(toastSummary()).toEqual([{ kind: 'success', title: fr['toast.settings.settingsReset'] }]);
+  });
+
+  it.each([
+    ['429 rate limit', new ApiError(429, 'Too Many Requests', 'Rate limit exceeded'), 'Rate limit exceeded'],
+    ['403', new ApiError(403, 'Forbidden', 'Forbidden'), 'Forbidden'],
+    ['network failure', new TypeError('Failed to fetch'), 'Failed to fetch'],
+  ])(
+    'on a %s shows a "Reset failed" toast with the error message, keeps the settings and never throws',
+    async (_label, rejection, body) => {
+      const store = useSettingsStore();
+      await loadCustomized(store);
+      mockedResetMySettings.mockRejectedValueOnce(rejection);
+
+      const outcome = await outcomeOf(store.resetSettings());
+
+      expect({ outcome, state: userState(store), toasts: toastSummary() }).toEqual({
+        outcome: 'resolved',
+        state: { theme: 'dark', notificationsEnabled: false, taskDoneNotifications: true },
+        toasts: [{ kind: 'error', title: en['toast.settings.resetFailed.title'], body }],
+      });
+    },
+  );
+
+  it('falls back to the translated reset-failed body for a non-Error rejection', async () => {
+    mockedResetMySettings.mockRejectedValueOnce('offline');
+    const store = useSettingsStore();
+
+    const outcome = await outcomeOf(store.resetSettings());
+
+    expect({ outcome, state: userState(store), toasts: toastSummary() }).toEqual({
+      outcome: 'resolved',
+      state: { theme: 'light', notificationsEnabled: true, taskDoneNotifications: false },
+      toasts: [
+        { kind: 'error', title: en['toast.settings.resetFailed.title'], body: en['settings.error.resetFailed'] },
+      ],
+    });
+  });
+
+  it('takes the failure toast title and fallback body from the active locale', async () => {
+    setLocale('fr');
+    mockedResetMySettings.mockRejectedValueOnce({ detail: 'not an Error' });
+
+    await outcomeOf(useSettingsStore().resetSettings());
+
+    expect(toastSummary()).toEqual([
+      { kind: 'error', title: fr['toast.settings.resetFailed.title'], body: fr['settings.error.resetFailed'] },
+    ]);
+  });
+
+  it.each([
+    ['succeeds', true],
+    ['fails', false],
+  ])(
+    'when the reset %s it never disconnects, patches or asks for the OAuth status, and keeps accounts, tools and session',
+    async (_label, succeeds) => {
+      const store = useSettingsStore();
+      statusesAre({ google: GOOGLE_CONNECTED, microsoft: MICROSOFT_CONNECTED });
+      await store.loadConnections();
+      mockedGetOrgSettings.mockResolvedValueOnce(orgSettings({ gmail: false, onedrive: false }));
+      await store.loadOrgTools();
+      const sessionBefore = store.sessionId;
+      const statusRequestsBefore = mockedGetOAuthStatus.mock.calls.length;
+      if (succeeds) {
+        mockedResetMySettings.mockResolvedValueOnce(mySettings('light', true, false));
+      } else {
+        mockedResetMySettings.mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'));
+      }
+
+      await outcomeOf(store.resetSettings());
+
+      expect({
+        resets: mockedResetMySettings.mock.calls.length,
+        disconnects: mockedDisconnectOAuth.mock.calls.length,
+        orgPatches: mockedPatchOrgSettings.mock.calls.length,
+        userPatches: mockedPatchMySettings.mock.calls.length,
+        statusRequests: mockedGetOAuthStatus.mock.calls.length - statusRequestsBefore,
+        accounts: store.connectedAccounts,
+        tools: store.tools,
+        sessionId: store.sessionId,
+        sessionStored: localStorage.getItem(SESSION_STORAGE_KEY),
+      }).toEqual({
+        resets: 1,
+        disconnects: 0,
+        orgPatches: 0,
+        userPatches: 0,
+        statusRequests: 0,
+        accounts: { google: GOOGLE_CONNECTED, microsoft: MICROSOFT_CONNECTED },
+        tools: tools({ gmail: false, onedrive: false }),
+        sessionId: sessionBefore,
+        sessionStored: sessionBefore,
+      });
+    },
+  );
 });
 
 // --- loadConnections: GET /api/oauth/{provider}/status --------------------

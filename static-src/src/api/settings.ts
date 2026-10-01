@@ -5,6 +5,9 @@
  * The old single `/api/settings` endpoint is gone. This module wraps:
  * - `getMySettings` / `patchMySettings` -> `/api/me/settings` (the caller's
  *   own theme and notifications, every role),
+ * - `resetMySettings` -> `POST /api/me/settings/reset` (issue #35: reverts
+ *   the caller's own theme and notifications to the defaults; no request
+ *   body),
  * - `getOrgSettings` / `patchOrgSettings` -> `/api/org/settings` (Org Admin
  *   only; anyone else gets a 403),
  * - `getOAuthStatus` -> `/api/oauth/{provider}/status`.
@@ -31,6 +34,10 @@ export async function patchMySettings(patch: UserSettingsPatch): Promise<UserSet
     method: 'PATCH',
     body: JSON.stringify(patch),
   });
+}
+
+export async function resetMySettings(): Promise<UserSettingsResponse> {
+  return fetchJson<UserSettingsResponse>('/api/me/settings/reset', { method: 'POST' });
 }
 
 export async function getOrgSettings(): Promise<OrgSettingsResponse> {

@@ -23,7 +23,7 @@ const auth = useAuthStore();
 const chatStore = useChatStore();
 const toasts = useToastStore();
 
-const showClearConfirm = ref(false);
+const showResetConfirm = ref(false);
 const activeSection = ref(route.hash === '#danger' ? 'danger' : 'appearance');
 
 // --- Subnav definition ---
@@ -70,12 +70,8 @@ async function onNotificationsChange(value: boolean) {
   await settings.setNotificationsEnabled(value);
 }
 
-// --- Data / Danger section ---
-function handleClearChat() {
-  chatStore.clearThread();
-  draftSessionId.value = settings.sessionId;
-  showClearConfirm.value = false;
-  toasts.add('success', t('settings.toast.chatCleared'));
+async function onTaskDoneChange(value: boolean) {
+  await settings.setTaskDoneNotifications(value);
 }
 
 function handleNewSession() {
@@ -89,26 +85,10 @@ async function handleLogout() {
   await router.replace('/login');
 }
 
-async function handleDisconnectAll() {
-  await settings.loadConnections();
-  if (settings.connectedAccounts.google.connected) {
-    await settings.disconnectGoogle();
-  }
-  if (settings.connectedAccounts.microsoft.connected) {
-    await settings.disconnectMicrosoft();
-  }
-}
-
-function handleResetSettings() {
-  toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.resetSettings'));
-}
-
-function handleEraseAll() {
-  toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.eraseAll'));
-}
-
-function handleComingSoonToggle() {
-  toasts.add('info', t('settings.comingSoon.title'), t('settings.comingSoon.toggle'));
+// --- Danger section ---
+async function handleResetConfirmed() {
+  await settings.resetSettings();
+  showResetConfirm.value = false;
 }
 </script>
 
@@ -232,14 +212,10 @@ function handleComingSoonToggle() {
                 {{ t('settings.notifications.taskDone.label') }}
                 <span class="row-hint">{{ t('settings.notifications.taskDone.hint') }}</span>
               </div>
-              <BaseToggle :model-value="false" @update:model-value="handleComingSoonToggle" />
-            </div>
-            <div class="s-row">
-              <div class="row-label">
-                {{ t('settings.notifications.sound.label') }}
-                <span class="row-hint">{{ t('settings.notifications.sound.hint') }}</span>
-              </div>
-              <BaseToggle :model-value="false" @update:model-value="handleComingSoonToggle" />
+              <BaseToggle
+                :model-value="settings.taskDoneNotifications"
+                @update:model-value="onTaskDoneChange"
+              />
             </div>
           </div>
         </template>
@@ -281,31 +257,10 @@ function handleComingSoonToggle() {
           <div class="danger-card">
             <div class="s-row">
               <div class="row-label">
-                {{ t('settings.danger.clear.label') }}
-                <span class="row-hint">{{ t('settings.danger.clear.hint') }}</span>
-              </div>
-              <button class="s-btn danger" @click="showClearConfirm = true">{{ t('settings.danger.clear.button') }}</button>
-            </div>
-            <div class="s-row">
-              <div class="row-label">
-                {{ t('settings.danger.disconnectAll.label') }}
-                <span class="row-hint">{{ t('settings.danger.disconnectAll.hint') }}</span>
-              </div>
-              <button class="s-btn danger" @click="handleDisconnectAll">{{ t('settings.danger.disconnectAll.button') }}</button>
-            </div>
-            <div class="s-row">
-              <div class="row-label">
                 {{ t('settings.danger.reset.label') }}
                 <span class="row-hint">{{ t('settings.danger.reset.hint') }}</span>
               </div>
-              <button class="s-btn danger" @click="handleResetSettings">{{ t('settings.danger.reset.button') }}</button>
-            </div>
-            <div class="s-row">
-              <div class="row-label danger-label">
-                {{ t('settings.danger.erase.label') }}
-                <span class="row-hint">{{ t('settings.danger.erase.hint') }}</span>
-              </div>
-              <button class="s-btn danger solid" @click="handleEraseAll">{{ t('settings.danger.erase.button') }}</button>
+              <button class="s-btn danger" @click="showResetConfirm = true">{{ t('settings.danger.reset.button') }}</button>
             </div>
           </div>
         </template>
@@ -313,13 +268,13 @@ function handleComingSoonToggle() {
     </main>
 
     <ConfirmSheet
-      v-if="showClearConfirm"
-      :heading="t('settings.danger.clearConfirm.heading')"
-      :subtext="t('settings.danger.clearConfirm.subtext')"
-      :confirm-label="t('settings.danger.clearConfirm.confirm')"
+      v-if="showResetConfirm"
+      :heading="t('settings.danger.resetConfirm.heading')"
+      :subtext="t('settings.danger.resetConfirm.subtext')"
+      :confirm-label="t('settings.danger.resetConfirm.confirm')"
       variant="destructive"
-      @confirm="handleClearChat"
-      @cancel="showClearConfirm = false"
+      @confirm="handleResetConfirmed"
+      @cancel="showResetConfirm = false"
     />
   </div>
 </template>
@@ -607,17 +562,6 @@ function handleComingSoonToggle() {
   color: #B82F2F;
 }
 
-.s-btn.danger.solid {
-  background: var(--color-error);
-  color: var(--color-text-on-dark);
-  border-color: var(--color-error);
-}
-
-.s-btn.danger.solid:hover {
-  background: #D34646;
-  border-color: #D34646;
-}
-
 .s-btn.small {
   padding: 6px 12px;
   font-size: 12.5px;
@@ -714,9 +658,5 @@ function handleComingSoonToggle() {
 
 .danger-card .s-row {
   border-bottom-color: #F5DBDB;
-}
-
-.danger-label {
-  color: #8A2A2A;
 }
 </style>

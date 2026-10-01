@@ -48,7 +48,8 @@ The settings scopes (GH-159, migration 0013):
 - ``user_settings`` (``user_settings``, keyed by user id): ``user_id``
   (primary key, references users ON DELETE CASCADE), ``theme`` (NOT NULL,
   default 'light', one of light / dark / system), ``notifications_enabled``
-  (NOT NULL, default true) and ``updated_at``.
+  (NOT NULL, default true), ``notifications_task_done`` (GH-35, migration
+  0015: NOT NULL, default false) and ``updated_at``.
 - Every statement naming one of the three tables runs through the SQL
   reader. Written rows must satisfy the migration: a value of the wrong
   Python type (a non-bool for a BOOLEAN, a non-int for an INTEGER, a non-str
@@ -427,7 +428,7 @@ _ORG_SETTINGS_COLUMNS: Final = frozenset(
     {"org_id", *(f"{tool}_enabled" for tool in TOOL_NAMES), "updated_at"}
 )
 _USER_SETTINGS_COLUMNS: Final = frozenset(
-    {"user_id", "theme", "notifications_enabled", "updated_at"}
+    {"user_id", "theme", "notifications_enabled", "notifications_task_done", "updated_at"}
 )
 _SETTINGS_TABLES: Final = frozenset({"platform_settings", "org_settings", "user_settings"})
 # The primary key of every table an INSERT ... ON CONFLICT may name.
@@ -456,6 +457,7 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
         "user_id": "uuid",
         "theme": "text",
         "notifications_enabled": "bool",
+        "notifications_task_done": "bool",
         "updated_at": "timestamptz",
     },
 }
@@ -963,13 +965,15 @@ class FakeDb:
         *,
         theme: str = "light",
         notifications_enabled: bool = True,
+        notifications_task_done: bool = False,
         updated_at: datetime | None = None,
     ) -> dict[str, Any]:
-        """Store a user's user_settings row (GH-159)."""
+        """Store a user's user_settings row (GH-159, GH-35)."""
         row: dict[str, Any] = {
             "user_id": user_id,
             "theme": theme,
             "notifications_enabled": notifications_enabled,
+            "notifications_task_done": notifications_task_done,
             "updated_at": updated_at or datetime.now(UTC),
         }
         self.check_settings("user_settings", row, original=None)
@@ -1248,7 +1252,7 @@ class FakeDb:
     # -- the settings tables of migration 0013 (GH-159) ----------------------------
 
     def settings_defaults(self, table: str, given: dict[str, Any], now: datetime) -> dict[str, Any]:
-        """A new settings row: the column defaults of migration 0013, then the given values."""
+        """A new settings row: the column defaults (migrations 0013-0015), then the given values."""
         row: dict[str, Any] = dict.fromkeys(_COLUMNS[table])
         if table == "platform_settings":
             row["id"] = True
@@ -1256,7 +1260,7 @@ class FakeDb:
         elif table == "org_settings":
             row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
         else:
-            row.update(theme="light", notifications_enabled=True)
+            row.update(theme="light", notifications_enabled=True, notifications_task_done=False)
         row["updated_at"] = now
         row.update(given)
         return row
