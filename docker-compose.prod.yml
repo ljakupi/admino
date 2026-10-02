@@ -2,11 +2,11 @@
 #
 # Usage (see Makefile):
 #   make docker-build-prod   # build the agent and caddy images
-#   make start-prod          # start postgres + agent + caddy (never vllm)
+#   make start-prod          # start postgres + migrate + agent + caddy (never vllm)
 #   make docker-logs-prod    # follow logs
 #   make docker-down-prod    # stop everything
 # which run, e.g.:
-#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres agent caddy
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d postgres migrate agent caddy
 #
 # docker-compose.local.yml (the laptop port) is left out, so the agent
 # publishes NO host port: Caddy is the only service on the host's ports (80 and

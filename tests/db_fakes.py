@@ -204,10 +204,13 @@ The organization lifecycle (GH-154):
   ``DELETE FROM users WHERE org_id = $1`` deletes every user of the org
   whatever its status, and each deleted user cascades to its sessions,
   invitation, email_outbox rows and reset token.
-- ``SELECT purge_org_audit_events($n)`` emulates migration 0011's function:
-  unless that org exists with status pending_deletion and ``purge_after <=
-  now()`` it raises InsufficientPrivilegeError; otherwise it deletes that org's
-  audit rows and returns how many. Every other DELETE, UPDATE or TRUNCATE that
+- ``SELECT purge_org_audit_events($n)`` emulates the function of migrations
+  0011 and 0019: unless that org exists with status pending_deletion and
+  ``purge_after <= now()`` it raises InsufficientPrivilegeError; while a users
+  row still names the org it raises ForeignKeyViolationError (users.org_id is
+  ON DELETE RESTRICT) and changes nothing; otherwise it deletes that org's
+  audit rows, then the organizations row (its cascades included, GH-220), and
+  returns how many audit rows it deleted. Every other DELETE, UPDATE or TRUNCATE that
   touches audit_events raises InsufficientPrivilegeError, like the
   append-only trigger, and any other TRUNCATE fails the test.
 - Audit rows keep every column (id, occurred_at, org_id, actor_user_id,
@@ -2028,7 +2031,8 @@ class FakeDb:
     def _purge_org_audit_events(
         self, method: str, match: re.Match[str], args: tuple[Any, ...]
     ) -> Any:
-        """Migration 0011's purge_org_audit_events(uuid): only for a due, pending org."""
+        """purge_org_audit_events(uuid) (migrations 0011, 0019): only for a due, pending
+        org whose users are gone; deletes its audit rows, then the org row."""
         index = int(match.group(1)) - 1
         assert 0 <= index < len(args), "purge_org_audit_events needs its org id bound"
         raw = args[index]
@@ -2044,6 +2048,12 @@ class FakeDb:
         ):
             msg = "audit events can only be purged for an organization due for deletion"
             raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+        # GH-220 (migration 0019): the function deletes the org row after its audit
+        # rows, in the same statement; users.org_id is ON DELETE RESTRICT, so a
+        # remaining user fails the whole call before anything changes.
+        if any(user["org_id"] == org["id"] for user in self.users.values()):
+            msg = 'update or delete on table "organizations" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
         kept = [
             event
             for event in self.audit
@@ -2051,6 +2061,7 @@ class FakeDb:
         ]
         purged = len(self.audit) - len(kept)
         self.audit = kept
+        self.delete_row("organizations", org)
         key = match.group(2) or "purge_org_audit_events"
         if method == "fetchval":
             return purged

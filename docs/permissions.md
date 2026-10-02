@@ -118,7 +118,9 @@ output or any message text.
 
 The table is append-only: a database trigger refuses edits and deletions, except the daily
 retention purge of rows older than the audit retention (12 months by default). If a row can't be written, the agent stops
-the run instead of carrying on unaudited. See
+the run instead of carrying on unaudited. The app's database role can only add and read
+rows there, so it can't switch the trigger off either (see
+[Database roles](SECURITY.md#database-roles)). See
 [Configuration → Data & storage](configuration.md#data--storage).
 
 ---

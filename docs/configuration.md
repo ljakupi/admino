@@ -397,6 +397,11 @@ the Super Admin did.
   invitations and queued email, their audit log, the organization itself, and its files on
   disk. What stays is the platform's record of the deletion: an `org.purge` audit event
   with the organization's ID and counts, no names.
+
+  The database enforces the grace period too: a deletion is always open for at least
+  7 days and its dates can't change while it's pending, so nothing can purge an
+  organization, or its audit log, sooner (see
+  [Security Model → Database roles](SECURITY.md#database-roles)).
 - **Data residency**: `PATCH /api/platform/orgs/{id}/residency` with `{"enabled": true}`
   or `false`. New organizations start with it on. The change is recorded in the
   organization's audit log, where its Org Admins see it. While it's on, the organization's
@@ -460,9 +465,9 @@ terminates TLS with a Let's Encrypt certificate. It's defined in
 targets:
 
 ```bash
-# .env: ADMINO_DOMAIN=admino.example.ch (plus the usual PG_PASSWORD, INFOMANIAK_API_TOKEN, SMTP_*)
+# .env: ADMINO_DOMAIN=admino.example.ch (plus the usual PG_PASSWORD, PG_APP_PASSWORD, INFOMANIAK_API_TOKEN, SMTP_*)
 make docker-build-prod    # build the agent and caddy images
-make start-prod           # postgres + agent + caddy
+make start-prod           # postgres + migrate + agent + caddy
 make docker-logs-prod     # follow logs
 make docker-down-prod     # stop everything
 ```
@@ -509,6 +514,12 @@ certificate authority instead of Let's Encrypt. Check it with curl, e.g.
 PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, each organization's `permissions`,
 each user's `memory` notes and `oauth_tokens` (one row per user and provider), the
 `audit_events` audit trail, and the `email_outbox` of queued transactional email.
+
+- **Two database roles.** The app connects as `admino_app`, a non-superuser with
+  per-table rights (`PG_APP_PASSWORD`). The owner `admino` (`PG_PASSWORD`) applies the
+  migrations in the one-shot `migrate` service before the agent starts (`make migrate` in
+  local dev), and the app never gets its password. The app refuses to start while
+  migrations are pending. See [Security Model → Database roles](SECURITY.md#database-roles).
 
 - **OAuth tokens** are stored as **encrypted ciphertext only**. The Fernet encryption key
   lives in the `OAUTH_ENCRYPTION_KEY` environment variable and is **never** persisted to

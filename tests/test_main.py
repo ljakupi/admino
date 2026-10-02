@@ -46,6 +46,17 @@ covering:
   root handler (JSON or text, no tracebacks). A database startup failure is
   logged by exception type only: a DSN or password in the exception message
   never reaches the log.
+- GH-220: least-privilege runtime role. ``_async_startup`` connects with the
+  runtime DSN (``database_url_from_env()``: user ``admino_app``, password
+  PG_APP_PASSWORD) and never runs migrations (the one-shot migrate step does):
+  after the health check it awaits ``database.pending_migration_versions(pool)``
+  and, when any shipped migration is missing, closes the pool and raises a
+  RuntimeError before any seeding. A missing PG_APP_PASSWORD raises a ValueError
+  naming it, before any connection, even when the owner's PG_PASSWORD is set.
+  main() also maps ``asyncpg.PostgresError`` (e.g. the runtime role doesn't exist
+  yet) to exit 1, logged by type only, with a hint that names PG_APP_PASSWORD and
+  never the owner variables. main.py never mentions PG_PASSWORD or PG_USER, and
+  never references ``run_migrations``.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -58,13 +69,15 @@ from __future__ import annotations
 import ast
 import inspect
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import DEFAULT, AsyncMock, MagicMock, patch
+from unittest.mock import DEFAULT, AsyncMock, MagicMock, call, patch
 
+import asyncpg
 import httpx
 import pytest
 import uvicorn
@@ -1024,6 +1037,149 @@ class TestMainDatabaseStartupFailures:
         mock_deps["uvicorn_run"].assert_not_called()
 
 
+# GH-220: the runtime role may not exist yet (the migrate step hasn't run), its
+# password may be wrong, or it may lack a privilege. asyncpg raises a PostgresError for
+# each, which is neither a ValueError, a RuntimeError nor an OSError.
+_POSTGRES_STARTUP_ERRORS: tuple[type[asyncpg.PostgresError], ...] = (
+    asyncpg.InvalidAuthorizationSpecificationError,
+    asyncpg.InvalidPasswordError,
+    asyncpg.InsufficientPrivilegeError,
+    asyncpg.UndefinedTableError,
+    asyncpg.PostgresError,
+)
+_DB_STARTUP_FAILURES: tuple[type[Exception], ...] = (
+    ValueError,
+    RuntimeError,
+    OSError,
+    *_POSTGRES_STARTUP_ERRORS,
+)
+# A message carrying what must never reach the log: the runtime password and the host.
+_LEAKY_DB_ERROR = (
+    'password authentication failed for user "admino_app" '
+    "(postgresql://admino_app:app-s3cretpw@db.internal:5432/admino)"
+)
+_OWNER_ENV_NAME = re.compile(r"\bPG_(?:PASSWORD|USER)\b")
+
+
+def _fail_db_startup(mock_deps: dict[str, Any], exc: Exception) -> None:
+    """Make main()'s asyncio.run(_async_startup(...)) raise ``exc`` (the coroutine is
+    closed first, so it is never left un-awaited)."""
+
+    def _close_then_raise(coro: Any) -> None:
+        if hasattr(coro, "close"):
+            coro.close()
+        raise exc
+
+    mock_deps["asyncio"].run = MagicMock(side_effect=_close_then_raise)
+
+
+def _db_startup_failure_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    """The "Database startup failed" records main() logged."""
+    return [
+        record
+        for record in caplog.records
+        if record.name == "admino.main" and "Database startup failed" in record.getMessage()
+    ]
+
+
+class TestMainDatabaseStartupRuntimeRole:
+    """GH-220: main() connects as the runtime role. A PostgresError at startup (the role
+    doesn't exist yet, a wrong PG_APP_PASSWORD, a missing privilege) exits 1 like the
+    other startup failures, and the fixed hint names the runtime variables only."""
+
+    @pytest.mark.parametrize("exc_type", _POSTGRES_STARTUP_ERRORS)
+    def test_main_postgres_error_at_startup_exits_1_without_serving(
+        self, mock_deps: dict[str, Any], exc_type: type[asyncpg.PostgresError]
+    ) -> None:
+        """An asyncpg.PostgresError from _async_startup exits with code 1; the app is
+        never created and uvicorn never runs."""
+        _fail_db_startup(mock_deps, exc_type('role "admino_app" does not exist'))
+
+        with pytest.raises(SystemExit) as exc_info:
+            main(config_path=Path("c.yaml"))
+
+        assert exc_info.value.code == 1
+        mock_deps["create_app"].assert_not_called()
+        mock_deps["uvicorn_run"].assert_not_called()
+
+    @pytest.mark.parametrize("exc_type", _POSTGRES_STARTUP_ERRORS)
+    def test_main_postgres_error_at_startup_logs_the_exception_type_only(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        exc_type: type[asyncpg.PostgresError],
+    ) -> None:
+        """One ERROR "Database startup failed" line names the PostgresError's type, never
+        its message (which can carry a DSN, a role or a host), and has no traceback."""
+        monkeypatch.setattr("admino.main._configure_logging", MagicMock())
+        _fail_db_startup(mock_deps, exc_type(_LEAKY_DB_ERROR))
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit):
+            main(config_path=Path("c.yaml"))
+
+        failures = _db_startup_failure_records(caplog)
+        assert len(failures) == 1
+        assert failures[0].levelno == logging.ERROR
+        assert exc_type.__name__ in failures[0].getMessage()
+        assert failures[0].exc_info is None
+        assert "app-s3cretpw" not in caplog.text
+        assert "db.internal" not in caplog.text
+        assert "password authentication failed" not in caplog.text
+
+    @pytest.mark.parametrize("exc_type", _DB_STARTUP_FAILURES)
+    def test_main_db_startup_hint_names_the_runtime_variables_and_the_migrations(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        exc_type: type[Exception],
+    ) -> None:
+        """The fixed hint names PG_APP_PASSWORD, PG_HOST, PG_PORT and PG_DATABASE, and
+        that the migrations must have run (the runtime role and the schema come from the
+        migrate step)."""
+        monkeypatch.setattr("admino.main._configure_logging", MagicMock())
+        _fail_db_startup(mock_deps, exc_type("db failed"))
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit):
+            main(config_path=Path("c.yaml"))
+
+        failures = _db_startup_failure_records(caplog)
+        assert len(failures) == 1
+        hint = failures[0].getMessage()
+        for name in ("PG_APP_PASSWORD", "PG_HOST", "PG_PORT", "PG_DATABASE"):
+            assert name in hint
+        assert "migrat" in hint.lower()
+
+    @pytest.mark.parametrize("exc_type", _DB_STARTUP_FAILURES)
+    def test_main_db_startup_hint_never_names_the_owner_variables(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        exc_type: type[Exception],
+    ) -> None:
+        """The app never uses the owner credential, so the hint never sends anyone to
+        PG_PASSWORD or PG_USER (only the migrate step knows them)."""
+        monkeypatch.setattr("admino.main._configure_logging", MagicMock())
+        _fail_db_startup(mock_deps, exc_type("db failed"))
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit):
+            main(config_path=Path("c.yaml"))
+
+        failures = _db_startup_failure_records(caplog)
+        assert len(failures) == 1
+        assert _OWNER_ENV_NAME.search(failures[0].getMessage()) is None
+
+    @pytest.mark.parametrize("name", ["PG_PASSWORD", "PG_USER"])
+    def test_main_module_never_mentions_the_owner_variables(self, name: str) -> None:
+        """main.py (code, messages and docstrings) contains neither PG_PASSWORD nor
+        PG_USER as a word: only admino.migrate reads the owner credential."""
+        source = _MAIN_MODULE_PATH.read_text(encoding="utf-8")
+
+        assert re.search(rf"\b{name}\b", source) is None
+
+
 # ---------------------------------------------------------------------------
 # _async_startup direct tests (GH-159: the platform row; GH-161: per-org permission seed)
 # ---------------------------------------------------------------------------
@@ -1083,20 +1239,33 @@ class _Startup:
     db: FakeDb
     events: list[tuple[str, int]]
     init_pool: AsyncMock
+    check_health: AsyncMock
+    pending_migration_versions: AsyncMock
+    run_migrations: AsyncMock
     seed_missing_orgs: AsyncMock
     close_pool: AsyncMock
 
 
-def _patch_startup_db(monkeypatch: pytest.MonkeyPatch) -> _Startup:
+def _patch_startup_db(
+    monkeypatch: pytest.MonkeyPatch, *, pending: list[int] | None = None
+) -> _Startup:
     """Run _async_startup against tests/db_fakes.FakeDb (GH-159).
 
-    Migrations, the per-org permission seed (GH-161:
-    ``org_permissions.seed_missing_orgs``), the health check and the pool's close
-    are patched; the settings code (admino.scoped_settings) runs for real against
-    the fake's platform_settings and org_settings tables, and any statement on the
-    dropped ``settings`` table fails like PostgreSQL.
+    The per-org permission seed (GH-161: ``org_permissions.seed_missing_orgs``), the
+    health check and the pool's close are patched; the settings code
+    (admino.scoped_settings) runs for real against the fake's platform_settings and
+    org_settings tables, and any statement on the dropped ``settings`` table fails
+    like PostgreSQL.
+
+    GH-220: the owner's PG_PASSWORD and PG_USER are unset (startup connects as the
+    runtime role with PG_APP_PASSWORD, which tests/conftest.py provides).
+    ``database.pending_migration_versions`` reports ``pending`` (default: none); it
+    is patched without ``raising=False``, so the real function must exist.
+    ``database.run_migrations`` is patched only so that a call (which the spec
+    forbids) is observable and harmless.
     """
-    monkeypatch.setenv("PG_PASSWORD", "testpass")
+    monkeypatch.delenv("PG_PASSWORD", raising=False)
+    monkeypatch.delenv("PG_USER", raising=False)
     db = FakeDb()
     events: list[tuple[str, int]] = []
 
@@ -1108,20 +1277,27 @@ def _patch_startup_db(monkeypatch: pytest.MonkeyPatch) -> _Startup:
         return _record
 
     init_pool = AsyncMock(return_value=db.pool, side_effect=step("init_pool"))
+    check_health = AsyncMock(return_value=True, side_effect=step("check_health"))
+    pending_migration_versions = AsyncMock(
+        return_value=list(pending or []), side_effect=step("pending_migration_versions")
+    )
+    run_migrations = AsyncMock(side_effect=step("run_migrations"))
     seed_missing_orgs = AsyncMock(return_value=0, side_effect=step("seed_missing_orgs"))
     close_pool = AsyncMock(side_effect=step("close_pool"))
     monkeypatch.setattr("admino.database.init_pool", init_pool)
     monkeypatch.setattr("admino.database.get_pool", lambda: db.pool)
-    monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
-    monkeypatch.setattr(
-        "admino.database.run_migrations", AsyncMock(side_effect=step("run_migrations"))
-    )
+    monkeypatch.setattr("admino.database.check_health", check_health)
+    monkeypatch.setattr("admino.database.pending_migration_versions", pending_migration_versions)
+    monkeypatch.setattr("admino.database.run_migrations", run_migrations)
     monkeypatch.setattr("admino.org_permissions.seed_missing_orgs", seed_missing_orgs)
     monkeypatch.setattr("admino.database.close_pool", close_pool)
     return _Startup(
         db=db,
         events=events,
         init_pool=init_pool,
+        check_health=check_health,
+        pending_migration_versions=pending_migration_versions,
+        run_migrations=run_migrations,
         seed_missing_orgs=seed_missing_orgs,
         close_pool=close_pool,
     )
@@ -1138,20 +1314,74 @@ def _platform_llm(row: dict[str, Any]) -> dict[str, Any]:
 
 
 class TestAsyncStartup:
-    """_async_startup: migrations, the platform row seeded from config.yaml and overlaid
-    onto the config (GH-159), and the per-org permission seed (GH-161)."""
+    """_async_startup: the pending-migrations check (GH-220), the platform row seeded from
+    config.yaml and overlaid onto the config (GH-159), and the per-org permission seed
+    (GH-161)."""
 
+    @pytest.mark.parametrize(
+        "app_password", [pytest.param(None, id="unset"), pytest.param("", id="empty")]
+    )
     @pytest.mark.asyncio
-    async def test_raises_when_pg_password_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """_async_startup raises ValueError when PG_PASSWORD is not set."""
-        monkeypatch.delenv("PG_PASSWORD", raising=False)
-        with pytest.raises(ValueError, match="PG_PASSWORD"):
-            await _async_startup(MagicMock())
+    async def test_async_startup_without_pg_app_password_raises_before_connecting(
+        self, monkeypatch: pytest.MonkeyPatch, app_password: str | None
+    ) -> None:
+        """GH-220: an unset or empty PG_APP_PASSWORD raises a ValueError naming it, and
+        nothing connects, even when the owner's PG_USER and PG_PASSWORD are set (startup
+        never falls back to the owner credential)."""
+        startup = _patch_startup_db(monkeypatch)
+        monkeypatch.setenv("PG_USER", "admino")
+        monkeypatch.setenv("PG_PASSWORD", "owner-secret")
+        if app_password is None:
+            monkeypatch.delenv("PG_APP_PASSWORD", raising=False)
+        else:
+            monkeypatch.setenv("PG_APP_PASSWORD", app_password)
+
+        with pytest.raises(ValueError, match="PG_APP_PASSWORD") as exc_info:
+            await _async_startup(_startup_config())
+
+        assert "owner-secret" not in str(exc_info.value)
+        startup.init_pool.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("app_password", "expected_dsn"),
+        [
+            pytest.param(
+                "test-suite-app-db-password",
+                "postgresql://admino_app:test-suite-app-db-password@localhost:5432/admino",
+                id="conftest-password",
+            ),
+            pytest.param(
+                "pg-S3cret/p@ss",
+                "postgresql://admino_app:pg-S3cret%2Fp%40ss@localhost:5432/admino",
+                id="encoded-password",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_async_startup_connects_with_the_runtime_role_dsn(
+        self, monkeypatch: pytest.MonkeyPatch, app_password: str, expected_dsn: str
+    ) -> None:
+        """GH-220: init_pool gets exactly the runtime DSN (user admino_app, password
+        PG_APP_PASSWORD, percent-encoded) and the config's pool sizes, even when PG_USER
+        and PG_PASSWORD are set to the owner's values; the owner password is never
+        passed."""
+        startup = _patch_startup_db(monkeypatch)
+        for name in ("PG_HOST", "PG_PORT", "PG_DATABASE"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("PG_USER", "admino")
+        monkeypatch.setenv("PG_PASSWORD", "owner-secret")
+        monkeypatch.setenv("PG_APP_PASSWORD", app_password)
+
+        await _async_startup(_startup_config())
+
+        assert startup.init_pool.call_args_list == [call(expected_dsn, min_size=3, max_size=10)]
+        assert "owner-secret" not in repr(startup.init_pool.call_args_list)
 
     @pytest.mark.asyncio
     async def test_raises_when_health_check_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """_async_startup raises RuntimeError when database is unreachable."""
-        monkeypatch.setenv("PG_PASSWORD", "testpass")
+        """_async_startup raises RuntimeError when database is unreachable (GH-220: with
+        only PG_APP_PASSWORD set, no owner PG_PASSWORD)."""
+        monkeypatch.delenv("PG_PASSWORD", raising=False)
         mock_pool = AsyncMock()
         monkeypatch.setattr("admino.database.init_pool", AsyncMock(return_value=mock_pool))
         monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=False))
@@ -1251,8 +1481,8 @@ class TestAsyncStartup:
     async def test_async_startup_seeds_org_permissions_after_the_platform_seed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Order: migrations, the platform row seed, then the per-org permission seed,
-        all before the startup pool is closed."""
+        """Order: the pending-migrations check (GH-220), the platform row seed, then the
+        per-org permission seed, all before the startup pool is closed."""
         startup = _patch_startup_db(monkeypatch)
 
         await _async_startup(_startup_config())
@@ -1265,9 +1495,9 @@ class TestAsyncStartup:
             if c.normalized.startswith("insert into platform_settings")
         ]
         assert platform_seeds
-        assert steps["run_migrations"] == 0
+        assert steps["pending_migration_versions"] == 0
         assert platform_seeds[0] < steps["seed_missing_orgs"]
-        assert names.index("run_migrations") < names.index("seed_missing_orgs")
+        assert names.index("pending_migration_versions") < names.index("seed_missing_orgs")
         assert names.index("seed_missing_orgs") < names.index("close_pool")
 
     @pytest.mark.asyncio
@@ -1286,18 +1516,22 @@ class TestAsyncStartup:
         assert startup.db.matching(r"\bfrom permissions\b") == []
 
     @pytest.mark.asyncio
-    async def test_async_startup_order_migrate_seed_read_then_close(
+    async def test_async_startup_order_check_seed_read_then_close(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Migrations run before any statement, the platform row is seeded before it is
-        read, and the startup pool is closed after the last statement."""
+        """GH-220 order: init_pool, the health check, then the pending-migrations check
+        before any statement; the platform row is seeded before it is read, and the
+        startup pool is closed after the last statement."""
         startup = _patch_startup_db(monkeypatch)
 
         await _async_startup(_startup_config())
 
         calls = startup.db.calls
         steps = dict(startup.events)
-        assert steps["run_migrations"] == 0
+        names = [name for name, _ in startup.events]
+        assert names[:3] == ["init_pool", "check_health", "pending_migration_versions"]
+        assert steps["pending_migration_versions"] == 0
+        assert names[-1] == "close_pool"
         seeds = [
             i
             for i, c in enumerate(calls)
@@ -1311,6 +1545,129 @@ class TestAsyncStartup:
         assert seeds and reads
         assert seeds[0] < reads[0]
         assert steps["close_pool"] == len(calls)
+
+    @pytest.mark.asyncio
+    async def test_async_startup_checks_the_pending_migrations_on_the_startup_pool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-220: database.pending_migration_versions is awaited once, with the pool
+        init_pool returned."""
+        startup = _patch_startup_db(monkeypatch)
+
+        await _async_startup(_startup_config())
+
+        startup.pending_migration_versions.assert_awaited_once_with(startup.db.pool)
+
+    @pytest.mark.asyncio
+    async def test_async_startup_never_runs_the_migrations(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-220: the runtime role can't run DDL; the one-shot migrate step applies the
+        migrations as the owner, so startup never calls database.run_migrations."""
+        startup = _patch_startup_db(monkeypatch)
+
+        await _async_startup(_startup_config())
+
+        startup.run_migrations.assert_not_called()
+        assert "run_migrations" not in [name for name, _ in startup.events]
+
+    @pytest.mark.asyncio
+    async def test_async_startup_health_failure_skips_the_pending_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-220: an unreachable database closes the pool and raises the health-check
+        RuntimeError; the pending-migrations check and the seeds never run."""
+        startup = _patch_startup_db(monkeypatch)
+        startup.check_health.return_value = False
+
+        with pytest.raises(RuntimeError, match="health check failed"):
+            await _async_startup(_startup_config())
+
+        startup.pending_migration_versions.assert_not_called()
+        startup.seed_missing_orgs.assert_not_called()
+        startup.close_pool.assert_awaited_once()
+
+    @pytest.mark.parametrize(
+        "pending",
+        [
+            pytest.param([18], id="one-missing"),
+            pytest.param([17, 18], id="several-missing"),
+            pytest.param(list(range(1, 19)), id="fresh-database"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_async_startup_pending_migrations_raise_a_runtime_error(
+        self, monkeypatch: pytest.MonkeyPatch, pending: list[int]
+    ) -> None:
+        """GH-220: shipped migrations missing from the database stop startup with a
+        RuntimeError whose fixed message says the schema is not up to date and the
+        migrations must run first (it never carries the DSN or the password)."""
+        _patch_startup_db(monkeypatch, pending=pending)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            await _async_startup(_startup_config())
+
+        message = str(exc_info.value)
+        assert "schema" in message.lower()
+        assert "migrat" in message.lower()
+        assert "test-suite-app-db-password" not in message
+        assert "postgresql://" not in message
+
+    @pytest.mark.parametrize("pending", [[18], list(range(1, 19))])
+    @pytest.mark.asyncio
+    async def test_async_startup_pending_migrations_close_the_pool(
+        self, monkeypatch: pytest.MonkeyPatch, pending: list[int]
+    ) -> None:
+        """GH-220: the startup pool is closed (once, after the check) before the
+        pending-migrations RuntimeError propagates."""
+        startup = _patch_startup_db(monkeypatch, pending=pending)
+
+        with pytest.raises(RuntimeError):
+            await _async_startup(_startup_config())
+
+        names = [name for name, _ in startup.events]
+        startup.close_pool.assert_awaited_once()
+        assert names.index("pending_migration_versions") < names.index("close_pool")
+
+    @pytest.mark.parametrize("pending", [[18], list(range(1, 19))])
+    @pytest.mark.asyncio
+    async def test_async_startup_pending_migrations_seed_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, pending: list[int]
+    ) -> None:
+        """GH-220: with the schema behind, nothing is seeded or read: no statement on
+        platform_settings and no per-org permission seed (an old schema must not be
+        written to)."""
+        startup = _patch_startup_db(monkeypatch, pending=pending)
+
+        with pytest.raises(RuntimeError):
+            await _async_startup(_startup_config())
+
+        assert startup.db.matching(r"\bplatform_settings\b") == []
+        assert startup.db.platform_row() is None
+        startup.seed_missing_orgs.assert_not_called()
+        startup.run_migrations.assert_not_called()
+
+    def test_main_module_never_references_run_migrations(self) -> None:
+        """GH-220: main.py neither imports nor calls database.run_migrations (as a name,
+        an attribute, an imported alias or a getattr string)."""
+        tree = ast.parse(_MAIN_MODULE_PATH.read_text(encoding="utf-8"))
+        used = (
+            {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+            | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+            | {
+                alias.name
+                for node in ast.walk(tree)
+                if isinstance(node, ast.ImportFrom)
+                for alias in node.names
+            }
+            | {
+                node.value
+                for node in ast.walk(tree)
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            }
+        )
+
+        assert "run_migrations" not in used
 
     @pytest.mark.asyncio
     async def test_calls_init_pool_with_config_values(

@@ -47,17 +47,25 @@ What these tests pin down (the spec: the issue, its decisions, tracker #139 §5)
   GH-161, its permission rows through ON DELETE CASCADE), its
   audit events (only through ``purge_org_audit_events``) and its directory under
   the attachments root (never following a symlink) go; everything else stays;
-  one platform ``org.purge`` record with counts. A failure rolls that org back
-  (files untouched) without stopping the others and is logged by class name
-  only. A concurrent cancel is skipped. #147's default organization, scheduled
-  by migration 0011, ends up with no org row and no audit event.
+  one platform ``org.purge`` record with counts. GH-220 order, in that one
+  transaction: the org row locked ``FOR UPDATE``, ``DELETE FROM users WHERE
+  org_id = $1``, then ``SELECT purge_org_audit_events($1)``, which deletes the
+  org's audit events and then the organizations row (migration 0019: owner-run,
+  so the runtime role needs no DELETE on organizations), then the ``org.purge``
+  record, the files last. The app never issues a DELETE on organizations
+  itself. A failure (the function refusing while a user still names the org
+  included) rolls that org back (files untouched) without stopping the others
+  and is logged by class name only. A concurrent cancel is skipped. #147's
+  default organization, scheduled by migration 0011, ends up with no org row
+  and no audit event.
 - run_org_purge_job: purge now, then once per interval, surviving failures,
   stopping on cancellation.
 
 All database calls go to the in-memory fake of tests/db_fakes.py (which
-models migration 0004's organizations CHECKs, ON DELETE RESTRICT, the cascades
-and migration 0011's ``purge_org_audit_events`` and append-only trigger). Files
-live under pytest's ``tmp_path``. No real PostgreSQL, no SMTP.
+models migration 0004's organizations CHECKs, ON DELETE RESTRICT, the cascades,
+migration 0011's append-only trigger and the ``purge_org_audit_events`` of
+migrations 0011 and 0019). Files live under pytest's ``tmp_path``. No real
+PostgreSQL, no SMTP.
 
 Security notes:
 - Operator blindness and no content in logs or audit rows: IDs, counts, bools
@@ -68,8 +76,10 @@ Security notes:
   audit row or a log line.
 - Fail closed: every change shares one transaction with its audit event.
 - Irreversible deletion is gated twice: the app re-checks the org under a lock,
-  and the database function refuses an org that isn't pending and due. A
-  symlink under the attachments root is removed, never followed.
+  and the database function refuses an org that isn't pending and due. Only
+  that owner-run function removes an organizations row (GH-220): the runtime
+  role has no DELETE on the table. A symlink under the attachments root is
+  removed, never followed.
 - Parameterized SQL only: values travel as bind parameters.
 """
 
@@ -108,6 +118,7 @@ from tests.db_fakes import (
     TOKEN_RE,
     Call,
     FakeDb,
+    norm,
     plain,
     sha256,
 )
@@ -1162,7 +1173,8 @@ class TestCreateOrgSeedsPermissions:
     async def test_organizations_purge_removes_the_orgs_permission_rows(
         self, orgs: ModuleType, db: FakeDb, root: Path
     ) -> None:
-        """ON DELETE CASCADE: the purged org's matrix goes with it; another org's stays."""
+        """ON DELETE CASCADE: the purged org's matrix goes with its row (which
+        purge_org_audit_events deletes, GH-220); another org's stays."""
         actor = _super_admin(db)
         db.add_org(ORG_ID)
         db.add_permissions(ORG_ID)
@@ -2102,6 +2114,21 @@ def _due(db: FakeDb, org_id: uuid.UUID | None = None, **fields: Any) -> uuid.UUI
     return db.add_org(org_id, status="pending_deletion", **values)
 
 
+# GH-220: a DELETE on organizations anywhere in a statement (normalized SQL) or in
+# the module's source. Only the owner-run purge_org_audit_events deletes the row.
+_ORG_DELETE_RE = r'\bdelete from (?:only )?(?:public\.)?"?organizations\b'
+_ORG_DELETE_SOURCE_RE = r'\bdelete\s+from\s+(?:only\s+)?(?:public\s*\.\s*)?"?organizations\b'
+
+
+def _locks_the_org(call: Call, org_id: uuid.UUID) -> bool:
+    """Whether the call reads the org's organizations row FOR UPDATE."""
+    return (
+        re.search(r"\bfrom organizations\b", call.normalized) is not None
+        and re.search(r"\bfor (?:no key )?update\b", call.normalized) is not None
+        and org_id in _bound_ids(call)
+    )
+
+
 @pytest.fixture()
 def world(db: FakeDb, root: Path) -> _World:
     """One due org, plus an active, a deactivated and a pending-but-not-due org with the
@@ -2259,31 +2286,89 @@ class TestPurgeCompleteness:
     async def test_organizations_purge_runs_in_one_committed_transaction(
         self, orgs: ModuleType, db: FakeDb, root: Path, world: _World
     ) -> None:
-        """The lock, the audit purge, the deletes and the org.purge record share one
-        transaction; the org row is locked FOR UPDATE before anything is deleted."""
+        """GH-220 order, in one committed transaction: the org row locked FOR UPDATE, the
+        org's users deleted, purge_org_audit_events (the audit events and the org row),
+        then the org.purge record. The app itself issues no DELETE on organizations."""
         await _purge(orgs, db, root)
 
         function = _one(db.matching(r"\bpurge_org_audit_events\b"))
         assert function.tx is not None
-        same_tx = [call for call in db.calls if (call.via, call.tx) == (function.via, function.tx)]
-        users = _one([call for call in same_tx if call.normalized.startswith("delete from users")])
-        org = _one(
-            [call for call in same_tx if call.normalized.startswith("delete from organizations")]
+        same_tx = [
+            (index, call)
+            for index, call in enumerate(db.calls)
+            if (call.via, call.tx) == (function.via, function.tx)
+        ]
+        locks = [index for index, call in same_tx if _locks_the_org(call, world.due)]
+        assert locks, "the org row is never locked"
+        users_index, users = _one(
+            [
+                (index, call)
+                for index, call in same_tx
+                if call.normalized.startswith("delete from users")
+            ]
         )
         assert world.due in _bound_ids(users)
-        assert world.due in _bound_ids(org)
-        assert _one([c for c in same_tx if c.normalized.startswith("insert into audit_events")])
-        locks = [
-            index
-            for index, call in enumerate(db.calls)
-            if call in same_tx
-            and re.search(r"\bfrom organizations\b", call.normalized)
-            and re.search(r"\bfor (?:no key )?update\b", call.normalized)
-            and world.due in _bound_ids(call)
-        ]
-        assert locks, "the org row is never locked"
-        assert locks[0] < db.calls.index(function)
+        record_index, _ = _one(
+            [
+                (index, call)
+                for index, call in same_tx
+                if call.normalized.startswith("insert into audit_events")
+            ]
+        )
+        assert locks[0] < users_index < db.calls.index(function) < record_index
         assert (function.tx, "commit") in db.transactions
+        assert db.matching(_ORG_DELETE_RE) == []
+
+    async def test_organizations_purge_deletes_the_users_before_calling_the_function(
+        self, orgs: ModuleType, db: FakeDb, root: Path, world: _World
+    ) -> None:
+        """users.org_id is ON DELETE RESTRICT and the function deletes the org row, so
+        DELETE FROM users (bound to the due org) runs before purge_org_audit_events."""
+        await _purge(orgs, db, root)
+
+        users = _one(db.matching(r"^delete from users\b"))
+        function = _one(db.matching(r"\bpurge_org_audit_events\b"))
+        assert world.due in _bound_ids(users)
+        assert db.calls.index(users) < db.calls.index(function)
+
+    async def test_organizations_purge_org_row_is_deleted_by_the_function_only(
+        self,
+        orgs: ModuleType,
+        db: FakeDb,
+        root: Path,
+        world: _World,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The org row still exists when purge_org_audit_events is called and is gone
+        when it returns; no statement of the app deletes an organizations row (the
+        runtime role has no DELETE on the table, migration 0019)."""
+        seen: list[tuple[bool, bool]] = []
+        handle = db.handle
+
+        def probe(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+            if not re.search(r"\bpurge_org_audit_events\b", norm(sql)):
+                return handle(method, sql, args, via, tx)
+            existed = world.due in db.orgs
+            result = handle(method, sql, args, via, tx)
+            seen.append((existed, world.due in db.orgs))
+            return result
+
+        monkeypatch.setattr(db, "handle", probe)
+
+        assert await _purge(orgs, db, root) == 1
+
+        assert seen == [(True, False)]
+        assert world.due not in db.orgs
+        assert db.matching(_ORG_DELETE_RE) == []
+
+    def test_organizations_source_has_no_org_delete_statement(self, orgs: ModuleType) -> None:
+        """GH-220: organizations.py holds no DELETE on organizations (not even in a
+        docstring: say "no DELETE on organizations") and no _DELETE_ORG_SQL constant."""
+        source = inspect.getsource(orgs)
+
+        assert re.search(_ORG_DELETE_SOURCE_RE, source, re.IGNORECASE) is None
+        assert "_DELETE_ORG_SQL" not in source
+        assert not hasattr(orgs, "_DELETE_ORG_SQL")
 
     async def test_organizations_purge_again_finds_nothing(
         self, orgs: ModuleType, db: FakeDb, root: Path, world: _World
@@ -2466,6 +2551,23 @@ def _small_org(db: FakeDb, root: Path) -> uuid.UUID:
     return org_id
 
 
+def _user_joins_after_the_users_delete(
+    db: FakeDb, org_id: uuid.UUID, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Add a user to the org right after the first DELETE FROM users has run (a race the
+    test injects), so purge_org_audit_events still finds a user naming the org."""
+    handle = db.handle
+    joined: list[uuid.UUID] = []
+
+    def joining(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+        result = handle(method, sql, args, via, tx)
+        if not joined and norm(sql).startswith("delete from users"):
+            joined.append(db.add_account(org_id=org_id, role="viewer"))
+        return result
+
+    monkeypatch.setattr(db, "handle", joining)
+
+
 class TestPurgeFailures:
     """A failure rolls that org back entirely and is logged by class name only."""
 
@@ -2474,13 +2576,14 @@ class TestPurgeFailures:
         [
             pytest.param(r"\bpurge_org_audit_events\b", id="audit-purge"),
             pytest.param(r"^delete from users\b", id="users-delete"),
-            pytest.param(r"^delete from organizations\b", id="org-delete"),
         ],
     )
     async def test_organizations_purge_database_failure_keeps_rows_and_files(
         self, orgs: ModuleType, db: FakeDb, root: Path, pattern: str
     ) -> None:
-        """Files are removed last: a failing database step never deletes a file."""
+        """Files are removed last: a failing database step never deletes a file. The
+        injected failure is what rolled the org back (the step was reached). GH-220: no
+        org-delete step any more, the function deletes the org row."""
         org_id = _small_org(db, root)
         before = _org_content(db, org_id)
         files = _files(root)
@@ -2490,6 +2593,44 @@ class TestPurgeFailures:
 
         assert _org_content(db, org_id) == before
         assert _files(root) == files
+        assert [outcome for _, outcome in db.transactions] == ["rollback:DeadlockDetectedError"]
+
+    async def test_organizations_purge_function_refusing_a_remaining_user_rolls_back(
+        self,
+        orgs: ModuleType,
+        db: FakeDb,
+        root: Path,
+        caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A user still names the org when purge_org_audit_events runs (one joins right
+        after the users DELETE): the function raises ForeignKeyViolationError and the
+        org's whole transaction rolls back, the users DELETE included. The org, its
+        users, audit rows and files are kept, nothing counts as purged, and the log
+        names the class only."""
+        caplog.set_level(logging.DEBUG)
+        org_id = _small_org(db, root)
+        before = _org_content(db, org_id)
+        files = _files(root)
+        _user_joins_after_the_users_delete(db, org_id, monkeypatch)
+
+        assert await _purge(orgs, db, root) == 0
+
+        assert _org_content(db, org_id) == before
+        assert _files(root) == files
+        assert db.audit_rows("org.purge") == []
+        users = _one(db.matching(r"^delete from users\b"))
+        function = _one(db.matching(r"\bpurge_org_audit_events\b"))
+        assert users.tx is not None
+        assert (users.via, users.tx) == (function.via, function.tx)
+        assert db.calls.index(users) < db.calls.index(function)
+        assert (function.tx, "rollback:ForeignKeyViolationError") in db.transactions
+        assert any(
+            "ForeignKeyViolationError" in record.getMessage() for record in _warnings(caplog)
+        )
+        _assert_no_leak(
+            _log_text(caplog), org_id, "violates", "foreign key constraint", ORG_NAME, str(root)
+        )
 
     async def test_organizations_purge_audit_failure_keeps_rows_and_files(
         self, orgs: ModuleType, db: FakeDb, root: Path, caplog: pytest.LogCaptureFixture

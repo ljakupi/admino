@@ -62,7 +62,8 @@ Key variables by use case:
 
 | Variable | Needed for | Notes |
 | --- | --- | --- |
-| `PG_PASSWORD` | Always | Prefilled with the dev default `changeme`. Change it for any non-local use. |
+| `PG_PASSWORD` | Always | The database owner's password, used only to apply migrations. Prefilled with the dev default `changeme`. Change it for any non-local use. |
+| `PG_APP_PASSWORD` | Always | The password the app connects with (role `admino_app`). Prefilled with the dev default `changeme-app`. Printable ASCII, different from `PG_PASSWORD`. |
 | `INFOMANIAK_API_TOKEN` | Chatting via Infomaniak (default) | Required for the default provider. See [Create the Infomaniak token](#create-the-infomaniak-token). |
 | `INFOMANIAK_PRODUCT_ID` | Infomaniak, several AI products | Optional. Discovered at startup when the token sees exactly one AI Tools product. |
 | `HF_TOKEN` | `make vllm-pull` (gated models only) | Optional — only if the model repo is private/gated. Never used at runtime. |
@@ -110,9 +111,14 @@ set -a; source .env; set +a
 # Start PostgreSQL (Docker) — the dev overlay publishes it on 127.0.0.1:5432
 make dev-db
 
-# Start the agent
+# Apply the migrations, then start the agent
 make run
 ```
+
+`make run` first runs `make migrate`: the migrations, applied as the database owner
+(`PG_PASSWORD`), which also set the password of the role the app connects as
+(`PG_APP_PASSWORD`). It then starts the app with `PG_PASSWORD` removed from its
+environment. See [Database roles](SECURITY.md#database-roles).
 
 The API comes up on **http://localhost:8000**. Continue to
 [Create the first Super Admin](#5-create-the-first-super-admin).
@@ -127,9 +133,9 @@ startup and drops from root to an unprivileged user (see the
 **no shell export is needed** here.
 
 ```bash
-cp .env.example .env          # change PG_PASSWORD; set INFOMANIAK_API_TOKEN
+cp .env.example .env          # change PG_PASSWORD and PG_APP_PASSWORD; set INFOMANIAK_API_TOKEN
 make docker-build             # build the agent image
-make start                    # start agent + Postgres (detached); same as make docker-up
+make start                    # start Postgres, migrations, then the agent (detached); same as make docker-up
 
 make docker-logs              # follow logs
 make docker-down              # stop everything
@@ -166,7 +172,8 @@ make create-superadmin EMAIL=you@example.ch NAME='Your Name'
 
 This runs `python -m admino.admin_cli create-superadmin --email … --name …` inside the
 agent container (`docker compose exec`, as the unprivileged `admino` user). For local dev
-(`make run`), run the same command from your shell with `.env` loaded:
+(`make run`), run the same command from your shell with `.env` loaded, after
+`make migrate` (or a first `make run`):
 
 ```bash
 python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your Name'
@@ -179,8 +186,9 @@ python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your
   to 128 characters, not your email address, and not one of the 100,000 most common
   passwords. A weak password or a typo in the confirmation asks again, up to three times.
 - An email address that's already taken is refused, whatever its capitalization.
-- The command applies pending database migrations first, so it also works on a fresh
-  database before the agent's first start.
+- The command doesn't run migrations: it connects as the app's role, `admino_app`,
+  which can't change the schema. In Docker the `migrate` service applied them before the
+  agent started; for local dev, run `make migrate` first.
 - The new account is active right away, and the creation is recorded in the audit log
   (`user.activate`, without the email or name). Neither the password nor the email is
   logged.
@@ -298,6 +306,10 @@ admino is becoming a multi-tenant platform, with organizations and user accounts
 roles: Super Admin, Org Admin, Editor and Viewer. **The upgrade starts from an empty
 platform.**
 
+- **Add `PG_APP_PASSWORD` to `.env` before you upgrade** (see `.env.example`). The app
+  now connects as the non-superuser role `admino_app`; the `migrate` service creates it
+  on your existing database at the next start and gives it that password. Keep
+  `PG_PASSWORD` as it is: it's the password your database volume was created with.
 - Migrations run on startup against your existing database. The first tenancy migration
   only adds the (empty) `organizations` and `users` tables, so nothing changes until login
   with user accounts arrives.
@@ -344,8 +356,12 @@ security rules.
   isn't ready yet. Either run `make start-local` and wait a few minutes for the model to
   load (CPU inference takes time on first start), or switch back to Infomaniak (see
   [Switching providers](configuration.md#llm-providers)).
-- **`PG_PASSWORD environment variable is required but not set`.** For local dev, load
-  `.env` into your shell first: `set -a; source .env; set +a`.
+- **`PG_APP_PASSWORD environment variable is required but not set`** (or the migration
+  says `PG_PASSWORD` or `PG_APP_PASSWORD` is missing). Set both in `.env`. For local dev,
+  load `.env` into your shell first: `set -a; source .env; set +a`.
+- **The database schema is not up to date.** The app found pending migrations and
+  doesn't run them itself. In Docker, check the `migrate` service's log
+  (`docker compose logs migrate`); for local dev, run `make migrate`.
 - **A tool says the account isn't connected.** Open the **Tools** page and click
   **Connect** for that provider (see [Connect your accounts](#connect-your-accounts)).
   Connections are per user: connecting your account doesn't connect a colleague's. If

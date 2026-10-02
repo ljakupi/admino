@@ -25,14 +25,15 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
   is kept. Login, sessions, resets and invitation links already refuse an org
   that isn't active.
 - ``purge_due_orgs`` irreversibly removes every org whose grace period is
-  over, each in its own transaction: its audit events (through the database
-  function ``purge_org_audit_events`` of migration 0011), its users (the
-  foreign keys cascade to their sessions, invitations, queued email and reset
-  tokens), the org row (cascading to its settings and permission rows), then
-  its directory under the attachments root. It
-  records one platform ``org.purge`` event (no org, counts only). A failure
-  rolls that org back; the next run retries it. ``run_org_purge_job`` runs it
-  at startup and then hourly from the server lifespan.
+  over, each in its own transaction: its users first (the foreign keys
+  cascade to their sessions, invitations, queued email and reset tokens),
+  then its audit events and the org row itself (cascading to its settings and
+  permission rows), both through one call of the database function
+  ``purge_org_audit_events`` (migrations 0011 and 0019), then its directory
+  under the attachments root. It records one platform ``org.purge`` event (no
+  org, counts only). A failure rolls that org back; the next run retries it.
+  ``run_org_purge_job`` runs it at startup and then hourly from the server
+  lifespan.
 
 Inputs: the database pool; the acting ``Principal`` (a Super Admin; the
 Operator for ``create_org`` only), the org id, the validated request models
@@ -56,6 +57,12 @@ Security notes:
   status is checked. The purge re-checks each due org under that lock, so a
   concurrent cancel wins; the database function refuses an org that isn't
   pending and due, a second, independent gate on the irreversible step.
+- The database owns the deletion window (migration 0019): a trigger stamps
+  the request date, refuses a purge date less than 7 days away and freezes
+  both dates while the deletion is pending, for every role. Only the
+  owner-run purge function removes the organization row; the runtime role has
+  no DELETE privilege on organizations, so the app can't remove an org (or
+  its audit log) outside the purge.
 - Files: ``<attachments_root>/<org_id>`` is removed in a worker thread, last
   inside the purge transaction, so a database failure never deletes files and
   a file failure rolls the database back. A symlink is unlinked, never
@@ -195,11 +202,13 @@ _LOCK_DUE_SQL: Final = """
     WHERE id = $1 AND status = 'pending_deletion' AND purge_after <= now()
     FOR UPDATE
 """
-# Migration 0011's function: the only way an org's audit events leave.
-_PURGE_AUDIT_SQL: Final = "SELECT purge_org_audit_events($1)"
-# Every user of the org, whatever its status; the foreign keys cascade.
+# Every user of the org, whatever its status; the foreign keys cascade. Runs
+# before the purge function: users.org_id restricts removing the org row.
 _DELETE_USERS_SQL: Final = "DELETE FROM users WHERE org_id = $1"
-_DELETE_ORG_SQL: Final = "DELETE FROM organizations WHERE id = $1"
+# Migrations 0011/0019's owner-run function: the only way an org's audit events
+# leave, and the only way the org row itself goes (it removes both and returns
+# the number of audit events).
+_PURGE_AUDIT_SQL: Final = "SELECT purge_org_audit_events($1)"
 
 
 class OrgNotFoundError(Exception):
@@ -679,13 +688,19 @@ def _remove_org_files(path: Path) -> None:
 
 
 async def _purge_org(pool: asyncpg.Pool, org_id: UUID, attachments_root: Path) -> bool:
-    """Purge one due org in its own transaction; return False if it is no longer due."""
+    """Purge one due org in its own transaction; return False if it is no longer due.
+
+    In order: lock the org and re-check it is due; delete its users (cascading
+    to their rows); call ``purge_org_audit_events``, which removes the org's
+    audit events and then the organization row; record ``org.purge``; remove
+    the org's files last. The app never removes the organization row itself:
+    the runtime role has no DELETE privilege on organizations.
+    """
     async with pool.acquire() as conn, conn.transaction():
         if await conn.fetchval(_LOCK_DUE_SQL, org_id) is None:
             return False
-        audit_purged: int = await conn.fetchval(_PURGE_AUDIT_SQL, org_id)
         users_purged = _deleted_count(await conn.execute(_DELETE_USERS_SQL, org_id))
-        await conn.execute(_DELETE_ORG_SQL, org_id)
+        audit_purged: int = await conn.fetchval(_PURGE_AUDIT_SQL, org_id)
         await audit_events.record(
             conn,
             action=AuditAction.ORG_PURGE,

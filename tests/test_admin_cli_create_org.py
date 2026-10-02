@@ -16,12 +16,15 @@ What these tests pin (the GH-154 "CLI" decisions and spec):
   1. The input is validated through ``models.OrgCreateRequest``: one fixed message per
      invalid field, naming its option and never repeating the input, then exit 1. A
      ``--budget-chf`` that isn't a number is such a validation error, not a usage error.
-  2. PG_PASSWORD is checked.
+  2. PG_APP_PASSWORD is checked (GH-220: the runtime role's password; the owner's
+     PG_PASSWORD is never a fallback).
   3. ``load_smtp_config()`` picks the delivery. Without SMTP, stdout must be a terminal.
-  4. Only then the database: ``init_pool(dsn, min_size=1, max_size=2)``,
-     ``run_migrations``, ``load_app_config`` (config.yaml plus its env overrides:
-     ``server.public_url``, the link base; GH-159 dropped the settings table the
-     CLI used to read it from), ``organizations.create_org`` and ``close_pool``.
+  4. Only then the database: ``init_pool(dsn, min_size=1, max_size=2)`` with the
+     runtime DSN (user ``admino_app``), ``load_app_config`` (config.yaml plus its env
+     overrides: ``server.public_url``, the link base; GH-159 dropped the settings
+     table the CLI used to read it from), ``organizations.create_org`` and
+     ``close_pool``. GH-220: no migrations; the one-shot migrate service applied
+     them before the agent (where the CLI runs) started.
 - The service call gets the pool, an ``Operator`` actor and the validated request:
   the stripped name and email, the seats, a Decimal budget, GiB x 1024**3 bytes and the
   status ``active``. It also gets the language, the stored public URL, ``ip=None`` and
@@ -31,16 +34,18 @@ What these tests pin (the GH-154 "CLI" decisions and spec):
   - Without SMTP: an explanation, then the one-time link on its own line and its
     expiry date (YYYY-MM-DD), on stdout only.
 - Failures: a taken email, an audit or database failure during creation, an
-  unreachable database, a failed migration and an invalid stored config each exit 1
-  with a fixed message and no traceback, and the pool is closed.
+  unreachable database and an invalid stored config each exit 1 with a fixed
+  message and no traceback, and the pool is closed.
 - ``create-superadmin`` still dispatches as before.
 
-Inputs: argv and the PG_* env vars. These are patched: ``load_smtp_config``,
-``load_app_config``, ``init_pool``, ``run_migrations``, ``close_pool`` (all
+Inputs: argv and the PG_* env vars (PG_APP_PASSWORD, and the owner's
+PG_USER/PG_PASSWORD, which the CLI must ignore). These are patched:
+``load_smtp_config``, ``load_app_config``, ``init_pool``, ``close_pool`` (all
 looked up on ``admino.admin_cli``; ``load_app_config`` is admino.config's config.yaml
 loader, called with ``$CONFIG_DIR/config.yaml`` like main.py) and
-``admino.organizations.create_org`` (called through the module attribute). stdout
-and stderr are stand-in streams whose ``isatty()`` answers what the test says.
+``admino.organizations.create_org`` (called through the module attribute). The
+migrations runner is a spy that must never be awaited. stdout and stderr are
+stand-in streams whose ``isatty()`` answers what the test says.
 Outputs: the exit code, the recorded calls and their order, stdout/stderr and log
 records.
 
@@ -113,15 +118,19 @@ _EXPIRY_DATE = "2026-10-01"
 _GIB = 1024**3
 _MAX_QUOTA_GIB = (2**53 - 1) // _GIB  # 8388607: the largest GiB count within 2**53 - 1 bytes
 _SMTP_PASSWORD = "smtp-Pa55word/For-Tests"
-_PG_PASSWORD = "pg-S3cret/p@ss"
-_EXPECTED_DSN = "postgresql://admino:pg-S3cret%2Fp%40ss@localhost:5432/admino"
+_PG_APP_PASSWORD = "pg-S3cret/p@ss"
+_OWNER_PASSWORD = "owner-secret"
+# GH-220: the runtime role admino_app with PG_APP_PASSWORD (percent-encoded).
+_EXPECTED_DSN = "postgresql://admino_app:pg-S3cret%2Fp%40ss@localhost:5432/admino"
 _PG_ENV: dict[str, str] = {
     "PG_HOST": "localhost",
     "PG_PORT": "5432",
-    "PG_USER": "admino",
     "PG_DATABASE": "admino",
-    "PG_PASSWORD": _PG_PASSWORD,
+    "PG_APP_PASSWORD": _PG_APP_PASSWORD,
 }
+# The owner's credentials, for the migrate service only. The fixture sets them too,
+# as a shell that sourced .env would: the CLI must ignore them.
+_OWNER_ENV: dict[str, str] = {"PG_USER": "admino", "PG_PASSWORD": _OWNER_PASSWORD}
 _SUPERADMIN_EMAIL = "Ops.Admin@Example.ch"
 _SUPERADMIN_NAME = "Ada Lovelace-Operator"
 _SUPERADMIN_PASSWORD = "Correct-Horse-Battery-9!"
@@ -146,10 +155,10 @@ _OPTIONS: tuple[str, ...] = (
 _VALIDATED_OPTIONS: tuple[str, ...] = _OPTIONS[:-1]
 
 # The service-call steps, in order, without the stdout.isatty/stderr.isatty probes.
+# GH-220: no "run_migrations" step.
 _DB_STEPS: list[str] = [
     "load_smtp_config",
     "init_pool",
-    "run_migrations",
     "load_app_config",
     "create_org",
     "close_pool",
@@ -258,7 +267,7 @@ class _Deps:
     created: Any
     load_smtp_config: MagicMock
     init_pool: AsyncMock
-    run_migrations: AsyncMock
+    run_migrations_spy: AsyncMock
     load_app_config: MagicMock
     create_org: AsyncMock
     close_pool: AsyncMock
@@ -351,9 +360,16 @@ def deps(cli: ModuleType, created_org: Any, monkeypatch: pytest.MonkeyPatch) -> 
     Defaults: load_smtp_config returns a valid SmtpConfig, the stored config's
     public_url is _PUBLIC_URL and create_org returns ``created_org``. stdin, stdout
     and stderr aren't terminals (stdout/stderr are installed by ``_run``), and
-    getpass fails the test.
+    getpass fails the test. PG_APP_PASSWORD and the owner's PG_USER/PG_PASSWORD
+    are all set (the CLI must use only the first).
+
+    GH-220: the migrations runner is replaced by ``run_migrations_spy``, which
+    records a "run_migrations" step and must never be awaited. It replaces
+    ``admino.database.run_migrations`` and, while admin_cli still has a name of
+    its own for it, that name too, so the real migrations never run against the
+    fake pool.
     """
-    for name, value in _PG_ENV.items():
+    for name, value in {**_PG_ENV, **_OWNER_ENV}.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("ADMINO_PUBLIC_URL", raising=False)
 
@@ -379,7 +395,7 @@ def deps(cli: ModuleType, created_org: Any, monkeypatch: pytest.MonkeyPatch) -> 
         return_value=smtp_config, side_effect=_logging(events, "load_smtp_config")
     )
     init_pool = AsyncMock(return_value=pool, side_effect=_logging(events, "init_pool"))
-    run_migrations = AsyncMock(side_effect=_logging(events, "run_migrations"))
+    run_migrations_spy = AsyncMock(side_effect=_logging(events, "run_migrations"))
     load_app_config = MagicMock(
         return_value=app_config, side_effect=_logging(events, "load_app_config")
     )
@@ -403,7 +419,9 @@ def deps(cli: ModuleType, created_org: Any, monkeypatch: pytest.MonkeyPatch) -> 
                 )
             )
         stack.enter_context(patch("admino.admin_cli.init_pool", new=init_pool))
-        stack.enter_context(patch("admino.admin_cli.run_migrations", new=run_migrations))
+        stack.enter_context(patch("admino.database.run_migrations", new=run_migrations_spy))
+        if hasattr(cli, "run_migrations"):
+            stack.enter_context(patch("admino.admin_cli.run_migrations", new=run_migrations_spy))
         stack.enter_context(patch("admino.admin_cli.close_pool", new=close_pool))
         stack.enter_context(patch("admino.organizations.create_org", new=create_org))
         yield _Deps(
@@ -415,7 +433,7 @@ def deps(cli: ModuleType, created_org: Any, monkeypatch: pytest.MonkeyPatch) -> 
             created=created_org,
             load_smtp_config=load_smtp_config,
             init_pool=init_pool,
-            run_migrations=run_migrations,
+            run_migrations_spy=run_migrations_spy,
             load_app_config=load_app_config,
             create_org=create_org,
             close_pool=close_pool,
@@ -494,6 +512,23 @@ def _log_text(caplog: pytest.LogCaptureFixture) -> str:
     for record in caplog.records:
         parts.extend([record.getMessage(), repr(record.args), record.exc_text or ""])
     return "\n".join(parts)
+
+
+def _set_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str | None]) -> None:
+    """Set each variable, or remove it when its value is None."""
+    for name, value in env.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+# GH-220: the runtime DSN is the same whatever the owner's variables say.
+_OWNER_ENV_VARIANTS: list[Any] = [
+    pytest.param({}, id="owner-vars-set"),
+    pytest.param({"PG_USER": None, "PG_PASSWORD": None}, id="owner-vars-unset"),
+    pytest.param({"PG_USER": "postgres"}, id="other-pg-user"),
+]
 
 
 def _duplicate_error() -> Exception:
@@ -595,17 +630,25 @@ class TestCreateOrgServiceCall:
         """Exit code 0 when the organization is created."""
         assert _run(deps, _argv()) == 0
 
-    def test_admin_cli_create_org_opens_a_small_pool_from_pg_env(self, deps: _Deps) -> None:
-        """init_pool(dsn from PG_*, min_size=1, max_size=2), once."""
-        _run(deps, _argv())
+    @pytest.mark.parametrize("owner_env", _OWNER_ENV_VARIANTS)
+    def test_admin_cli_create_org_opens_a_small_pool_as_the_runtime_role(
+        self, deps: _Deps, monkeypatch: pytest.MonkeyPatch, owner_env: dict[str, str | None]
+    ) -> None:
+        """GH-220: init_pool(runtime DSN, min_size=1, max_size=2), once: user admino_app and
+        PG_APP_PASSWORD, whether the owner's PG_USER/PG_PASSWORD are set, unset or name
+        another user.
+        """
+        _set_env(monkeypatch, owner_env)
+
+        assert _run(deps, _argv()) == 0
 
         deps.init_pool.assert_awaited_once_with(_EXPECTED_DSN, min_size=1, max_size=2)
 
-    def test_admin_cli_create_org_applies_migrations_to_the_pool(self, deps: _Deps) -> None:
-        """Pending migrations are applied first, so it works on a fresh database."""
+    def test_admin_cli_create_org_never_runs_migrations(self, deps: _Deps) -> None:
+        """GH-220: no migrations on the opened pool; the migrate service applied them."""
         _run(deps, _argv())
 
-        deps.run_migrations.assert_awaited_once_with(deps.pool)
+        deps.run_migrations_spy.assert_not_awaited()
 
     def test_admin_cli_create_org_loads_config_yaml(self, deps: _Deps) -> None:
         """load_app_config($CONFIG_DIR/config.yaml) provides server.public_url (GH-159:
@@ -726,7 +769,7 @@ class TestCreateOrgServiceCall:
         assert _service_call(deps)[1]["ip"] is None
 
     def test_admin_cli_create_org_steps_run_in_order(self, deps: _Deps) -> None:
-        """SMTP lookup, pool, migrations, stored config, create_org, close: each once."""
+        """SMTP lookup, pool, stored config, create_org, close: each once (no migrations)."""
         _run(deps, _argv())
 
         assert deps.steps() == _DB_STEPS
@@ -797,7 +840,7 @@ class TestCreateOrgValidBoundaries:
 
 
 # ---------------------------------------------------------------------------
-# 3. Validation: before PG_PASSWORD, SMTP, the terminal and the database
+# 3. Validation: before PG_APP_PASSWORD, SMTP, the terminal and the database
 # ---------------------------------------------------------------------------
 
 _INVALID_INPUTS: list[Any] = [
@@ -1019,17 +1062,17 @@ class TestCreateOrgInvalidInput:
         err = deps.err()
         assert [option for option in _VALIDATED_OPTIONS if option not in err] == []
 
-    def test_admin_cli_create_org_validation_precedes_the_pg_password_check(
+    def test_admin_cli_create_org_validation_precedes_the_pg_app_password_check(
         self, deps: _Deps, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Invalid input and no PG_PASSWORD: the input is what gets reported."""
-        monkeypatch.delenv("PG_PASSWORD")
+        """Invalid input and no PG_APP_PASSWORD: the input is what gets reported."""
+        monkeypatch.delenv("PG_APP_PASSWORD")
 
         assert _run(deps, _argv(name="")) == 1
 
         err = deps.err()
         assert "--name" in err
-        assert "PG_PASSWORD" not in err
+        assert "PG_APP_PASSWORD" not in err
 
     def test_admin_cli_create_org_validation_precedes_the_terminal_check(
         self, no_smtp_pipe: _Deps
@@ -1044,36 +1087,53 @@ class TestCreateOrgInvalidInput:
 
 
 # ---------------------------------------------------------------------------
-# 4. PG_PASSWORD
+# 4. PG_APP_PASSWORD (GH-220: the runtime role's password, never the owner's)
 # ---------------------------------------------------------------------------
 
-_NO_DSN_MESSAGE = "Error: the PG_PASSWORD environment variable is not set."
+_NO_DSN_MESSAGE = "Error: the PG_APP_PASSWORD environment variable is not set."
+
+_MISSING_APP_PASSWORD: list[Any] = [
+    pytest.param({"PG_APP_PASSWORD": None}, id="unset-owner-vars-set"),
+    pytest.param({"PG_APP_PASSWORD": ""}, id="empty-owner-vars-set"),
+    pytest.param(
+        {"PG_APP_PASSWORD": None, "PG_USER": None, "PG_PASSWORD": None},
+        id="unset-owner-vars-unset",
+    ),
+    pytest.param(
+        {"PG_APP_PASSWORD": "", "PG_USER": None, "PG_PASSWORD": None},
+        id="empty-owner-vars-unset",
+    ),
+]
 
 
-class TestCreateOrgRequiresPgPassword:
-    """Without PG_PASSWORD there is no DSN: refuse before SMTP and the database."""
+class TestCreateOrgRequiresPgAppPassword:
+    """Without PG_APP_PASSWORD there is no runtime DSN: refuse before SMTP and the database.
 
-    @pytest.mark.parametrize("unset", [True, False], ids=["unset", "empty"])
-    def test_admin_cli_create_org_without_pg_password_returns_one(
-        self, deps: _Deps, monkeypatch: pytest.MonkeyPatch, unset: bool
+    The owner's PG_PASSWORD is never a fallback, so setting it changes nothing.
+    """
+
+    @pytest.mark.parametrize("env", _MISSING_APP_PASSWORD)
+    def test_admin_cli_create_org_without_pg_app_password_returns_one(
+        self, deps: _Deps, monkeypatch: pytest.MonkeyPatch, env: dict[str, str | None]
     ) -> None:
-        """Exit 1 with the existing PG_PASSWORD message; nothing looked up or opened."""
-        if unset:
-            monkeypatch.delenv("PG_PASSWORD")
-        else:
-            monkeypatch.setenv("PG_PASSWORD", "")
+        """Exit 1, stderr is exactly the fixed message naming PG_APP_PASSWORD; nothing
+        looked up or opened.
+        """
+        _set_env(monkeypatch, env)
 
         assert _run(deps, _argv()) == 1
 
-        assert _NO_DSN_MESSAGE in deps.err()
+        assert deps.err() == _NO_DSN_MESSAGE + "\n"
         assert deps.steps() == []
         deps.create_org.assert_not_awaited()
 
-    def test_admin_cli_create_org_pg_password_check_precedes_the_terminal_check(
+    def test_admin_cli_create_org_pg_app_password_check_precedes_the_terminal_check(
         self, no_smtp_pipe: _Deps, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """No PG_PASSWORD, no SMTP, no terminal: PG_PASSWORD is what gets reported."""
-        monkeypatch.delenv("PG_PASSWORD")
+        """No PG_APP_PASSWORD (the owner's PG_PASSWORD set), no SMTP, no terminal:
+        PG_APP_PASSWORD is what gets reported.
+        """
+        monkeypatch.delenv("PG_APP_PASSWORD")
 
         assert _run(no_smtp_pipe, _argv()) == 1
 
@@ -1330,16 +1390,11 @@ _UNREACHABLE: list[Any] = [
     pytest.param(asyncpg.PostgresError("auth failed"), id="postgres-error"),
 ]
 
-_MIGRATION_FAILURES: list[Any] = [
-    pytest.param(asyncpg.PostgresError(f"{_DRIVER_MARKER}: migration failed"), id="postgres"),
-    pytest.param(OSError(f"{_DRIVER_MARKER}: connection lost"), id="os-error"),
-]
-
 _DATABASE_UNAVAILABLE = "database is unavailable"
 
 
 class TestCreateOrgSetupFailures:
-    """The pool, the migrations or the stored config fail: exit 1 before create_org."""
+    """The pool or the stored config fail: exit 1 before create_org."""
 
     @pytest.mark.parametrize("error", _UNREACHABLE)
     def test_admin_cli_create_org_unreachable_database_returns_one(
@@ -1353,35 +1408,38 @@ class TestCreateOrgSetupFailures:
         err = deps.err()
         assert _DATABASE_UNAVAILABLE in err.lower()
         assert "Traceback" not in err
-        deps.run_migrations.assert_not_awaited()
+        deps.run_migrations_spy.assert_not_awaited()
         deps.create_org.assert_not_awaited()
 
-    @pytest.mark.parametrize("error", _MIGRATION_FAILURES)
-    def test_admin_cli_create_org_migration_failure_returns_one(
-        self, deps: _Deps, error: Exception
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(
+                asyncpg.UndefinedTableError(f'{_DRIVER_MARKER}: relation "organizations"'),
+                id="schema-not-migrated",
+            ),
+            pytest.param(
+                asyncpg.InsufficientPrivilegeError(f"{_DRIVER_MARKER}: permission denied"),
+                id="missing-grant",
+            ),
+        ],
+    )
+    def test_admin_cli_create_org_first_query_failure_runs_no_migrations(
+        self, deps: _Deps, error: asyncpg.PostgresError
     ) -> None:
-        """run_migrations fails → exit 1, 'database is unavailable', no driver text."""
-        deps.run_migrations.side_effect = error
+        """GH-220: the first query (create_org) fails as the runtime role → exit 1, the
+        fixed 'could not be created' message without the driver's text, the pool
+        closed, and no migrations are run to make up for a missing table.
+        """
+        deps.create_org.side_effect = error
 
         assert _run(deps, _argv()) == 1
 
         err = deps.err()
-        assert _DATABASE_UNAVAILABLE in err.lower()
+        assert "could not be created" in err.lower()
         assert _DRIVER_MARKER not in err
-        assert "Traceback" not in err
-
-    @pytest.mark.parametrize("error", _MIGRATION_FAILURES)
-    def test_admin_cli_create_org_migration_failure_creates_nothing_and_closes(
-        self, deps: _Deps, error: Exception
-    ) -> None:
-        """No stored config read, no service call, the pool closed."""
-        deps.run_migrations.side_effect = error
-
-        _run(deps, _argv())
-
-        deps.load_app_config.assert_not_called()
-        deps.create_org.assert_not_awaited()
         deps.close_pool.assert_awaited_once()
+        deps.run_migrations_spy.assert_not_awaited()
 
     @pytest.mark.parametrize(
         "make_error",
@@ -1442,8 +1500,8 @@ def _scenario_no_smtp_pipe(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None
     deps.load_smtp_config.return_value = None
 
 
-def _scenario_no_pg_password(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("PG_PASSWORD")
+def _scenario_no_pg_app_password(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PG_APP_PASSWORD")
 
 
 def _scenario_email_taken(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1462,10 +1520,6 @@ def _scenario_unreachable(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None:
     deps.init_pool.side_effect = ConnectionRefusedError("connection refused")
 
 
-def _scenario_migration_failure(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None:
-    deps.run_migrations.side_effect = _driver_error()
-
-
 def _scenario_invalid_config(deps: _Deps, monkeypatch: pytest.MonkeyPatch) -> None:
     deps.load_app_config.side_effect = _config_validation_error()
 
@@ -1475,12 +1529,11 @@ _SCENARIOS: list[Any] = [
     pytest.param(_scenario_smtp_success, False, id="smtp-success"),
     pytest.param(_scenario_no_smtp_terminal, True, id="no-smtp-terminal"),
     pytest.param(_scenario_no_smtp_pipe, False, id="no-smtp-pipe"),
-    pytest.param(_scenario_no_pg_password, False, id="no-pg-password"),
+    pytest.param(_scenario_no_pg_app_password, False, id="no-pg-app-password"),
     pytest.param(_scenario_email_taken, False, id="email-taken"),
     pytest.param(_scenario_audit_failure, False, id="audit-failure"),
     pytest.param(_scenario_db_failure, False, id="db-failure"),
     pytest.param(_scenario_unreachable, False, id="unreachable"),
-    pytest.param(_scenario_migration_failure, False, id="migration-failure"),
     pytest.param(_scenario_invalid_config, False, id="invalid-config"),
 ]
 
@@ -1615,18 +1668,30 @@ def _run_module(*args: str, env_extra: dict[str, str]) -> subprocess.CompletedPr
 class TestCreateOrgEntryPoint:
     """``python -m admino.admin_cli create-org`` refuses before the database when it must."""
 
-    def test_admin_cli_module_create_org_without_pg_password_exits_one(self) -> None:
-        """No PG_* at all → exit 1 with the PG_PASSWORD message."""
+    @pytest.mark.parametrize(
+        "env_extra",
+        [
+            pytest.param({}, id="no-pg-vars"),
+            pytest.param(_OWNER_ENV, id="owner-vars-only"),
+        ],
+    )
+    def test_admin_cli_module_create_org_without_pg_app_password_exits_one(
+        self, env_extra: dict[str, str]
+    ) -> None:
+        """No PG_APP_PASSWORD (no PG_* at all, or only the owner's PG_USER/PG_PASSWORD)
+        → exit 1 with the PG_APP_PASSWORD message, and the owner's password not shown.
+        """
         result = _run_module(
-            "create-org", "--name", _ORG_NAME, "--admin-email", _ADMIN_EMAIL, env_extra={}
+            "create-org", "--name", _ORG_NAME, "--admin-email", _ADMIN_EMAIL, env_extra=env_extra
         )
 
         assert result.returncode == 1, result.stderr
-        assert "PG_PASSWORD" in result.stderr
+        assert _NO_DSN_MESSAGE in result.stderr
+        assert _OWNER_PASSWORD not in result.stdout + result.stderr
 
     def test_admin_cli_module_create_org_without_smtp_refuses_piped_stdout(self) -> None:
-        """PG_* set (an unreachable port), no SMTP_*, stdout piped → exit 1 asking for a
-        terminal, before any database connection, with no link anywhere.
+        """PG_APP_PASSWORD set (an unreachable port), no SMTP_*, stdout piped → exit 1
+        asking for a terminal, before any database connection, with no link anywhere.
         """
         result = _run_module(
             "create-org",
@@ -1637,9 +1702,8 @@ class TestCreateOrgEntryPoint:
             env_extra={
                 "PG_HOST": "127.0.0.1",
                 "PG_PORT": "9",
-                "PG_USER": "admino",
                 "PG_DATABASE": "admino",
-                "PG_PASSWORD": _PG_PASSWORD,
+                "PG_APP_PASSWORD": _PG_APP_PASSWORD,
             },
         )
 
