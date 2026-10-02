@@ -9,8 +9,9 @@ a Super Admin; real session cookies resolved by the real
 ``server.require_session``) over the in-memory database of tests/db_fakes.py,
 and one prepared request per route (``_SETUPS``, keyed by (method, path)):
 whatever the request needs exists in the caller's org (a pending invitation,
-a second member, a second session, a pending confirmation or promotion, an
-OAuth connection, a target org for the platform routes).
+a second member, a fresh active or deactivated member to manage (GH-164), a
+second session, a pending confirmation or promotion, an OAuth connection, a
+target org for the platform routes).
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -126,6 +127,7 @@ _CHAT_ID: Final = "roles-163"
 _CONFIRMATION_ID: Final = "confirm-163"
 _INVITEE_EMAIL: Final = "roles-invitee-163@example.ch"
 _TARGET_EMAIL: Final = "roles-target-163@example.ch"
+_MANAGED_EMAIL: Final = "roles-managed-164@example.ch"
 _NEW_ORG_ADMIN_EMAIL: Final = "roles-new-admin-163@example.ch"
 _REFRESH_TOKEN: Final = "fake-refresh-token-gh163"
 
@@ -179,6 +181,46 @@ def _force_logout(world: World, caller: Account) -> _Request:
     )
     world.db.open_session(target)
     return _Request("POST", f"/api/org/users/{target}/logout")
+
+
+def _disposable_member(world: World, caller: Account, *, status: str = "active") -> Any:
+    """A fresh Editor of the caller's org, created per request: never the caller, never
+    the org's last Org Admin. An active one has a live session; a deactivated one has
+    none (deactivation revoked them). The org keeps free seats (100, 3 members)."""
+    target = world.db.add_account(
+        role="editor", org_id=_caller_org(world, caller), status=status, email=_MANAGED_EMAIL
+    )
+    if status == "active":
+        world.db.open_session(target)
+    return target
+
+
+def _patch_org_user(world: World, caller: Account) -> _Request:
+    """Change a fresh Editor's role to Viewer (a real change: ORG_USERS_ROLE_CHANGE)."""
+    return _Request(
+        "PATCH", f"/api/org/users/{_disposable_member(world, caller)}", json={"role": "viewer"}
+    )
+
+
+def _deactivate_org_user(world: World, caller: Account) -> _Request:
+    """Deactivate a fresh active Editor of the caller's org."""
+    return _Request("POST", f"/api/org/users/{_disposable_member(world, caller)}/deactivate")
+
+
+def _reactivate_org_user(world: World, caller: Account) -> _Request:
+    """Reactivate a fresh deactivated Editor of the caller's org (a seat is free)."""
+    target = _disposable_member(world, caller, status="deactivated")
+    return _Request("POST", f"/api/org/users/{target}/reactivate")
+
+
+def _delete_org_user(world: World, caller: Account) -> _Request:
+    """Delete a fresh active Editor of the caller's org."""
+    return _Request("DELETE", f"/api/org/users/{_disposable_member(world, caller)}")
+
+
+def _org_user_password_reset(world: World, caller: Account) -> _Request:
+    """Send a password reset to a fresh active Editor of the caller's org."""
+    return _Request("POST", f"/api/org/users/{_disposable_member(world, caller)}/password-reset")
 
 
 def _pending_invitation(world: World, caller: Account) -> Any:
@@ -276,6 +318,12 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     ),
     ("POST", "/api/me/settings/reset"): _Setup(_plain("POST", "/api/me/settings/reset"), 200),
     # --- org users and invitations ---
+    ("GET", "/api/org/users"): _Setup(_plain("GET", "/api/org/users"), 200),
+    ("PATCH", "/api/org/users/{user_id}"): _Setup(_patch_org_user, 200),
+    ("POST", "/api/org/users/{user_id}/deactivate"): _Setup(_deactivate_org_user, 200),
+    ("POST", "/api/org/users/{user_id}/reactivate"): _Setup(_reactivate_org_user, 200),
+    ("DELETE", "/api/org/users/{user_id}"): _Setup(_delete_org_user, 204),
+    ("POST", "/api/org/users/{user_id}/password-reset"): _Setup(_org_user_password_reset, 202),
     ("POST", "/api/org/users/{user_id}/logout"): _Setup(_force_logout, 204),
     ("POST", "/api/org/invitations"): _Setup(
         _plain("POST", "/api/org/invitations", json={"email": _INVITEE_EMAIL, "role": "editor"}),
@@ -500,7 +548,7 @@ class TestAllowedRoles:
     def test_tenancy_roles_allowed_role_gets_the_success_status(
         self, world: World, spec: RouteSpec, role: Role
     ) -> None:
-        """The documented 200/201/204 (never a 403) for the caller's valid request."""
+        """The documented 200/201/202/204 (never a 403) for the caller's valid request."""
         app = make_app()
         caller = world.by_role(role)
         setup = _SETUPS[(spec.method, spec.path)]
@@ -539,11 +587,12 @@ class TestRoleCaseCoverage:
         } == {"missing": [], "stale": []}
 
     def test_tenancy_roles_success_statuses_are_documented_ones(self) -> None:
-        """Every setup expects a success status: 200, 201 or 204."""
+        """Every setup expects a success status: 200, 201, 202 (an admin-triggered
+        password reset, GH-164) or 204."""
         assert {
             key: setup.status
             for key, setup in _SETUPS.items()
-            if setup.status not in (200, 201, 204)
+            if setup.status not in (200, 201, 202, 204)
         } == {}
 
     def test_tenancy_roles_every_route_is_checked_against_every_role(self) -> None:

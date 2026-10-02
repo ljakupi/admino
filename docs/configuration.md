@@ -238,9 +238,9 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   the `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database
   only stores its SHA-256 hash.
 - **Ending a session** deletes it at once, and its cookie stops working on the next
-  request: logging out, ending one of your sessions, an Org Admin's forced logout, and a
-  password reset (which ends all of them). Sessions that expired or went idle are deleted
-  every hour.
+  request: logging out, ending one of your sessions, an Org Admin's forced logout,
+  deactivating or deleting a user, and a password reset (all three end every session of
+  the account). Sessions that expired or went idle are deleted every hour.
 - **Your sessions**: `GET /api/me/sessions` lists the sessions you're logged in with (when
   each started and was last used, until when it can last, its IP address and browser, and
   which one is the current one). `DELETE /api/me/sessions/{id}` ends one of them, for
@@ -314,12 +314,44 @@ log, without the email address. Only a hash of the link's token is stored.
 
 A send refused because the address is already taken, or because there's no free seat,
 answers `409` and is recorded in the audit log too (without the address). Refused sends
-have their own, tighter limit per Org Admin: after five, only one a minute is allowed, and
-further sends get `429`. This keeps anyone from quickly checking which addresses have an
-account elsewhere on the platform. The link's token is part of the URL path of the two
-link endpoints, so admino doesn't write access logs; a reverse proxy in front of it must
-not log request paths either. The bundled Caddy proxy doesn't (see
+have their own, tighter limit per Org Admin, shared with email changes refused because the
+address is taken (see **Managing users** below): after five, only one a minute is allowed,
+and further sends and email changes get `429`. This keeps anyone from quickly checking
+which addresses have an account elsewhere on the platform. The link's token is part of the
+URL path of the two link endpoints, so admino doesn't write access logs; a reverse proxy in
+front of it must not log request paths either. The bundled Caddy proxy doesn't (see
 [Production deployment](#production-deployment-tls-reverse-proxy)).
+
+**Managing users.** Org Admins manage the people in their organization with these
+routes. Editors, Viewers and the Super Admin get `403`.
+
+- `GET /api/org/users` lists the organization's active and deactivated users, oldest
+  first: name, email address, role, status, when the account was created and when the user
+  last logged in. Invited people aren't listed: until they accept, their accounts are
+  managed with the invitation routes above.
+- `PATCH /api/org/users/{id}` changes a user's role, name or email address. The new address
+  can't belong to any account on the platform yet, in any capitalization. When the address
+  changes, admino emails the old address a short notice (without either address), and a
+  password reset link the user already got stops working. A new role applies from the
+  user's next request. A Viewer keeps their connections and notes, unused.
+- `POST /api/org/users/{id}/deactivate` ends every session of the user at once and emails
+  them that their account was deactivated. Their connections, notes and settings are kept.
+- `POST /api/org/users/{id}/reactivate` needs a free seat (active and invited users take
+  one), and emails the user a link to log in.
+- `DELETE /api/org/users/{id}` deletes the account with its sessions, connections, notes
+  and settings. The email address is free again.
+- `POST /api/org/users/{id}/password-reset` sends the user the same email as **Forgot your
+  password?** above. The admin never sees the link. A deactivated user can't get one.
+
+Org Admins can also change, deactivate or delete their own account; deactivating or
+deleting it logs them out. An organization always keeps at least one active Org Admin:
+demoting, deactivating or deleting the last one answers `409` with the reason
+`last_admin`. The other `409` reasons are `email_taken` (the address belongs to another
+account), `seat_limit` (no free seat to reactivate) and `invalid_status` (the user is
+already deactivated or already active, or a reset for a deactivated user). A user of
+another organization answers `404`, like an unknown one. Every action is recorded in the
+organization's audit log, without names or email addresses. An email change refused with
+`email_taken` counts toward the refused-send limit above.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -415,8 +447,9 @@ and changing limits or residency while a deletion is pending, answers `409`.
 ## Email (SMTP)
 
 admino sends transactional email through **one SMTP account for the whole platform**:
-invitations, password resets, account activated/deactivated notices, budget alerts,
-model deprecation notices and scheduled org deletion notices, for every organization.
+invitations, password resets, account activated/deactivated notices, email change
+notices, budget alerts, model deprecation notices and scheduled org deletion notices, for
+every organization.
 Organizations don't configure their own mail server.
 
 We recommend a **Swiss-based provider** so mail stays in Switzerland, for example

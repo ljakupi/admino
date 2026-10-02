@@ -1,13 +1,13 @@
-"""Tests for admino.email_templates — the transactional email templates (GH-148).
+"""Tests for admino.email_templates — the transactional email templates (GH-148, GH-164).
 
-admino sends seven kinds of transactional email: invitation, password reset,
+admino sends eight kinds of transactional email: invitation, password reset,
 account activated, account deactivated, budget alert (the 80% warning), model
-deprecation and scheduled org deletion. Each one is a params model plus a DE,
-FR and EN rendering in plain text and minimal HTML, picked by the recipient's
-``ui_language``.
+deprecation, scheduled org deletion and (GH-164) email changed. Each one is a
+params model plus a DE, FR and EN rendering in plain text and minimal HTML,
+picked by the recipient's ``ui_language``.
 
 What these tests pin down:
-- EmailTemplate is the closed catalog of the 7 template keys, EmailLanguage is
+- EmailTemplate is the closed catalog of the 8 template keys, EmailLanguage is
   exactly de/fr/en, and TEMPLATE_PARAMS maps every key to its params model.
 - The params models are SealedModels (frozen, extra="forbid"), and their
   fields follow the field-kind rule: the only str fields are ``org_name`` and
@@ -24,6 +24,14 @@ What these tests pin down:
   languages differ, no placeholder is left behind, the subject is one line,
   and the HTML is minimal (doctype, lang attribute, <a href> links, every
   value HTML-escaped, no scripts or remote resources).
+- GH-164: ``EmailTemplate.EMAIL_CHANGED`` ("email_changed") with
+  ``EmailChangedParams`` (only ``org_name``): the notice an Org Admin's email
+  change sends to the user's old address. Its DE/FR/EN copy names the org,
+  says an administrator changed the sign-in address and to contact the org's
+  administrator if unexpected, and never carries an address ('@'), a name or
+  a link. The GH-164 names are looked up at call time (``_cls``, string keys
+  for "email_changed"), so the rest of the file keeps collecting before they
+  exist.
 
 The module is pure: no I/O and no logging. Nothing is mocked because nothing
 external is touched.
@@ -115,8 +123,12 @@ _SPEC_TEMPLATE_KEYS: frozenset[str] = frozenset(
         "budget_alert",
         "model_deprecation",
         "org_deletion_scheduled",
+        # GH-164: the notice to the old address after an Org Admin changed a user's email.
+        "email_changed",
     }
 )
+
+_EMAIL_CHANGED = "email_changed"
 
 _CLASSES: dict[EmailTemplate, type[TemplateParams]] = {
     EmailTemplate.INVITATION: InvitationParams,
@@ -128,7 +140,9 @@ _CLASSES: dict[EmailTemplate, type[TemplateParams]] = {
     EmailTemplate.ORG_DELETION_SCHEDULED: OrgDeletionScheduledParams,
 }
 
-_VALID_KWARGS: dict[EmailTemplate, dict[str, Any]] = {
+# Keyed by the template value (EmailTemplate is a StrEnum, so a member finds its entry):
+# the GH-164 key exists here before the member does.
+_VALID_KWARGS: dict[str, dict[str, Any]] = {
     EmailTemplate.INVITATION: {
         "org_name": _ORG_NAME,
         "accept_link": _ACCEPT_LINK,
@@ -148,10 +162,11 @@ _VALID_KWARGS: dict[EmailTemplate, dict[str, Any]] = {
         "models_link": _MODELS_LINK,
     },
     EmailTemplate.ORG_DELETION_SCHEDULED: {"org_name": _ORG_NAME, "purge_after": _PURGE_AFTER},
+    _EMAIL_CHANGED: {"org_name": _ORG_NAME},
 }
 
 # The exact fields of every params model: nothing that could carry org content.
-_SPEC_FIELDS: dict[EmailTemplate, frozenset[str]] = {
+_SPEC_FIELDS: dict[str, frozenset[str]] = {
     EmailTemplate.INVITATION: frozenset({"org_name", "accept_link", "expires_at"}),
     EmailTemplate.PASSWORD_RESET: frozenset({"reset_link", "expires_at"}),
     EmailTemplate.ACCOUNT_ACTIVATED: frozenset({"org_name", "login_link"}),
@@ -159,6 +174,7 @@ _SPEC_FIELDS: dict[EmailTemplate, frozenset[str]] = {
     EmailTemplate.BUDGET_ALERT: frozenset({"org_name", "month", "usage_link"}),
     EmailTemplate.MODEL_DEPRECATION: frozenset({"org_name", "retires_on", "models_link"}),
     EmailTemplate.ORG_DELETION_SCHEDULED: frozenset({"org_name", "purge_after"}),
+    _EMAIL_CHANGED: frozenset({"org_name"}),
 }
 
 # JSON schema format of every non-str field: "date-time" for datetimes, "date" for dates.
@@ -280,10 +296,28 @@ _SRC_DIR = Path(templates_mod.__file__).resolve().parent
 # ---------------------------------------------------------------------------
 
 
-def _params(template: EmailTemplate, **overrides: Any) -> TemplateParams:
+def _email_changed_params() -> type[TemplateParams]:
+    """GH-164's EmailChangedParams, looked up at call time (AttributeError until it exists)."""
+    cls: type[TemplateParams] = templates_mod.EmailChangedParams
+    return cls
+
+
+def _email_changed_template() -> EmailTemplate:
+    """GH-164's EmailTemplate.EMAIL_CHANGED (ValueError until it exists)."""
+    return EmailTemplate(_EMAIL_CHANGED)
+
+
+def _cls(template: str) -> type[TemplateParams]:
+    """The params class of a template (GH-164's looked up at call time)."""
+    if template == _EMAIL_CHANGED:
+        return _email_changed_params()
+    return _CLASSES[EmailTemplate(template)]
+
+
+def _params(template: str, **overrides: Any) -> TemplateParams:
     """Build the sample params of a template, with some fields overridden."""
     kwargs = {**_VALID_KWARGS[template], **overrides}
-    return _CLASSES[template](**kwargs)
+    return _cls(template)(**kwargs)
 
 
 def _links(params: TemplateParams) -> list[str]:
@@ -357,15 +391,15 @@ def _templates() -> list[Any]:
 
 
 class TestTemplateCatalog:
-    """EmailTemplate is the closed catalog of the 7 email types; languages are de/fr/en."""
+    """EmailTemplate is the closed catalog of the 8 email types; languages are de/fr/en."""
 
     def test_email_templates_template_is_a_str_enum(self) -> None:
         """EmailTemplate is a StrEnum, so its members bind as plain strings."""
         assert issubclass(EmailTemplate, StrEnum)
 
-    def test_email_templates_catalog_has_exactly_the_seven_types(self) -> None:
+    def test_email_templates_catalog_has_exactly_the_eight_types(self) -> None:
         """invitation, password reset, account activated/deactivated, budget alert, model
-        deprecation and scheduled org deletion: nothing else."""
+        deprecation, scheduled org deletion and (GH-164) email changed: nothing else."""
         assert {template.value for template in EmailTemplate} == _SPEC_TEMPLATE_KEYS
 
     @pytest.mark.parametrize(
@@ -378,6 +412,7 @@ class TestTemplateCatalog:
             ("BUDGET_ALERT", "budget_alert"),
             ("MODEL_DEPRECATION", "model_deprecation"),
             ("ORG_DELETION_SCHEDULED", "org_deletion_scheduled"),
+            ("EMAIL_CHANGED", "email_changed"),
         ],
     )
     def test_email_templates_member_names_map_to_keys(self, member: str, value: str) -> None:
@@ -399,7 +434,7 @@ class TestTemplateCatalog:
         """Each key maps to its own params class, whose template ClassVar is that key."""
         cls = TEMPLATE_PARAMS[template]
 
-        assert cls is _CLASSES[template]
+        assert cls is _cls(template)
         assert cls.template is template
 
     @pytest.mark.parametrize("template", _templates())
@@ -407,7 +442,7 @@ class TestTemplateCatalog:
         self, template: EmailTemplate
     ) -> None:
         """Every params model is a TemplateParams and a SealedModel (frozen, extra="forbid")."""
-        cls = _CLASSES[template]
+        cls = _cls(template)
 
         assert issubclass(cls, TemplateParams)
         assert issubclass(cls, SealedModel)
@@ -428,7 +463,7 @@ class TestParamsFields:
         self, template: EmailTemplate
     ) -> None:
         """No extra field (a project, chat or file name, message text, user name, address)."""
-        assert set(_CLASSES[template].model_fields) == _SPEC_FIELDS[template]
+        assert set(_cls(template).model_fields) == _SPEC_FIELDS[template]
 
     @pytest.mark.parametrize("template", _templates())
     def test_email_templates_str_fields_are_only_org_name_and_links(
@@ -436,7 +471,7 @@ class TestParamsFields:
     ) -> None:
         """The field-kind rule: a str field is org_name or ends in _link; every other field
         is a datetime or a date (JSON schema format date-time or date)."""
-        cls = _CLASSES[template]
+        cls = _cls(template)
         schema = cls.model_json_schema()["properties"]
         for name, field in cls.model_fields.items():
             if name == "org_name" or name.endswith("_link"):
@@ -451,7 +486,7 @@ class TestParamsFields:
         """template is a ClassVar: not a field, and not in the dumped params."""
         params = _params(template)
 
-        assert "template" not in _CLASSES[template].model_fields
+        assert "template" not in _cls(template).model_fields
         assert "template" not in params.model_dump(mode="json")
         assert params.template is template
 
@@ -485,7 +520,7 @@ class TestParamsFields:
     ) -> None:
         """model_construct() (which skips validation) is refused, as for every SealedModel."""
         with pytest.raises(TypeError):
-            _CLASSES[template].model_construct(**_VALID_KWARGS[template])
+            _cls(template).model_construct(**_VALID_KWARGS[template])
 
     @pytest.mark.parametrize("template", _templates())
     def test_email_templates_params_refuse_copy_with_update(self, template: EmailTemplate) -> None:
@@ -502,7 +537,7 @@ class TestParamsFields:
             kwargs = dict(_VALID_KWARGS[template])
             del kwargs[field]
             with pytest.raises(ValidationError):
-                _CLASSES[template](**kwargs)
+                _cls(template)(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -782,7 +817,7 @@ class TestParamsFor:
         result = params_for(template.value, stored)
 
         assert result == params
-        assert type(result) is _CLASSES[template]
+        assert type(result) is _cls(template)
 
     @pytest.mark.parametrize(
         "template_key",
@@ -1230,3 +1265,238 @@ class TestModuleIsolation:
         doc = (templates_mod.__doc__ or "").lower()
 
         assert "content" in doc
+
+
+# ---------------------------------------------------------------------------
+# 9. GH-164: the email_changed notice (to the old address, no address in it)
+# ---------------------------------------------------------------------------
+
+# Fields an email-change notice must never take: the old or new address, a name, a link.
+_EMAIL_CHANGED_REFUSED_FIELDS: tuple[str, ...] = (
+    "email",
+    "new_email",
+    "old_email",
+    "address",
+    "new_address",
+    "name",
+    "user_name",
+    "new_name",
+    "admin_name",
+    "link",
+    "login_link",
+    "reset_link",
+    "changed_at",
+)
+
+# A loose marker per language: the copy talks about the sign-in email address.
+_ADDRESS_MARKERS: dict[str, re.Pattern[str]] = {
+    "de": re.compile(r"E-Mail-Adresse|E-Mail Adresse|Adresse", re.IGNORECASE),
+    "fr": re.compile(r"adresse", re.IGNORECASE),
+    "en": re.compile(r"e-?mail address|address", re.IGNORECASE),
+}
+
+# A loose marker per language: the copy names the organization's administrator(s).
+_ADMIN_MARKERS: dict[str, re.Pattern[str]] = {
+    "de": re.compile(r"administr", re.IGNORECASE),
+    "fr": re.compile(r"administr", re.IGNORECASE),
+    "en": re.compile(r"administr", re.IGNORECASE),
+}
+
+# Anything link-like: a scheme, a www host or an anchor.
+_LINK_RE = re.compile(r"https?:|://|www\.|href|<\s*a\b|mailto:", re.IGNORECASE)
+
+
+def _email_changed(**overrides: Any) -> TemplateParams:
+    """EmailChangedParams for the sample org name, with fields overridden."""
+    return _email_changed_params()(**{"org_name": _ORG_NAME, **overrides})
+
+
+class TestEmailChangedTemplate:
+    """EmailTemplate.EMAIL_CHANGED and EmailChangedParams (org_name only)."""
+
+    def test_email_templates_email_changed_member_is_the_stored_key(self) -> None:
+        """EmailTemplate.EMAIL_CHANGED is "email_changed" (the outbox template_key)."""
+        member = getattr(EmailTemplate, "EMAIL_CHANGED", None)
+
+        assert member is not None, "EmailTemplate must define EMAIL_CHANGED"
+        assert member.value == _EMAIL_CHANGED
+
+    def test_email_templates_email_changed_params_is_in_template_params(self) -> None:
+        """TEMPLATE_PARAMS maps the key to EmailChangedParams, whose template is the key."""
+        template = _email_changed_template()
+        cls = _email_changed_params()
+
+        assert TEMPLATE_PARAMS[template] is cls
+        assert cls.template is template
+
+    def test_email_templates_email_changed_params_is_a_sealed_template_params(self) -> None:
+        cls = _email_changed_params()
+
+        assert issubclass(cls, TemplateParams)
+        assert issubclass(cls, SealedModel)
+        assert cls.model_config.get("extra") == "forbid"
+        assert cls.model_config.get("frozen") is True
+
+    def test_email_templates_email_changed_params_has_only_org_name(self) -> None:
+        """No address, name, link or date: the org name is the whole params."""
+        assert set(_email_changed_params().model_fields) == {"org_name"}
+
+    def test_email_templates_email_changed_org_name_is_an_org_name(self) -> None:
+        """org_name is a str with OrgName's bounds (same metadata as the other notices)."""
+        field = _email_changed_params().model_fields["org_name"]
+        reference = AccountDeactivatedParams.model_fields["org_name"]
+
+        assert field.annotation is str
+        assert field.metadata == reference.metadata
+
+    def test_email_templates_email_changed_stored_params_are_the_org_name_only(self) -> None:
+        """The outbox row's params JSON is {"org_name": ...}, nothing else."""
+        assert _email_changed().model_dump(mode="json") == {"org_name": _ORG_NAME}
+
+    @pytest.mark.parametrize("field", _EMAIL_CHANGED_REFUSED_FIELDS)
+    def test_email_templates_email_changed_refuses_extra_fields(self, field: str) -> None:
+        """An address, a name or a link can't be given: the extra key is a ValidationError."""
+        cls = _email_changed_params()
+
+        with pytest.raises(ValidationError):
+            cls(org_name=_ORG_NAME, **{field: "new.address@example.ch"})
+
+    @pytest.mark.parametrize(
+        "org_name",
+        [
+            pytest.param("", id="empty"),
+            pytest.param("   ", id="blank"),
+            pytest.param("A" * 121, id="121-chars"),
+            pytest.param("Acme" + _CARRIAGE_RETURN + _NEWLINE + "Bcc: eve@evil.example", id="crlf"),
+            pytest.param("Acme" + _ZERO_WIDTH_SPACE + "AG", id="zero-width-space"),
+            pytest.param(_RTL_OVERRIDE + "GA emcA", id="rtl-override"),
+            pytest.param("Acme" + _LINE_SEPARATOR + "AG", id="line-separator"),
+            pytest.param(None, id="none"),
+        ],
+    )
+    def test_email_templates_email_changed_refuses_unsafe_org_names(self, org_name: Any) -> None:
+        """The org name reaches the Subject header: OrgName's rules apply."""
+        cls = _email_changed_params()
+
+        with pytest.raises(ValidationError):
+            cls(org_name=org_name)
+
+    def test_email_templates_email_changed_requires_org_name(self) -> None:
+        cls = _email_changed_params()
+
+        with pytest.raises(ValidationError):
+            cls()
+
+    def test_email_templates_email_changed_params_for_round_trips(self) -> None:
+        """The stored key and JSON params (as the outbox keeps them) give the model back."""
+        params = _email_changed()
+        stored = json.loads(json.dumps(params.model_dump(mode="json")))
+
+        result = params_for(_EMAIL_CHANGED, stored)
+
+        assert result == params
+        assert type(result) is _email_changed_params()
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            pytest.param({}, id="empty"),
+            pytest.param({"org_name": _ORG_NAME, "email": "a@example.ch"}, id="address"),
+            pytest.param({"org_name": _ORG_NAME, "login_link": _LOGIN_LINK}, id="link"),
+        ],
+    )
+    def test_email_templates_email_changed_params_for_refuses_bad_data(
+        self, data: dict[str, Any]
+    ) -> None:
+        _email_changed_template()
+
+        with pytest.raises(ValueError, match=r".*"):
+            params_for(_EMAIL_CHANGED, data)
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_renders(self, language: str) -> None:
+        """A RenderedEmail with a non-empty subject, text and HTML in each language."""
+        rendered = render(_email_changed(), language)
+
+        assert isinstance(rendered, RenderedEmail)
+        assert rendered.subject.strip()
+        assert rendered.text.strip()
+        assert rendered.html.strip()
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_text_names_the_org(self, language: str) -> None:
+        """The raw org name in the text, HTML-escaped in the HTML."""
+        rendered = render(_email_changed(), language)
+
+        assert _ORG_NAME in rendered.text
+        assert html_lib.escape(_ORG_NAME, quote=False) in rendered.html
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_subject_is_one_line(self, language: str) -> None:
+        rendered = render(_email_changed(), language)
+
+        assert rendered.subject == rendered.subject.strip()
+        assert len(rendered.subject.splitlines()) == 1
+        assert _CARRIAGE_RETURN not in rendered.subject
+        assert _NEWLINE not in rendered.subject
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_contains_no_address(self, language: str) -> None:
+        """No '@' anywhere: neither the old nor the new address (nor any other)."""
+        rendered = render(_email_changed(), language)
+
+        for part in (rendered.subject, rendered.text, rendered.html):
+            assert "@" not in part, part
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_contains_no_link(self, language: str) -> None:
+        """No URL, www host, anchor or mailto: the notice links nowhere."""
+        rendered = render(_email_changed(), language)
+
+        for part in (rendered.subject, rendered.text, rendered.html):
+            assert _LINK_RE.search(part) is None, part
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_no_placeholder_is_left(self, language: str) -> None:
+        rendered = render(_email_changed(), language)
+
+        for part in (rendered.subject, rendered.text, rendered.html):
+            assert _PLACEHOLDER_RE.search(part) is None, part
+
+    def test_email_templates_email_changed_languages_differ(self) -> None:
+        rendered = [render(_email_changed(), language) for language in _LANGUAGES]
+
+        assert len({r.subject for r in rendered}) == 3
+        assert len({r.text for r in rendered}) == 3
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_says_what_happened(self, language: str) -> None:
+        """Loose markers: the copy is about the (sign-in) email address, in the requested
+        language, and points to the organization's administrator."""
+        text = render(_email_changed(), language).text
+
+        assert _LANGUAGE_MARKERS[language].search(text), text
+        assert _ADDRESS_MARKERS[language].search(text), text
+        assert _ADMIN_MARKERS[language].search(text), text
+
+    @pytest.mark.parametrize("language", _LANGUAGES)
+    def test_email_templates_email_changed_differs_from_the_deactivation_notice(
+        self, language: str
+    ) -> None:
+        """Its own copy, not another template's text reused."""
+        changed = render(_email_changed(), language)
+        deactivated = render(AccountDeactivatedParams(org_name=_ORG_NAME), language)
+
+        assert changed.subject != deactivated.subject
+        assert changed.text != deactivated.text
+
+    def test_email_templates_email_changed_render_logs_nothing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level(logging.DEBUG)
+        params = _email_changed()
+
+        for language in _LANGUAGES:
+            render(params, language)
+
+        assert caplog.records == []

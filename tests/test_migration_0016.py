@@ -26,11 +26,12 @@ What these tests pin down:
   ``PermissionEntry`` pattern do (a trailing newline, upper case, 63 vs 64
   characters), so a value the API accepts never makes the database refuse the
   write with a 500. The permission values equal ``get_args(PermissionState)``.
-- ``audit_events_action_check`` is dropped, then added again with a list that
-  is exactly the live ``AuditAction`` catalog (47 actions): 0010's 43 plus
-  ``org.permission_change``, ``org.permission_promote``,
-  ``org.permission_promote_cancel`` and ``org.permission_demote``. The exact
-  sync with the live catalog moved here from tests/test_migration_0010.py.
+- ``audit_events_action_check`` is dropped, then added again with a list of 47
+  actions: 0010's 43 plus ``org.permission_change``, ``org.permission_promote``,
+  ``org.permission_promote_cancel`` and ``org.permission_demote``, all still in
+  ``AuditAction``. The exact sync with the live catalog moved here from
+  tests/test_migration_0010.py, then on to tests/test_migration_0020.py when
+  GH-164 added ``user.profile_change``.
 - Nothing else: no INSERT (no seed rows), no UPDATE / DELETE / TRUNCATE, no
   other DROP or ALTER, no index, function, trigger, view, type or DO block, no
   GRANT / REVOKE, parameter-free.
@@ -739,13 +740,22 @@ class TestMigration0016ActionCatalog:
     def test_migration_0016_action_check_contains_the_new_action(self, action: str) -> None:
         assert action in _added_action_check()
 
-    def test_migration_0016_action_check_matches_audit_action(self) -> None:
-        """The live catalog sync (moved here from test_migration_0010.py): the SQL action
-        list equals AuditAction's values exactly."""
-        assert set(_added_action_check()) == _live_catalog()
+    def test_migration_0016_action_check_is_still_in_audit_action(self) -> None:
+        """Every action 0016 allows is still an AuditAction (none was dropped).
 
-    def test_migration_0016_live_catalog_has_the_contract_size(self) -> None:
-        assert len(_live_catalog()) == _CATALOG_SIZE
+        A shipped migration never changes, so 0016's list stays its 47 actions. The
+        catalog grows by replacing the audit_events_action_check constraint in a later
+        migration (0020 for GH-164's user.profile_change), so the exact sync with the
+        live AuditAction lives in that migration's tests (tests/test_migration_0020.py).
+        """
+        assert set(_added_action_check()) <= _live_catalog()
+
+    def test_migration_0016_action_check_still_lists_its_own_47_actions(self) -> None:
+        """0016's list is its own 47 actions, whatever the live catalog has grown to."""
+        listed = set(_added_action_check())
+
+        assert len(listed) == _CATALOG_SIZE
+        assert len(_live_catalog()) >= _CATALOG_SIZE
 
 
 # ---------------------------------------------------------------------------

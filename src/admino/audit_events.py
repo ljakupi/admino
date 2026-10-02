@@ -1,16 +1,17 @@
 """Content-free, append-only audit event store: action catalog, record(), retention purge (GH-146).
 
 Every security-relevant action (logins and lockouts, password resets, session
-revocations and forced logouts, invitations, role changes, activations,
-sharing changes, deletions and restores, exports, Org Admin access to other
-users' projects, org and platform settings, org tool permissions, Super
-Admin actions, residency policy, break-glass sessions, agent tool calls) is
+revocations and forced logouts, invitations, role and profile changes,
+activations, sharing changes, deletions and restores, exports, Org Admin access
+to other users' projects, org and platform settings, org tool permissions,
+Super Admin actions, residency policy, break-glass sessions, agent tool calls) is
 written through ``record()`` as one row of the ``audit_events`` table
 (migration 0005; the action catalog CHECK is replaced by migration 0009 for
 GH-152's session actions, by migration 0010 for GH-153's invitation.resend
-and invitation.refuse, and by migration 0016 for GH-161's
+and invitation.refuse, by migration 0016 for GH-161's
 org.permission_change, org.permission_promote, org.permission_promote_cancel
-and org.permission_demote).
+and org.permission_demote, and by migration 0020 for GH-164's
+user.profile_change).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -100,8 +101,11 @@ class AuditAction(StrEnum):
     INVITATION_ACCEPT = "invitation.accept"
     INVITATION_RESEND = "invitation.resend"
     INVITATION_REFUSE = "invitation.refuse"
-    # Role changes, activations, deactivations, account deletion
+    # Role changes; an Org Admin changing a user's name or email, or the email
+    # change refused because the address is taken (GH-164); activations,
+    # deactivations, account deletion
     USER_ROLE_CHANGE = "user.role_change"
+    USER_PROFILE_CHANGE = "user.profile_change"
     USER_ACTIVATE = "user.activate"
     USER_DEACTIVATE = "user.deactivate"
     USER_DELETE = "user.delete"
@@ -181,6 +185,7 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.INVITATION_RESEND: "org",
         AuditAction.INVITATION_REFUSE: "org",
         AuditAction.USER_ROLE_CHANGE: "org",
+        AuditAction.USER_PROFILE_CHANGE: "org",
         AuditAction.USER_ACTIVATE: "any",
         AuditAction.USER_DEACTIVATE: "any",
         AuditAction.USER_DELETE: "any",

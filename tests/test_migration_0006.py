@@ -13,7 +13,9 @@ What these tests pin down:
   attempts, next_attempt_at, created_at and finished_at. No subject, body,
   error text or other content column.
 - CHECKs that mirror the Python bounds: the address format mirrors
-  users_email_format_check, template_key is the EmailTemplate catalog,
+  users_email_format_check, template_key is GH-148's 7-key EmailTemplate
+  catalog (all still in EmailTemplate; the exact sync with the live catalog
+  moved to tests/test_migration_0020.py when GH-164 added email_changed),
   language is EmailLanguage, status is OutboxStatus, attempts is non-negative
   (any upper bound leaves room for MAX_ATTEMPTS), params is a JSON object.
 - Row invariants: a row is pending exactly when finished_at is NULL, and only
@@ -578,11 +580,18 @@ class TestMigration0006Indexes:
 class TestMigration0006PythonSync:
     """The CHECKs mirror admino.email_templates and admino.email_outbox."""
 
-    def test_migration_0006_template_key_check_matches_email_template(self) -> None:
-        """The SQL template keys equal EmailTemplate's values."""
+    def test_migration_0006_template_key_check_is_still_in_email_template(self) -> None:
+        """Every template key 0006 allows is still an EmailTemplate (none was dropped).
+
+        A shipped migration never changes, so 0006's list stays its 7 keys
+        (test_migration_0006_template_key_check_lists_the_seven_templates pins it). The
+        catalog grows by replacing the email_outbox_template_key_check constraint in a
+        later migration (0020 for GH-164's email_changed), so the exact sync with the
+        live EmailTemplate lives in that migration's tests (tests/test_migration_0020.py).
+        """
         templates = _email_templates_module()
 
-        assert _in_check_values("template_key") == {t.value for t in templates.EmailTemplate}
+        assert _in_check_values("template_key") <= {t.value for t in templates.EmailTemplate}
 
     def test_migration_0006_language_check_matches_email_language(self) -> None:
         """The SQL languages equal the EmailLanguage Literal."""

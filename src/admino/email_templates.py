@@ -1,10 +1,12 @@
 """Transactional email templates: params models and DE/FR/EN rendering (GH-148).
 
-admino sends seven kinds of transactional email (``EmailTemplate``):
+admino sends eight kinds of transactional email (``EmailTemplate``):
 invitation, password reset, account activated, account deactivated, budget
-alert (the 80% warning), model deprecation and scheduled org deletion. Each has
-a params model and a German, French and English copy, rendered as plain text
-plus a minimal HTML part in the recipient's UI language.
+alert (the 80% warning), model deprecation, scheduled org deletion and (GH-164)
+email changed, the notice an Org Admin's change of a user's sign-in address
+sends to the old address. Each has a params model and a German, French and
+English copy, rendered as plain text plus a minimal HTML part in the
+recipient's UI language.
 
 Inputs: a ``TemplateParams`` instance (built by the caller, or restored from
 the outbox with ``params_for()``) and a language (de, fr or en).
@@ -16,7 +18,8 @@ Security notes:
   everything else is a timezone-aware datetime or a date. Every params model is
   a ``SealedModel`` (frozen, extra="forbid"), so a project, chat or file name,
   message text, user name or address can't be passed in. The model deprecation
-  email doesn't even name the model. The greeting is generic.
+  email doesn't even name the model, and the email changed notice names neither
+  the old nor the new address. The greeting is generic.
 - Header injection: ``org_name`` (it reaches the Subject header) is 1 to 120
   characters, not blank, and refuses control (Cc), format (Cf), surrogate (Cs)
   and line/paragraph separator (Zl, Zp) characters.
@@ -64,6 +67,7 @@ class EmailTemplate(StrEnum):
     BUDGET_ALERT = "budget_alert"
     MODEL_DEPRECATION = "model_deprecation"
     ORG_DELETION_SCHEDULED = "org_deletion_scheduled"
+    EMAIL_CHANGED = "email_changed"
 
 
 _LANGUAGES: Final[frozenset[str]] = frozenset(get_args(EmailLanguage))
@@ -190,6 +194,14 @@ class OrgDeletionScheduledParams(TemplateParams):
     purge_after: AwareDatetime
 
 
+class EmailChangedParams(TemplateParams):
+    """An administrator changed the recipient's sign-in address (sent to the old one)."""
+
+    template: ClassVar[EmailTemplate] = EmailTemplate.EMAIL_CHANGED
+
+    org_name: OrgName
+
+
 TEMPLATE_PARAMS: Final[Mapping[EmailTemplate, type[TemplateParams]]] = MappingProxyType(
     {
         params.template: params
@@ -201,6 +213,7 @@ TEMPLATE_PARAMS: Final[Mapping[EmailTemplate, type[TemplateParams]]] = MappingPr
             BudgetAlertParams,
             ModelDeprecationParams,
             OrgDeletionScheduledParams,
+            EmailChangedParams,
         )
     }
 )
@@ -494,6 +507,41 @@ _COPY: Final[Mapping[EmailTemplate, Mapping[EmailLanguage, _Copy]]] = MappingPro
                     "All of the organization's data will be permanently deleted "
                     "after {purge_after}.",
                     "If this is not intended, please contact admino support before then.",
+                ),
+            ),
+        },
+        EmailTemplate.EMAIL_CHANGED: {
+            "de": _Copy(
+                "Die Anmeldeadresse Ihres Kontos bei {org_name} wurde geändert",
+                (
+                    "Die E-Mail-Adresse, mit der Sie sich bei Ihrem admino-Konto in der "
+                    "Organisation {org_name} anmelden, wurde von der Administration Ihrer "
+                    "Organisation geändert.",
+                    "Ab sofort melden Sie sich mit der neuen Adresse an.",
+                    "Falls Sie diese Änderung nicht erwartet haben, wenden Sie sich bitte "
+                    "an die Administration Ihrer Organisation.",
+                ),
+            ),
+            "fr": _Copy(
+                "L'adresse de connexion de votre compte chez {org_name} a été modifiée",
+                (
+                    "L'adresse e-mail avec laquelle vous vous connectez à votre compte admino "
+                    "dans l'organisation {org_name} a été modifiée par l'administration "
+                    "de votre organisation.",
+                    "Désormais, vous vous connectez avec la nouvelle adresse.",
+                    "Si vous n'attendiez pas ce changement, veuillez contacter "
+                    "l'administration de votre organisation.",
+                ),
+            ),
+            "en": _Copy(
+                "The sign-in address of your account at {org_name} has been changed",
+                (
+                    "The email address you use to sign in to your admino account in the "
+                    "organization {org_name} has been changed by an administrator of your "
+                    "organization.",
+                    "From now on, you sign in with the new address.",
+                    "If you were not expecting this change, please contact an administrator "
+                    "of your organization.",
                 ),
             ),
         },

@@ -1,4 +1,5 @@
-"""Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153).
+"""Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153,
+GH-161, GH-164).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
@@ -7,7 +8,8 @@ Super Admin action, residency policy, break-glass sessions, agent tool calls,
 since GH-152 a user revoking one of their sessions and an Org Admin's forced
 logout, since GH-153 an invitation sent again, and since GH-161 an Org Admin
 changing, promoting, demoting or cancelling the promotion of one of the org's
-tool permissions) is recorded through one
+tool permissions, and since GH-164 an Org Admin changing a user's name or email)
+is recorded through one
 service function, record(), as a row in the append-only audit_events table
 (migration 0005, tests/test_migration_0005.py).
 
@@ -43,6 +45,12 @@ What these tests pin down:
   confirm) and a demotion (confirm -> deny), ``{"tool", "action"}`` for a
   cancelled promotion. A tool or action name outside the vocabulary (free
   text such as "Gmail Send") is refused like any other content.
+- GH-164: one more org-scoped action, ``user.profile_change`` (48 in all): an
+  Org Admin changed a user's name and/or email (metadata ``{"name_changed":
+  bool, "email_changed": bool}``), or the email change was refused because the
+  address is taken (``{"email_taken": True}``). The target is the user; the
+  name and the email are never in the row: a metadata value that is an email
+  address or a name is refused by the existing content validator.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -192,6 +200,9 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         "org.permission_promote",
         "org.permission_promote_cancel",
         "org.permission_demote",
+        # GH-164: an Org Admin changes a user's name or email (or the change is refused
+        # because the email is taken).
+        "user.profile_change",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -235,6 +246,7 @@ _ISSUE_CATEGORIES: list[Any] = [
         id="invitations",
     ),
     pytest.param({"user.role_change", "project.member_role_change"}, id="role-changes"),
+    pytest.param({"user.profile_change"}, id="user-profile-changes"),
     pytest.param({"user.activate"}, id="activations"),
     pytest.param({"user.deactivate"}, id="deactivations"),
     pytest.param(
@@ -648,12 +660,12 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 47 actions of the spec (GH-146's 39, GH-152's
+        """The catalog has exactly the 48 actions of the spec (GH-146's 39, GH-152's
         session.revoke and session.force_logout, GH-153's invitation.resend and
-        invitation.refuse, GH-161's four org.permission_* actions): nothing missing,
-        nothing extra."""
+        invitation.refuse, GH-161's four org.permission_* actions, GH-164's
+        user.profile_change): nothing missing, nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 47
+        assert len(AuditAction) == 48
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:
@@ -733,9 +745,11 @@ class TestActionScopes:
     def test_audit_events_org_scoped_action_without_org_is_rejected(self, value: str) -> None:
         """An org-scoped action needs an org_id, even from a Super Admin (whose actions
         affecting an org must land in that org's log)."""
+        action = AuditAction(value)
+
         with pytest.raises(ValidationError):
             _event(
-                action=value,
+                action=action,
                 actor_kind="super_admin",
                 actor_user_id=_SUPER_ADMIN,
                 org_id=None,
@@ -2957,4 +2971,194 @@ class TestOrgPermissionActions:
 
         _assert_no_content(str(caught.value), "Gmail Send", _ORG, _USER)
         _assert_no_content(repr(caught.value), "Gmail Send", _ORG, _USER)
+        assert caught.value.__cause__ is None
+
+
+# ---------------------------------------------------------------------------
+# GH-164: user.profile_change (an Org Admin changes a user's name or email)
+# ---------------------------------------------------------------------------
+
+_PROFILE_CHANGE = "user.profile_change"
+
+# The contract's metadata of a successful change: which of the two fields changed.
+_PROFILE_FLAGS: list[Any] = [
+    pytest.param(True, False, id="name-only"),
+    pytest.param(False, True, id="email-only"),
+    pytest.param(True, True, id="name-and-email"),
+]
+
+# A name or an address in place of (or next to) the flags: content, always refused.
+_PROFILE_CONTENT_METADATA: list[Any] = [
+    pytest.param(
+        {"name_changed": True, "email_changed": True, "new_email": "ada@example.ch"}, id="new-email"
+    ),
+    pytest.param(
+        {"name_changed": False, "email_changed": True, "old_email": "Ada@Example.CH"},
+        id="old-email",
+    ),
+    pytest.param({"email_changed": "ada.lovelace@example.ch"}, id="email-as-flag-value"),
+    pytest.param({"email": "ada@example.ch"}, id="email-key"),
+    pytest.param({"email_taken": "ada@example.ch"}, id="email-as-taken-value"),
+    pytest.param({"name_changed": True, "new_name": "Ada Lovelace"}, id="new-name"),
+    pytest.param({"name_changed": True, "old_name": "Alice"}, id="old-name"),
+    pytest.param({"name_changed": "Ada Lovelace"}, id="name-as-flag-value"),
+    pytest.param({"name": "ada"}, id="lowercase-name"),
+]
+
+
+def _profile_change() -> AuditAction:
+    """The AuditAction for user.profile_change (raises ValueError until it exists)."""
+    return AuditAction(_PROFILE_CHANGE)
+
+
+def _profile_record_kwargs(**overrides: Any) -> dict[str, Any]:
+    """record() keyword arguments for the contract's row: an Org Admin changed a user."""
+    kwargs: dict[str, Any] = {
+        "action": _profile_change(),
+        "actor_kind": "member",
+        "actor_user_id": _USER,
+        "org_id": _ORG,
+        "target_type": TargetType.USER,
+        "target_ids": [_MARKER],
+        "ip": _IP,
+        "metadata": {"name_changed": True, "email_changed": False},
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+def _profile_event(metadata: Any) -> AuditEvent:
+    """An AuditEvent of user.profile_change on one target user with the given metadata."""
+    action = _profile_change()
+    return _event(
+        action=action, target_type=TargetType.USER, target_ids=(_MARKER,), metadata=metadata
+    )
+
+
+class TestUserProfileChangeAction:
+    """GH-164's org-scoped user.profile_change and its bool-only metadata."""
+
+    def test_audit_events_profile_change_member_has_contract_value(self) -> None:
+        """AuditAction.USER_PROFILE_CHANGE is "user.profile_change"."""
+        member = getattr(AuditAction, "USER_PROFILE_CHANGE", None)
+
+        assert member is not None, "AuditAction must define USER_PROFILE_CHANGE"
+        assert member.value == _PROFILE_CHANGE
+        assert AuditAction(_PROFILE_CHANGE) is member
+
+    def test_audit_events_profile_change_is_org_scoped(self) -> None:
+        """The event belongs to the org's log (the org's admins see it), and the actions
+        the user-management routes also write keep their scopes."""
+        assert ACTION_SCOPES[_profile_change()] == "org"
+        assert ACTION_SCOPES[AuditAction.USER_ROLE_CHANGE] == "org"
+        assert ACTION_SCOPES[AuditAction.SESSION_FORCE_LOGOUT] == "org"
+        assert ACTION_SCOPES[AuditAction.USER_ACTIVATE] == "any"
+        assert ACTION_SCOPES[AuditAction.USER_DEACTIVATE] == "any"
+        assert ACTION_SCOPES[AuditAction.USER_DELETE] == "any"
+        assert ACTION_SCOPES[AuditAction.PASSWORD_RESET_REQUEST] == "any"
+
+    @pytest.mark.parametrize(("name_changed", "email_changed"), _PROFILE_FLAGS)
+    def test_audit_events_profile_change_flags_metadata_is_valid(
+        self, name_changed: bool, email_changed: bool
+    ) -> None:
+        """{"name_changed": bool, "email_changed": bool} validates and stays bools."""
+        metadata = {"name_changed": name_changed, "email_changed": email_changed}
+
+        event = _profile_event(metadata)
+
+        assert event.metadata == metadata
+        assert type(event.metadata["name_changed"]) is bool
+        assert type(event.metadata["email_changed"]) is bool
+
+    def test_audit_events_profile_change_contract_example_is_valid(self) -> None:
+        """The contract's example: the name changed, the email didn't."""
+        event = _profile_event({"name_changed": True, "email_changed": False})
+
+        assert event.action == _profile_change()
+        assert event.metadata == {"name_changed": True, "email_changed": False}
+
+    def test_audit_events_profile_change_email_taken_metadata_is_valid(self) -> None:
+        """The refused change on a taken email is recorded as {"email_taken": True}."""
+        event = _profile_event({"email_taken": True})
+
+        assert event.metadata == {"email_taken": True}
+
+    @pytest.mark.parametrize("metadata", _PROFILE_CONTENT_METADATA)
+    def test_audit_events_profile_change_content_metadata_is_refused(
+        self, metadata: dict[str, Any]
+    ) -> None:
+        """An email address or a name as a metadata value is content: refused."""
+        action = _profile_change()
+
+        with pytest.raises(ValidationError):
+            _event(
+                action=action, target_type=TargetType.USER, target_ids=(_MARKER,), metadata=metadata
+            )
+
+    async def test_audit_events_record_profile_change_is_stored(self, conn: MagicMock) -> None:
+        """The contract's row: the Org Admin as a member actor, their org, the changed user
+        as the target, the client IP and the two flags."""
+        await record(conn, **_profile_record_kwargs())
+
+        row = _inserted_row(conn)
+        assert row["action"] == _PROFILE_CHANGE
+        assert row["org_id"] == _ORG
+        assert (row["actor_kind"], row["actor_user_id"]) == ("member", _USER)
+        assert row["target_type"] == "user"
+        assert json.loads(row["target_ids"]) == [str(_MARKER)]
+        assert str(row["ip"]) == _IP
+        assert json.loads(row["metadata"]) == {"name_changed": True, "email_changed": False}
+
+    async def test_audit_events_record_profile_change_email_taken_is_stored(
+        self, conn: MagicMock
+    ) -> None:
+        await record(conn, **_profile_record_kwargs(metadata={"email_taken": True}))
+
+        assert json.loads(_inserted_row(conn)["metadata"]) == {"email_taken": True}
+
+    @pytest.mark.parametrize(
+        ("actor_kind", "actor_user_id"),
+        [
+            pytest.param("member", _USER, id="member"),
+            pytest.param("super_admin", _SUPER_ADMIN, id="super-admin"),
+        ],
+    )
+    async def test_audit_events_record_profile_change_without_org_is_refused(
+        self, conn: MagicMock, actor_kind: str, actor_user_id: UUID
+    ) -> None:
+        """Without an org_id the event has no log to land in: refused before any SQL."""
+        kwargs = _profile_record_kwargs(
+            actor_kind=actor_kind, actor_user_id=actor_user_id, org_id=None
+        )
+
+        with pytest.raises(AuditRecordError):
+            await record(conn, **kwargs)
+
+        conn.execute.assert_not_awaited()
+
+    @pytest.mark.parametrize("metadata", _PROFILE_CONTENT_METADATA)
+    async def test_audit_events_record_profile_change_content_is_refused(
+        self, conn: MagicMock, metadata: dict[str, Any]
+    ) -> None:
+        """record() refuses a name or an address (AuditRecordError) and writes nothing."""
+        kwargs = _profile_record_kwargs(metadata=metadata)
+
+        with pytest.raises(AuditRecordError):
+            await record(conn, **kwargs)
+
+        conn.execute.assert_not_awaited()
+
+    async def test_audit_events_record_profile_change_error_repeats_no_address(
+        self, conn: MagicMock
+    ) -> None:
+        """The refusal carries neither the rejected address nor the IDs."""
+        kwargs = _profile_record_kwargs(
+            metadata={"name_changed": False, "email_changed": True, "new_email": "quokka@zoo.ch"}
+        )
+
+        with pytest.raises(AuditRecordError) as caught:
+            await record(conn, **kwargs)
+
+        _assert_no_content(str(caught.value), "quokka", _ORG, _USER, _MARKER)
+        _assert_no_content(repr(caught.value), "quokka", _ORG, _USER, _MARKER)
         assert caught.value.__cause__ is None

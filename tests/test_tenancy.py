@@ -199,6 +199,45 @@ def _org_user_logout(world: World, _caller: Account, _client: TestClient) -> _Re
     return _Request("POST", f"/api/org/users/{world.a['viewer'].user_id}/logout")
 
 
+def _org_a_member(world: World, *, status: str = "active") -> str:
+    """Seed a fresh Editor of org A (never the last Org Admin); return its id."""
+    return str(
+        world.db.add_account(
+            role="editor",
+            org_id=world.org_a,
+            status=status,
+            email=f"managed-{status}-164@example.ch",
+        )
+    )
+
+
+def _org_user_patch(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """PATCH org A's Viewer to Editor (GH-164)."""
+    return _Request("PATCH", f"/api/org/users/{world.a['viewer'].user_id}", {"role": "editor"})
+
+
+def _org_user_deactivate(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """Deactivate org A's (active) Viewer."""
+    return _Request("POST", f"/api/org/users/{world.a['viewer'].user_id}/deactivate")
+
+
+def _org_user_reactivate(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """Reactivate a deactivated Editor of org A (seats are free)."""
+    return _Request(
+        "POST", f"/api/org/users/{_org_a_member(world, status='deactivated')}/reactivate"
+    )
+
+
+def _org_user_delete(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """Delete a fresh active Editor of org A."""
+    return _Request("DELETE", f"/api/org/users/{_org_a_member(world)}")
+
+
+def _org_user_password_reset(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """Send org A's (active) Viewer a password reset link."""
+    return _Request("POST", f"/api/org/users/{world.a['viewer'].user_id}/password-reset")
+
+
 def _pending_invitation_id(world: World) -> str:
     """Seed a pending invitation in org A; return its id."""
     invited = world.db.add_account(
@@ -302,6 +341,12 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ),
     ("POST", "/api/me/settings/reset"): _plain("POST", "/api/me/settings/reset"),
     # --- org users and invitations ---
+    ("GET", "/api/org/users"): _plain("GET", "/api/org/users"),
+    ("PATCH", "/api/org/users/{user_id}"): _org_user_patch,
+    ("POST", "/api/org/users/{user_id}/deactivate"): _org_user_deactivate,
+    ("POST", "/api/org/users/{user_id}/reactivate"): _org_user_reactivate,
+    ("DELETE", "/api/org/users/{user_id}"): _org_user_delete,
+    ("POST", "/api/org/users/{user_id}/password-reset"): _org_user_password_reset,
     ("POST", "/api/org/users/{user_id}/logout"): _org_user_logout,
     ("POST", "/api/org/invitations"): _plain(
         "POST", "/api/org/invitations", {"email": "new-invitee-163@example.ch", "role": "editor"}
@@ -377,6 +422,7 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
 _BODY_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("PATCH", "/api/me/settings"),
+        ("PATCH", "/api/org/users/{user_id}"),
         ("POST", "/api/org/invitations"),
         ("PATCH", "/api/org/settings"),
         ("PATCH", "/api/org/permissions"),
