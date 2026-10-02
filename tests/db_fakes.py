@@ -177,6 +177,15 @@ Organizations and invitations (GH-153):
   invitation, queued emails, sessions and reset token.
 - ``now()`` is the fake's clock (``datetime.now(UTC)``) when the statement
   runs; ``created_at`` and ``sent_at`` default to it.
+- GH-164: a users SELECT by ``id = $n`` within ``org_id = $n`` (the Org Admin
+  user routes) runs on the reader too, so its status and deleted_at
+  predicates and every selected column apply. The last-admin guard's query
+  (``accounts.ensure_not_last_active_admin``, with its OR) is emulated
+  exactly: the target's row if it belongs to the org, plus the org's active
+  Org Admins, flagged ``is_active_admin``, in id order. ``DELETE FROM
+  password_reset_tokens WHERE user_id = $n`` deletes the user's reset token.
+  Queued emails record their ``recipient_address``, copied from the users row
+  when queued (an email change notifies the old address).
 - ``after_invitation_lookup`` runs once, right after the first SELECT on
   invitations bound to a token hash (a concurrent accept, revoke, rotation or
   expiry between the lookup and the transaction).
@@ -328,6 +337,16 @@ LIVE_IDLE_RE: Final = rf"(?:{_IDLE_DEADLINE} ?> ?{NOW_SQL}|{NOW_SQL} ?< ?{_IDLE_
 ID_PARAM_RE: Final = r"(?<![\w.])(?:\w+\.)?id = \$(\d+)"
 USER_ID_PARAM_RE: Final = r"(?<![\w])(?:\w+\.)?user_id = \$(\d+)"
 ORG_ID_PARAM_RE: Final = r"(?<![\w])(?:\w+\.)?org_id = \$(\d+)"
+# GH-164: accounts.ensure_not_last_active_admin's guard query (normalized).
+_LAST_ADMIN_GUARD_RE: Final = re.compile(
+    r"select id, \(role = 'org_admin' and status = 'active' and deleted_at is null\)"
+    r" as is_active_admin from users where org_id = \$1 and \(id = \$2 or \(role ="
+    r" 'org_admin' and status = 'active' and deleted_at is null\)\) order by id for update"
+)
+# GH-164: an email change deletes the user's live reset token.
+_DELETE_USER_TOKEN_RE: Final = re.compile(
+    r"delete from password_reset_tokens where user_id = \$\d+(?: returning user_id)?"
+)
 
 # The columns of the sessions table after migration 0009.
 _SESSION_COLUMNS: Final = frozenset(
@@ -827,13 +846,16 @@ class FakeDb:
         ui_language: str = "de",
         org_id: uuid.UUID = ORG_ID,
         name: str | None = "Some Person",
+        created_at: datetime | None = None,
+        last_login_at: datetime | None = None,
     ) -> uuid.UUID:
         """Add an account and return its id (a plain uuid.UUID).
 
         A member's org is created (active, 100 seats) if it doesn't exist.
         ``org_status`` overrides the org's status for this account's login,
         session and reset lookups only; left out, the account follows the
-        organizations row.
+        organizations row. ``created_at`` defaults to one day ago and
+        ``last_login_at`` to None (GH-164: the Org Admin user list shows both).
         """
         user_id = uuid.uuid4()
         is_member = kind == "member"
@@ -852,8 +874,8 @@ class FakeDb:
             "org_status": org_status if is_member else None,
             "ui_language": ui_language,
             "response_language": None,
-            "created_at": datetime.now(UTC) - timedelta(days=1),
-            "last_login_at": None,
+            "created_at": created_at or datetime.now(UTC) - timedelta(days=1),
+            "last_login_at": last_login_at,
         }
         return user_id
 
@@ -1357,6 +1379,8 @@ class FakeDb:
         assert not n.startswith("truncate"), f"the fake doesn't truncate: {n}"
         if purge := _PURGE_ORG_AUDIT_RE.fullmatch(n):
             return self._purge_org_audit_events(method, purge, args)
+        if method == "fetch" and _LAST_ADMIN_GUARD_RE.fullmatch(n):
+            return self._last_admin_guard_rows(args)
         if _runs_on_reader(method, n, args):
             return self._run_statement(method, n, args)
         if n.startswith("insert into audit_events"):
@@ -1368,6 +1392,8 @@ class FakeDb:
         if n.startswith("insert into password_reset_tokens"):
             return self._upsert_token(args)
         if n.startswith("delete from password_reset_tokens"):
+            if not any(isinstance(arg, bytes | bytearray) for arg in args):
+                return self._delete_user_token(method, n, args)
             return self._consume_token(args)
         if method == "fetchrow" and "password_reset_tokens" in n:
             return self._token_row(args)
@@ -2080,6 +2106,8 @@ class FakeDb:
         self.outbox.append(
             {
                 "user_id": plain(user_id),
+                # Copied from the users row when queued, as the real INSERT ... SELECT does.
+                "recipient_address": account["email"],
                 "template_key": template_key,
                 "language": account["ui_language"],
                 "params": json.loads(params_json),
@@ -2121,6 +2149,45 @@ class FakeDb:
                 row.update(status="failed", params={}, finished_at=now)
                 count += 1
         return f"UPDATE {count}"
+
+    def _delete_user_token(self, method: str, n: str, args: tuple[Any, ...]) -> Any:
+        """GH-164: ``DELETE FROM password_reset_tokens WHERE user_id = $n`` (an email
+        change cancels the user's live reset link). Only that shape is accepted."""
+        assert _DELETE_USER_TOKEN_RE.fullmatch(n), f"unexpected reset-token delete: {n}"
+        user_id = plain(_bound(args, USER_ID_PARAM_RE, _where(n)))
+        deleted = self.tokens.pop(user_id, None) is not None
+        if method == "fetchval":
+            return _pg(user_id) if deleted and " returning " in n else None
+        return f"DELETE {int(deleted)}"
+
+    def _last_admin_guard_rows(self, args: tuple[Any, ...]) -> list[dict[str, Any]]:
+        """``accounts.ensure_not_last_active_admin``'s query (GH-145, used by GH-164).
+
+        The target's row (only when it belongs to the org) plus the org's active,
+        non-deleted Org Admins, each flagged ``is_active_admin``, in id order. The
+        FOR UPDATE lock is recorded in ``calls`` and has no other effect.
+        """
+        org_id, user_id = (_canonical(arg) for arg in args)
+
+        def is_active_admin(account: dict[str, Any]) -> bool:
+            return (
+                account["role"] == "org_admin"
+                and account["status"] == "active"
+                and account["deleted_at"] is None
+            )
+
+        rows = [
+            account
+            for account in self.users.values()
+            if account["org_id"] is not None
+            and account["org_id"] == org_id
+            and (account["id"] == user_id or is_active_admin(account))
+        ]
+        rows.sort(key=lambda account: account["id"])
+        return [
+            {"id": _pg(account["id"]), "is_active_admin": is_active_admin(account)}
+            for account in rows
+        ]
 
     def _upsert_token(self, args: tuple[Any, ...]) -> datetime:
         token_hash = next(arg for arg in args if isinstance(arg, bytes))
@@ -2589,11 +2656,12 @@ def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
     if re.match(r"select exists\b", n) or method == "fetch":
         return True
     where = _where(n)
-    return (
-        re.search(ORG_ID_PARAM_RE, where) is not None
-        and re.search(ID_PARAM_RE, where) is None
-        and (method == "fetch" or not any(isinstance(arg, str) for arg in args))
-    )
+    if re.search(ORG_ID_PARAM_RE, where) is None:
+        return False
+    # GH-164: a lookup by id within an org (the Org Admin user routes) runs on the
+    # reader too, so every predicate it states (status, deleted_at) and every
+    # column it selects apply.
+    return method == "fetch" or not any(isinstance(arg, str) for arg in args)
 
 
 @dataclass(frozen=True)

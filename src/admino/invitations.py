@@ -32,7 +32,9 @@ list of summaries (listing), None (revoking), an ``InvitationDetails``
 Sending runs in one transaction: the org row is locked (``FOR UPDATE``) and
 the org's active and invited users are counted (an expired invitation keeps
 its seat until it is revoked; deactivated and deleted users don't count). A
-full org raises ``SeatLimitError`` before anything is written. Then the
+full org raises ``SeatLimitError`` before anything is written
+(``ensure_free_seat``, which an Org Admin's reactivation of a deactivated
+user reuses, GH-164's ``admino.org_users``). Then the
 invitee's users row is inserted (a member of the org with the role, status
 'invited', no name and no password, the given language), plus an
 ``invitations`` row with the SHA-256 hash of a fresh 256-bit token and
@@ -333,6 +335,40 @@ async def _lock_org(conn: PoolConnectionProxy, org_id: UUID | None) -> Record:
     return org
 
 
+async def _check_free_seat(conn: PoolConnectionProxy, *, org: Record, org_id: UUID | None) -> None:
+    """Refuse one more user in a locked org whose active and invited users fill every seat.
+
+    Raises:
+        SeatLimitError: If the org has no free seat.
+    """
+    if await conn.fetchval(_SEATS_TAKEN_SQL, org_id) + 1 > org["seats"]:
+        raise SeatLimitError
+
+
+async def ensure_free_seat(conn: PoolConnectionProxy, org_id: UUID) -> Record:
+    """Lock an org row until the transaction ends and check it has a free seat.
+
+    Active and invited users take a seat (an expired invitation keeps its seat
+    until it is revoked); deactivated and deleted users don't. The lock makes
+    concurrent sends and reactivations count one after the other, so they
+    can't both take the last seat.
+
+    Args:
+        conn: An asyncpg connection inside the caller's transaction.
+        org_id: The organization (a bind parameter).
+
+    Returns:
+        The locked org's name and seats.
+
+    Raises:
+        OrgNotFoundError: If the org doesn't exist.
+        SeatLimitError: If the org has no free seat for one more user.
+    """
+    org = await _lock_org(conn, org_id)
+    await _check_free_seat(conn, org=org, org_id=org_id)
+    return org
+
+
 async def _send(
     conn: PoolConnectionProxy,
     *,
@@ -356,8 +392,7 @@ async def _send(
         SeatLimitError: If the org has no free seat (nothing is inserted).
         DuplicateEmailError: If a user with the email already exists.
     """
-    if await conn.fetchval(_SEATS_TAKEN_SQL, org_id) + 1 > org["seats"]:
-        raise SeatLimitError
+    await _check_free_seat(conn, org=org, org_id=org_id)
     try:
         user_id = await conn.fetchval(_INSERT_USER_SQL, email, org_id, role, language)
     except asyncpg.UniqueViolationError:

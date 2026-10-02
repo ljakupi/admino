@@ -5,8 +5,8 @@ functions here take an explicit org_id instead of a TenantContext: the Super
 Admin platform routes (#167) use them as well as the org routes (#164).
 
 ``ensure_not_last_active_admin`` is the single last-admin guard (GH-145): an
-organization always keeps at least one active Org Admin. #164 and #167 call it
-before demoting, deactivating or deleting a user.
+organization always keeps at least one active Org Admin. ``admino.org_users``
+(#164) and #167 call it before demoting, deactivating or deleting a user.
 
 ``org_user_ids`` lists the ids of an organization's users: the server delivers
 a completed critical permission promotion's notice to that org's in-memory chats
@@ -189,7 +189,7 @@ async def create_super_admin(
 
 
 async def ensure_not_last_active_admin(
-    conn: asyncpg.Connection, *, org_id: UUID, user_id: UUID
+    conn: asyncpg.Connection | PoolConnectionProxy, *, org_id: UUID, user_id: UUID
 ) -> None:
     """Refuse to demote, deactivate or delete the org's last active Org Admin.
 

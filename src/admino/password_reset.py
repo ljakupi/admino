@@ -1,15 +1,19 @@
-"""Self-service password reset by email (GH-151).
+"""Self-service password reset by email (GH-151), also sent by an Org Admin (GH-164).
 
 A user who forgot their password asks for a reset link (``request_reset``);
 an account that may log in gets an email with a single-use link, valid for
 30 minutes. Opening the link and choosing a new password (``confirm_reset``)
-stores the new password and ends every session of the account.
+stores the new password and ends every session of the account. An Org Admin
+can send the same link to an active user of their org
+(``admino.org_users.trigger_password_reset``); both flows issue it through
+``queue_reset_link``.
 
 Inputs: ``request_reset`` takes the database pool, the email the user typed,
 the configured public URL (``server.public_url``) and the client IP.
-``confirm_reset`` takes the pool, the token from the link, the new password
-and the client IP.
-Outputs: both return None. ``confirm_reset`` raises ``InvalidResetTokenError``
+``queue_reset_link`` takes a connection inside the caller's transaction, the
+user id and the public URL. ``confirm_reset`` takes the pool, the token from
+the link, the new password and the client IP.
+Outputs: all return None. ``confirm_reset`` raises ``InvalidResetTokenError``
 for a link that can't be used and ``passwords.PasswordPolicyError`` for a new
 password the policy refuses.
 
@@ -28,8 +32,8 @@ the new Argon2 hash, ends every session of the user (deletes its rows,
 Security notes:
 - No user enumeration: ``request_reset`` returns None and raises nothing for
   an unknown email or an account that may not log in, like for an eligible
-  one; the caller (the HTTP route, or an admin flow reusing this one) never
-  sees the token.
+  one. Neither its caller (the HTTP route) nor an Org Admin triggering a
+  reset ever sees the token: ``queue_reset_link`` returns nothing.
 - Reset-link poisoning: the link base is the configured public URL, never a
   request header.
 - Only the token's SHA-256 hash is stored or queried; the raw token travels
@@ -67,7 +71,10 @@ from admino.audit_events import AuditAction, TargetType
 from admino.email_templates import PasswordResetParams
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     import asyncpg
+    from asyncpg.pool import PoolConnectionProxy
 
 RESET_TOKEN_LIFETIME: Final = timedelta(minutes=30)
 INVALID_RESET_TOKEN_MESSAGE: Final = "This reset link is invalid or has expired."  # noqa: S105 - a message, not a secret
@@ -139,6 +146,39 @@ def _is_live(expires_at: object) -> bool:
     )
 
 
+async def queue_reset_link(
+    conn: asyncpg.Connection | PoolConnectionProxy, *, user_id: UUID, public_url: str
+) -> None:
+    """Replace a user's reset token with a fresh one and queue the email with its link.
+
+    The SHA-256 hash of a new 256-bit token replaces the user's previous one
+    (one live token per user, expiring 30 minutes from now on the database
+    clock), and the ``password_reset`` email is queued with the link
+    ``{public_url}/reset-password#token=<token>``. The raw token exists only
+    in that queued email. The caller records ``password_reset.request`` on the
+    same connection, inside the same transaction, so a failed audit write
+    stores and queues nothing.
+
+    Args:
+        conn: An asyncpg connection inside the caller's transaction.
+        user_id: The account the link is for.
+        public_url: The configured origin the link is built from
+            (``server.public_url``), without a trailing slash.
+
+    Raises:
+        RecipientNotFoundError: If the user doesn't exist or is deleted.
+    """
+    token = secrets.token_urlsafe(_TOKEN_BYTES)
+    expires_at = await conn.fetchval(_UPSERT_SQL, user_id, _hash_token(token), RESET_TOKEN_LIFETIME)
+    await email_outbox.enqueue_email(
+        conn,
+        user_id=user_id,
+        params=PasswordResetParams(
+            reset_link=f"{public_url}/reset-password#token={token}", expires_at=expires_at
+        ),
+    )
+
+
 async def request_reset(pool: asyncpg.Pool, *, email: str, public_url: str, ip: str | None) -> None:
     """Email a password reset link to the account of an email, if it may log in.
 
@@ -186,18 +226,8 @@ async def request_reset(pool: asyncpg.Pool, *, email: str, public_url: str, ip: 
         )
         return
 
-    token = secrets.token_urlsafe(_TOKEN_BYTES)
     async with pool.acquire() as conn, conn.transaction():
-        expires_at = await conn.fetchval(
-            _UPSERT_SQL, user_id, _hash_token(token), RESET_TOKEN_LIFETIME
-        )
-        await email_outbox.enqueue_email(
-            conn,
-            user_id=user_id,
-            params=PasswordResetParams(
-                reset_link=f"{public_url}/reset-password#token={token}", expires_at=expires_at
-            ),
-        )
+        await queue_reset_link(conn, user_id=user_id, public_url=public_url)
         await audit_events.record(
             conn,
             action=AuditAction.PASSWORD_RESET_REQUEST,

@@ -19,6 +19,10 @@ Security notes:
   ``OrgLimitsPatch`` hide their input from validation errors (an org name or
   admin email never reaches a log or a 422 body); seats, quotas and the
   residency switch are strict ints and bools.
+- Org user management (GH-164): ``OrgUserSummary`` carries account metadata
+  only (no hash, token, org id or kind); ``OrgUserPatch`` refuses unknown keys
+  (the org, the target, the status and the kind come from the session, the
+  path and the dedicated routes) and hides its input from validation errors.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -2226,6 +2230,88 @@ class OrgCreateResponse(BaseModel):
 
     organization: OrgSummary
     invitation: InvitationSummary
+
+
+# ---------------------------------------------------------------------------
+# Org user management API models (GH-164): account metadata only, no credential
+# ---------------------------------------------------------------------------
+
+# A user's name is stored and shown in the org's user list: the display-name
+# rule plus surrogates (Cs), which can't be stored as UTF-8.
+_USER_NAME_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
+
+
+class OrgUserSummary(BaseModel):
+    """One user of the caller's org (list, change and status responses).
+
+    No password hash, token, org id or account kind: a user is identified by
+    its id only. An invited or deleted account is never a user here, so the
+    status is ``active`` or ``deactivated``. ``name`` is None for an account
+    created without one; ``last_login_at`` is None until the first login.
+    """
+
+    id: PlainUUID
+    name: str | None = Field(max_length=120)
+    email: str = Field(max_length=254)
+    role: MemberRole
+    status: Literal["active", "deactivated"]
+    created_at: datetime
+    last_login_at: datetime | None
+
+
+class OrgUserListResponse(BaseModel):
+    """GET /api/org/users response: the org's active and deactivated users, oldest first."""
+
+    users: list[OrgUserSummary]
+
+
+class OrgUserPatch(BaseModel):
+    """PATCH /api/org/users/{user_id} request body: a new role, name or email.
+
+    Any of the three; a null counts as not given, and at least one must be
+    given. The name follows ``InvitationAcceptRequest.name``'s rules and also
+    refuses surrogates; the email follows ``InvitationCreateRequest.email``'s
+    rules exactly (capitalization kept). The org, the target user, the status
+    and the account kind are never chosen by the body: unknown fields are
+    refused. Validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    role: MemberRole | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+
+    @field_validator("name", "email", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        """Strip surrounding whitespace before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str | None:
+        """Refuse control, format, surrogate and line/paragraph separator characters."""
+        if value is not None and any(
+            unicodedata.category(char) in _USER_NAME_BANNED_CATEGORIES for char in value
+        ):
+            msg = "The name must not contain control or formatting characters."
+            raise ValueError(msg)
+        return value
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, value: str | None) -> str | None:
+        """The invitation email rules; the messages never include the address."""
+        return None if value is None else _check_invite_email(value)
+
+    @model_validator(mode="after")
+    def _check_something_given(self) -> OrgUserPatch:
+        """Refuse a patch that changes nothing."""
+        if self.role is None and self.name is None and self.email is None:
+            msg = "Give a role, a name or an email to change."
+            raise ValueError(msg)
+        return self
 
 
 # ---------------------------------------------------------------------------

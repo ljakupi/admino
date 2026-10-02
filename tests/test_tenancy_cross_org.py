@@ -12,7 +12,13 @@ Viewer, plus a Super Admin):
   caller reaches its own org's resource, and org B still reaches its own.
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
-  promotions, the permission summary, invitations).
+  promotions, the permission summary, invitations, the user list).
+- The org user routes of GH-164 (PATCH, deactivate, reactivate, DELETE,
+  password reset): every kind of org B account (its last Org Admin, a member,
+  a deactivated user, an invited account) is a 404 "User not found" for org
+  A's Org Admin, never a 409 that would tell its state, and B's user keeps
+  its row, sessions, connections, notes, settings, reset token, queued emails
+  and in-memory state.
 - ``own_user`` routes: only the caller's own data: sessions, settings, the
   account, logout, OAuth connections (and the data residency of the caller's
   own org), the in-memory chat history and the SSE stream.
@@ -33,6 +39,7 @@ patched, and the consent URL is only built, never fetched.
 from __future__ import annotations
 
 import copy
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -43,7 +50,7 @@ from unittest.mock import AsyncMock
 import pytest
 from cryptography.fernet import Fernet
 
-from admino import org_permissions, server
+from admino import oauth, org_permissions, server
 from admino.models import LLMMessage, PendingConfirmation, ToolCall
 from admino.oauth import encrypt_refresh_token
 from tests.db_fakes import FakeDb
@@ -62,6 +69,7 @@ from tests.tenancy_world import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from unittest.mock import MagicMock
 
     import httpx
@@ -74,6 +82,12 @@ Route = tuple[str, str]
 _SHARED_CHAT: Final = "shared-163"
 _A_INVITEE: Final = "a-invitee-163@example.ch"
 _B_INVITEE: Final = "b-invitee-163@example.ch"
+_A_DEACTIVATED: Final = "a-deactivated-164@example.ch"
+_B_DEACTIVATED: Final = "b-deactivated-164@example.ch"
+_B_INVITED: Final = "b-invited-164@example.ch"
+_USER_NOT_FOUND: Final = {"detail": "User not found"}
+# One PATCH that changes every field the body allows: role, name and email.
+_USER_PATCH: Final = {"role": "viewer", "name": "Umbenannt 164", "email": "renamed-164@example.ch"}
 _PROVIDERS: Final = ("google", "microsoft")
 _LABELS: Final = {"google": "Google", "microsoft": "Microsoft"}
 
@@ -311,6 +325,35 @@ def _a_editor_id(world: World, _client: TestClient) -> str:
     return str(world.a["editor"].user_id)
 
 
+def _deactivated(world: World, org_id: uuid.UUID, email: str) -> str:
+    """A deactivated Viewer of the org (no session); its id."""
+    return str(
+        world.db.add_account(role="viewer", org_id=org_id, status="deactivated", email=email)
+    )
+
+
+def _b_deactivated(world: World, _client: TestClient) -> str:
+    return _deactivated(world, world.org_b, _B_DEACTIVATED)
+
+
+def _a_deactivated(world: World, _client: TestClient) -> str:
+    return _deactivated(world, world.org_a, _A_DEACTIVATED)
+
+
+def _b_invited(world: World) -> str:
+    """An invited account of org B with its pending invitation; the account's id."""
+    invited = world.db.add_account(
+        role="editor",
+        org_id=world.org_b,
+        status="invited",
+        name=None,
+        password_hash=None,
+        email=_B_INVITED,
+    )
+    world.db.add_invitation(invited)
+    return str(invited)
+
+
 def _b_invitation(world: World, client: TestClient) -> str:
     return _invite(client, world.b["org_admin"], _B_INVITEE)
 
@@ -336,6 +379,26 @@ def _delete_session(client: TestClient, caller: Account, ident: str) -> httpx.Re
 
 def _force_logout(client: TestClient, caller: Account, ident: str) -> httpx.Response:
     return client.post(f"/api/org/users/{ident}/logout", headers=caller.cookie)
+
+
+def _patch_user(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.patch(f"/api/org/users/{ident}", json=dict(_USER_PATCH), headers=caller.cookie)
+
+
+def _deactivate_user(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.post(f"/api/org/users/{ident}/deactivate", headers=caller.cookie)
+
+
+def _reactivate_user(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.post(f"/api/org/users/{ident}/reactivate", headers=caller.cookie)
+
+
+def _delete_user(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.delete(f"/api/org/users/{ident}", headers=caller.cookie)
+
+
+def _reset_user_password(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.post(f"/api/org/users/{ident}/password-reset", headers=caller.cookie)
 
 
 def _revoke_invitation(client: TestClient, caller: Account, ident: str) -> httpx.Response:
@@ -367,6 +430,51 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
         seed_foreign=_b_editor_id,
         seed_own=_a_editor_id,
         send=_force_logout,
+        unknown_id=_uuid_id,
+    ),
+    ("PATCH", "/api/org/users/{user_id}"): _PathIdCase(
+        caller="org_admin",
+        detail="User not found",
+        own_status=200,
+        seed_foreign=_b_editor_id,
+        seed_own=_a_editor_id,
+        send=_patch_user,
+        unknown_id=_uuid_id,
+    ),
+    ("POST", "/api/org/users/{user_id}/deactivate"): _PathIdCase(
+        caller="org_admin",
+        detail="User not found",
+        own_status=200,
+        seed_foreign=_b_editor_id,
+        seed_own=_a_editor_id,
+        send=_deactivate_user,
+        unknown_id=_uuid_id,
+    ),
+    ("POST", "/api/org/users/{user_id}/reactivate"): _PathIdCase(
+        caller="org_admin",
+        detail="User not found",
+        own_status=200,
+        seed_foreign=_b_deactivated,
+        seed_own=_a_deactivated,
+        send=_reactivate_user,
+        unknown_id=_uuid_id,
+    ),
+    ("DELETE", "/api/org/users/{user_id}"): _PathIdCase(
+        caller="org_admin",
+        detail="User not found",
+        own_status=204,
+        seed_foreign=_b_editor_id,
+        seed_own=_a_editor_id,
+        send=_delete_user,
+        unknown_id=_uuid_id,
+    ),
+    ("POST", "/api/org/users/{user_id}/password-reset"): _PathIdCase(
+        caller="org_admin",
+        detail="User not found",
+        own_status=202,
+        seed_foreign=_b_editor_id,
+        seed_own=_a_editor_id,
+        send=_reset_user_password,
         unknown_id=_uuid_id,
     ),
     ("DELETE", "/api/org/invitations/{invitation_id}"): _PathIdCase(
@@ -402,6 +510,38 @@ _PATH_ID_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]} {route[1]}") for route in _PATH_ID_CASES
 ]
 
+# The org user routes of GH-164 that name a user in the path.
+_USER_ROUTES: Final[tuple[Route, ...]] = (
+    ("PATCH", "/api/org/users/{user_id}"),
+    ("POST", "/api/org/users/{user_id}/deactivate"),
+    ("POST", "/api/org/users/{user_id}/reactivate"),
+    ("DELETE", "/api/org/users/{user_id}"),
+    ("POST", "/api/org/users/{user_id}/password-reset"),
+)
+_USER_ROUTE_PARAMS: Final = [
+    pytest.param(route, id=f"{route[0]} {route[1]}") for route in _USER_ROUTES
+]
+# Every kind of org B account a user route could be pointed at. B's Org Admin is
+# B's only one: a guard that ran before the org check would answer 409 last_admin.
+_FOREIGN_KINDS: Final = ("org_admin", "editor", "viewer", "deactivated", "invited")
+
+
+def _foreign_account(world: World, kind: str) -> str:
+    """Org B's account of ``kind`` (a member role, "deactivated" or "invited"); its id."""
+    if kind == "deactivated":
+        return _deactivated(world, world.org_b, _B_DEACTIVATED)
+    if kind == "invited":
+        return _b_invited(world)
+    return str(world.b[cast("MemberRole", kind)].user_id)
+
+
+@pytest.fixture()
+def _clean_access_tokens() -> Iterator[None]:
+    """An empty process-wide access-token cache before and after the test."""
+    oauth.access_tokens.clear()
+    yield
+    oauth.access_tokens.clear()
+
 
 class TestPathIdRoutes:
     """Org A's caller with org B's resource ids, for every path_id route."""
@@ -424,7 +564,8 @@ class TestPathIdRoutes:
     def test_cross_org_path_id_foreign_id_answers_exactly_like_an_unknown_id(
         self, world: World, client: TestClient, route: Route
     ) -> None:
-        """No existence leak: org B's id and a never-issued id get the same status and body."""
+        """No existence leak: org B's id and a never-issued id get the same status and body
+        (the route's own not-found answer, not a missing route's)."""
         case = _PATH_ID_CASES[route]
         foreign = case.seed_foreign(world, client)
         caller = world.a[case.caller]
@@ -432,6 +573,10 @@ class TestPathIdRoutes:
         foreign_response = case.send(client, caller, foreign)
         unknown_response = case.send(client, caller, case.unknown_id())
 
+        assert (unknown_response.status_code, unknown_response.json()) == (
+            404,
+            {"detail": case.detail},
+        )
         assert (foreign_response.status_code, foreign_response.json()) == (
             unknown_response.status_code,
             unknown_response.json(),
@@ -450,8 +595,9 @@ class TestPathIdRoutes:
         foreign = case.seed_foreign(world, client)
         before = _state(world.db)
 
-        case.send(client, world.a[case.caller], foreign)
+        response = case.send(client, world.a[case.caller], foreign)
 
+        assert (response.status_code, response.json()) == (404, {"detail": case.detail})
         assert _state(world.db) == before
         agent.run.assert_not_awaited()
 
@@ -466,6 +612,7 @@ class TestPathIdRoutes:
 
         response = case.send(client, world.a[case.caller], foreign)
 
+        assert (response.status_code, response.json()) == (404, {"detail": case.detail})
         assert foreign not in response.text
         assert all(foreign not in value for value in response.headers.values())
 
@@ -563,6 +710,135 @@ class TestPathIdSideEffects:
         assert world.db.user_by_email(_B_INVITEE) is not None
         assert len(world.db.invitation_emails(invited_id)) == 1
         assert len(world.db.audit_rows()) == audit_before
+
+    @covers(*_USER_ROUTES)
+    @pytest.mark.parametrize("kind", _FOREIGN_KINDS)
+    @pytest.mark.parametrize("route", _USER_ROUTE_PARAMS)
+    def test_cross_org_user_route_on_any_kind_of_foreign_account_is_404_and_changes_nothing(
+        self, world: World, client: TestClient, route: Route, kind: str
+    ) -> None:
+        """B's last Org Admin, Editor, Viewer, a deactivated user and an invited account
+        are each a 404 "User not found" for A's Org Admin, never a 409 (last_admin,
+        invalid_status, seat_limit) that would tell the account's state; nothing changes."""
+        sender = _PATH_ID_CASES[route].send
+        target = _foreign_account(world, kind)
+        before = _state(world.db)
+
+        response = sender(client, world.a["org_admin"], target)
+
+        assert (response.status_code, response.json()) == (404, _USER_NOT_FOUND)
+        assert _state(world.db) == before
+
+    @covers(*_USER_ROUTES)
+    @pytest.mark.usefixtures("_clean_access_tokens")
+    @pytest.mark.parametrize("route", _USER_ROUTE_PARAMS)
+    def test_cross_org_user_route_keeps_the_foreign_users_account_sessions_and_data(
+        self, world: World, client: TestClient, revoke: dict[str, AsyncMock], route: Route
+    ) -> None:
+        """B's Editor (a deactivated B user for reactivate) keeps its row (status, role,
+        name, email), both sessions, OAuth connections, notes, settings, reset token,
+        in-memory chat, pending confirmation, OAuth state and cached access token; no
+        email is queued, no audit row written, nothing revoked at a provider."""
+        reactivate = route[1].endswith("/reactivate")
+        if reactivate:
+            victim = uuid.UUID(_b_deactivated(world, client))
+        else:
+            victim = world.b["editor"].user_id
+            world.db.open_session(victim)  # a second device
+        for provider in _PROVIDERS:
+            world.db.add_oauth_token(
+                victim,
+                provider,
+                encrypted_refresh_token=encrypt_refresh_token(f"b-{provider}-refresh-164"),
+            )
+        world.db.add_memory(victim, "client", "B's private note 164")
+        world.db.add_user_settings(victim, theme="dark")
+        world.db.add_reset_token(victim)
+        chat_key = server._chat_key(victim, _SHARED_CHAT)
+        server._sessions[chat_key] = [LLMMessage(role="user", content="B-secret-164 question")]
+        now = datetime.now(UTC)
+        server._pending_confirmations[chat_key] = PendingConfirmation(
+            confirmation_id="conf-b-164",
+            session_id=_SHARED_CHAT,
+            tool_call=ToolCall(tool="google_calendar", action="create", args={}),
+            created_at=now,
+            expires_at=now + timedelta(minutes=5),
+        )
+        server._oauth_pending_states["b-state-164"] = server.OAuthPendingState(
+            created_at=time.time(),
+            provider="google",
+            redirect_uri="https://admino.example.ch/api/oauth/callback",
+            user_id=victim,
+            session_id=uuid.uuid4(),
+        )
+        oauth.access_tokens._store(
+            (victim, "microsoft"), "b-access-token-164", now + timedelta(minutes=30)
+        )
+        user_before = copy.deepcopy(world.db.users[victim])
+        sessions_before = sorted(str(row["session_id"]) for row in world.db.sessions_of(victim))
+        oauth_before = {p: copy.deepcopy(world.db.oauth_token(victim, p)) for p in _PROVIDERS}
+        settings_before = _user_settings_row(world.db, victim)
+        token_before = copy.deepcopy(world.db.tokens[victim])
+        audit_before = copy.deepcopy(world.db.audit_rows())
+        outbox_before = copy.deepcopy(world.db.outbox)
+        chat_before = copy.deepcopy(server._sessions[chat_key])
+
+        response = _PATH_ID_CASES[route].send(client, world.a["org_admin"], str(victim))
+
+        assert (response.status_code, response.json()) == (404, _USER_NOT_FOUND)
+        assert world.db.users[victim] == user_before
+        assert sorted(str(row["session_id"]) for row in world.db.sessions_of(victim)) == (
+            sessions_before
+        )
+        assert len(sessions_before) == (0 if reactivate else 2)
+        assert {p: world.db.oauth_token(victim, p) for p in _PROVIDERS} == oauth_before
+        assert world.db.memories_of(victim) == {"client": "B's private note 164"}
+        assert _user_settings_row(world.db, victim) == settings_before
+        assert world.db.tokens.get(victim) == token_before
+        assert world.db.outbox == outbox_before
+        assert world.db.audit_rows() == audit_before
+        assert server._sessions.get(chat_key) == chat_before
+        assert server._pending_confirmations[chat_key].confirmation_id == "conf-b-164"
+        assert server._oauth_pending_states["b-state-164"].user_id == victim
+        assert (victim, "microsoft") in oauth.access_tokens._entries
+        assert [mock.await_count for mock in revoke.values()] == [0, 0]
+
+    @covers(("PATCH", "/api/org/users/{user_id}"))
+    def test_cross_org_email_change_to_another_orgs_address_never_touches_that_org(
+        self, world: World, client: TestClient
+    ) -> None:
+        """A's Org Admin gives A's Editor the address of B's Editor (other case): 409
+        email_taken (uniqueness is platform-wide), B's and A's users are unchanged, no email
+        is queued, and the one audit row is org A's, about A's Editor, naming neither B's
+        user nor the address; the body echoes neither."""
+        victim = world.b["editor"]
+        target = world.a["editor"]
+        victim_before = copy.deepcopy(world.db.users[victim.user_id])
+        target_before = copy.deepcopy(world.db.users[target.user_id])
+        outbox_before = copy.deepcopy(world.db.outbox)
+        audit_start = len(world.db.audit_rows())
+
+        response = client.patch(
+            f"/api/org/users/{target.user_id}",
+            json={"email": victim.email.upper()},
+            headers=world.a["org_admin"].cookie,
+        )
+
+        assert (response.status_code, response.json()) == (
+            409,
+            {"detail": "A user with this email already exists.", "reason": "email_taken"},
+        )
+        assert victim.email not in response.text.lower()
+        assert str(victim.user_id) not in response.text
+        assert world.db.users[victim.user_id] == victim_before
+        assert world.db.users[target.user_id] == target_before
+        assert world.db.outbox == outbox_before
+        new_rows = world.db.audit_rows()[audit_start:]
+        assert [
+            (row["action"], _plain(row["org_id"]), list(row["target_ids"])) for row in new_rows
+        ] == [("user.profile_change", world.org_a, [str(target.user_id)])]
+        assert str(victim.user_id) not in repr(new_rows)
+        assert victim.email not in repr(new_rows).lower()
 
     @covers(("POST", "/api/confirm/{confirmation_id}"))
     def test_cross_org_confirm_with_the_other_orgs_chat_and_confirmation_ids_is_404(
@@ -827,6 +1103,38 @@ class TestOwnOrgRoutes:
         assert b_list.status_code == 200, b_list.text
         assert b_list.json()["invitations"] == []
         assert invitation_id not in b_list.text
+
+    @covers(("GET", "/api/org/users"))
+    def test_cross_org_org_user_list_shows_only_the_callers_org(
+        self, world: World, client: TestClient
+    ) -> None:
+        """Each org also has a deactivated user, and B an invited one: A's Org Admin lists
+        exactly A's active and deactivated users, B's exactly B's; no id or email of the
+        other org, and none of the Super Admin, appears in either list."""
+        a_off = _a_deactivated(world, client)
+        b_off = _b_deactivated(world, client)
+        b_invited = _b_invited(world)
+
+        a_view = client.get("/api/org/users", headers=world.a["org_admin"].cookie)
+        b_view = client.get("/api/org/users", headers=world.b["org_admin"].cookie)
+
+        assert a_view.status_code == 200, a_view.text
+        assert b_view.status_code == 200, b_view.text
+        a_ids = {str(account.user_id) for account in world.a.values()} | {a_off}
+        b_ids = {str(account.user_id) for account in world.b.values()} | {b_off}
+        assert {entry["id"] for entry in a_view.json()["users"]} == a_ids
+        assert {entry["id"] for entry in b_view.json()["users"]} == b_ids
+        a_marks = [*a_ids, _A_DEACTIVATED, *(account.email for account in world.a.values())]
+        b_marks = [
+            *b_ids,
+            b_invited,
+            _B_DEACTIVATED,
+            _B_INVITED,
+            *(account.email for account in world.b.values()),
+        ]
+        operator = [str(world.super_admin.user_id), world.super_admin.email]
+        assert [mark for mark in [*b_marks, *operator] if mark in a_view.text] == []
+        assert [mark for mark in [*a_marks, *operator] if mark in b_view.text] == []
 
 
 # ---------------------------------------------------------------------------
