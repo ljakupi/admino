@@ -74,14 +74,17 @@ source .venv/bin/activate
 
 # 2. Configure — copy the sample env
 cp .env.example .env
-#    PG_PASSWORD is prefilled with the dev default: changeme
+#    PG_PASSWORD (database owner) and PG_APP_PASSWORD (the app's role) are prefilled
+#    with dev defaults: changeme and changeme-app
 #    Set INFOMANIAK_API_TOKEN (the default LLM provider)
 
 # 3. Load .env into your shell — `make run` reads the shell environment, not .env
 set -a; source .env; set +a
 
-# 4. Start PostgreSQL (Docker), create the first account (prompts for a password), start the agent
+# 4. Start PostgreSQL (Docker), apply the migrations, create the first account
+#    (prompts for a password), start the agent
 make dev-db
+make migrate
 python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your Name'
 make run
 ```
@@ -124,9 +127,9 @@ Starts the agent (behind its egress firewall) and PostgreSQL together — Docker
 `.env` directly, so no shell export needed:
 
 ```bash
-cp .env.example .env               # change PG_PASSWORD; set INFOMANIAK_API_TOKEN
+cp .env.example .env               # change PG_PASSWORD and PG_APP_PASSWORD; set INFOMANIAK_API_TOKEN
 make docker-build
-make docker-up                     # → http://localhost:8000 (postgres + agent)
+make docker-up                     # → http://localhost:8000 (postgres, migrations, agent)
 # or: make start-local             # adds the opt-in local vllm container
 make create-superadmin EMAIL=you@example.ch NAME='Your Name'   # first account
 ```

@@ -5,12 +5,15 @@ Startup sequence:
 2. Configure Python logging from config.log_level and config.log_format
    (text, or structured JSON lines with a per-request ID).
 3. Load the bundled common-password list (the password policy's list check).
-4. Initialise the database: run migrations, seed the platform settings row
-   from config.yaml (its llm on every boot, its limits once), seed the
-   default permission matrix of every org that has none
-   (``org_permissions.seed_missing_orgs``), then overlay the stored platform
-   LLM and limits onto the config. No organization is created: a fresh
-   install starts with none.
+4. Initialise the database as the least-privilege runtime role
+   ``admino_app`` (GH-220): connect with PG_APP_PASSWORD, check health, and
+   refuse to start while a shipped migration is not applied (startup never
+   migrates: the one-shot migrate step, ``python -m admino.migrate``, does
+   that as the owner). Then seed the platform settings row from config.yaml
+   (its llm on every boot, its limits once), seed the default permission
+   matrix of every org that has none (``org_permissions.seed_missing_orgs``),
+   and overlay the stored platform LLM and limits onto the config. No
+   organization is created: a fresh install starts with none.
 5. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
@@ -54,6 +57,9 @@ Security notes:
   URLs with query strings at INFO and whole request payloads at DEBUG.
 - Startup failures are logged by exception type with a fixed hint, never the
   exception's message (a DSN carries the database password).
+- The app never holds the database owner's credential (GH-220): it connects
+  as ``admino_app``, which owns nothing and can't switch off the append-only
+  audit trigger, and it runs no DDL.
 """
 
 from __future__ import annotations
@@ -66,6 +72,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, TextIO
 
+import asyncpg
 import uvicorn
 
 from admino import passwords
@@ -336,17 +343,22 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
 
 
 async def _async_startup(config: AppConfig) -> AppConfig:
-    """Initialise the database, run migrations, seed, and load the runtime settings.
+    """Initialise the database, check the schema, seed, and load the runtime settings.
 
-    Creates no organization: a fresh install starts with none.
+    Connects as the runtime role ``admino_app`` (``database_url_from_env``).
+    Never migrates: the migrate step applies the migrations as the owner
+    before the app starts, and a schema with a shipped migration missing stops
+    startup before anything is written. Creates no organization: a fresh
+    install starts with none.
 
-    In order: migrations; the platform settings row seeded from config.yaml
-    (its llm re-applied on every boot, its limits stored once); the default
-    permission matrix of every org that has no permission rows (GH-161; orgs
-    with rows are untouched); and the config overlaid with the stored platform
-    LLM and limits (every other section stays as config.yaml and its env
-    overrides set it). No permission matrix or tools switch is loaded here:
-    every run loads its own org's policy.
+    In order: the health check; the pending-migrations check; the platform
+    settings row seeded from config.yaml (its llm re-applied on every boot,
+    its limits stored once); the default permission matrix of every org that
+    has no permission rows (GH-161; orgs with rows are untouched); and the
+    config overlaid with the stored platform LLM and limits (every other
+    section stays as config.yaml and its env overrides set it). No permission
+    matrix or tools switch is loaded here: every run loads its own org's
+    policy.
 
     Args:
         config: The config.yaml-loaded application config (used for seeding).
@@ -355,8 +367,9 @@ async def _async_startup(config: AppConfig) -> AppConfig:
         The config overlaid with the platform row.
 
     Raises:
-        ValueError: If PG_PASSWORD is not set.
-        RuntimeError: If the database health check fails.
+        ValueError: If PG_APP_PASSWORD is not set.
+        RuntimeError: If the database health check fails, or the schema is
+            not up to date.
     """
     from admino import org_permissions, scoped_settings
     from admino.database import (
@@ -364,12 +377,12 @@ async def _async_startup(config: AppConfig) -> AppConfig:
         close_pool,
         database_url_from_env,
         init_pool,
-        run_migrations,
+        pending_migration_versions,
     )
 
     database_url = database_url_from_env()
     if not database_url:
-        msg = "PG_PASSWORD environment variable is required but not set."
+        msg = "PG_APP_PASSWORD environment variable is required but not set."
         raise ValueError(msg)
 
     pool = await init_pool(
@@ -383,7 +396,14 @@ async def _async_startup(config: AppConfig) -> AppConfig:
         msg = "PostgreSQL health check failed — database is unreachable."
         raise RuntimeError(msg)
 
-    await run_migrations(pool)
+    if await pending_migration_versions(pool):
+        await close_pool()
+        msg = (
+            "The database schema is not up to date: run the migrations first "
+            "(make migrate, or the migrate service)."
+        )
+        raise RuntimeError(msg)
+
     await scoped_settings.seed_platform_settings(pool, config)
     await org_permissions.seed_missing_orgs(pool)
 
@@ -442,15 +462,16 @@ def main(
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 4. Initialize database, run migrations, seed and load from DB
+    # 4. Initialize the database (runtime role), check the schema, seed and load
     # ------------------------------------------------------------------
     try:
         config = asyncio.run(_async_startup(config))
-    except (ValueError, RuntimeError, OSError) as exc:
+    except (ValueError, RuntimeError, OSError, asyncpg.PostgresError) as exc:
         # The type only: the message can carry the DSN (the database password).
         logger.error(
-            "Database startup failed (%s): check PG_PASSWORD, PG_HOST, PG_PORT, PG_USER "
-            "and PG_DATABASE, and that PostgreSQL is reachable.",
+            "Database startup failed (%s): check PG_APP_PASSWORD, PG_HOST, PG_PORT and "
+            "PG_DATABASE, that PostgreSQL is reachable, and that the migrations have run "
+            "(make migrate, or the migrate service).",
             type(exc).__name__,
         )
         sys.exit(1)

@@ -38,6 +38,12 @@
 # 127.0.0.1:8000, and the Makefile's laptop targets pass it. The production
 # targets leave it out, so there the agent publishes no port.
 #
+# Database roles (GH-220), in every mode: the one-shot `migrate` service applies
+# the schema migrations as the owner (`admino`, PG_PASSWORD) and exits; only
+# then does the agent start, connecting as the non-superuser runtime role
+# `admino_app` (PG_APP_PASSWORD). The owner password never reaches the agent's
+# container. See docs/SECURITY.md → Database roles.
+#
 # The Makefile wraps these with `make start` / `make start-local` /
 # `make start-prod` — see Makefile.
 
@@ -51,6 +57,11 @@ services:
   # Data persists in the named Docker volume "admino-pgdata" (survives
   # `down`/`up`; not visible in the repo tree — avoids the uid-999 bind-mount
   # permissions footgun on Linux). Reset with `docker volume rm admino-pgdata`.
+  #
+  # POSTGRES_USER is the owner role: a superuser that owns the schema and is
+  # used only by the migrate service. The image creates it (and runs
+  # docker-entrypoint-initdb.d) only on an empty volume, so the runtime role is
+  # created by migration 0018 instead, which upgrades existing volumes too.
   # --------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
@@ -75,6 +86,60 @@ services:
         limits:
           memory: 512m
           cpus: "1.0"
+
+  # --------------------------------------------------------------------------
+  # migrate — One-shot schema migrations as the database owner (GH-220).
+  # Runs `python -m admino.migrate` from the agent image, then exits:
+  #   1. applies the pending migrations as the owner (`admino`, PG_PASSWORD);
+  #      migration 0018 creates the runtime role `admino_app` and its grants;
+  #   2. sets admino_app's password from PG_APP_PASSWORD (as a SCRAM verifier,
+  #      on every start, so changing it in .env and restarting rotates it).
+  # The agent starts only after this exits successfully. The owner password
+  # lives only in this short-lived container: it gets no env_file, just the
+  # variables below, and the agent's container never receives it.
+  # Internal network only (no route out, so no firewall to program), runs as
+  # the unprivileged admino user from the start, no capabilities, read-only.
+  # --------------------------------------------------------------------------
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: admino-agent:local
+    container_name: admino-migrate
+    restart: "no"
+    # Bypasses entrypoint.sh: there is no egress to lock down and no root
+    # privilege to drop.
+    entrypoint: ["python", "-m", "admino.migrate"]
+    user: admino
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      PG_HOST: postgres
+      PG_PORT: "5432"
+      PG_USER: admino
+      PG_DATABASE: admino
+      PG_PASSWORD: ${PG_PASSWORD}
+      # Empty when unset: the migration then stops with a message naming it.
+      PG_APP_PASSWORD: ${PG_APP_PASSWORD:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_FORMAT: ${LOG_FORMAT:-text}
+
+    networks:
+      - internal
+
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
 
   # --------------------------------------------------------------------------
   # agent — Python ASGI app. Serves HTTP on port 8000.
@@ -118,6 +183,9 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      # The schema is migrated and the runtime role exists before the app starts.
+      migrate:
+        condition: service_completed_successfully
 
     env_file:
       - .env
@@ -138,8 +206,12 @@ services:
       REQUIRE_EGRESS_WHITELIST: "${REQUIRE_EGRESS_WHITELIST:-true}"
       PG_HOST: postgres
       PG_PORT: "5432"
-      PG_USER: admino
       PG_DATABASE: admino
+      # The agent connects as the runtime role admino_app with PG_APP_PASSWORD
+      # (from .env). The owner password must never reach this container, so the
+      # PG_PASSWORD that env_file would pass in is blanked here (`environment`
+      # takes precedence over `env_file`).
+      PG_PASSWORD: ""
 
     volumes:
       # No host user directory is mounted: the container sees only these paths.

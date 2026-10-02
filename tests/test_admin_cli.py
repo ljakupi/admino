@@ -4,24 +4,32 @@
 the platform's first Super Admin. It validates the email (3 to 254 characters,
 no whitespace, an '@' after a non-empty local part) and the name (1 to 120
 characters after trimming, no control characters), refuses to run without an
-interactive terminal, opens the pool from the PG_* env vars and applies pending
-migrations. It then refuses a duplicate email (before any prompt), reads the
-password twice with getpass under the #149 policy (3 attempts), hashes it off
-the event loop and creates the account and its user.activate audit event in
-one transaction. The module is argparse-based with subcommands, so #154 can
-add ``create-org``.
+interactive terminal and opens the pool as the runtime role (GH-220). It then
+refuses a duplicate email (before any prompt), reads the password twice with
+getpass under the #149 policy (3 attempts), hashes it off the event loop and
+creates the account and its user.activate audit event in one transaction. The
+module is argparse-based with subcommands, so #154 can add ``create-org``.
+
+GH-220 (least-privilege runtime role): the CLI runs inside the agent container,
+which only has the runtime role's credentials. Its DSN is
+``database_url_from_env()``: user ``admino_app`` and PG_APP_PASSWORD, never the
+owner's PG_USER/PG_PASSWORD (which the fixture sets too, as a shell that sourced
+.env would, and the CLI must ignore). Without PG_APP_PASSWORD it refuses with a
+fixed message naming it. It never applies migrations: the one-shot migrate
+service did that before the agent started, so the module neither imports nor
+mentions the migrations runner.
 
 Inputs: argv, the PG_* env vars, a scripted getpass and a stubbed sys.stdin.
 Outputs: the exit code (0 created, 1 refused or failed, 2 usage error), the
-calls to the patched pool/migrations/accounts functions, stdout/stderr and log
-records.
+calls to the patched pool/accounts functions, stdout/stderr and log records.
 
 The module is imported lazily through the ``cli`` fixture, so before it exists
 every test errors on its own instead of the whole file failing to collect.
 
 Security notes:
-- All database access is mocked (init_pool, run_migrations, close_pool and a
-  recording fake pool). No real PostgreSQL connection is made.
+- All database access is mocked (init_pool, close_pool and a recording fake
+  pool; the migrations runner is a spy that must never be awaited). No real
+  PostgreSQL connection is made.
 - Argon2 is replaced by a fast fake, except in one test that checks that the
   stored hash verifies.
 - The password never appears in stdout, stderr or any log record. The email
@@ -39,6 +47,7 @@ import sys
 import threading
 from contextlib import ExitStack, asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from unittest.mock import DEFAULT, AsyncMock, MagicMock, call, patch
 from uuid import UUID
@@ -71,15 +80,21 @@ _FAKE_HASH = (
     "$ZmFrZWRpZ2VzdGZha2VkaWdlc3RmYWtlZGlnZXN0MDE"
 )
 _NEW_USER_ID = UUID("3c9e1f4a-7b2d-4e8f-a1c6-5d0b9e2f7a14")
-_PG_PASSWORD = "pg-S3cret/p@ss"
-_EXPECTED_DSN = "postgresql://admino:pg-S3cret%2Fp%40ss@localhost:5432/admino"
+_PG_APP_PASSWORD = "pg-S3cret/p@ss"
+_OWNER_PASSWORD = "owner-secret"
+# GH-220: the runtime role admino_app with PG_APP_PASSWORD (percent-encoded).
+_EXPECTED_DSN = "postgresql://admino_app:pg-S3cret%2Fp%40ss@localhost:5432/admino"
 _PG_ENV: dict[str, str] = {
     "PG_HOST": "localhost",
     "PG_PORT": "5432",
-    "PG_USER": "admino",
     "PG_DATABASE": "admino",
-    "PG_PASSWORD": _PG_PASSWORD,
+    "PG_APP_PASSWORD": _PG_APP_PASSWORD,
 }
+# The owner's credentials, for the migrate service only. The fixture sets them too,
+# as a shell that sourced .env would: the CLI must ignore them.
+_OWNER_ENV: dict[str, str] = {"PG_USER": "admino", "PG_PASSWORD": _OWNER_PASSWORD}
+_NO_DSN_MESSAGE = "Error: the PG_APP_PASSWORD environment variable is not set."
+_DATABASE_UNAVAILABLE_MESSAGE = "Error: the database is unavailable; nothing was created."
 _PASSWORD_PROMPT = "Password: "
 _REPEAT_PROMPT = "Repeat password: "
 _TYPED_PASSWORDS: tuple[str, ...] = (
@@ -252,7 +267,7 @@ class _Deps:
     pool: _FakePool
     prompts: _Prompts
     init_pool: AsyncMock
-    run_migrations: AsyncMock
+    run_migrations_spy: AsyncMock
     close_pool: AsyncMock
     email_exists: AsyncMock
     create_super_admin: AsyncMock
@@ -288,9 +303,16 @@ def deps(cli: ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Deps]:
 
     Defaults: the email is free, the password is typed twice correctly, the
     insert returns _NEW_USER_ID and hash_password returns _FAKE_HASH. The
-    password policy is the real one, wrapped in a spy.
+    password policy is the real one, wrapped in a spy. PG_APP_PASSWORD and the
+    owner's PG_USER/PG_PASSWORD are all set (the CLI must use only the first).
+
+    GH-220: the migrations runner is replaced by ``run_migrations_spy``, which
+    records a "run_migrations" step and must never be awaited. It replaces
+    ``admino.database.run_migrations`` and, while admin_cli still has a name of
+    its own for it, that name too, so the real migrations never run against
+    the fake pool.
     """
-    for name, value in _PG_ENV.items():
+    for name, value in {**_PG_ENV, **_OWNER_ENV}.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(sys, "stdin", _Stdin(tty=True))
 
@@ -314,7 +336,7 @@ def deps(cli: ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Deps]:
         return DEFAULT
 
     init_pool = AsyncMock(return_value=pool, side_effect=_logging(events, "init_pool"))
-    run_migrations = AsyncMock(side_effect=_logging(events, "run_migrations"))
+    run_migrations_spy = AsyncMock(side_effect=_logging(events, "run_migrations"))
     close_pool = AsyncMock(side_effect=_logging(events, "close_pool"))
     email_exists = AsyncMock(return_value=False, side_effect=_logging(events, "email_exists"))
     create_super_admin = AsyncMock(return_value=_NEW_USER_ID, side_effect=_log_create)
@@ -327,7 +349,9 @@ def deps(cli: ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Deps]:
 
     with ExitStack() as stack:
         stack.enter_context(patch("admino.admin_cli.init_pool", new=init_pool))
-        stack.enter_context(patch("admino.admin_cli.run_migrations", new=run_migrations))
+        stack.enter_context(patch("admino.database.run_migrations", new=run_migrations_spy))
+        if hasattr(cli, "run_migrations"):
+            stack.enter_context(patch("admino.admin_cli.run_migrations", new=run_migrations_spy))
         stack.enter_context(patch("admino.admin_cli.close_pool", new=close_pool))
         stack.enter_context(patch("admino.accounts.email_exists", new=email_exists))
         stack.enter_context(patch("admino.accounts.create_super_admin", new=create_super_admin))
@@ -338,7 +362,7 @@ def deps(cli: ModuleType, monkeypatch: pytest.MonkeyPatch) -> Iterator[_Deps]:
             pool=pool,
             prompts=prompts,
             init_pool=init_pool,
-            run_migrations=run_migrations,
+            run_migrations_spy=run_migrations_spy,
             close_pool=close_pool,
             email_exists=email_exists,
             create_super_admin=create_super_admin,
@@ -377,6 +401,23 @@ def _log_text(caplog: pytest.LogCaptureFixture) -> str:
     for record in caplog.records:
         parts.extend([record.getMessage(), repr(record.args), record.exc_text or ""])
     return "\n".join(parts)
+
+
+def _set_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str | None]) -> None:
+    """Set each variable, or remove it when its value is None."""
+    for name, value in env.items():
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+
+# GH-220: the runtime DSN is the same whatever the owner's variables say.
+_OWNER_ENV_VARIANTS: list[Any] = [
+    pytest.param({}, id="owner-vars-set"),
+    pytest.param({"PG_USER": None, "PG_PASSWORD": None}, id="owner-vars-unset"),
+    pytest.param({"PG_USER": "postgres"}, id="other-pg-user"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -454,23 +495,34 @@ class TestCreateSuperAdminHappyPath:
 
         assert deps.prompts.prompts == [_PASSWORD_PROMPT, _REPEAT_PROMPT]
 
-    def test_admin_cli_create_superadmin_opens_the_pool_from_pg_env(
-        self, cli: ModuleType, deps: _Deps
+    @pytest.mark.parametrize("owner_env", _OWNER_ENV_VARIANTS)
+    def test_admin_cli_create_superadmin_opens_the_pool_as_the_runtime_role(
+        self,
+        cli: ModuleType,
+        deps: _Deps,
+        monkeypatch: pytest.MonkeyPatch,
+        owner_env: dict[str, str | None],
     ) -> None:
-        """init_pool gets the DSN built from PG_* (password URL-encoded)."""
-        _run(cli)
+        """GH-220: init_pool gets the runtime DSN (admino_app, PG_APP_PASSWORD URL-encoded),
+        whether the owner's PG_USER/PG_PASSWORD are set, unset or name another user.
+        """
+        _set_env(monkeypatch, owner_env)
+
+        assert _run(cli) == 0
 
         deps.init_pool.assert_awaited_once()
         assert deps.init_pool.await_args is not None
-        assert deps.init_pool.await_args.args[0] == _EXPECTED_DSN
+        dsn = deps.init_pool.await_args.args[0]
+        assert dsn == _EXPECTED_DSN
+        assert _OWNER_PASSWORD not in dsn
 
-    def test_admin_cli_create_superadmin_runs_migrations_on_the_pool(
+    def test_admin_cli_create_superadmin_never_runs_migrations(
         self, cli: ModuleType, deps: _Deps
     ) -> None:
-        """Pending migrations are applied to the opened pool (works on a fresh database)."""
+        """GH-220: no migrations on the opened pool; the migrate service applied them."""
         _run(cli)
 
-        deps.run_migrations.assert_awaited_once_with(deps.pool)
+        deps.run_migrations_spy.assert_not_awaited()
 
     def test_admin_cli_create_superadmin_checks_duplicate_on_the_pool(
         self, cli: ModuleType, deps: _Deps
@@ -483,12 +535,11 @@ class TestCreateSuperAdminHappyPath:
     def test_admin_cli_create_superadmin_steps_run_in_order(
         self, cli: ModuleType, deps: _Deps
     ) -> None:
-        """Pool, migrations, duplicate check, prompts, hash, transaction + create, close."""
+        """Pool, duplicate check, prompts, hash, transaction + create, close (no migrations)."""
         _run(cli)
 
         assert deps.events == [
             "init_pool",
-            "run_migrations",
             "email_exists",
             "getpass",
             "getpass",
@@ -889,7 +940,7 @@ class TestCreateSuperAdminInterruptOutsidePrompt:
 
 
 # ---------------------------------------------------------------------------
-# 4. Preconditions: interactive terminal and PG_PASSWORD
+# 4. Preconditions: interactive terminal and PG_APP_PASSWORD (the runtime role)
 # ---------------------------------------------------------------------------
 
 
@@ -938,40 +989,81 @@ class TestCreateSuperAdminRequiresTty:
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
-        """Without a TTY and without PG_PASSWORD, the terminal is what gets reported."""
+        """Without a TTY and without PG_APP_PASSWORD, the terminal is what gets reported."""
         monkeypatch.setattr(sys, "stdin", _Stdin(tty=False))
-        monkeypatch.delenv("PG_PASSWORD")
+        monkeypatch.delenv("PG_APP_PASSWORD")
 
         assert _run(cli) == 1
 
         err = capsys.readouterr().err
         assert "interactive terminal" in err.lower()
-        assert "PG_PASSWORD" not in err
+        assert "PG_APP_PASSWORD" not in err
 
 
-class TestCreateSuperAdminRequiresPgPassword:
-    """Without PG_PASSWORD there is no DSN: refuse before opening a pool."""
+_MISSING_APP_PASSWORD: list[Any] = [
+    pytest.param({"PG_APP_PASSWORD": None}, id="unset-owner-vars-set"),
+    pytest.param({"PG_APP_PASSWORD": ""}, id="empty-owner-vars-set"),
+    pytest.param(
+        {"PG_APP_PASSWORD": None, "PG_USER": None, "PG_PASSWORD": None},
+        id="unset-owner-vars-unset",
+    ),
+    pytest.param(
+        {"PG_APP_PASSWORD": "", "PG_USER": None, "PG_PASSWORD": None},
+        id="empty-owner-vars-unset",
+    ),
+]
 
-    @pytest.mark.parametrize("unset", [True, False], ids=["unset", "empty"])
-    def test_admin_cli_create_superadmin_without_pg_password_returns_one(
+
+class TestCreateSuperAdminRequiresPgAppPassword:
+    """GH-220: without PG_APP_PASSWORD there is no runtime DSN: refuse before opening a pool.
+
+    The owner's PG_PASSWORD is never a fallback, so setting it changes nothing.
+    """
+
+    @pytest.mark.parametrize("env", _MISSING_APP_PASSWORD)
+    def test_admin_cli_create_superadmin_without_pg_app_password_returns_one(
         self,
         cli: ModuleType,
         deps: _Deps,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
-        unset: bool,
+        env: dict[str, str | None],
     ) -> None:
-        """PG_PASSWORD unset or empty → exit 1, stderr names PG_PASSWORD, no pool, no prompt."""
-        if unset:
-            monkeypatch.delenv("PG_PASSWORD")
-        else:
-            monkeypatch.setenv("PG_PASSWORD", "")
+        """PG_APP_PASSWORD unset or empty → exit 1, stderr is exactly the fixed message
+        naming PG_APP_PASSWORD, no pool, no prompt.
+        """
+        _set_env(monkeypatch, env)
 
         assert _run(cli) == 1
 
-        assert "PG_PASSWORD" in capsys.readouterr().err
+        assert capsys.readouterr().err == _NO_DSN_MESSAGE + "\n"
         deps.init_pool.assert_not_awaited()
         assert deps.prompts.prompts == []
+
+
+def _source(cli: ModuleType) -> str:
+    """The admin_cli module's source text."""
+    assert cli.__file__ is not None
+    return Path(cli.__file__).read_text(encoding="utf-8")
+
+
+class TestAdminCliRuntimeRoleOnly:
+    """GH-220: the CLI neither runs migrations nor knows the owner's credentials."""
+
+    def test_admin_cli_has_no_run_migrations(self, cli: ModuleType) -> None:
+        """admin_cli doesn't import the migrations runner (no module attribute)."""
+        assert not hasattr(cli, "run_migrations")
+
+    def test_admin_cli_source_never_mentions_run_migrations(self, cli: ModuleType) -> None:
+        """run_migrations appears nowhere in the module's source, not even via the module."""
+        assert re.search(r"\brun_migrations\b", _source(cli)) is None
+
+    def test_admin_cli_source_never_reads_the_owner_credentials(self, cli: ModuleType) -> None:
+        """The owner's PG_PASSWORD and PG_USER appear nowhere in the module's source."""
+        source = _source(cli)
+
+        found = [name for name in ("PG_PASSWORD", "PG_USER") if re.search(rf"\b{name}\b", source)]
+        assert found == []
 
 
 # ---------------------------------------------------------------------------
@@ -1038,7 +1130,7 @@ class TestCreateSuperAdminInvalidEmail:
 
         assert capsys.readouterr().err.strip()
         deps.init_pool.assert_not_awaited()
-        deps.run_migrations.assert_not_awaited()
+        deps.run_migrations_spy.assert_not_awaited()
         assert deps.prompts.prompts == []
         deps.create_super_admin.assert_not_awaited()
 
@@ -1085,7 +1177,7 @@ class TestCreateSuperAdminInvalidName:
 
         assert capsys.readouterr().err.strip()
         deps.init_pool.assert_not_awaited()
-        deps.run_migrations.assert_not_awaited()
+        deps.run_migrations_spy.assert_not_awaited()
         assert deps.prompts.prompts == []
         deps.create_super_admin.assert_not_awaited()
 
@@ -1181,17 +1273,39 @@ class TestCreateSuperAdminSetupFailures:
         assert deps.prompts.prompts == []
         deps.create_super_admin.assert_not_awaited()
 
-    def test_admin_cli_create_superadmin_migration_failure_returns_one_and_closes(
-        self, cli: ModuleType, deps: _Deps
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(
+                asyncpg.UndefinedTableError('relation "users" does not exist'),
+                id="schema-not-migrated",
+            ),
+            pytest.param(
+                asyncpg.InsufficientPrivilegeError("permission denied for table users"),
+                id="missing-grant",
+            ),
+            pytest.param(asyncpg.PostgresError("query failed"), id="postgres-error"),
+        ],
+    )
+    def test_admin_cli_create_superadmin_first_query_failure_says_database_unavailable(
+        self,
+        cli: ModuleType,
+        deps: _Deps,
+        capsys: pytest.CaptureFixture[str],
+        error: asyncpg.PostgresError,
     ) -> None:
-        """run_migrations fails → exit 1, no duplicate check, no prompt, pool closed."""
-        deps.run_migrations.side_effect = asyncpg.PostgresError("migration failed")
+        """GH-220: the first query (email_exists) fails as the runtime role → exit 1, stderr
+        is exactly the fixed 'database is unavailable' message, no prompt, pool closed,
+        and no migrations are run to make up for a missing table.
+        """
+        deps.email_exists.side_effect = error
 
         assert _run(cli) == 1
 
-        deps.email_exists.assert_not_awaited()
+        assert capsys.readouterr().err == _DATABASE_UNAVAILABLE_MESSAGE + "\n"
         assert deps.prompts.prompts == []
         deps.close_pool.assert_awaited_once()
+        deps.run_migrations_spy.assert_not_awaited()
 
     def test_admin_cli_create_superadmin_duplicate_check_failure_returns_one_and_closes(
         self, cli: ModuleType, deps: _Deps

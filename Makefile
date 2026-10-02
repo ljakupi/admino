@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down docker-build-prod docker-up-prod docker-down-prod docker-logs-prod start-prod
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down migrate run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down docker-build-prod docker-up-prod docker-down-prod docker-logs-prod start-prod
 
 # Source and package configuration
 SRC_DIR    := src
@@ -25,9 +25,10 @@ COMPOSE_FILES := -f docker-compose.yml -f docker-compose.local.yml
 # docker-compose.local.yml, so the agent publishes no host port. The
 # services are listed explicitly, so a COMPOSE_PROFILES=vllm in the
 # environment can never start the local vllm container in production.
+# migrate is the one-shot schema migration (GH-220) the agent waits for.
 # --------------------------------------------------------------------------
 PROD_COMPOSE_FILES := -f docker-compose.yml -f docker-compose.prod.yml
-PROD_SERVICES      := postgres agent caddy
+PROD_SERVICES      := postgres migrate agent caddy
 
 # --------------------------------------------------------------------------
 # Local vLLM container settings
@@ -75,8 +76,9 @@ check: lint format-check typecheck
 docker-build:
 	docker compose $(COMPOSE_FILES) build
 
-# docker-up: bring up postgres + agent. The default provider (Infomaniak) is a
-# cloud API, so no local model container is provisioned or started.
+# docker-up: bring up postgres + agent (after the one-shot migrate service). The
+# default provider (Infomaniak) is a cloud API, so no local model container is
+# provisioned or started.
 # (Re)start everything after a rebuild:
 #   make docker-down && make docker-build && make docker-up
 docker-up:
@@ -100,8 +102,19 @@ dev-db:
 dev-db-down:
 	docker compose -f docker-compose.yml -f docker-compose.dev.yml down postgres
 
-run:
-	python -m $(PACKAGE).main
+# --------------------------------------------------------------------------
+# Native dev against `make dev-db` (GH-220). Both read the shell environment.
+# migrate: apply pending migrations and set the runtime role's password, as the
+#   database owner (PG_USER/PG_PASSWORD; PG_APP_PASSWORD for admino_app).
+# run: migrate, then start the app as the runtime role admino_app
+#   (PG_APP_PASSWORD), with the owner password removed from its environment.
+# In Docker the one-shot `migrate` service does the same before the agent starts.
+# --------------------------------------------------------------------------
+migrate:
+	python -m $(PACKAGE).migrate
+
+run: migrate
+	env -u PG_PASSWORD python -m $(PACKAGE).main
 
 clean:
 	find $(SRC_DIR) $(TESTS_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
@@ -172,7 +185,7 @@ start: docker-up
 docker-build-prod:
 	docker compose $(PROD_COMPOSE_FILES) build agent caddy
 
-# docker-up-prod: postgres + agent + the Caddy TLS reverse proxy on ports 80/443.
+# docker-up-prod: postgres + migrate + agent + the Caddy TLS reverse proxy on ports 80/443.
 docker-up-prod:
 	docker compose $(PROD_COMPOSE_FILES) up -d $(PROD_SERVICES)
 

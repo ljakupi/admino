@@ -1,9 +1,10 @@
 """Foreign-key guard: the org purge stays complete as tables are added (GH-154).
 
-The org purge (``admino.organizations.purge_due_orgs``) deletes an org's audit
-events through ``purge_org_audit_events``, then ``DELETE FROM users WHERE
-org_id = $1``, then the organizations row. Everything else that belongs to the
-org must go with those rows through ``ON DELETE CASCADE``. A new table that
+The org purge (``admino.organizations.purge_due_orgs``) runs ``DELETE FROM
+users WHERE org_id = $1``, then ``purge_org_audit_events``, which deletes the
+org's audit events and then the organizations row (GH-220, migration 0019:
+the runtime role has no DELETE on organizations). Everything else that belongs
+to the org must go with those rows through ``ON DELETE CASCADE``. A new table that
 references ``users`` or ``organizations`` without CASCADE would either block
 the purge (RESTRICT / NO ACTION) or keep the org's data after it (SET NULL),
 so this guard reads every shipped migration and pins the rule:

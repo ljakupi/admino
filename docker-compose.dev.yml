@@ -2,7 +2,17 @@
 #
 # Usage:
 #   make dev-db          (starts Postgres with host port 5432)
+#   make migrate         (migrations as the owner, PG_USER/PG_PASSWORD; sets the
+#                         runtime role admino_app's password from PG_APP_PASSWORD)
+#   make run             (runs make migrate, then the app as admino_app with the
+#                         owner password removed from its environment)
 #   make dev-db-down     (stops it)
+#
+# Credentials (GH-220): Postgres is initialized with the owner role `admino`
+# (PG_PASSWORD). The app never connects as it: it uses the non-superuser
+# runtime role `admino_app` (PG_APP_PASSWORD), which migration 0018 creates.
+# `make migrate` / `make run` read both from your shell (`set -a; source .env;
+# set +a`), not from .env.
 #
 # This overlay is the ONLY place Postgres is exposed to the host. It adds:
 #   - a 127.0.0.1:5432 port mapping so the Python process running natively

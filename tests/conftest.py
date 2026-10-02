@@ -121,6 +121,27 @@ def _default_anthropic_key() -> Generator[None, None, None]:
             os.environ["ANTHROPIC_API_KEY"] = previous
 
 
+@pytest.fixture(autouse=True)
+def _default_app_db_password() -> Generator[None, None, None]:
+    """Provide PG_APP_PASSWORD so the runtime DSN exists by default (GH-220).
+
+    The server lifespan and ``_async_startup`` connect as the runtime role
+    ``admino_app`` with PG_APP_PASSWORD. Tests that exercise the missing-password
+    path override it with ``monkeypatch.delenv`` or ``patch.dict(..., clear=True)``.
+
+    Managed via os.environ directly, like ``_default_anthropic_key``.
+    """
+    previous = os.environ.get("PG_APP_PASSWORD")
+    os.environ["PG_APP_PASSWORD"] = "test-suite-app-db-password"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PG_APP_PASSWORD", None)
+        else:
+            os.environ["PG_APP_PASSWORD"] = previous
+
+
 @pytest.fixture()
 def mock_pool() -> MagicMock:
     """Return a MagicMock with spec=asyncpg.Pool and async method stubs.

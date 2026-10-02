@@ -30,6 +30,7 @@ Enforcement is a Linux firewall (`iptables`) programmed at container startup by
 
 ```
 docker compose up
+  └─ migrate (one-shot, database owner): applies migrations, sets admino_app's password, exits
   └─ container starts as root (needed to program the firewall)
        └─ entrypoint.sh (as root):
             • reads egress.allowed_hosts from config.yaml
@@ -75,6 +76,55 @@ itself in — not full root:
 | `cap_add: NET_ADMIN` | Add back only "manage the firewall" (to program iptables). |
 | `cap_add: SETUID`, `SETGID` | Add back only "switch user" (so `gosu` can drop root → admino). |
 | `security_opt: no-new-privileges` | Once dropped to `admino`, it can never climb back to root. |
+
+## Database roles
+
+The app doesn't connect to PostgreSQL as a superuser. Two roles split the work:
+
+| Role | Used by | What it can do |
+| --- | --- | --- |
+| `admino` (owner) | The one-shot `migrate` service, or `make migrate` in local dev, with `PG_PASSWORD` | The superuser the postgres image creates. Owns every table and function and applies the migrations. |
+| `admino_app` (runtime) | The running app and the admin CLI, with `PG_APP_PASSWORD` | Not a superuser: no `CREATEDB`, `CREATEROLE`, `REPLICATION` or `BYPASSRLS`, and it owns nothing. Per-table rights for the queries the app runs, plus `EXECUTE` on the two audit purge functions. |
+
+**Why.** The audit log, `audit_events`, is append-only. A superuser session could still
+switch its append-only trigger off (`SET session_replication_role = replica`), drop the
+trigger, or run commands inside the database container (`COPY ... TO PROGRAM`). The app
+only sends fixed, parameterized statements, but a compromised or buggy app with a
+superuser connection could rewrite or erase the audit log. As `admino_app`, all of these
+fail:
+
+- `SET session_replication_role`, `DROP TRIGGER`, `ALTER TABLE ... DISABLE TRIGGER` and
+  `COPY ... TO PROGRAM`;
+- `UPDATE`, `DELETE` and `TRUNCATE` on `audit_events`, where the role has `SELECT` and
+  `INSERT` only;
+- `CREATE TABLE`, `CREATE FUNCTION` and temporary tables.
+
+How it's enforced:
+
+- **The purges run as the owner.** The retention purge (`purge_audit_events`) and the
+  organization purge (`purge_org_audit_events`) are `SECURITY DEFINER` functions with a
+  pinned `search_path`, and the only functions `admino_app` may execute. The append-only
+  trigger stays as a second layer: it still lets a delete through only from one of them.
+- **No quiet erasure through an organization purge.** The organization purge deletes the
+  organization itself in the same call as its audit events, and `admino_app` can't delete
+  organizations any other way. A database trigger keeps every scheduled deletion open for
+  at least 7 days: it stamps the request with the database clock, refuses an earlier purge
+  date, and freezes both dates while the deletion is pending. So a compromised app can't
+  erase a live organization's audit log. The most it can do is schedule a deletion, which
+  locks the organization's members out and shows in the Super Admin's organization list
+  for at least a week, where it can still be cancelled.
+- **The owner password never reaches the app.** Only the `migrate` container gets
+  `PG_PASSWORD`; the agent's container has it blanked, and `make run` starts the app with
+  it removed from its environment. The migrate step sends `admino_app`'s password to
+  PostgreSQL as a SCRAM verifier, so the plaintext never reaches the database or its logs,
+  and it refuses a `PG_APP_PASSWORD` equal to `PG_PASSWORD`.
+- **No migrations at runtime.** The app and the admin CLI never run migrations. The app
+  refuses to start while any are pending.
+- **New tables get explicit grants.** A migration that creates a table grants
+  `admino_app` exactly what the app needs on it, in the same file; a unit test fails
+  otherwise. New functions get no `EXECUTE` for anyone by default.
+- **Upgrades.** Migration 0018 creates the role and its grants, so a data volume created
+  before this change gets them on the next start. Set `PG_APP_PASSWORD` in `.env` first.
 
 ## The TLS reverse proxy (production profile)
 
@@ -204,6 +254,16 @@ We prefer to be transparent about what this does **not** guarantee:
   bypassing TLS. They get no more than any other client: the login is still
   required, and their forwarded headers are ignored because they don't come from
   Caddy's address. Anyone with that access to the server can already read `.env`.
+- **The owner password lives in `.env`.** The database roles protect the audit log from
+  a compromised app, not from someone who can read `.env` on the server: `PG_PASSWORD`
+  is the database superuser's password.
+- **The deletion window is checked when the deletion is scheduled, not when it's
+  committed.** A compromised app that keeps one database transaction open for the whole
+  grace period could commit a deletion that is already due, so the organization would
+  disappear without a visible pending period. It still can't purge sooner than 7 days
+  after it started, and the purge deletes the organization, so its audit log can't be
+  quietly erased while it lives on. Closing this would take commit timestamps on the
+  database server.
 - **Laptop-first.** This control exists because the default deployment is a
   laptop or home server, where there is no cloud network policy. Cloud
   deployments can and should *also* use native egress controls (K8s

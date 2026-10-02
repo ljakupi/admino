@@ -3850,21 +3850,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
     invalidate any connections created there.
-    """
-    import os
-    from urllib.parse import quote_plus
 
+    GH-220: the pool connects as the least-privilege runtime role
+    ``admino_app`` (``database_url_from_env``), never as the database owner;
+    without PG_APP_PASSWORD the app refuses to start.
+    """
     from admino.audit_events import run_retention_job
-    from admino.database import close_pool, get_pool, init_pool
+    from admino.database import close_pool, database_url_from_env, get_pool, init_pool
     from admino.email_outbox import run_outbox_sender
     from admino.mailer import load_smtp_config
 
-    password = os.environ.get("PG_PASSWORD", "")
-    host = os.environ.get("PG_HOST", "localhost")
-    port = os.environ.get("PG_PORT", "5432")
-    user = os.environ.get("PG_USER", "admino")
-    database = os.environ.get("PG_DATABASE", "admino")
-    database_url = f"postgresql://{user}:{quote_plus(password)}@{host}:{port}/{database}"
+    database_url = database_url_from_env()
+    if database_url is None:
+        msg = "PG_APP_PASSWORD environment variable is required but not set."
+        raise RuntimeError(msg)
 
     await init_pool(database_url)
 

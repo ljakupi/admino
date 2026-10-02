@@ -13,14 +13,19 @@ The make targets run the same commands inside the agent container, as the
 unprivileged admino user (``docker compose exec -u admino agent``). Commands
 are argparse subcommands.
 
+The CLI connects as the least-privilege runtime role ``admino_app`` with
+PG_APP_PASSWORD (``database.database_url_from_env``, GH-220), like the
+server, and never applies migrations: the one-shot migrate service applied
+them before the agent started (or ``make migrate`` outside Docker).
+
 ``create-superadmin``, in order:
 
 1. Validates the email (3 to 254 characters, no whitespace, an '@' after a
    non-empty local part, like the users table CHECKs; never trimmed) and the
    name (1 to 120 characters after trimming, no control characters).
-2. Refuses to run without an interactive terminal, or without PG_PASSWORD.
-3. Opens a small pool from the PG_* env vars and applies pending migrations,
-   so it also works on a fresh database before the agent's first start.
+2. Refuses to run without an interactive terminal, or without
+   PG_APP_PASSWORD.
+3. Opens a small pool as the runtime role.
 4. Refuses an email that's already taken, in any capitalization, before any
    password prompt.
 5. Asks for the password and its confirmation with getpass, under the
@@ -38,11 +43,11 @@ order:
 1. Validates the input through ``models.OrgCreateRequest`` (the budget as an
    exact decimal, the quota as GiB x 1024**3 bytes); each invalid field gets
    one fixed message naming its option.
-2. Refuses to run without PG_PASSWORD.
+2. Refuses to run without PG_APP_PASSWORD.
 3. Picks the delivery: with SMTP configured (``mailer.load_smtp_config``)
    the invitation email is queued; without it nothing is queued and the
    one-time link is shown on stdout, so stdout must be a terminal.
-4. Opens a small pool, applies pending migrations, reads ``server.public_url``
+4. Opens a small pool as the runtime role, reads ``server.public_url``
    (``$CONFIG_DIR/config.yaml`` plus ADMINO_PUBLIC_URL, like the server's
    startup) as the link base, and creates the org, its ``org.create`` event
    and the invitation in one transaction.
@@ -78,6 +83,8 @@ Security notes:
 - Fail closed: every change and its audit event share one transaction, so a
   failed audit write creates nothing. Every refusal or failure exits 1
   without a traceback, and the pool is closed.
+- The database owner's credential is never read: the CLI runs as the
+  runtime role, which owns nothing and runs no DDL.
 - No shell, subprocess, eval or exec.
 """
 
@@ -108,7 +115,7 @@ from admino import accounts, organizations, passwords
 from admino.access import Operator
 from admino.audit_events import AuditRecordError
 from admino.config import load_app_config
-from admino.database import close_pool, database_url_from_env, init_pool, run_migrations
+from admino.database import close_pool, database_url_from_env, init_pool
 from admino.mailer import load_smtp_config
 from admino.models import OrgCreateRequest
 
@@ -164,7 +171,7 @@ _NO_TTY_FOR_LINK: Final = (
     "Error: SMTP isn't configured, so the one-time invitation link would be shown on "
     "stdout; run this command in an interactive terminal, without redirecting its output."
 )
-_NO_DSN: Final = "Error: the PG_PASSWORD environment variable is not set."
+_NO_DSN: Final = "Error: the PG_APP_PASSWORD environment variable is not set."
 _DATABASE_UNAVAILABLE: Final = "Error: the database is unavailable; nothing was created."
 _INVALID_CONFIG: Final = "Error: the configuration is invalid; nothing was created."
 _CONFIG_UNREADABLE: Final = "Error: the configuration can't be read; nothing was created."
@@ -285,13 +292,12 @@ def _run_on_database(dsn: str, command: Callable[[asyncpg.Pool], Awaitable[int]]
 
 
 async def _create_with_pool(pool: asyncpg.Pool, account: _NewSuperAdmin) -> int:
-    """Migrate, check the email, ask for the password, hash it and create the account.
+    """Check the email, ask for the password, hash it and create the account.
 
     Returns:
         The exit code: 0 when created, 1 otherwise.
     """
     try:
-        await run_migrations(pool)
         taken = await accounts.email_exists(pool, account.email)
     except _DATABASE_ERRORS:
         _error(_DATABASE_UNAVAILABLE)
@@ -321,7 +327,7 @@ async def _create_with_pool(pool: asyncpg.Pool, account: _NewSuperAdmin) -> int:
 
 
 def _create_superadmin(*, email: str, name: str) -> int:
-    """Run create-superadmin: validate, check the terminal and PG_PASSWORD, then create.
+    """Run create-superadmin: validate, check the terminal and PG_APP_PASSWORD, then create.
 
     Returns:
         The exit code: 0 when created, 1 otherwise.
@@ -349,16 +355,11 @@ async def _create_org_with_pool(
     language: EmailLanguage,
     queue_email: bool,
 ) -> int:
-    """Migrate, read the link base, create the org and print the outcome.
+    """Read the link base, create the org and print the outcome.
 
     Returns:
         The exit code: 0 when created, 1 otherwise.
     """
-    try:
-        await run_migrations(pool)
-    except _DATABASE_ERRORS:
-        _error(_DATABASE_UNAVAILABLE)
-        return 1
     try:
         app_config = load_app_config(_CONFIG_PATH)
     except OSError:
@@ -396,7 +397,7 @@ async def _create_org_with_pool(
 
 
 def _create_org(args: argparse.Namespace) -> int:
-    """Run create-org: validate, check PG_PASSWORD and the delivery, then create.
+    """Run create-org: validate, check PG_APP_PASSWORD and the delivery, then create.
 
     Returns:
         The exit code: 0 when created, 1 otherwise.
