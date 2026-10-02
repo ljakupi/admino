@@ -17,7 +17,10 @@ inside the test's call phase, so the rest of the suite is unaffected.
 The scenario uses ``admino.server.create_app`` and the real services against
 the in-memory database tests/db_fakes.FakeDb:
 1. A Super Admin creates an org (``POST /api/platform/orgs``) with the fixture
-   org name and first-admin email.
+   org name and first-admin email. The new org has data residency on (the
+   default), so the Super Admin switches it off (``PATCH
+   /api/platform/orgs/{id}/residency``): GH-162 blocks the Google and
+   Microsoft tools and connections in a residency org.
 2. The first admin opens and accepts the invitation (fixture display name and
    password), then invites a colleague (``POST /api/org/invitations``, the
    invitee's fixture email).
@@ -36,10 +39,15 @@ the in-memory database tests/db_fakes.FakeDb:
    the defaults (gmail.search allowed) when the org was created in step 1.
    The tool runs over a real ``httpx.AsyncClient`` on an
    ``httpx.MockTransport``, so httpx's own request logging, which prints the
-   full URL including ``?q=``, is exercised. The mocked Gmail API answers with
+   full URL including ``?q=``, is exercised. GH-162: the access token comes
+   from the per-user cache ``oauth.access_tokens``, whose refresh
+   (``oauth.get_valid_access_token``) is patched. The mocked Gmail API answers with
    the title as subject and the file name as attachment. A second turn's LLM
    call raises an ``LLMError`` whose message holds fixture strings.
 7. The Google OAuth callback stores a token for the fixture Google account.
+   GH-162: the pending state is bound to the Org Admin's session
+   (``server.OAuthPendingState``) and the callback request carries the
+   ``admino_oauth_state`` binding cookie; the token row is the Org Admin's own.
 8. ``GET /api/org/permissions`` as the Org Admin, whose service call
    (``org_permissions.get_org_permissions``) raises ``RuntimeError(<fixture
    text>)`` (GH-159 removed ``/api/settings``; GH-161 moved the permission
@@ -68,8 +76,9 @@ What these tests pin down:
   step must produce (a DEBUG record, both chat turns, the outbox failure by
   class name, the unhandled exception). The scenario also checks every
   step's effect: the org, the accepted invitation, the three logins, the reset
-  token, the delivery attempts, the Gmail API query, the tool result the LLM
-  saw, the tool.call audit row and the stored OAuth token.
+  token, the residency switch, the delivery attempts, the Gmail API query, the
+  tool result the LLM saw, the tool.call audit row and the Org Admin's stored
+  OAuth token.
 
 Security notes:
 - Test infrastructure only: no real network, PostgreSQL, SMTP or sleep
@@ -102,7 +111,7 @@ import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 
-from admino import email_outbox, server
+from admino import email_outbox, oauth, server
 from admino import main as main_module
 from admino.agent import Agent
 from admino.llm import LLMError, LLMResponse
@@ -204,6 +213,7 @@ _CONTENT: Final = (
 _FORMATS: Final = ["text", "json"]
 _IP: Final = "203.0.113.77"
 _COOKIE: Final = "admino_session"
+_OAUTH_STATE_COOKIE: Final = "admino_oauth_state"
 _CHAT_SESSION: Final = "logscan-chat-1"
 _GMAIL_MESSAGE_ID: Final = "msgLogscan0001"
 _GMAIL_SCOPE: Final = "https://www.googleapis.com/auth/gmail.readonly"
@@ -288,20 +298,21 @@ def gmail_requests(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[httpx.Reque
     """Point the real Gmail tool at a mocked Gmail API; yield the requests it received.
 
     The tool keeps its real ``httpx.AsyncClient`` (so httpx's own request logging
-    runs), on an ``httpx.MockTransport``. Token acquisition is patched: no OAuth
-    refresh, no network. The module's cached token is restored after.
+    runs), on an ``httpx.MockTransport``. Token acquisition is patched: the
+    per-user cache (GH-162, ``oauth.access_tokens``) starts and ends empty, and
+    the refresh it calls (``oauth.get_valid_access_token``) returns the fixture
+    access token. No OAuth refresh, no network.
     """
     seen: list[httpx.Request] = []
     client = httpx.AsyncClient(transport=httpx.MockTransport(_gmail_api(seen)))
     monkeypatch.setattr(gmail, "_http_client", client)
-    monkeypatch.setattr(gmail, "_cached_token", None)
-    monkeypatch.setattr(gmail, "_cached_expires_at", None)
     monkeypatch.setattr(
-        gmail,
-        "get_valid_access_token",
+        "admino.oauth.get_valid_access_token",
         AsyncMock(return_value=(_GOOGLE_ACCESS_TOKEN, datetime.now(UTC) + timedelta(hours=1))),
     )
+    oauth.access_tokens.clear()
     yield seen
+    oauth.access_tokens.clear()
     asyncio.run(client.aclose())
 
 
@@ -587,8 +598,11 @@ def _account_id(db: FakeDb, email: str) -> uuid.UUID:
     return plain(row["id"])
 
 
-def _create_org(db: FakeDb, client: TestClient, secrets: dict[str, str]) -> uuid.UUID:
-    """Step 1: a Super Admin creates the org and invites its first Org Admin."""
+def _create_org(db: FakeDb, client: TestClient, secrets: dict[str, str]) -> tuple[uuid.UUID, str]:
+    """Step 1: a Super Admin creates the org and invites its first Org Admin.
+
+    Returns the org's id and the Super Admin's session token.
+    """
     operator = db.add_account(kind="super_admin", role=None, email="operator@admino.example.ch")
     token = db.open_session(operator)
     secrets[token] = "super admin session token"
@@ -607,7 +621,22 @@ def _create_org(db: FakeDb, client: TestClient, secrets: dict[str, str]) -> uuid
     assert response.status_code == 201, response.text
     org_id = uuid.UUID(response.json()["organization"]["id"])
     assert db.orgs[org_id]["name"] == _ORG_NAME
-    return org_id
+    return org_id, token
+
+
+def _lift_residency(
+    db: FakeDb, client: TestClient, operator_session: str, org_id: uuid.UUID
+) -> None:
+    """Step 1b: the new org has data residency on; the Super Admin switches it off, so
+    gmail.search stays allowed (GH-162)."""
+    assert db.orgs[org_id]["data_residency"] is True
+    response = client.patch(
+        f"/api/platform/orgs/{org_id}/residency",
+        json={"enabled": False},
+        headers=_cookie(operator_session),
+    )
+    assert response.status_code == 200, response.text
+    assert db.orgs[org_id]["data_residency"] is False
 
 
 def _accept_invitation(db: FakeDb, client: TestClient, secrets: dict[str, str]) -> str:
@@ -729,12 +758,19 @@ def _chat(
     return first, second
 
 
-def _connect_google(db: FakeDb, client: TestClient) -> None:
-    """Step 7: the Google OAuth callback stores a token for the fixture account."""
-    server._oauth_pending_states[_OAUTH_STATE] = (
+def _connect_google(db: FakeDb, client: TestClient, admin_session: str) -> None:
+    """Step 7: the Google OAuth callback stores a token for the fixture account.
+
+    GH-162: the pending state is bound to the Org Admin's session, and the callback
+    request carries the binding cookie; the row is the Org Admin's own.
+    """
+    admin = _account_id(db, _MEMBER_EMAIL)
+    server._oauth_pending_states[_OAUTH_STATE] = server.OAuthPendingState(
         time.time(),
         "google",
         f"{PUBLIC_URL}/api/oauth/callback",
+        admin,
+        db.session_id_of(admin_session),
     )
     exchange = AsyncMock(return_value=(_GOOGLE_ACCESS_TOKEN, _GOOGLE_REFRESH_TOKEN, [_GMAIL_SCOPE]))
     with (
@@ -742,13 +778,16 @@ def _connect_google(db: FakeDb, client: TestClient) -> None:
         patch("admino.server.get_google_user_email", AsyncMock(return_value=_GOOGLE_EMAIL)),
     ):
         response = client.get(
-            "/api/oauth/callback", params={"code": _OAUTH_CODE, "state": _OAUTH_STATE}
+            "/api/oauth/callback",
+            params={"code": _OAUTH_CODE, "state": _OAUTH_STATE},
+            headers={"Cookie": f"{_OAUTH_STATE_COOKIE}={_OAUTH_STATE}"},
         )
     assert response.status_code == 307, response.text
     assert response.headers["location"] == "/tools?oauth=success"
-    stored = db.matching(r"^insert into oauth_tokens\b")
-    assert len(stored) == 1
-    assert _GOOGLE_EMAIL in stored[0].args
+    assert len(db.matching(r"^insert into oauth_tokens\b")) == 1
+    stored = db.oauth_token(admin, "google")
+    assert stored is not None
+    assert stored["email"] == _GOOGLE_EMAIL
 
 
 def _crash(app: FastAPI, session: str) -> httpx.Response:
@@ -780,7 +819,7 @@ def _run_scenario(
     login_delays: list[float],
     monkeypatch: pytest.MonkeyPatch,
 ) -> _Run:
-    """Configure logging into a sink, run steps 1 to 9, return the sink's text."""
+    """Configure logging into a sink, run steps 1 (and 1b) to 9, return the sink's text."""
     secrets: dict[str, str] = {}
     llm = _ScriptedLLM(_llm_script())
     with _log_sink(log_format) as sink:
@@ -791,14 +830,15 @@ def _run_scenario(
         app = create_app(agent=_agent(llm), config=_config())  # type: ignore[arg-type]
         client = TestClient(app, client=(_IP, 50000), follow_redirects=False)
 
-        org_id = _create_org(db, client, secrets)
+        org_id, operator_session = _create_org(db, client, secrets)
+        _lift_residency(db, client, operator_session, org_id)
         admin_session = _accept_invitation(db, client, secrets)
         _invite_colleague(db, client, admin_session, secrets)
         member_session = _log_in(client, secrets)
         _request_resets(db, client, org_id, secrets)
         _deliver_outbox(db, monkeypatch)
         chat_turns = _chat(db, client, member_session, llm, gmail_requests)
-        _connect_google(db, client)
+        _connect_google(db, client, member_session)
         crashed = _crash(app, member_session)
         _health(client)
         output = sink.getvalue()

@@ -42,6 +42,17 @@ Covers:
   payload, every dispatch and the per-run system message (configured prompt +
   "\n\n" + the run's tools line) use that run's policy only — concurrent
   runs with different policies never see each other's.
+- GH-162: the agent derives each run's tool context once from the run's
+  principal (``TenantContext.from_principal``) and passes it as ``tenant=`` to
+  every ``dispatch_tool_call`` (the first dispatch of a turn and the resume
+  pre-dispatch alike), so handlers get the logged-in user's ``user_id`` and
+  ``org_id``, never values from LLM arguments or history; concurrent runs for
+  two users dispatch with their own context. A principal without an org (a
+  Super Admin) has no tool context: nothing is dispatched, the outcome is a
+  ``deny`` with "No organization context." and it is recorded as usual (the
+  real recorder raises for such a principal, so the run still ends with
+  "Internal error: audit unavailable."). Test handlers take ``**_`` so they
+  accept the new ``tenant`` keyword.
 - Security invariants: no forbidden imports (server, database, audit_events,
   the removed NDJSON audit module, asyncpg), no raw content in logs.
 
@@ -84,6 +95,7 @@ from admino.models import (
     ToolsSettings,
 )
 from admino.permissions import PermissionsConfig, ToolPermissions
+from admino.tenancy import TenantContext
 from admino.tools.registry import (
     ToolCallResult,
     ToolDescription,
@@ -191,11 +203,11 @@ class EchoArgs(BaseModel):
     text: str = Field(min_length=1, max_length=100)
 
 
-async def echo_handler(args: EchoArgs, *, session_id: str) -> str:
+async def echo_handler(args: EchoArgs, *, session_id: str, **_: object) -> str:
     return f"echo:{args.text}"
 
 
-async def always_raise_handler(args: EchoArgs, *, session_id: str) -> str:
+async def always_raise_handler(args: EchoArgs, *, session_id: str, **_: object) -> str:
     msg = "handler exploded"
     raise RuntimeError(msg)
 
@@ -867,7 +879,7 @@ class TestAgentLimits:
         """Only 3 dispatches should occur even if the LLM never stops."""
         dispatch_count = {"n": 0}
 
-        async def counting_handler(args: EchoArgs, *, session_id: str) -> str:
+        async def counting_handler(args: EchoArgs, *, session_id: str, **_: object) -> str:
             dispatch_count["n"] += 1
             return f"n={dispatch_count['n']}"
 
@@ -942,7 +954,7 @@ class TestAgentConfirmation:
     ) -> None:
         called = {"n": 0}
 
-        async def tracker(args: EchoArgs, *, session_id: str) -> str:
+        async def tracker(args: EchoArgs, *, session_id: str, **_: object) -> str:
             called["n"] += 1
             return "done"
 
@@ -2078,11 +2090,11 @@ _OUTPUT_MARKER = "SECRET-OUTPUT-91bc"
 _ERROR_MARKER = "SECRET-ERR-5d1e"
 
 
-async def _marker_output_handler(args: EchoArgs, *, session_id: str) -> str:
+async def _marker_output_handler(args: EchoArgs, *, session_id: str, **_: object) -> str:
     return f"{_OUTPUT_MARKER}:{args.text}"
 
 
-async def _marker_raising_handler(args: EchoArgs, *, session_id: str) -> str:
+async def _marker_raising_handler(args: EchoArgs, *, session_id: str, **_: object) -> str:
     msg = f"backend exploded: {_ERROR_MARKER}"
     raise RuntimeError(msg)
 
@@ -2597,7 +2609,7 @@ class TestToolCallRecorderFailureAbortsRun:
         recorder = RecordingRecorder(fail_with=make_error())
         runs = {"n": 0}
 
-        async def counting_handler(args: EchoArgs, *, session_id: str) -> str:
+        async def counting_handler(args: EchoArgs, *, session_id: str, **_: object) -> str:
             runs["n"] += 1
             return "ok"
 
@@ -4233,3 +4245,379 @@ class TestAgentPerRunSystemMessage:
         assert not any(
             "You have access to the following tools" in m.content for m in result.history
         )
+
+
+# ===========================================================================
+# 17. Per-request tool context (GH-162)
+# ===========================================================================
+
+_SUPER_ADMIN_PRINCIPAL = Principal(
+    user_id=UUID("33333333-4444-4555-8666-777777777777"), kind="super_admin"
+)
+_NO_ORG_CONTEXT = "No organization context."
+_SAY_ALLOWED = {"echo": {"say": "allow"}}
+
+
+class _DispatchSpy:
+    """Stands in for ``agent.dispatch_tool_call``: records each call, then forwards it."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[ToolCall, dict[str, Any]]] = []
+        self._real = agent_module.dispatch_tool_call
+
+    async def __call__(
+        self, tool_call: ToolCall, permissions: PermissionsConfig, **kwargs: Any
+    ) -> ToolCallResult:
+        self.calls.append((tool_call, dict(kwargs)))
+        return await self._real(tool_call, permissions, **kwargs)
+
+    def tenants(self) -> list[Any]:
+        """The ``tenant`` keyword of every dispatch, in order (None when missing)."""
+        return [kwargs.get("tenant") for _, kwargs in self.calls]
+
+
+@pytest.fixture()
+def dispatch_spy(monkeypatch: pytest.MonkeyPatch) -> _DispatchSpy:
+    """Replace the agent's ``dispatch_tool_call`` with a forwarding spy."""
+    spy = _DispatchSpy()
+    monkeypatch.setattr(agent_module, "dispatch_tool_call", spy)
+    return spy
+
+
+def _register_context_echo(
+    *actions: str, args_model: type[BaseModel] = EchoArgs
+) -> list[tuple[Any, Any]]:
+    """Register echo.<action> with a handler that records (session_id, tenant) per call
+    and answers with the tenant's user id."""
+    seen: list[tuple[Any, Any]] = []
+
+    async def context_handler(args: BaseModel, **kwargs: Any) -> str:
+        tenant = kwargs.get("tenant")
+        seen.append((kwargs.get("session_id"), tenant))
+        return f"user:{getattr(tenant, 'user_id', None)}"
+
+    for action in actions or ("say",):
+        register_tool("echo", action, f"echo {action}", args_model)(context_handler)
+    return seen
+
+
+class _EchoUserArgs(BaseModel):
+    """A schema that declares its own ``user_id`` field (an LLM-filled value)."""
+
+    text: str = Field(min_length=1, max_length=100)
+    user_id: str = Field(min_length=1, max_length=100)
+
+
+def _tool_messages(result: AgentResult) -> list[str]:
+    return [m.content for m in result.history if m.role == "tool"]
+
+
+class TestAgentToolContext:
+    """Every dispatch carries the tool context of the run's principal, never the LLM's."""
+
+    async def test_agent_every_dispatch_gets_the_runs_tenant(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+    ) -> None:
+        """A two-step chain: both dispatches carry the principal's context (one object,
+        derived once per run) and the handler receives it."""
+        seen = _register_context_echo("say")
+        fake = FakeLLM(
+            [
+                _tool_response(ToolCall(tool="echo", action="say", args={"text": "a"})),
+                _tool_response(ToolCall(tool="echo", action="say", args={"text": "b"})),
+                _text_response("done"),
+            ]
+        )
+        agent = _new_agent(fake, recorder, agent_config)
+        expected = TenantContext.from_principal(_PRINCIPAL)
+
+        result = await agent.run(
+            "go",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_policy(_permissions(_SAY_ALLOWED)),
+        )
+
+        assert dispatch_spy.tenants() == [expected, expected]
+        assert dispatch_spy.tenants()[0] is dispatch_spy.tenants()[1]
+        assert seen == [("s", expected), ("s", expected)]
+        assert [(c.permission, c.success) for c in result.tool_calls] == [
+            ("allow", True),
+            ("allow", True),
+        ]
+
+    async def test_agent_resume_pre_dispatch_gets_the_runs_tenant(
+        self,
+        recorder: RecordingRecorder,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+    ) -> None:
+        """The confirm-gated dispatch and the resume pre-dispatch both carry the context;
+        the handler runs once, on resume, with it."""
+        seen = _register_context_echo("write")
+        fake = FakeLLM(
+            [
+                _tool_response(
+                    ToolCall(tool="echo", action="write", args={"text": "x"}, tool_call_id="c-1")
+                ),
+                _text_response("Written."),
+            ]
+        )
+        agent = _new_agent(fake, recorder, agent_config)
+        policy = _policy(permissions_config)
+        expected = TenantContext.from_principal(_PRINCIPAL)
+
+        first = await agent.run(
+            "please write x", session_id="s", history=[], principal=_PRINCIPAL, tool_policy=policy
+        )
+        assert first.pending_confirmation is not None
+        second = await agent.run(
+            "",
+            session_id="s",
+            history=first.history,
+            pending_confirmation=first.pending_confirmation,
+            principal=_PRINCIPAL,
+            tool_policy=policy,
+        )
+
+        assert dispatch_spy.tenants() == [expected, expected]
+        assert dispatch_spy.calls[1][1].get("pending_confirmation") == first.pending_confirmation
+        assert seen == [("s", expected)]
+        assert (second.status, second.tool_calls[0].success) == ("final", True)
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("user_id", str(_OTHER_PRINCIPAL.user_id)),
+            ("org_id", str(_ORG_B)),
+            ("tenant", {"user_id": str(_OTHER_PRINCIPAL.user_id), "org_id": str(_ORG_B)}),
+        ],
+        ids=["user_id", "org_id", "tenant"],
+    )
+    async def test_agent_llm_context_argument_does_not_change_the_tenant(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+        key: str,
+        value: object,
+    ) -> None:
+        """Tool args naming another user/org: the dispatch still carries the principal's
+        context, the call is refused and the handler never runs."""
+        seen = _register_context_echo("say")
+        call = ToolCall(tool="echo", action="say", args={"text": "x", key: value})
+        agent = _new_agent(FakeLLM(_tool_then_text(call)), recorder, agent_config)
+
+        result = await agent.run(
+            "go",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_policy(_permissions(_SAY_ALLOWED)),
+        )
+
+        assert dispatch_spy.tenants() == [TenantContext.from_principal(_PRINCIPAL)]
+        assert result.tool_calls[0].success is False
+        assert seen == []
+
+    async def test_agent_schema_user_id_field_does_not_feed_the_tenant(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+    ) -> None:
+        """Even where a schema accepts a user_id, the handler's context is the
+        principal's: another user's id in the args never becomes the tenant."""
+        seen = _register_context_echo("say", args_model=_EchoUserArgs)
+        call = ToolCall(
+            tool="echo",
+            action="say",
+            args={"text": "x", "user_id": str(_OTHER_PRINCIPAL.user_id)},
+        )
+        agent = _new_agent(FakeLLM(_tool_then_text(call)), recorder, agent_config)
+        expected = TenantContext.from_principal(_PRINCIPAL)
+
+        result = await agent.run(
+            "go",
+            session_id="s",
+            history=[],
+            principal=_PRINCIPAL,
+            tool_policy=_policy(_permissions(_SAY_ALLOWED)),
+        )
+
+        assert dispatch_spy.tenants() == [expected]
+        assert seen == [("s", expected)]
+        assert _tool_messages(result) == [f"user:{_PRINCIPAL.user_id}"]
+
+
+@pytest.mark.parametrize("a_first", [True, False], ids=["a-first", "b-first"])
+@pytest.mark.parametrize(
+    ("principal_a", "principal_b"),
+    [
+        pytest.param(_PRINCIPAL, _OTHER_PRINCIPAL, id="same-org"),
+        pytest.param(_ORG_A_PRINCIPAL, _ORG_B_PRINCIPAL, id="other-org"),
+    ],
+)
+class TestAgentConcurrentRunsUseTheirOwnTenant:
+    """User A's and user B's interleaved runs on one agent each dispatch with their own
+    context: both LLM calls happen before either dispatch, and both handlers are in
+    flight together."""
+
+    async def test_agent_concurrent_runs_dispatch_with_their_own_tenant(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+        principal_a: Principal,
+        principal_b: Principal,
+        a_first: bool,
+    ) -> None:
+        seen: list[tuple[Any, Any]] = []
+        both_running = asyncio.Event()
+
+        async def waiting_handler(args: EchoArgs, **kwargs: Any) -> str:
+            tenant = kwargs.get("tenant")
+            seen.append((kwargs.get("session_id"), tenant))
+            if len(seen) == 2:
+                both_running.set()
+            await asyncio.wait_for(both_running.wait(), timeout=5.0)
+            return f"user:{getattr(tenant, 'user_id', None)}"
+
+        register_tool("echo", "say", "echo say", EchoArgs)(waiting_handler)
+        say = ToolCall(tool="echo", action="say", args={"text": "x"})
+        llm = _InterleavingLLM({"run-A": say, "run-B": say})
+        agent = _new_agent(llm, recorder, agent_config)
+        policy = _policy(_permissions(_SAY_ALLOWED))
+        run_a = agent.run(
+            "run-A", session_id="sess-a", history=[], principal=principal_a, tool_policy=policy
+        )
+        run_b = agent.run(
+            "run-B", session_id="sess-b", history=[], principal=principal_b, tool_policy=policy
+        )
+        if a_first:
+            result_a, result_b = await asyncio.gather(run_a, run_b)
+        else:
+            result_b, result_a = await asyncio.gather(run_b, run_a)
+        tenant_a = TenantContext.from_principal(principal_a)
+        tenant_b = TenantContext.from_principal(principal_b)
+
+        assert sorted(
+            (kwargs["session_id"], kwargs.get("tenant")) for _, kwargs in dispatch_spy.calls
+        ) == [("sess-a", tenant_a), ("sess-b", tenant_b)]
+        assert sorted(seen) == [("sess-a", tenant_a), ("sess-b", tenant_b)]
+        assert _tool_messages(result_a) == [f"user:{principal_a.user_id}"]
+        assert _tool_messages(result_b) == [f"user:{principal_b.user_id}"]
+
+
+class TestAgentRunWithoutToolContext:
+    """A principal without an organization (a Super Admin) has no tool context: the
+    agent never dispatches, and the refusal is recorded as a deny."""
+
+    @pytest.mark.parametrize(
+        ("action", "state"), [("say", "allow"), ("write", "confirm")], ids=["allow", "confirm"]
+    )
+    async def test_agent_super_admin_tool_call_is_never_dispatched(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+        action: str,
+        state: str,
+    ) -> None:
+        """Allowed or confirm-gated alike: no dispatch, no handler, no pending
+        confirmation; the outcome is a recorded deny with the fixed message."""
+        seen = _register_context_echo(action)
+        call = ToolCall(tool="echo", action=action, args={"text": "x"})
+        agent = _new_agent(FakeLLM(_tool_then_text(call)), recorder, agent_config)
+
+        result = await agent.run(
+            "go",
+            session_id="s",
+            history=[],
+            principal=_SUPER_ADMIN_PRINCIPAL,
+            tool_policy=_policy(_permissions({"echo": {action: state}})),
+        )
+
+        assert dispatch_spy.calls == []
+        assert seen == []
+        assert recorder.outcomes() == [("deny", False)]
+        assert recorder.calls[0]["principal"] is _SUPER_ADMIN_PRINCIPAL
+        assert (recorder.calls[0]["tool"], recorder.calls[0]["action"]) == ("echo", action)
+        assert (result.tool_calls[0].permission, result.tool_calls[0].success) == (
+            "deny",
+            False,
+        )
+        assert result.pending_confirmation is None
+        assert _tool_messages(result) == [_NO_ORG_CONTEXT]
+
+    async def test_agent_super_admin_resume_is_never_dispatched(
+        self,
+        recorder: RecordingRecorder,
+        permissions_config: PermissionsConfig,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+    ) -> None:
+        """A resumed confirmation run without tool context pre-dispatches nothing."""
+        seen = _register_context_echo("write")
+        tool_call = ToolCall(tool="echo", action="write", args={"text": "x"}, tool_call_id="c")
+        now = datetime.now(UTC)
+        pending = PendingConfirmation(
+            confirmation_id="conf-sa",
+            session_id="s",
+            tool_call=tool_call,
+            created_at=now,
+            expires_at=now + timedelta(seconds=60),
+        )
+        agent = _new_agent(FakeLLM([_text_response("done")]), recorder, agent_config)
+
+        result = await agent.run(
+            "",
+            session_id="s",
+            history=[],
+            pending_confirmation=pending,
+            principal=_SUPER_ADMIN_PRINCIPAL,
+            tool_policy=_policy(permissions_config),
+        )
+
+        assert dispatch_spy.calls == []
+        assert seen == []
+        assert recorder.outcomes() == [("deny", False)]
+        assert (result.tool_calls[0].permission, result.tool_calls[0].success) == (
+            "deny",
+            False,
+        )
+        assert _tool_messages(result) == [_NO_ORG_CONTEXT]
+
+    @pytest.mark.parametrize("make_error", _RECORDER_ERRORS)
+    async def test_agent_super_admin_run_with_failing_recorder_ends_audit_unavailable(
+        self,
+        agent_config: AgentConfig,
+        dispatch_spy: _DispatchSpy,
+        make_error: Any,
+    ) -> None:
+        """With the real behaviour (the recorder can't write a row without an org and
+        raises), the run still ends with the fixed audit error, and nothing ran."""
+        recorder = RecordingRecorder(fail_with=make_error())
+        seen = _register_context_echo("say")
+        fake = FakeLLM(_tool_then_text(_say()))
+        agent = _new_agent(fake, recorder, agent_config)
+
+        result = await agent.run(
+            "go",
+            session_id="s",
+            history=[],
+            principal=_SUPER_ADMIN_PRINCIPAL,
+            tool_policy=_policy(_permissions(_SAY_ALLOWED)),
+        )
+
+        assert (result.status, result.response) == ("error", _AUDIT_UNAVAILABLE)
+        assert result.pending_confirmation is None
+        assert dispatch_spy.calls == []
+        assert seen == []
+        assert recorder.outcomes() == [("deny", False)]
+        assert fake.calls == 1

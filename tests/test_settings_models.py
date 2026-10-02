@@ -29,7 +29,8 @@ What these tests pin down:
 - ``PlatformLimits`` has exactly the ``LimitsConfig`` fields and bounds.
 - ``UserSettingsResponse``, ``OrgSettingsResponse`` and
   ``PlatformSettingsResponse`` carry exactly their scope's sections (the
-  platform one: llm, limits, files, retention, security since GH-160).
+  platform one: llm, limits, files, retention, security since GH-160; the org
+  one: tools plus the required, read-only ``data_residency`` bool since GH-162).
 - Validation errors of the request models never repeat the rejected input.
 - GH-35 (task-done pings): ``SettingsNotifications`` is ``{enabled: True,
   task_done: False}`` by default (pings start off; neither is a master switch
@@ -613,15 +614,28 @@ class TestScopedSettingsResponses:
         }
 
     def test_org_settings_response_shape(self) -> None:
+        """GH-162 adds the org's data residency policy (required, read-only here)."""
         fields = _model("OrgSettingsResponse").model_fields
 
-        assert set(fields) == {"tools"}
+        assert set(fields) == {"tools", "data_residency"}
         assert fields["tools"].annotation is ToolsSettings
+        assert fields["data_residency"].annotation is bool
+        assert fields["data_residency"].is_required()
 
     def test_org_settings_response_defaults_dump(self) -> None:
-        body = _model("OrgSettingsResponse")(tools=ToolsSettings())
+        body = _model("OrgSettingsResponse")(tools=ToolsSettings(), data_residency=False)
 
-        assert body.model_dump() == {"tools": dict.fromkeys(_TOOLS, True)}
+        assert body.model_dump() == {
+            "tools": dict.fromkeys(_TOOLS, True),
+            "data_residency": False,
+        }
+
+    def test_org_settings_response_without_data_residency_is_refused(self) -> None:
+        """GH-162: a response can't silently omit the residency policy."""
+        with pytest.raises(ValidationError) as error:
+            _model("OrgSettingsResponse")(tools=ToolsSettings())
+
+        assert [tuple(item["loc"]) for item in error.value.errors()] == [("data_residency",)]
 
     def test_platform_settings_response_shape(self) -> None:
         """GH-160 adds files, retention and security next to llm and limits."""

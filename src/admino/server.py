@@ -62,10 +62,17 @@ Routes:
   pending promotion; audited.
 - GET  /api/permissions/summary — The effective state of each of the caller's
   org's tool actions (read-only, every member role).
-- /api/oauth/* — account connections.
+- GET  /api/oauth/{google,microsoft}/authorize — The consent URL to connect the
+  caller's own account; binds the state to the caller's session and sets the
+  ``admino_oauth_state`` cookie.
+- GET  /api/oauth/{google,microsoft}/status — The caller's own connection, the
+  org's switches of the provider's services and the org's data residency.
+- DELETE /api/oauth/{google,microsoft} — Revokes and deletes the caller's own
+  connection.
 - GET  /health            — Health check (public): ``{"status": "ok"}``, or 503
   ``{"status": "degraded"}`` when the database is unreachable; nothing else.
-- GET  /api/oauth/callback — The OAuth provider's redirect (public, state-checked).
+- GET  /api/oauth/callback — The OAuth provider's redirect (public; checks the
+  state, its binding cookie and the initiating session).
 - /                       — Static PWA files (public); a missing client route
   (outside /api and /health, last segment without an extension) gets
   index.html for the PWA's router.
@@ -152,6 +159,28 @@ Security notes:
   them); an org's due ones are completed by that org's next chat run, summary
   or critical-permissions request, and a user-role notice (GH-66) is appended
   to that org's in-memory chats only.
+- OAuth connections are per user (GH-162): every OAuth route but the callback
+  spends a per-user bucket, then needs ``Capability.OAUTH_CONNECT`` through
+  ``access.can`` (Org Admin and Editor: 403 for a Viewer or a Super Admin)
+  before any database work, and only ever reads, writes or deletes the
+  caller's own ``oauth_tokens`` row (``TenantContext.from_principal``, never
+  a request value). Under the org's data residency policy authorize is a 403
+  with ``OAUTH_RESIDENCY_DETAIL`` and nothing stored; status still reports
+  the kept (inactive) connection and disconnect still works. Authorize binds
+  the state to the initiating user and session (``OAuthPendingState``) and
+  sets the ``admino_oauth_state`` cookie (HttpOnly, SameSite=Lax,
+  Path=/api/oauth/callback, Max-Age=600, Secure iff ``server.cookie_secure``).
+  A user has at most one pending state (a new authorize replaces theirs) and
+  no authorize ever evicts another user's, so no org can break another org's
+  connect flow; expired states are reaped. The public callback pops the
+  state first (one-shot), requires the cookie to equal it (constant time),
+  then re-resolves the initiating session by id
+  (``sessions.resolve_session_by_id``, which never refreshes it) and
+  re-checks ``oauth.connect`` and residency before any token-endpoint call;
+  the token is stored for the initiating user only, nothing is stored on any
+  error, and every redirect deletes the cookie. Connecting and disconnecting
+  invalidate that user's cached access token (``oauth.access_tokens``). No
+  token, code, state value or email is logged.
 - The agent holds no permission state (GH-161): every chat run loads the
   requesting org's tool policy (its matrix, promoted tier-2 pairs and enabled
   services) and passes it as ``tool_policy``, so one org's settings never
@@ -230,10 +259,12 @@ Security notes:
 
 Deployment note:
 - This module uses module-level dicts (_sessions, _pending_confirmations,
-  _rate_buckets) for in-memory state, and ``admino.org_permissions`` keeps
-  the pending promotions in memory. This requires a **single-worker** ASGI
-  deployment. Running multiple workers (e.g. uvicorn --workers 2) will silently
-  split state across processes. Use ``--workers 1`` (the default).
+  _rate_buckets, _oauth_pending_states) for in-memory state, and
+  ``admino.org_permissions`` keeps the pending promotions in memory (as
+  ``admino.oauth`` does the access-token cache). This requires a
+  **single-worker** ASGI deployment. Running multiple workers (e.g. uvicorn
+  --workers 2) will silently split state across processes. Use
+  ``--workers 1`` (the default).
 
 Chat session ID note:
 - Chat session IDs are client-provided until #176 and validated by Pydantic
@@ -250,12 +281,13 @@ import contextlib
 import json
 import logging
 import os
+import secrets
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
-from typing import TYPE_CHECKING, Annotated, Final
+from typing import TYPE_CHECKING, Annotated, Final, NamedTuple
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
 
@@ -287,6 +319,7 @@ from admino import (
 from admino.access import Capability, Principal, can
 from admino.logs import request_id_var
 from admino.models import (
+    PROVIDER_TOOLS,
     AgentConfig,
     AgentResult,
     ChatRequest,
@@ -305,6 +338,7 @@ from admino.models import (
     MeResponse,
     OAuthAuthorizeResponse,
     OAuthConnectionStatus,
+    OAuthServiceStatus,
     OrgCreateRequest,
     OrgCreateResponse,
     OrgLimitsPatch,
@@ -333,6 +367,7 @@ from admino.oauth import (
     OAuthError,
     OAuthProvider,
     OAuthToken,
+    access_tokens,
     build_google_consent_url,
     build_microsoft_consent_url,
     encrypt_refresh_token,
@@ -346,12 +381,6 @@ from admino.oauth import (
 from admino.permissions import PROMOTABLE_DENIALS
 from admino.proxy_headers import TrustedProxyHeadersMiddleware
 from admino.tenancy import TenantContext
-from admino.tools.gmail import clear_token_cache as _clear_gmail_cache
-from admino.tools.google_calendar import clear_token_cache as _clear_gcal_cache
-from admino.tools.google_drive import clear_token_cache as _clear_gdrive_cache
-from admino.tools.onedrive import clear_token_cache as _clear_onedrive_cache
-from admino.tools.outlook import clear_token_cache as _clear_outlook_cache
-from admino.tools.outlook_calendar import clear_token_cache as _clear_outcal_cache
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
@@ -830,11 +859,37 @@ _pending_confirmations: dict[tuple[UUID, str], PendingConfirmation] = {}
 # up on LRU eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
 _session_locks: dict[tuple[UUID, str], asyncio.Lock] = {}
 
-# OAuth CSRF state tokens: maps state string -> (timestamp, provider, redirect_uri).
-# Entries expire after _OAUTH_STATE_TTL_S seconds. Reaped on each authorize call.
+# OAuth state binding (GH-162): the authorize route stores the state with the
+# initiating user and session, and sets this short-lived cookie (HttpOnly,
+# SameSite=Lax, scoped to the callback path) to the same value. The callback
+# requires both, so only the browser that started the authorization can
+# complete it, and only for the user who started it.
+OAUTH_STATE_COOKIE_NAME: Final = "admino_oauth_state"
+_OAUTH_CALLBACK_PATH: Final = "/api/oauth/callback"
+# The 403 explanation of the authorize route in a data residency org.
+OAUTH_RESIDENCY_DETAIL: Final = (
+    "Your organization's data residency policy doesn't allow Google or Microsoft accounts."
+)
+
+
+class OAuthPendingState(NamedTuple):
+    """An authorization waiting for its callback: what the state is bound to (GH-162)."""
+
+    created_at: float  # time.time() at authorize
+    provider: OAuthProvider
+    redirect_uri: str
+    user_id: UUID  # the initiating user
+    session_id: UUID  # the initiating session (AuthenticatedSession.session_id)
+
+
+# OAuth CSRF state tokens: maps state string -> its OAuthPendingState. Entries
+# expire after _OAUTH_STATE_TTL_S seconds (also the binding cookie's Max-Age)
+# and are reaped on each authorize call. A user has at most one entry (a new
+# authorize replaces their earlier one), so the map is bounded by the users
+# who started a connection in the last 10 minutes, and no user's authorize
+# ever evicts another user's (or org's) pending state.
 _OAUTH_STATE_TTL_S: int = 600  # 10 minutes
-_OAUTH_PENDING_STATES_MAX: int = 50
-_oauth_pending_states: dict[str, tuple[float, OAuthProvider, str]] = {}
+_oauth_pending_states: dict[str, OAuthPendingState] = {}
 
 # Injected at app creation time by create_app().
 _agent: Agent | None = None
@@ -3275,23 +3330,24 @@ async def get_permissions_summary(principal: _PrincipalDep) -> PermissionsSummar
 # ---------------------------------------------------------------------------
 
 
-def _reap_oauth_states() -> None:
-    """Reap expired CSRF state tokens and enforce the capacity cap.
+def _reap_oauth_states(user_id: UUID) -> None:
+    """Drop the expired pending states and the given user's earlier one.
 
-    Removes all entries older than ``_OAUTH_STATE_TTL_S`` seconds,
-    then evicts the oldest entry if the dict is at capacity. This is
-    a synchronous function (no ``await``) to ensure atomicity within
-    the single-threaded asyncio event loop.
+    Removes every entry older than ``_OAUTH_STATE_TTL_S`` seconds and every
+    entry of ``user_id`` (their earlier authorization is dead anyway: the new
+    one overwrites its binding cookie). Another user's fresh entry is never
+    removed, so one user, or org, can't break another's connect flow. This is
+    a synchronous function (no ``await``) to ensure atomicity within the
+    single-threaded asyncio event loop.
     """
     now = time.time()
-    expired = [
-        s for s, (ts, _p, _u) in _oauth_pending_states.items() if now - ts > _OAUTH_STATE_TTL_S
+    stale = [
+        s
+        for s, entry in _oauth_pending_states.items()
+        if now - entry.created_at > _OAUTH_STATE_TTL_S or entry.user_id == user_id
     ]
-    for s in expired:
+    for s in stale:
         del _oauth_pending_states[s]
-    if len(_oauth_pending_states) >= _OAUTH_PENDING_STATES_MAX:
-        oldest = min(_oauth_pending_states, key=lambda s: _oauth_pending_states[s][0])
-        del _oauth_pending_states[oldest]
 
 
 def _build_oauth_redirect_uri() -> str:
@@ -3317,76 +3373,123 @@ def _build_oauth_redirect_uri() -> str:
     return f"http://{host}:{_config.server.port}/api/oauth/callback"
 
 
-async def oauth_google_authorize(
-    principal: _PrincipalDep,
-) -> OAuthAuthorizeResponse:
-    """Build and return a Google OAuth consent URL.
+def _oauth_cookie_secure() -> bool:
+    """Whether the OAuth binding cookie is Secure: ``server.cookie_secure`` (on without config)."""
+    return _config.server.cookie_secure if _config is not None else True
 
-    Generates a CSRF state token, stores it in ``_oauth_pending_states``,
-    and returns the consent URL for the frontend to redirect the user.
-    Expired state tokens are reaped on each call.
+
+def _oauth_redirect(location: str) -> RedirectResponse:
+    """A callback redirect (307) that also deletes the binding cookie (same Path)."""
+    response = RedirectResponse(url=location, status_code=307)
+    response.delete_cookie(
+        key=OAUTH_STATE_COOKIE_NAME,
+        path=_OAUTH_CALLBACK_PATH,
+        secure=_oauth_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+    return response
+
+
+def _oauth_error(reason: str) -> RedirectResponse:
+    """The callback's error redirect: ``/tools?oauth=error&reason=<reason>``."""
+    return _oauth_redirect(f"/tools?oauth=error&reason={reason}")
+
+
+async def _oauth_authorize(
+    session: sessions.AuthenticatedSession, response: Response, provider: OAuthProvider
+) -> OAuthAuthorizeResponse:
+    """Build the provider's consent URL and bind its state to the caller's session.
+
+    Order: the per-user bucket, ``oauth.connect`` (403 ``Forbidden`` for a
+    Viewer or a Super Admin), the org's data residency (403
+    ``OAUTH_RESIDENCY_DETAIL``), the consent URL; only then the pending state
+    and the binding cookie, so a refused request stores and sets nothing.
+
+    Args:
+        session: The caller's resolved session (its id is bound to the state).
+        response: The response the binding cookie is set on.
+        provider: ``"google"`` or ``"microsoft"``.
 
     Returns:
         OAuthAuthorizeResponse with the consent URL.
 
     Raises:
-        HTTPException: 500 if OAuth env vars are not configured.
-
-    Security notes:
-        - Requires a session.
-        - Rate limited to prevent state-token flooding.
-        - State tokens expire after ``_OAUTH_STATE_TTL_S`` seconds.
-        - Never logs credentials or tokens.
+        HTTPException: 429 when rate-limited, 403 without ``oauth.connect`` or
+            under residency, 500 if the provider's OAuth env vars are missing.
     """
-    _check_rate_limit("/api/oauth/google/authorize", _user_caller(principal))
-    _reap_oauth_states()
+    principal = session.principal
+    _check_rate_limit(f"/api/oauth/{provider}/authorize", _user_caller(principal))
+    _require_capability(principal, Capability.OAUTH_CONNECT)
 
+    from admino.database import get_pool
+
+    if await scoped_settings.org_residency(get_pool(), TenantContext.from_principal(principal)):
+        raise HTTPException(status_code=403, detail=OAUTH_RESIDENCY_DETAIL)
+
+    _reap_oauth_states(principal.user_id)
     redirect_uri = _build_oauth_redirect_uri()
+    build_consent_url = (
+        build_google_consent_url if provider == "google" else build_microsoft_consent_url
+    )
     try:
-        url, state = build_google_consent_url(redirect_uri)
+        url, state = build_consent_url(redirect_uri)
     except OAuthError:
-        logger.error("Failed to build Google consent URL — check OAuth env vars.")
+        logger.error(
+            "Failed to build %s consent URL — check OAuth env vars.", provider.capitalize()
+        )
         raise HTTPException(status_code=500, detail="OAuth configuration error.")  # noqa: B904
 
-    _oauth_pending_states[state] = (time.time(), "google", redirect_uri)
-    logger.info("Google OAuth authorize URL generated.")
+    _oauth_pending_states[state] = OAuthPendingState(
+        time.time(), provider, redirect_uri, principal.user_id, session.session_id
+    )
+    response.set_cookie(
+        key=OAUTH_STATE_COOKIE_NAME,
+        value=state,
+        max_age=_OAUTH_STATE_TTL_S,
+        path=_OAUTH_CALLBACK_PATH,
+        secure=_oauth_cookie_secure(),
+        httponly=True,
+        samesite="lax",
+    )
+    logger.info("%s OAuth authorize URL generated.", provider.capitalize())
     return OAuthAuthorizeResponse(url=url)
+
+
+async def oauth_google_authorize(
+    session: _SessionDep, response: Response
+) -> OAuthAuthorizeResponse:
+    """Handle GET /api/oauth/google/authorize — start connecting the caller's Google account.
+
+    See ``_oauth_authorize`` (``oauth.connect``, residency, the session-bound
+    state and the binding cookie).
+
+    Args:
+        session: The caller's resolved session (401 without one).
+        response: The response the binding cookie is set on.
+
+    Returns:
+        OAuthAuthorizeResponse with the consent URL.
+    """
+    return await _oauth_authorize(session, response, "google")
 
 
 async def oauth_microsoft_authorize(
-    principal: _PrincipalDep,
+    session: _SessionDep, response: Response
 ) -> OAuthAuthorizeResponse:
-    """Build and return a Microsoft OAuth consent URL.
+    """Handle GET /api/oauth/microsoft/authorize — start connecting the caller's Microsoft account.
 
-    Generates a CSRF state token, stores it in ``_oauth_pending_states``,
-    and returns the consent URL for the frontend to redirect the user.
-    Expired state tokens are reaped on each call.
+    See ``_oauth_authorize`` (``oauth.connect``, residency, the session-bound
+    state and the binding cookie).
+
+    Args:
+        session: The caller's resolved session (401 without one).
+        response: The response the binding cookie is set on.
 
     Returns:
         OAuthAuthorizeResponse with the consent URL.
-
-    Raises:
-        HTTPException: 500 if OAuth env vars are not configured.
-
-    Security notes:
-        - Requires a session.
-        - Rate limited to prevent state-token flooding.
-        - State tokens expire after ``_OAUTH_STATE_TTL_S`` seconds.
-        - Never logs credentials or tokens.
     """
-    _check_rate_limit("/api/oauth/microsoft/authorize", _user_caller(principal))
-    _reap_oauth_states()
-
-    redirect_uri = _build_oauth_redirect_uri()
-    try:
-        url, state = build_microsoft_consent_url(redirect_uri)
-    except OAuthError:
-        logger.error("Failed to build Microsoft consent URL — check OAuth env vars.")
-        raise HTTPException(status_code=500, detail="OAuth configuration error.")  # noqa: B904
-
-    _oauth_pending_states[state] = (time.time(), "microsoft", redirect_uri)
-    logger.info("Microsoft OAuth authorize URL generated.")
-    return OAuthAuthorizeResponse(url=url)
+    return await _oauth_authorize(session, response, "microsoft")
 
 
 async def oauth_callback(
@@ -3397,16 +3500,30 @@ async def oauth_callback(
 ) -> RedirectResponse:
     """Handle the OAuth callback redirect for Google and Microsoft.
 
-    Validates the CSRF state, determines the provider from the stored state,
-    exchanges the authorization code for tokens, encrypts the refresh token,
-    and persists it to the database (oauth_tokens table).
+    No session required: this endpoint is the provider's cross-site redirect
+    (a SameSite=Strict session cookie isn't sent on it). The state, its
+    binding cookie and the initiating session protect it instead (GH-162).
+    Rate-limited per client IP. Checks, in order:
 
-    No session required — this endpoint is the provider's cross-site redirect
-    (a SameSite=Strict session cookie isn't sent on it); the OAuth state token
-    protects it instead. Rate-limited per client IP.
+    1. a known ``state`` (else ``invalid_state``); its pending entry is popped
+       at once, so every state is one-shot;
+    2. the ``admino_oauth_state`` cookie equals the state (constant-time),
+       and the entry is at most ``_OAUTH_STATE_TTL_S`` old (else
+       ``invalid_state``);
+    3. the provider's ``error`` (``denied``), a ``code`` (``missing_code``);
+    4. the initiating session still resolves, for the initiating user (else
+       ``invalid_state``); that user still has ``oauth.connect``
+       (``forbidden``); their org has no data residency (``residency``);
+    5. the code exchange, encryption and ``save_token`` for the initiating
+       user (``exchange_failed`` on any OAuthError); then that user's cached
+       access token is invalidated.
+
+    Every outcome is a 307 to ``/tools?oauth=success`` or
+    ``/tools?oauth=error&reason=<reason>`` that deletes the binding cookie.
 
     Args:
-        request: The incoming request (its client IP keys the rate limit).
+        request: The incoming request (its client IP keys the rate limit, its
+            cookies carry the binding cookie).
         code: Authorization code from the provider (present on success).
         state: CSRF state token (must match a pending state).
         error: Error string from the provider (present on user denial).
@@ -3415,37 +3532,60 @@ async def oauth_callback(
         RedirectResponse to the tools page with oauth status query params.
 
     Security notes:
-        - CSRF protection via state token validation.
-        - Rate limited to prevent brute-force code replay.
+        - Nothing is stored on any error; the session, role and residency
+          checks run before any token-endpoint call.
+        - The token is stored for the initiating user only, whatever session
+          cookie the callback request carries.
         - Tokens are Fernet-encrypted before being written to the database.
-        - Never logs credentials, tokens, or authorization codes.
+        - Never logs credentials, tokens, codes, state values or emails.
     """
     _check_rate_limit("/api/oauth/callback", f"ip:{_client_ip(request)}")
 
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    # Validate CSRF state first (RFC 6749 §10.12) — before inspecting any
-    # other parameter, including the error parameter from the provider.
-    if not state or state not in _oauth_pending_states:
+    # Validate the CSRF state first (RFC 6749 §10.12), before inspecting any
+    # other parameter, the provider's error included. Pop it: one-shot.
+    entry = _oauth_pending_states.pop(state, None) if state else None
+    if state is None or entry is None:
         logger.warning("OAuth callback received invalid or missing state.")
-        return RedirectResponse(url="/tools?oauth=error&reason=invalid_state", status_code=307)
+        return _oauth_error("invalid_state")
 
-    # Pop and validate state expiry.
-    created_at, provider, redirect_uri = _oauth_pending_states.pop(state)
-    if time.time() - created_at > _OAUTH_STATE_TTL_S:
-        logger.warning("%s OAuth callback received expired state token.", provider.capitalize())
-        return RedirectResponse(url="/tools?oauth=error&reason=invalid_state", status_code=307)
+    provider = entry.provider
+    label = provider.capitalize()
+    cookie = request.cookies.get(OAUTH_STATE_COOKIE_NAME)
+    if cookie is None or not secrets.compare_digest(cookie.encode(), state.encode()):
+        logger.warning("%s OAuth callback without a matching state cookie.", label)
+        return _oauth_error("invalid_state")
+    if time.time() - entry.created_at > _OAUTH_STATE_TTL_S:
+        logger.warning("%s OAuth callback received expired state token.", label)
+        return _oauth_error("invalid_state")
 
     # Provider denied consent.
     if error:
-        logger.info("%s OAuth callback received denial from user.", provider.capitalize())
-        return RedirectResponse(url="/tools?oauth=error&reason=denied", status_code=307)
+        logger.info("%s OAuth callback received denial from user.", label)
+        return _oauth_error("denied")
 
     # Missing authorization code.
     if not code:
-        logger.warning("%s OAuth callback missing authorization code.", provider.capitalize())
-        return RedirectResponse(url="/tools?oauth=error&reason=missing_code", status_code=307)
+        logger.warning("%s OAuth callback missing authorization code.", label)
+        return _oauth_error("missing_code")
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    session = await sessions.resolve_session_by_id(pool, entry.session_id)
+    if session is None or session.principal.user_id != entry.user_id:
+        logger.warning("%s OAuth callback: the initiating session has ended.", label)
+        return _oauth_error("invalid_state")
+    principal = session.principal
+    if not can(principal, Capability.OAUTH_CONNECT):
+        logger.warning("%s OAuth callback: the initiating user can't connect accounts.", label)
+        return _oauth_error("forbidden")
+    tenant = TenantContext.from_principal(principal)
+    if await scoped_settings.org_residency(pool, tenant):
+        logger.info("%s OAuth callback refused: data residency is on.", label)
+        return _oauth_error("residency")
 
     try:
         async with httpx.AsyncClient(
@@ -3453,13 +3593,13 @@ async def oauth_callback(
         ) as client:
             if provider == "google":
                 access_token, refresh_token, scopes = await exchange_google_code(
-                    code, redirect_uri, client
+                    code, entry.redirect_uri, client
                 )
                 # Best-effort: fetch user email for display purposes.
                 email = await get_google_user_email(access_token, client)
             else:
                 access_token, refresh_token, scopes = await exchange_microsoft_code(
-                    code, redirect_uri, client
+                    code, entry.redirect_uri, client
                 )
                 email = None
 
@@ -3481,178 +3621,155 @@ async def oauth_callback(
                 created_at=now_utc,
                 last_refreshed_at=now_utc,
             )
-            from admino.database import get_pool
-
-            await save_token(get_pool(), token)
+            await save_token(pool, tenant, token)
     except OAuthError:
-        logger.error("%s OAuth token exchange or storage failed.", provider.capitalize())
-        return RedirectResponse(url="/tools?oauth=error&reason=exchange_failed", status_code=307)
+        logger.error("%s OAuth token exchange or storage failed.", label)
+        return _oauth_error("exchange_failed")
+
+    # A reconnect must never serve the previous account's cached access token.
+    await access_tokens.invalidate(entry.user_id, provider)
 
     if email:
-        logger.info("%s OAuth connected successfully for user.", provider.capitalize())
+        logger.info("%s OAuth connected successfully for user.", label)
     else:
-        logger.info("%s OAuth connected successfully (email not retrieved).", provider.capitalize())
+        logger.info("%s OAuth connected successfully (email not retrieved).", label)
 
-    return RedirectResponse(url="/tools?oauth=success", status_code=307)
-
-
-async def oauth_google_status(
-    principal: _PrincipalDep,
-) -> OAuthConnectionStatus:
-    """Return the connection status for the Google OAuth account.
-
-    Reads the Google token row from the database.
-
-    Returns:
-        OAuthConnectionStatus indicating whether Google is connected and healthy.
-
-    Security notes:
-        - Requires a session.
-        - Never exposes token contents in the response.
-    """
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-
-    _check_rate_limit("/api/oauth/google/status", _user_caller(principal))
-
-    from admino.database import get_pool
-
-    connected, healthy = await get_connection_status(get_pool(), "google")
-    if connected:
-        return OAuthConnectionStatus(
-            connected=True,
-            healthy=healthy,
-            services=["gmail", "google_calendar", "google_drive"],
-        )
-    return OAuthConnectionStatus(connected=False)
+    return _oauth_redirect("/tools?oauth=success")
 
 
-async def oauth_microsoft_status(
-    principal: _PrincipalDep,
-) -> OAuthConnectionStatus:
-    """Return the connection status for the Microsoft OAuth account.
+async def _oauth_status(principal: Principal, provider: OAuthProvider) -> OAuthConnectionStatus:
+    """The caller's own connection to ``provider``, the org's services and residency.
 
-    Reads the Microsoft token row from the database.
+    Args:
+        principal: The logged-in principal.
+        provider: ``"google"`` or ``"microsoft"``.
 
     Returns:
-        OAuthConnectionStatus indicating whether Microsoft is connected and healthy.
-
-    Security notes:
-        - Requires a session.
-        - Never exposes token contents in the response.
-    """
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
-
-    _check_rate_limit("/api/oauth/microsoft/status", _user_caller(principal))
-
-    from admino.database import get_pool
-
-    connected, healthy = await get_connection_status(get_pool(), "microsoft")
-    if connected:
-        return OAuthConnectionStatus(
-            connected=True,
-            healthy=healthy,
-            services=["outlook", "outlook_calendar", "onedrive"],
-        )
-    return OAuthConnectionStatus(connected=False)
-
-
-async def oauth_google_disconnect(
-    principal: _PrincipalDep,
-) -> dict[str, str]:
-    """Disconnect the Google OAuth account by deleting its token row.
-
-    Removes the encrypted token row from the database. Returns 404 if no
-    Google account is connected.
-
-    Returns:
-        A dict with ``{"status": "disconnected"}`` on success.
+        OAuthConnectionStatus: ``connected``/``healthy`` of the caller's own
+        row (never another user's), the org's ``data_residency``, and the
+        provider's services with the org's stored switches.
 
     Raises:
-        HTTPException: 404 if not connected, 500 if deletion fails.
-
-    Security notes:
-        - Requires a session.
-        - Rate limited to prevent abuse.
-        - Never logs token contents.
+        HTTPException: 429 when rate-limited, 403 without ``oauth.connect``
+            (both before any database work).
     """
     if _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
 
-    _check_rate_limit("/api/oauth/google/disconnect", _user_caller(principal))
+    _check_rate_limit(f"/api/oauth/{provider}/status", _user_caller(principal))
+    _require_capability(principal, Capability.OAUTH_CONNECT)
 
     from admino.database import get_pool
 
+    pool = get_pool()
+    tenant = TenantContext.from_principal(principal)
+    connected, healthy = await get_connection_status(pool, tenant, provider)
+    switches = await scoped_settings.org_tools_enabled(pool, tenant)
+    return OAuthConnectionStatus(
+        connected=connected,
+        healthy=healthy,
+        data_residency=await scoped_settings.org_residency(pool, tenant),
+        services=[
+            OAuthServiceStatus(tool=tool, enabled=switches[tool])
+            for tool in PROVIDER_TOOLS[provider]
+        ],
+    )
+
+
+async def oauth_google_status(principal: _PrincipalDep) -> OAuthConnectionStatus:
+    """Handle GET /api/oauth/google/status — the caller's own Google connection.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        OAuthConnectionStatus (see ``_oauth_status``); never token contents.
+    """
+    return await _oauth_status(principal, "google")
+
+
+async def oauth_microsoft_status(principal: _PrincipalDep) -> OAuthConnectionStatus:
+    """Handle GET /api/oauth/microsoft/status — the caller's own Microsoft connection.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        OAuthConnectionStatus (see ``_oauth_status``); never token contents.
+    """
+    return await _oauth_status(principal, "microsoft")
+
+
+async def _oauth_disconnect(principal: Principal, provider: OAuthProvider) -> dict[str, str]:
+    """Revoke and delete the caller's own connection to ``provider``.
+
+    Allowed while the org's data residency is on (the user may remove a kept
+    connection). The caller's cached access token is invalidated afterwards.
+
+    Args:
+        principal: The logged-in principal.
+        provider: ``"google"`` or ``"microsoft"``.
+
+    Returns:
+        ``{"status": "disconnected"}``.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without ``oauth.connect``
+            (both before any database work), 404 when the caller has no
+            connection, 500 if the deletion fails.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+
+    _check_rate_limit(f"/api/oauth/{provider}/disconnect", _user_caller(principal))
+    _require_capability(principal, Capability.OAUTH_CONNECT)
+
+    from admino.database import get_pool
+
+    label = provider.capitalize()
+    tenant = TenantContext.from_principal(principal)
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0),
         ) as client:
-            deleted = await revoke_and_delete_token(get_pool(), "google", client)
+            deleted = await revoke_and_delete_token(get_pool(), tenant, provider, client)
     except OAuthError:
-        logger.error("Failed to disconnect Google account.")
+        logger.error("Failed to disconnect %s account.", label)
         raise HTTPException(status_code=500, detail="Failed to disconnect.")  # noqa: B904
 
     if not deleted:
-        raise HTTPException(status_code=404, detail="Google account is not connected.")
+        raise HTTPException(status_code=404, detail=f"{label} account is not connected.")
 
-    # Invalidate in-memory cached access tokens so tool modules stop
-    # reusing a stale token after the refresh token row is gone.
-    await _clear_gmail_cache()
-    await _clear_gcal_cache()
-    await _clear_gdrive_cache()
+    # The tools must stop reusing the caller's cached access token now that
+    # the refresh token row is gone.
+    await access_tokens.invalidate(principal.user_id, provider)
 
-    logger.info("Google OAuth account disconnected.")
+    logger.info("%s OAuth account disconnected.", label)
     return {"status": "disconnected"}
 
 
-async def oauth_microsoft_disconnect(
-    principal: _PrincipalDep,
-) -> dict[str, str]:
-    """Disconnect the Microsoft OAuth account by deleting its token row.
+async def oauth_google_disconnect(principal: _PrincipalDep) -> dict[str, str]:
+    """Handle DELETE /api/oauth/google — disconnect the caller's own Google account.
 
-    Removes the encrypted token row from the database and invalidates all
-    in-memory cached access tokens for Microsoft tool modules.
-    Returns 404 if no Microsoft account is connected.
+    Args:
+        principal: The logged-in principal (401 without a session).
 
     Returns:
-        A dict with ``{"status": "disconnected"}`` on success.
-
-    Raises:
-        HTTPException: 404 if not connected, 500 if deletion fails.
-
-    Security notes:
-        - Requires a session.
-        - Rate limited to prevent abuse.
-        - Never logs token contents.
+        ``{"status": "disconnected"}`` (see ``_oauth_disconnect``).
     """
-    if _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
+    return await _oauth_disconnect(principal, "google")
 
-    _check_rate_limit("/api/oauth/microsoft/disconnect", _user_caller(principal))
 
-    from admino.database import get_pool
+async def oauth_microsoft_disconnect(principal: _PrincipalDep) -> dict[str, str]:
+    """Handle DELETE /api/oauth/microsoft — disconnect the caller's own Microsoft account.
 
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=5.0),
-        ) as client:
-            deleted = await revoke_and_delete_token(get_pool(), "microsoft", client)
-    except OAuthError:
-        logger.error("Failed to disconnect Microsoft account.")
-        raise HTTPException(status_code=500, detail="Failed to disconnect.")  # noqa: B904
+    Args:
+        principal: The logged-in principal (401 without a session).
 
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Microsoft account is not connected.")
-
-    # Invalidate in-memory cached access tokens so tool modules stop
-    # reusing a stale token after the refresh token row is gone.
-    await _clear_outlook_cache()
-    await _clear_outcal_cache()
-    await _clear_onedrive_cache()
-
-    logger.info("Microsoft OAuth account disconnected.")
-    return {"status": "disconnected"}
+    Returns:
+        ``{"status": "disconnected"}`` (see ``_oauth_disconnect``).
+    """
+    return await _oauth_disconnect(principal, "microsoft")
 
 
 # ---------------------------------------------------------------------------

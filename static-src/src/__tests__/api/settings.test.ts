@@ -14,10 +14,22 @@
  *   the provider is only ever `google` or `microsoft`. Any other value throws
  *   `Invalid provider` before a request is made, so a crafted value can never
  *   reach another path.
- * `getOAuthAuthorizeUrl` and `disconnectOAuth` are unchanged (regression
+ * `getOAuthAuthorizeUrl` and `disconnectOAuth` keep their paths (regression
  * guards below). Every call goes through `fetchJson`, so it sends the session
  * cookie (`credentials: 'same-origin'`) and a PATCH body is exactly the
  * JSON-encoded patch. No call ever targets `/api/settings`.
+ *
+ * Issue #162 (per-user connections, residency gating): same functions and
+ * paths. The response types change: `OAuthConnectionStatus` gains
+ * `data_residency` and its `services` become `{ tool, enabled }` entries (the
+ * provider's three services with the org's stored switch), and
+ * `OrgSettingsResponse` gains the org's read-only `data_residency`. The
+ * client resolves those bodies verbatim (a type change only, so those cases
+ * are RED under `npm run typecheck`, not at runtime).
+ * `getOAuthAuthorizeUrl(provider)` now validates the provider like
+ * `getOAuthStatus`: anything but `google` / `microsoft` throws
+ * `Invalid provider` before any request, so a crafted value can never reach
+ * another path.
  *
  * Issue #35 (Settings controls: task-done pings, reset my settings):
  * - the user settings carry `notifications.task_done` next to `enabled`, and
@@ -75,21 +87,72 @@ const ORG_SETTINGS: OrgSettingsResponse = {
     onedrive: true,
     memory: true,
   },
+  data_residency: false,
+};
+
+/** A residency org: its stored switches plus `data_residency: true` (issue #162). */
+const RESIDENCY_ORG_SETTINGS: OrgSettingsResponse = {
+  tools: {
+    gmail: true,
+    google_calendar: false,
+    google_drive: true,
+    outlook: true,
+    outlook_calendar: true,
+    onedrive: false,
+    memory: false,
+  },
+  data_residency: true,
 };
 
 const GOOGLE_STATUS: OAuthConnectionStatus = {
   connected: true,
   healthy: true,
-  email: 'alice@example.ch',
-  services: ['gmail', 'google_calendar'],
+  email: null,
+  data_residency: false,
+  services: [
+    { tool: 'gmail', enabled: true },
+    { tool: 'google_calendar', enabled: false },
+    { tool: 'google_drive', enabled: true },
+  ],
 };
 
+/** A residency org's caller with a kept (inactive) Microsoft connection. */
 const MICROSOFT_STATUS: OAuthConnectionStatus = {
+  connected: true,
+  healthy: true,
+  email: null,
+  data_residency: true,
+  services: [
+    { tool: 'outlook', enabled: true },
+    { tool: 'outlook_calendar', enabled: true },
+    { tool: 'onedrive', enabled: false },
+  ],
+};
+
+const DISCONNECTED_STATUS: OAuthConnectionStatus = {
   connected: false,
   healthy: false,
   email: null,
-  services: [],
+  data_residency: false,
+  services: [
+    { tool: 'outlook', enabled: true },
+    { tool: 'outlook_calendar', enabled: true },
+    { tool: 'onedrive', enabled: true },
+  ],
 };
+
+/** Provider values a well-behaved caller never passes. */
+const INVALID_PROVIDERS = [
+  'github',
+  '../x',
+  '',
+  'Google',
+  'MICROSOFT',
+  'google/../settings',
+  'google?x=1',
+  '__proto__',
+  'constructor',
+];
 
 function jsonResponse(status: number, body: unknown, statusText = ''): Response {
   return new Response(JSON.stringify(body), {
@@ -344,6 +407,12 @@ describe('settings api getOrgSettings', () => {
     expect(await getOrgSettings()).toEqual(ORG_SETTINGS);
   });
 
+  it('resolves a residency org\'s data_residency flag with its stored switches (issue #162)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, RESIDENCY_ORG_SETTINGS));
+
+    expect(await getOrgSettings()).toEqual(RESIDENCY_ORG_SETTINGS);
+  });
+
   it('rejects the 403 a non-admin gets with an ApiError carrying the status', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(403, { detail: 'Forbidden' }, 'Forbidden'));
 
@@ -392,6 +461,12 @@ describe('settings api patchOrgSettings', () => {
     expect(await patchOrgSettings({ tools: { gmail: false } })).toEqual(ORG_SETTINGS);
   });
 
+  it('resolves the residency flag the server returns with the stored tools (issue #162)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, RESIDENCY_ORG_SETTINGS));
+
+    expect(await patchOrgSettings({ tools: { memory: false } })).toEqual(RESIDENCY_ORG_SETTINGS);
+  });
+
   it('rejects the 403 an Editor gets with an ApiError carrying the status', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(403, { detail: 'Forbidden' }, 'Forbidden'));
 
@@ -408,6 +483,7 @@ describe('settings api getOAuthStatus', () => {
   it.each([
     ['google', GOOGLE_STATUS],
     ['microsoft', MICROSOFT_STATUS],
+    ['microsoft', DISCONNECTED_STATUS],
   ] as const)('sends GET /api/oauth/%s/status and resolves the parsed status', async (provider, status) => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, status));
 
@@ -424,7 +500,7 @@ describe('settings api getOAuthStatus', () => {
     });
   });
 
-  it.each(['github', '../x', '', 'Google', 'MICROSOFT', 'google/../settings', 'google?x=1', '__proto__', 'constructor'])(
+  it.each(INVALID_PROVIDERS)(
     'throws "Invalid provider" for %j without sending any request',
     async (provider) => {
       const error = await thrownBy(() => getOAuthStatus(provider as 'google'));
@@ -438,24 +514,60 @@ describe('settings api getOAuthStatus', () => {
   );
 });
 
+// --- OAuth authorize (issue #162: the provider is validated) ---------------
+
+describe('settings api getOAuthAuthorizeUrl', () => {
+  it.each(['google', 'microsoft'] as const)(
+    'sends GET /api/oauth/%s/authorize and resolves the url',
+    async (provider) => {
+      fetchMock.mockResolvedValueOnce(jsonResponse(200, { url: 'https://login.example/authorize' }));
+
+      const result = await getOAuthAuthorizeUrl(provider);
+
+      expect({ request: sentRequest(), result }).toEqual({
+        request: {
+          method: 'GET',
+          url: `/api/oauth/${provider}/authorize`,
+          body: undefined,
+          credentials: 'same-origin',
+        },
+        result: { url: 'https://login.example/authorize' },
+      });
+    },
+  );
+
+  it.each(INVALID_PROVIDERS)(
+    'throws "Invalid provider" for %j without sending any request',
+    async (provider) => {
+      fetchMock.mockResolvedValue(jsonResponse(200, { url: 'https://login.example/authorize' }));
+
+      const error = await thrownBy(() => getOAuthAuthorizeUrl(provider as 'google'));
+
+      expect({
+        isError: error instanceof Error,
+        message: (error as Error).message,
+        requests: fetchMock.mock.calls.length,
+      }).toEqual({ isError: true, message: 'Invalid provider', requests: 0 });
+    },
+  );
+
+  it('rejects the residency 403 with an ApiError carrying the explanation', async () => {
+    const detail = "Your organization's data residency policy doesn't allow Google or Microsoft accounts.";
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, { detail }, 'Forbidden'));
+
+    const error = await thrownBy(() => getOAuthAuthorizeUrl('google'));
+
+    expect({
+      isApiError: error instanceof ApiError,
+      status: (error as ApiError).status,
+      message: (error as ApiError).message,
+    }).toEqual({ isApiError: true, status: 403, message: detail });
+  });
+});
+
 // --- Unchanged OAuth calls (regression guards) ----------------------------
 
 describe('settings api unchanged oauth calls', () => {
-  it('getOAuthAuthorizeUrl sends GET /api/oauth/{provider}/authorize and resolves the url', async () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, { url: 'https://login.example/authorize' }));
-
-    const result = await getOAuthAuthorizeUrl('microsoft');
-
-    expect({ request: sentRequest(), result }).toEqual({
-      request: {
-        method: 'GET',
-        url: '/api/oauth/microsoft/authorize',
-        body: undefined,
-        credentials: 'same-origin',
-      },
-      result: { url: 'https://login.example/authorize' },
-    });
-  });
 
   it('disconnectOAuth sends DELETE /api/oauth/{provider}', async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse(200, { status: 'disconnected' }));

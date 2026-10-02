@@ -18,6 +18,10 @@ mocked. What these tests pin down:
   agent passes it to the recorder with the six content-free fields. GH-161: every
   run also passes its org's ``tool_policy`` (the agent holds no permissions).
 - A turn without a tool call writes nothing (conversation entries are gone).
+- GH-162: the member's run reaches the tool handler with the member's own
+  ``TenantContext`` (``tenant=``); a Super Admin's run (no organization, so no
+  tool context) never reaches the handler at all, and still ends with the
+  fixed audit error with nothing written.
 - The NDJSON audit log is gone: ``admino.audit`` doesn't exist, no source file
   names an ``.ndjson`` file, and a full run with a tool call creates no
   ``.ndjson`` file.
@@ -51,10 +55,11 @@ from admino.agent import Agent
 from admino.llm import LLMResponse
 from admino.models import AgentConfig, ToolCall
 from admino.permissions import PermissionsConfig, ToolPermissions
+from admino.tenancy import TenantContext
 from admino.tools.registry import clear_registry, register_tool
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Awaitable, Callable, Generator
 
     from admino.models import LLMMessage
 
@@ -90,7 +95,7 @@ class _ReadArgs(BaseModel):
     key: str = Field(min_length=1, max_length=200)
 
 
-async def _read_handler(args: _ReadArgs, *, session_id: str) -> str:
+async def _read_handler(args: _ReadArgs, *, session_id: str, **_: object) -> str:
     return f"{_OUTPUT_MARKER}:{args.key}"
 
 
@@ -110,9 +115,13 @@ def pool(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     return mock_pool
 
 
-def _agent(responses: list[LLMResponse], recorder: Any = None) -> Agent:
+def _agent(
+    responses: list[LLMResponse],
+    recorder: Any = None,
+    handler: Callable[..., Awaitable[str]] = _read_handler,
+) -> Agent:
     """A real Agent (GH-161 constructor: no permission state of its own)."""
-    register_tool("memory", "read", "Read a note", _ReadArgs)(_read_handler)
+    register_tool("memory", "read", "Read a note", _ReadArgs)(handler)
     return Agent(
         llm_client=_ScriptedLLM(responses),
         tool_call_recorder=recorder or main_module._build_tool_call_recorder(),
@@ -346,6 +355,54 @@ class TestNoOrgNoToolCall:
             tool_policy=_tool_policy(),
         )
 
+        pool.execute.assert_not_awaited()
+
+
+class TestToolContextReachesTheHandler:
+    """GH-162: the handler gets the run's tool context, built from the principal."""
+
+    @pytest.mark.asyncio
+    async def test_member_run_hands_the_handler_the_members_tenant(self, pool: MagicMock) -> None:
+        """The member's run dispatches with TenantContext.from_principal(member): the
+        handler sees the member's user_id and org_id, and the call is audited once."""
+        seen: list[Any] = []
+
+        async def tenant_handler(args: _ReadArgs, **kwargs: Any) -> str:
+            seen.append(kwargs.get("tenant"))
+            return f"{_OUTPUT_MARKER}:{args.key}"
+
+        result = await _agent(_tool_then_text(), handler=tenant_handler).run(
+            "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
+        )
+
+        assert result.status == "final"
+        assert seen == [TenantContext.from_principal(_MEMBER)]
+        assert (seen[0].user_id, seen[0].org_id) == (_USER_ID, _ORG_ID)
+        assert pool.execute.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_super_admin_run_never_reaches_the_handler(self, pool: MagicMock) -> None:
+        """No organization, no tool context: the handler never runs, and the run still
+        ends with the fixed audit error with nothing written."""
+        seen: list[Any] = []
+
+        async def tenant_handler(args: _ReadArgs, **kwargs: Any) -> str:
+            seen.append(kwargs.get("tenant"))
+            return f"{_OUTPUT_MARKER}:{args.key}"
+
+        result = await _agent(_tool_then_text(), handler=tenant_handler).run(
+            "go",
+            session_id=_SESSION,
+            history=[],
+            principal=_SUPER_ADMIN,
+            tool_policy=_tool_policy(),
+        )
+
+        assert seen == []
+        assert (result.status, result.response) == (
+            "error",
+            "Internal error: audit unavailable.",
+        )
         pool.execute.assert_not_awaited()
 
 

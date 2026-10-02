@@ -1,15 +1,26 @@
 """Outlook mail tool using Microsoft Graph API.
 
 Provides read, list, search, and send actions for Outlook messages via the
-Microsoft Graph ``/me/messages`` and ``/me/sendMail`` endpoints.
-Authentication is handled via OAuth tokens managed by ``admino.oauth``.
+Microsoft Graph ``/me/messages`` and ``/me/sendMail`` endpoints, in the
+calling user's own Microsoft account (per-user connections, GH-162).
+
+Inputs: the validated args (``OutlookReadArgs``, ``OutlookListArgs``,
+``OutlookSearchArgs``, ``OutlookSendArgs``) and the required keyword
+``tenant`` (the run's ``TenantContext``, passed by
+``registry.dispatch_tool_call``). Outputs: the formatted message(s), a send
+summary, or a user-facing error string.
 
 Security notes:
+- Per-user tokens: every API request of a handler call carries the access
+  token of that call's tenant, from ``_get_microsoft_token(tenant)``, which
+  reads the shared per-user cache ``oauth.access_tokens`` (keyed by user and
+  provider). The tenant comes from the server-side session, never from LLM
+  arguments. The module keeps no token state of its own; refresh tokens
+  never leave oauth.py, and no token is logged.
 - outlook.send is a tier-2 promotable denial in permissions.py. It is denied
   by default and requires explicit user promotion + cooldown before use.
   outlook.delete remains a hardcoded immutable denial.
 - Message body content is truncated to 10 000 characters before returning.
-- OAuth tokens are cached in-memory only; refresh tokens stay encrypted on disk.
 - JSON payload structure of Microsoft Graph prevents header injection by design.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
@@ -17,19 +28,19 @@ Security notes:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Final
 from urllib.parse import quote
 
 import httpx
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
+from admino import database
 from admino.models import OutlookListArgs, OutlookReadArgs, OutlookSearchArgs, OutlookSendArgs
-from admino.oauth import OAuthError, get_valid_access_token
+from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
@@ -40,49 +51,32 @@ logger = logging.getLogger(__name__)
 _GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
 _MAX_BODY_CHARS: Final[int] = 10_000
 
-# ---------------------------------------------------------------------------
-# Module-level token cache
-# ---------------------------------------------------------------------------
-
+# The module's HTTP client (created on first use). It holds no credentials:
+# each request sets its own caller's Authorization header.
 _http_client: httpx.AsyncClient | None = None
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
-_token_lock = asyncio.Lock()
 
 
-async def _get_microsoft_token() -> str:
-    """Obtain a valid Microsoft access token, refreshing if needed.
+def _client() -> httpx.AsyncClient:
+    """Return the module's HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+async def _get_microsoft_token(tenant: TenantContext) -> str:
+    """Obtain a valid Microsoft access token for the tenant's own connection.
+
+    Args:
+        tenant: The handler call's tool context; its user's token is used.
 
     Returns:
         A valid access token string.
 
     Raises:
-        OAuthError: If OAuth is not configured or refresh fails.
+        OAuthError: If the user has no Microsoft connection or refresh fails.
     """
-    from admino.database import get_pool
-
-    async with _token_lock:
-        global _http_client, _cached_token, _cached_expires_at
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        _cached_token, _cached_expires_at = await get_valid_access_token(
-            get_pool(), "microsoft", _cached_token, _cached_expires_at, _http_client
-        )
-        return _cached_token
-
-
-async def clear_token_cache() -> None:
-    """Reset the in-memory cached access token.
-
-    Acquires ``_token_lock`` to avoid clearing the cache while a
-    concurrent tool call is mid-refresh. Called by the OAuth disconnect
-    endpoint to ensure stale tokens are not reused after the user
-    disconnects their Microsoft account.
-    """
-    async with _token_lock:
-        global _cached_token, _cached_expires_at
-        _cached_token = None
-        _cached_expires_at = None
+    return await access_tokens.get(database.get_pool(), tenant, "microsoft", _client())
 
 
 def _extract_graph_error(response: httpx.Response) -> str:
@@ -148,17 +142,18 @@ def _format_message_summary(msg: dict[str, object]) -> str:
     ),
     args_schema=OutlookReadArgs,
 )
-async def outlook_read(args: OutlookReadArgs, **kwargs: object) -> str:
+async def outlook_read(args: OutlookReadArgs, *, tenant: TenantContext, **_: object) -> str:
     """Read a single Outlook message by ID.
 
     Args:
         args: Validated read arguments (message_id).
+        tenant: The caller's tool context (whose mailbox is read).
 
     Returns:
         Formatted message content, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -172,7 +167,7 @@ async def outlook_read(args: OutlookReadArgs, **kwargs: object) -> str:
         "?$select=id,subject,from,receivedDateTime,bodyPreview,body"
     )
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -213,17 +208,18 @@ async def outlook_read(args: OutlookReadArgs, **kwargs: object) -> str:
     description="List recent Outlook email messages, ordered by date descending.",
     args_schema=OutlookListArgs,
 )
-async def outlook_list(args: OutlookListArgs, **kwargs: object) -> str:
+async def outlook_list(args: OutlookListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List recent Outlook messages.
 
     Args:
         args: Validated list arguments (max_results).
+        tenant: The caller's tool context (whose mailbox is read).
 
     Returns:
         Formatted list of messages, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -236,7 +232,7 @@ async def outlook_list(args: OutlookListArgs, **kwargs: object) -> str:
         "$orderby": "receivedDateTime desc",
     }
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             params=params,
             headers={"Authorization": f"Bearer {token}"},
@@ -272,17 +268,18 @@ async def outlook_list(args: OutlookListArgs, **kwargs: object) -> str:
     description="Search Outlook email messages using KQL query syntax.",
     args_schema=OutlookSearchArgs,
 )
-async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
+async def outlook_search(args: OutlookSearchArgs, *, tenant: TenantContext, **_: object) -> str:
     """Search Outlook messages using KQL.
 
     Args:
         args: Validated search arguments (query, max_results).
+        tenant: The caller's tool context (whose mailbox is searched).
 
     Returns:
         Formatted list of matching messages, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -300,7 +297,7 @@ async def outlook_search(args: OutlookSearchArgs, **kwargs: object) -> str:
         "$select": "id,subject,from,receivedDateTime,bodyPreview",
     }
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             f"{_GRAPH_BASE}/me/messages",
             params=params,
             headers={"Authorization": f"Bearer {token}"},
@@ -392,17 +389,18 @@ def _outlook_send_summary(args: OutlookSendArgs) -> str:
     ),
     args_schema=OutlookSendArgs,
 )
-async def outlook_send(args: OutlookSendArgs, **kwargs: object) -> str:
+async def outlook_send(args: OutlookSendArgs, *, tenant: TenantContext, **_: object) -> str:
     """Send an email via the Microsoft Graph ``sendMail`` endpoint.
 
     Args:
         args: Validated send arguments (to, subject, body, cc, bcc).
+        tenant: The caller's tool context (whose mailbox sends).
 
     Returns:
         Confirmation summary string, or an error message.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -411,7 +409,7 @@ async def outlook_send(args: OutlookSendArgs, **kwargs: object) -> str:
     payload = _build_sendmail_payload(args)
 
     try:
-        response = await _http_client.post(  # type: ignore[union-attr]
+        response = await _client().post(
             f"{_GRAPH_BASE}/me/sendMail",
             headers={"Authorization": f"Bearer {token}"},
             json=payload,

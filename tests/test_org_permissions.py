@@ -1,5 +1,5 @@
 """Tests for admino.org_permissions — the per-org tool permission matrix and its
-critical (tier-2) promotions (GH-161).
+critical (tier-2) promotions (GH-161), gated by the org's data residency (GH-162).
 
 The ``permissions`` table is recreated org-scoped (migration 0016: primary key
 ``(org_id, tool, action)``, ON DELETE CASCADE from organizations). Each org's
@@ -42,6 +42,15 @@ What these tests pin down (the GH-161 implementation contract):
   Super Admin): one entry per stored pair of the actor's org, sorted;
   "disabled" for a switched-off service; hardcoded pairs "deny"; a promoted
   tier-2 pair "confirm".
+- GH-162, data residency: for an org with ``data_residency = true`` (read through
+  ``scoped_settings.org_residency(executor, tenant)``, fail closed when the org row
+  is missing), ``load_tool_policy`` maps gmail, google_calendar, google_drive,
+  outlook, outlook_calendar and onedrive to False in ``enabled_tools`` whatever the
+  stored switches say (an Org Admin's enabled gmail included); memory keeps its
+  stored switch; ``permissions`` and ``promoted`` are unchanged; nothing is written;
+  another org is never affected. ``permissions_summary`` reads those six tools'
+  actions "disabled" (a promoted pair included). The fixture orgs have residency
+  off, so every other test sees the stored switches as they are.
 
 All database calls go to tests/db_fakes.FakeDb (which models migration 0016's
 permissions table). ``admino.org_permissions`` is imported per test through the
@@ -172,10 +181,15 @@ def svc() -> Iterator[ModuleType]:
 
 @pytest.fixture()
 def db() -> FakeDb:
-    """A fresh in-memory database with two active orgs and no permission rows."""
+    """A fresh in-memory database with two active orgs and no permission rows.
+
+    Both orgs have data residency off (GH-162: an org defaults to residency on, which
+    switches the Google/Microsoft tools off), so the tests below see every stored switch
+    as it is; the residency tests turn it on per org.
+    """
     fake = FakeDb()
-    fake.add_org(ORG_ID)
-    fake.add_org(OTHER_ORG_ID)
+    fake.add_org(ORG_ID, data_residency=False)
+    fake.add_org(OTHER_ORG_ID, data_residency=False)
     return fake
 
 
@@ -995,6 +1009,206 @@ class TestLoadToolPolicy:
         policy = await svc.load_tool_policy(db.pool, _tenant(admin))
 
         assert policy.promoted == frozenset()
+
+
+# ---------------------------------------------------------------------------
+# 4b. load_tool_policy under data residency (GH-162)
+# ---------------------------------------------------------------------------
+
+# The tools an org's data residency policy switches off: both providers' services.
+_RESIDENCY_TOOLS: tuple[str, ...] = (
+    "gmail",
+    "google_calendar",
+    "google_drive",
+    "outlook",
+    "outlook_calendar",
+    "onedrive",
+)
+# A residency org's switches when every stored switch is on: only memory stays on.
+_RESIDENCY_ON: dict[str, bool] = {**_ALL_ON, **dict.fromkeys(_RESIDENCY_TOOLS, False)}
+_RESIDENCY_PAIRS = [
+    pytest.param(True, False, id="a-on-b-off"),
+    pytest.param(False, True, id="a-off-b-on"),
+]
+
+
+def _residency(db: FakeDb, org_id: uuid.UUID, *, on: bool) -> None:
+    """Set an org's data_residency flag (the organizations row)."""
+    db.add_org(org_id, data_residency=on)
+
+
+def _enabled(residency: bool) -> dict[str, bool]:
+    """The enabled_tools of an org without an org_settings row."""
+    return _RESIDENCY_ON if residency else _ALL_ON
+
+
+class TestResidencyGating:
+    """A residency org's policy has every Google/Microsoft tool off whatever its stored
+    switches say; memory keeps its stored switch; the matrix and the promotions are
+    unchanged; nothing is written; another org is never affected."""
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_org_permissions_policy_residency_org_has_the_six_connector_tools_off(
+        self, svc: ModuleType, db: FakeDb, role: str
+    ) -> None:
+        db.add_permissions(ORG_ID)
+        _residency(db, ORG_ID, on=True)
+        member = _actor(db, role)
+
+        policy = await svc.load_tool_policy(db.pool, _tenant(member))
+
+        assert policy.enabled_tools == _RESIDENCY_ON
+        assert all(type(value) is bool for value in policy.enabled_tools.values())
+
+    @pytest.mark.parametrize("memory", [True, False])
+    async def test_org_permissions_policy_residency_keeps_memorys_stored_switch(
+        self, svc: ModuleType, db: FakeDb, memory: bool
+    ) -> None:
+        db.add_permissions(ORG_ID)
+        db.add_org_settings(ORG_ID, memory=memory)
+        _residency(db, ORG_ID, on=True)
+        admin = _actor(db, "org_admin")
+
+        policy = await svc.load_tool_policy(db.pool, _tenant(admin))
+
+        assert policy.enabled_tools == {**_RESIDENCY_ON, "memory": memory}
+
+    async def test_org_permissions_policy_residency_overrides_a_service_the_org_admin_enabled(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The Org Admin switches gmail on through the org settings (stored on): the run
+        still has gmail, and every other Google/Microsoft tool, off."""
+        from admino import scoped_settings
+        from admino.models import OrgSettingsPatch
+
+        db.add_permissions(ORG_ID)
+        db.add_org_settings(ORG_ID, gmail=False)
+        _residency(db, ORG_ID, on=True)
+        admin = _actor(db, "org_admin")
+        await scoped_settings.update_org_settings(
+            db.pool,
+            actor=admin,
+            patch=OrgSettingsPatch.model_validate({"tools": {"gmail": True}}),
+            ip=_IP,
+        )
+        assert db.org_tools(ORG_ID) == _ALL_ON
+
+        policy = await svc.load_tool_policy(db.pool, _tenant(admin))
+
+        assert policy.enabled_tools["gmail"] is False
+        assert policy.enabled_tools == _RESIDENCY_ON
+
+    async def test_org_permissions_policy_residency_leaves_the_stored_switches_untouched(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The gating happens in the policy only: the org_settings row, the
+        organizations row and every other table stay as they were."""
+        db.add_permissions(ORG_ID)
+        db.add_org_settings(ORG_ID, onedrive=False, memory=False, updated_at=_OLD)
+        _residency(db, ORG_ID, on=True)
+        admin = _actor(db, "org_admin")
+        before = _state(db)
+
+        policy = await svc.load_tool_policy(db.pool, _tenant(admin))
+
+        assert policy.enabled_tools == {**_RESIDENCY_ON, "memory": False}
+        assert _state(db) == before
+        assert db.org_tools(ORG_ID) == {**_ALL_ON, "onedrive": False, "memory": False}
+        assert db.matching(r"^(?:insert into|update|delete from)\b") == []
+
+    async def test_org_permissions_policy_residency_keeps_the_matrix_and_promotions(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Residency changes enabled_tools only: a residency org's permissions and
+        promoted pairs read exactly as a non-residency org's with the same rows."""
+        rows = _with(gmail__send="confirm", google_drive__read="confirm")
+        db.add_permissions(ORG_ID, rows)
+        db.add_permissions(OTHER_ORG_ID, rows)
+        _residency(db, ORG_ID, on=True)
+        admin_a = _actor(db, "org_admin", ORG_ID)
+        admin_b = _actor(db, "org_admin", OTHER_ORG_ID)
+
+        policy_a = await svc.load_tool_policy(db.pool, _tenant(admin_a))
+        policy_b = await svc.load_tool_policy(db.pool, _tenant(admin_b))
+
+        assert policy_a.enabled_tools == _RESIDENCY_ON
+        assert policy_b.enabled_tools == _ALL_ON
+        assert policy_a.permissions == policy_b.permissions
+        assert policy_a.promoted == policy_b.promoted == frozenset({("gmail", "send")})
+        assert policy_a.permissions.tools["google_drive"].actions["read"] == "confirm"
+
+    @pytest.mark.parametrize(("residency_a", "residency_b"), _RESIDENCY_PAIRS)
+    async def test_org_permissions_policy_residency_is_per_org(
+        self, svc: ModuleType, db: FakeDb, residency_a: bool, residency_b: bool
+    ) -> None:
+        """Org A's residency never gates org B's tools (and the other way round); B's
+        policy never binds A's id."""
+        db.add_permissions(ORG_ID)
+        db.add_permissions(OTHER_ORG_ID)
+        _residency(db, ORG_ID, on=residency_a)
+        _residency(db, OTHER_ORG_ID, on=residency_b)
+        admin_a = _actor(db, "org_admin", ORG_ID)
+        admin_b = _actor(db, "org_admin", OTHER_ORG_ID)
+
+        policy_a = await svc.load_tool_policy(db.pool, _tenant(admin_a))
+        db.calls.clear()
+        policy_b = await svc.load_tool_policy(db.pool, _tenant(admin_b))
+
+        assert policy_a.enabled_tools == _enabled(residency_a)
+        assert policy_b.enabled_tools == _enabled(residency_b)
+        assert not _bound(db, ORG_ID)
+
+    async def test_org_permissions_policy_org_without_an_organizations_row_fails_closed(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """No organizations row to read the policy from: treated as residency on."""
+        ghost = Principal(user_id=uuid.uuid4(), kind="member", org_id=uuid.uuid4(), role="editor")
+
+        policy = await svc.load_tool_policy(db.pool, _tenant(ghost))
+
+        assert policy.enabled_tools == _RESIDENCY_ON
+
+    @pytest.mark.parametrize("residency", [True, False])
+    async def test_org_permissions_policy_asks_scoped_settings_org_residency(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, residency: bool
+    ) -> None:
+        """The decision is ``scoped_settings.org_residency(executor, tenant)`` (the one
+        fail-closed residency read), asked once with the run's tenant; the stored flag is
+        set the other way so a second read of its own would show."""
+        from admino import scoped_settings
+
+        db.add_permissions(ORG_ID)
+        _residency(db, ORG_ID, on=not residency)
+        admin = _actor(db, "org_admin")
+        tenant = _tenant(admin)
+        spy = AsyncMock(return_value=residency)
+        monkeypatch.setattr(scoped_settings, "org_residency", spy, raising=False)
+        if hasattr(svc, "org_residency"):
+            monkeypatch.setattr(svc, "org_residency", spy)
+
+        policy = await svc.load_tool_policy(db.pool, tenant)
+
+        assert policy.enabled_tools == _enabled(residency)
+        spy.assert_awaited_once()
+        call = spy.await_args
+        assert call is not None
+        asked = call.kwargs.get("tenant", call.args[1] if len(call.args) > 1 else None)
+        assert asked == tenant
+
+    async def test_org_permissions_policy_reads_residency_on_the_given_connection(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """The residency read runs on the caller's executor, like the rest of the load."""
+        db.add_permissions(ORG_ID)
+        _residency(db, ORG_ID, on=True)
+        admin = _actor(db, "org_admin")
+
+        async with db.pool.acquire() as conn:
+            policy = await svc.load_tool_policy(conn, _tenant(admin))
+
+        assert policy.enabled_tools == _RESIDENCY_ON
+        assert db.matching(r"\bfrom organizations\b")
+        assert all(call.via != "pool" for call in db.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -2247,3 +2461,75 @@ class TestPermissionsSummary:
 
         assert _writes(db) == []
         assert _state(db) == before
+
+
+# ---------------------------------------------------------------------------
+# 15. permissions_summary under data residency (GH-162)
+# ---------------------------------------------------------------------------
+
+
+def _engine_states(tools: set[str]) -> dict[tuple[str, str], str]:
+    """The engine's decisions of the default matrix for these tools' pairs."""
+    config = build_default_permissions_config()
+    return {
+        (tool, action): check_permission(tool, action, config).allowed
+        for tool, action in _DEFAULT_PAIRS
+        if tool in tools
+    }
+
+
+class TestResidencySummary:
+    """A residency org's summary reads "disabled" for every Google/Microsoft action and
+    the engine's decisions for the other tools; another org is never affected."""
+
+    async def test_org_permissions_summary_residency_org_reads_the_connector_tools_disabled(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Every action of the six tools (hardcoded ones included) reads "disabled";
+        memory reads as before."""
+        db.add_permissions(ORG_ID)
+        _residency(db, ORG_ID, on=True)
+        viewer = _actor(db, "viewer")
+
+        states = _summary_states(await svc.permissions_summary(db.pool, actor=viewer))
+
+        assert sorted(states) == _DEFAULT_PAIRS
+        for tool in _RESIDENCY_TOOLS:
+            assert {state for (name, _), state in states.items() if name == tool} == {"disabled"}, (
+                tool
+            )
+        memory = {pair: state for pair, state in states.items() if pair[0] == "memory"}
+        assert memory == _engine_states({"memory"})
+
+    async def test_org_permissions_summary_residency_beats_a_promoted_pair(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """A promoted tier-2 pair of a residency org reads "disabled", not "confirm"."""
+        db.add_permissions(ORG_ID, _with(gmail__send="confirm", outlook_calendar__update="confirm"))
+        _residency(db, ORG_ID, on=True)
+        editor = _actor(db, "editor")
+
+        states = _summary_states(await svc.permissions_summary(db.pool, actor=editor))
+
+        assert states[("gmail", "send")] == "disabled"
+        assert states[("outlook_calendar", "update")] == "disabled"
+
+    async def test_org_permissions_summary_residency_of_another_org_changes_nothing_here(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Org B has residency on: B's connector actions read "disabled", org A's summary
+        is the engine's decisions with nothing disabled."""
+        db.add_permissions(ORG_ID)
+        db.add_permissions(OTHER_ORG_ID)
+        _residency(db, OTHER_ORG_ID, on=True)
+        viewer_a = _actor(db, "viewer", ORG_ID)
+        viewer_b = _actor(db, "viewer", OTHER_ORG_ID)
+
+        states_a = _summary_states(await svc.permissions_summary(db.pool, actor=viewer_a))
+        states_b = _summary_states(await svc.permissions_summary(db.pool, actor=viewer_b))
+
+        assert states_a == _engine_states(set(DEFAULT_PERMISSIONS))
+        assert "disabled" not in states_a.values()
+        assert {state for (tool, _), state in states_b.items() if tool in _RESIDENCY_TOOLS} == {
+            "disabled"
+        }

@@ -17,11 +17,17 @@ platform policy re-times every open Super Admin session
 (``apply_super_admin_policy``). Ending a session deletes its row, and a
 background job purges the rows that expired or went idle.
 
+The OAuth callback (GH-162) re-resolves the session that started an
+authorization by its row id (``resolve_session_by_id``): the same checks as
+the token lookup, but it never touches ``last_seen_at``.
+
 Inputs: a database executor (the pool or a connection) plus a raw session
-token; the user id, policy, client IP and user agent of a new session; the
-user or org whose sessions all end; the new Super Admin policy.
+token or (the OAuth callback) a session id; the user id, policy, client IP
+and user agent of a new session; the user or org whose sessions all end; the
+new Super Admin policy.
 Outputs: the raw token of a new session (``create_session``), the
-``AuthenticatedSession`` of a usable session or None (``resolve_session``),
+``AuthenticatedSession`` of a usable session or None (``resolve_session``,
+``resolve_session_by_id``),
 nothing (``revoke_session``), the number of rows deleted
 (``revoke_user_sessions``, ``revoke_org_sessions``,
 ``purge_expired_sessions``) or re-timed (``apply_super_admin_policy``).
@@ -30,7 +36,9 @@ Security notes:
 - The one Principal builder: this is the only module that builds an
   ``access.Principal`` (tests/test_access.py allowlists it), and it builds it
   from the session's users row only, never from request data.
-  ``resolve_session`` takes nothing but the executor and the token.
+  ``resolve_session`` takes nothing but the executor and the token,
+  ``resolve_session_by_id`` nothing but the executor and the session id
+  (which the OAuth state binding stored server-side, never a request value).
 - Re-checked on every request: one query re-reads the session, the user and
   the org, and the decision is made here on each call. A deleted, expired or
   idle session (past the row's own timeout), a user that isn't active or is
@@ -39,7 +47,8 @@ Security notes:
 - Fail closed: a row with malformed timestamps or idle timeout, or one that
   fails Principal validation, resolves to None.
 - ``last_seen_at`` is written at most once a minute per session, keyed by the
-  session id, and only for a session that resolved.
+  session id, and only for a session that resolved through its token; the
+  lookup by id writes nothing (the OAuth redirect can't keep a session alive).
 - The expiry is computed on the database clock (``now() + $n::interval``),
   like ``created_at``, so the 72-hour CHECK of migration 0009 holds exactly.
   The policy bounds mirror that migration's CHECKs.
@@ -100,8 +109,8 @@ _INSERT_SQL: Final = """
     VALUES ($1, $2, now() + $3::interval, $4, $5::inet, $6)
 """
 
-# LEFT JOIN: a Super Admin belongs to no organization.
-_RESOLVE_SQL: Final = """
+# A session with its user and org. LEFT JOIN: a Super Admin belongs to no organization.
+_RESOLVE_SELECT: Final = """
     SELECT s.id AS session_id,
            s.expires_at,
            s.last_seen_at,
@@ -118,8 +127,10 @@ _RESOLVE_SQL: Final = """
     FROM sessions s
     JOIN users u ON u.id = s.user_id
     LEFT JOIN organizations o ON o.id = u.org_id
-    WHERE s.token_hash = $1
 """
+_RESOLVE_SQL: Final = _RESOLVE_SELECT + "    WHERE s.token_hash = $1\n"
+# GH-162: the OAuth callback re-resolves the initiating session by its row id.
+_RESOLVE_BY_ID_SQL: Final = _RESOLVE_SELECT + "    WHERE s.id = $1\n"
 
 _TOUCH_SQL: Final = "UPDATE sessions SET last_seen_at = now() WHERE id = $1"
 
@@ -238,6 +249,50 @@ def _client_ip(ip: str | None) -> IPv4Address | IPv6Address | None:
         return None
 
 
+# Any: asyncpg returns an untyped Record (or None).
+def _usable_session(row: Any, now: datetime) -> AuthenticatedSession | None:
+    """Build the AuthenticatedSession of a resolve row, or None when it isn't usable.
+
+    The one decision both lookups share: None for a missing row, malformed
+    timestamps or idle timeout, an expired session or one idle past its own
+    timeout (``<=`` means gone), a user that isn't active or is deleted, a
+    member of an org that isn't active, or a row that doesn't form a valid
+    Principal. Writes nothing.
+    """
+    if row is None:
+        return None
+    expires_at = row["expires_at"]
+    last_seen_at = row["last_seen_at"]
+    idle_minutes = row["idle_timeout_minutes"]
+    if not _is_aware(expires_at) or not _is_aware(last_seen_at):
+        return None
+    if (
+        type(idle_minutes) is not int
+        or not MIN_IDLE_TIMEOUT_MINUTES <= idle_minutes <= MAX_IDLE_TIMEOUT_MINUTES
+    ):
+        return None
+    if expires_at <= now or last_seen_at + timedelta(minutes=idle_minutes) <= now:
+        return None
+    if row["status"] != "active" or row["deleted_at"] is not None:
+        return None
+    if row["kind"] == "member" and row["org_status"] != "active":
+        return None
+    try:
+        principal = Principal(
+            user_id=row["user_id"], kind=row["kind"], org_id=row["org_id"], role=row["role"]
+        )
+        return AuthenticatedSession(
+            session_id=row["session_id"],
+            principal=principal,
+            ui_language=row["ui_language"],
+            response_language=row["response_language"],
+        )
+    except ValidationError:
+        # No IDs or values: the row is inconsistent, and access is refused.
+        logger.warning("A session row failed validation; the session is refused.")
+        return None
+
+
 async def create_session(
     executor: Executor,
     *,
@@ -299,42 +354,37 @@ async def resolve_session(executor: Executor, token: str) -> AuthenticatedSessio
     if not _is_plausible_token(token):
         return None
     row = await executor.fetchrow(_RESOLVE_SQL, hash_session_token(token))
-    if row is None:
-        return None
-    expires_at = row["expires_at"]
-    last_seen_at = row["last_seen_at"]
-    idle_minutes = row["idle_timeout_minutes"]
-    if not _is_aware(expires_at) or not _is_aware(last_seen_at):
-        return None
-    if (
-        type(idle_minutes) is not int
-        or not MIN_IDLE_TIMEOUT_MINUTES <= idle_minutes <= MAX_IDLE_TIMEOUT_MINUTES
-    ):
-        return None
     now = datetime.now(UTC)
-    if expires_at <= now or last_seen_at + timedelta(minutes=idle_minutes) <= now:
+    session = _usable_session(row, now)
+    if session is None:
         return None
-    if row["status"] != "active" or row["deleted_at"] is not None:
-        return None
-    if row["kind"] == "member" and row["org_status"] != "active":
-        return None
-    try:
-        principal = Principal(
-            user_id=row["user_id"], kind=row["kind"], org_id=row["org_id"], role=row["role"]
-        )
-        session = AuthenticatedSession(
-            session_id=row["session_id"],
-            principal=principal,
-            ui_language=row["ui_language"],
-            response_language=row["response_language"],
-        )
-    except ValidationError:
-        # No IDs or values: the row is inconsistent, and access is refused.
-        logger.warning("A session row failed validation; the session is refused.")
-        return None
-    if now - last_seen_at >= LAST_SEEN_UPDATE_INTERVAL:
+    if now - row["last_seen_at"] >= LAST_SEEN_UPDATE_INTERVAL:
         await executor.execute(_TOUCH_SQL, session.session_id)
     return session
+
+
+async def resolve_session_by_id(
+    executor: Executor, session_id: UUID
+) -> AuthenticatedSession | None:
+    """Resolve a session by its row id, with the same checks as ``resolve_session`` (GH-162).
+
+    Only the OAuth callback uses it: the provider's cross-site redirect
+    carries no session cookie, so the callback re-resolves the session that
+    started the authorization. It never writes: ``last_seen_at`` is left as
+    it is, so the redirect can't keep a session alive.
+
+    Args:
+        executor: The pool or a connection.
+        session_id: The id of the initiating session's row.
+
+    Returns:
+        The AuthenticatedSession, or None in every case ``resolve_session``
+        refuses (unknown or deleted session, expired or idle past its own
+        timeout, malformed row, user not active or deleted, member of an org
+        that isn't active, invalid Principal).
+    """
+    row = await executor.fetchrow(_RESOLVE_BY_ID_SQL, session_id)
+    return _usable_session(row, datetime.now(UTC))
 
 
 async def revoke_session(executor: Executor, token: str) -> None:

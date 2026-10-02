@@ -110,6 +110,19 @@ lazy import). The conftest primes ``scoped_settings._platform_cache`` with the
 default row; tests whose consumers must see this file's FakeDb row set it to
 None (or load it through a GET or PATCH first).
 
+GH-162 (data residency) adds, on the org scope:
+- ``GET`` / ``PATCH /api/org/settings`` answer ``{"tools": ..., "data_residency":
+  <bool>}``: the actor's own org's residency policy (``SELECT data_residency
+  FROM organizations WHERE id = $1`` with the actor's org), read on every
+  request, read-only here. The fixture orgs have no residency, so the GH-159
+  bodies gain ``"data_residency": false``.
+- A Google/Microsoft switch can still be changed while residency is on: it is
+  stored and audited as before (the gating is separate), and the response
+  says ``data_residency: true``.
+- The PATCH body can't set residency: a ``data_residency`` key, at the top or
+  under ``tools``, is a 422 like any unknown key (no echo, nothing written,
+  the org keeps its policy).
+
 All database calls are faked. No network, no real PostgreSQL, no LLM.
 
 Security notes:
@@ -535,11 +548,12 @@ class _Probes:
 
 @pytest.fixture()
 def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
-    """The fake database the server's get_pool() returns: two active orgs and the platform
-    row (Anthropic active, every model set, limits 7/4/120/5000/30)."""
+    """The fake database the server's get_pool() returns: two active orgs without data
+    residency (GH-162) and the platform row (Anthropic active, every model set, limits
+    7/4/120/5000/30)."""
     fake = FakeDb()
-    fake.add_org(ORG_ID)
-    fake.add_org(OTHER_ORG_ID)
+    fake.add_org(ORG_ID, data_residency=False)
+    fake.add_org(OTHER_ORG_ID, data_residency=False)
     fake.add_platform_settings(
         llm_provider="anthropic",
         anthropic_model="claude-sonnet-4-6",
@@ -1253,7 +1267,7 @@ class TestOrgSettings:
         response = _call(_client(app), "org_get", token)
 
         assert response.status_code == 200, response.text
-        assert response.json() == {"tools": _ALL_ON}
+        assert response.json() == {"tools": _ALL_ON, "data_residency": False}
 
     def test_settings_api_org_patch_is_stored_returned_and_audited(
         self, db: FakeDb, app: FastAPI
@@ -1265,7 +1279,7 @@ class TestOrgSettings:
 
         expected = {**_ALL_ON, "gmail": False, "outlook": False}
         assert response.status_code == 200, response.text
-        assert response.json() == {"tools": expected}
+        assert response.json() == {"tools": expected, "data_residency": False}
         assert db.org_tools(ORG_ID) == expected
         event = _one(db.audit)
         assert event["action"] == "org.settings_change"
@@ -1297,8 +1311,8 @@ class TestOrgSettings:
         read_a = _call(client, "org_get", token_a)
 
         assert patched.status_code == 200, patched.text
-        assert read_b.json() == {"tools": _ALL_ON}
-        assert read_a.json() == {"tools": {**_ALL_ON, "gmail": False}}
+        assert read_b.json() == {"tools": _ALL_ON, "data_residency": False}
+        assert read_a.json() == {"tools": {**_ALL_ON, "gmail": False}, "data_residency": False}
         assert OTHER_ORG_ID not in db.org_settings
         assert _uuid(_one(db.audit)["org_id"]) == ORG_ID
 
@@ -1372,6 +1386,150 @@ class TestOrgSettings:
         assert response.status_code == 500
         assert _state(db) == before
         _assert_no_agent_gate(agent)
+
+
+# ---------------------------------------------------------------------------
+# 5b. GH-162: the org's data residency policy on /api/org/settings
+# ---------------------------------------------------------------------------
+
+# GH-162: the tools an org's data residency switches off (RESIDENCY_BLOCKED_TOOLS).
+_RESIDENCY_TOOLS: Final = (
+    "gmail",
+    "google_calendar",
+    "google_drive",
+    "outlook",
+    "outlook_calendar",
+    "onedrive",
+)
+_RESIDENCY_KEY_BODIES = [
+    pytest.param({"tools": {"gmail": False}, "data_residency": False}, id="beside-tools"),
+    pytest.param({"data_residency": False}, id="alone"),
+    pytest.param({"tools": {"gmail": False, "data_residency": False}}, id="under-tools"),
+    pytest.param({"tools": {"gmail": False}, "data_residency": "ECHOMARK42"}, id="marker-value"),
+]
+
+
+def _residency_reads(db: FakeDb, since: int) -> list[Any]:
+    """The statements since ``since`` that read data_residency from organizations."""
+    return [
+        call
+        for call in db.calls[since:]
+        if re.search(r"\bdata_residency\b.*\bfrom organizations\b", call.normalized)
+    ]
+
+
+class TestOrgSettingsDataResidency:
+    """The org settings answer the actor's own org's residency policy, which the PATCH
+    body can't change; switches stay editable under residency (GH-162)."""
+
+    @pytest.mark.parametrize("residency", [True, False], ids=["residency", "no-residency"])
+    def test_settings_api_org_get_reports_the_orgs_data_residency(
+        self, db: FakeDb, app: FastAPI, residency: bool
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=residency)
+        _, token = _login(db, "org_admin")
+
+        response = _call(_client(app), "org_get", token)
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"tools": _ALL_ON, "data_residency": residency}
+
+    def test_settings_api_org_settings_report_each_admins_own_orgs_residency(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """Org A has residency, org B hasn't: each admin reads their own org's policy, and
+        the residency read binds the admin's org only."""
+        db.add_org(ORG_ID, data_residency=True)
+        _, token_a = _login(db, "org_admin", ORG_ID)
+        _, token_b = _login(db, "org_admin", OTHER_ORG_ID)
+        client = _client(app)
+
+        since = len(db.calls)
+        read_b = _call(client, "org_get", token_b)
+        reads_b = _residency_reads(db, since)
+        read_a = _call(client, "org_get", token_a)
+
+        assert (read_a.status_code, read_b.status_code) == (200, 200), read_a.text
+        assert read_a.json()["data_residency"] is True
+        assert read_b.json()["data_residency"] is False
+        assert reads_b, "GET /api/org/settings read no data_residency"
+        assert all(str(OTHER_ORG_ID) in map(str, call.args) for call in reads_b)
+        assert not any(str(ORG_ID) in map(str, call.args) for call in reads_b)
+
+    def test_settings_api_org_get_follows_a_residency_change(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """The policy is read on every request (no cached value)."""
+        _, token = _login(db, "org_admin")
+        client = _client(app)
+
+        before = _call(client, "org_get", token)
+        db.add_org(ORG_ID, data_residency=True)
+        after = _call(client, "org_get", token)
+
+        assert before.json()["data_residency"] is False
+        assert after.json()["data_residency"] is True
+
+    @pytest.mark.parametrize("tool", _RESIDENCY_TOOLS)
+    def test_settings_api_org_patch_of_a_connector_switch_under_residency_is_stored(
+        self, db: FakeDb, app: FastAPI, tool: str
+    ) -> None:
+        """Residency gating is separate: the switch is stored, returned and audited as
+        before, and the response says residency is on."""
+        db.add_org(ORG_ID, data_residency=True)
+        admin_id, token = _login(db, "org_admin")
+
+        response = _call(_client(app), "org_patch", token, body={"tools": {tool: False}})
+
+        expected = {**_ALL_ON, tool: False}
+        assert response.status_code == 200, response.text
+        assert response.json() == {"tools": expected, "data_residency": True}
+        assert db.org_tools(ORG_ID) == expected
+        event = _one(db.audit)
+        assert event["action"] == "org.settings_change"
+        assert (event["actor_kind"], _uuid(event["actor_user_id"])) == ("member", admin_id)
+        assert _uuid(event["org_id"]) == ORG_ID
+        assert event["ip"] == _IP_A
+        assert event["metadata"] == {f"{tool}_old": True, f"{tool}_new": False}
+        assert db.orgs[ORG_ID]["data_residency"] is True
+
+    def test_settings_api_org_patch_noop_under_residency_reports_it(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=True)
+        db.add_org_settings(ORG_ID, outlook=False)
+        _, token = _login(db, "org_admin")
+
+        response = _call(_client(app), "org_patch", token, body={"tools": {"outlook": False}})
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "tools": {**_ALL_ON, "outlook": False},
+            "data_residency": True,
+        }
+        assert db.audit == []
+
+    @pytest.mark.parametrize("body", _RESIDENCY_KEY_BODIES)
+    def test_settings_api_org_patch_cannot_set_data_residency(
+        self, db: FakeDb, app: FastAPI, probes: _Probes, body: Any
+    ) -> None:
+        """A data_residency key is refused like any unknown key (422, no echo, nothing
+        written); the org keeps residency on, as the next GET reports."""
+        db.add_org(ORG_ID, data_residency=True)
+        _, token = _login(db, "org_admin")
+        client = _client(app)
+        before = _state(db)
+
+        response = _call(client, "org_patch", token, body=body)
+        read = _call(client, "org_get", token)
+
+        assert response.status_code == 422, response.text
+        assert "ECHOMARK42" not in response.text
+        assert all("input" not in error for error in response.json()["detail"])
+        assert _state(db) == before
+        assert db.orgs[ORG_ID]["data_residency"] is True
+        assert read.status_code == 200, read.text
+        assert read.json() == {"tools": _ALL_ON, "data_residency": True}
 
 
 # ---------------------------------------------------------------------------

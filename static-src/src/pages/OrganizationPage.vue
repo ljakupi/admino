@@ -5,18 +5,23 @@
  * Permissions page. The route guard already keeps every other role out of
  * `/organization` (`services/access.ts` area matrix), `canManageOrgPermissions`
  * is a defense-in-depth check only.
+ *
+ * Issue #162: the Org Admin's per-service switches move here too
+ * (`OrgServicesCard.vue`), gated the same way by `canManageOrgSettings`.
  */
 import { computed } from 'vue';
 import { Building2 } from 'lucide-vue-next';
 import EmptyState from '@/components/EmptyState.vue';
 import PermissionMatrix from '@/components/PermissionMatrix.vue';
 import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
+import OrgServicesCard from '@/components/OrgServicesCard.vue';
 import { useAuthStore } from '@/stores/auth';
-import { canManageOrgPermissions } from '@/services/access';
+import { canManageOrgPermissions, canManageOrgSettings } from '@/services/access';
 import { t } from '@/i18n';
 
 const auth = useAuthStore();
 const canManage = computed(() => canManageOrgPermissions(auth.role));
+const canManageServices = computed(() => canManageOrgSettings(auth.role));
 </script>
 
 <template>
@@ -26,6 +31,7 @@ const canManage = computed(() => canManageOrgPermissions(auth.role));
         <h1>{{ t('nav.organization') }}</h1>
       </header>
       <div class="page-content">
+        <OrgServicesCard v-if="canManageServices" />
         <PermissionMatrix />
         <CriticalPermissionsCard />
       </div>

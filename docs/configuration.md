@@ -158,7 +158,7 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 | Scope | Who changes it | Route | What it holds |
 | --- | --- | --- | --- |
 | **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows only these. |
-| **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. On the **Tools** page, Org Admins see the switches. |
+| **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins switch them under **Organization → Services**. The response also carries the organization's data residency policy (`data_residency`, read-only here). |
 | **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. |
 
 - The UI and response languages belong to your account, not to these settings.
@@ -170,6 +170,9 @@ Settings have three scopes. Each has an owner and its own route; any other role 
   are never recorded.
 - A tool service an organization switches off is off for that organization only. Each
   chat run reads its own organization's services, so other organizations aren't affected.
+- When the organization's data residency policy is on, the Google and Microsoft services
+  are off whatever their switch says, and **Organization → Services** shows them locked.
+  Their stored switches are kept for when residency is off.
 - The tool permission matrix and critical promotions are per organization too. See
   [Permissions → Per organization](permissions.md#per-organization).
 - Upgrading from a version with the single `settings` table drops it: everyone starts from
@@ -250,9 +253,10 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   password reset endpoints (`POST /api/auth/password-reset` and
   `POST /api/auth/password-reset/confirm`), the two invitation link endpoints
   (`GET /api/auth/invitations/{token}` and `POST /api/auth/invitations/{token}/accept`)
-  and the OAuth callback. A deactivated account, or an account whose organization is
-  deactivated or pending deletion, is refused on its next request, even with a session
-  that's still open.
+  and the OAuth callback. The callback completes a connection only in the browser that
+  started it and only while the session that started it is still open. A deactivated
+  account, or an account whose organization is deactivated or pending deletion, is refused
+  on its next request, even with a session that's still open.
 - **`/health` only says up or degraded.** It answers `{"status": "ok"}`, or `503`
   `{"status": "degraded"}` when the database is unreachable, and is rate-limited per IP
   address. The active LLM provider, the model and whether the provider is reachable are
@@ -348,8 +352,10 @@ What you see depends on your role:
 | Viewer | Chat (read-only: projects shared with you, with no message box), Permissions (read-only) and Settings |
 | Super Admin | Platform only (no chat) |
 
-The Organization page holds the organization's tool permissions and critical permissions.
-Later releases add users, settings and more. The Permissions page shows Editors and Viewers
+The Organization page holds the organization's services (which tools the agent may use),
+tool permissions and critical permissions. Later releases add users, settings and more.
+The Tools page is **My connections**: each user connects their own Google and Microsoft
+accounts there (see [Tools → Authentication](tools.md#authentication)). The Permissions page shows Editors and Viewers
 what the agent may do in their organization. The Platform page is a placeholder that a later
 release fills in. The server checks every request on its own, so a hidden page's API still
 refuses a role that isn't allowed to use it.
@@ -393,7 +399,9 @@ the Super Admin did.
   with the organization's ID and counts, no names.
 - **Data residency**: `PATCH /api/platform/orgs/{id}/residency` with `{"enabled": true}`
   or `false`. New organizations start with it on. The change is recorded in the
-  organization's audit log, where its Org Admins see it.
+  organization's audit log, where its Org Admins see it. While it's on, the organization's
+  Google and Microsoft tools are disabled and its members can't connect those accounts;
+  connections made before are kept but inactive until it's turned off.
 
 An organization's status can only move this way: active ⇄ deactivated, active or
 deactivated → pending deletion, pending deletion → deactivated (cancelled). Anything else,
@@ -499,13 +507,14 @@ certificate authority instead of Let's Encrypt. Check it with curl, e.g.
 ## Data & storage
 
 PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, each organization's `permissions`,
-`memory` notes, `oauth_tokens`, the
+each user's `memory` notes and `oauth_tokens` (one row per user and provider), the
 `audit_events` audit trail, and the `email_outbox` of queued transactional email.
 
 - **OAuth tokens** are stored as **encrypted ciphertext only**. The Fernet encryption key
   lives in the `OAUTH_ENCRYPTION_KEY` environment variable and is **never** persisted to
-  the database. Lose the key and stored tokens are unrecoverable; rotating it requires
-  re-running the [OAuth consent flow](getting-started.md#connect-your-accounts).
+  the database. Lose the key and stored tokens are unrecoverable; after rotating it, every
+  user reconnects their accounts on the Tools page (see
+  [Connect your accounts](getting-started.md#connect-your-accounts)).
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the tool, the action, the permission decision, success and duration. Arguments,
   tool output and message text are never stored. Rows are kept for 12 months by default

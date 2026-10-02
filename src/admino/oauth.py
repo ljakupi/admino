@@ -1,37 +1,59 @@
-"""OAuth token management for admino.
+"""OAuth token management for admino: per-user connections and access tokens.
 
 Handles encrypted storage of OAuth refresh tokens for Google and Microsoft
-using Fernet symmetric encryption, and manages token refresh via each
-provider's OAuth2 token endpoint.
+using Fernet symmetric encryption, manages token refresh via each
+provider's OAuth2 token endpoint, and caches the short-lived access tokens
+per user.
 
-Storage (GH-86): refresh tokens live in the PostgreSQL ``oauth_tokens``
-table, one row per provider. Only the Fernet ciphertext is stored in the
-database — the plaintext refresh token never touches the DB, and the
-encryption key stays in the ``OAUTH_ENCRYPTION_KEY`` environment variable,
-never persisted. Access tokens are NEVER stored; they are held in-memory
-only by the caller.
+Storage (GH-86, GH-162): refresh tokens live in the PostgreSQL
+``oauth_tokens`` table (migration 0017), one row per user and provider: each
+user connects their own Google and Microsoft accounts. Only the Fernet
+ciphertext is stored in the database — the plaintext refresh token never
+touches the DB, and the encryption key stays in the ``OAUTH_ENCRYPTION_KEY``
+environment variable, never persisted.
 
-The load/save/delete/refresh functions are async and take an asyncpg
-``Pool`` as their first argument.
+Inputs: an asyncpg ``Pool`` and the caller's ``TenantContext`` (every
+persistence and refresh function takes both, in that order), a provider
+(``"google"`` or ``"microsoft"``, no default), an httpx client for the
+provider calls. Outputs: ``OAuthToken`` rows, (connected, healthy) flags,
+access tokens. Errors: ``OAuthError`` / ``OAuthRefreshError`` with safe
+messages.
+
+Access tokens (GH-162): never stored in the database. ``access_tokens`` is
+the one process-wide ``AccessTokenCache``, keyed by (user_id, provider):
+bounded LRU (``ACCESS_TOKEN_CACHE_MAX`` entries), one lock per key, and
+``invalidate`` drops a user's entry on connect and disconnect.
 
 Security notes:
+- Tenant isolation: every statement on ``oauth_tokens`` binds the caller's
+  user_id AND org_id, both taken from the ``TenantContext`` (never from a
+  token model or a request value), so one user's row is never read, used,
+  changed or deleted for another user, or for the right user in another org.
+- The access-token cache never hands one key's token to another key: keys
+  are (user_id, provider), different keys never wait on each other, and an
+  invalidation during an in-flight refresh keeps that refresh's token out of
+  the cache. Errors propagate unchanged and cache nothing.
 - The Fernet encryption key is read exclusively from the
   ``OAUTH_ENCRYPTION_KEY`` environment variable. It is never logged,
   stored in the database in plaintext, or included in error messages.
 - All SQL is parameterized ($1, $2, ...) — no string interpolation.
 - No credentials (access tokens, refresh tokens, client secrets, Fernet
-  keys) appear in log output or raised exception messages.
+  keys), emails or user ids appear in log output or raised exception
+  messages.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import secrets
 import unicodedata
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Literal
+from typing import TYPE_CHECKING, Annotated, Final, Literal
 from urllib.parse import urlencode
 
 import httpx
@@ -39,7 +61,11 @@ from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, ValidationError
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     import asyncpg
+
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +164,8 @@ _TERMINAL_REFRESH_ERRORS: frozenset[str] = frozenset({"invalid_grant"})
 class OAuthToken(BaseModel):
     """Database-backed representation of an encrypted OAuth token.
 
-    Mirrors a row of the ``oauth_tokens`` table. The
+    Mirrors a row of the ``oauth_tokens`` table, without its owner: the
+    user_id and org_id always come from the caller's ``TenantContext``. The
     ``encrypted_refresh_token`` field holds the Fernet-encrypted refresh
     token as a string (ciphertext only). Access tokens are never stored in
     this model or in the database.
@@ -244,34 +271,55 @@ def decrypt_refresh_token(token: OAuthToken) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Token persistence (PostgreSQL, shared across providers)
+# Token persistence (PostgreSQL, one row per user and provider)
 # ---------------------------------------------------------------------------
+
+_LOAD_SQL: Final = """
+    SELECT provider, scopes, encrypted_refresh_token, email, healthy, created_at,
+           last_refreshed_at
+    FROM oauth_tokens
+    WHERE user_id = $1 AND org_id = $2 AND provider = $3
+"""
+# The upsert never changes the row's owner, provider or created_at.
+_SAVE_SQL: Final = """
+    INSERT INTO oauth_tokens (user_id, org_id, provider, encrypted_refresh_token, email,
+                              scopes, healthy, created_at, last_refreshed_at)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
+    ON CONFLICT (user_id, provider) DO UPDATE SET
+        encrypted_refresh_token = EXCLUDED.encrypted_refresh_token,
+        email = EXCLUDED.email,
+        scopes = EXCLUDED.scopes,
+        healthy = EXCLUDED.healthy,
+        last_refreshed_at = EXCLUDED.last_refreshed_at
+"""
+_DELETE_SQL: Final = """
+    DELETE FROM oauth_tokens WHERE user_id = $1 AND org_id = $2 AND provider = $3
+"""
 
 
 async def load_token(
     pool: asyncpg.Pool,
-    provider: OAuthProvider = "google",
+    tenant: TenantContext,
+    provider: OAuthProvider,
 ) -> OAuthToken | None:
-    """Read a provider's token row from the database.
+    """Read the caller's own token row for a provider.
 
     The ``encrypted_refresh_token`` field remains encrypted in the returned
     model. Use ``decrypt_refresh_token`` to obtain the plaintext.
 
     Args:
         pool: An asyncpg connection pool.
+        tenant: The caller's org scope (its user_id and org_id are bound).
         provider: OAuth provider name.
 
     Returns:
-        An OAuthToken instance, or None if no row exists for the provider.
+        An OAuthToken instance, or None if the caller has no row for the
+        provider in their org.
 
     Raises:
         OAuthError: If a row exists but cannot be parsed.
     """
-    row = await pool.fetchrow(
-        "SELECT provider, scopes, encrypted_refresh_token, email, healthy, "
-        "created_at, last_refreshed_at FROM oauth_tokens WHERE provider = $1",
-        provider,
-    )
+    row = await pool.fetchrow(_LOAD_SQL, tenant.user_id, tenant.org_id, provider)
     if row is None:
         return None
     try:
@@ -293,20 +341,24 @@ async def load_token(
         raise OAuthError(msg) from exc
 
 
-async def save_token(pool: asyncpg.Pool, token: OAuthToken) -> None:
-    """Persist a token row via an UPSERT keyed on provider.
+async def save_token(pool: asyncpg.Pool, tenant: TenantContext, token: OAuthToken) -> None:
+    """Persist the caller's token row via an UPSERT keyed on (user_id, provider).
 
     Args:
         pool: An asyncpg connection pool.
+        tenant: The caller's org scope: the row is stored under its user_id
+            and org_id.
         token: The OAuthToken to persist. The ``encrypted_refresh_token``
             field must already be encrypted.
 
     Raises:
-        OAuthError: If the provider is unknown or the write fails.
+        OAuthError: If the provider is unknown (before any statement) or the
+            write fails.
 
     Security notes:
         Only the Fernet ciphertext is written — the plaintext refresh token
-        never reaches the database. All values are bound as parameters.
+        never reaches the database. All values are bound as parameters; an
+        existing row keeps its owner and created_at.
     """
     import asyncpg
 
@@ -316,15 +368,9 @@ async def save_token(pool: asyncpg.Pool, token: OAuthToken) -> None:
 
     try:
         await pool.execute(
-            "INSERT INTO oauth_tokens (provider, encrypted_refresh_token, email, "
-            "scopes, healthy, created_at, last_refreshed_at) "
-            "VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7) "
-            "ON CONFLICT (provider) DO UPDATE SET "
-            "encrypted_refresh_token = EXCLUDED.encrypted_refresh_token, "
-            "email = EXCLUDED.email, "
-            "scopes = EXCLUDED.scopes, "
-            "healthy = EXCLUDED.healthy, "
-            "last_refreshed_at = EXCLUDED.last_refreshed_at",
+            _SAVE_SQL,
+            tenant.user_id,
+            tenant.org_id,
             token.provider,
             token.encrypted_refresh_token,
             token.email,
@@ -340,16 +386,18 @@ async def save_token(pool: asyncpg.Pool, token: OAuthToken) -> None:
 
 async def delete_token(
     pool: asyncpg.Pool,
-    provider: OAuthProvider = "google",
+    tenant: TenantContext,
+    provider: OAuthProvider,
 ) -> bool:
-    """Delete a provider's token row from the database.
+    """Delete the caller's own token row for a provider.
 
     Args:
         pool: An asyncpg connection pool.
+        tenant: The caller's org scope (its user_id and org_id are bound).
         provider: OAuth provider name.
 
     Returns:
-        True if a row existed and was deleted, False otherwise.
+        True if the caller's row existed and was deleted, False otherwise.
 
     Raises:
         OAuthError: If the DELETE fails.
@@ -360,10 +408,7 @@ async def delete_token(
     import asyncpg
 
     try:
-        status = await pool.execute(
-            "DELETE FROM oauth_tokens WHERE provider = $1",
-            provider,
-        )
+        status = await pool.execute(_DELETE_SQL, tenant.user_id, tenant.org_id, provider)
     except asyncpg.PostgresError as exc:
         msg = "Failed to delete token."
         raise OAuthError(msg) from exc
@@ -378,15 +423,17 @@ async def delete_token(
 
 async def revoke_and_delete_token(
     pool: asyncpg.Pool,
+    tenant: TenantContext,
     provider: OAuthProvider,
     http_client: httpx.AsyncClient,
 ) -> bool:
-    """Revoke the refresh token at the provider, then delete the DB row.
+    """Revoke the caller's refresh token at the provider, then delete their row.
 
-    Decrypts the refresh token from the DB row, POSTs it to the provider's
-    revocation endpoint (best-effort), then deletes the row. This ensures
-    both the provider-side credential and the local copy are invalidated
-    during account disconnection.
+    Decrypts the refresh token from the caller's row, POSTs it to the
+    provider's revocation endpoint (best-effort), then deletes the row. This
+    ensures both the provider-side credential and the local copy are
+    invalidated during account disconnection. Without a row of the caller's,
+    nothing is revoked or deleted.
 
     If revocation fails (network error, provider error), the row is still
     deleted and a warning is logged. The disconnect proceeds regardless so
@@ -394,11 +441,13 @@ async def revoke_and_delete_token(
 
     Args:
         pool: An asyncpg connection pool.
+        tenant: The caller's org scope (its user_id and org_id are bound).
         provider: OAuth provider name (``"google"`` or ``"microsoft"``).
         http_client: An httpx async client for the revocation request.
 
     Returns:
-        True if a row existed and was deleted, False if none existed.
+        True if the caller's row existed and was deleted, False if none
+        existed.
 
     Raises:
         OAuthError: If the row exists but deletion fails.
@@ -406,7 +455,7 @@ async def revoke_and_delete_token(
     Security notes:
         No credentials are logged or included in error messages.
     """
-    token = await load_token(pool, provider)
+    token = await load_token(pool, tenant, provider)
     if token is None:
         return False
 
@@ -424,7 +473,7 @@ async def revoke_and_delete_token(
         )
 
     # Always delete the DB row regardless of revocation outcome.
-    return await delete_token(pool, provider)
+    return await delete_token(pool, tenant, provider)
 
 
 async def _revoke_google_token(
@@ -969,31 +1018,35 @@ async def _refresh_microsoft_token(
 
 async def get_valid_access_token(
     pool: asyncpg.Pool,
+    tenant: TenantContext,
     provider: OAuthProvider,
     cached_token: str | None,
     cached_expires_at: datetime | None,
     http_client: httpx.AsyncClient,
 ) -> tuple[str, datetime]:
-    """Return a valid access token for the given provider, refreshing if needed.
+    """Return a valid access token for the caller's connection, refreshing if needed.
 
     If ``cached_token`` is still valid (not expired within the 60-second
-    buffer), it is returned as-is. Otherwise, the refresh token is loaded
-    from the database, decrypted, and used to obtain a new access token from
-    the provider's token endpoint.
+    buffer), it is returned as-is. Otherwise, the caller's own refresh token
+    is loaded from the database, decrypted, and used to obtain a new access
+    token from the provider's token endpoint. The outcome (a terminal failure
+    flags the row unhealthy, a success marks it healthy and refreshed) is
+    written to the caller's row only.
 
     Args:
         pool: An asyncpg connection pool.
+        tenant: The caller's org scope (whose connection is used).
         provider: OAuth provider ("google" or "microsoft").
-        cached_token: The currently cached access token, or None.
+        cached_token: The caller's currently cached access token, or None.
         cached_expires_at: Expiry time of the cached token, or None.
         http_client: An httpx async client for the refresh request.
 
     Returns:
         A (access_token, expires_at) tuple. The caller must cache these
-        and pass them back on the next call.
+        and pass them back on the next call (``AccessTokenCache`` does).
 
     Raises:
-        OAuthError: If no token row exists or refresh fails.
+        OAuthError: If the caller has no token row or refresh fails.
     """
     now = datetime.now(UTC)
 
@@ -1006,7 +1059,7 @@ async def get_valid_access_token(
         return cached_token, cached_expires_at
 
     # Need to refresh — load and decrypt the refresh token
-    token = await load_token(pool, provider)
+    token = await load_token(pool, tenant, provider)
     if token is None:
         msg = f"No {provider} account is connected."
         raise OAuthError(msg)
@@ -1025,7 +1078,7 @@ async def get_valid_access_token(
         if exc.terminal and token.healthy:
             token.healthy = False
             try:
-                await save_token(pool, token)
+                await save_token(pool, tenant, token)
             except OAuthError:
                 logger.warning("Failed to persist unhealthy flag for %s token.", provider)
         raise
@@ -1037,7 +1090,7 @@ async def get_valid_access_token(
     token.healthy = True
     token.last_refreshed_at = now
     try:
-        await save_token(pool, token)
+        await save_token(pool, tenant, token)
     except OAuthError:
         # Non-fatal: log but don't fail the refresh
         logger.warning("Failed to update last_refreshed_at for %s token.", provider)
@@ -1048,11 +1101,13 @@ async def get_valid_access_token(
 
 async def get_connection_status(
     pool: asyncpg.Pool,
+    tenant: TenantContext,
     provider: OAuthProvider,
 ) -> tuple[bool, bool]:
-    """Return ``(connected, healthy)`` for a provider from DB state only.
+    """Return ``(connected, healthy)`` of the caller's connection from DB state only.
 
-    ``connected`` is True when a token row exists for the provider.
+    ``connected`` is True when the caller has a token row for the provider
+    (another user's row never counts).
     ``healthy`` is True when that row exists and its ``healthy`` flag is set
     (its refresh token is still believed valid). A dead/revoked refresh
     token — detected at tool-call time and persisted via ``healthy=False`` —
@@ -1064,6 +1119,7 @@ async def get_connection_status(
 
     Args:
         pool: An asyncpg connection pool.
+        tenant: The caller's org scope (its user_id and org_id are bound).
         provider: OAuth provider name.
 
     Returns:
@@ -1073,7 +1129,7 @@ async def get_connection_status(
         No credentials are read into the response — only the boolean flags.
     """
     try:
-        token = await load_token(pool, provider)
+        token = await load_token(pool, tenant, provider)
     except OAuthError:
         # A corrupt/unparseable token row exists but cannot be trusted —
         # report connected-but-unhealthy so the UI prompts a reconnect.
@@ -1092,11 +1148,127 @@ async def get_connection_status(
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compatible aliases (used by existing oauth_setup.py and tests)
+# Per-user access-token cache (used by the tool modules)
 # ---------------------------------------------------------------------------
 
-# These are kept for backwards compatibility with existing code that
-# imports from oauth.py. New code should use the provider-specific functions.
-build_consent_url = build_google_consent_url
-exchange_code = exchange_google_code
-_get_client_credentials = _get_google_client_credentials
+# At most this many (user_id, provider) access tokens are cached at once.
+ACCESS_TOKEN_CACHE_MAX: Final[int] = 512
+
+# (user_id, provider)
+type _CacheKey = tuple[UUID, str]
+
+
+@dataclass(slots=True)
+class _KeyState:
+    """The lock of one cache key while gets of it are in flight.
+
+    ``holders`` counts the gets holding or waiting for the lock (the state is
+    dropped when it reaches 0, so the states stay bounded by the in-flight
+    gets). ``generation`` grows on every invalidation of the key: a refresh
+    that started under an older generation doesn't store its token.
+    """
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    holders: int = 0
+    generation: int = 0
+
+
+class AccessTokenCache:
+    """Short-lived access tokens per (user_id, provider): bounded LRU, one lock per key.
+
+    ``get`` refreshes through ``get_valid_access_token`` with the key's cached
+    token and expiry (which hands a still-valid token back as it is) and
+    caches the result. Concurrent gets of one key run one at a time; gets of
+    different keys never wait on each other. Access tokens live in this
+    process's memory only and are never logged.
+    """
+
+    def __init__(self, max_entries: int = ACCESS_TOKEN_CACHE_MAX) -> None:
+        """Create an empty cache holding at most ``max_entries`` keys."""
+        self._max_entries = max_entries
+        self._entries: OrderedDict[_CacheKey, tuple[str, datetime]] = OrderedDict()
+        self._states: dict[_CacheKey, _KeyState] = {}
+
+    async def get(
+        self,
+        pool: asyncpg.Pool,
+        tenant: TenantContext,
+        provider: OAuthProvider,
+        http_client: httpx.AsyncClient,
+    ) -> str:
+        """Return a valid access token for the caller's connection to a provider.
+
+        Marks the key most recently used; adding a key beyond the bound evicts
+        the least recently used one.
+
+        Args:
+            pool: An asyncpg connection pool.
+            tenant: The caller's org scope; its user_id keys the cache.
+            provider: OAuth provider name.
+            http_client: An httpx async client for the refresh request.
+
+        Returns:
+            The access token.
+
+        Raises:
+            OAuthError: Unchanged from ``get_valid_access_token`` (no
+                connection, refresh failure); nothing is cached.
+        """
+        key: _CacheKey = (tenant.user_id, provider)
+        state = self._states.get(key)
+        if state is None:
+            state = self._states[key] = _KeyState()
+        state.holders += 1
+        try:
+            async with state.lock:
+                generation = state.generation
+                cached_token, cached_expires_at = self._entries.get(key, (None, None))
+                token, expires_at = await get_valid_access_token(
+                    pool, tenant, provider, cached_token, cached_expires_at, http_client
+                )
+                # An invalidation while the refresh ran (a disconnect, a
+                # reconnect) keeps this token out of the cache.
+                if state.generation == generation:
+                    self._store(key, token, expires_at)
+                return token
+        finally:
+            state.holders -= 1
+            if state.holders == 0:
+                del self._states[key]
+
+    async def invalidate(self, user_id: UUID, provider: OAuthProvider) -> None:
+        """Drop one user's cached token for a provider (connect and disconnect).
+
+        A refresh of that key already in flight won't put its token back: the
+        next ``get`` loads the connection from the database again.
+
+        Args:
+            user_id: The user whose entry goes.
+            provider: OAuth provider name.
+        """
+        key: _CacheKey = (user_id, provider)
+        self._entries.pop(key, None)
+        state = self._states.get(key)
+        if state is not None:
+            state.generation += 1
+
+    def clear(self) -> None:
+        """Drop every entry (tests, shutdown); in-flight refreshes cache nothing."""
+        self._entries.clear()
+        for state in self._states.values():
+            state.generation += 1
+
+    def __len__(self) -> int:
+        """Return the number of cached (user_id, provider) entries."""
+        return len(self._entries)
+
+    def _store(self, key: _CacheKey, token: str, expires_at: datetime) -> None:
+        """Cache a key's token as the most recently used; evict beyond the bound."""
+        self._entries[key] = (token, expires_at)
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+
+
+# The process-wide cache the tool modules use.
+access_tokens: Final[AccessTokenCache] = AccessTokenCache()

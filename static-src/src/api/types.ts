@@ -144,10 +144,30 @@ export interface UserSettingsPatch {
 /** `GET`/`PATCH /api/org/settings` — Org Admin only: which tool services are enabled. */
 export interface OrgSettingsResponse {
   tools: ToolsSettings;
+  /** The org's data residency policy (read-only here; issue #162). */
+  data_residency: boolean;
 }
 
 export interface OrgSettingsPatch {
   tools: Partial<ToolsSettings>;
+}
+
+// OAuth connections (issue #162: per-user connections, residency gating).
+
+export type OAuthProvider = 'google' | 'microsoft';
+
+export type ConnectorTool =
+  | 'gmail'
+  | 'google_calendar'
+  | 'google_drive'
+  | 'outlook'
+  | 'outlook_calendar'
+  | 'onedrive';
+
+/** One of a provider's services and the org's stored switch for it. */
+export interface OAuthServiceStatus {
+  tool: ConnectorTool;
+  enabled: boolean;
 }
 
 /** `GET /api/oauth/{provider}/status`. */
@@ -156,16 +176,14 @@ export interface OAuthConnectionStatus {
   /**
    * True when the stored refresh token is still believed valid. A connected
    * but unhealthy account (dead/revoked refresh token) is shown as "Not
-   * connected" — see `effectivelyConnected` on the Tools page.
+   * connected" — see `providerState` in `services/connections.ts`.
    */
   healthy: boolean;
   email: string | null;
-  services: string[];
-}
-
-export interface ConnectedAccounts {
-  google: OAuthConnectionStatus;
-  microsoft: OAuthConnectionStatus;
+  /** True when the caller's org has data residency on (connect refused, connection kept but inactive). */
+  data_residency: boolean;
+  /** The provider's services, in `PROVIDER_TOOLS` order, each with the org's stored switch. */
+  services: OAuthServiceStatus[];
 }
 
 // Permissions types

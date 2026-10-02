@@ -18,6 +18,10 @@ so this guard reads every shipped migration and pins the rule:
   aggregate table (monthly cost per org, kept by law after the purge).
 - GH-161: the per-org ``permissions`` table (migration 0016) has exactly one
   foreign key, ``org_id`` -> ``organizations`` ON DELETE CASCADE.
+- GH-162: the per-user ``oauth_tokens`` and ``memory`` tables (migration 0017)
+  each have exactly two foreign keys, ``user_id`` -> ``users`` and ``org_id`` ->
+  ``organizations``, both ON DELETE CASCADE (deleting a user or purging the org
+  removes their connections and notes).
 
 The parser reads the final schema across all migrations, in version order:
 inline column FKs, table-level ``FOREIGN KEY`` constraints, ``ALTER TABLE ...
@@ -380,6 +384,24 @@ class TestSchemaForeignKeyGuard:
         }
 
         assert found == {("permissions", ("org_id",), "organizations", "cascade")}
+
+    @pytest.mark.parametrize("table", ["oauth_tokens", "memory"])
+    def test_schema_fk_per_user_table_cascades_from_users_and_organizations(
+        self, table: str
+    ) -> None:
+        """GH-162: connections and memory notes are per user. Each table has exactly two
+        foreign keys, user_id -> users and org_id -> organizations, both ON DELETE
+        CASCADE, so a user delete and the org purge remove the rows (migration 0017)."""
+        found = sorted(
+            (fk.columns, fk.referenced, fk.on_delete)
+            for fk in _shipped_schema().foreign_keys
+            if fk.table == table
+        )
+
+        assert found == [
+            (("org_id",), "organizations", "cascade"),
+            (("user_id",), "users", "cascade"),
+        ]
 
     def test_schema_fk_references_to_orgs_and_users_cascade(self) -> None:
         """Apart from users.org_id and audit_events.org_id, every foreign key to

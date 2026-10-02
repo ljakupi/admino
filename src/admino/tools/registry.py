@@ -27,6 +27,12 @@ Security notes:
   pattern used by the permission engine.
 - Argument validation errors never leak raw input values; only field-level
   constraint descriptions are surfaced.
+- Tool context (GH-162): ``dispatch_tool_call`` requires the run's
+  ``TenantContext`` and hands it to the handler as ``tenant=``; handlers
+  scope every content query by its user_id and org_id. The context only
+  comes from the server side: unknown argument keys (``user_id``, ``org_id``,
+  ``tenant``, ``session_id``) are rejected before validation, so an LLM can't
+  supply or override it. The permission engine never sees it.
 - No ``eval``, ``exec``, ``compile``, ``importlib``, or ``shell=True``.
 - This module does NOT import from ``agent.py``, ``llm.py``, or ``server.py``.
 """
@@ -38,7 +44,7 @@ import os
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -49,6 +55,9 @@ from admino.models import (
     ToolCall,
 )
 from admino.permissions import PermissionResult, PermissionsConfig, check_permission
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +77,9 @@ _MAX_RESULT_LENGTH: Final[int] = 65_536
 # ---------------------------------------------------------------------------
 
 # Async tool handler: receives validated Pydantic args model instance, returns
-# a result string.  Additional keyword arguments (e.g. session_id) may be
-# passed by the dispatch function.
+# a result string.  The dispatch function passes the keyword arguments
+# ``session_id`` and ``tenant`` (the run's TenantContext, GH-162); handlers
+# take ``**_`` for the ones they don't use.
 #
 # NOTE: ``Callable[..., Awaitable[str]]`` cannot enforce the return type at
 # registration time — Python's type system does not narrow ``...`` parameter
@@ -241,6 +251,7 @@ async def dispatch_tool_call(
     permissions_config: PermissionsConfig,
     *,
     session_id: str,
+    tenant: TenantContext,
     pending_confirmation: PendingConfirmation | None = None,
     promoted: frozenset[tuple[str, str]] = frozenset(),
     enabled_tools: dict[str, bool] | None = None,
@@ -260,7 +271,7 @@ async def dispatch_tool_call(
        indicating that user confirmation is required.  If pending_confirmation
        IS supplied, verify its tool/action identity and expiry.
     5. Reject unknown args keys, then validate against the Pydantic schema.
-    6. Execute the async handler.
+    6. Execute the async handler with ``session_id`` and ``tenant``.
 
     Dispatch writes no audit record itself: the agent records every returned
     outcome (``result.permission.allowed`` and ``result.success``) through its
@@ -271,6 +282,11 @@ async def dispatch_tool_call(
         tool_call: The LLM-requested tool call (tool, action, raw args).
         permissions_config: The validated permissions configuration.
         session_id: Current session identifier (passed to the handler).
+        tenant: The run's tool context (GH-162): the logged-in user's
+            ``TenantContext``, built server-side from the principal and passed
+            to the handler as ``tenant=`` unchanged. Never taken from the
+            LLM's arguments: an argument key the schema doesn't declare (e.g.
+            ``user_id``, ``org_id``, ``tenant``) is rejected before the handler.
         pending_confirmation: If present, the user has already confirmed this
             call.  Dispatch verifies that ``pending_confirmation.tool_call.tool``,
             ``.action``, AND ``.args`` match the incoming ``tool_call`` and that
@@ -424,7 +440,7 @@ async def dispatch_tool_call(
 
     # 6. Execute the async handler.
     try:
-        result = await entry.handler(validated_args, session_id=session_id)
+        result = await entry.handler(validated_args, session_id=session_id, tenant=tenant)
     except (MemoryError, RecursionError):
         raise
     except Exception as exc:

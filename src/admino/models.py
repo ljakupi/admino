@@ -33,6 +33,12 @@ Security notes:
   errors. ``ToolPolicy`` (one org's permissions for one agent run) is frozen,
   so a loaded policy can't be changed. ``PermissionSummaryEntry`` carries a
   (tool, action) pair and its effective state only.
+- Per-user connections (GH-162): ``PROVIDER_TOOLS`` (a read-only mapping)
+  and ``RESIDENCY_BLOCKED_TOOLS`` (a frozenset) drive residency gating and
+  can't be widened or emptied at runtime; memory is not residency-blocked.
+  ``OAuthServiceStatus.tool`` is a closed Literal (``ConnectorTool``), and
+  ``OAuthConnectionStatus`` / ``OrgSettingsResponse`` carry the org's
+  residency flag only, never a token.
 - Platform defaults (GH-160): the section patch models of
   ``PlatformSettingsPatch`` take strict ints only (a bool, float or numeric
   string is refused, never coerced) within bounds that mirror migration
@@ -1353,13 +1359,44 @@ class OAuthAuthorizeResponse(BaseModel):
     url: str = Field(max_length=2048, pattern=r"^https://")
 
 
-class OAuthConnectionStatus(BaseModel):
-    """OAuth connection status for a provider.
+# The tools of the Google and Microsoft OAuth providers (their "services", GH-162).
+ConnectorTool = Literal[
+    "gmail", "google_calendar", "google_drive", "outlook", "outlook_calendar", "onedrive"
+]
 
-    ``connected`` means a token row exists in the database. ``healthy`` means
-    the stored refresh token is still believed valid (not flagged dead after
-    a terminal refresh failure). The frontend treats ``connected and not
-    healthy`` the same as "Not connected" — prompting a fresh Connect.
+# Each OAuth provider's tools, in the order the connection status lists them.
+PROVIDER_TOOLS: Final[MappingProxyType[str, tuple[ConnectorTool, ...]]] = MappingProxyType(
+    {
+        "google": ("gmail", "google_calendar", "google_drive"),
+        "microsoft": ("outlook", "outlook_calendar", "onedrive"),
+    }
+)
+
+# The tools an org's data residency policy switches off: every provider's tools
+# (memory stays on: it never leaves the server).
+RESIDENCY_BLOCKED_TOOLS: Final[frozenset[str]] = frozenset(
+    tool for tools in PROVIDER_TOOLS.values() for tool in tools
+)
+
+
+class OAuthServiceStatus(BaseModel):
+    """One service of an OAuth provider and the org's stored switch for it (GH-162)."""
+
+    tool: ConnectorTool
+    enabled: bool
+
+
+class OAuthConnectionStatus(BaseModel):
+    """The caller's own connection to an OAuth provider (GH-162: per user).
+
+    ``connected`` means the caller has a token row for the provider.
+    ``healthy`` means the stored refresh token is still believed valid (not
+    flagged dead after a terminal refresh failure). The frontend treats
+    ``connected and not healthy`` the same as "Not connected" — prompting a
+    fresh Connect. ``data_residency`` is the caller's org's residency policy:
+    connecting is refused and a stored connection is inactive. ``services``
+    lists the provider's tools (``PROVIDER_TOOLS`` order), each with the
+    org's stored switch.
     """
 
     connected: bool = False
@@ -1369,7 +1406,8 @@ class OAuthConnectionStatus(BaseModel):
         max_length=254,
         pattern=r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
     )
-    services: list[str] = Field(default_factory=list)
+    data_residency: bool = False
+    services: list[OAuthServiceStatus] = Field(default_factory=list)
 
 
 class ToolsSettings(BaseModel):
@@ -1481,9 +1519,15 @@ class UserSettingsPatch(BaseModel):
 
 
 class OrgSettingsResponse(BaseModel):
-    """GET/PATCH /api/org/settings response: the Org Admin's own org's tool services."""
+    """GET/PATCH /api/org/settings response: the Org Admin's own org's tool services.
+
+    ``data_residency`` (GH-162) is the org's residency policy, read-only here:
+    when on, the Google and Microsoft services are off for every run whatever
+    their stored switch says.
+    """
 
     tools: ToolsSettings
+    data_residency: bool
 
 
 class OrgToolsPatch(BaseModel):

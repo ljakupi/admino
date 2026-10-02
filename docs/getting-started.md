@@ -237,8 +237,9 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
 
 ## Connect your accounts
 
-`files` and `memory` work with no account. The Google and Microsoft tools need a one-time
-OAuth consent. First, set the encryption key that protects stored refresh tokens:
+`memory` works with no account. The Google and Microsoft tools use each user's own
+accounts, which they connect in the app. The operator sets up two things once. First, the
+encryption key that protects stored refresh tokens:
 
 ```bash
 # Generate a Fernet key and add it to .env as OAUTH_ENCRYPTION_KEY
@@ -252,18 +253,34 @@ Then register an OAuth app with the provider and put its client ID/secret in `.e
   `GOOGLE_CLIENT_SECRET`.
 - **Microsoft** (Outlook, Calendar, OneDrive) — register an app at
   <https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps> using the *Mobile and
-  desktop applications* platform with redirect URI `http://localhost:8000/oauth/callback`.
-  Set `MICROSOFT_CLIENT_ID` and `MICROSOFT_CLIENT_SECRET`.
+  desktop applications* platform with redirect URI
+  `http://localhost:8000/api/oauth/callback`. Set `MICROSOFT_CLIENT_ID` and
+  `MICROSOFT_CLIENT_SECRET`.
 
-Run the one-time consent flow (make sure the variables above are loaded in your shell):
+admino sends `http://<server.host>:<server.port>/api/oauth/callback` as the redirect URI
+(`localhost` when the host is `0.0.0.0`). When admino runs behind another address, set
+`OAUTH_REDIRECT_URI` in `.env` to the callback address you registered with the provider.
 
-```bash
-python -m admino.oauth_setup google       # or: microsoft
-```
+From then on, each user connects their own accounts:
 
-The script prints a consent URL, you paste back the authorization code, and the resulting
-**refresh token is encrypted with your Fernet key and stored in PostgreSQL** — the access
-token obtained during setup is discarded and never persisted.
+1. Log in as an Org Admin or Editor and open the **Tools** page (**My connections**).
+2. Click **Connect** on the Google or Microsoft card and grant consent at the provider.
+   Finish within 10 minutes, in the same browser; otherwise the Tools page says the
+   session expired and you click **Connect** again.
+3. You're back on the Tools page with the account connected. Each service shows whether
+   it's active, turned off by your organization, or restricted by data residency.
+
+The **refresh token is encrypted with your Fernet key and stored in PostgreSQL** for your
+user only. Access tokens are kept in memory only and never persisted. The agent uses your
+connection in your own chats only, never in a colleague's. **Disconnect** on the same card
+revokes the token at the provider and deletes it.
+
+- Viewers can't chat, so they have no connections.
+- An Org Admin turns services on or off for the whole organization under
+  **Organization → Services**.
+- When your organization's data residency policy is on, the Google and Microsoft tools are
+  disabled and connecting an account is refused. Connections made before are kept but
+  inactive; you can still disconnect them.
 
 ## How environment loading differs (local vs Docker)
 
@@ -286,8 +303,10 @@ platform.**
   with user accounts arrives.
 - Later migrations move settings, tool permissions, memory notes and Google/Microsoft
   connections from the single install to organizations and users. They **drop the existing
-  rows** instead of converting them. After that upgrade you set your settings and tool
-  permissions again and reconnect your accounts.
+  rows** instead of converting them: the install-wide Google and Microsoft tokens and every
+  memory note are deleted, never handed to some user. After that upgrade you set your
+  settings and tool permissions again, and each user reconnects their own accounts on the
+  **Tools** page.
 - Some earlier versions created a "Default organization" to hold the audit events of tool
   calls made before login existed. The upgrade deletes it and its audit events
   automatically, so an upgraded install starts with no organization, like a new one.
@@ -327,9 +346,11 @@ security rules.
   [Switching providers](configuration.md#llm-providers)).
 - **`PG_PASSWORD environment variable is required but not set`.** For local dev, load
   `.env` into your shell first: `set -a; source .env; set +a`.
-- **A tool says the account isn't connected.** Run `python -m admino.oauth_setup <google|microsoft>`
-  with `OAUTH_ENCRYPTION_KEY` and the client credentials loaded — see
-  [Connect your accounts](#connect-your-accounts).
+- **A tool says the account isn't connected.** Open the **Tools** page and click
+  **Connect** for that provider (see [Connect your accounts](#connect-your-accounts)).
+  Connections are per user: connecting your account doesn't connect a colleague's. If
+  connecting fails, check that `OAUTH_ENCRYPTION_KEY` and the client credentials are set.
+  If it's refused, your organization's data residency policy may be on.
 - **The container won't start / egress errors.** By default the agent fails closed if it
   can't program its egress firewall. See the [Security Model](SECURITY.md) and the
   `REQUIRE_EGRESS_WHITELIST` note in [`.env.example`](../.env.example).

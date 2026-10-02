@@ -81,6 +81,17 @@ export function canManageOrgPermissions(role: ShellRole | null): boolean {
   return role !== null && ORG_PERMISSIONS_MANAGE_ROLES.includes(role);
 }
 
+const OAUTH_CONNECT_ROLES: readonly ShellRole[] = ['org_admin', 'editor'];
+
+/**
+ * Mirrors the backend's `Capability.OAUTH_CONNECT`: Org Admin and Editor
+ * only. Gates the Tools page's "my connections" connect/disconnect actions
+ * (issue #162).
+ */
+export function canConnectAccounts(role: ShellRole | null | undefined): boolean {
+  return role !== null && role !== undefined && OAUTH_CONNECT_ROLES.includes(role);
+}
+
 /** Where a role lands after login: `/platform` for a Super Admin, `/chat` for members, `/login` for `null`. */
 export function homePath(role: ShellRole | null): string {
   if (role === 'super_admin') return '/platform';

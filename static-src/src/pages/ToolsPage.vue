@@ -1,36 +1,46 @@
 <script setup lang="ts">
+/**
+ * Tools page — "my connections" (issue #162). Shows the caller's own Google
+ * and Microsoft connections and the per-service status of each (active /
+ * turned off by the org / restricted by data residency / not connected).
+ * Connecting, disconnecting and the org's per-service switches moved here
+ * from the old combined Tools page: `useConnectionsStore` owns this page's
+ * state; the org's switches now live on the Organization console
+ * (`OrgServicesCard.vue`, `useOrgServicesStore`).
+ */
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import {
-  Mail, Calendar, Folder, Brain, Link,
-} from 'lucide-vue-next';
-import BaseToggle from '@/components/BaseToggle.vue';
+import { Mail, Calendar, Folder, Link } from 'lucide-vue-next';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
-import { useSettingsStore } from '@/stores/settings';
+import { useConnectionsStore } from '@/stores/connections';
 import { useAuthStore } from '@/stores/auth';
 import { useToastStore } from '@/stores/toasts';
-import { canManageOrgSettings } from '@/services/access';
-import type { ToolsSettings } from '@/api/types';
+import { canConnectAccounts } from '@/services/access';
+import {
+  PROVIDER_TOOLS,
+  canConnect,
+  canDisconnect,
+  oauthCallbackMessageKey,
+  providerState,
+  serviceState,
+  serviceStateKey,
+} from '@/services/connections';
+import type { ConnectorTool, OAuthProvider } from '@/api/types';
 import { useI18n, type MessageKey } from '@/i18n';
 
 const { t } = useI18n();
 const router = useRouter();
-const settings = useSettingsStore();
+const connections = useConnectionsStore();
 const auth = useAuthStore();
 const toasts = useToastStore();
 
-// Only an Org Admin may see/change which tool services are enabled for the
-// organization (until #161 replaces the interim gate; see GH-159 contract).
-const canManageTools = computed(() => canManageOrgSettings(auth.role));
+const canConnectOwnAccounts = computed(() => canConnectAccounts(auth.role));
 
-// --- OAuth callback handling (moved from SettingsPage) ---
+// --- OAuth callback handling ---
 onMounted(async () => {
-  await settings.loadConnections();
-  if (canManageTools.value) {
-    await settings.loadOrgTools();
-  }
+  await connections.load();
 
-  // Only process OAuth callback params if we actually initiated a flow
+  // Only process OAuth callback params if we actually initiated a flow.
   const oauthPending = sessionStorage.getItem('oauth_pending');
   const params = new URLSearchParams(window.location.search);
   const oauthResult = params.get('oauth');
@@ -40,112 +50,72 @@ onMounted(async () => {
       await router.replace({ path: '/tools' });
       toasts.add('success', t('toolsPage.oauth.connected.title'), t('toolsPage.oauth.connected.body'));
     } else if (oauthResult === 'error') {
-      const REASON_KEYS: Record<string, MessageKey> = {
-        denied: 'toolsPage.oauth.reason.denied',
-        invalid_state: 'toolsPage.oauth.reason.invalidState',
-        missing_code: 'toolsPage.oauth.reason.missingCode',
-        exchange_failed: 'toolsPage.oauth.reason.exchangeFailed',
-      };
-      // `reason` comes from the URL: own keys only, never an inherited property.
-      const reason = params.get('reason') || '';
-      const messageKey: MessageKey = Object.hasOwn(REASON_KEYS, reason)
-        ? REASON_KEYS[reason]
-        : 'toolsPage.oauth.reason.unexpected';
+      const reason = params.get('reason');
       await router.replace({ path: '/tools' });
-      toasts.add('error', t('toast.settings.connectionFailed.title'), t(messageKey));
+      toasts.add('error', t('toast.settings.connectionFailed.title'), t(oauthCallbackMessageKey(reason)));
     }
   } else if (oauthResult) {
-    // Strip stale or crafted oauth params without showing a toast
+    // Strip stale or crafted oauth params without showing a toast.
     await router.replace({ path: '/tools' });
   }
 });
 
-// --- Service mappings (ported from SettingsPage) ---
-const serviceIconMap: Record<string, typeof Mail> = {
-  mail: Mail,
-  calendar: Calendar,
-  folder: Folder,
+// --- Provider display metadata ---
+interface ProviderDef {
+  id: OAuthProvider;
+  label: string;
+  logoClass: string;
+  logoInitial: string;
+  connectHintKey: MessageKey;
+}
+
+const PROVIDERS: readonly ProviderDef[] = [
+  { id: 'google', label: 'Google', logoClass: 'google', logoInitial: 'G', connectHintKey: 'toolsPage.google.connectHint' },
+  { id: 'microsoft', label: 'Microsoft', logoClass: 'microsoft', logoInitial: 'M', connectHintKey: 'toolsPage.microsoft.connectHint' },
+];
+
+const SERVICE_ICON: Record<ConnectorTool, typeof Mail> = {
+  gmail: Mail,
+  google_calendar: Calendar,
+  google_drive: Folder,
+  outlook: Mail,
+  outlook_calendar: Calendar,
+  onedrive: Folder,
 };
 
-interface ServiceDef {
-  id: string;
-  icon: string;
-  nameKey: MessageKey;
-  toolKey: keyof ToolsSettings;
+const SERVICE_NAME_KEY: Record<ConnectorTool, MessageKey> = {
+  gmail: 'tools.gmail.label',
+  google_calendar: 'tools.googleCalendar.label',
+  google_drive: 'tools.googleDrive.label',
+  outlook: 'toolsPage.service.outlookMail',
+  outlook_calendar: 'tools.outlookCalendar.label',
+  onedrive: 'tools.onedrive.label',
+};
+
+const STATUS_PILL_KEY: Record<ReturnType<typeof providerState>, MessageKey> = {
+  connected: 'toolsPage.status.connected',
+  not_connected: 'toolsPage.status.notConnected',
+  residency: 'toolsPage.status.residency',
+};
+
+function servicesOf(provider: OAuthProvider): readonly ConnectorTool[] {
+  return PROVIDER_TOOLS[provider];
 }
 
-const googleServices: ServiceDef[] = [
-  { id: 'gmail', icon: 'mail', nameKey: 'tools.gmail.label', toolKey: 'gmail' },
-  { id: 'calendar', icon: 'calendar', nameKey: 'tools.googleCalendar.label', toolKey: 'google_calendar' },
-  { id: 'drive', icon: 'folder', nameKey: 'tools.googleDrive.label', toolKey: 'google_drive' },
-];
-
-const microsoftServices: ServiceDef[] = [
-  { id: 'outlook', icon: 'mail', nameKey: 'toolsPage.service.outlookMail', toolKey: 'outlook' },
-  { id: 'outlookc', icon: 'calendar', nameKey: 'tools.outlookCalendar.label', toolKey: 'outlook_calendar' },
-  { id: 'onedrive', icon: 'folder', nameKey: 'tools.onedrive.label', toolKey: 'onedrive' },
-];
-
-// Derive toggle state from store
-const googleServiceToggles = computed<Record<string, boolean>>(() => {
-  return Object.fromEntries(
-    googleServices.map((svc) => [svc.id, settings.tools[svc.toolKey]]),
-  );
-});
-
-const microsoftServiceToggles = computed<Record<string, boolean>>(() => {
-  return Object.fromEntries(
-    microsoftServices.map((svc) => [svc.id, settings.tools[svc.toolKey]]),
-  );
-});
-
-function onGoogleServiceToggle(serviceId: string, enabled: boolean) {
-  const svc = googleServices.find((s) => s.id === serviceId);
-  if (svc) settings.setToolEnabled(svc.toolKey, enabled);
+function statusOf(provider: OAuthProvider) {
+  return connections.accounts[provider];
 }
 
-function onMicrosoftServiceToggle(serviceId: string, enabled: boolean) {
-  const svc = microsoftServices.find((s) => s.id === serviceId);
-  if (svc) settings.setToolEnabled(svc.toolKey, enabled);
+// --- Connect / disconnect ---
+function connect(provider: OAuthProvider) {
+  connections.connect(provider);
 }
 
-// --- Local tools metadata ---
-const LOCAL_TOOLS: { id: keyof ToolsSettings; nameKey: MessageKey; descriptionKey: MessageKey; icon: typeof Mail }[] = [
-  { id: 'memory', nameKey: 'tools.memory.label', descriptionKey: 'toolsPage.memory.description', icon: Brain },
-];
-
-function onLocalToolToggle(toolId: keyof ToolsSettings, enabled: boolean) {
-  settings.setToolEnabled(toolId, enabled);
-}
-
-// --- Effective connection state ---
-// A connected-but-unhealthy account (dead/revoked refresh token) is treated
-// the same as not connected: it shows the grey "Not connected" pill and a
-// "Connect" button, never a "Reconnect" button. Two states only.
-const googleConnected = computed(
-  () => settings.connectedAccounts.google.connected && settings.connectedAccounts.google.healthy,
-);
-const microsoftConnected = computed(
-  () =>
-    settings.connectedAccounts.microsoft.connected && settings.connectedAccounts.microsoft.healthy,
-);
-
-// --- OAuth connect/disconnect ---
-function connectGoogle() {
-  settings.connectGoogle();
-}
-
-function connectMicrosoft() {
-  settings.connectMicrosoft();
-}
-
-const disconnectTarget = ref<'google' | 'microsoft' | null>(null);
+const disconnectTarget = ref<OAuthProvider | null>(null);
 
 async function confirmDisconnect() {
-  if (disconnectTarget.value === 'google') {
-    await settings.disconnectGoogle();
-  } else if (disconnectTarget.value === 'microsoft') {
-    await settings.disconnectMicrosoft();
+  if (disconnectTarget.value) {
+    await connections.disconnect(disconnectTarget.value);
   }
   disconnectTarget.value = null;
 }
@@ -158,135 +128,75 @@ async function confirmDisconnect() {
     </header>
 
     <div class="page-content">
-      <div v-if="settings.loading" class="loading-overlay">
+      <div v-if="connections.loading" class="loading-overlay">
         <span class="loading-spinner" :aria-label="t('common.loading')" />
       </div>
 
       <div v-else class="tools-inner">
-        <!-- ── Connected accounts ── -->
         <section class="tools-section">
           <div class="section-head">
             <h2 class="section-title">{{ t('toolsPage.accounts.title') }}</h2>
             <p class="section-sub">{{ t('toolsPage.accounts.subtitle') }}</p>
           </div>
 
-          <!-- Google card -->
-          <div class="provider-card" :class="{ connected: googleConnected }">
+          <div
+            v-for="provider in PROVIDERS"
+            :key="provider.id"
+            class="provider-card"
+            :class="[providerState(statusOf(provider.id)), { residency: statusOf(provider.id).data_residency }]"
+          >
             <div class="provider-head">
-              <div class="provider-logo google">G</div>
+              <div class="provider-logo" :class="provider.logoClass">{{ provider.logoInitial }}</div>
               <div class="provider-info">
                 <div class="provider-title">
-                  Google
-                  <span class="pill" :class="googleConnected ? 'leaf' : 'amber'">
+                  {{ provider.label }}
+                  <span class="pill" :class="providerState(statusOf(provider.id))">
                     <span class="pill-dot" />
-                    {{ googleConnected ? t('toolsPage.status.connected') : t('toolsPage.status.notConnected') }}
+                    {{ t(STATUS_PILL_KEY[providerState(statusOf(provider.id))]) }}
                   </span>
                 </div>
                 <div class="provider-meta">
-                  <template v-if="googleConnected">
-                    {{ settings.connectedAccounts.google.email }}
+                  <template v-if="statusOf(provider.id).connected && statusOf(provider.id).healthy && statusOf(provider.id).email">
+                    {{ statusOf(provider.id).email }}
                   </template>
-                  <template v-else>
-                    {{ t('toolsPage.google.connectHint') }}
+                  <template v-else-if="!statusOf(provider.id).data_residency">
+                    {{ t(provider.connectHintKey) }}
                   </template>
                 </div>
               </div>
               <div class="provider-actions">
                 <button
-                  v-if="googleConnected"
+                  v-if="canConnectOwnAccounts && canDisconnect(statusOf(provider.id))"
                   class="s-btn danger small"
-                  @click="disconnectTarget = 'google'"
+                  @click="disconnectTarget = provider.id"
                 >
                   {{ t('toolsPage.disconnect') }}
                 </button>
-                <button v-else class="s-btn primary small" @click="connectGoogle">
-                  <Link :size="13" :stroke-width="2" />
-                  {{ t('toolsPage.connect') }}
-                </button>
-              </div>
-            </div>
-            <div v-if="googleConnected && canManageTools" class="provider-services">
-              <div v-for="svc in googleServices" :key="svc.id" class="service-row">
-                <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
-                <div class="service-info">
-                  <span class="service-name">{{ t(svc.nameKey) }}</span>
-                </div>
-                <BaseToggle
-                  :model-value="googleServiceToggles[svc.id]"
-                  @update:model-value="onGoogleServiceToggle(svc.id, $event)"
-                />
-              </div>
-            </div>
-          </div>
-
-          <!-- Microsoft card -->
-          <div class="provider-card" :class="{ connected: microsoftConnected }">
-            <div class="provider-head">
-              <div class="provider-logo microsoft">M</div>
-              <div class="provider-info">
-                <div class="provider-title">
-                  Microsoft
-                  <span class="pill" :class="microsoftConnected ? 'leaf' : 'amber'">
-                    <span class="pill-dot" />
-                    {{ microsoftConnected ? t('toolsPage.status.connected') : t('toolsPage.status.notConnected') }}
-                  </span>
-                </div>
-                <div class="provider-meta">
-                  <template v-if="microsoftConnected">
-                    {{ settings.connectedAccounts.microsoft.email }}
-                  </template>
-                  <template v-else>
-                    {{ t('toolsPage.microsoft.connectHint') }}
-                  </template>
-                </div>
-              </div>
-              <div class="provider-actions">
                 <button
-                  v-if="microsoftConnected"
-                  class="s-btn danger small"
-                  @click="disconnectTarget = 'microsoft'"
+                  v-else-if="canConnectOwnAccounts && canConnect(statusOf(provider.id))"
+                  class="s-btn primary small"
+                  @click="connect(provider.id)"
                 >
-                  {{ t('toolsPage.disconnect') }}
-                </button>
-                <button v-else class="s-btn primary small" @click="connectMicrosoft">
                   <Link :size="13" :stroke-width="2" />
                   {{ t('toolsPage.connect') }}
                 </button>
               </div>
             </div>
-            <div v-if="microsoftConnected && canManageTools" class="provider-services">
-              <div v-for="svc in microsoftServices" :key="svc.id" class="service-row">
-                <component :is="serviceIconMap[svc.icon]" class="service-icon" :size="18" :stroke-width="1.75" />
+
+            <p v-if="statusOf(provider.id).data_residency" class="residency-note">
+              {{ t('toolsPage.residency.explanation') }}
+            </p>
+
+            <div class="provider-services">
+              <div v-for="service in servicesOf(provider.id)" :key="service" class="service-row">
+                <component :is="SERVICE_ICON[service]" class="service-icon" :size="18" :stroke-width="1.75" />
                 <div class="service-info">
-                  <span class="service-name">{{ t(svc.nameKey) }}</span>
+                  <span class="service-name">{{ t(SERVICE_NAME_KEY[service]) }}</span>
                 </div>
-                <BaseToggle
-                  :model-value="microsoftServiceToggles[svc.id]"
-                  @update:model-value="onMicrosoftServiceToggle(svc.id, $event)"
-                />
+                <span class="service-state" :class="serviceState(statusOf(provider.id), service)">
+                  {{ t(serviceStateKey(serviceState(statusOf(provider.id), service))) }}
+                </span>
               </div>
-            </div>
-          </div>
-        </section>
-
-        <!-- ── Local tools ── -->
-        <section v-if="canManageTools" class="tools-section">
-          <div class="section-head">
-            <h2 class="section-title">{{ t('toolsPage.local.title') }}</h2>
-            <p class="section-sub">{{ t('toolsPage.local.subtitle') }}</p>
-          </div>
-
-          <div class="local-tools">
-            <div v-for="tool in LOCAL_TOOLS" :key="tool.id" class="local-tool-row">
-              <component :is="tool.icon" class="local-tool-icon" :size="20" :stroke-width="1.75" />
-              <div class="local-tool-info">
-                <span class="local-tool-name">{{ t(tool.nameKey) }}</span>
-                <span class="local-tool-desc">{{ t(tool.descriptionKey) }}</span>
-              </div>
-              <BaseToggle
-                :model-value="settings.tools[tool.id]"
-                @update:model-value="onLocalToolToggle(tool.id, $event)"
-              />
             </div>
           </div>
         </section>
@@ -393,6 +303,10 @@ async function confirmDisconnect() {
   margin-top: 12px;
 }
 
+.provider-card.residency {
+  opacity: 0.7;
+}
+
 .provider-head {
   display: grid;
   grid-template-columns: 36px 1fr auto;
@@ -457,6 +371,14 @@ async function confirmDisconnect() {
   flex-shrink: 0;
 }
 
+.residency-note {
+  padding: 12px 20px;
+  font-size: 12.5px;
+  color: var(--color-text-muted);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-warn-soft);
+}
+
 /* ── Pill badges ── */
 .pill {
   display: inline-flex;
@@ -477,23 +399,25 @@ async function confirmDisconnect() {
   flex-shrink: 0;
 }
 
-.pill.leaf {
+.pill.connected {
   background: #DCF8C6;
   color: #1F5C2F;
   border-color: #BFE6A3;
 }
 
-.pill.leaf .pill-dot {
+.pill.connected .pill-dot {
   background: var(--color-accent);
 }
 
-.pill.amber {
+.pill.not_connected,
+.pill.residency {
   background: var(--color-warn-soft);
   color: #8A5A14;
   border-color: #F1D495;
 }
 
-.pill.amber .pill-dot {
+.pill.not_connected .pill-dot,
+.pill.residency .pill-dot {
   background: var(--color-warn);
 }
 
@@ -508,6 +432,7 @@ async function confirmDisconnect() {
   gap: 12px;
   align-items: center;
   padding: 12px 20px;
+  min-height: 44px;
 }
 
 .service-row + .service-row {
@@ -532,13 +457,30 @@ async function confirmDisconnect() {
   color: var(--color-text);
 }
 
-/* ── Buttons (matching SettingsPage) ── */
+.service-state {
+  font-size: 12px;
+  font-weight: var(--fw-medium);
+  color: var(--color-text-muted);
+  white-space: nowrap;
+}
+
+.service-state.active {
+  color: #1F5C2F;
+}
+
+.service-state.residency,
+.service-state.org_disabled {
+  color: #8A5A14;
+}
+
+/* ── Buttons ── */
 .s-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 6px;
   padding: 9px 16px;
+  min-height: 44px;
   border-radius: var(--radius-input);
   font: inherit;
   font-size: 13.5px;
@@ -560,17 +502,6 @@ async function confirmDisconnect() {
   border-color: var(--color-primary-hover);
 }
 
-.s-btn.secondary {
-  background: var(--color-bg-elevated);
-  color: var(--color-text);
-  border-color: var(--color-border-strong);
-}
-
-.s-btn.secondary:hover {
-  background: #F5F7F5;
-  border-color: var(--color-text-muted);
-}
-
 .s-btn.danger {
   background: var(--color-bg-elevated);
   color: #C73B3B;
@@ -585,51 +516,8 @@ async function confirmDisconnect() {
 
 .s-btn.small {
   padding: 6px 12px;
+  min-height: 44px;
   font-size: 12.5px;
-}
-
-/* ── Local tools ── */
-.local-tools {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-.local-tool-row {
-  display: grid;
-  grid-template-columns: 28px 1fr auto;
-  gap: 14px;
-  align-items: center;
-  padding: 14px 20px;
-}
-
-.local-tool-row + .local-tool-row {
-  border-top: 1px solid var(--color-border);
-}
-
-.local-tool-icon {
-  color: var(--color-primary-mid);
-  display: flex;
-  align-items: center;
-}
-
-.local-tool-info {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
-
-.local-tool-name {
-  font-weight: var(--fw-semibold);
-  font-size: 14px;
-  color: var(--color-text);
-}
-
-.local-tool-desc {
-  font-size: 12.5px;
-  color: var(--color-text-muted);
 }
 
 /* ── Responsive ── */

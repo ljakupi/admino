@@ -1,157 +1,467 @@
-"""Tests for the memory tool (admino.tools.memory) — PostgreSQL-backed.
+"""Tests for the memory tool (admino.tools.memory): each user's own notes (GH-162).
 
-Covers store/recall/list actions with a mocked asyncpg pool,
-Pydantic model validation, and adversarial input handling.
+The handlers ``memory_store`` / ``memory_recall`` / ``memory_list`` take the
+validated args plus a required keyword-only ``tenant`` (``TenantContext``, built
+server-side from the logged-in principal) and run against the shared
+in-memory ``FakeDb`` (``tests/db_fakes.py``), which models migration 0017's
+``memory`` table: ``user_id`` and ``org_id`` (FKs, NOT NULL), ``key`` (CHECK
+``^[a-zA-Z0-9_. -]{1,200}$``), ``value`` (at most 2000 characters), primary key
+``(user_id, key)``.
+
+Covers:
+- ``tenant`` is required: calling a handler without it is a TypeError.
+- Isolation: a user only stores, recalls and lists their own notes; another
+  user of the same org, or a user of another org, with the same key is
+  separate, and a row under the user's id but another org is invisible.
+- Store is an upsert on ``(user_id, key)``: the second value replaces the
+  first, still one row.
+- Outputs are unchanged: "Stored memory: <key>", the value or "No memory found
+  for key: <key>", newline-joined sorted keys or "No memories stored.".
+- Every memory statement is parameterized and carries both the tenant's
+  user_id and org_id as bind args; no key, value or id is interpolated.
+- Registration is unchanged (store / recall / list, no delete handler) and
+  ``memory.delete`` stays a hardcoded denial.
+- The args models still reject bad keys and oversized values.
 
 Security notes:
-- All database calls are mocked — no real PostgreSQL connections.
-- Verifies parameterized queries ($1, $2) are used, not string interpolation.
+- Tenant isolation: content queries filter by the caller's org_id AND user_id
+  from the TenantContext, never from a request or LLM value.
+- No content in logs: memory keys and values never appear in log lines.
+- No real PostgreSQL: ``admino.tools.memory.get_pool`` returns ``FakeDb.pool``.
 """
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+import importlib
+import inspect
+import logging
+import re
+from typing import TYPE_CHECKING, Any
+from unittest.mock import patch
 
 import pytest
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from admino.models import MemoryListArgs, MemoryRecallArgs, MemoryStoreArgs
+from admino.access import Principal
+from admino.models import MemoryListArgs, MemoryRecallArgs, MemoryStoreArgs, ToolCall
+from admino.permissions import PermissionsConfig, ToolPermissions, check_permission
+from admino.tenancy import TenantContext
+from admino.tools.registry import clear_registry, get_registered_tools, get_tool_entry
+from tests.db_fakes import OTHER_ORG_ID, FakeDb
+
+if TYPE_CHECKING:
+    import uuid
+    from collections.abc import Generator
+
+
+# ---------------------------------------------------------------------------
+# Fixtures and helpers
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture()
-def mock_pool() -> MagicMock:
-    """Return a mock asyncpg pool for memory tool tests."""
-    pool = MagicMock()
-    pool.execute = AsyncMock()
-    pool.fetch = AsyncMock(return_value=[])
-    pool.fetchrow = AsyncMock(return_value=None)
-    pool.fetchval = AsyncMock(return_value=None)
-    return pool
+def db() -> Generator[FakeDb, None, None]:
+    """A fresh FakeDb behind ``admino.tools.memory.get_pool``."""
+    fake = FakeDb()
+    with patch("admino.tools.memory.get_pool", return_value=fake.pool):
+        yield fake
+
+
+def _tenant(db: FakeDb, user_id: uuid.UUID) -> TenantContext:
+    """The TenantContext of a FakeDb member, built the way the server builds it."""
+    user = db.users[user_id]
+    principal = Principal(user_id=user_id, kind="member", org_id=user["org_id"], role=user["role"])
+    return TenantContext.from_principal(principal)
+
+
+@pytest.fixture()
+def alice(db: FakeDb) -> TenantContext:
+    """An editor of ORG_ID."""
+    return _tenant(db, db.add_account(role="editor"))
+
+
+@pytest.fixture()
+def bob(db: FakeDb) -> TenantContext:
+    """Another member (an Org Admin) of alice's org."""
+    return _tenant(db, db.add_account(role="org_admin"))
+
+
+@pytest.fixture()
+def carol(db: FakeDb) -> TenantContext:
+    """An editor of another organization (OTHER_ORG_ID)."""
+    return _tenant(db, db.add_account(role="editor", org_id=OTHER_ORG_ID))
+
+
+async def _store(key: str, value: str, tenant: TenantContext) -> str:
+    from admino.tools.memory import memory_store
+
+    return await memory_store(MemoryStoreArgs(key=key, value=value), tenant=tenant)
+
+
+async def _recall(key: str, tenant: TenantContext) -> str:
+    from admino.tools.memory import memory_recall
+
+    return await memory_recall(MemoryRecallArgs(key=key), tenant=tenant)
+
+
+async def _list(tenant: TenantContext) -> str:
+    from admino.tools.memory import memory_list
+
+    return await memory_list(MemoryListArgs(), tenant=tenant)
+
+
+def _memory_calls(db: FakeDb) -> list[Any]:
+    """Every recorded statement on the memory table."""
+    return db.matching(r"\bmemory\b")
+
+
+def _rows_of(db: FakeDb, tenant: TenantContext) -> list[dict[str, Any]]:
+    return [row for (owner, _), row in db.memory.items() if owner == tenant.user_id]
+
+
+_HANDLER_ARGS: list[Any] = [
+    pytest.param("memory_store", MemoryStoreArgs(key="greeting", value="hello"), id="store"),
+    pytest.param("memory_recall", MemoryRecallArgs(key="greeting"), id="recall"),
+    pytest.param("memory_list", MemoryListArgs(), id="list"),
+]
 
 
 # ---------------------------------------------------------------------------
-# 1. Store Tests
+# 1. The tool context is required
 # ---------------------------------------------------------------------------
 
 
-class TestMemoryStore:
-    """Tests for the memory_store handler."""
+class TestMemoryHandlersRequireTenant:
+    """Every handler takes a required keyword-only tenant; without one, nothing runs."""
 
-    async def test_stores_new_key(self, mock_pool: MagicMock) -> None:
-        """memory_store calls pool.execute with INSERT/ON CONFLICT SQL."""
-        from admino.tools.memory import memory_store
+    @pytest.mark.parametrize(("name", "args"), _HANDLER_ARGS)
+    def test_memory_handler_tenant_is_keyword_only_without_default(
+        self, name: str, args: BaseModel
+    ) -> None:
+        """tenant is keyword-only with no default."""
+        import admino.tools.memory as memory_module
 
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            result = await memory_store(MemoryStoreArgs(key="greeting", value="hello world"))
+        param = inspect.signature(getattr(memory_module, name)).parameters.get("tenant")
 
-        assert "Stored memory: greeting" in result
-        mock_pool.execute.assert_awaited_once()
+        assert param is not None, f"{name} must take a tenant"
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is inspect.Parameter.empty
 
-    async def test_store_uses_parameterized_query(self, mock_pool: MagicMock) -> None:
-        """memory_store uses $1, $2 placeholders, not string interpolation."""
-        from admino.tools.memory import memory_store
+    @pytest.mark.parametrize(("name", "args"), _HANDLER_ARGS)
+    async def test_memory_handler_without_tenant_raises_type_error(
+        self, db: FakeDb, name: str, args: BaseModel
+    ) -> None:
+        """A call without the tenant is a TypeError and runs no statement."""
+        import admino.tools.memory as memory_module
 
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            await memory_store(MemoryStoreArgs(key="mykey", value="myval"))
+        handler: Any = getattr(memory_module, name)
 
-        call_args = mock_pool.execute.call_args
-        sql = call_args.args[0]
-        assert "$1" in sql
-        assert "$2" in sql
-        assert call_args.args[1] == "mykey"
-        assert call_args.args[2] == "myval"
-
-    async def test_returns_confirmation_message(self, mock_pool: MagicMock) -> None:
-        """memory_store returns 'Stored memory: <key>'."""
-        from admino.tools.memory import memory_store
-
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            result = await memory_store(MemoryStoreArgs(key="mykey", value="myval"))
-
-        assert result == "Stored memory: mykey"
+        with pytest.raises(TypeError):
+            await handler(args)
+        assert _memory_calls(db) == []
 
 
 # ---------------------------------------------------------------------------
-# 2. Recall Tests
+# 2. Store and recall: each user's own notes
 # ---------------------------------------------------------------------------
 
 
-class TestMemoryRecall:
-    """Tests for the memory_recall handler."""
+class TestMemoryStoreAndRecall:
+    """A user stores and recalls only their own notes."""
 
-    async def test_recalls_existing_key(self, mock_pool: MagicMock) -> None:
-        """memory_recall returns the value when a row is found."""
-        from admino.tools.memory import memory_recall
+    async def test_memory_store_then_recall_returns_the_value(
+        self, db: FakeDb, alice: TenantContext
+    ) -> None:
+        """Store confirms with the key; recall returns the stored value."""
+        stored = await _store("greeting", "hello world", alice)
+        recalled = await _recall("greeting", alice)
 
-        mock_pool.fetchrow = AsyncMock(return_value={"value": "admino"})
+        assert stored == "Stored memory: greeting"
+        assert recalled == "hello world"
 
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            result = await memory_recall(MemoryRecallArgs(key="name"))
+    async def test_memory_store_writes_the_tenants_user_and_org(
+        self, db: FakeDb, alice: TenantContext
+    ) -> None:
+        """The row belongs to the caller: their user_id and their org_id."""
+        await _store("greeting", "hello world", alice)
 
-        assert result == "admino"
+        assert db.memories_of(alice.user_id) == {"greeting": "hello world"}
+        [row] = _rows_of(db, alice)
+        assert (row["user_id"], row["org_id"], row["key"]) == (
+            alice.user_id,
+            alice.org_id,
+            "greeting",
+        )
 
-    async def test_returns_not_found_for_missing_key(self, mock_pool: MagicMock) -> None:
-        """memory_recall returns not-found when fetchrow returns None."""
-        from admino.tools.memory import memory_recall
+    async def test_memory_other_user_cannot_recall_a_users_key(
+        self, db: FakeDb, alice: TenantContext, bob: TenantContext
+    ) -> None:
+        """Bob (same org) asking for Alice's key gets the not-found message."""
+        await _store("pin-hint", "alice-only-value", alice)
 
-        mock_pool.fetchrow = AsyncMock(return_value=None)
+        assert await _recall("pin-hint", bob) == "No memory found for key: pin-hint"
 
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            result = await memory_recall(MemoryRecallArgs(key="nonexistent"))
+    async def test_memory_same_key_for_two_users_keeps_both_values(
+        self, db: FakeDb, alice: TenantContext, bob: TenantContext
+    ) -> None:
+        """Alice and Bob store the same key with different values; each recalls their own."""
+        await _store("project", "alice-value", alice)
+        await _store("project", "bob-value", bob)
 
-        assert "No memory found for key: nonexistent" in result
+        assert await _recall("project", alice) == "alice-value"
+        assert await _recall("project", bob) == "bob-value"
+        assert db.memories_of(alice.user_id) == {"project": "alice-value"}
+        assert db.memories_of(bob.user_id) == {"project": "bob-value"}
 
-    async def test_recall_uses_parameterized_query(self, mock_pool: MagicMock) -> None:
-        """memory_recall uses $1 placeholder for the key."""
-        from admino.tools.memory import memory_recall
+    async def test_memory_store_by_another_user_never_overwrites(
+        self, db: FakeDb, alice: TenantContext, bob: TenantContext
+    ) -> None:
+        """Bob storing Alice's key creates Bob's note; Alice's value is untouched."""
+        db.add_memory(alice.user_id, "project", "alice-value")
 
-        mock_pool.fetchrow = AsyncMock(return_value=None)
+        await _store("project", "bob-value", bob)
 
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            await memory_recall(MemoryRecallArgs(key="testkey"))
+        assert db.memories_of(alice.user_id) == {"project": "alice-value"}
+        assert await _recall("project", alice) == "alice-value"
 
-        call_args = mock_pool.fetchrow.call_args
-        sql = call_args.args[0]
-        assert "$1" in sql
-        assert call_args.args[1] == "testkey"
+    async def test_memory_user_of_another_org_is_isolated(
+        self, db: FakeDb, alice: TenantContext, carol: TenantContext
+    ) -> None:
+        """Carol (another org) with the same key: neither sees the other's value."""
+        await _store("project", "alice-value", alice)
+        await _store("project", "carol-value", carol)
+        await _store("carol-only", "carol-secret", carol)
+
+        assert await _recall("project", alice) == "alice-value"
+        assert await _recall("project", carol) == "carol-value"
+        assert await _recall("carol-only", alice) == "No memory found for key: carol-only"
+        assert _rows_of(db, carol)[0]["org_id"] == OTHER_ORG_ID
+
+    async def test_memory_row_under_another_org_is_invisible(
+        self, db: FakeDb, alice: TenantContext
+    ) -> None:
+        """A row with the caller's user_id but another org_id is neither recalled nor
+        listed: every read filters by the org too, not by the user alone."""
+        db.add_org(OTHER_ORG_ID)
+        db.add_memory(alice.user_id, "stray", "stray-value", org_id=OTHER_ORG_ID)
+
+        assert await _recall("stray", alice) == "No memory found for key: stray"
+        assert await _list(alice) == "No memories stored."
+
+    async def test_memory_recall_missing_key_returns_not_found(
+        self, db: FakeDb, alice: TenantContext
+    ) -> None:
+        """A key the caller never stored gets the fixed not-found message, from one
+        lookup bound to the caller's ids and the key."""
+        db.add_memory(alice.user_id, "other-key", "other-value")
+
+        result = await _recall("nonexistent", alice)
+
+        assert result == "No memory found for key: nonexistent"
+        [call] = _memory_calls(db)
+        assert {str(alice.user_id), str(alice.org_id), "nonexistent"} <= {
+            str(arg) for arg in call.args
+        }
+
+    async def test_memory_store_is_an_upsert(self, db: FakeDb, alice: TenantContext) -> None:
+        """Storing a key twice replaces the value and keeps exactly one row."""
+        first = await _store("mood", "first value", alice)
+        second = await _store("mood", "second value", alice)
+
+        assert (first, second) == ("Stored memory: mood", "Stored memory: mood")
+        assert await _recall("mood", alice) == "second value"
+        assert db.memories_of(alice.user_id) == {"mood": "second value"}
+        assert len(_rows_of(db, alice)) == 1
 
 
 # ---------------------------------------------------------------------------
-# 3. List Tests
+# 3. List: only the caller's keys, sorted
 # ---------------------------------------------------------------------------
 
 
 class TestMemoryList:
-    """Tests for the memory_list handler."""
+    """memory_list lists the caller's keys only."""
 
-    async def test_lists_all_keys(self, mock_pool: MagicMock) -> None:
-        """memory_list returns keys from pool.fetch results."""
-        from admino.tools.memory import memory_list
+    async def test_memory_list_returns_only_the_callers_keys_sorted(
+        self, db: FakeDb, alice: TenantContext, bob: TenantContext, carol: TenantContext
+    ) -> None:
+        """Alice's keys, sorted and newline-joined; Bob's and Carol's never appear."""
+        for key in ("zebra", "alpha", "middle"):
+            await _store(key, f"value of {key}", alice)
+        db.add_memory(bob.user_id, "beta", "bob-value")
+        db.add_memory(carol.user_id, "aardvark", "carol-value")
 
-        mock_pool.fetch = AsyncMock(
-            return_value=[{"key": "alpha"}, {"key": "middle"}, {"key": "zebra"}]
-        )
+        assert await _list(alice) == "alpha\nmiddle\nzebra"
 
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            result = await memory_list(MemoryListArgs())
+    async def test_memory_list_of_each_user_is_their_own(
+        self, db: FakeDb, alice: TenantContext, bob: TenantContext
+    ) -> None:
+        """Two users with overlapping keys each list exactly their own set."""
+        db.add_memory(alice.user_id, "shared", "a")
+        db.add_memory(alice.user_id, "alice-only", "a")
+        db.add_memory(bob.user_id, "shared", "b")
+        db.add_memory(bob.user_id, "bob-only", "b")
 
-        lines = result.strip().split("\n")
-        assert lines == ["alpha", "middle", "zebra"]
+        assert await _list(alice) == "alice-only\nshared"
+        assert await _list(bob) == "bob-only\nshared"
 
-    async def test_empty_returns_no_memories_message(self, mock_pool: MagicMock) -> None:
-        """memory_list returns 'No memories stored.' when fetch returns empty."""
-        from admino.tools.memory import memory_list
+    async def test_memory_list_without_notes_says_none_stored(
+        self, db: FakeDb, alice: TenantContext, bob: TenantContext
+    ) -> None:
+        """A user with no notes gets "No memories stored." even when others have some."""
+        db.add_memory(bob.user_id, "bob-note", "b")
 
-        mock_pool.fetch = AsyncMock(return_value=[])
-
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            result = await memory_list(MemoryListArgs())
-
-        assert result == "No memories stored."
+        assert await _list(alice) == "No memories stored."
 
 
 # ---------------------------------------------------------------------------
-# 4. Pydantic Model Validation Tests
+# 4. The SQL: parameterized and scoped to the tenant
+# ---------------------------------------------------------------------------
+
+
+class TestMemorySqlIsScoped:
+    """Every memory statement binds the tenant's user_id and org_id; nothing is
+    interpolated into the SQL text."""
+
+    async def test_memory_every_statement_binds_user_and_org(
+        self, db: FakeDb, alice: TenantContext
+    ) -> None:
+        """Store, recall and list each run statements carrying both ids as bind args."""
+        await _store("greeting", "hello", alice)
+        await _recall("greeting", alice)
+        await _list(alice)
+
+        calls = _memory_calls(db)
+        assert len(calls) >= 3
+        for call in calls:
+            bound = {str(arg) for arg in call.args}
+            assert str(alice.user_id) in bound, call.sql
+            assert str(alice.org_id) in bound, call.sql
+            assert re.search(r"\$\d", call.sql), call.sql
+
+    @pytest.mark.parametrize(
+        "value",
+        ["'; DROP TABLE memory; --", "x' OR '1'='1", "Robert'); DELETE FROM memory; --"],
+    )
+    async def test_memory_values_are_bind_args_never_sql_text(
+        self, db: FakeDb, alice: TenantContext, value: str
+    ) -> None:
+        """An injection-shaped value is stored and recalled verbatim, and neither it, the
+        key nor an id ever appears in the SQL text."""
+        key = "marker-key-7f3a"
+
+        await _store(key, value, alice)
+        recalled = await _recall(key, alice)
+
+        assert recalled == value
+        store_calls = [call for call in _memory_calls(db) if value in call.args]
+        assert len(store_calls) == 1
+        assert key in store_calls[0].args
+        for call in _memory_calls(db):
+            for literal in (value, key, str(alice.user_id), str(alice.org_id)):
+                assert literal not in call.sql
+
+    async def test_memory_max_length_value_is_stored_whole(
+        self, db: FakeDb, alice: TenantContext
+    ) -> None:
+        """A value at the 2000-character limit is stored and recalled whole."""
+        long_value = "x" * 2000
+
+        await _store("long-val", long_value, alice)
+
+        assert await _recall("long-val", alice) == long_value
+
+    async def test_memory_logs_no_keys_or_values(
+        self, db: FakeDb, alice: TenantContext, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No content in logs: neither the key nor the value reaches any log line."""
+        key = "log-marker-key-5d1e"
+        value = "LOG-MARKER-VALUE-91bc"
+
+        with caplog.at_level(logging.DEBUG):
+            await _store(key, value, alice)
+            await _recall(key, alice)
+            await _list(alice)
+
+        assert db.memories_of(alice.user_id) == {key: value}
+        assert key not in caplog.text
+        assert value not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 5. Registration and the memory.delete denial
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def memory_registry(db: FakeDb) -> Generator[None, None, None]:
+    """Re-run the memory module's registrations into a clean registry.
+
+    The reload re-binds the module's ``get_pool``, so it is patched to the FakeDb
+    pool again afterwards.
+    """
+    import admino.tools.memory as memory_module
+
+    clear_registry()
+    importlib.reload(memory_module)
+    with patch("admino.tools.memory.get_pool", return_value=db.pool):
+        yield
+    clear_registry()
+
+
+class TestMemoryRegistration:
+    """store / recall / list stay the only memory tools; delete stays denied."""
+
+    async def test_memory_registered_actions_dispatch_with_the_tenant(
+        self, db: FakeDb, alice: TenantContext, memory_registry: None
+    ) -> None:
+        """Exactly store, recall and list are registered (no delete handler), and a
+        registry dispatch of memory.store lands in the dispatching tenant's notes."""
+        from admino.permissions import build_default_permissions_config
+        from admino.tools.registry import dispatch_tool_call
+
+        registered = {(t.tool, t.action) for t in get_registered_tools() if t.tool == "memory"}
+
+        result = await dispatch_tool_call(
+            ToolCall(tool="memory", action="store", args={"key": "via-registry", "value": "v"}),
+            build_default_permissions_config(),
+            session_id="sess-1",
+            tenant=alice,
+        )
+
+        assert registered == {("memory", "store"), ("memory", "recall"), ("memory", "list")}
+        assert get_tool_entry("memory", "delete") is None
+        assert (result.success, result.result) == (True, "Stored memory: via-registry")
+        assert db.memories_of(alice.user_id) == {"via-registry": "v"}
+
+    async def test_memory_delete_stays_denied_even_when_config_allows(
+        self, db: FakeDb, alice: TenantContext, memory_registry: None
+    ) -> None:
+        """memory.delete is a hardcoded denial: the engine says deny over a config that
+        allows it, and a dispatch is refused without touching the memory table."""
+        from admino.tools.registry import dispatch_tool_call
+
+        db.add_memory(alice.user_id, "keep-me", "kept")
+        config = PermissionsConfig(
+            tools={"memory": ToolPermissions(actions={"delete": "allow", "store": "allow"})}
+        )
+
+        decision = check_permission("memory", "delete", config)
+        result = await dispatch_tool_call(
+            ToolCall(tool="memory", action="delete", args={"key": "keep-me"}),
+            config,
+            session_id="sess-1",
+            tenant=alice,
+        )
+
+        assert decision.allowed == "deny"
+        assert (result.success, result.permission.allowed) == (False, "deny")
+        assert _memory_calls(db) == []
+        assert db.memories_of(alice.user_id) == {"keep-me": "kept"}
+
+
+# ---------------------------------------------------------------------------
+# 6. Pydantic model validation
 # ---------------------------------------------------------------------------
 
 
@@ -213,54 +523,7 @@ class TestMemoryModelValidation:
         args = MemoryStoreArgs(key="my key", value="val")
         assert args.key == "my key"
 
-
-# ---------------------------------------------------------------------------
-# 5. Adversarial / SQL Injection Tests
-# ---------------------------------------------------------------------------
-
-
-class TestAdversarialInputs:
-    """Adversarial tests verifying parameterized queries block SQL injection."""
-
-    async def test_sql_injection_in_value_uses_parameterized_query(
-        self, mock_pool: MagicMock
-    ) -> None:
-        """SQL injection attempts in values are passed as parameters, not interpolated."""
-        from admino.tools.memory import memory_store
-
-        malicious_value = "'; DROP TABLE memory; --"
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            await memory_store(MemoryStoreArgs(key="safe-key", value=malicious_value))
-
-        call_args = mock_pool.execute.call_args
-        sql = call_args.args[0]
-        # The malicious value must NOT appear in the SQL string itself
-        assert "DROP TABLE" not in sql
-        # It must be passed as a separate parameter
-        assert call_args.args[2] == malicious_value
-
-    async def test_unicode_values_passed_as_parameters(self, mock_pool: MagicMock) -> None:
-        """Unicode content is passed as a parameter to pool.execute."""
-        from admino.tools.memory import memory_store
-
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            await memory_store(MemoryStoreArgs(key="emoji-test", value="Hello world!"))
-
-        call_args = mock_pool.execute.call_args
-        assert call_args.args[2] == "Hello world!"
-
-    async def test_very_long_valid_value_passed_as_parameter(self, mock_pool: MagicMock) -> None:
-        """Values at exactly max_length are passed as parameters."""
-        from admino.tools.memory import memory_store
-
-        long_value = "x" * 2000
-        with patch("admino.tools.memory.get_pool", return_value=mock_pool):
-            await memory_store(MemoryStoreArgs(key="long-val", value=long_value))
-
-        call_args = mock_pool.execute.call_args
-        assert call_args.args[2] == long_value
-
-    async def test_recall_sql_injection_key_rejected_by_pydantic(self) -> None:
+    def test_recall_sql_injection_key_rejected_by_pydantic(self) -> None:
         """SQL injection in recall key is rejected by Pydantic validation."""
         with pytest.raises(ValidationError):
             MemoryRecallArgs(key="'; DROP TABLE memory; --")
