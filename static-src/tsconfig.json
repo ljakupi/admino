@@ -16,6 +16,5 @@
     },
     "types": ["vite/client"]
   },
-  "include": ["src/**/*.ts", "src/**/*.vue", "env.d.ts"],
-  "references": [{ "path": "./tsconfig.node.json" }]
+  "include": ["src/**/*.ts", "src/**/*.vue", "env.d.ts"]
 }

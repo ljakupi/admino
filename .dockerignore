@@ -64,3 +64,7 @@ Makefile
 static/
 static-src/node_modules/
 static-src/*.tsbuildinfo
+# Compiled Vite config left in older checkouts (GH-212). Vite loads
+# vite.config.js before vite.config.ts, so a stale copy would override it.
+static-src/vite.config.js
+static-src/vite.config.d.ts
