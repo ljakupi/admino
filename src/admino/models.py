@@ -227,8 +227,12 @@ class ChatMessage(BaseModel):
 class ChatRequest(BaseModel):
     """Incoming POST /chat request body.
 
-    Validated on receipt by the ASGI server before any processing.
+    Validated on receipt by the ASGI server before any processing. Unknown
+    fields (e.g. a smuggled ``org_id`` or ``user_id``) are refused with a 422:
+    whose chat it is comes from the session only (GH-163).
     """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     message: str = Field(
         min_length=1,
@@ -392,8 +396,12 @@ class ChatResponse(BaseModel):
 class ConfirmRequest(BaseModel):
     """Incoming POST /confirm request body.
 
-    Used when the user approves or denies a pending confirmation.
+    Used when the user approves or denies a pending confirmation. Unknown
+    fields (e.g. a smuggled ``org_id`` or ``user_id``) are refused with a 422:
+    whose confirmation it is comes from the session only (GH-163).
     """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     session_id: str = Field(
         min_length=1,

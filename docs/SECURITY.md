@@ -132,6 +132,26 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   the audit log (`login.failure`), and the password rules (at least 12 characters,
   common passwords refused) make that rate negligible.
 
+## Tenant isolation and authorization
+
+- **Sessions.** Every API route needs a session, except `/health`, login, password reset,
+  the invitation link and the OAuth callback (which checks its own state token).
+- **Roles.** Each route checks the caller's role against the role matrix in `access.py`.
+  Each route also rate-limits per user, or per client IP on the public routes.
+- **Own organization only.** A route reads an organization's content only within the
+  caller's own organization. Another organization's resource answers `404` with the same
+  body as an unknown ID, so its existence isn't revealed.
+- **No smuggled IDs.** Request bodies reject unknown fields, so an `org_id` or `user_id`
+  can't be slipped into one. The agent's tools refuse the same fields in their arguments.
+- **Operator blindness.** The Super Admin reaches only the platform routes and their own
+  account. Platform responses carry metadata and counts, never content, titles or file
+  names.
+
+The tenant isolation suite, `tests/test_tenancy*.py`, checks all of this route by route
+over HTTP. Its route catalog lives in `tests/tenancy_world.py`. Every registered route has
+a row there, every role is tried on every route, and every content route has a cross-org
+case. A route added without its row fails the suite.
+
 ## Logs and error tracking
 
 Application logs hold IDs, counts, sizes, statuses and durations only. Message text,

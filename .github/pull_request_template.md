@@ -18,4 +18,5 @@
 - [ ] Pydantic models used for all new data structures
 - [ ] Credential redaction patterns updated if new token types introduced
 - [ ] Permission entries added for new tools (if applicable)
+- [ ] New or changed routes have their row in `tests/tenancy_world.py` (`ROUTES`, and `PENDING_CAPABILITIES` / `PROJECT_ROLES_PENDING` updated) plus role and cross-org cases in the tenant isolation suite, `tests/test_tenancy*.py` (#163) (if applicable)
 - [ ] New UI strings go through `t()` with EN/DE/FR entries; `npm run check:i18n` passes (if applicable)
