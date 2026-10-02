@@ -1,41 +1,52 @@
 """Outlook Calendar tool using Microsoft Graph API.
 
 Provides read, list, create, and update actions for Outlook Calendar events via
-the Microsoft Graph ``/me/events`` and ``/me/calendarView`` endpoints.
-Authentication is handled via OAuth tokens managed by ``admino.oauth``.
+the Microsoft Graph ``/me/events`` and ``/me/calendarView`` endpoints, in the
+calling user's own Microsoft account (per-user connections, GH-162).
+
+Inputs: the validated args (``OutlookCalendarReadArgs``,
+``OutlookCalendarListArgs``, ``OutlookCalendarCreateArgs``,
+``OutlookCalendarUpdateArgs``) and the required keyword ``tenant`` (the run's
+``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
+formatted event(s), a confirmation, or a user-facing error string.
 
 Security notes:
+- Per-user tokens: every API request of a handler call carries the access
+  token of that call's tenant, from ``_get_microsoft_token(tenant)``, which
+  reads the shared per-user cache ``oauth.access_tokens`` (keyed by user and
+  provider). The tenant comes from the server-side session, never from LLM
+  arguments. The module keeps no token state of its own; refresh tokens
+  never leave oauth.py, and no token is logged.
 - No delete capability. outlook_calendar.delete is an immutable hardcoded denial.
 - outlook_calendar.update is a tier-2 promotable denial: denied by default,
   usable only after explicit user promotion (plus per-call confirmation) via the
   Critical Permissions UI. event_id and attendee addresses are validated in
   models.py to prevent path traversal and injection.
 - Event body content is truncated to 10 000 characters before returning.
-- OAuth tokens are cached in-memory only; refresh tokens stay encrypted on disk.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Final
 from urllib.parse import quote
 
 import httpx
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
+from admino import database
 from admino.models import (
     OutlookCalendarCreateArgs,
     OutlookCalendarListArgs,
     OutlookCalendarReadArgs,
     OutlookCalendarUpdateArgs,
 )
-from admino.oauth import OAuthError, get_valid_access_token
+from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
@@ -46,49 +57,32 @@ logger = logging.getLogger(__name__)
 _GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
 _MAX_BODY_CHARS: Final[int] = 10_000
 
-# ---------------------------------------------------------------------------
-# Module-level token cache
-# ---------------------------------------------------------------------------
-
+# The module's HTTP client (created on first use). It holds no credentials:
+# each request sets its own caller's Authorization header.
 _http_client: httpx.AsyncClient | None = None
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
-_token_lock = asyncio.Lock()
 
 
-async def _get_microsoft_token() -> str:
-    """Obtain a valid Microsoft access token, refreshing if needed.
+def _client() -> httpx.AsyncClient:
+    """Return the module's HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+async def _get_microsoft_token(tenant: TenantContext) -> str:
+    """Obtain a valid Microsoft access token for the tenant's own connection.
+
+    Args:
+        tenant: The handler call's tool context; its user's token is used.
 
     Returns:
         A valid access token string.
 
     Raises:
-        OAuthError: If OAuth is not configured or refresh fails.
+        OAuthError: If the user has no Microsoft connection or refresh fails.
     """
-    from admino.database import get_pool
-
-    async with _token_lock:
-        global _http_client, _cached_token, _cached_expires_at
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        _cached_token, _cached_expires_at = await get_valid_access_token(
-            get_pool(), "microsoft", _cached_token, _cached_expires_at, _http_client
-        )
-        return _cached_token
-
-
-async def clear_token_cache() -> None:
-    """Reset the in-memory cached access token.
-
-    Acquires ``_token_lock`` to avoid clearing the cache while a
-    concurrent tool call is mid-refresh. Called by the OAuth disconnect
-    endpoint to ensure stale tokens are not reused after the user
-    disconnects their Microsoft account.
-    """
-    async with _token_lock:
-        global _cached_token, _cached_expires_at
-        _cached_token = None
-        _cached_expires_at = None
+    return await access_tokens.get(database.get_pool(), tenant, "microsoft", _client())
 
 
 def _extract_graph_error(response: httpx.Response) -> str:
@@ -166,17 +160,20 @@ def _format_event_summary(event: dict[str, object]) -> str:
     ),
     args_schema=OutlookCalendarReadArgs,
 )
-async def outlook_calendar_read(args: OutlookCalendarReadArgs, **kwargs: object) -> str:
+async def outlook_calendar_read(
+    args: OutlookCalendarReadArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Read a single Outlook Calendar event by ID.
 
     Args:
         args: Validated read arguments (event_id).
+        tenant: The caller's tool context (whose calendar is read).
 
     Returns:
         Formatted event details, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -189,7 +186,7 @@ async def outlook_calendar_read(args: OutlookCalendarReadArgs, **kwargs: object)
         "?$select=id,subject,start,end,body,location,attendees,webLink"
     )
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -263,17 +260,20 @@ async def outlook_calendar_read(args: OutlookCalendarReadArgs, **kwargs: object)
     description="List Outlook Calendar events in a time range, ordered by start time.",
     args_schema=OutlookCalendarListArgs,
 )
-async def outlook_calendar_list(args: OutlookCalendarListArgs, **kwargs: object) -> str:
+async def outlook_calendar_list(
+    args: OutlookCalendarListArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """List Outlook Calendar events in a time range.
 
     Args:
         args: Validated list arguments (time_min, time_max, max_results).
+        tenant: The caller's tool context (whose calendar is read).
 
     Returns:
         Formatted list of events, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -291,7 +291,7 @@ async def outlook_calendar_list(args: OutlookCalendarListArgs, **kwargs: object)
         "$orderby": "start/dateTime",
     }
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             params=params,
             headers={
@@ -330,17 +330,20 @@ async def outlook_calendar_list(args: OutlookCalendarListArgs, **kwargs: object)
     description="Create a new Outlook Calendar event. Requires user confirmation.",
     args_schema=OutlookCalendarCreateArgs,
 )
-async def outlook_calendar_create(args: OutlookCalendarCreateArgs, **kwargs: object) -> str:
+async def outlook_calendar_create(
+    args: OutlookCalendarCreateArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Create a new Outlook Calendar event.
 
     Args:
         args: Validated create arguments (subject, start, end, body, location).
+        tenant: The caller's tool context (whose calendar gets the event).
 
     Returns:
         Confirmation message with event ID and web link, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -366,7 +369,7 @@ async def outlook_calendar_create(args: OutlookCalendarCreateArgs, **kwargs: obj
     }
 
     try:
-        response = await _http_client.post(  # type: ignore[union-attr]
+        response = await _client().post(
             f"{_GRAPH_BASE}/me/events",
             json=event_payload,
             headers={
@@ -408,11 +411,14 @@ async def outlook_calendar_create(args: OutlookCalendarCreateArgs, **kwargs: obj
     ),
     args_schema=OutlookCalendarUpdateArgs,
 )
-async def outlook_calendar_update(args: OutlookCalendarUpdateArgs, **kwargs: object) -> str:
+async def outlook_calendar_update(
+    args: OutlookCalendarUpdateArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Update an existing Outlook Calendar event (partial PATCH).
 
     Args:
         args: Validated update arguments (event_id plus optional fields).
+        tenant: The caller's tool context (whose calendar is updated).
 
     Returns:
         Confirmation message with the updated event summary, or an error string.
@@ -443,7 +449,7 @@ async def outlook_calendar_update(args: OutlookCalendarUpdateArgs, **kwargs: obj
         return "No fields provided to update. Specify at least one field to change."
 
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -452,7 +458,7 @@ async def outlook_calendar_update(args: OutlookCalendarUpdateArgs, **kwargs: obj
     # Graph event IDs contain '=', '/', '+'; percent-encode before path use.
     event_id = quote(args.event_id, safe="")
     try:
-        response = await _http_client.patch(  # type: ignore[union-attr]
+        response = await _client().patch(
             f"{_GRAPH_BASE}/me/events/{event_id}",
             json=event_payload,
             headers={

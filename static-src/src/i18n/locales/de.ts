@@ -252,20 +252,33 @@ export const de: Record<MessageKey, Message> = {
   'organization.permissions.subtitle':
     'Legen Sie fest, was der Agent in dieser Organisation tun darf, pro Tool und Aktion.',
 
-  // --- toolsPage (connected accounts, local tools, OAuth callback) -------
-  'toolsPage.accounts.title': 'Verbundene Konten',
+  // --- organization services (Org Admin's tool switches, issue #162) -----
+  'organization.services.title': 'Dienste',
+  'organization.services.subtitle':
+    'Schalten Sie Tool-Dienste für alle Mitglieder dieser Organisation ein oder aus.',
+  'organization.services.residencyLocked':
+    'Die Data-Residency-Richtlinie Ihrer Organisation hält Daten in der Schweiz, daher können Google- und Microsoft-Konten nicht genutzt werden.',
+
+  // --- toolsPage (my connections, OAuth callback, issue #162) ------------
+  'toolsPage.accounts.title': 'Meine Verbindungen',
   'toolsPage.accounts.subtitle':
-    'Verbinden Sie einen Anbieter einmal. Einzelne Dienste können Sie jederzeit ein- und ausschalten.',
+    'Verbinden Sie Ihre eigenen Google- und Microsoft-Konten. Trennen Sie sie jederzeit wieder.',
   'toolsPage.status.connected': 'Verbunden',
   'toolsPage.status.notConnected': 'Nicht verbunden',
+  'toolsPage.status.residency': 'Eingeschränkt',
   'toolsPage.google.connectHint': 'Verbinden, um Gmail, Google Kalender und Google Drive zu nutzen.',
   'toolsPage.microsoft.connectHint': 'Verbinden, um Outlook Mail, Outlook-Kalender und OneDrive zu nutzen.',
   'toolsPage.connect': 'Verbinden',
   'toolsPage.disconnect': 'Trennen',
   'toolsPage.service.outlookMail': 'Outlook Mail',
-  'toolsPage.local.title': 'Lokale Tools',
-  'toolsPage.local.subtitle': 'Tools, die auf Ihrem admino-Server laufen. Kein externes Konto nötig.',
-  'toolsPage.memory.description': 'Dauerhafte Schlüssel-Wert-Notizen',
+  'toolsPage.service.state.active': 'Aktiv',
+  'toolsPage.service.state.orgDisabled': 'Von Ihrer Organisation deaktiviert',
+  'toolsPage.service.state.residency': 'Durch Data Residency eingeschränkt',
+  'toolsPage.service.state.notConnected': 'Nicht verbunden',
+  'toolsPage.residency.explanation':
+    'Die Data-Residency-Richtlinie Ihrer Organisation hält Daten in der Schweiz, daher können Google- und Microsoft-Konten nicht genutzt werden.',
+  'toolsPage.residency.connectBlocked':
+    'Die Data-Residency-Richtlinie Ihrer Organisation erlaubt keine Google- oder Microsoft-Konten.',
   'toolsPage.disconnectConfirm.heading': '{provider} trennen?',
   'toolsPage.disconnectConfirm.subtext':
     'Dadurch wird das OAuth-Refresh-Token widerrufen. Sie können sich jederzeit wieder verbinden.',
@@ -276,6 +289,9 @@ export const de: Record<MessageKey, Message> = {
   'toolsPage.oauth.reason.missingCode': 'Kein Autorisierungscode erhalten.',
   'toolsPage.oauth.reason.exchangeFailed':
     'Token-Austausch fehlgeschlagen. Prüfen Sie die OAuth-Zugangsdaten.',
+  'toolsPage.oauth.reason.forbidden': 'Sie sind nicht berechtigt, Konten zu verbinden.',
+  'toolsPage.oauth.reason.residency':
+    'Die Data-Residency-Richtlinie Ihrer Organisation erlaubt keine Google- oder Microsoft-Konten.',
   'toolsPage.oauth.reason.unexpected': 'Ein unerwarteter Fehler ist aufgetreten.',
 
   // --- settings page (subnav, sections, danger zone) ---------------------

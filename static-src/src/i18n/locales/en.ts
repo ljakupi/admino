@@ -251,19 +251,31 @@ export const en = {
   'organization.permissions.title': 'Permission matrix',
   'organization.permissions.subtitle': 'Choose what the agent may do in this organization, per tool and action.',
 
-  // --- toolsPage (connected accounts, local tools, OAuth callback) -------
-  'toolsPage.accounts.title': 'Connected accounts',
-  'toolsPage.accounts.subtitle': 'Connect a provider once. Toggle individual services any time.',
+  // --- organization services (Org Admin's tool switches, issue #162) -----
+  'organization.services.title': 'Services',
+  'organization.services.subtitle': 'Turn tool services on or off for everyone in this organization.',
+  'organization.services.residencyLocked':
+    "Your organization's data residency policy keeps data in Switzerland, so Google and Microsoft accounts can't be used.",
+
+  // --- toolsPage (my connections, OAuth callback, issue #162) ------------
+  'toolsPage.accounts.title': 'My connections',
+  'toolsPage.accounts.subtitle': 'Connect your own Google and Microsoft accounts. Disconnect any time.',
   'toolsPage.status.connected': 'Connected',
   'toolsPage.status.notConnected': 'Not connected',
+  'toolsPage.status.residency': 'Restricted',
   'toolsPage.google.connectHint': 'Connect to use Gmail, Google Calendar, Google Drive.',
   'toolsPage.microsoft.connectHint': 'Connect to use Outlook Mail, Outlook Calendar, OneDrive.',
   'toolsPage.connect': 'Connect',
   'toolsPage.disconnect': 'Disconnect',
   'toolsPage.service.outlookMail': 'Outlook Mail',
-  'toolsPage.local.title': 'Local tools',
-  'toolsPage.local.subtitle': 'Tools that run on your admino server. No external account needed.',
-  'toolsPage.memory.description': 'Persistent key-value notes',
+  'toolsPage.service.state.active': 'Active',
+  'toolsPage.service.state.orgDisabled': 'Turned off by your organization',
+  'toolsPage.service.state.residency': 'Restricted by data residency',
+  'toolsPage.service.state.notConnected': 'Not connected',
+  'toolsPage.residency.explanation':
+    "Your organization's data residency policy keeps data in Switzerland, so Google and Microsoft accounts can't be used.",
+  'toolsPage.residency.connectBlocked':
+    "Your organization's data residency policy doesn't allow Google or Microsoft accounts.",
   'toolsPage.disconnectConfirm.heading': 'Disconnect {provider}?',
   'toolsPage.disconnectConfirm.subtext':
     'This will revoke the OAuth refresh token. You can reconnect at any time.',
@@ -273,6 +285,8 @@ export const en = {
   'toolsPage.oauth.reason.invalidState': 'Session expired. Please try again.',
   'toolsPage.oauth.reason.missingCode': 'No authorization code received.',
   'toolsPage.oauth.reason.exchangeFailed': 'Token exchange failed. Check OAuth credentials.',
+  'toolsPage.oauth.reason.forbidden': "You don't have permission to connect accounts.",
+  'toolsPage.oauth.reason.residency': "Your organization's data residency policy doesn't allow Google or Microsoft accounts.",
   'toolsPage.oauth.reason.unexpected': 'An unexpected error occurred.',
 
   // --- settings page (subnav, sections, danger zone) ---------------------

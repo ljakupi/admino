@@ -13,12 +13,14 @@
  * - `getOAuthStatus` -> `/api/oauth/{provider}/status`.
  * `getOAuthAuthorizeUrl` and `disconnectOAuth` are unchanged. Every call goes
  * through `fetchJson`, so it carries the session cookie and throws `ApiError`
- * on a non-2xx response. `provider` is validated before any request is made,
- * so a crafted value can never reach another path.
+ * on a non-2xx response. `provider` is validated before any request is made
+ * (issue #162: `getOAuthAuthorizeUrl` validates it too, like `getOAuthStatus`
+ * and `disconnectOAuth`), so a crafted value can never reach another path.
  */
 import { fetchJson } from './client';
 import type {
   OAuthConnectionStatus,
+  OAuthProvider,
   OrgSettingsPatch,
   OrgSettingsResponse,
   UserSettingsPatch,
@@ -51,18 +53,21 @@ export async function patchOrgSettings(patch: OrgSettingsPatch): Promise<OrgSett
   });
 }
 
-export async function getOAuthStatus(provider: 'google' | 'microsoft'): Promise<OAuthConnectionStatus> {
+export async function getOAuthStatus(provider: OAuthProvider): Promise<OAuthConnectionStatus> {
   if (provider !== 'google' && provider !== 'microsoft') {
     throw new Error('Invalid provider');
   }
   return fetchJson<OAuthConnectionStatus>(`/api/oauth/${provider}/status`);
 }
 
-export async function getOAuthAuthorizeUrl(provider: 'google' | 'microsoft' = 'google'): Promise<{ url: string }> {
+export async function getOAuthAuthorizeUrl(provider: OAuthProvider): Promise<{ url: string }> {
+  if (provider !== 'google' && provider !== 'microsoft') {
+    throw new Error('Invalid provider');
+  }
   return fetchJson<{ url: string }>(`/api/oauth/${provider}/authorize`);
 }
 
-export async function disconnectOAuth(provider: 'google' | 'microsoft'): Promise<void> {
+export async function disconnectOAuth(provider: OAuthProvider): Promise<void> {
   if (provider !== 'google' && provider !== 'microsoft') {
     throw new Error('Invalid provider');
   }

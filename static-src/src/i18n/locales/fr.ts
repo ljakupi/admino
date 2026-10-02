@@ -250,22 +250,34 @@ export const fr: Record<MessageKey, Message> = {
   'organization.permissions.subtitle':
     "Choisissez ce que l'agent peut faire dans cette organisation, par outil et par action.",
 
-  // --- toolsPage (connected accounts, local tools, OAuth callback) -------
-  'toolsPage.accounts.title': 'Comptes connectés',
+  // --- organization services (Org Admin's tool switches, issue #162) -----
+  'organization.services.title': 'Services',
+  'organization.services.subtitle':
+    'Activez ou désactivez les services pour tous les membres de cette organisation.',
+  'organization.services.residencyLocked':
+    "La politique de résidence des données de votre organisation conserve les données en Suisse, les comptes Google et Microsoft ne peuvent donc pas être utilisés.",
+
+  // --- toolsPage (my connections, OAuth callback, issue #162) ------------
+  'toolsPage.accounts.title': 'Mes connexions',
   'toolsPage.accounts.subtitle':
-    'Connectez un fournisseur une seule fois. Activez ou désactivez chaque service à tout moment.',
+    'Connectez vos propres comptes Google et Microsoft. Déconnectez-les à tout moment.',
   'toolsPage.status.connected': 'Connecté',
   'toolsPage.status.notConnected': 'Non connecté',
+  'toolsPage.status.residency': 'Restreint',
   'toolsPage.google.connectHint': 'Connectez-vous pour utiliser Gmail, Google Agenda et Google Drive.',
   'toolsPage.microsoft.connectHint':
     'Connectez-vous pour utiliser Outlook Mail, Calendrier Outlook et OneDrive.',
   'toolsPage.connect': 'Connecter',
   'toolsPage.disconnect': 'Déconnecter',
   'toolsPage.service.outlookMail': 'Outlook Mail',
-  'toolsPage.local.title': 'Outils locaux',
-  'toolsPage.local.subtitle':
-    'Outils qui fonctionnent sur votre serveur admino. Aucun compte externe requis.',
-  'toolsPage.memory.description': 'Notes clé-valeur persistantes',
+  'toolsPage.service.state.active': 'Actif',
+  'toolsPage.service.state.orgDisabled': 'Désactivé par votre organisation',
+  'toolsPage.service.state.residency': 'Restreint par la résidence des données',
+  'toolsPage.service.state.notConnected': 'Non connecté',
+  'toolsPage.residency.explanation':
+    "La politique de résidence des données de votre organisation conserve les données en Suisse, les comptes Google et Microsoft ne peuvent donc pas être utilisés.",
+  'toolsPage.residency.connectBlocked':
+    "La politique de résidence des données de votre organisation n'autorise pas les comptes Google ou Microsoft.",
   'toolsPage.disconnectConfirm.heading': 'Déconnecter {provider}?',
   'toolsPage.disconnectConfirm.subtext':
     "Le jeton d'actualisation OAuth sera révoqué. Vous pouvez vous reconnecter à tout moment.",
@@ -275,6 +287,9 @@ export const fr: Record<MessageKey, Message> = {
   'toolsPage.oauth.reason.invalidState': 'Session expirée. Veuillez réessayer.',
   'toolsPage.oauth.reason.missingCode': "Aucun code d'autorisation reçu.",
   'toolsPage.oauth.reason.exchangeFailed': "Échec de l'échange de jetons. Vérifiez les identifiants OAuth.",
+  'toolsPage.oauth.reason.forbidden': "Vous n'êtes pas autorisé à connecter des comptes.",
+  'toolsPage.oauth.reason.residency':
+    "La politique de résidence des données de votre organisation n'autorise pas les comptes Google ou Microsoft.",
   'toolsPage.oauth.reason.unexpected': 'Une erreur inattendue est survenue.',
 
   // --- settings page (subnav, sections, danger zone) ---------------------

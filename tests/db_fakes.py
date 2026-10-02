@@ -1,8 +1,9 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-161).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-162).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
-platform_settings, org_settings, user_settings and permissions tables behind a pool-shaped
+platform_settings, org_settings, user_settings, permissions, oauth_tokens and
+memory tables behind a pool-shaped
 object (``FakeDb.pool``). The real ``admino.auth``, ``admino.sessions``,
 ``admino.session_management``, ``admino.password_reset``,
 ``admino.invitations``, ``admino.organizations``, ``admino.email_outbox``,
@@ -68,6 +69,25 @@ The settings scopes (GH-159, migration 0013):
   row deletes its permissions rows. ``add_permissions(org_id)`` seeds an
   org's matrix (``DEFAULT_PERMISSIONS`` unless rows are given) and
   ``org_permissions(org_id)`` reads it back as tool -> {action: state}.
+- ``oauth_tokens`` (GH-162, migration 0017: one row per user and provider):
+  ``user_id`` (UUID NOT NULL, references users ON DELETE CASCADE), ``org_id``
+  (UUID NOT NULL, references organizations ON DELETE CASCADE), ``provider``
+  (TEXT NOT NULL, google / microsoft), ``encrypted_refresh_token`` (TEXT NOT
+  NULL, 1 to 4096 characters), ``email`` (NULL or at most 254 characters),
+  ``scopes`` (JSONB NOT NULL: a JSON array of at most 50 items; asyncpg has no
+  JSONB codec here, so it is sent and returned as a JSON str), ``healthy``
+  (BOOLEAN NOT NULL, default true), ``created_at`` and ``last_refreshed_at``
+  (NOT NULL, default now()); primary key (user_id, provider).
+  ``add_oauth_token`` seeds a row and ``oauth_token(user_id, provider)`` reads
+  one back.
+- ``memory`` (GH-162, migration 0017: each user's notes): ``user_id`` and
+  ``org_id`` (as above, both ON DELETE CASCADE), ``key`` (TEXT NOT NULL, CHECK
+  ``~ '^[a-zA-Z0-9_. -]{1,200}$'``), ``value`` (TEXT NOT NULL, at most 2000
+  characters), ``created_at`` and ``updated_at`` (NOT NULL, default now());
+  primary key (user_id, key). ``add_memory`` seeds a note and
+  ``memories_of(user_id)`` reads a user's notes back as key -> value.
+- Deleting a users row deletes its oauth_tokens and memory rows; deleting an
+  organizations row deletes its org's rows of both tables (CASCADE).
 - The SQL forms the reader runs on these tables (``$n`` bind parameters,
   optionally cast, literals, ``DEFAULT``, ``now()`` and ``coalesce(...)``
   anywhere a value goes):
@@ -446,8 +466,28 @@ PERMISSION_STATES: Final = frozenset({"allow", "confirm", "deny"})
 # The identifier CHECK on permissions.tool and permissions.action, read the way
 # PostgreSQL reads '^[a-z][a-z0-9_]{0,62}$' (a trailing newline doesn't match).
 IDENTIFIER_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,62}")
+# GH-162: per-user OAuth connections and notes (the recreated oauth_tokens and memory).
+_OAUTH_TOKEN_COLUMNS: Final = frozenset(
+    {
+        "user_id",
+        "org_id",
+        "provider",
+        "encrypted_refresh_token",
+        "email",
+        "scopes",
+        "healthy",
+        "created_at",
+        "last_refreshed_at",
+    }
+)
+_MEMORY_COLUMNS: Final = frozenset(
+    {"user_id", "org_id", "key", "value", "created_at", "updated_at"}
+)
+OAUTH_PROVIDERS: Final = frozenset({"google", "microsoft"})
+# memory.key's CHECK ~ '^[a-zA-Z0-9_. -]{1,200}$', read the way PostgreSQL reads it.
+MEMORY_KEY_RE: Final = re.compile(r"[a-zA-Z0-9_. -]{1,200}")
 _SETTINGS_TABLES: Final = frozenset(
-    {"platform_settings", "org_settings", "user_settings", "permissions"}
+    {"platform_settings", "org_settings", "user_settings", "permissions", "oauth_tokens", "memory"}
 )
 # The primary key of every table an INSERT ... ON CONFLICT may name.
 _CONFLICT_KEYS: Final[dict[str, tuple[str, ...]]] = {
@@ -455,6 +495,8 @@ _CONFLICT_KEYS: Final[dict[str, tuple[str, ...]]] = {
     "org_settings": ("org_id",),
     "user_settings": ("user_id",),
     "permissions": ("org_id", "tool", "action"),
+    "oauth_tokens": ("user_id", "provider"),
+    "memory": ("user_id", "key"),
     "login_throttle": ("scope", "subject"),
 }
 # Column types of the settings tables (for asyncpg's encoders and the NOT NULLs).
@@ -486,12 +528,33 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
         "permission": "text",
         "updated_at": "timestamptz",
     },
+    "oauth_tokens": {
+        "user_id": "uuid",
+        "org_id": "uuid",
+        "provider": "text",
+        "encrypted_refresh_token": "text",
+        "email": "text",
+        "scopes": "jsonb",
+        "healthy": "bool",
+        "created_at": "timestamptz",
+        "last_refreshed_at": "timestamptz",
+    },
+    "memory": {
+        "user_id": "uuid",
+        "org_id": "uuid",
+        "key": "text",
+        "value": "text",
+        "created_at": "timestamptz",
+        "updated_at": "timestamptz",
+    },
 }
 _SETTINGS_NULLABLE: Final[dict[str, frozenset[str]]] = {
     "platform_settings": frozenset(MODEL_COLUMNS),
     "org_settings": frozenset(),
     "user_settings": frozenset(),
     "permissions": frozenset(),
+    "oauth_tokens": frozenset({"email"}),
+    "memory": frozenset(),
 }
 # A statement on the old key/value settings table (dropped by migration 0013).
 _OLD_SETTINGS_RE: Final = re.compile(
@@ -510,6 +573,8 @@ _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "org_settings": _ORG_SETTINGS_COLUMNS,
     "user_settings": _USER_SETTINGS_COLUMNS,
     "permissions": _PERMISSIONS_COLUMNS,
+    "oauth_tokens": _OAUTH_TOKEN_COLUMNS,
+    "memory": _MEMORY_COLUMNS,
 }
 # The tables the SQL reader writes (INSERT, UPDATE, DELETE).
 _WRITABLE: Final = frozenset(
@@ -674,6 +739,9 @@ class FakeDb:
         self.user_settings: dict[uuid.UUID, dict[str, Any]] = {}
         # GH-161: the org-scoped permission matrix, keyed by (org_id, tool, action).
         self.permissions: dict[tuple[uuid.UUID, str, str], dict[str, Any]] = {}
+        # GH-162: per-user connections keyed by (user_id, provider), notes by (user_id, key).
+        self.oauth_tokens: dict[tuple[uuid.UUID, str], dict[str, Any]] = {}
+        self.memory: dict[tuple[uuid.UUID, str], dict[str, Any]] = {}
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
         self.open_transactions = 0
@@ -1047,6 +1115,74 @@ class FakeDb:
                 matrix.setdefault(tool, {})[action] = row["permission"]
         return matrix
 
+    def add_oauth_token(
+        self,
+        user_id: uuid.UUID,
+        provider: str,
+        *,
+        encrypted_refresh_token: str,
+        org_id: uuid.UUID | None = None,
+        email: str | None = None,
+        scopes: list[str] | None = None,
+        healthy: bool = True,
+        created_at: datetime | None = None,
+        last_refreshed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Store a user's oauth_tokens row for a provider (GH-162), replacing one they had.
+
+        ``org_id`` defaults to the user's org; ``scopes`` (default ``["scope"]``) is
+        stored as its JSON text, like asyncpg sends a JSONB value without a codec.
+        """
+        now = datetime.now(UTC)
+        row: dict[str, Any] = {
+            "user_id": user_id,
+            "org_id": org_id if org_id is not None else self.users[_canonical(user_id)]["org_id"],
+            "provider": provider,
+            "encrypted_refresh_token": encrypted_refresh_token,
+            "email": email,
+            "scopes": json.dumps(["scope"] if scopes is None else scopes),
+            "healthy": healthy,
+            "created_at": created_at or now,
+            "last_refreshed_at": last_refreshed_at or now,
+        }
+        existing = self.oauth_tokens.get((_canonical(user_id), provider))
+        self.check_settings("oauth_tokens", row, original=existing)
+        self.oauth_tokens[(row["user_id"], provider)] = row
+        return row
+
+    def oauth_token(self, user_id: uuid.UUID, provider: str) -> dict[str, Any] | None:
+        """A user's stored oauth_tokens row for a provider, if any."""
+        return self.oauth_tokens.get((_canonical(user_id), provider))
+
+    def add_memory(
+        self, user_id: uuid.UUID, key: str, value: str, *, org_id: uuid.UUID | None = None
+    ) -> dict[str, Any]:
+        """Store one of a user's notes (GH-162), replacing the note they had under the key.
+
+        ``org_id`` defaults to the user's org.
+        """
+        now = datetime.now(UTC)
+        row: dict[str, Any] = {
+            "user_id": user_id,
+            "org_id": org_id if org_id is not None else self.users[_canonical(user_id)]["org_id"],
+            "key": key,
+            "value": value,
+            "created_at": now,
+            "updated_at": now,
+        }
+        existing = self.memory.get((_canonical(user_id), key))
+        self.check_settings("memory", row, original=existing)
+        self.memory[(row["user_id"], key)] = row
+        return row
+
+    def memories_of(self, user_id: uuid.UUID) -> dict[str, str]:
+        """A user's stored notes as key -> value (empty without any)."""
+        return {
+            key: row["value"]
+            for (owner, key), row in sorted(self.memory.items(), key=str)
+            if owner == _canonical(user_id)
+        }
+
     def platform_row(self) -> dict[str, Any] | None:
         """The platform_settings row, if there is one."""
         return self.platform_settings[0] if self.platform_settings else None
@@ -1170,6 +1306,8 @@ class FakeDb:
                 "org_settings": self.org_settings,
                 "user_settings": self.user_settings,
                 "permissions": self.permissions,
+                "oauth_tokens": self.oauth_tokens,
+                "memory": self.memory,
             }
         )
 
@@ -1187,6 +1325,8 @@ class FakeDb:
         self.org_settings = state["org_settings"]
         self.user_settings = state["user_settings"]
         self.permissions = state["permissions"]
+        self.oauth_tokens = state["oauth_tokens"]
+        self.memory = state["memory"]
 
     def new_connection(self) -> FakeConnection:
         """A new connection on this database."""
@@ -1241,7 +1381,7 @@ class FakeDb:
         if method == "fetch" and re.search(r"\bfrom sessions\b", n):
             return self._list_sessions(n, args)
         if method == "fetchrow" and "sessions" in n:
-            return self._session_row(args)
+            return self._session_row(n, args)
         if (
             method in {"fetchrow", "fetchval"}
             and re.search(r"\bfrom users\b", n)
@@ -1317,6 +1457,10 @@ class FakeDb:
             return list(self.user_settings.values())
         if table == "permissions":
             return list(self.permissions.values())
+        if table == "oauth_tokens":
+            return list(self.oauth_tokens.values())
+        if table == "memory":
+            return list(self.memory.values())
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
 
@@ -1332,7 +1476,12 @@ class FakeDb:
             row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
         elif table == "user_settings":
             row.update(theme="light", notifications_enabled=True, notifications_task_done=False)
-        row["updated_at"] = now
+        elif table == "oauth_tokens":
+            row.update(healthy=True, created_at=now, last_refreshed_at=now)
+        elif table == "memory":
+            row["created_at"] = now
+        if "updated_at" in row:
+            row["updated_at"] = now
         row.update(given)
         return row
 
@@ -1352,6 +1501,10 @@ class FakeDb:
             self.org_settings[row["org_id"]] = row
         elif table == "permissions":
             self.permissions[(row["org_id"], row["tool"], row["action"])] = row
+        elif table == "oauth_tokens":
+            self.oauth_tokens[(row["user_id"], row["provider"])] = row
+        elif table == "memory":
+            self.memory[(row["user_id"], row["key"])] = row
         else:
             self.user_settings[row["user_id"]] = row
 
@@ -1384,6 +1537,15 @@ class FakeDb:
                 valid = isinstance(value, str)
             elif kind == "timestamptz":
                 valid = isinstance(value, datetime) and value.tzinfo is not None
+            elif kind == "jsonb":
+                # No JSONB codec: asyncpg sends the JSON text and PostgreSQL parses it.
+                valid = isinstance(value, str)
+                if valid:
+                    try:
+                        json.loads(value)
+                    except ValueError:
+                        msg = "invalid input syntax for type json"
+                        raise asyncpg.exceptions.InvalidTextRepresentationError(msg) from None
             elif isinstance(value, str):
                 try:
                     row[column] = uuid.UUID(value)
@@ -1422,6 +1584,17 @@ class FakeDb:
             rules.append(("permission", row["permission"] in PERMISSION_STATES))
             rules.append(("tool", IDENTIFIER_RE.fullmatch(row["tool"]) is not None))
             rules.append(("action", IDENTIFIER_RE.fullmatch(row["action"]) is not None))
+        elif table == "oauth_tokens":
+            scopes = json.loads(row["scopes"])
+            rules.append(("provider", row["provider"] in OAUTH_PROVIDERS))
+            rules.append(
+                ("encrypted_refresh_token", 1 <= len(row["encrypted_refresh_token"]) <= 4096)
+            )
+            rules.append(("email", row["email"] is None or len(row["email"]) <= 254))
+            rules.append(("scopes", isinstance(scopes, list) and len(scopes) <= 50))
+        elif table == "memory":
+            rules.append(("key", MEMORY_KEY_RE.fullmatch(row["key"]) is not None))
+            rules.append(("value", len(row["value"]) <= 2000))
         for name, valid in rules:
             if not valid:
                 msg = f'new row for relation "{table}" violates the {name} check'
@@ -1443,6 +1616,12 @@ class FakeDb:
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
         if table == "user_settings" and _canonical(row["user_id"]) not in self.users:
             msg = 'insert or update on table "user_settings" violates foreign key constraint'
+            raise asyncpg.exceptions.ForeignKeyViolationError(msg)
+        if table in {"oauth_tokens", "memory"} and (
+            _canonical(row["user_id"]) not in self.users
+            or _canonical(row["org_id"]) not in self.orgs
+        ):
+            msg = f'insert or update on table "{table}" violates foreign key constraint'
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
 
     def normalized(self, table: str, values: dict[str, Any]) -> dict[str, Any]:
@@ -1780,6 +1959,15 @@ class FakeDb:
             self.permissions = {
                 key: value for key, value in self.permissions.items() if key[0] != row["id"]
             }
+            # GH-162: oauth_tokens.org_id and memory.org_id cascade too.
+            self.oauth_tokens = {
+                key: value
+                for key, value in self.oauth_tokens.items()
+                if value["org_id"] != row["id"]
+            }
+            self.memory = {
+                key: value for key, value in self.memory.items() if value["org_id"] != row["id"]
+            }
             return
         if table == "platform_settings":
             self.platform_settings = [other for other in self.platform_settings if other is not row]
@@ -1793,11 +1981,22 @@ class FakeDb:
         if table == "permissions":
             del self.permissions[(row["org_id"], row["tool"], row["action"])]
             return
+        if table == "oauth_tokens":
+            del self.oauth_tokens[(row["user_id"], row["provider"])]
+            return
+        if table == "memory":
+            del self.memory[(row["user_id"], row["key"])]
+            return
         assert table == "users", f"the fake never deletes from {table}"
         user_id = row["id"]
         del self.users[user_id]
         # GH-159: user_settings.user_id REFERENCES users ON DELETE CASCADE.
         self.user_settings.pop(user_id, None)
+        # GH-162: oauth_tokens.user_id and memory.user_id cascade too.
+        self.oauth_tokens = {
+            key: value for key, value in self.oauth_tokens.items() if key[0] != user_id
+        }
+        self.memory = {key: value for key, value in self.memory.items() if key[0] != user_id}
         self.invitations = {
             key: value for key, value in self.invitations.items() if value["user_id"] != user_id
         }
@@ -2133,9 +2332,16 @@ class FakeDb:
             for row in rows
         ]
 
-    def _session_row(self, args: tuple[Any, ...]) -> dict[str, Any] | None:
+    def _session_row(self, n: str, args: tuple[Any, ...]) -> dict[str, Any] | None:
+        """The resolve row of a session, looked up by token hash or (GH-162) by session id."""
         token_hash = next((arg for arg in args if isinstance(arg, bytes)), None)
         session = self.sessions.get(token_hash) if token_hash is not None else None
+        if token_hash is None and re.search(r"where s\.id = \$1$", n) and args:
+            # GH-162: sessions.resolve_session_by_id (the OAuth callback).
+            wanted = _canonical(args[0]) if isinstance(args[0], uuid.UUID) else None
+            session = next(
+                (row for row in self.sessions.values() if row["session_id"] == wanted), None
+            )
         if session is None:
             return None
         account = self.users[session["user_id"]]
@@ -2353,6 +2559,9 @@ def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
         return True
     if re.search(r"\b(?:platform|org|user)_settings\b", n) or re.search(r"\bpermissions\b", n):
         # GH-159: the settings scopes of migration 0013; GH-161: the org permission matrix.
+        return True
+    if re.search(r"\boauth_tokens\b", n) or re.search(r"\bmemory\b", n):
+        # GH-162: the per-user connections and notes of migration 0017.
         return True
     table = _primary_table(n)
     if table is None and n.startswith("select") and re.search(r"\bsha256 ?\(", n):
@@ -2780,7 +2989,10 @@ class _Statement:
         return rows
 
     def insert(self, n: str) -> tuple[list[dict[str, Any]], int]:
-        if re.search(r"\b(?:(?:platform|org|user)_settings|permissions)\b", n.split("(", 1)[0]):
+        if re.search(
+            r"\b(?:(?:platform|org|user)_settings|permissions|oauth_tokens|memory)\b",
+            n.split("(", 1)[0],
+        ):
             return self.insert_settings(n)
         clauses = _clauses(n, ("insert into", "values", "on conflict", "returning"))
         head = re.fullmatch(r"(\w+) ?\((.*)\)", clauses["insert into"])

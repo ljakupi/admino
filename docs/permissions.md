@@ -38,6 +38,15 @@ Each organization has its own permission matrix:
   first, what is denied, and which services the organization switched off.
 - Every chat run uses its own organization's matrix, critical promotions and tool services.
   One organization's changes never reach another organization's chats.
+- When the organization's data residency policy is on, the Google and Microsoft tools
+  (Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive) count as
+  switched off, whatever the matrix and the service switches say: the agent isn't offered
+  them, a call to one is refused, and the **Permissions** summary shows them as disabled.
+  The stored switches and connections are kept, so they apply again once residency is off.
+- A tool that acts on an account uses the calling user's own connection (see
+  [Tools → Authentication](tools.md#authentication)), and `memory` only ever reads and
+  writes the calling user's own notes. The agent takes the user and organization from the
+  logged-in session, never from the model's tool arguments.
 - The hardcoded denials below are the same for every organization. No organization can
   change them.
 

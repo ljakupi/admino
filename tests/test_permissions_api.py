@@ -49,6 +49,14 @@ What these tests pin down (the GH-161 implementation contract):
   hardcoded denials ``deny`` (whatever is stored), a promoted tier-2 pair
   ``confirm``, otherwise the stored state. Never another org's.
 
+GH-162 (data residency) adds: an org with ``data_residency = true`` has every
+Google/Microsoft tool (gmail, google_calendar, google_drive, outlook,
+outlook_calendar, onedrive) off in its runs' ``tool_policy.enabled_tools``,
+whatever its stored switches and promotions say (memory unaffected, no
+org_settings row written), and its summary reports those tools' actions
+``disabled``. The fixture orgs have no residency, so the GH-161 tests keep their
+meaning; non-residency orgs are unchanged.
+
 All database calls are faked. No network, no real PostgreSQL, no LLM.
 
 Security notes:
@@ -155,6 +163,10 @@ _REMOVED_SERVER_GLOBALS = [
     "_PROMOTION_COOLDOWN_S",
 ]
 _ALL_ON: dict[str, bool] = dict.fromkeys(TOOL_NAMES, True)
+# GH-162: the tools an org's data residency switches off (RESIDENCY_BLOCKED_TOOLS).
+_RESIDENCY_TOOLS: Final = frozenset(
+    {"gmail", "google_calendar", "google_drive", "outlook", "outlook_calendar", "onedrive"}
+)
 _POLICY_TABLES = r"\b(?:permissions|org_settings|audit_events)\b"
 _MATRIX_WRITE = r"^(?:insert into|update|delete from) permissions\b"
 _CROSS_ORIGIN = [
@@ -301,10 +313,11 @@ def _pending(session_id: str) -> PendingConfirmation:
 
 @pytest.fixture()
 def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
-    """The fake database get_pool() returns: two active orgs, each with the default matrix."""
+    """The fake database get_pool() returns: two active orgs without data residency (GH-162),
+    each with the default matrix."""
     fake = FakeDb()
     for org_id in (ORG_ID, OTHER_ORG_ID):
-        fake.add_org(org_id)
+        fake.add_org(org_id, data_residency=False)
         fake.add_permissions(org_id)
     monkeypatch.setattr("admino.database.get_pool", lambda: fake.pool)
     return fake
@@ -470,9 +483,18 @@ def _effective(tool: str, action: str, stored: str, disabled: frozenset[str]) ->
     return stored
 
 
+def _effective_services(db: FakeDb, org_id: uuid.UUID) -> dict[str, bool]:
+    """The org's stored switches (all on without a row), with every residency-blocked tool
+    off when the org has data residency (GH-162)."""
+    services = dict(db.org_tools(org_id) or _ALL_ON)
+    if db.orgs[org_id]["data_residency"]:
+        services.update(dict.fromkeys(_RESIDENCY_TOOLS, False))
+    return services
+
+
 def _expected_summary(db: FakeDb, org_id: uuid.UUID) -> dict[str, list[dict[str, str]]]:
-    tools = db.org_tools(org_id) or _ALL_ON
-    disabled = frozenset(tool for tool, enabled in tools.items() if not enabled)
+    services = _effective_services(db, org_id)
+    disabled = frozenset(tool for tool, enabled in services.items() if not enabled)
     matrix = db.org_permissions(org_id)
     return {
         "permissions": [
@@ -531,7 +553,7 @@ def _assert_policy_of(policy: ToolPolicy, db: FakeDb, org_id: uuid.UUID) -> None
         if matrix.get(tool, {}).get(action) == "confirm"
     )
     assert policy.promoted == promoted
-    assert dict(policy.enabled_tools) == (db.org_tools(org_id) or _ALL_ON)
+    assert dict(policy.enabled_tools) == _effective_services(db, org_id)
 
 
 def _assert_agent_untouched(agent: _SpyAgent) -> None:
@@ -1378,3 +1400,127 @@ class TestSummary:
         assert response.status_code == 200, response.text
         assert _state(db) == before
         assert [call for call in db.calls[since:] if _matches(call, _MATRIX_WRITE)] == []
+
+
+# ---------------------------------------------------------------------------
+# 9. GH-162: data residency switches the Google/Microsoft tools off
+# ---------------------------------------------------------------------------
+
+
+class TestDataResidency:
+    """A residency org's runs and summary have every Google/Microsoft tool off; memory and
+    the other orgs are unaffected; nothing is written."""
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    def test_permissions_api_summary_of_a_residency_org_disables_the_connector_tools(
+        self, db: FakeDb, app: FastAPI, role: str
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=True)
+        _, token = _login(db, role, ORG_ID)
+
+        response = _call(_client(app), "summary_get", token)
+
+        assert response.status_code == 200, response.text
+        states = _states(response.json())
+        connector = {pair: state for pair, state in states.items() if pair[0] in _RESIDENCY_TOOLS}
+        assert connector, "the summary lists no Google/Microsoft action"
+        assert set(connector.values()) == {"disabled"}, connector
+        assert {tool for tool, _ in connector} == _RESIDENCY_TOOLS
+        assert states[("memory", "recall")] == "allow"
+        assert states[("memory", "delete")] == "deny"
+        assert response.json() == _expected_summary(db, ORG_ID)
+
+    def test_permissions_api_summary_of_a_residency_org_disables_a_promoted_pair(
+        self, db: FakeDb, app: FastAPI
+    ) -> None:
+        """A stored gmail.send promotion is still 'disabled' in a residency org's summary;
+        the other org's same promotion reads 'confirm'."""
+        for org_id in (ORG_ID, OTHER_ORG_ID):
+            db.add_permissions(org_id, {"gmail": {"send": "confirm"}})
+        db.add_org(ORG_ID, data_residency=True)
+        _, viewer_a = _login(db, "viewer", ORG_ID)
+        _, viewer_b = _login(db, "viewer", OTHER_ORG_ID)
+        client = _client(app)
+
+        read_a = _call(client, "summary_get", viewer_a)
+        read_b = _call(client, "summary_get", viewer_b)
+
+        assert (read_a.status_code, read_b.status_code) == (200, 200), read_a.text
+        assert _states(read_a.json())[("gmail", "send")] == "disabled"
+        assert _states(read_b.json())[("gmail", "send")] == "confirm"
+        assert _states(read_b.json())[("gmail", "read")] == "allow"
+
+    def test_permissions_api_residency_orgs_run_has_the_connector_tools_off(
+        self, db: FakeDb, app: FastAPI, agent: _SpyAgent
+    ) -> None:
+        """Org A has residency, org B hasn't: A's run has the six tools off (memory on), B's
+        has every service on; no org_settings row is written."""
+        db.add_org(ORG_ID, data_residency=True)
+        _, editor_a = _login(db, "editor", ORG_ID)
+        _, editor_b = _login(db, "editor", OTHER_ORG_ID)
+        client = _client(app)
+
+        sent_a = _post_message(client, editor_a)
+        sent_b = _post_message(client, editor_b)
+
+        assert (sent_a.status_code, sent_b.status_code) == (200, 200), sent_a.text
+        policy_a, policy_b = (_policy(run) for run in agent.runs)
+        assert dict(policy_a.enabled_tools) == {
+            **_ALL_ON,
+            **dict.fromkeys(_RESIDENCY_TOOLS, False),
+        }
+        assert dict(policy_b.enabled_tools) == _ALL_ON
+        assert db.org_settings == {}
+        _assert_agent_untouched(agent)
+
+    def test_permissions_api_residency_overrides_a_stored_switch_and_keeps_memory_off(
+        self, db: FakeDb, app: FastAPI, agent: _SpyAgent
+    ) -> None:
+        """Stored switches: gmail on, memory off. With residency, gmail is off in the run and
+        memory stays off; the stored row is unchanged."""
+        db.add_org_settings(ORG_ID, gmail=True, memory=False)
+        stored = dict(db.org_tools(ORG_ID) or {})
+        db.add_org(ORG_ID, data_residency=True)
+        _, editor = _login(db, "editor", ORG_ID)
+
+        response = _post_message(_client(app), editor)
+
+        assert response.status_code == 200, response.text
+        policy = _policy(agent.runs[0])
+        assert policy.enabled_tools["gmail"] is False
+        assert policy.enabled_tools["memory"] is False
+        assert all(policy.enabled_tools[tool] is False for tool in _RESIDENCY_TOOLS)
+        assert db.org_tools(ORG_ID) == stored
+
+    def test_permissions_api_residency_keeps_a_promoted_connector_pair_switched_off(
+        self, db: FakeDb, app: FastAPI, agent: _SpyAgent
+    ) -> None:
+        """A promoted gmail.send stays unreachable in a residency org: the run's policy has
+        gmail off (the agent advertises and dispatches nothing of a disabled service)."""
+        db.add_permissions(ORG_ID, {"gmail": {"send": "confirm"}})
+        db.add_org(ORG_ID, data_residency=True)
+        _, editor = _login(db, "editor", ORG_ID)
+
+        response = _post_message(_client(app), editor)
+
+        assert response.status_code == 200, response.text
+        policy = _policy(agent.runs[0])
+        assert policy.enabled_tools["gmail"] is False
+        _assert_policy_of(policy, db, ORG_ID)
+
+    def test_permissions_api_residency_change_applies_to_the_next_run(
+        self, db: FakeDb, app: FastAPI, agent: _SpyAgent
+    ) -> None:
+        """Residency is read per run: switched on between two runs of one org."""
+        _, editor = _login(db, "editor", ORG_ID)
+        client = _client(app)
+
+        before = _post_message(client, editor, session_id="before")
+        db.add_org(ORG_ID, data_residency=True)
+        after = _post_message(client, editor, session_id="after")
+
+        assert (before.status_code, after.status_code) == (200, 200), after.text
+        first, second = (_policy(run) for run in agent.runs)
+        assert first.enabled_tools["outlook"] is True
+        assert second.enabled_tools["outlook"] is False
+        _assert_policy_of(second, db, ORG_ID)

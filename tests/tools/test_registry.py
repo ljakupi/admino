@@ -3,16 +3,34 @@
 Covers tool registration, dispatch with permission checks, argument validation,
 handler execution, error handling, and security properties (no input leakage,
 no raw exception details).
+
+GH-162 (per-request tool context): ``dispatch_tool_call`` takes a required
+keyword-only ``tenant`` (``tenancy.TenantContext``, built server-side from the
+logged-in principal) and calls the handler with ``session_id=`` and
+``tenant=`` (the exact object passed). Every dispatch here passes the
+module-level ``_TENANT``; the test handlers take ``**_`` so they accept the new
+keyword. An LLM-supplied ``user_id`` / ``org_id`` / ``tenant`` / ``session_id``
+argument is an unexpected field: rejected before validation with the fixed
+message, and the handler never runs, so tool context never comes from LLM
+arguments.
+
+Security notes:
+- Tenant isolation: each handler call gets the tenant of its own dispatch,
+  also when dispatches for two users interleave.
+- The permission engine still sees (tool, action, config) only, never the
+  tenant.
 """
 
 from __future__ import annotations
 
 import ast
+import asyncio
 import inspect
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, Field
@@ -20,8 +38,10 @@ from pydantic import BaseModel, Field
 if TYPE_CHECKING:
     from collections.abc import Generator
 
+from admino.access import Principal
 from admino.models import PendingConfirmation, ToolCall
 from admino.permissions import PermissionsConfig, ToolPermissions
+from admino.tenancy import TenantContext
 from admino.tools.registry import (
     ToolCallResult,
     ToolDescription,
@@ -30,6 +50,17 @@ from admino.tools.registry import (
     get_registered_tools,
     get_tool_entry,
     register_tool,
+)
+
+# The server-side tool context every dispatch in this suite runs under (GH-162):
+# an editor of one organization.
+_TENANT = TenantContext.from_principal(
+    Principal(
+        user_id=UUID("3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f"),
+        kind="member",
+        org_id=UUID("9a8b7c6d-5e4f-4a3b-9c2d-1e0f9a8b7c6d"),
+        role="editor",
+    )
 )
 
 # ---------------------------------------------------------------------------
@@ -50,18 +81,18 @@ class StrictArgs(BaseModel):
     label: str = Field(min_length=1, max_length=50)
 
 
-async def sample_handler(args: SampleArgs, *, session_id: str) -> str:
+async def sample_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
     """Sample handler that returns a predictable result."""
     return f"result for {args.query}"
 
 
-async def failing_handler(args: SampleArgs, *, session_id: str) -> str:
+async def failing_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
     """Handler that always raises an exception."""
     msg = "secret internal error: /home/user/.config/secrets.json"
     raise RuntimeError(msg)
 
 
-async def strict_handler(args: StrictArgs, *, session_id: str) -> str:
+async def strict_handler(args: StrictArgs, *, session_id: str, **_: object) -> str:
     """Handler for StrictArgs."""
     return f"{args.label}: {args.count}"
 
@@ -271,7 +302,7 @@ class TestDispatchPermissionDenied:
     ) -> None:
         """Tool denied by config returns success=False."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
 
     async def test_dispatch_denied_tool_handler_never_called(
@@ -280,14 +311,14 @@ class TestDispatchPermissionDenied:
         """When denied, the handler function is never invoked."""
         call_count = 0
 
-        async def counting_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def counting_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             nonlocal call_count
             call_count += 1
             return "should not happen"
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(counting_handler)
         tc = _make_tool_call()
-        await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert call_count == 0
 
     async def test_dispatch_denied_returns_permission_result(
@@ -295,7 +326,7 @@ class TestDispatchPermissionDenied:
     ) -> None:
         """Result includes the deny permission decision."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert result.permission.allowed == "deny"
 
     async def test_dispatch_hardcoded_denial_returns_failure(self, registered_tool: None) -> None:
@@ -310,7 +341,9 @@ class TestDispatchPermissionDenied:
             tools={"gmail": ToolPermissions(actions={"send": "allow"})}
         )
         tc = _make_tool_call(tool="gmail", action="send", args={})
-        result = await dispatch_tool_call(tc, config_says_allow, session_id="sess-1")
+        result = await dispatch_tool_call(
+            tc, config_says_allow, session_id="sess-1", tenant=_TENANT
+        )
         assert result.success is False
         assert result.permission.allowed == "deny"
         assert "hardcoded" in result.permission.reason.lower()
@@ -329,7 +362,7 @@ class TestDispatchConfirmRequired:
     ) -> None:
         """When confirm needed and no pending_confirmation, returns success=False."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
 
     async def test_dispatch_confirm_with_pending_proceeds(
@@ -339,7 +372,7 @@ class TestDispatchConfirmRequired:
         tc = _make_tool_call()
         pending = _make_pending_confirmation(tc)
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert result.success is True
         assert "result for test" in result.result
@@ -349,7 +382,7 @@ class TestDispatchConfirmRequired:
     ) -> None:
         """Result message includes tool.action when confirmation is needed."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1", tenant=_TENANT)
         assert "gmail.read" in result.result
 
 
@@ -367,7 +400,7 @@ class TestDispatchUnknownTool:
         """Tool allowed by permissions but not registered returns failure."""
         # gmail.read is allowed but NOT registered (no registered_tool fixture)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "unknown" in result.result.lower()
 
@@ -379,7 +412,7 @@ class TestDispatchUnknownTool:
         """A warning is logged when an unknown tool is dispatched."""
         tc = _make_tool_call()
         with caplog.at_level(logging.WARNING, logger="admino.tools.registry"):
-            await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+            await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert any(
             "unknown tool" in r.message.lower() or "not in registry" in r.message.lower()
             for r in caplog.records
@@ -399,7 +432,7 @@ class TestDispatchArgValidation:
     ) -> None:
         """Wrong args for schema produce a validation error result."""
         tc = _make_tool_call(args={"query": ""})  # min_length=1 violation
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "validation failed" in result.result.lower()
 
@@ -409,7 +442,7 @@ class TestDispatchArgValidation:
         """Error message does NOT contain raw argument values."""
         secret = "super_secret_api_key_ghp_1234567890"
         tc = _make_tool_call(args={"query": secret * 10})  # exceeds max_length=100
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert secret not in result.result
 
@@ -418,7 +451,7 @@ class TestDispatchArgValidation:
     ) -> None:
         """Missing required args produce a validation failure."""
         tc = _make_tool_call(args={})  # 'query' is required
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "validation failed" in result.result.lower()
 
@@ -428,7 +461,7 @@ class TestDispatchArgValidation:
         """Wrong type for an arg field causes validation failure."""
         register_tool("gmail", "read", "Read emails", StrictArgs)(strict_handler)
         tc = _make_tool_call(args={"count": "not_a_number", "label": "test"})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
 
     async def test_dispatch_valid_args_passes_validated_model(
@@ -437,13 +470,13 @@ class TestDispatchArgValidation:
         """Handler receives a Pydantic model instance, not a raw dict."""
         received_args: list[object] = []
 
-        async def capturing_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def capturing_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             received_args.append(args)
             return "ok"
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(capturing_handler)
         tc = _make_tool_call()
-        await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert len(received_args) == 1
         assert isinstance(received_args[0], SampleArgs)
         assert received_args[0].query == "test"  # type: ignore[union-attr]
@@ -462,7 +495,7 @@ class TestDispatchExecution:
     ) -> None:
         """Handler returns a string, dispatch returns success=True with that string."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is True
         assert result.result == "result for test"
 
@@ -472,7 +505,7 @@ class TestDispatchExecution:
         """Handler raising an exception results in success=False."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(failing_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "RuntimeError" in result.result
 
@@ -482,7 +515,7 @@ class TestDispatchExecution:
         """Error result does NOT contain the exception message details."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(failing_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         # The handler's message contains a path -- it must not leak
         assert "secrets.json" not in result.result
         assert "secret internal error" not in result.result
@@ -494,7 +527,7 @@ class TestDispatchExecution:
     ) -> None:
         """Successful dispatch includes the allow permission."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.permission.allowed == "allow"
 
     async def test_dispatch_returns_tool_call_result(
@@ -502,7 +535,7 @@ class TestDispatchExecution:
     ) -> None:
         """Dispatch returns a ToolCallResult model instance."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert isinstance(result, ToolCallResult)
 
 
@@ -563,7 +596,7 @@ class TestDispatchOrdering:
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         # Args that would fail validation -- but permission check comes first
         tc = _make_tool_call(args={"nonexistent_field": 999})
-        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert result.permission.allowed == "deny"
         # If arg validation ran first, error would mention validation, not permission
@@ -575,7 +608,7 @@ class TestDispatchOrdering:
         """An unlisted tool is denied before any arg validation."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         tc = _make_tool_call(args={"bad": True})
-        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert result.permission.allowed == "deny"
 
@@ -593,7 +626,7 @@ class TestAdversarialRegistry:
         register_tool("gmail", "list", "List emails", SampleArgs)(sample_handler)
         # gmail.read is allowed but only gmail.list is registered
         tc = _make_tool_call(tool="gmail", action="read")
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "unknown" in result.result.lower()
 
@@ -602,7 +635,7 @@ class TestAdversarialRegistry:
     ) -> None:
         """Oversized query arg is caught by Pydantic validation."""
         tc = _make_tool_call(args={"query": "x" * 200})  # max_length=100
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "validation failed" in result.result.lower()
 
@@ -611,7 +644,7 @@ class TestAdversarialRegistry:
         config = PermissionsConfig(tools={"gmail": ToolPermissions(actions={"send": "allow"})})
         register_tool("gmail", "send", "Send email", SampleArgs)(sample_handler)
         tc = _make_tool_call(tool="gmail", action="send")
-        result = await dispatch_tool_call(tc, config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert result.permission.allowed == "deny"
 
@@ -620,13 +653,13 @@ class TestAdversarialRegistry:
     ) -> None:
         """Handler exceptions only expose the error type name."""
 
-        async def leaky_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def leaky_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             msg = "Database connection failed: postgres://user:password@host:5432/db"
             raise ConnectionError(msg)
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(leaky_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "password" not in result.result
         assert "postgres" not in result.result
@@ -693,13 +726,15 @@ class TestDispatchHandlerArgPassing:
         """Handler receives the exact session_id passed to dispatch."""
         received_session_ids: list[str] = []
 
-        async def capturing_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def capturing_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             received_session_ids.append(session_id)
             return "ok"
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(capturing_handler)
         tc = _make_tool_call()
-        await dispatch_tool_call(tc, allow_config, session_id="my-unique-session-42")
+        await dispatch_tool_call(
+            tc, allow_config, session_id="my-unique-session-42", tenant=_TENANT
+        )
         assert received_session_ids == ["my-unique-session-42"]
 
     async def test_handler_result_string_passed_through(
@@ -707,23 +742,23 @@ class TestDispatchHandlerArgPassing:
     ) -> None:
         """The exact string returned by the handler appears in ToolCallResult.result."""
 
-        async def custom_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def custom_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return "custom output: 42"
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(custom_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.result == "custom output: 42"
 
     async def test_handler_returns_empty_string(self, allow_config: PermissionsConfig) -> None:
         """Handler returning an empty string is valid and passed through."""
 
-        async def empty_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def empty_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return ""
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(empty_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is True
         assert result.result == ""
 
@@ -731,12 +766,12 @@ class TestDispatchHandlerArgPassing:
         """Handler returning a string at the ToolCallResult max_length (65536) succeeds."""
         max_result = "x" * 65536
 
-        async def big_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def big_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return max_result
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(big_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is True
         assert len(result.result) == 65536
 
@@ -760,12 +795,12 @@ class TestDispatchNoArgsTools:
     ) -> None:
         """Tool with no required fields succeeds with empty args dict."""
 
-        async def no_arg_handler(args: NoArgs, *, session_id: str) -> str:
+        async def no_arg_handler(args: NoArgs, *, session_id: str, **_: object) -> str:
             return "no args needed"
 
         register_tool("gmail", "read", "Read emails", NoArgs)(no_arg_handler)
         tc = _make_tool_call(args={})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is True
         assert result.result == "no args needed"
 
@@ -784,7 +819,7 @@ class TestDispatchArgValidationAdditional:
         """Value exceeding ge/le Field constraint returns validation error."""
         register_tool("gmail", "read", "Read emails", StrictArgs)(strict_handler)
         tc = _make_tool_call(args={"count": 999, "label": "test"})  # le=100
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "validation failed" in result.result.lower()
 
@@ -794,7 +829,7 @@ class TestDispatchArgValidationAdditional:
         """Value below ge constraint returns validation error."""
         register_tool("gmail", "read", "Read emails", StrictArgs)(strict_handler)
         tc = _make_tool_call(args={"count": 0, "label": "test"})  # ge=1
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "validation failed" in result.result.lower()
 
@@ -808,7 +843,7 @@ class TestDispatchArgValidationAdditional:
         the LLM cannot sneak fields past the schema.
         """
         tc = _make_tool_call(args={"query": "test", "extra_field": "sneaky"})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "unexpected fields" in result.result.lower()
 
@@ -818,7 +853,7 @@ class TestDispatchArgValidationAdditional:
         """The rejection message does not echo the extra field's value."""
         secret = "ghp_verysensitivetokenvalue1234567890abcd"
         tc = _make_tool_call(args={"query": "test", "sneaky_token": secret})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert secret not in result.result
 
@@ -829,7 +864,7 @@ class TestDispatchArgValidationAdditional:
         register_tool("gmail", "read", "Read emails", StrictArgs)(strict_handler)
         secret_value = "super_secret_password_12345"
         tc = _make_tool_call(args={"count": secret_value, "label": "test"})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert secret_value not in result.result
 
@@ -841,7 +876,7 @@ class TestDispatchArgValidationAdditional:
         tc = _make_tool_call(args={"query": ""})  # min_length=1 violation
         pending = _make_pending_confirmation(tc)
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert result.success is False
         assert "validation failed" in result.result.lower()
@@ -860,7 +895,7 @@ class TestDispatchPermissionAdditional:
     ) -> None:
         """Denied result includes a non-empty reason from the permission engine."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert result.permission.reason
         assert len(result.permission.reason) > 0
 
@@ -870,14 +905,14 @@ class TestDispatchPermissionAdditional:
         """Config-based denial (not hardcoded) blocks handler from executing."""
         call_count = 0
 
-        async def counting_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def counting_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             nonlocal call_count
             call_count += 1
             return "should not run"
 
         register_tool("gmail", "read", "Read emails", SampleArgs)(counting_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert result.permission.allowed == "deny"
         assert call_count == 0
@@ -886,7 +921,7 @@ class TestDispatchPermissionAdditional:
         """Tool not listed in config at all is denied (default-deny)."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert result.permission.allowed == "deny"
 
@@ -926,7 +961,7 @@ class TestDispatchPermissionAdditional:
         config = PermissionsConfig(tools={tool: ToolPermissions(actions={action: "allow"})})
         register_tool(tool, action, f"{tool} {action}", SampleArgs)(sample_handler)
         tc = _make_tool_call(tool=tool, action=action)
-        result = await dispatch_tool_call(tc, config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert result.permission.allowed == "deny"
 
@@ -943,7 +978,7 @@ class TestDispatchUnknownToolAdditional:
         """Handler for a different tool.action is never called for an unknown one."""
         call_count = 0
 
-        async def counting_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def counting_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             nonlocal call_count
             call_count += 1
             return "ok"
@@ -951,7 +986,7 @@ class TestDispatchUnknownToolAdditional:
         # Register gmail.list, but dispatch gmail.read (allowed but not registered)
         register_tool("gmail", "list", "List emails", SampleArgs)(counting_handler)
         tc = _make_tool_call(tool="gmail", action="read")
-        await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert call_count == 0
 
     async def test_unknown_tool_result_mentions_unknown(
@@ -959,7 +994,7 @@ class TestDispatchUnknownToolAdditional:
     ) -> None:
         """Result message for unknown tool contains 'unknown'."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert "unknown" in result.result.lower()
 
     async def test_unknown_tool_includes_tool_action_in_message(
@@ -967,7 +1002,7 @@ class TestDispatchUnknownToolAdditional:
     ) -> None:
         """Result message for unknown tool includes the tool.action pair."""
         tc = _make_tool_call(tool="gmail", action="read")
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert "gmail.read" in result.result
 
 
@@ -1071,7 +1106,7 @@ class TestDispatchLogging:
         register_tool("gmail", "read", "Read emails", SampleArgs)(failing_handler)
         tc = _make_tool_call()
         with caplog.at_level(logging.ERROR, logger="admino.tools.registry"):
-            await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+            await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert any("RuntimeError" in r.message for r in caplog.records)
 
     async def test_handler_exception_log_does_not_leak_secrets(
@@ -1081,7 +1116,7 @@ class TestDispatchLogging:
         register_tool("gmail", "read", "Read emails", SampleArgs)(failing_handler)
         tc = _make_tool_call()
         with caplog.at_level(logging.ERROR, logger="admino.tools.registry"):
-            await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+            await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         # Check both the message template and the full formatted output (inc. exc_info)
         formatter = logging.Formatter()
         for record in caplog.records:
@@ -1104,7 +1139,7 @@ class TestAdversarialModelConstructBypass:
         """model_construct bypasses validators; dispatch must still reject."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         tc = ToolCall.model_construct(tool="x" * 200, action="../../etc", args={})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
 
     async def test_dispatch_rejects_invalid_identifier_in_tool_call(
@@ -1113,7 +1148,7 @@ class TestAdversarialModelConstructBypass:
         """dispatch_tool_call rejects tool_call with malformed identifiers."""
         register_tool("gmail", "read", "Read emails", SampleArgs)(sample_handler)
         tc = ToolCall.model_construct(tool="GMAIL", action="read", args={"query": "test"})
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
 
 
@@ -1130,12 +1165,12 @@ class TestHandlerResultSanitization:
     ) -> None:
         """Null bytes in handler result are stripped or rejected."""
 
-        async def null_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def null_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return "result\x00with\x00nulls"
 
         register_tool("gmail", "read", "Read", SampleArgs)(null_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         # Either success with nulls stripped, or failure — but never nulls in result
         assert "\x00" not in result.result
 
@@ -1174,12 +1209,12 @@ class TestHandlerNonStringReturn:
     ) -> None:
         """Handler returning None results in success=False with descriptive message."""
 
-        async def none_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def none_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return None  # type: ignore[return-value]
 
         register_tool("gmail", "read", "Read", SampleArgs)(none_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="s1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="s1", tenant=_TENANT)
         assert result.success is False
         assert "non-string" in result.result.lower()
 
@@ -1188,12 +1223,12 @@ class TestHandlerNonStringReturn:
     ) -> None:
         """Handler returning an int results in success=False with descriptive message."""
 
-        async def int_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def int_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return 42  # type: ignore[return-value]
 
         register_tool("gmail", "read", "Read", SampleArgs)(int_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="s1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="s1", tenant=_TENANT)
         assert result.success is False
         assert "non-string" in result.result.lower()
 
@@ -1211,12 +1246,12 @@ class TestHandlerResultTruncation:
     ) -> None:
         """Handler returning >65536 chars is truncated to 65536, still success."""
 
-        async def big_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def big_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             return "x" * 100_000
 
         register_tool("gmail", "read", "Read", SampleArgs)(big_handler)
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="s1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="s1", tenant=_TENANT)
         assert result.success is True
         assert len(result.result) == 65536
 
@@ -1257,24 +1292,24 @@ class TestResourceExhaustionReRaise:
     async def test_memory_error_is_reraised(self, allow_config: PermissionsConfig) -> None:
         """MemoryError from handler propagates instead of being caught."""
 
-        async def oom_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def oom_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             raise MemoryError("out of memory")
 
         register_tool("gmail", "read", "Read", SampleArgs)(oom_handler)
         tc = _make_tool_call()
         with pytest.raises(MemoryError):
-            await dispatch_tool_call(tc, allow_config, session_id="s1")
+            await dispatch_tool_call(tc, allow_config, session_id="s1", tenant=_TENANT)
 
     async def test_recursion_error_is_reraised(self, allow_config: PermissionsConfig) -> None:
         """RecursionError from handler propagates instead of being caught."""
 
-        async def recurse_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def recurse_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             raise RecursionError("max depth")
 
         register_tool("gmail", "read", "Read", SampleArgs)(recurse_handler)
         tc = _make_tool_call()
         with pytest.raises(RecursionError):
-            await dispatch_tool_call(tc, allow_config, session_id="s1")
+            await dispatch_tool_call(tc, allow_config, session_id="s1", tenant=_TENANT)
 
 
 # ---------------------------------------------------------------------------
@@ -1298,7 +1333,7 @@ class TestPendingConfirmationEnforcement:
         # Now dispatch gmail.read with that stale/wrong confirmation
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert result.success is False
         assert result.permission.allowed == "deny"
@@ -1311,7 +1346,7 @@ class TestPendingConfirmationEnforcement:
         pending = _make_pending_confirmation(other_tc)
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert result.success is False
         assert result.permission.allowed == "deny"
@@ -1322,7 +1357,7 @@ class TestPendingConfirmationEnforcement:
         """Handler must not execute when pending_confirmation identity mismatches."""
         called = False
 
-        async def spy_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def spy_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             nonlocal called
             called = True
             return "run"
@@ -1332,7 +1367,7 @@ class TestPendingConfirmationEnforcement:
         pending = _make_pending_confirmation(other_tc)
         tc = _make_tool_call()
         await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert called is False
 
@@ -1352,7 +1387,7 @@ class TestPendingConfirmationEnforcement:
             expires_at=now - timedelta(minutes=5),
         )
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert result.success is False
         assert result.permission.allowed == "deny"
@@ -1364,7 +1399,7 @@ class TestPendingConfirmationEnforcement:
         """Handler must not execute when pending_confirmation has expired."""
         called = False
 
-        async def spy_handler(args: SampleArgs, *, session_id: str) -> str:
+        async def spy_handler(args: SampleArgs, *, session_id: str, **_: object) -> str:
             nonlocal called
             called = True
             return "run"
@@ -1380,7 +1415,7 @@ class TestPendingConfirmationEnforcement:
             expires_at=now - timedelta(minutes=5),
         )
         await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert called is False
 
@@ -1418,7 +1453,7 @@ class TestCheckPermissionIsolation:
         monkeypatch.setattr(reg, "check_permission", spy)
         register_tool("gmail", "read", "Read", SampleArgs)(sample_handler)
         tc = _make_tool_call(args={"query": "sensitive-value-should-not-reach-engine"})
-        await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
 
         assert len(captured) == 1
         positional = captured[0]
@@ -1462,7 +1497,7 @@ class TestHandlerExceptionLogHasNoExcInfo:
         monkeypatch.setattr(reg.logger, "error", spy)
         register_tool("gmail", "read", "Read", SampleArgs)(failing_handler)
         tc = _make_tool_call()
-        await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
 
         assert len(calls) >= 1
         for _args, kwargs in calls:
@@ -1536,6 +1571,7 @@ class TestDispatchWritesNoAudit:
                 _make_tool_call(),
                 allow_config,
                 session_id="sess-1",
+                tenant=_TENANT,
                 audit_logger=None,  # type: ignore[call-arg]
             )
 
@@ -1553,7 +1589,9 @@ class TestDispatchWritesNoAudit:
         from admino.tools import registry as reg
 
         monkeypatch.setattr(reg, "_IS_PRODUCTION", True)
-        result = await dispatch_tool_call(_make_tool_call(), allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="sess-1", tenant=_TENANT
+        )
         assert result.success is True
 
     @pytest.mark.parametrize(
@@ -1629,7 +1667,7 @@ class TestToolEnabledGating:
         """Dispatching a disabled tool returns success=False with a clear message."""
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+            tc, allow_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": False}
         )
         assert result.success is False
         assert "Tool 'gmail' is disabled" in result.result
@@ -1640,7 +1678,7 @@ class TestToolEnabledGating:
         """A disabled tool's result carries a deny decision (what the agent records)."""
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+            tc, allow_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": False}
         )
         assert result.permission.allowed == "deny"
         assert result.success is False
@@ -1651,7 +1689,7 @@ class TestToolEnabledGating:
         """Enabled check runs before permission check: 'disabled' trumps 'deny'."""
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, deny_config, session_id="sess-1", enabled_tools={"gmail": False}
+            tc, deny_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": False}
         )
         assert result.success is False
         assert "disabled" in result.result.lower()
@@ -1662,7 +1700,7 @@ class TestToolEnabledGating:
         """An explicitly enabled tool dispatches normally."""
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": True}
+            tc, allow_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": True}
         )
         assert result.success is True
 
@@ -1671,7 +1709,7 @@ class TestToolEnabledGating:
     ) -> None:
         """Omitting enabled_tools allows dispatch as before (backward compat)."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is True
 
     def test_reenable_tool_makes_it_available(self, registered_tool: None) -> None:
@@ -1693,6 +1731,7 @@ class TestToolEnabledGating:
             tc,
             confirm_config,
             session_id="sess-1",
+            tenant=_TENANT,
             pending_confirmation=pending,
             enabled_tools={"gmail": False},
         )
@@ -1711,7 +1750,7 @@ class TestToolEnabledGating:
         """
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+            tc, allow_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": False}
         )
         assert result.success is False
         assert "disabled" in result.result.lower()
@@ -1726,7 +1765,7 @@ class TestToolEnabledGating:
         """
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", enabled_tools={"gmail": False}
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": False}
         )
         assert result.success is False
         assert "disabled" in result.result.lower()
@@ -1747,6 +1786,7 @@ class TestToolEnabledGating:
             tc,
             config,
             session_id="sess-1",
+            tenant=_TENANT,
             promoted=frozenset({("google_calendar", "update")}),
             enabled_tools={"google_calendar": False},
         )
@@ -1784,6 +1824,7 @@ class TestToolEnabledGating:
             tc,
             allow_config,
             session_id="sess-1",
+            tenant=_TENANT,
             enabled_tools={"gmail": True, "outlook": True},
         )
         assert result.success is True
@@ -1954,7 +1995,7 @@ class TestDispatchUnknownToolBeforePermission:
     ) -> None:
         """A confirm-level action with no handler never asks the user to confirm."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "Unknown tool: gmail.read" in result.result
         assert "confirmation" not in result.result.lower()
@@ -1964,7 +2005,7 @@ class TestDispatchUnknownToolBeforePermission:
     ) -> None:
         """The unknown-tool rejection reports a deny decision, never 'confirm'."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, confirm_config, session_id="sess-1", tenant=_TENANT)
         assert result.permission.allowed == "deny"
         assert result.pending_confirmation is None
 
@@ -1973,7 +2014,7 @@ class TestDispatchUnknownToolBeforePermission:
     ) -> None:
         """An unregistered action configured 'deny' is reported as an unknown tool."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, deny_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "Unknown tool: gmail.read" in result.result
         assert result.permission.allowed == "deny"
@@ -1983,7 +2024,7 @@ class TestDispatchUnknownToolBeforePermission:
     ) -> None:
         """An unregistered action absent from the config is reported as unknown."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, empty_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "Unknown tool: gmail.read" in result.result
         assert "not listed" not in result.result.lower()
@@ -1994,7 +2035,7 @@ class TestDispatchUnknownToolBeforePermission:
         """An unregistered hardcoded-denied action (gmail.send) is reported as unknown."""
         config = PermissionsConfig(tools={"gmail": ToolPermissions(actions={"send": "allow"})})
         tc = _make_tool_call(tool="gmail", action="send", args={})
-        result = await dispatch_tool_call(tc, config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "Unknown tool: gmail.send" in result.result
         assert result.permission.allowed == "deny"
@@ -2004,7 +2045,7 @@ class TestDispatchUnknownToolBeforePermission:
     ) -> None:
         """Even when the engine would allow it, an unknown tool reports 'deny'."""
         tc = _make_tool_call()
-        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1")
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
         assert result.success is False
         assert "Unknown tool: gmail.read" in result.result
         assert result.permission.allowed == "deny"
@@ -2021,7 +2062,7 @@ class TestDispatchUnknownToolBeforePermission:
     ) -> None:
         """The permission engine never sees a (tool, action) that has no handler."""
         config: PermissionsConfig = request.getfixturevalue(config_fixture)
-        await dispatch_tool_call(_make_tool_call(), config, session_id="sess-1")
+        await dispatch_tool_call(_make_tool_call(), config, session_id="sess-1", tenant=_TENANT)
         assert check_permission_spy.calls == []
 
     async def test_check_permission_still_invoked_for_registered_pair(
@@ -2031,7 +2072,9 @@ class TestDispatchUnknownToolBeforePermission:
         check_permission_spy: _CheckPermissionSpy,
     ) -> None:
         """Registered pairs still go through the permission engine exactly once."""
-        await dispatch_tool_call(_make_tool_call(), allow_config, session_id="sess-1")
+        await dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="sess-1", tenant=_TENANT
+        )
         assert check_permission_spy.calls == [("gmail", "read")]
 
     async def test_unregistered_pair_with_forged_confirmation_is_unknown(
@@ -2041,7 +2084,7 @@ class TestDispatchUnknownToolBeforePermission:
         tc = _make_tool_call()
         pending = _make_pending_confirmation(tc)
         result = await dispatch_tool_call(
-            tc, confirm_config, session_id="sess-1", pending_confirmation=pending
+            tc, confirm_config, session_id="sess-1", tenant=_TENANT, pending_confirmation=pending
         )
         assert result.success is False
         assert "Unknown tool: gmail.read" in result.result
@@ -2053,7 +2096,7 @@ class TestDispatchUnknownToolBeforePermission:
         """Ordering: identifier check, then enabled check, then unknown-tool check."""
         tc = _make_tool_call()
         result = await dispatch_tool_call(
-            tc, allow_config, session_id="sess-1", enabled_tools={"gmail": False}
+            tc, allow_config, session_id="sess-1", tenant=_TENANT, enabled_tools={"gmail": False}
         )
         assert result.success is False
         assert "Tool 'gmail' is disabled" in result.result
@@ -2082,7 +2125,7 @@ class TestFilesToolCallsRejectedAsUnknown:
 
         tc = ToolCall(tool="files", action=action, args={"path": "/app/documents/notes.txt"})
         result = await dispatch_tool_call(
-            tc, build_default_permissions_config(), session_id="sess-1"
+            tc, build_default_permissions_config(), session_id="sess-1", tenant=_TENANT
         )
         assert result.success is False
         assert f"Unknown tool: files.{action}" in result.result
@@ -2096,7 +2139,9 @@ class TestFilesToolCallsRejectedAsUnknown:
         from admino.permissions import build_default_permissions_config
 
         tc = ToolCall(tool="files", action=action, args={})
-        await dispatch_tool_call(tc, build_default_permissions_config(), session_id="sess-1")
+        await dispatch_tool_call(
+            tc, build_default_permissions_config(), session_id="sess-1", tenant=_TENANT
+        )
         assert check_permission_spy.calls == []
 
 
@@ -2174,3 +2219,258 @@ class TestRealToolRegistrySurface:
         _register_real_tool_modules()
         offered = get_registered_tools(permissions_config=build_default_permissions_config())
         assert (tool, action) in {(t.tool, t.action) for t in offered}
+
+
+# ---------------------------------------------------------------------------
+# 38. Per-request tool context (GH-162)
+# ---------------------------------------------------------------------------
+
+# A user of another organization.
+_OTHER_TENANT = TenantContext.from_principal(
+    Principal(
+        user_id=UUID("7e6d5c4b-3a29-4818-8f7e-6d5c4b3a2918"),
+        kind="member",
+        org_id=UUID("1f2e3d4c-5b6a-4798-8a7b-6c5d4e3f2a1b"),
+        role="org_admin",
+    )
+)
+# Another user of _TENANT's organization.
+_COLLEAGUE_TENANT = TenantContext.from_principal(
+    Principal(
+        user_id=UUID("5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d"),
+        kind="member",
+        org_id=_TENANT.org_id,
+        role="editor",
+    )
+)
+_UNEXPECTED_FIELDS = "Argument validation failed: unexpected fields are not permitted."
+
+
+class _UserIdArgs(BaseModel):
+    """A tool schema that (unwisely) declares a ``user_id`` field of its own."""
+
+    query: str = Field(min_length=1, max_length=100)
+    user_id: str = Field(min_length=1, max_length=100)
+
+
+def _register_context_recorder(
+    args_model: type[BaseModel] = SampleArgs,
+) -> list[dict[str, Any]]:
+    """Register gmail.read with a handler that records the keywords of each call."""
+    calls: list[dict[str, Any]] = []
+
+    async def context_handler(args: BaseModel, **kwargs: Any) -> str:
+        calls.append(dict(kwargs))
+        return "ok"
+
+    register_tool("gmail", "read", "Read emails", args_model)(context_handler)
+    return calls
+
+
+class TestDispatchToolContext:
+    """dispatch_tool_call(..., tenant=...) hands each handler its own server-side context."""
+
+    def test_dispatch_tenant_is_a_required_keyword_only_parameter(self) -> None:
+        """tenant is keyword-only with no default: a dispatch is never context-free."""
+        param = inspect.signature(dispatch_tool_call).parameters.get("tenant")
+
+        assert param is not None, "dispatch_tool_call must take a tenant"
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is inspect.Parameter.empty
+
+    async def test_dispatch_without_tenant_raises_type_error(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Leaving the tenant out is a TypeError, and no handler runs."""
+        calls = _register_context_recorder()
+        dispatch: Any = dispatch_tool_call
+
+        with pytest.raises(TypeError):
+            await dispatch(_make_tool_call(), allow_config, session_id="sess-1")
+        assert calls == []
+
+    async def test_dispatch_hands_the_handler_the_exact_tenant_and_session_id(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """The handler is called with session_id= and tenant= (the very object passed)."""
+        calls = _register_context_recorder()
+
+        result = await dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="sess-ctx-1", tenant=_TENANT
+        )
+
+        assert result.success is True
+        assert len(calls) == 1
+        assert set(calls[0]) == {"session_id", "tenant"}
+        assert calls[0]["session_id"] == "sess-ctx-1"
+        assert calls[0]["tenant"] is _TENANT
+
+    async def test_confirmed_dispatch_hands_the_handler_the_tenant(
+        self, confirm_config: PermissionsConfig
+    ) -> None:
+        """A confirm-gated call resumed with its pending confirmation gets the tenant too."""
+        calls = _register_context_recorder()
+        tc = _make_tool_call()
+
+        result = await dispatch_tool_call(
+            tc,
+            confirm_config,
+            session_id="sess-1",
+            tenant=_TENANT,
+            pending_confirmation=_make_pending_confirmation(tc),
+        )
+
+        assert result.success is True
+        assert [call["tenant"] for call in calls] == [_TENANT]
+        assert calls[0]["tenant"] is _TENANT
+
+    @pytest.mark.parametrize(
+        "second", [_OTHER_TENANT, _COLLEAGUE_TENANT], ids=["other-org", "same-org"]
+    )
+    async def test_sequential_dispatches_each_hand_over_their_own_tenant(
+        self, allow_config: PermissionsConfig, second: TenantContext
+    ) -> None:
+        """Two dispatches, two users: each handler call gets its own dispatch's tenant."""
+        calls = _register_context_recorder()
+
+        await dispatch_tool_call(_make_tool_call(), allow_config, session_id="s-a", tenant=_TENANT)
+        await dispatch_tool_call(_make_tool_call(), allow_config, session_id="s-b", tenant=second)
+
+        assert [(call["session_id"], call["tenant"]) for call in calls] == [
+            ("s-a", _TENANT),
+            ("s-b", second),
+        ]
+        assert calls[0]["tenant"] is _TENANT
+        assert calls[1]["tenant"] is second
+
+    @pytest.mark.parametrize("a_first", [True, False], ids=["a-first", "b-first"])
+    @pytest.mark.parametrize(
+        "tenant_b", [_OTHER_TENANT, _COLLEAGUE_TENANT], ids=["other-org", "same-org"]
+    )
+    async def test_concurrent_dispatches_each_hand_over_their_own_tenant(
+        self, allow_config: PermissionsConfig, tenant_b: TenantContext, a_first: bool
+    ) -> None:
+        """Both handlers are in flight at once (each waits for the other to start);
+        each still sees, and answers with, its own dispatch's tenant."""
+        entered: list[tuple[str, Any]] = []
+        both_running = asyncio.Event()
+
+        async def waiting_handler(args: SampleArgs, **kwargs: Any) -> str:
+            tenant = kwargs.get("tenant")
+            entered.append((kwargs.get("session_id", ""), tenant))
+            if len(entered) == 2:
+                both_running.set()
+            await asyncio.wait_for(both_running.wait(), timeout=5.0)
+            user_id = getattr(tenant, "user_id", None)
+            return f"{kwargs.get('session_id')}:{user_id}"
+
+        register_tool("gmail", "read", "Read emails", SampleArgs)(waiting_handler)
+        run_a = dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="s-a", tenant=_TENANT
+        )
+        run_b = dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="s-b", tenant=tenant_b
+        )
+        if a_first:
+            result_a, result_b = await asyncio.gather(run_a, run_b)
+        else:
+            result_b, result_a = await asyncio.gather(run_b, run_a)
+
+        assert sorted(entered, key=lambda item: item[0]) == [
+            ("s-a", _TENANT),
+            ("s-b", tenant_b),
+        ]
+        assert result_a.result == f"s-a:{_TENANT.user_id}"
+        assert result_b.result == f"s-b:{tenant_b.user_id}"
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            ("user_id", str(_OTHER_TENANT.user_id)),
+            ("org_id", str(_OTHER_TENANT.org_id)),
+            ("tenant", {"user_id": str(_OTHER_TENANT.user_id)}),
+            ("session_id", "sess-of-someone-else"),
+        ],
+        ids=["user_id", "org_id", "tenant", "session_id"],
+    )
+    async def test_llm_supplied_context_argument_is_rejected_before_the_handler(
+        self, allow_config: PermissionsConfig, key: str, value: object
+    ) -> None:
+        """A context key in the LLM's arguments is an unexpected field: the exact fixed
+        rejection, no success, and the handler never runs (so it never sees the id)."""
+        calls = _register_context_recorder()
+        tc = _make_tool_call(args={"query": "test", key: value})
+
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
+
+        assert result.success is False
+        assert result.result == _UNEXPECTED_FIELDS
+        assert calls == []
+
+    async def test_schema_field_named_user_id_never_feeds_the_tenant(
+        self, allow_config: PermissionsConfig
+    ) -> None:
+        """Even a schema that declares user_id only yields args: the handler's tenant is
+        the dispatch's tenant, never one built from the LLM's value."""
+        calls = _register_context_recorder(_UserIdArgs)
+        tc = _make_tool_call(args={"query": "test", "user_id": str(_OTHER_TENANT.user_id)})
+
+        result = await dispatch_tool_call(tc, allow_config, session_id="sess-1", tenant=_TENANT)
+
+        assert result.success is True
+        assert len(calls) == 1
+        assert calls[0]["tenant"] is _TENANT
+        assert calls[0]["tenant"].user_id != _OTHER_TENANT.user_id
+
+    @pytest.mark.parametrize("state", ["allow", "confirm"])
+    async def test_disabled_tool_never_calls_the_handler(self, state: str) -> None:
+        """A switched-off service is refused with a deny and its handler never runs, even
+        allowed or confirmed, whatever the tenant."""
+        calls = _register_context_recorder()
+        config = PermissionsConfig(tools={"gmail": ToolPermissions(actions={"read": state})})
+        tc = _make_tool_call()
+
+        result = await dispatch_tool_call(
+            tc,
+            config,
+            session_id="sess-1",
+            tenant=_TENANT,
+            pending_confirmation=_make_pending_confirmation(tc) if state == "confirm" else None,
+            enabled_tools={"gmail": False},
+        )
+
+        assert result.success is False
+        assert "Tool 'gmail' is disabled" in result.result
+        assert result.permission.allowed == "deny"
+        assert calls == []
+
+    async def test_permission_engine_never_sees_the_tenant(
+        self, allow_config: PermissionsConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """check_permission still gets (tool, action, config) only: no tenant, no ids."""
+        from admino.permissions import check_permission as real_check
+        from admino.tools import registry as reg
+
+        seen: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+        def spy(*args: object, **kwargs: object) -> object:
+            seen.append((args, dict(kwargs)))
+            return real_check(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(reg, "check_permission", spy)
+        _register_context_recorder()
+
+        result = await dispatch_tool_call(
+            _make_tool_call(), allow_config, session_id="sess-1", tenant=_TENANT
+        )
+
+        assert result.success is True
+        assert len(seen) == 1
+        args, kwargs = seen[0]
+        assert args == ("gmail", "read", allow_config)
+        assert set(kwargs) <= {"promoted"}
+        values = [*args, *kwargs.values()]
+        assert not any(isinstance(value, TenantContext) for value in values)
+        flattened = repr(values)
+        assert str(_TENANT.user_id) not in flattened
+        assert str(_TENANT.org_id) not in flattened

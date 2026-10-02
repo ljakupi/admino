@@ -2709,7 +2709,7 @@ class _EchoArgs(BaseModel):
     text: str = Field(min_length=1, max_length=100)
 
 
-async def _echo_handler(args: _EchoArgs, *, session_id: str) -> str:
+async def _echo_handler(args: _EchoArgs, *, session_id: str, **_: object) -> str:
     return f"echo:{args.text}"
 
 

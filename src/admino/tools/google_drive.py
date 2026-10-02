@@ -1,89 +1,81 @@
 """Google Drive tool for reading, listing, and searching files via Drive API v3.
 
-Provides read (metadata), list, and search actions for Google Drive files using
-the authenticated user's account. OAuth tokens are managed by admino.oauth.
+Provides read (metadata), list, and search actions for Google Drive files in
+the calling user's own Google account (per-user connections, GH-162).
 
 The download action is not registered: it wrote into the removed local files
 tool's host directories (GH-143) and returns as chat attachments with #192. Its
 ``google_drive.download`` permission row stays at ``confirm`` for that reason;
 until then, dispatch rejects the call as an unknown tool.
 
+Inputs: the validated args (``GoogleDriveReadArgs``, ``GoogleDriveListArgs``,
+``GoogleDriveSearchArgs``) and the required keyword ``tenant`` (the run's
+``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
+formatted file metadata or listing, or a user-facing error string.
+
 Security notes:
+- Per-user tokens: every API request of a handler call carries the access
+  token of that call's tenant, from ``_get_google_token(tenant)``, which
+  reads the shared per-user cache ``oauth.access_tokens`` (keyed by user and
+  provider). The tenant comes from the server-side session, never from LLM
+  arguments. The module keeps no token state of its own; refresh tokens
+  never leave oauth.py, and no token is logged.
 - No delete capability. google_drive.delete is a hardcoded denial in
   permissions.py.
 - Read-only: no action writes to the local filesystem or to Drive.
-- OAuth tokens are cached in module-level state; refresh tokens never appear
-  in memory outside oauth.py.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 import httpx
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
+from admino import database
 from admino.models import (
     GoogleDriveListArgs,
     GoogleDriveReadArgs,
     GoogleDriveSearchArgs,
 )
-from admino.oauth import OAuthError, get_valid_access_token
+from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level state for OAuth token caching and HTTP client
-# ---------------------------------------------------------------------------
-
+# The module's HTTP client (created on first use). It holds no credentials:
+# each request sets its own caller's Authorization header.
 _http_client: httpx.AsyncClient | None = None
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
-_token_lock = asyncio.Lock()
 
 _DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
 
 
-async def _get_google_token() -> str:
-    """Obtain a valid Google OAuth access token, refreshing if needed.
+def _client() -> httpx.AsyncClient:
+    """Return the module's HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+async def _get_google_token(tenant: TenantContext) -> str:
+    """Obtain a valid Google access token for the tenant's own connection.
+
+    Args:
+        tenant: The handler call's tool context; its user's token is used.
 
     Returns:
         A valid access token string.
 
     Raises:
-        OAuthError: If no token file exists or refresh fails.
+        OAuthError: If the user has no Google connection or refresh fails.
     """
-    from admino.database import get_pool
-
-    async with _token_lock:
-        global _http_client, _cached_token, _cached_expires_at
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        _cached_token, _cached_expires_at = await get_valid_access_token(
-            get_pool(), "google", _cached_token, _cached_expires_at, _http_client
-        )
-        return _cached_token
-
-
-async def clear_token_cache() -> None:
-    """Reset the in-memory cached access token.
-
-    Acquires ``_token_lock`` to avoid clearing the cache while a
-    concurrent tool call is mid-refresh. Called by the OAuth disconnect
-    endpoint to ensure stale tokens are not reused after the user
-    disconnects their Google account.
-    """
-    async with _token_lock:
-        global _cached_token, _cached_expires_at
-        _cached_token = None
-        _cached_expires_at = None
+    return await access_tokens.get(database.get_pool(), tenant, "google", _client())
 
 
 def _auth_headers(token: str) -> dict[str, str]:
@@ -150,22 +142,22 @@ def _format_file_entry(file: dict[str, object]) -> str:
     ),
     args_schema=GoogleDriveReadArgs,
 )
-async def google_drive_read(args: GoogleDriveReadArgs, **kwargs: object) -> str:
+async def google_drive_read(
+    args: GoogleDriveReadArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Read metadata for a single Google Drive file.
 
     Args:
         args: Validated read arguments (file_id).
+        tenant: The caller's tool context (whose Drive is read).
 
     Returns:
         Formatted file metadata string.
     """
     fields = "id,name,mimeType,size,createdTime,modifiedTime,webViewLink"
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.get(
+        token = await _get_google_token(tenant)
+        response = await _client().get(
             f"{_DRIVE_API_BASE}/files/{args.file_id}",
             params={"fields": fields},
             headers=_auth_headers(token),
@@ -199,11 +191,14 @@ async def google_drive_read(args: GoogleDriveReadArgs, **kwargs: object) -> str:
     description="List files in a Google Drive folder. If no folder ID given, lists root.",
     args_schema=GoogleDriveListArgs,
 )
-async def google_drive_list(args: GoogleDriveListArgs, **kwargs: object) -> str:
+async def google_drive_list(
+    args: GoogleDriveListArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """List files in a Google Drive folder.
 
     Args:
         args: Validated list arguments (folder_id, max_results).
+        tenant: The caller's tool context (whose Drive is listed).
 
     Returns:
         Formatted list of files in the folder.
@@ -219,11 +214,8 @@ async def google_drive_list(args: GoogleDriveListArgs, **kwargs: object) -> str:
     fields = "files(id,name,mimeType,size,modifiedTime)"
 
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.get(
+        token = await _get_google_token(tenant)
+        response = await _client().get(
             f"{_DRIVE_API_BASE}/files",
             params={"q": query, "pageSize": str(args.max_results), "fields": fields},
             headers=_auth_headers(token),
@@ -257,11 +249,14 @@ async def google_drive_list(args: GoogleDriveListArgs, **kwargs: object) -> str:
     description="Search for files in Google Drive by text query.",
     args_schema=GoogleDriveSearchArgs,
 )
-async def google_drive_search(args: GoogleDriveSearchArgs, **kwargs: object) -> str:
+async def google_drive_search(
+    args: GoogleDriveSearchArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Search Google Drive files by full-text query.
 
     Args:
         args: Validated search arguments (query, max_results).
+        tenant: The caller's tool context (whose Drive is searched).
 
     Returns:
         Formatted list of matching files.
@@ -273,11 +268,8 @@ async def google_drive_search(args: GoogleDriveSearchArgs, **kwargs: object) -> 
     fields = "files(id,name,mimeType,size,modifiedTime)"
 
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.get(
+        token = await _get_google_token(tenant)
+        response = await _client().get(
             f"{_DRIVE_API_BASE}/files",
             params={"q": query, "pageSize": str(args.max_results), "fields": fields},
             headers=_auth_headers(token),

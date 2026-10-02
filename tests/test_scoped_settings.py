@@ -1,7 +1,8 @@
 """Tests for admino.scoped_settings — the platform, org and user settings scopes
 (GH-159), the cached, editable platform defaults (GH-160), the task-done pings
 and "reset my settings" of the Settings page (GH-35), and the per-org
-tool switches a chat run reads (GH-161, ``org_tools_enabled``).
+tool switches a chat run reads (GH-161, ``org_tools_enabled``) and the org's
+data residency policy (GH-162, ``org_residency``).
 
 The old key/value ``settings`` table is dropped (migration 0013). Each value
 now has an owner: ``user_settings`` (each user: theme and notifications),
@@ -72,6 +73,14 @@ What these tests pin down (the GH-159 and GH-160 implementation contracts):
   switches (its org_settings row; a missing row means all seven on), reads
   only that org's row, needs no capability (an internal read for a chat run)
   and writes nothing.
+- GH-162, data residency: ``org_residency(executor, tenant)`` reads
+  ``SELECT data_residency FROM organizations WHERE id = $1`` bound to the
+  tenant's org id (another org's value never leaks), returns True when the org
+  row is missing (fail closed), needs no capability and writes nothing.
+  ``get_org_settings`` / ``update_org_settings`` responses carry
+  ``data_residency`` (the actor's org; the stored switches unchanged), a
+  Google/Microsoft switch is still stored and audited while residency is on,
+  and ``org_tools_enabled`` keeps returning the stored switches.
 - ``seed_platform_settings``: one upsert; the first boot stores config.yaml's
   llm and limits; later boots re-apply the llm (an empty model is NULL) and
   keep the stored limits. ``load_platform_settings`` raises RuntimeError
@@ -133,7 +142,7 @@ import admino.database as db_mod
 from admino.access import Capability, Principal
 from admino.audit_events import AuditRecordError
 from admino.config import AppConfig
-from tests.db_fakes import ORG_ID, OTHER_ORG_ID, TOOL_NAMES, FakeDb, plain
+from tests.db_fakes import ID_PARAM_RE, ORG_ID, OTHER_ORG_ID, TOOL_NAMES, FakeDb, plain
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -1783,6 +1792,271 @@ class TestOrgToolsEnabled:
         await svc.org_tools_enabled(db.pool, _tenant(viewer))
 
         assert spy.capabilities == []
+
+
+# ---------------------------------------------------------------------------
+# 5b. The tenant org's data residency policy (GH-162)
+# ---------------------------------------------------------------------------
+
+
+def _ghost_tenant(role: str = "editor") -> Any:
+    """A tenant of an org that has no organizations row."""
+    return _tenant(Principal(user_id=uuid.uuid4(), kind="member", org_id=uuid.uuid4(), role=role))
+
+
+def _org_reads(db: FakeDb) -> list[Any]:
+    """The recorded statements that read the organizations table."""
+    return db.matching(r"\bfrom organizations\b")
+
+
+def _org_writes(db: FakeDb) -> list[Any]:
+    """Every INSERT, UPDATE or DELETE the fake recorded (any table)."""
+    return db.matching(r"^(?:insert into|update|delete from)\b")
+
+
+_RESIDENCY_PAIRS = [
+    pytest.param(True, False, id="a-on-b-off"),
+    pytest.param(False, True, id="a-off-b-on"),
+]
+
+
+class TestOrgResidency:
+    """org_residency: the tenant org's own data_residency flag, fail closed without a row,
+    no capability check, nothing written."""
+
+    def test_scoped_settings_org_residency_is_a_coroutine_of_executor_and_tenant(
+        self, svc: ModuleType
+    ) -> None:
+        assert inspect.iscoroutinefunction(svc.org_residency)
+        assert list(inspect.signature(svc.org_residency).parameters) == ["executor", "tenant"]
+
+    @pytest.mark.parametrize("residency", [True, False])
+    async def test_scoped_settings_org_residency_returns_the_orgs_flag(
+        self, svc: ModuleType, db: FakeDb, residency: bool
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=residency)
+        editor = _actor(db, "editor")
+
+        result = await svc.org_residency(db.pool, _tenant(editor))
+
+        assert result is residency
+
+    async def test_scoped_settings_org_residency_without_an_org_row_fails_closed(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """No organizations row to read the policy from: residency on (True)."""
+        db.add_org(ORG_ID, data_residency=False)
+        db.add_org(OTHER_ORG_ID, data_residency=False)
+
+        result = await svc.org_residency(db.pool, _ghost_tenant())
+
+        assert result is True
+
+    @pytest.mark.parametrize(("residency_a", "residency_b"), _RESIDENCY_PAIRS)
+    async def test_scoped_settings_org_residency_reads_only_the_tenants_org(
+        self, svc: ModuleType, db: FakeDb, residency_a: bool, residency_b: bool
+    ) -> None:
+        """Each tenant gets its own org's flag; org A's id is never bound for org B."""
+        db.add_org(ORG_ID, data_residency=residency_a)
+        db.add_org(OTHER_ORG_ID, data_residency=residency_b)
+        editor_a = _actor(db, "editor", ORG_ID)
+        editor_b = _actor(db, "editor", OTHER_ORG_ID)
+
+        result_a = await svc.org_residency(db.pool, _tenant(editor_a))
+        db.calls.clear()
+        result_b = await svc.org_residency(db.pool, _tenant(editor_b))
+
+        assert (result_a, result_b) == (residency_a, residency_b)
+        assert _bound(db, OTHER_ORG_ID)
+        assert not _bound(db, ORG_ID)
+
+    async def test_scoped_settings_org_residency_binds_the_tenants_org_id(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """One read of organizations.data_residency, ``id = $n`` bound to the tenant's
+        org id (a parameter, never inlined)."""
+        editor = _actor(db, "editor")
+
+        await svc.org_residency(db.pool, _tenant(editor))
+
+        assert len(db.calls) == 1, db.calls
+        call = _one(_org_reads(db))
+        assert re.search(r"\bdata_residency\b", call.normalized) is not None
+        where = call.normalized.split(" where ", 1)[1]
+        match = re.search(ID_PARAM_RE, where)
+        assert match is not None, call.sql
+        assert _uuid(call.args[int(match.group(1)) - 1]) == ORG_ID
+        assert str(ORG_ID) not in call.sql
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_scoped_settings_org_residency_needs_no_capability(
+        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch, role: str
+    ) -> None:
+        """An internal read (a chat run, the OAuth routes): it never asks access.can."""
+        db.add_org(ORG_ID, data_residency=True)
+        member = _actor(db, role)
+        spy = _CanSpy(monkeypatch, svc)
+
+        result = await svc.org_residency(db.pool, _tenant(member))
+
+        assert result is True
+        assert spy.capabilities == []
+
+    async def test_scoped_settings_org_residency_writes_nothing(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Neither a stored org nor a missing one is written (the missing row isn't
+        created)."""
+        db.add_org(ORG_ID, data_residency=True)
+        editor = _actor(db, "editor")
+        before = _state(db)
+
+        await svc.org_residency(db.pool, _tenant(editor))
+        await svc.org_residency(db.pool, _ghost_tenant())
+
+        assert _state(db) == before
+        assert _org_writes(db) == []
+
+    async def test_scoped_settings_org_residency_runs_on_a_connection(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """An executor: the pool or a connection (the caller's transaction)."""
+        db.add_org(ORG_ID, data_residency=False)
+        editor = _actor(db, "editor")
+
+        async with db.pool.acquire() as conn:
+            result = await svc.org_residency(conn, _tenant(editor))
+
+        assert result is False
+        assert db.calls
+        assert all(call.via != "pool" for call in db.calls)
+
+
+class TestOrgSettingsResidency:
+    """get/update_org_settings carry the actor's org residency (read-only there); the
+    stored switches are still shown and changeable while residency is on, and
+    org_tools_enabled keeps returning the stored switches."""
+
+    @pytest.mark.parametrize("residency", [True, False])
+    async def test_scoped_settings_get_org_carries_the_orgs_residency(
+        self, svc: ModuleType, db: FakeDb, residency: bool
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=residency)
+        admin = _actor(db, "org_admin")
+
+        result = await svc.get_org_settings(db.pool, actor=admin)
+
+        assert result.model_dump() == {"tools": _ALL_ON, "data_residency": residency}
+        assert type(result.data_residency) is bool
+
+    async def test_scoped_settings_get_org_shows_the_stored_switches_under_residency(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Residency doesn't rewrite the stored view: every stored switch as it is (the
+        Organization console disables the Google/Microsoft rows from data_residency)."""
+        db.add_org(ORG_ID, data_residency=True)
+        db.add_org_settings(ORG_ID, outlook=False)
+        admin = _actor(db, "org_admin")
+
+        result = await svc.get_org_settings(db.pool, actor=admin)
+
+        assert result.model_dump() == {
+            "tools": {**_ALL_ON, "outlook": False},
+            "data_residency": True,
+        }
+
+    @pytest.mark.parametrize(("residency_a", "residency_b"), _RESIDENCY_PAIRS)
+    async def test_scoped_settings_get_org_residency_is_the_actors_orgs(
+        self, svc: ModuleType, db: FakeDb, residency_a: bool, residency_b: bool
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=residency_a)
+        db.add_org(OTHER_ORG_ID, data_residency=residency_b)
+        admin_a = _actor(db, "org_admin", ORG_ID)
+        admin_b = _actor(db, "org_admin", OTHER_ORG_ID)
+
+        result_a = await svc.get_org_settings(db.pool, actor=admin_a)
+        db.calls.clear()
+        result_b = await svc.get_org_settings(db.pool, actor=admin_b)
+
+        assert (result_a.data_residency, result_b.data_residency) == (residency_a, residency_b)
+        assert not _bound(db, ORG_ID)
+
+    @pytest.mark.parametrize("residency", [True, False])
+    async def test_scoped_settings_update_org_carries_the_orgs_residency(
+        self, svc: ModuleType, db: FakeDb, residency: bool
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=residency)
+        admin = _actor(db, "org_admin")
+
+        result = await svc.update_org_settings(
+            db.pool, actor=admin, patch=_org_patch(memory=False), ip=_IP
+        )
+
+        assert result.model_dump() == {
+            "tools": {**_ALL_ON, "memory": False},
+            "data_residency": residency,
+        }
+
+    @pytest.mark.parametrize("residency", [True, False])
+    async def test_scoped_settings_update_org_noop_carries_the_orgs_residency(
+        self, svc: ModuleType, db: FakeDb, residency: bool
+    ) -> None:
+        db.add_org(ORG_ID, data_residency=residency)
+        db.add_org_settings(ORG_ID, gmail=False)
+        admin = _actor(db, "org_admin")
+
+        result = await svc.update_org_settings(
+            db.pool, actor=admin, patch=_org_patch(gmail=False), ip=_IP
+        )
+
+        assert result.model_dump() == {
+            "tools": {**_ALL_ON, "gmail": False},
+            "data_residency": residency,
+        }
+        assert db.audit == []
+
+    async def test_scoped_settings_update_org_google_switch_changes_while_residency_is_on(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Residency gating is separate (the run's policy): the Org Admin's change is
+        stored, locked and audited as before, and the residency flag itself is never
+        written here."""
+        db.add_org(ORG_ID, data_residency=True)
+        db.add_org_settings(ORG_ID, gmail=False, outlook=False)
+        admin = _actor(db, "org_admin")
+
+        result = await svc.update_org_settings(
+            db.pool, actor=admin, patch=_org_patch(gmail=True, outlook=True), ip=_IP
+        )
+
+        assert db.org_tools(ORG_ID) == _ALL_ON
+        assert result.model_dump() == {"tools": _ALL_ON, "data_residency": True}
+        row = _one(db.audit)
+        assert row["action"] == "org.settings_change"
+        assert row["metadata"] == {
+            "gmail_old": False,
+            "gmail_new": True,
+            "outlook_old": False,
+            "outlook_new": True,
+        }
+        _assert_locked_in_one_transaction(db, "org_settings")
+        assert db.orgs[ORG_ID]["data_residency"] is True
+        assert db.matching(r"^update organizations\b") == []
+
+    async def test_scoped_settings_org_tools_enabled_ignores_residency(
+        self, svc: ModuleType, db: FakeDb
+    ) -> None:
+        """Residency on, yet org_tools_enabled returns the STORED switches: residency is
+        applied by the run's policy (org_permissions.load_tool_policy), not here."""
+        db.add_org(ORG_ID, data_residency=True)
+        db.add_org_settings(ORG_ID, outlook=False)
+        editor = _actor(db, "editor")
+
+        residency = await svc.org_residency(db.pool, _tenant(editor))
+        tools = await svc.org_tools_enabled(db.pool, _tenant(editor))
+
+        assert residency is True
+        assert dict(tools) == {**_ALL_ON, "outlook": False}
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,13 @@ Security notes:
   values, tool output or error text. Conversation content is not audited.
 - A run is never anonymous: ``run`` takes the caller's ``principal`` as a
   required keyword (GH-149); the agent makes no access decision with it.
+- Tool context (GH-162): each run derives its ``TenantContext`` once from
+  the principal and passes it as ``tenant`` to every dispatch (the resume
+  pre-dispatch included), so handlers scope their content by the logged-in
+  user's user_id and org_id; it never comes from LLM output or history. A
+  principal without an organization (a Super Admin) has no tool context:
+  nothing is dispatched, and each tool call ends as a recorded "No
+  organization context." deny.
 - H-1: if the recorder raises, the run aborts with a fixed
   "Internal error: audit unavailable." result: no further LLM call, no
   further dispatch, and no ``pending_confirmation`` is handed out for an
@@ -87,14 +94,16 @@ from admino.models import (
     ToolCall,
     ToolCallRecord,
 )
-from admino.tools.registry import dispatch_tool_call, get_registered_tools
+from admino.permissions import PermissionResult
+from admino.tenancy import NoTenantContextError, TenantContext
+from admino.tools.registry import ToolCallResult, dispatch_tool_call, get_registered_tools
 
 if TYPE_CHECKING:
     from admino.access import Principal
     from admino.llm import LLMClient
     from admino.models import ToolPolicy
     from admino.permissions import PermissionState
-    from admino.tools.registry import ToolCallResult, ToolDescription
+    from admino.tools.registry import ToolDescription
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +125,9 @@ _LLM_ERROR_MESSAGE: str = (
     "I hit an error while processing your request. Please try again in a moment."
 )
 _AUDIT_UNAVAILABLE_MESSAGE: str = "Internal error: audit unavailable."
+# GH-162: the outcome of a tool call in a run without a tool context (a
+# principal without an organization): nothing is dispatched.
+_NO_ORG_CONTEXT_MESSAGE: str = "No organization context."
 _NO_TOOLS_LINE: str = "You have no tools available."
 
 
@@ -262,6 +274,14 @@ class Agent:
             message), and a summary of tool calls made during the run.
         """
         config = self._config if agent_config is None else agent_config
+        # GH-162: the run's tool context, derived once from the principal (never
+        # from LLM output or history). A principal without an org (a Super
+        # Admin) has none, and then no tool call is dispatched.
+        tenant: TenantContext | None
+        try:
+            tenant = TenantContext.from_principal(principal)
+        except NoTenantContextError:
+            tenant = None
         # Work on a local copy so we never mutate the caller's list. The
         # system message is NOT stored here: it is added per LLM call by
         # _build_context, so the returned history never carries it and it
@@ -337,6 +357,7 @@ class Agent:
             pre_result = await self._resume_pending_dispatch(
                 pending_confirmation=pending_confirmation,
                 principal=principal,
+                tenant=tenant,
                 tool_policy=tool_policy,
                 session_id=session_id,
                 working_history=working_history,
@@ -436,6 +457,7 @@ class Agent:
                 dispatched = await self._dispatch_one(
                     tool_call=tool_call,
                     principal=principal,
+                    tenant=tenant,
                     tool_policy=tool_policy,
                     session_id=session_id,
                     pending_confirmation=carry_confirmation,
@@ -529,6 +551,7 @@ class Agent:
         *,
         tool_call: ToolCall,
         principal: Principal,
+        tenant: TenantContext | None,
         tool_policy: ToolPolicy,
         session_id: str,
         pending_confirmation: PendingConfirmation | None,
@@ -536,9 +559,11 @@ class Agent:
         """Dispatch a single tool call via the registry, then record it.
 
         The dispatch is decided by the run's ``tool_policy`` (permissions,
-        promoted pairs, enabled services). The one place that times a
-        dispatch and awaits the recorder, so no call site can dispatch
-        without recording. The recorder gets the run's
+        promoted pairs, enabled services), and the handler gets the run's
+        ``tenant`` (GH-162). Without a tool context nothing is dispatched: the
+        outcome is a fixed "No organization context." deny. The one place
+        that times a dispatch and awaits the recorder, so no call site can
+        dispatch without recording. The recorder gets the run's
         principal, the raw tool/action names the LLM asked for, the final
         decision, the success flag and the duration — never arguments, output
         or error text.
@@ -550,14 +575,22 @@ class Agent:
             message.
         """
         start = time.monotonic()
-        result = await dispatch_tool_call(
-            tool_call,
-            tool_policy.permissions,
-            session_id=session_id,
-            pending_confirmation=pending_confirmation,
-            promoted=tool_policy.promoted,
-            enabled_tools=tool_policy.enabled_tools or None,
-        )
+        if tenant is None:
+            result = ToolCallResult(
+                success=False,
+                result=_NO_ORG_CONTEXT_MESSAGE,
+                permission=PermissionResult(allowed="deny", reason=_NO_ORG_CONTEXT_MESSAGE),
+            )
+        else:
+            result = await dispatch_tool_call(
+                tool_call,
+                tool_policy.permissions,
+                session_id=session_id,
+                tenant=tenant,
+                pending_confirmation=pending_confirmation,
+                promoted=tool_policy.promoted,
+                enabled_tools=tool_policy.enabled_tools or None,
+            )
         duration_ms = int((time.monotonic() - start) * 1000)
         try:
             await self._record_tool_call(
@@ -581,6 +614,7 @@ class Agent:
         *,
         pending_confirmation: PendingConfirmation,
         principal: Principal,
+        tenant: TenantContext | None,
         tool_policy: ToolPolicy,
         session_id: str,
         working_history: list[LLMMessage],
@@ -605,6 +639,7 @@ class Agent:
         dispatched = await self._dispatch_one(
             tool_call=tool_call,
             principal=principal,
+            tenant=tenant,
             tool_policy=tool_policy,
             session_id=session_id,
             pending_confirmation=pending_confirmation,

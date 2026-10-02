@@ -1,41 +1,51 @@
 """OneDrive tool using Microsoft Graph API.
 
 Provides read, list, and search actions for OneDrive files via the Microsoft
-Graph ``/me/drive`` endpoints. Authentication is handled via OAuth tokens
-managed by ``admino.oauth``.
+Graph ``/me/drive`` endpoints, in the calling user's own Microsoft account
+(per-user connections, GH-162).
 
 The download action is not registered: it wrote into the removed local files
 tool's host directories (GH-143) and returns as chat attachments with #192. Its
 ``onedrive.download`` permission row stays at ``confirm`` for that reason;
 until then, dispatch rejects the call as an unknown tool.
 
+Inputs: the validated args (``OneDriveReadArgs``, ``OneDriveListArgs``,
+``OneDriveSearchArgs``) and the required keyword ``tenant`` (the run's
+``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
+formatted item metadata or listing, or a user-facing error string.
+
 Security notes:
+- Per-user tokens: every API request of a handler call carries the access
+  token of that call's tenant, from ``_get_microsoft_token(tenant)``, which
+  reads the shared per-user cache ``oauth.access_tokens`` (keyed by user and
+  provider). The tenant comes from the server-side session, never from LLM
+  arguments. The module keeps no token state of its own; refresh tokens
+  never leave oauth.py, and no token is logged.
 - No delete capability. onedrive.delete is a hardcoded denial in permissions.py.
 - Read-only: no action writes to the local filesystem or to OneDrive.
-- OAuth tokens are cached in-memory only; refresh tokens stay encrypted on disk.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING, Final
 from urllib.parse import quote
 
 import httpx
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
+from admino import database
 from admino.models import (
     OneDriveListArgs,
     OneDriveReadArgs,
     OneDriveSearchArgs,
 )
-from admino.oauth import OAuthError, get_valid_access_token
+from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
@@ -45,49 +55,32 @@ logger = logging.getLogger(__name__)
 
 _GRAPH_BASE: Final[str] = "https://graph.microsoft.com/v1.0"
 
-# ---------------------------------------------------------------------------
-# Module-level token cache
-# ---------------------------------------------------------------------------
-
+# The module's HTTP client (created on first use). It holds no credentials:
+# each request sets its own caller's Authorization header.
 _http_client: httpx.AsyncClient | None = None
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
-_token_lock = asyncio.Lock()
 
 
-async def _get_microsoft_token() -> str:
-    """Obtain a valid Microsoft access token, refreshing if needed.
+def _client() -> httpx.AsyncClient:
+    """Return the module's HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+async def _get_microsoft_token(tenant: TenantContext) -> str:
+    """Obtain a valid Microsoft access token for the tenant's own connection.
+
+    Args:
+        tenant: The handler call's tool context; its user's token is used.
 
     Returns:
         A valid access token string.
 
     Raises:
-        OAuthError: If OAuth is not configured or refresh fails.
+        OAuthError: If the user has no Microsoft connection or refresh fails.
     """
-    from admino.database import get_pool
-
-    async with _token_lock:
-        global _http_client, _cached_token, _cached_expires_at
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        _cached_token, _cached_expires_at = await get_valid_access_token(
-            get_pool(), "microsoft", _cached_token, _cached_expires_at, _http_client
-        )
-        return _cached_token
-
-
-async def clear_token_cache() -> None:
-    """Reset the in-memory cached access token.
-
-    Acquires ``_token_lock`` to avoid clearing the cache while a
-    concurrent tool call is mid-refresh. Called by the OAuth disconnect
-    endpoint to ensure stale tokens are not reused after the user
-    disconnects their Microsoft account.
-    """
-    async with _token_lock:
-        global _cached_token, _cached_expires_at
-        _cached_token = None
-        _cached_expires_at = None
+    return await access_tokens.get(database.get_pool(), tenant, "microsoft", _client())
 
 
 def _extract_graph_error(response: httpx.Response) -> str:
@@ -161,17 +154,18 @@ def _human_readable_size(size_bytes: int) -> str:
     description="Read OneDrive file or folder metadata by item ID.",
     args_schema=OneDriveReadArgs,
 )
-async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
+async def onedrive_read(args: OneDriveReadArgs, *, tenant: TenantContext, **_: object) -> str:
     """Read metadata for a OneDrive item by ID.
 
     Args:
         args: Validated read arguments (item_id).
+        tenant: The caller's tool context (whose OneDrive is read).
 
     Returns:
         Formatted item metadata, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -185,7 +179,7 @@ async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
         "?$select=id,name,size,createdDateTime,lastModifiedDateTime,webUrl,file,folder"
     )
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -221,17 +215,18 @@ async def onedrive_read(args: OneDriveReadArgs, **kwargs: object) -> str:
     description="List items in a OneDrive folder. Lists root if no folder path is given.",
     args_schema=OneDriveListArgs,
 )
-async def onedrive_list(args: OneDriveListArgs, **kwargs: object) -> str:
+async def onedrive_list(args: OneDriveListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List items in a OneDrive folder.
 
     Args:
         args: Validated list arguments (folder_path, max_results).
+        tenant: The caller's tool context (whose OneDrive is listed).
 
     Returns:
         Formatted list of items, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -253,7 +248,7 @@ async def onedrive_list(args: OneDriveListArgs, **kwargs: object) -> str:
         "$select": "id,name,size,lastModifiedDateTime,file,folder",
     }
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             params=params,
             headers={"Authorization": f"Bearer {token}"},
@@ -289,17 +284,18 @@ async def onedrive_list(args: OneDriveListArgs, **kwargs: object) -> str:
     description="Search for files in OneDrive by query string.",
     args_schema=OneDriveSearchArgs,
 )
-async def onedrive_search(args: OneDriveSearchArgs, **kwargs: object) -> str:
+async def onedrive_search(args: OneDriveSearchArgs, *, tenant: TenantContext, **_: object) -> str:
     """Search for files in OneDrive.
 
     Args:
         args: Validated search arguments (query, max_results).
+        tenant: The caller's tool context (whose OneDrive is searched).
 
     Returns:
         Formatted list of matching items, or an error string.
     """
     try:
-        token = await _get_microsoft_token()
+        token = await _get_microsoft_token(tenant)
     except OAuthError as exc:
         return (
             f"Microsoft OAuth error: {exc} Open the Tools page to reconnect your Microsoft account."
@@ -314,7 +310,7 @@ async def onedrive_search(args: OneDriveSearchArgs, **kwargs: object) -> str:
         "$select": "id,name,size,lastModifiedDateTime,file,folder",
     }
     try:
-        response = await _http_client.get(  # type: ignore[union-attr]
+        response = await _client().get(
             url,
             params=params,
             headers={"Authorization": f"Bearer {token}"},

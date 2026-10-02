@@ -10,14 +10,31 @@ GH-86: refresh tokens moved from encrypted files into PostgreSQL. These
 tests target the DB-backed contract (async functions taking an asyncpg
 pool as the first argument), NOT the removed file-based implementation.
 
+GH-162: ``oauth_tokens`` is keyed by (user_id, provider). Every persistence
+function takes the caller's ``TenantContext`` right after the pool
+(``load_token(pool, tenant, provider)``, ``save_token(pool, tenant, token)``,
+``delete_token``, ``revoke_and_delete_token``, ``get_valid_access_token``,
+``get_connection_status``), ``provider`` has no default, and every statement
+binds the tenant's user_id and org_id. The backwards-compatible aliases
+``build_consent_url``, ``exchange_code`` and ``_get_client_credentials`` are
+removed (their only user, the oauth_setup CLI, is gone); the tests that used
+them call the provider-specific functions. tests/test_oauth_token_cache.py runs
+the same functions against FakeDb (per-user isolation) and covers the per-user
+access-token cache.
+
 Security notes:
 - All HTTP clients are mocked — no real Google/Microsoft API calls.
 - The database pool is mocked (``mock_pool`` fixture) — no real DB.
+- Tenant isolation: the user and org ids are bound parameters taken from the
+  TenantContext, never interpolated into SQL.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, patch
@@ -27,6 +44,8 @@ import pytest
 from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
+import admino.oauth as oauth
+from admino.access import Principal
 from admino.oauth import (
     _EXPIRY_BUFFER_SECONDS,
     GOOGLE_AUTH_ENDPOINT,
@@ -36,21 +55,22 @@ from admino.oauth import (
     OAuthError,
     OAuthRefreshError,
     OAuthToken,
-    _get_client_credentials,
     _get_fernet,
+    _get_google_client_credentials,
     _get_microsoft_client_credentials,
     _safe_error_code,
-    build_consent_url,
+    build_google_consent_url,
     build_microsoft_consent_url,
     decrypt_refresh_token,
     encrypt_refresh_token,
-    exchange_code,
+    exchange_google_code,
     exchange_microsoft_code,
     get_connection_status,
     get_valid_access_token,
     load_token,
     save_token,
 )
+from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
     from unittest.mock import MagicMock
@@ -65,6 +85,41 @@ _TEST_CLIENT_SECRET: str = "test-client-secret-abc"
 _TEST_MS_CLIENT_ID: str = "ms-test-client-id-456"
 _TEST_MS_CLIENT_SECRET: str = "ms-test-client-secret-def"
 _PLAINTEXT_REFRESH_TOKEN: str = "1//0abc-REFRESH-TOKEN-plaintext"
+
+# GH-162: the caller every persistence function is scoped to.
+_USER_ID: uuid.UUID = uuid.UUID("0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d")
+_ORG_ID: uuid.UUID = uuid.UUID("5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d")
+_TENANT: TenantContext = TenantContext.from_principal(
+    Principal(user_id=_USER_ID, kind="member", org_id=_ORG_ID, role="editor")
+)
+
+
+def _save_token_contract(pool: Any, tenant: Any, token: Any) -> None:
+    """The GH-162 shape of save_token, used to bind a spy's arguments by name."""
+
+
+def _saved_token(args: tuple[Any, ...], kwargs: dict[str, Any]) -> OAuthToken:
+    """The token of a save_token(pool, tenant, token) call made for the caller's tenant."""
+    bound = inspect.signature(_save_token_contract).bind(*args, **kwargs)
+    assert bound.arguments["tenant"] == _TENANT, "save_token was called for another tenant"
+    token = bound.arguments["token"]
+    assert isinstance(token, OAuthToken)
+    return token
+
+
+def _binds_tenant(call: Any) -> bool:
+    """True when a recorded pool call binds the tenant's user_id and org_id as parameters."""
+    args = call.args[1:]
+
+    def _has(value: uuid.UUID) -> bool:
+        return any(arg == value or arg == str(value) for arg in args)
+
+    return _has(_USER_ID) and _has(_ORG_ID)
+
+
+def _ids_not_in_sql(sql: str) -> bool:
+    """True when neither tenant id is interpolated into the SQL text."""
+    return all(text not in sql for value in (_USER_ID, _ORG_ID) for text in (str(value), value.hex))
 
 
 @pytest.fixture()
@@ -233,7 +288,7 @@ class TestLoadToken:
         """A fetched row is mapped to an OAuthToken."""
         _prime_fetchrow(mock_pool, _row_from_token(sample_token))
 
-        result = await load_token(mock_pool, "google")
+        result = await load_token(mock_pool, _TENANT, "google")
 
         assert result is not None
         assert result.provider == "google"
@@ -244,7 +299,7 @@ class TestLoadToken:
         """No matching row returns None."""
         _prime_fetchrow(mock_pool, None)
 
-        result = await load_token(mock_pool, "google")
+        result = await load_token(mock_pool, _TENANT, "google")
 
         assert result is None
 
@@ -255,7 +310,7 @@ class TestLoadToken:
         row = _row_from_token(sample_token)
         _prime_fetchrow(mock_pool, row)
 
-        await load_token(mock_pool, "google")
+        await load_token(mock_pool, _TENANT, "google")
 
         # Whichever fetchrow was used, "google" must be a bound argument and
         # the SQL text must use a positional placeholder ($1), never the raw value.
@@ -265,6 +320,11 @@ class TestLoadToken:
         assert "$1" in sql
         assert "google" in call.args[1:]
         assert "google" not in sql
+        # GH-162: the row is the tenant's own: user_id and org_id are bound, never inlined.
+        assert _binds_tenant(call)
+        assert _ids_not_in_sql(sql)
+        assert re.search(r"\buser_id\s*=\s*\$\d", sql)
+        assert re.search(r"\borg_id\s*=\s*\$\d", sql)
 
     async def test_healthy_flag_read_from_row(
         self, mock_pool: MagicMock, sample_token: OAuthToken
@@ -274,7 +334,7 @@ class TestLoadToken:
         row["healthy"] = False
         _prime_fetchrow(mock_pool, row)
 
-        result = await load_token(mock_pool, "google")
+        result = await load_token(mock_pool, _TENANT, "google")
 
         assert result is not None
         assert result.healthy is False
@@ -297,7 +357,7 @@ class TestSaveToken:
 
     async def test_upsert_on_conflict(self, mock_pool: MagicMock, sample_token: OAuthToken) -> None:
         """save_token issues an INSERT ... ON CONFLICT (provider) DO UPDATE."""
-        await save_token(mock_pool, sample_token)
+        await save_token(mock_pool, _TENANT, sample_token)
 
         call = self._executed_call(mock_pool)
         assert call is not None
@@ -310,7 +370,7 @@ class TestSaveToken:
         self, mock_pool: MagicMock, sample_token: OAuthToken
     ) -> None:
         """The UPSERT uses positional placeholders, not string interpolation."""
-        await save_token(mock_pool, sample_token)
+        await save_token(mock_pool, _TENANT, sample_token)
 
         call = self._executed_call(mock_pool)
         assert call is not None
@@ -323,7 +383,7 @@ class TestSaveToken:
         self, mock_pool: MagicMock, sample_token: OAuthToken
     ) -> None:
         """The encrypted token and email are bound as parameters."""
-        await save_token(mock_pool, sample_token)
+        await save_token(mock_pool, _TENANT, sample_token)
 
         call = self._executed_call(mock_pool)
         assert call is not None
@@ -335,13 +395,47 @@ class TestSaveToken:
         self, mock_pool: MagicMock, sample_token: OAuthToken
     ) -> None:
         """scopes are serialised to a JSON string for the JSONB column."""
-        await save_token(mock_pool, sample_token)
+        await save_token(mock_pool, _TENANT, sample_token)
 
         call = self._executed_call(mock_pool)
         assert call is not None
         args = call.args[1:]
         serialized = json.dumps(sample_token.scopes)
         assert serialized in args
+
+    async def test_insert_binds_the_tenants_user_and_org(
+        self, mock_pool: MagicMock, sample_token: OAuthToken
+    ) -> None:
+        """GH-162: the row's user_id and org_id come from the TenantContext, as parameters."""
+        await save_token(mock_pool, _TENANT, sample_token)
+
+        call = self._executed_call(mock_pool)
+        assert call is not None
+        assert _binds_tenant(call)
+        assert _ids_not_in_sql(call.args[0])
+
+    async def test_conflict_target_is_user_and_provider(
+        self, mock_pool: MagicMock, sample_token: OAuthToken
+    ) -> None:
+        """GH-162: the upsert is keyed by (user_id, provider), the table's new primary key."""
+        await save_token(mock_pool, _TENANT, sample_token)
+
+        call = self._executed_call(mock_pool)
+        assert call is not None
+        sql = " ".join(call.args[0].lower().split())
+        assert re.search(r"on conflict \( ?user_id ?, ?provider ?\) do update", sql)
+
+    async def test_unknown_provider_raises_before_any_statement(
+        self, mock_pool: MagicMock, sample_token: OAuthToken
+    ) -> None:
+        """An unknown provider is refused with OAuthError and nothing is written."""
+        token = sample_token.model_copy(update={"provider": "github"})
+
+        with pytest.raises(OAuthError):
+            await save_token(mock_pool, _TENANT, token)
+
+        mock_pool.execute.assert_not_called()
+        mock_pool._mock_conn.execute.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +458,7 @@ class TestDeleteToken:
 
         self._prime_execute(mock_pool, "DELETE 1")
 
-        result = await delete_token(mock_pool, "google")
+        result = await delete_token(mock_pool, _TENANT, "google")
 
         assert result is True
 
@@ -374,7 +468,7 @@ class TestDeleteToken:
 
         self._prime_execute(mock_pool, "DELETE 0")
 
-        result = await delete_token(mock_pool, "google")
+        result = await delete_token(mock_pool, _TENANT, "google")
 
         assert result is False
 
@@ -384,7 +478,7 @@ class TestDeleteToken:
 
         self._prime_execute(mock_pool, "DELETE 1")
 
-        await delete_token(mock_pool, "google")
+        await delete_token(mock_pool, _TENANT, "google")
 
         call = mock_pool.execute.call_args or mock_pool._mock_conn.execute.call_args
         assert call is not None
@@ -392,6 +486,9 @@ class TestDeleteToken:
         assert "DELETE FROM" in sql
         assert "$1" in call.args[0]
         assert "google" in call.args[1:]
+        # GH-162: only the tenant's own row: user_id and org_id are bound, never inlined.
+        assert _binds_tenant(call)
+        assert _ids_not_in_sql(call.args[0])
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +511,7 @@ class TestGetValidAccessToken:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
 
         token, expires = await get_valid_access_token(
-            mock_pool, "google", "cached-access-token", future, mock_client
+            mock_pool, _TENANT, "google", "cached-access-token", future, mock_client
         )
 
         assert token == "cached-access-token"
@@ -434,7 +531,7 @@ class TestGetValidAccessToken:
         mock_client.post.return_value = response
 
         token, expires = await get_valid_access_token(
-            mock_pool, "google", "old-token", past, mock_client
+            mock_pool, _TENANT, "google", "old-token", past, mock_client
         )
 
         assert token == "new-access-token"
@@ -447,7 +544,7 @@ class TestGetValidAccessToken:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
 
         with pytest.raises(OAuthError, match="No google account is connected"):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
     async def test_none_cached_triggers_refresh(
         self, mock_pool: MagicMock, sample_token: OAuthToken
@@ -458,7 +555,9 @@ class TestGetValidAccessToken:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post.return_value = response
 
-        token, _ = await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+        token, _ = await get_valid_access_token(
+            mock_pool, _TENANT, "google", None, None, mock_client
+        )
         assert token == "fresh-token"
 
     async def test_refresh_http_error_raises(
@@ -470,7 +569,7 @@ class TestGetValidAccessToken:
         mock_client.post.side_effect = httpx.ConnectError("connection failed")
 
         with pytest.raises(OAuthError, match=r"HTTP request.*failed"):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
     async def test_refresh_invalid_json_raises(
         self, mock_pool: MagicMock, sample_token: OAuthToken
@@ -482,7 +581,7 @@ class TestGetValidAccessToken:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthError, match="invalid JSON"):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
     async def test_refresh_missing_access_token_raises(
         self, mock_pool: MagicMock, sample_token: OAuthToken
@@ -494,7 +593,7 @@ class TestGetValidAccessToken:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthError, match="missing access_token"):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
 
 # ---------------------------------------------------------------------------
@@ -521,7 +620,7 @@ class TestExpiryBuffer:
         mock_client.post.return_value = response
 
         token, _ = await get_valid_access_token(
-            mock_pool, "google", "about-to-expire", almost_expired, mock_client
+            mock_pool, _TENANT, "google", "about-to-expire", almost_expired, mock_client
         )
         assert token == "buffer-refreshed"
         mock_client.post.assert_called_once()
@@ -532,7 +631,7 @@ class TestExpiryBuffer:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
 
         token, _ = await get_valid_access_token(
-            mock_pool, "google", "still-good", future, mock_client
+            mock_pool, _TENANT, "google", "still-good", future, mock_client
         )
         assert token == "still-good"
         mock_client.post.assert_not_called()
@@ -563,28 +662,28 @@ class TestMissingEnvVars:
         monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
         monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "secret")
         with pytest.raises(OAuthError, match="GOOGLE_CLIENT_ID"):
-            _get_client_credentials()
+            _get_google_client_credentials()
 
     def test_get_client_credentials_missing_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Missing GOOGLE_CLIENT_SECRET raises OAuthError."""
         monkeypatch.setenv("GOOGLE_CLIENT_ID", "id")
         monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
         with pytest.raises(OAuthError, match="GOOGLE_CLIENT_SECRET"):
-            _get_client_credentials()
+            _get_google_client_credentials()
 
     def test_build_consent_url_missing_client_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """build_consent_url raises OAuthError without GOOGLE_CLIENT_ID."""
+        """build_google_consent_url raises OAuthError without GOOGLE_CLIENT_ID."""
         monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
         with pytest.raises(OAuthError, match="GOOGLE_CLIENT_ID"):
-            build_consent_url("http://localhost/callback")
+            build_google_consent_url("http://localhost/callback")
 
     async def test_exchange_code_missing_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """exchange_code raises OAuthError without client credentials."""
+        """exchange_google_code raises OAuthError without client credentials."""
         monkeypatch.delenv("GOOGLE_CLIENT_ID", raising=False)
         monkeypatch.delenv("GOOGLE_CLIENT_SECRET", raising=False)
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         with pytest.raises(OAuthError, match="GOOGLE_CLIENT_ID"):
-            await exchange_code("code", "http://localhost/cb", mock_client)
+            await exchange_google_code("code", "http://localhost/cb", mock_client)
 
     def test_encrypt_refresh_token_missing_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """encrypt_refresh_token raises OAuthError without encryption key."""
@@ -608,7 +707,7 @@ class TestPlaintextNeverPersisted:
         self, mock_pool: MagicMock, sample_token: OAuthToken
     ) -> None:
         """The plaintext refresh token must not appear in any bound parameter."""
-        await save_token(mock_pool, sample_token)
+        await save_token(mock_pool, _TENANT, sample_token)
 
         call = mock_pool.execute.call_args or mock_pool._mock_conn.execute.call_args
         assert call is not None
@@ -619,7 +718,7 @@ class TestPlaintextNeverPersisted:
         self, mock_pool: MagicMock, sample_token: OAuthToken
     ) -> None:
         """The plaintext refresh token must not be interpolated into the SQL."""
-        await save_token(mock_pool, sample_token)
+        await save_token(mock_pool, _TENANT, sample_token)
 
         call = mock_pool.execute.call_args or mock_pool._mock_conn.execute.call_args
         assert call is not None
@@ -627,7 +726,7 @@ class TestPlaintextNeverPersisted:
 
 
 # ---------------------------------------------------------------------------
-# 9. build_consent_url
+# 9. build_google_consent_url
 # ---------------------------------------------------------------------------
 
 
@@ -637,7 +736,7 @@ class TestBuildConsentUrl:
     def test_includes_required_params(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """URL contains client_id, access_type=offline, prompt=consent, state."""
         monkeypatch.setenv("GOOGLE_CLIENT_ID", _TEST_CLIENT_ID)
-        url, state = build_consent_url("http://localhost/callback")
+        url, state = build_google_consent_url("http://localhost/callback")
 
         assert GOOGLE_AUTH_ENDPOINT in url
         assert _TEST_CLIENT_ID in url
@@ -650,7 +749,7 @@ class TestBuildConsentUrl:
     def test_includes_all_scopes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """URL contains all configured Google scopes."""
         monkeypatch.setenv("GOOGLE_CLIENT_ID", _TEST_CLIENT_ID)
-        url, _state = build_consent_url("http://localhost/callback")
+        url, _state = build_google_consent_url("http://localhost/callback")
 
         for scope in GOOGLE_SCOPES:
             assert scope.replace(":", "%3A").replace("/", "%2F") in url or scope in url
@@ -658,18 +757,18 @@ class TestBuildConsentUrl:
     def test_includes_redirect_uri(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """URL contains the provided redirect_uri host."""
         monkeypatch.setenv("GOOGLE_CLIENT_ID", _TEST_CLIENT_ID)
-        url, _state = build_consent_url("http://localhost:8000/oauth/callback")
+        url, _state = build_google_consent_url("http://localhost:8000/oauth/callback")
         assert "localhost" in url
 
 
 # ---------------------------------------------------------------------------
-# 10. exchange_code (Google)
+# 10. exchange_google_code (Google)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("google_env")
 class TestExchangeCode:
-    """Tests for exchange_code with mocked httpx."""
+    """Tests for exchange_google_code with mocked httpx."""
 
     pytestmark = pytest.mark.asyncio
 
@@ -682,7 +781,7 @@ class TestExchangeCode:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post.return_value = response
 
-        access, refresh, scopes = await exchange_code(
+        access, refresh, scopes = await exchange_google_code(
             "auth-code", "http://localhost/cb", mock_client
         )
 
@@ -697,7 +796,7 @@ class TestExchangeCode:
         mock_client.post.side_effect = httpx.ConnectError("fail")
 
         with pytest.raises(OAuthError, match=r"HTTP request.*failed"):
-            await exchange_code("code", "http://localhost/cb", mock_client)
+            await exchange_google_code("code", "http://localhost/cb", mock_client)
 
     async def test_non_200_raises(self) -> None:
         """Non-200 status raises OAuthError."""
@@ -706,7 +805,7 @@ class TestExchangeCode:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthError, match="token exchange failed"):
-            await exchange_code("code", "http://localhost/cb", mock_client)
+            await exchange_google_code("code", "http://localhost/cb", mock_client)
 
     async def test_malformed_json_raises(self) -> None:
         """Malformed JSON response raises OAuthError."""
@@ -715,7 +814,7 @@ class TestExchangeCode:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthError, match="invalid JSON"):
-            await exchange_code("code", "http://localhost/cb", mock_client)
+            await exchange_google_code("code", "http://localhost/cb", mock_client)
 
     async def test_missing_tokens_raises(self) -> None:
         """Response without tokens raises OAuthError."""
@@ -724,7 +823,7 @@ class TestExchangeCode:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthError, match="missing access_token or refresh_token"):
-            await exchange_code("code", "http://localhost/cb", mock_client)
+            await exchange_google_code("code", "http://localhost/cb", mock_client)
 
     async def test_empty_scope_returns_empty_list(self) -> None:
         """Empty scope string returns an empty scopes list."""
@@ -734,7 +833,7 @@ class TestExchangeCode:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post.return_value = response
 
-        _, _, scopes = await exchange_code("code", "http://localhost/cb", mock_client)
+        _, _, scopes = await exchange_google_code("code", "http://localhost/cb", mock_client)
         assert scopes == []
 
 
@@ -882,7 +981,7 @@ class TestOAuthErrorMessages:
             assert secret_value not in str(exc)
 
         try:
-            _get_client_credentials()
+            _get_google_client_credentials()
         except OAuthError as exc:
             assert secret_value not in str(exc)
 
@@ -1065,7 +1164,7 @@ class TestRefreshMicrosoftToken:
         mock_client.post.return_value = response
 
         token, expires = await get_valid_access_token(
-            mock_pool, "microsoft", "old-ms-token", past, mock_client
+            mock_pool, _TENANT, "microsoft", "old-ms-token", past, mock_client
         )
 
         assert token == "ms-new-access-token"
@@ -1077,7 +1176,7 @@ class TestRefreshMicrosoftToken:
         _prime_fetchrow(mock_pool, None)
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         with pytest.raises(OAuthError, match="No microsoft account is connected"):
-            await get_valid_access_token(mock_pool, "microsoft", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "microsoft", None, None, mock_client)
 
     async def test_microsoft_refresh_non_200_raises(
         self, mock_pool: MagicMock, microsoft_token: OAuthToken
@@ -1089,7 +1188,7 @@ class TestRefreshMicrosoftToken:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthError, match="Microsoft token refresh failed"):
-            await get_valid_access_token(mock_pool, "microsoft", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "microsoft", None, None, mock_client)
 
     async def test_microsoft_refresh_invalid_expires_in_defaults(
         self, mock_pool: MagicMock, microsoft_token: OAuthToken
@@ -1101,7 +1200,7 @@ class TestRefreshMicrosoftToken:
         mock_client.post.return_value = response
 
         token, expires = await get_valid_access_token(
-            mock_pool, "microsoft", None, None, mock_client
+            mock_pool, _TENANT, "microsoft", None, None, mock_client
         )
         assert token == "ms-token"
         expected_min = datetime.now(UTC) + timedelta(seconds=3500)
@@ -1130,7 +1229,9 @@ class TestGoogleRefreshExpiresInEdgeCases:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post.return_value = response
 
-        token, expires = await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+        token, expires = await get_valid_access_token(
+            mock_pool, _TENANT, "google", None, None, mock_client
+        )
         assert token == "token-with-bad-expiry"
         expected_min = datetime.now(UTC) + timedelta(seconds=3500)
         assert expires > expected_min
@@ -1144,7 +1245,9 @@ class TestGoogleRefreshExpiresInEdgeCases:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         mock_client.post.return_value = response
 
-        token, expires = await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+        token, expires = await get_valid_access_token(
+            mock_pool, _TENANT, "google", None, None, mock_client
+        )
         assert token == "token-zero-expiry"
         expected_min = datetime.now(UTC) + timedelta(seconds=3500)
         assert expires > expected_min
@@ -1205,7 +1308,7 @@ class TestSaveTokenNonFatalInRefresh:
 
         with patch("admino.oauth.save_token", new=AsyncMock(side_effect=OAuthError("db down"))):
             token, expires = await get_valid_access_token(
-                mock_pool, "google", None, None, mock_client
+                mock_pool, _TENANT, "google", None, None, mock_client
             )
 
         assert token == "refreshed-despite-save-fail"
@@ -1233,7 +1336,7 @@ class TestTerminalRefreshMarksUnhealthy:
         mock_client.post.return_value = response
 
         with pytest.raises(OAuthRefreshError) as exc_info:
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
         assert exc_info.value.terminal is True
 
     async def test_invalid_grant_saves_healthy_false(
@@ -1247,14 +1350,14 @@ class TestTerminalRefreshMarksUnhealthy:
 
         saved: list[OAuthToken] = []
 
-        async def _capture(_pool: Any, token: OAuthToken) -> None:
-            saved.append(token)
+        async def _capture(*args: Any, **kwargs: Any) -> None:
+            saved.append(_saved_token(args, kwargs))
 
         with (
             patch("admino.oauth.save_token", new=AsyncMock(side_effect=_capture)),
             pytest.raises(OAuthRefreshError),
         ):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
         assert saved, "save_token was not called to persist the unhealthy flag"
         assert saved[-1].healthy is False
@@ -1275,14 +1378,14 @@ class TestTerminalRefreshMarksUnhealthy:
 
         saved: list[OAuthToken] = []
 
-        async def _capture(_pool: Any, token: OAuthToken) -> None:
-            saved.append(token)
+        async def _capture(*args: Any, **kwargs: Any) -> None:
+            saved.append(_saved_token(args, kwargs))
 
         with (
             patch("admino.oauth.save_token", new=AsyncMock(side_effect=_capture)),
             pytest.raises(OAuthRefreshError),
         ):
-            await get_valid_access_token(mock_pool, "microsoft", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "microsoft", None, None, mock_client)
 
         assert saved
         assert saved[-1].healthy is False
@@ -1304,14 +1407,14 @@ class TestTransientRefreshKeepsHealthy:
 
         saved: list[OAuthToken] = []
 
-        async def _capture(_pool: Any, token: OAuthToken) -> None:
-            saved.append(token)
+        async def _capture(*args: Any, **kwargs: Any) -> None:
+            saved.append(_saved_token(args, kwargs))
 
         with (
             patch("admino.oauth.save_token", new=AsyncMock(side_effect=_capture)),
             pytest.raises(OAuthError),
         ):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
         assert all(t.healthy is not False for t in saved)
 
@@ -1326,14 +1429,14 @@ class TestTransientRefreshKeepsHealthy:
 
         saved: list[OAuthToken] = []
 
-        async def _capture(_pool: Any, token: OAuthToken) -> None:
-            saved.append(token)
+        async def _capture(*args: Any, **kwargs: Any) -> None:
+            saved.append(_saved_token(args, kwargs))
 
         with (
             patch("admino.oauth.save_token", new=AsyncMock(side_effect=_capture)),
             pytest.raises(OAuthError) as exc_info,
         ):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
         if isinstance(exc_info.value, OAuthRefreshError):
             assert exc_info.value.terminal is False
 
@@ -1359,11 +1462,13 @@ class TestSuccessfulRefreshMarksHealthy:
 
         saved: list[OAuthToken] = []
 
-        async def _capture(_pool: Any, token: OAuthToken) -> None:
-            saved.append(token)
+        async def _capture(*args: Any, **kwargs: Any) -> None:
+            saved.append(_saved_token(args, kwargs))
 
         with patch("admino.oauth.save_token", new=AsyncMock(side_effect=_capture)):
-            token, _ = await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            token, _ = await get_valid_access_token(
+                mock_pool, _TENANT, "google", None, None, mock_client
+            )
 
         assert token == "ok"
         assert saved, "save_token was not called after successful refresh"
@@ -1383,11 +1488,11 @@ class TestSuccessfulRefreshMarksHealthy:
 
         saved: list[OAuthToken] = []
 
-        async def _capture(_pool: Any, token: OAuthToken) -> None:
-            saved.append(token)
+        async def _capture(*args: Any, **kwargs: Any) -> None:
+            saved.append(_saved_token(args, kwargs))
 
         with patch("admino.oauth.save_token", new=AsyncMock(side_effect=_capture)):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
         assert saved
         assert saved[-1].last_refreshed_at > original
@@ -1417,7 +1522,7 @@ class TestDecryptFailurePath:
             patch.dict("os.environ", {"OAUTH_ENCRYPTION_KEY": wrong_key}),
             pytest.raises(OAuthError, match="decrypt"),
         ):
-            await get_valid_access_token(mock_pool, "google", None, None, mock_client)
+            await get_valid_access_token(mock_pool, _TENANT, "google", None, None, mock_client)
 
     async def test_get_connection_status_reports_unhealthy_on_undecryptable(
         self, mock_pool: MagicMock, fernet_env: str, sample_token: OAuthToken
@@ -1429,7 +1534,7 @@ class TestDecryptFailurePath:
         row["encrypted_refresh_token"] = "not-valid-fernet-ciphertext"
         _prime_fetchrow(mock_pool, row)
 
-        result = await get_connection_status(mock_pool, "google")
+        result = await get_connection_status(mock_pool, _TENANT, "google")
 
         assert result == (True, False)
 
@@ -1448,14 +1553,14 @@ class TestGetConnectionStatus:
     async def test_no_row_is_not_connected(self, mock_pool: MagicMock) -> None:
         """No row → (False, False)."""
         _prime_fetchrow(mock_pool, None)
-        assert await get_connection_status(mock_pool, "google") == (False, False)
+        assert await get_connection_status(mock_pool, _TENANT, "google") == (False, False)
 
     async def test_healthy_row_is_connected_and_healthy(
         self, mock_pool: MagicMock, sample_token: OAuthToken
     ) -> None:
         """A healthy row → (True, True)."""
         _prime_fetchrow(mock_pool, _row_from_token(sample_token))
-        assert await get_connection_status(mock_pool, "google") == (True, True)
+        assert await get_connection_status(mock_pool, _TENANT, "google") == (True, True)
 
     async def test_unhealthy_row_is_connected_but_unhealthy(
         self, mock_pool: MagicMock, sample_token: OAuthToken
@@ -1464,7 +1569,7 @@ class TestGetConnectionStatus:
         row = _row_from_token(sample_token)
         row["healthy"] = False
         _prime_fetchrow(mock_pool, row)
-        assert await get_connection_status(mock_pool, "google") == (True, False)
+        assert await get_connection_status(mock_pool, _TENANT, "google") == (True, False)
 
 
 # ---------------------------------------------------------------------------
@@ -1485,7 +1590,7 @@ class TestRevokeAndDeleteToken:
         _prime_fetchrow(mock_pool, None)
         mock_client = AsyncMock(spec=httpx.AsyncClient)
 
-        result = await revoke_and_delete_token(mock_pool, "google", mock_client)
+        result = await revoke_and_delete_token(mock_pool, _TENANT, "google", mock_client)
 
         assert result is False
 
@@ -1502,10 +1607,18 @@ class TestRevokeAndDeleteToken:
         mock_client.get.return_value = response
 
         with patch("admino.oauth.delete_token", new=AsyncMock(return_value=True)) as mock_delete:
-            result = await revoke_and_delete_token(mock_pool, "google", mock_client)
+            result = await revoke_and_delete_token(mock_pool, _TENANT, "google", mock_client)
 
         assert result is True
         mock_delete.assert_awaited_once()
+        # GH-162: the caller's own row is the one deleted.
+        await_args = mock_delete.await_args
+        assert await_args is not None
+        bound = inspect.signature(_delete_token_contract).bind(
+            *await_args.args, **await_args.kwargs
+        )
+        assert bound.arguments["tenant"] == _TENANT
+        assert bound.arguments["provider"] == "google"
 
     async def test_provider_revoke_failure_still_deletes(
         self, mock_pool: MagicMock, sample_token: OAuthToken
@@ -1519,7 +1632,58 @@ class TestRevokeAndDeleteToken:
         mock_client.get.side_effect = httpx.ConnectError("revoke failed")
 
         with patch("admino.oauth.delete_token", new=AsyncMock(return_value=True)) as mock_delete:
-            result = await revoke_and_delete_token(mock_pool, "google", mock_client)
+            result = await revoke_and_delete_token(mock_pool, _TENANT, "google", mock_client)
 
         assert result is True
         mock_delete.assert_awaited_once()
+
+
+def _delete_token_contract(pool: Any, tenant: Any, provider: Any) -> None:
+    """The GH-162 shape of delete_token, used to bind a spy's arguments by name."""
+
+
+# ---------------------------------------------------------------------------
+# 24. GH-162 surface: tenant signatures and removed aliases
+# ---------------------------------------------------------------------------
+
+# The contract's parameter lists: the caller's TenantContext right after the pool.
+_TENANT_SIGNATURES: dict[str, list[str]] = {
+    "load_token": ["pool", "tenant", "provider"],
+    "save_token": ["pool", "tenant", "token"],
+    "delete_token": ["pool", "tenant", "provider"],
+    "revoke_and_delete_token": ["pool", "tenant", "provider", "http_client"],
+    "get_valid_access_token": [
+        "pool",
+        "tenant",
+        "provider",
+        "cached_token",
+        "cached_expires_at",
+        "http_client",
+    ],
+    "get_connection_status": ["pool", "tenant", "provider"],
+}
+
+
+class TestTenantSignatures:
+    """Every persistence function takes the caller's TenantContext; provider has no default."""
+
+    @pytest.mark.parametrize("name", sorted(_TENANT_SIGNATURES))
+    def test_oauth_persistence_function_takes_tenant_after_pool(self, name: str) -> None:
+        """The parameters are exactly the contract's; provider (where taken) has no default."""
+        parameters = inspect.signature(getattr(oauth, name)).parameters
+
+        assert list(parameters) == _TENANT_SIGNATURES[name]
+        assert parameters["tenant"].default is inspect.Parameter.empty
+        if "provider" in parameters:
+            assert parameters["provider"].default is inspect.Parameter.empty
+
+
+class TestRemovedAliases:
+    """The backwards-compatible aliases went with oauth_setup.py (GH-162)."""
+
+    @pytest.mark.parametrize(
+        "name", ["build_consent_url", "exchange_code", "_get_client_credentials"]
+    )
+    def test_oauth_backwards_compatible_alias_is_removed(self, name: str) -> None:
+        """Only the provider-specific functions remain."""
+        assert not hasattr(oauth, name)

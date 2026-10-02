@@ -55,6 +55,9 @@ reauthenticate" and "server.py routes"):
   none to other orgs' chats, never twice; it survives ``_trim_context``.
 - The agent run of an org's member gets ``tool_policy`` (a ``ToolPolicy``)
   whose ``promoted`` holds that org's completed promotions only.
+- GH-162: the fixture orgs have no data residency. In a residency org a
+  completed gmail.send promotion still leaves every Google/Microsoft service
+  off in the run's ``enabled_tools`` (memory on); other orgs are unaffected.
 - The server lifespan no longer loads promoted permissions or a tools gate
   into the agent; ``main._build_system_prompt(config)`` has no static tool line.
 
@@ -126,6 +129,15 @@ _PROMOTABLE: Final[list[tuple[str, str]]] = [
 ]
 _GMAIL_SEND: Final = ("gmail", "send")
 _OUTLOOK_SEND: Final = ("outlook", "send")
+# GH-162: the tools an org's data residency switches off (RESIDENCY_BLOCKED_TOOLS).
+_RESIDENCY_TOOLS: Final = (
+    "gmail",
+    "google_calendar",
+    "google_drive",
+    "outlook",
+    "outlook_calendar",
+    "onedrive",
+)
 
 _ADMIN_PASSWORD: Final = "admin correct horse battery staple"
 _OTHER_PASSWORD: Final = "editor tr0ub4dor and three more"
@@ -244,10 +256,12 @@ class _Clock:
 
 @pytest.fixture()
 def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
-    """The fake database get_pool() returns: two active orgs, each with the default matrix."""
+    """The fake database get_pool() returns: two active orgs without data residency (GH-162:
+    a residency org's runs have the Google/Microsoft tools off), each with the default
+    matrix."""
     fake = FakeDb()
-    fake.add_org(ORG_ID)
-    fake.add_org(OTHER_ORG_ID)
+    fake.add_org(ORG_ID, data_residency=False)
+    fake.add_org(OTHER_ORG_ID, data_residency=False)
     fake.add_platform_settings()
     fake.add_permissions(ORG_ID)
     fake.add_permissions(OTHER_ORG_ID)
@@ -1633,6 +1647,32 @@ class TestAgentPolicy:
         assert _GMAIL_SEND in promoted_before
         assert _GMAIL_SEND not in _policy_of(agent).promoted
 
+    def test_critical_permissions_residency_keeps_a_promoted_connector_switched_off(
+        self, db: FakeDb, app: FastAPI, agent: MagicMock, clock: _Clock
+    ) -> None:
+        """GH-162: a completed gmail.send promotion doesn't reopen gmail in a residency org.
+        That org's run has every Google/Microsoft service off (memory on); the other org's
+        run keeps them on."""
+        db.add_org(ORG_ID, data_residency=True)
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        editor_b = _account(db, "editor", OTHER_ORG_ID)
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        sent_a = _post_message(client, editor_a)
+        policy_a = _policy_of(agent)
+        sent_b = _post_message(client, editor_b)
+        policy_b = _policy_of(agent)
+
+        assert (sent_a.status_code, sent_b.status_code) == (200, 200), sent_a.text
+        assert _stored(db, ORG_ID, _GMAIL_SEND) == "confirm"
+        assert {
+            tool: policy_a.enabled_tools.get(tool) for tool in _RESIDENCY_TOOLS
+        } == dict.fromkeys(_RESIDENCY_TOOLS, False)
+        assert policy_a.enabled_tools.get("memory", True) is True
+        assert all(policy_b.enabled_tools.get(tool, True) for tool in _RESIDENCY_TOOLS)
+
 
 # ---------------------------------------------------------------------------
 # 10. The lifespan and the system prompt no longer carry a global policy
@@ -1681,7 +1721,7 @@ class TestNoGlobalPolicy:
         class _Args(BaseModel):
             q: str = Field(min_length=1, max_length=10)
 
-        async def _handler(args: _Args, *, session_id: str) -> str:
+        async def _handler(args: _Args, *, session_id: str, **_: object) -> str:
             return "ok"
 
         clear_registry()

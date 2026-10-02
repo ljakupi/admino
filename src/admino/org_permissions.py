@@ -11,7 +11,11 @@ every chat run loads its own org's policy:
   ``seed_missing_orgs`` (startup) seeds every org that has no rows.
 - The run policy: ``load_tool_policy`` returns a frozen ``ToolPolicy``: the
   org's ``PermissionsConfig``, its promoted tier-2 pairs (stored 'confirm')
-  and its tool switches (``scoped_settings.org_tools_enabled``).
+  and its tool switches (``scoped_settings.org_tools_enabled``). Residency
+  gating (GH-162): when ``scoped_settings.org_residency`` is on, the Google
+  and Microsoft tools (``RESIDENCY_BLOCKED_TOOLS``) read as switched off, so
+  the run doesn't advertise them, dispatch refuses them and the summary
+  shows them "disabled"; the stored switches are untouched.
 - The matrix (``Capability.ORG_PERMISSIONS_MANAGE``): ``get_org_permissions``
   reads it; ``update_org_permission`` changes one pair (the normalized value
   of ``validate_permissions_config``) and records ``org.permission_change``.
@@ -28,7 +32,8 @@ every chat run loads its own org's policy:
   them (fail closed). ``clear_pending`` empties them.
 - The read-only summary (``Capability.ORG_PERMISSIONS_VIEW``, every member
   role): ``permissions_summary`` gives each stored pair's effective state
-  (the engine's decision, or "disabled" for a switched-off service).
+  (the engine's decision, or "disabled" for a switched-off service, a
+  residency-blocked one included).
 
 Inputs: the database pool (or the caller's connection for the seed and the
 policy), the acting ``Principal`` (from the session) or a ``TenantContext``,
@@ -84,6 +89,7 @@ from admino import audit_events, auth, scoped_settings
 from admino.access import Capability, Principal, can
 from admino.audit_events import AuditAction, TargetType
 from admino.models import (
+    RESIDENCY_BLOCKED_TOOLS,
     CriticalPermissionEntry,
     CriticalPermissionsResponse,
     CriticalPermissionState,
@@ -312,8 +318,12 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
     """Return the tenant org's tool policy for one agent run.
 
     No capability check: the server loads it for any member's run. Only the
-    tenant org's rows and tool switches are read; nothing is written. An org
-    without rows gets an empty config (everything default-deny).
+    tenant org's rows, tool switches and residency policy are read; nothing
+    is written. An org without rows gets an empty config (everything
+    default-deny). For a residency org (GH-162: the fail-closed
+    ``scoped_settings.org_residency``) every ``RESIDENCY_BLOCKED_TOOLS`` tool
+    reads as switched off, whatever its stored switch says, so the run
+    neither advertises nor dispatches it.
 
     Args:
         executor: The pool, or a connection.
@@ -321,7 +331,7 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
 
     Returns:
         The frozen ToolPolicy: the validated config of the org's rows, the
-        tier-2 pairs it stores as 'confirm', and its tool switches.
+        tier-2 pairs it stores as 'confirm', and its effective tool switches.
     """
     rows = await executor.fetch(_ORG_ROWS_SQL, tenant.org_id)
     raw: dict[str, dict[str, str]] = {}
@@ -335,6 +345,8 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
             state = "deny"
         raw.setdefault(tool, {})[action] = state
     enabled_tools = await scoped_settings.org_tools_enabled(executor, tenant)
+    if await scoped_settings.org_residency(executor, tenant):
+        enabled_tools = {**enabled_tools, **dict.fromkeys(RESIDENCY_BLOCKED_TOOLS, False)}
     return ToolPolicy(
         permissions=validate_permissions_config(raw),
         promoted=frozenset(promoted),

@@ -1,5 +1,5 @@
 """Tests for admino.sessions — server-side sessions, session policies and the one
-Principal builder (GH-149, GH-152).
+Principal builder (GH-149, GH-152, GH-162).
 
 A login creates a ``sessions`` row holding the SHA-256 hash of a random 256-bit
 token; the raw token only ever lives in the ``admino_session`` cookie. Every
@@ -43,6 +43,12 @@ What these tests pin down:
   isn't active → None. An accepted session last seen at least a minute ago gets
   exactly one ``UPDATE sessions SET last_seen_at = now() WHERE id = $n`` (bound to
   the session id); a fresher one gets no write, and a rejected one never does.
+- ``resolve_session_by_id(executor, session_id)`` (GH-162, the OAuth callback): the
+  same checks and the same AuthenticatedSession as ``resolve_session``, but one
+  ``fetchrow`` keyed by the session row id (``... WHERE s.id = $1``, the id bound,
+  no token hash) with the same joins; an unknown, revoked, expired or idle session,
+  an inactive or deleted user and an org that isn't active → None. It never writes:
+  no ``UPDATE sessions`` (last_seen_at untouched), even for a session seen long ago.
 - Revocation deletes rows: ``revoke_session`` by token hash, ``revoke_user_sessions``
   by user, ``revoke_org_sessions`` by the users of an org (the deactivation
   services of #164 and #154/#167), each returning the "DELETE <n>" count.
@@ -2042,3 +2048,316 @@ class TestSessionsHygiene:
             assert hash_session_token(secret).hex() not in caplog.text
         assert _IP not in caplog.text
         assert "UA-marker-7731" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 16. resolve_session_by_id: the OAuth callback's lookup by session row id (GH-162)
+# ---------------------------------------------------------------------------
+
+
+async def _by_id(executor: Any, session_id: uuid.UUID) -> Any:
+    """sessions.resolve_session_by_id, looked up at call time so this file collects
+    before GH-162."""
+    return await sessions_mod.resolve_session_by_id(executor, session_id)
+
+
+def _db_writes(db: FakeDb) -> list[Any]:
+    """Every INSERT, UPDATE or DELETE the fake recorded (any table)."""
+    return db.matching(r"^(?:insert into|update|delete from)\b")
+
+
+def _session_in_org_with_status(db: FakeDb, status: str) -> str:
+    """A live session of an active editor whose org then gets this status."""
+    token = db.open_session(db.add_account(role="editor"))
+    db.add_org(ORG_ID, status=status)
+    return token
+
+
+# FakeDb setups whose session must not resolve, built when the test runs: each
+# returns the raw token of the stored session (looked up by its id in the test).
+_GONE_BY_ID: list[Any] = [
+    pytest.param(
+        lambda db: db.open_session(db.add_account(), expires_in=timedelta(seconds=-1)),
+        id="expired",
+    ),
+    pytest.param(
+        lambda db: db.open_session(db.add_account(), last_seen_ago=timedelta(minutes=61)),
+        id="idle-60",
+    ),
+    pytest.param(
+        lambda db: db.open_session(
+            db.add_account(), idle_timeout_minutes=15, last_seen_ago=timedelta(minutes=16)
+        ),
+        id="idle-15",
+    ),
+    pytest.param(
+        lambda db: db.open_session(db.add_account(status="deactivated")), id="user-deactivated"
+    ),
+    pytest.param(lambda db: db.open_session(db.add_account(status="invited")), id="user-invited"),
+    pytest.param(
+        lambda db: db.open_session(db.add_account(deleted_at=_ago(days=1))), id="user-deleted"
+    ),
+    pytest.param(lambda db: _session_in_org_with_status(db, "deactivated"), id="org-deactivated"),
+    pytest.param(
+        lambda db: _session_in_org_with_status(db, "pending_deletion"),
+        id="org-pending-deletion",
+    ),
+    pytest.param(
+        lambda db: db.open_session(
+            db.add_account(kind="super_admin", role=None, status="deactivated")
+        ),
+        id="super-admin-deactivated",
+    ),
+]
+
+
+class TestResolveSessionById:
+    """GH-162: the OAuth callback resolves the initiating user's session by its row id.
+
+    The same checks and result as resolve_session (expired, idle past its own timeout,
+    malformed row, inactive or deleted user, inactive org, invalid Principal: None), one
+    parameterized ``... WHERE s.id = $1`` lookup, and never a write: the callback is a
+    cross-site redirect, so it must not keep a session alive (no last_seen_at touch).
+    """
+
+    def test_sessions_by_id_is_a_coroutine_of_the_executor_and_session_id(self) -> None:
+        resolve_by_id = sessions_mod.resolve_session_by_id
+
+        assert inspect.iscoroutinefunction(resolve_by_id)
+        assert list(inspect.signature(resolve_by_id).parameters) == ["executor", "session_id"]
+
+    # -- against the in-memory database ---------------------------------------------
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_sessions_by_id_live_member_session_matches_the_token_lookup(
+        self, role: str
+    ) -> None:
+        """The same AuthenticatedSession as resolve_session: principal, session id and
+        both languages."""
+        db = FakeDb()
+        user_id = db.add_account(role=role, ui_language="fr")
+        db.users[user_id]["response_language"] = "it"
+        token = db.open_session(user_id)
+        session_id = db.session_id_of(token)
+
+        by_id = await _by_id(db.pool, session_id)
+        by_token = await resolve_session(db.pool, token)
+
+        assert by_id is not None
+        assert by_id == by_token
+        assert type(by_id) is AuthenticatedSession
+        assert by_id.principal == Principal(
+            user_id=user_id, kind="member", org_id=ORG_ID, role=role
+        )
+        assert by_id.session_id == session_id
+        assert (by_id.ui_language, by_id.response_language) == ("fr", "it")
+
+    async def test_sessions_by_id_live_super_admin_session_matches_the_token_lookup(
+        self,
+    ) -> None:
+        db = FakeDb()
+        admin = db.add_account(kind="super_admin", role=None, ui_language="en")
+        token = db.open_session(admin)
+
+        by_id = await _by_id(db.pool, db.session_id_of(token))
+
+        assert by_id is not None
+        assert by_id == await resolve_session(db.pool, token)
+        assert by_id.principal == Principal(user_id=admin, kind="super_admin")
+
+    async def test_sessions_by_id_resolves_the_session_of_that_id(self) -> None:
+        """Two users' sessions: each id resolves to its own user, never the other."""
+        db = FakeDb()
+        alice = db.add_account(role="editor")
+        bob = db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
+        alice_token = db.open_session(alice)
+        bob_token = db.open_session(bob)
+
+        bob_session = await _by_id(db.pool, db.session_id_of(bob_token))
+        alice_session = await _by_id(db.pool, db.session_id_of(alice_token))
+
+        assert bob_session is not None
+        assert alice_session is not None
+        assert (bob_session.principal.user_id, bob_session.principal.org_id) == (
+            bob,
+            OTHER_ORG_ID,
+        )
+        assert (alice_session.principal.user_id, alice_session.principal.org_id) == (
+            alice,
+            ORG_ID,
+        )
+
+    async def test_sessions_by_id_unknown_id_returns_none(self) -> None:
+        db = FakeDb()
+        db.open_session(db.add_account())
+
+        assert await _by_id(db.pool, uuid.uuid4()) is None
+        assert _db_writes(db) == []
+
+    async def test_sessions_by_id_revoked_session_returns_none(self) -> None:
+        """Logout deletes the row: its id no longer resolves."""
+        db = FakeDb()
+        token = db.open_session(db.add_account())
+        session_id = db.session_id_of(token)
+        assert await _by_id(db.pool, session_id) is not None
+
+        await revoke_session(db.pool, token)
+
+        assert await _by_id(db.pool, session_id) is None
+
+    @pytest.mark.parametrize("make_session", _GONE_BY_ID)
+    async def test_sessions_by_id_rejects_a_session_resolve_session_rejects(
+        self, make_session: Callable[[FakeDb], str]
+    ) -> None:
+        """Expired, idle past its own timeout, an inactive or deleted user, an org that
+        isn't active → None, and nothing is written."""
+        db = FakeDb()
+        token = make_session(db)
+
+        assert await _by_id(db.pool, db.session_id_of(token)) is None
+        assert _db_writes(db) == []
+        # The same session by its token is rejected too (the setup really is a reject).
+        assert await resolve_session(db.pool, token) is None
+
+    async def test_sessions_by_id_open_session_rejected_after_deactivation(self) -> None:
+        """Re-read on every call: deactivating the user ends the lookup by id at once."""
+        db = FakeDb()
+        user_id = db.add_account()
+        session_id = db.session_id_of(db.open_session(user_id))
+        assert await _by_id(db.pool, session_id) is not None
+
+        db.users[user_id]["status"] = "deactivated"
+
+        assert await _by_id(db.pool, session_id) is None
+
+    async def test_sessions_by_id_never_touches_a_session_seen_long_ago(self) -> None:
+        """Last seen 7 hours ago (inside its 480-minute timeout): it resolves, but no
+        UPDATE sessions is issued and last_seen_at keeps its value. The token lookup of
+        the same session does touch it, so the setup would be written."""
+        db = FakeDb()
+        token = db.open_session(
+            db.add_account(), idle_timeout_minutes=480, last_seen_ago=timedelta(hours=7)
+        )
+        before = dict(db.session(token))
+
+        session = await _by_id(db.pool, db.session_id_of(token))
+
+        assert session is not None
+        assert db.matching(r"^update sessions\b") == []
+        assert _db_writes(db) == []
+        assert db.session(token) == before
+        assert [call.method for call in db.calls] == ["fetchrow"]
+
+        assert await resolve_session(db.pool, token) is not None
+        assert len(db.matching(r"^update sessions\b")) == 1
+
+    # -- the statement and the decision, against a recording executor ------------------
+
+    async def test_sessions_by_id_issues_one_fetchrow_bound_to_the_session_id(self) -> None:
+        """One fetchrow whose WHERE binds the id as a parameter: never inlined, and no
+        token hash."""
+        executor = _Executor([_row(last_seen_at=_ago(minutes=5))])
+
+        session = await _by_id(executor, _SESSION_ID)
+
+        assert session is not None
+        assert [method for method, _, _ in executor.calls] == ["fetchrow"]
+        _, sql, args = executor.calls[0]
+        where = _norm(sql).split(" where ", 1)[1]
+        match = re.search(ID_PARAM_RE, where)
+        assert match is not None, where
+        assert str(args[int(match.group(1)) - 1]) == str(_SESSION_ID)
+        assert str(_SESSION_ID) not in sql
+        assert _SESSION_ID.hex not in sql
+        assert "token_hash" not in where
+        assert all(not isinstance(arg, bytes | bytearray) for arg in args)
+
+    async def test_sessions_by_id_reads_the_same_joins_as_the_token_lookup(self) -> None:
+        """The session, its users row and (LEFT JOIN) its org; its own last_seen_at and
+        idle_timeout_minutes; never revoked_at."""
+        executor = _Executor([_row()])
+
+        await _by_id(executor, _SESSION_ID)
+
+        sql = _norm(executor.calls[0][1])
+        assert re.search(r"\bfrom sessions\b", sql) is not None
+        assert re.search(r"\bjoin users\b", sql) is not None
+        assert re.search(r"\bleft (?:outer )?join organizations\b", sql) is not None
+        assert re.search(r"\blast_seen_at\b", sql) is not None
+        assert re.search(r"\bidle_timeout_minutes\b", sql) is not None
+        assert "revoked_at" not in sql
+
+    async def test_sessions_by_id_unknown_row_returns_none(self) -> None:
+        assert await _by_id(_Executor([None]), _SESSION_ID) is None
+
+    @pytest.mark.parametrize("make_row", [*_REJECTED_ROWS, *_INVALID_PRINCIPAL_ROWS])
+    async def test_sessions_by_id_rejected_row_returns_none_without_a_write(
+        self, make_row: Callable[[datetime], dict[str, Any]]
+    ) -> None:
+        """Every row resolve_session rejects (last seen 5 minutes ago unless the case says
+        otherwise) → None, never raising, and only the fetchrow."""
+        executor = _Executor([make_row(_ago(minutes=5))])
+
+        assert await _by_id(executor, _SESSION_ID) is None
+        assert [method for method, _, _ in executor.calls] == ["fetchrow"]
+
+    @pytest.mark.parametrize("idle", [15, 60, 480])
+    async def test_sessions_by_id_idle_boundary_is_refused(self, idle: int) -> None:
+        """``last_seen_at + idle_timeout_minutes <= now`` is idle, as in resolve_session."""
+        row = _row(idle_timeout_minutes=idle, last_seen_at=_exactly_ago(timedelta(minutes=idle)))
+
+        assert await _by_id(_Executor([row]), _SESSION_ID) is None
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_sessions_by_id_accepts_an_active_member(self, role: str) -> None:
+        session = await _by_id(_Executor([_row(role=role)]), _SESSION_ID)
+
+        assert type(session) is AuthenticatedSession
+        assert session.principal == Principal(
+            user_id=_USER_ID, kind="member", org_id=_ORG_ID, role=role
+        )
+        assert session.session_id == _SESSION_ID
+        assert (session.ui_language, session.response_language) == ("de", "fr")
+        assert type(session.principal.user_id) is uuid.UUID
+        assert type(session.principal.org_id) is uuid.UUID
+
+    async def test_sessions_by_id_accepts_an_active_super_admin(self) -> None:
+        session = await _by_id(_Executor([_super_admin_row()]), _SESSION_ID)
+
+        assert session is not None
+        assert session.principal == Principal(user_id=_USER_ID, kind="super_admin")
+
+    @pytest.mark.parametrize(
+        ("idle", "seen_ago"),
+        [
+            pytest.param(60, timedelta(minutes=5), id="5-min"),
+            pytest.param(60, timedelta(minutes=59), id="59-min"),
+            pytest.param(480, timedelta(hours=7), id="7-h-of-480-min"),
+        ],
+    )
+    async def test_sessions_by_id_never_writes_last_seen_at(
+        self, idle: int, seen_ago: timedelta
+    ) -> None:
+        """A session resolve_session would touch (seen a minute or more ago) is returned
+        with only the fetchrow: no UPDATE, no other statement."""
+        row = _row(idle_timeout_minutes=idle, last_seen_at=datetime.now(UTC) - seen_ago)
+        executor = _Executor([row])
+
+        session = await _by_id(executor, _SESSION_ID)
+
+        assert session is not None
+        assert _updates(executor) == []
+        assert [method for method, _, _ in executor.calls] == ["fetchrow"]
+
+    async def test_sessions_by_id_logs_no_session_id(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Neither an accepted nor a rejected lookup logs the session id."""
+        caplog.set_level(logging.DEBUG)
+
+        await _by_id(_Executor([_row(last_seen_at=_ago(minutes=5))]), _SESSION_ID)
+        await _by_id(_Executor([_row(status="deactivated")]), _SESSION_ID)
+        await _by_id(_Executor([None]), _SESSION_ID)
+
+        assert str(_SESSION_ID) not in caplog.text
+        assert _SESSION_ID.hex not in caplog.text

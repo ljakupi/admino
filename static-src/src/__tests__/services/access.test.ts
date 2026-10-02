@@ -27,8 +27,14 @@
  *   `Capability.ORG_PERMISSIONS_MANAGE`: Org Admin only. It gates the
  *   permission matrix and the critical permissions under Organization; every
  *   other role, `null` and unknown or prototype-key strings are refused.
+ * - `canConnectAccounts(role)` (issue #162) mirrors `Capability.OAUTH_CONNECT`:
+ *   Org Admin and Editor only (the Tools page's "my connections"). Viewers and
+ *   Super Admins can't connect accounts; `null`, `undefined` and unknown or
+ *   prototype-key strings are refused (never a thrown error). The area matrix
+ *   is unchanged (Tools: Org Admin + Editor).
  */
 import { describe, it, expect } from 'vitest';
+import * as access from '@/services/access';
 import {
   canAccessArea,
   canManageOrgPermissions,
@@ -246,6 +252,50 @@ describe('access canManageOrgPermissions', () => {
 
   it('never gives a permission manager the read-only Permissions page as well', () => {
     expect(ROLES.filter((role) => canManageOrgPermissions(role) && canAccessArea(role, 'permissions'))).toEqual([]);
+  });
+});
+
+// --- canConnectAccounts (issue #162) ---------------------------------------
+
+describe('access canConnectAccounts', () => {
+  it.each([
+    ['org_admin', true],
+    ['editor', true],
+    ['viewer', false],
+    ['super_admin', false],
+    [null, false],
+  ] as Array<[ShellRole | null, boolean]>)('%s may connect accounts: %s', (role, expected) => {
+    expect(access.canConnectAccounts(role)).toBe(expected);
+  });
+
+  it.each([
+    'owner',
+    'admin',
+    'Editor',
+    'EDITOR',
+    ' editor',
+    'editor ',
+    'Org_Admin',
+    '',
+    '__proto__',
+    'constructor',
+    'toString',
+    'hasOwnProperty',
+  ])('refuses connections to the unknown role %j without throwing', (role) => {
+    expect(access.canConnectAccounts(role as ShellRole)).toBe(false);
+  });
+
+  it('refuses connections to undefined without throwing', () => {
+    expect(access.canConnectAccounts(undefined as unknown as ShellRole | null)).toBe(false);
+  });
+
+  it('grants connections exactly to the roles that may open the Tools page', () => {
+    const connectors = ROLES.filter((role) => access.canConnectAccounts(role));
+
+    expect({ connectors, tools: ROLES.filter((role) => canAccessArea(role, 'tools')) }).toEqual({
+      connectors: ['org_admin', 'editor'],
+      tools: ['org_admin', 'editor'],
+    });
   });
 });
 

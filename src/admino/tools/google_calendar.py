@@ -1,88 +1,82 @@
 """Google Calendar tool for reading, listing, creating, and updating events via Calendar API v3.
 
 Provides read, list, create, and update actions for Google Calendar events on
-the authenticated user's primary calendar. OAuth tokens are managed by admino.oauth.
+the primary calendar of the calling user's own Google account (per-user
+connections, GH-162).
+
+Inputs: the validated args (``GoogleCalendarReadArgs``,
+``GoogleCalendarListArgs``, ``GoogleCalendarCreateArgs``,
+``GoogleCalendarUpdateArgs``) and the required keyword ``tenant`` (the run's
+``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
+formatted event(s), a confirmation, or a user-facing error string.
 
 Security notes:
+- Per-user tokens: every API request of a handler call carries the access
+  token of that call's tenant, from ``_get_google_token(tenant)``, which
+  reads the shared per-user cache ``oauth.access_tokens`` (keyed by user and
+  provider). The tenant comes from the server-side session, never from LLM
+  arguments. The module keeps no token state of its own; refresh tokens
+  never leave oauth.py, and no token is logged.
 - No delete capability. google_calendar.delete is an immutable hardcoded denial.
 - google_calendar.update is a tier-2 promotable denial: it is denied by default
   and can only be used after explicit user promotion (plus per-call confirmation)
   via the Critical Permissions UI. event_id and attendee addresses are validated
   in models.py to prevent path traversal and injection.
 - google_calendar.create requires user confirmation via the permission engine.
-- OAuth tokens are cached in module-level state; refresh tokens never appear
-  in memory outside oauth.py.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import TYPE_CHECKING
 
 import httpx
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
+from admino import database
 from admino.models import (
     GoogleCalendarCreateArgs,
     GoogleCalendarListArgs,
     GoogleCalendarReadArgs,
     GoogleCalendarUpdateArgs,
 )
-from admino.oauth import OAuthError, get_valid_access_token
+from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level state for OAuth token caching and HTTP client
-# ---------------------------------------------------------------------------
-
+# The module's HTTP client (created on first use). It holds no credentials:
+# each request sets its own caller's Authorization header.
 _http_client: httpx.AsyncClient | None = None
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
-_token_lock = asyncio.Lock()
 
 _CALENDAR_API_BASE = "https://www.googleapis.com/calendar/v3/calendars/primary"
 
 
-async def _get_google_token() -> str:
-    """Obtain a valid Google OAuth access token, refreshing if needed.
+def _client() -> httpx.AsyncClient:
+    """Return the module's HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+async def _get_google_token(tenant: TenantContext) -> str:
+    """Obtain a valid Google access token for the tenant's own connection.
+
+    Args:
+        tenant: The handler call's tool context; its user's token is used.
 
     Returns:
         A valid access token string.
 
     Raises:
-        OAuthError: If no token file exists or refresh fails.
+        OAuthError: If the user has no Google connection or refresh fails.
     """
-    from admino.database import get_pool
-
-    async with _token_lock:
-        global _http_client, _cached_token, _cached_expires_at
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        _cached_token, _cached_expires_at = await get_valid_access_token(
-            get_pool(), "google", _cached_token, _cached_expires_at, _http_client
-        )
-        return _cached_token
-
-
-async def clear_token_cache() -> None:
-    """Reset the in-memory cached access token.
-
-    Acquires ``_token_lock`` to avoid clearing the cache while a
-    concurrent tool call is mid-refresh. Called by the OAuth disconnect
-    endpoint to ensure stale tokens are not reused after the user
-    disconnects their Google account.
-    """
-    async with _token_lock:
-        global _cached_token, _cached_expires_at
-        _cached_token = None
-        _cached_expires_at = None
+    return await access_tokens.get(database.get_pool(), tenant, "google", _client())
 
 
 def _auth_headers(token: str) -> dict[str, str]:
@@ -194,21 +188,21 @@ def _format_event(event: dict[str, object]) -> str:
     ),
     args_schema=GoogleCalendarReadArgs,
 )
-async def google_calendar_read(args: GoogleCalendarReadArgs, **kwargs: object) -> str:
+async def google_calendar_read(
+    args: GoogleCalendarReadArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Read a single Google Calendar event by ID.
 
     Args:
         args: Validated read arguments (event_id).
+        tenant: The caller's tool context (whose calendar is read).
 
     Returns:
         Formatted event details string.
     """
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.get(
+        token = await _get_google_token(tenant)
+        response = await _client().get(
             f"{_CALENDAR_API_BASE}/events/{args.event_id}",
             headers=_auth_headers(token),
         )
@@ -254,11 +248,14 @@ async def google_calendar_read(args: GoogleCalendarReadArgs, **kwargs: object) -
     ),
     args_schema=GoogleCalendarListArgs,
 )
-async def google_calendar_list(args: GoogleCalendarListArgs, **kwargs: object) -> str:
+async def google_calendar_list(
+    args: GoogleCalendarListArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """List Google Calendar events in a time range.
 
     Args:
         args: Validated list arguments (time_min, time_max, max_results).
+        tenant: The caller's tool context (whose calendar is read).
 
     Returns:
         Formatted list of events.
@@ -272,11 +269,8 @@ async def google_calendar_list(args: GoogleCalendarListArgs, **kwargs: object) -
     }
 
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.get(
+        token = await _get_google_token(tenant)
+        response = await _client().get(
             f"{_CALENDAR_API_BASE}/events",
             params=params,
             headers=_auth_headers(token),
@@ -312,11 +306,14 @@ async def google_calendar_list(args: GoogleCalendarListArgs, **kwargs: object) -
     description="Create a new calendar event. Returns the event ID and link on success.",
     args_schema=GoogleCalendarCreateArgs,
 )
-async def google_calendar_create(args: GoogleCalendarCreateArgs, **kwargs: object) -> str:
+async def google_calendar_create(
+    args: GoogleCalendarCreateArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Create a new Google Calendar event.
 
     Args:
         args: Validated create arguments (summary, start, end, description, location).
+        tenant: The caller's tool context (whose calendar gets the event).
 
     Returns:
         Confirmation message with event ID and link.
@@ -332,11 +329,8 @@ async def google_calendar_create(args: GoogleCalendarCreateArgs, **kwargs: objec
         event_body["location"] = args.location
 
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.post(
+        token = await _get_google_token(tenant)
+        response = await _client().post(
             f"{_CALENDAR_API_BASE}/events",
             json=event_body,
             headers={
@@ -375,11 +369,14 @@ async def google_calendar_create(args: GoogleCalendarCreateArgs, **kwargs: objec
     ),
     args_schema=GoogleCalendarUpdateArgs,
 )
-async def google_calendar_update(args: GoogleCalendarUpdateArgs, **kwargs: object) -> str:
+async def google_calendar_update(
+    args: GoogleCalendarUpdateArgs, *, tenant: TenantContext, **_: object
+) -> str:
     """Update an existing Google Calendar event (partial PATCH).
 
     Args:
         args: Validated update arguments (event_id plus optional fields).
+        tenant: The caller's tool context (whose calendar is updated).
 
     Returns:
         Confirmation message with the updated event summary, or an error string.
@@ -402,11 +399,8 @@ async def google_calendar_update(args: GoogleCalendarUpdateArgs, **kwargs: objec
         return "No fields provided to update. Specify at least one field to change."
 
     try:
-        global _http_client
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        token = await _get_google_token()
-        response = await _http_client.patch(
+        token = await _get_google_token(tenant)
+        response = await _client().patch(
             f"{_CALENDAR_API_BASE}/events/{args.event_id}",
             json=event_body,
             headers={

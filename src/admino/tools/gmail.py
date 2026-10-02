@@ -1,14 +1,24 @@
 """Gmail tool for reading, listing, searching, and sending emails via Google Gmail API v1.
 
-Provides read, list, search, and send actions for Gmail messages using the
-authenticated user's account. OAuth tokens are managed by admino.oauth.
+Provides read, list, search, and send actions for Gmail messages in the
+calling user's own Google account (per-user connections, GH-162).
+
+Inputs: the validated args (``GmailReadArgs``, ``GmailListArgs``,
+``GmailSearchArgs``, ``GmailSendArgs``) and the required keyword ``tenant``
+(the run's ``TenantContext``, passed by ``registry.dispatch_tool_call``).
+Outputs: the formatted message(s), a send summary, or a user-facing error
+string.
 
 Security notes:
+- Per-user tokens: every API request of a handler call carries the access
+  token of that call's tenant, from ``_get_google_token(tenant)``, which
+  reads the shared per-user cache ``oauth.access_tokens`` (keyed by user and
+  provider). The tenant comes from the server-side session, never from LLM
+  arguments. The module keeps no token state of its own; refresh tokens
+  never leave oauth.py, and no token is logged.
 - gmail.send is a tier-2 promotable denial in permissions.py. It is denied
   by default and requires explicit user promotion + cooldown before use.
   gmail.delete remains a hardcoded immutable denial.
-- OAuth tokens are cached in module-level state; refresh tokens never appear
-  in memory outside oauth.py.
 - Email body content is truncated to 10000 characters to prevent LLM context
   overflow.
 - RFC 2822 message construction uses stdlib email.message.EmailMessage to
@@ -19,73 +29,51 @@ Security notes:
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import logging
 from typing import TYPE_CHECKING
 
 import httpx
 
-if TYPE_CHECKING:
-    from datetime import datetime
-
+from admino import database
 from admino.models import GmailListArgs, GmailReadArgs, GmailSearchArgs, GmailSendArgs
-from admino.oauth import OAuthError, get_valid_access_token
+from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
+
+if TYPE_CHECKING:
+    from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Module-level state for OAuth token caching and HTTP client
-# NOTE: Each Google tool module (gmail, google_calendar, google_drive) maintains
-# its own token cache. Under concurrent requests, multiple modules may refresh
-# the same token independently. This is a known design limitation; each refresh
-# is individually correct but may produce redundant refreshes. A shared token
-# cache module would eliminate this but is deferred for simplicity.
-# ---------------------------------------------------------------------------
-
+# The module's HTTP client (created on first use). It holds no credentials:
+# each request sets its own caller's Authorization header.
 _http_client: httpx.AsyncClient | None = None
-_cached_token: str | None = None
-_cached_expires_at: datetime | None = None
-_token_lock = asyncio.Lock()
 
 _GMAIL_API_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
 _MAX_BODY_CHARS = 10_000
 
 
-async def _get_google_token() -> str:
-    """Obtain a valid Google OAuth access token, refreshing if needed.
+def _client() -> httpx.AsyncClient:
+    """Return the module's HTTP client, creating it on first use."""
+    global _http_client
+    if _http_client is None:
+        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    return _http_client
+
+
+async def _get_google_token(tenant: TenantContext) -> str:
+    """Obtain a valid Google access token for the tenant's own connection.
+
+    Args:
+        tenant: The handler call's tool context; its user's token is used.
 
     Returns:
         A valid access token string.
 
     Raises:
-        OAuthError: If no token file exists or refresh fails.
+        OAuthError: If the user has no Google connection or refresh fails.
     """
-    from admino.database import get_pool
-
-    async with _token_lock:
-        global _http_client, _cached_token, _cached_expires_at
-        if _http_client is None:
-            _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-        _cached_token, _cached_expires_at = await get_valid_access_token(
-            get_pool(), "google", _cached_token, _cached_expires_at, _http_client
-        )
-        return _cached_token
-
-
-async def clear_token_cache() -> None:
-    """Reset the in-memory cached access token.
-
-    Acquires ``_token_lock`` to avoid clearing the cache while a
-    concurrent tool call is mid-refresh. Called by the OAuth disconnect
-    endpoint to ensure stale tokens are not reused after the user
-    disconnects their Google account.
-    """
-    async with _token_lock:
-        global _cached_token, _cached_expires_at
-        _cached_token = None
-        _cached_expires_at = None
+    return await access_tokens.get(database.get_pool(), tenant, "google", _client())
 
 
 def _auth_headers(token: str) -> dict[str, str]:
@@ -93,11 +81,14 @@ def _auth_headers(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
-async def _google_get(url: str, params: dict[str, str] | None = None) -> httpx.Response:
-    """Perform an authenticated GET request to the Google API.
+async def _google_get(
+    url: str, tenant: TenantContext, params: dict[str, str] | None = None
+) -> httpx.Response:
+    """Perform a GET request to the Google API with the tenant's access token.
 
     Args:
         url: Full URL to request.
+        tenant: The handler call's tool context.
         params: Optional query parameters.
 
     Returns:
@@ -106,11 +97,8 @@ async def _google_get(url: str, params: dict[str, str] | None = None) -> httpx.R
     Raises:
         OAuthError: If token retrieval fails.
     """
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-    token = await _get_google_token()
-    return await _http_client.get(url, params=params, headers=_auth_headers(token))
+    token = await _get_google_token(tenant)
+    return await _client().get(url, params=params, headers=_auth_headers(token))
 
 
 def _extract_header(headers: list[dict[str, str]], name: str) -> str:
@@ -190,11 +178,12 @@ def _format_api_error(response: httpx.Response) -> str:
     return f"Google API error {response.status_code}"
 
 
-async def _fetch_message_headers(message_id: str) -> dict[str, str]:
+async def _fetch_message_headers(message_id: str, tenant: TenantContext) -> dict[str, str]:
     """Fetch subject, from, and date headers for a single message.
 
     Args:
         message_id: Gmail message ID.
+        tenant: The handler call's tool context.
 
     Returns:
         Dict with keys 'id', 'subject', 'from', 'date'.
@@ -204,11 +193,8 @@ async def _fetch_message_headers(message_id: str) -> dict[str, str]:
         "format": "metadata",
         "metadataHeaders": ["Subject", "From", "Date"],
     }
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-    token = await _get_google_token()
-    response = await _http_client.get(url, params=params, headers=_auth_headers(token))
+    token = await _get_google_token(tenant)
+    response = await _client().get(url, params=params, headers=_auth_headers(token))
 
     if response.status_code != 200:
         return {"id": message_id, "subject": "[error]", "from": "", "date": ""}
@@ -260,7 +246,7 @@ def _format_message_list(messages: list[dict[str, str]]) -> str:
     description="Read a single email by message ID. Returns subject, from, date, and body text.",
     args_schema=GmailReadArgs,
 )
-async def gmail_read(args: GmailReadArgs, **kwargs: object) -> str:
+async def gmail_read(args: GmailReadArgs, *, tenant: TenantContext, **_: object) -> str:
     """Read a single Gmail message by ID.
 
     Fetches the full message and extracts subject, from, date, snippet,
@@ -268,6 +254,7 @@ async def gmail_read(args: GmailReadArgs, **kwargs: object) -> str:
 
     Args:
         args: Validated read arguments (message_id).
+        tenant: The caller's tool context (whose Google account is read).
 
     Returns:
         Formatted message content string.
@@ -275,6 +262,7 @@ async def gmail_read(args: GmailReadArgs, **kwargs: object) -> str:
     try:
         response = await _google_get(
             f"{_GMAIL_API_BASE}/messages/{args.message_id}",
+            tenant,
             params={"format": "full"},
         )
     except OAuthError as exc:
@@ -316,13 +304,14 @@ async def gmail_read(args: GmailReadArgs, **kwargs: object) -> str:
     description="List recent emails. Returns subject, from, and date for each message.",
     args_schema=GmailListArgs,
 )
-async def gmail_list(args: GmailListArgs, **kwargs: object) -> str:
+async def gmail_list(args: GmailListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List recent Gmail messages.
 
     Fetches message IDs, then batch-fetches headers for each.
 
     Args:
         args: Validated list arguments (max_results).
+        tenant: The caller's tool context (whose Google account is read).
 
     Returns:
         Formatted list of messages with headers.
@@ -330,6 +319,7 @@ async def gmail_list(args: GmailListArgs, **kwargs: object) -> str:
     try:
         response = await _google_get(
             f"{_GMAIL_API_BASE}/messages",
+            tenant,
             params={"maxResults": str(args.max_results)},
         )
     except OAuthError as exc:
@@ -350,7 +340,7 @@ async def gmail_list(args: GmailListArgs, **kwargs: object) -> str:
     for ref in message_refs:
         if isinstance(ref, dict) and "id" in ref:
             try:
-                msg = await _fetch_message_headers(str(ref["id"]))
+                msg = await _fetch_message_headers(str(ref["id"]), tenant)
                 messages.append(msg)
             except (OAuthError, httpx.HTTPError):
                 continue
@@ -364,7 +354,7 @@ async def gmail_list(args: GmailListArgs, **kwargs: object) -> str:
     description="Search emails by query. Returns subject, from, and date for matching messages.",
     args_schema=GmailSearchArgs,
 )
-async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
+async def gmail_search(args: GmailSearchArgs, *, tenant: TenantContext, **_: object) -> str:
     """Search Gmail messages by query.
 
     Uses Gmail's search query syntax (same as the Gmail web UI search bar).
@@ -372,6 +362,7 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
 
     Args:
         args: Validated search arguments (query, max_results).
+        tenant: The caller's tool context (whose Google account is searched).
 
     Returns:
         Formatted list of matching messages with headers.
@@ -379,6 +370,7 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
     try:
         response = await _google_get(
             f"{_GMAIL_API_BASE}/messages",
+            tenant,
             params={"q": args.query, "maxResults": str(args.max_results)},
         )
     except OAuthError as exc:
@@ -399,7 +391,7 @@ async def gmail_search(args: GmailSearchArgs, **kwargs: object) -> str:
     for ref in message_refs:
         if isinstance(ref, dict) and "id" in ref:
             try:
-                msg = await _fetch_message_headers(str(ref["id"]))
+                msg = await _fetch_message_headers(str(ref["id"]), tenant)
                 messages.append(msg)
             except (OAuthError, httpx.HTTPError):
                 continue
@@ -467,7 +459,7 @@ def _send_summary(args: GmailSendArgs) -> str:
     ),
     args_schema=GmailSendArgs,
 )
-async def gmail_send(args: GmailSendArgs, **kwargs: object) -> str:
+async def gmail_send(args: GmailSendArgs, *, tenant: TenantContext, **_: object) -> str:
     """Send an email via the Gmail API.
 
     Constructs an RFC 2822 message, base64url-encodes it, and POSTs to the
@@ -475,23 +467,20 @@ async def gmail_send(args: GmailSendArgs, **kwargs: object) -> str:
 
     Args:
         args: Validated send arguments (to, subject, body, cc, bcc).
+        tenant: The caller's tool context (whose Google account sends).
 
     Returns:
         Confirmation summary string, or an error message.
     """
     try:
-        token = await _get_google_token()
+        token = await _get_google_token(tenant)
     except OAuthError as exc:
         return f"Google OAuth error: {exc} Open the Tools page to reconnect your Google account."
 
     raw_message = _build_rfc2822(args)
 
-    global _http_client
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
-
     try:
-        response = await _http_client.post(
+        response = await _client().post(
             f"{_GMAIL_API_BASE}/messages/send",
             headers=_auth_headers(token),
             json={"raw": raw_message},

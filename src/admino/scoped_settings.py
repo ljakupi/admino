@@ -14,7 +14,11 @@ owner, and this module is the service behind their routes and the startup:
   caller's own org's row (``Capability.ORG_SETTINGS_MANAGE``); each real
   change is an ``org.settings_change`` audit event. ``org_tools_enabled``
   (GH-161) reads a tenant org's switches for a chat run, without a
-  capability check (an internal read: every member's run needs it).
+  capability check (an internal read: every member's run needs it); it
+  returns the stored switches, residency not applied. ``org_residency``
+  (GH-162) reads the org's ``data_residency`` policy the same way; both org
+  settings responses carry it, read-only (a Google or Microsoft switch can
+  still be stored while it is on).
 - ``platform_settings`` (one row, the Super Admin): the LLM provider, one
   model per provider, the limits and (GH-160) the files, retention and
   security defaults. ``seed_platform_settings`` stores config.yaml's llm and
@@ -41,7 +45,8 @@ acting ``Principal`` (from the session), the validated patch models
 (``UserSettingsPatch``, ``OrgSettingsPatch``, ``PlatformSettingsPatch``) and
 the client IP; the ``AppConfig`` (startup); an account kind.
 Outputs: ``UserSettingsResponse``, ``OrgSettingsResponse``,
-``StoredPlatformSettings``, an org's switches (tool name -> bool), the
+``StoredPlatformSettings``, an org's switches (tool name -> bool) and its
+residency flag, the
 overlaid ``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
 ``AuditRecordError``, ``InvalidPlatformSettingsError`` (the merged trash
 minimum exceeds the maximum), ``RuntimeError`` (no platform row: startup
@@ -54,7 +59,8 @@ Security notes:
 - Tenant isolation: the org is always ``TenantContext.from_principal(actor)``
   and the user always ``actor.user_id``, both bind parameters; never a
   request value.
-- Fail closed: an org or platform change, its row lock (``FOR UPDATE``) and
+- Fail closed: an org without an organizations row reads as residency on.
+  An org or platform change, its row lock (``FOR UPDATE``) and
   its audit events share one transaction on one connection, so a failed audit
   write rolls the change back (for the platform, the re-timed Super Admin
   sessions too). A no-op writes nothing and records nothing; an invalid
@@ -141,6 +147,8 @@ _ORG_SQL: Final = """
     FROM org_settings
     WHERE org_id = $1
 """
+# GH-162: the org's data residency policy (the Super Admin's switch).
+_ORG_RESIDENCY_SQL: Final = "SELECT data_residency FROM organizations WHERE id = $1"
 _ORG_ENSURE_SQL: Final = """
     INSERT INTO org_settings (org_id) VALUES ($1)
     ON CONFLICT (org_id) DO NOTHING
@@ -468,18 +476,19 @@ async def get_org_settings(pool: asyncpg.Pool, *, actor: Principal) -> OrgSettin
         actor: The Org Admin asking.
 
     Returns:
-        The OrgSettingsResponse. A missing row reads as every tool enabled and
-        nothing is written.
+        The OrgSettingsResponse: the stored switches (a missing row reads as
+        every tool enabled and nothing is written) and the org's residency
+        policy (``org_residency``).
 
     Raises:
         PermissionError: Without ``Capability.ORG_SETTINGS_MANAGE``; no query
             is issued.
     """
     _require(actor, Capability.ORG_SETTINGS_MANAGE)
-    org_id = TenantContext.from_principal(actor).org_id
-    row: Record | None = await pool.fetchrow(_ORG_SQL, org_id)
+    tenant = TenantContext.from_principal(actor)
+    row: Record | None = await pool.fetchrow(_ORG_SQL, tenant.org_id)
     tools = ToolsSettings() if row is None else ToolsSettings.model_validate(dict(row))
-    return OrgSettingsResponse(tools=tools)
+    return OrgSettingsResponse(tools=tools, data_residency=await org_residency(pool, tenant))
 
 
 async def update_org_settings(
@@ -499,7 +508,9 @@ async def update_org_settings(
         ip: The client address, if known.
 
     Returns:
-        The org's OrgSettingsResponse after the change.
+        The org's OrgSettingsResponse after the change, with the org's
+        residency policy (read-only: a Google or Microsoft switch is stored
+        even while residency is on; the run's policy applies residency).
 
     Raises:
         PermissionError: Without ``Capability.ORG_SETTINGS_MANAGE``; no query
@@ -508,19 +519,21 @@ async def update_org_settings(
             changes.
     """
     _require(actor, Capability.ORG_SETTINGS_MANAGE)
-    org_id = TenantContext.from_principal(actor).org_id
+    tenant = TenantContext.from_principal(actor)
+    org_id = tenant.org_id
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(_ORG_ENSURE_SQL, org_id)
         # The row exists now: the locking SELECT yields exactly one row.
         (locked,) = await conn.fetch(_ORG_LOCK_SQL, org_id)
         old = ToolsSettings.model_validate(dict(locked))
+        residency = await org_residency(conn, tenant)
         changed: dict[str, bool] = {
             tool: enabled
             for tool, enabled in patch.tools.model_dump(exclude_none=True).items()
             if getattr(old, tool) != enabled
         }
         if not changed:
-            return OrgSettingsResponse(tools=old)
+            return OrgSettingsResponse(tools=old, data_residency=residency)
         (row,) = await conn.fetch(_ORG_UPDATE_SQL, org_id, *(changed.get(tool) for tool in _TOOLS))
         metadata: dict[str, MetadataValue] = {}
         for tool in _TOOLS:
@@ -538,7 +551,28 @@ async def update_org_settings(
             ip=ip,
             metadata=metadata,
         )
-    return OrgSettingsResponse(tools=ToolsSettings.model_validate(dict(row)))
+    return OrgSettingsResponse(
+        tools=ToolsSettings.model_validate(dict(row)), data_residency=residency
+    )
+
+
+async def org_residency(executor: sessions.Executor, tenant: TenantContext) -> bool:
+    """Return whether the tenant org's data residency policy is on (GH-162).
+
+    No capability check: an internal read (a chat run's tool policy, the
+    OAuth routes, the org settings responses). Only the tenant's org row is
+    read; nothing is written.
+
+    Args:
+        executor: The pool, or a connection.
+        tenant: The org scope.
+
+    Returns:
+        The org's ``data_residency`` flag; True when the org row is missing
+        (fail closed: the Google and Microsoft tools stay off).
+    """
+    row: Record | None = await executor.fetchrow(_ORG_RESIDENCY_SQL, tenant.org_id)
+    return True if row is None else row["data_residency"] is not False
 
 
 async def org_tools_enabled(executor: sessions.Executor, tenant: TenantContext) -> dict[str, bool]:
