@@ -43,6 +43,22 @@ export const de: Record<MessageKey, Message> = {
   'chat.header.menu': 'Menü',
   'chat.toolCall.expired': 'Abgelaufen',
 
+  // --- chat errors (issue #242: V1 model policy, decision D3 — anstelle der
+  // englischen `response`-Rückfallantwort bei einer Fehlerantwort gezeigt) ---
+  'chat.error.not_configured':
+    'Dieses KI-Modell ist noch nicht eingerichtet. Bitten Sie Ihre Administratorin oder Ihren Administrator, es zu konfigurieren.',
+  'chat.error.missing_model':
+    'Das konfigurierte KI-Modell ist nicht verfügbar. Bitten Sie Ihre Administratorin oder Ihren Administrator, die Einrichtung zu prüfen.',
+  'chat.error.provider_unavailable':
+    'Der KI-Dienst ist vorübergehend nicht verfügbar. Bitte warten Sie einen Moment und versuchen Sie es erneut.',
+  'chat.error.rate_limited':
+    'Gerade zu viele Anfragen. Bitte warten Sie einen Moment und versuchen Sie es erneut.',
+  'chat.error.timeout': 'Der KI-Dienst hat zu lange für eine Antwort gebraucht. Bitte versuchen Sie es erneut.',
+  'chat.error.residency_blocked':
+    'Die Richtlinie Ihrer Organisation zum Datenstandort erlaubt das aktuelle KI-Modell nicht. Bitten Sie Ihre Administratorin oder Ihren Administrator, auf ein zulässiges Modell zu wechseln.',
+  'chat.error.context_too_long': 'Diese Unterhaltung ist für das KI-Modell zu lang geworden. Beginnen Sie einen neuen Chat.',
+  'chat.error.generic': 'Beim Beantworten dieser Nachricht ist etwas schiefgelaufen. Bitte versuchen Sie es erneut.',
+
   // --- toast (shared) ----------------------------------------------------
   'toast.common.saved': 'Gespeichert',
   'toast.common.saveFailed.title': 'Speichern fehlgeschlagen',
@@ -579,6 +595,15 @@ export const de: Record<MessageKey, Message> = {
   // --- platform page (placeholder, Super Admin console, issue #155) ---------
   'platform.empty.heading': 'Plattform-Konsole',
   'platform.empty.subtext': 'Die Plattform-Konsole wird hier erscheinen.',
+
+  // --- platform defaults: residency confirmation (issue #242, D1; #168 renders the dialog) ---
+  'platform.defaults.residencyConfirm.title': 'Nicht-Schweizer Datenstandort bestätigen',
+  'platform.defaults.residencyConfirm.body': {
+    one: '{count} Organisation verlangt aktuell einen Schweizer Datenstandort und ist von dieser Änderung betroffen.',
+    other:
+      '{count} Organisationen verlangen aktuell einen Schweizer Datenstandort und sind von dieser Änderung betroffen.',
+  },
+  'platform.defaults.residencyConfirm.confirm': 'Trotzdem wechseln',
 
   // --- chat page (read-only viewer, issue #155) -----------------------------
   'chat.viewerEmpty.heading': 'Noch nichts mit Ihnen geteilt',

@@ -20,14 +20,23 @@ owner, and this module is the service behind their routes and the startup:
   settings responses carry it, read-only (a Google or Microsoft switch can
   still be stored while it is on).
 - ``platform_settings`` (one row, the Super Admin): the LLM provider, one
-  model per provider, the limits and (GH-160) the files, retention and
-  security defaults. ``seed_platform_settings`` stores config.yaml's llm and
-  limits on the first boot and re-applies its llm on every later boot (the
-  stored limits are kept; the other defaults start from migration 0014's
-  column defaults); ``apply_platform_settings`` overlays the LLM and limits
-  onto the config; ``update_platform_settings`` changes any of the five
-  sections (``Capability.PLATFORM_DEFAULTS_MANAGE``), each changed section a
-  ``platform.settings_change`` audit event.
+  model per provider, (GH-242, migration 0022) the active model's
+  capabilities (``max_input_tokens``, ``image_input``) and the LLM retry
+  limit (``max_retries``, column ``llm_max_retries``), the limits and
+  (GH-160) the files, retention and security defaults.
+  ``seed_platform_settings`` stores config.yaml's llm and limits on the first
+  boot and re-applies its llm (provider, models, model capabilities) on
+  every later boot (the stored limits are kept; the retry limit is never
+  seeded, so it starts from its column default and a stored value is kept;
+  the other defaults start from migration 0014's column defaults);
+  ``apply_platform_settings`` overlays the LLM (all but the retry limit,
+  which is no ``LLMConfig`` field) and limits onto the config;
+  ``update_platform_settings`` changes any of the five sections
+  (``Capability.PLATFORM_DEFAULTS_MANAGE``), each changed section a
+  ``platform.settings_change`` audit event. ``count_residency_orgs``
+  (GH-242) counts the orgs with data residency on; an update given the count
+  the route confirmed for a non-Swiss switch counts again under its row lock
+  and raises ``ResidencyConfirmationError`` when it changed.
 - One in-process cache of the platform row (``_platform_cache``, GH-160):
   ``current_platform_settings`` answers from it (reading the row once when it
   is empty), ``load_platform_settings`` (startup, the platform settings page)
@@ -49,7 +58,8 @@ Outputs: ``UserSettingsResponse``, ``OrgSettingsResponse``,
 residency flag, the
 overlaid ``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
 ``AuditRecordError``, ``InvalidPlatformSettingsError`` (the merged trash
-minimum exceeds the maximum), ``RuntimeError`` (no platform row: startup
+minimum exceeds the maximum), ``ResidencyConfirmationError`` (the confirmed
+residency-org count changed before the write), ``RuntimeError`` (no platform row: startup
 always seeds it first), ``ValueError`` (no session policy for the kind).
 
 Security notes:
@@ -72,9 +82,10 @@ Security notes:
   a session older than the new lifetime, or idle past the new timeout, ends.
 - No content in audit rows: org events carry one ``<tool>_old`` /
   ``<tool>_new`` bool pair per changed tool; the platform llm event carries
-  the names of the changed fields mapped to True, never a provider or model
-  value; the other platform events carry ``<field>_old`` / ``<field>_new``
-  ints (and ``sessions_updated``, a count). Nothing is logged here.
+  the names of the changed fields mapped to True (``max_retries``, never the
+  column name), never a provider, model, input window or retry value; the
+  other platform events carry ``<field>_old`` / ``<field>_new`` ints (and
+  ``sessions_updated``, a count). Nothing is logged here.
 - Parameterized SQL only: every statement is a constant, every value a bind
   parameter.
 - Imports only access, tenancy, audit_events, models, config and sessions
@@ -149,6 +160,10 @@ _ORG_SQL: Final = """
 """
 # GH-162: the org's data residency policy (the Super Admin's switch).
 _ORG_RESIDENCY_SQL: Final = "SELECT data_residency FROM organizations WHERE id = $1"
+# GH-242: the number of orgs with data residency on (every status).
+_RESIDENCY_ORGS_SQL: Final = (
+    "SELECT count(*) AS residency_orgs FROM organizations WHERE data_residency"
+)
 _ORG_ENSURE_SQL: Final = """
     INSERT INTO org_settings (org_id) VALUES ($1)
     ON CONFLICT (org_id) DO NOTHING
@@ -182,24 +197,29 @@ _ORG_UPDATE_SQL: Final = """
 """
 
 # The singleton row (id defaults to true). On a later boot config.yaml's llm
-# replaces the stored one; the stored limits are kept.
+# (provider, models, model capabilities) replaces the stored one; the stored
+# limits are kept. The retry limit is never written here (column default 2).
 _PLATFORM_SEED_SQL: Final = """
     INSERT INTO platform_settings (
         llm_provider, infomaniak_model, vllm_model, anthropic_model, openai_model,
+        max_input_tokens, image_input,
         max_tool_calls_per_message, max_pending_confirmations, confirmation_timeout_s,
         max_message_length, max_context_messages
     )
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
     ON CONFLICT (id) DO UPDATE
     SET llm_provider = EXCLUDED.llm_provider,
         infomaniak_model = EXCLUDED.infomaniak_model,
         vllm_model = EXCLUDED.vllm_model,
         anthropic_model = EXCLUDED.anthropic_model,
         openai_model = EXCLUDED.openai_model,
+        max_input_tokens = EXCLUDED.max_input_tokens,
+        image_input = EXCLUDED.image_input,
         updated_at = now()
 """
 _PLATFORM_SQL: Final = """
     SELECT llm_provider, infomaniak_model, vllm_model, anthropic_model, openai_model,
+           max_input_tokens, image_input, llm_max_retries,
            max_tool_calls_per_message, max_pending_confirmations, confirmation_timeout_s,
            max_message_length, max_context_messages,
            max_file_size_mb, max_files_per_message, max_pages_per_file, render_dpi,
@@ -212,6 +232,7 @@ _PLATFORM_SQL: Final = """
 # Locked until the transaction ends: concurrent platform changes serialize.
 _PLATFORM_LOCK_SQL: Final = """
     SELECT llm_provider, infomaniak_model, vllm_model, anthropic_model, openai_model,
+           max_input_tokens, image_input, llm_max_retries,
            max_tool_calls_per_message, max_pending_confirmations, confirmation_timeout_s,
            max_message_length, max_context_messages,
            max_file_size_mb, max_files_per_message, max_pages_per_file, render_dpi,
@@ -222,7 +243,7 @@ _PLATFORM_LOCK_SQL: Final = """
     WHERE id
     FOR UPDATE
 """
-# $1 to $24 follow _UPDATE_FIELDS; a NULL parameter keeps the stored value.
+# $1 to $27 follow _UPDATE_FIELDS; a NULL parameter keeps the stored value.
 _PLATFORM_UPDATE_SQL: Final = """
     UPDATE platform_settings
     SET llm_provider = coalesce($1, llm_provider),
@@ -230,28 +251,32 @@ _PLATFORM_UPDATE_SQL: Final = """
         vllm_model = coalesce($3, vllm_model),
         anthropic_model = coalesce($4, anthropic_model),
         openai_model = coalesce($5, openai_model),
-        max_tool_calls_per_message = coalesce($6, max_tool_calls_per_message),
-        max_pending_confirmations = coalesce($7, max_pending_confirmations),
-        confirmation_timeout_s = coalesce($8, confirmation_timeout_s),
-        max_message_length = coalesce($9, max_message_length),
-        max_context_messages = coalesce($10, max_context_messages),
-        max_file_size_mb = coalesce($11, max_file_size_mb),
-        max_files_per_message = coalesce($12, max_files_per_message),
-        max_pages_per_file = coalesce($13, max_pages_per_file),
-        render_dpi = coalesce($14, render_dpi),
-        trash_min_days = coalesce($15, trash_min_days),
-        trash_max_days = coalesce($16, trash_max_days),
-        audit_months = coalesce($17, audit_months),
-        org_deletion_grace_days = coalesce($18, org_deletion_grace_days),
-        rate_limit_per_minute = coalesce($19, rate_limit_per_minute),
-        lockout_after_failures = coalesce($20, lockout_after_failures),
-        lockout_window_minutes = coalesce($21, lockout_window_minutes),
-        lockout_minutes = coalesce($22, lockout_minutes),
-        session_idle_timeout_minutes = coalesce($23, session_idle_timeout_minutes),
-        session_max_lifetime_hours = coalesce($24, session_max_lifetime_hours),
+        max_input_tokens = coalesce($6, max_input_tokens),
+        image_input = coalesce($7, image_input),
+        llm_max_retries = coalesce($8, llm_max_retries),
+        max_tool_calls_per_message = coalesce($9, max_tool_calls_per_message),
+        max_pending_confirmations = coalesce($10, max_pending_confirmations),
+        confirmation_timeout_s = coalesce($11, confirmation_timeout_s),
+        max_message_length = coalesce($12, max_message_length),
+        max_context_messages = coalesce($13, max_context_messages),
+        max_file_size_mb = coalesce($14, max_file_size_mb),
+        max_files_per_message = coalesce($15, max_files_per_message),
+        max_pages_per_file = coalesce($16, max_pages_per_file),
+        render_dpi = coalesce($17, render_dpi),
+        trash_min_days = coalesce($18, trash_min_days),
+        trash_max_days = coalesce($19, trash_max_days),
+        audit_months = coalesce($20, audit_months),
+        org_deletion_grace_days = coalesce($21, org_deletion_grace_days),
+        rate_limit_per_minute = coalesce($22, rate_limit_per_minute),
+        lockout_after_failures = coalesce($23, lockout_after_failures),
+        lockout_window_minutes = coalesce($24, lockout_window_minutes),
+        lockout_minutes = coalesce($25, lockout_minutes),
+        session_idle_timeout_minutes = coalesce($26, session_idle_timeout_minutes),
+        session_max_lifetime_hours = coalesce($27, session_max_lifetime_hours),
         updated_at = now()
     WHERE id
     RETURNING llm_provider, infomaniak_model, vllm_model, anthropic_model, openai_model,
+              max_input_tokens, image_input, llm_max_retries,
               max_tool_calls_per_message, max_pending_confirmations, confirmation_timeout_s,
               max_message_length, max_context_messages,
               max_file_size_mb, max_files_per_message, max_pages_per_file, render_dpi,
@@ -262,7 +287,13 @@ _PLATFORM_UPDATE_SQL: Final = """
 
 
 class StoredPlatformLLM(BaseModel):
-    """The platform LLM as stored: the provider and one model per provider (None: unset)."""
+    """The platform LLM as stored.
+
+    The provider, one model per provider (None: unset) and (GH-242, migration
+    0022) the active model's capabilities and the LLM retry limit, whose
+    defaults and bounds are the column's. ``max_retries`` is stored in the
+    column ``llm_max_retries``.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -271,6 +302,9 @@ class StoredPlatformLLM(BaseModel):
     vllm_model: str | None = Field(max_length=200)
     anthropic_model: str | None = Field(max_length=200)
     openai_model: str | None = Field(max_length=200)
+    max_input_tokens: int = Field(default=200_000, ge=1000, le=2_000_000)
+    image_input: bool = True
+    max_retries: int = Field(default=2, ge=0, le=5)
 
 
 class StoredPlatformSettings(BaseModel):
@@ -291,6 +325,18 @@ class StoredPlatformSettings(BaseModel):
 
 class InvalidPlatformSettingsError(ValueError):
     """The patch merged into the stored values is invalid (trash minimum above maximum)."""
+
+
+class ResidencyConfirmationError(Exception):
+    """The residency-org count the route confirmed changed before the write (GH-242).
+
+    Attributes:
+        residency_orgs: The count inside the write transaction (a count only).
+    """
+
+    def __init__(self, residency_orgs: int) -> None:
+        self.residency_orgs = residency_orgs
+        super().__init__("The number of organizations with data residency changed.")
 
 
 # The int sections; each field is its platform_settings column.
@@ -345,6 +391,9 @@ def _stored_platform(row: Record) -> StoredPlatformSettings:
                 "vllm_model": row["vllm_model"],
                 "anthropic_model": row["anthropic_model"],
                 "openai_model": row["openai_model"],
+                "max_input_tokens": row["max_input_tokens"],
+                "image_input": row["image_input"],
+                "max_retries": row["llm_max_retries"],
             },
             **{
                 section: {field: row[field] for field in model.model_fields}
@@ -593,12 +642,32 @@ async def org_tools_enabled(executor: sessions.Executor, tenant: TenantContext) 
     return tools.model_dump()
 
 
+async def count_residency_orgs(executor: sessions.Executor) -> int:
+    """Return how many organizations have their data residency policy on (GH-242).
+
+    Every status counts. No capability check: the platform settings route
+    checks ``Capability.PLATFORM_DEFAULTS_MANAGE`` first, and
+    ``update_platform_settings`` counts again inside its write. One read;
+    nothing is written.
+
+    Args:
+        executor: The pool, or a connection.
+
+    Returns:
+        The number of organizations whose ``data_residency`` is on.
+    """
+    row: Record = await executor.fetchrow(_RESIDENCY_ORGS_SQL)
+    return int(row["residency_orgs"])
+
+
 async def seed_platform_settings(pool: asyncpg.Pool, config: AppConfig) -> None:
     """Store config.yaml's llm and limits in the platform row (one upsert statement).
 
-    The first boot stores both; a later boot re-applies the llm (provider and
-    the four models; an empty model is stored as NULL) and keeps the stored
-    limits.
+    The first boot stores both; a later boot re-applies the llm (provider,
+    the four models, an empty model stored as NULL, and the GH-242 model
+    capabilities ``max_input_tokens`` and ``image_input``) and keeps the
+    stored limits. The LLM retry limit is never written here: the first boot
+    takes the column default (2) and a later boot keeps the stored value.
 
     Args:
         pool: The database pool.
@@ -613,6 +682,8 @@ async def seed_platform_settings(pool: asyncpg.Pool, config: AppConfig) -> None:
         llm.vllm_model or None,
         llm.anthropic_model or None,
         llm.openai_model or None,
+        llm.max_input_tokens,
+        llm.image_input,
         limits.max_tool_calls_per_message,
         limits.max_pending_confirmations,
         limits.confirmation_timeout_s,
@@ -694,11 +765,16 @@ def apply_platform_settings(config: AppConfig, stored: StoredPlatformSettings) -
 
     Returns:
         A copy of ``config`` whose ``llm.provider``, the four ``llm.*_model``
-        fields and the five limits come from ``stored`` (both sections
-        validated again). Every other llm field (timeout, vLLM URL and
-        context length, response tokens) and every other section stay.
+        fields, ``llm.max_input_tokens``, ``llm.image_input`` and the five
+        limits come from ``stored`` (both sections validated again). Every
+        other llm field (timeout, vLLM URL and context length, response
+        tokens) and every other section stay. The stored retry limit is no
+        ``LLMConfig`` field and is not overlaid (a run reads it from the
+        stored settings).
     """
-    llm = LLMConfig.model_validate({**config.llm.model_dump(), **stored.llm.model_dump()})
+    # The retry limit is no LLMConfig field.
+    overlay = stored.llm.model_dump(exclude={"max_retries"})
+    llm = LLMConfig.model_validate({**config.llm.model_dump(), **overlay})
     limits = LimitsConfig.model_validate(stored.limits.model_dump())
     return config.model_copy(update={"llm": llm, "limits": limits})
 
@@ -756,7 +832,12 @@ def _event_metadata(
 
 
 async def update_platform_settings(
-    pool: asyncpg.Pool, *, actor: Principal, patch: PlatformSettingsPatch, ip: str | None
+    pool: asyncpg.Pool,
+    *,
+    actor: Principal,
+    patch: PlatformSettingsPatch,
+    ip: str | None,
+    expected_residency_orgs: int | None = None,
 ) -> StoredPlatformSettings:
     """Change the given platform defaults; audit each changed section; re-time sessions.
 
@@ -772,11 +853,20 @@ async def update_platform_settings(
     patch that changes nothing writes and records nothing. After the commit
     the cache holds the new settings.
 
+    GH-242: when the route confirmed a switch to a non-Swiss provider, it
+    passes the residency-org count it confirmed. The count is read again
+    right after the row lock, in this transaction: if it changed, nothing is
+    written. A residency change that commits after that read never reads
+    the provider, so it is as if it came after the switch (the per-run guard
+    blocks that org's chats).
+
     Args:
         pool: The database pool.
         actor: The Super Admin changing them.
         patch: The validated sections to change.
         ip: The client address, if known.
+        expected_residency_orgs: The residency-org count the route confirmed,
+            or None when the patch needs no confirmation (nothing is counted).
 
     Returns:
         The StoredPlatformSettings after the change (the new cache value).
@@ -788,12 +878,18 @@ async def update_platform_settings(
             maximum; nothing changes.
         AuditRecordError: If an audit event can't be recorded; nothing
             changes (the sessions and the cache included).
+        ResidencyConfirmationError: If ``expected_residency_orgs`` no longer
+            matches the count; nothing changes.
         RuntimeError: If there is no platform row.
     """
     global _platform_cache, _cache_generation
     _require(actor, Capability.PLATFORM_DEFAULTS_MANAGE)
     async with pool.acquire() as conn, conn.transaction():
         stored = await _fetch_platform(conn, _PLATFORM_LOCK_SQL)
+        if expected_residency_orgs is not None:
+            residency_orgs = await count_residency_orgs(conn)
+            if residency_orgs != expected_residency_orgs:
+                raise ResidencyConfirmationError(residency_orgs)
         changes = _changes(stored, patch)
         if "retention" in changes:
             _check_retention(stored.retention, changes["retention"])

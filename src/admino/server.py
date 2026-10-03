@@ -66,16 +66,21 @@ Routes:
   active one (Super Admin); audited in the org's own log.
 - GET  /api/platform/diagnostics — The database status, the active LLM provider
   and model, and whether the LLM looks reachable (Super Admin).
-- POST /api/message       — Send a user message; returns ChatResponse.
+- POST /api/message       — Send a user message; returns ChatResponse (with the
+  run's LLM error code, GH-242).
 - GET  /api/events        — SSE stream for a chat session.
-- POST /api/confirm/{cid} — Approve or deny a pending confirmation.
+- POST /api/confirm/{cid} — Approve or deny a pending confirmation; returns
+  ChatResponse (with the resumed run's LLM error code).
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
   defaults (every role).
 - GET/PATCH /api/org/settings — The Org Admin's own org's tool services; audited.
-- GET/PATCH /api/platform/settings — The platform defaults: LLM, limits,
-  files, retention and security (Super Admin); audited.
+- GET/PATCH /api/platform/settings — The platform defaults: LLM (with the
+  model capabilities, the retry limit and the number of residency orgs),
+  limits, files, retention and security (Super Admin); audited. A switch to a
+  non-Swiss provider needs the residency-org count confirmed (409
+  ``residency_confirmation`` otherwise).
 - GET/PATCH /api/org/permissions — The Org Admin's own org's tool permission
   matrix; a change is audited.
 - GET  /api/org/critical-permissions — The org's four promotable (tier-2)
@@ -216,6 +221,21 @@ Security notes:
   one best-effort. A trash retention minimum above the maximum (merged with
   the stored values) is a 400 with nothing written. The platform response
   carries key presence flags, never a key.
+- Model policy (GH-242, ``admino.llm_policy``): a PATCH switching the
+  platform LLM to a provider outside ``llm_policy.SWISS_PROVIDERS``
+  (infomaniak, vllm) needs ``confirm_residency_orgs`` equal to the current
+  number of residency orgs (``organizations.count_residency_orgs``, every
+  org status). Otherwise it is a 409 ``{"detail", "reason":
+  "residency_confirmation", "residency_orgs"}``, checked after the rate
+  limit and the capability (a member still gets 403) and before any client
+  is built: nothing written, no audit event, the running client kept. A
+  change of the model capabilities (``max_input_tokens``, ``image_input``) or
+  the retry limit (``max_retries``) alone never rebuilds the client. The
+  agent's residency guard blocks a residency org's run on a non-Swiss client
+  before any LLM call or tool dispatch (``residency_blocked``). Chat
+  responses carry the run's ``error_code`` (the PWA shows its translation);
+  the response text is a user-facing error's fixed message or the generic
+  reply, and no provider text or exception cause is ever logged or returned.
 - Tool permissions per org (GH-161, ``admino.org_permissions``): each route
   spends a per-user bucket, then checks its capability before any database
   work: ``org.permissions.manage`` (Org Admin) for the matrix and the critical
@@ -259,7 +279,8 @@ Security notes:
   reach another org's runs.
 - Platform defaults apply without a restart (GH-160): the chat routes read
   the stored limits through the settings cache on every request (the message
-  length, and each agent run's tool-call, context and confirmation limits),
+  length, and each agent run's tool-call, context and confirmation limits
+  and, GH-242, its LLM retry limit),
   logins the Super Admin session policy, the login throttle its lockout
   thresholds, an org deletion its grace period and the audit retention job
   its months.
@@ -379,6 +400,7 @@ from admino import (
     accounts,
     auth,
     invitations,
+    llm_policy,
     login_throttle,
     my_account,
     org_permissions,
@@ -476,7 +498,7 @@ if TYPE_CHECKING:
     from admino.agent import Agent
     from admino.config import AppConfig
     from admino.llm import LLMClient
-    from admino.models import PlatformLimits, SettingsPatchLLM
+    from admino.models import SettingsPatchLLM
 
 logger = logging.getLogger(__name__)
 
@@ -3295,19 +3317,29 @@ async def post_platform_org_user_invitation(
     )
 
 
-async def _platform_limits() -> PlatformLimits:
-    """The stored platform limits (GH-160), read through the settings cache."""
+async def _platform_run_settings() -> scoped_settings.StoredPlatformSettings:
+    """The stored platform settings a chat run uses, read through the settings cache.
+
+    The limits (GH-160) and the LLM retry limit (GH-242), read on every chat
+    request, so a change applies to the next run without a restart.
+    """
     from admino.database import get_pool
 
-    return (await scoped_settings.current_platform_settings(get_pool())).limits
+    return await scoped_settings.current_platform_settings(get_pool())
 
 
-def _run_config(limits: PlatformLimits) -> AgentConfig:
-    """The AgentConfig of one agent run: the stored tool-call, context and timeout limits."""
+def _run_config(platform: scoped_settings.StoredPlatformSettings) -> AgentConfig:
+    """The AgentConfig of one agent run.
+
+    The stored tool-call, context and timeout limits, and the stored LLM retry
+    limit (``llm.max_retries``, GH-242).
+    """
+    limits = platform.limits
     return AgentConfig(
         max_tool_calls=limits.max_tool_calls_per_message,
         max_context_messages=limits.max_context_messages,
         confirmation_timeout_s=float(limits.confirmation_timeout_s),
+        llm_max_retries=platform.llm.max_retries,
     )
 
 
@@ -3320,17 +3352,19 @@ async def post_message(
     Validates the request, retrieves or creates the caller's chat, runs the
     agent with the caller's principal and their org's tool policy, updates
     chat state, and returns the response. The message length and the run's
-    limits are the stored platform limits, read on every request (GH-160: a
-    change applies without a restart). The org's due critical permission
-    promotions are completed first, and the policy is loaded on every request
-    (GH-161), so a change applies to the next run.
+    limits are the stored platform limits, and its LLM retry limit the stored
+    ``llm.max_retries`` (GH-242), read on every request (GH-160: a change
+    applies without a restart). The org's due critical permission promotions
+    are completed first, and the policy (the org's data residency included)
+    is loaded on every request (GH-161), so a change applies to the next run.
 
     Args:
         body: Validated ChatRequest with message and session_id.
         principal: The logged-in principal (needs ``chat.send``).
 
     Returns:
-        ChatResponse with the agent's reply and tool call summary.
+        ChatResponse with the agent's reply, tool call summary and the run's
+        LLM error code (None unless a coded LLM error ended it).
     """
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -3344,8 +3378,8 @@ async def post_message(
     await _resolve_due_promotions(pool, principal)
 
     # Enforce the stored max_message_length (tighter than Pydantic's 32768).
-    limits = await _platform_limits()
-    max_len = limits.max_message_length
+    platform = await _platform_run_settings()
+    max_len = platform.limits.max_message_length
     if len(body.message) > max_len:
         raise HTTPException(
             status_code=422,
@@ -3385,7 +3419,7 @@ async def post_message(
                 history=history,
                 principal=principal,
                 tool_policy=policy,
-                agent_config=_run_config(limits),
+                agent_config=_run_config(platform),
             )
         except (MemoryError, RecursionError):
             raise
@@ -3415,6 +3449,7 @@ async def post_message(
             tool_calls=result.tool_calls,
             status=result.status,
             pending_confirmation=pending_summary,
+            error_code=result.error_code,
         )
 
 
@@ -3493,10 +3528,13 @@ async def post_confirm(
 
     Looks up the caller's pending confirmation by session_id, verifies the
     confirmation_id matches, checks expiry, and if approved, resumes the agent
-    run with the caller's principal, the stored platform limits (read on
-    every request, GH-160) and their org's tool policy as it is now (loaded
-    again, after completing the org's due promotions; GH-161). Another user's
-    pending confirmation is never found (404).
+    run with the caller's principal, the stored platform limits and LLM retry
+    limit (read on every request, GH-160, GH-242) and their org's tool policy
+    as it is now (loaded again, after completing the org's due promotions;
+    GH-161). Under the org's data residency a resumed run whose LLM provider
+    has meanwhile become non-Swiss ends with ``residency_blocked`` before the
+    approved tool is dispatched (the agent's guard). Another user's pending
+    confirmation is never found (404).
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -3504,7 +3542,8 @@ async def post_confirm(
         body: Validated ConfirmRequest with session_id and approved flag.
 
     Returns:
-        ChatResponse with the result of the resumed agent run.
+        ChatResponse with the result of the resumed agent run (its LLM error
+        code included; None for a denial).
 
     Raises:
         HTTPException: 404 if confirmation not found, 400 if IDs mismatch,
@@ -3520,7 +3559,7 @@ async def post_confirm(
 
     pool = get_pool()
     await _resolve_due_promotions(pool, principal)
-    limits = await _platform_limits()
+    platform = await _platform_run_settings()
     policy = await org_permissions.load_tool_policy(pool, TenantContext.from_principal(principal))
 
     session_id = body.session_id
@@ -3583,7 +3622,7 @@ async def post_confirm(
                 principal=principal,
                 tool_policy=policy,
                 pending_confirmation=pending,
-                agent_config=_run_config(limits),
+                agent_config=_run_config(platform),
             )
         except (MemoryError, RecursionError):
             raise
@@ -3604,6 +3643,7 @@ async def post_confirm(
             tool_calls=result.tool_calls,
             status=result.status,
             pending_confirmation=pending_summary,
+            error_code=result.error_code,
         )
 
 
@@ -3619,13 +3659,16 @@ def _require_capability(principal: Principal, capability: Capability) -> None:
 
 
 async def _platform_settings_response(
-    stored: scoped_settings.StoredPlatformSettings,
+    pool: sessions.Executor, stored: scoped_settings.StoredPlatformSettings
 ) -> PlatformSettingsResponse:
     """Build the PlatformSettingsResponse of the stored platform row.
 
     A model that isn't set (NULL) is shown as ``""``. The available models come
     from the two provider probes (filtered again by ``SettingsLLM``); the key
-    flags are the presence of the env vars, never their values.
+    flags are the presence of the env vars, never their values. The model
+    capabilities and the retry limit are the stored ones; ``residency_orgs``
+    is counted on every call (``organizations.count_residency_orgs``, every
+    org status), never cached.
     """
     llm = stored.llm
     return PlatformSettingsResponse(
@@ -3637,6 +3680,10 @@ async def _platform_settings_response(
             infomaniak_available_models=await _get_infomaniak_available_models(llm.provider),
             vllm_model=llm.vllm_model or "",
             vllm_available_models=await _get_vllm_available_models(),
+            max_input_tokens=llm.max_input_tokens,
+            image_input=llm.image_input,
+            max_retries=llm.max_retries,
+            residency_orgs=await organizations.count_residency_orgs(pool),
             # Presence flags only — credential values never leave the server.
             anthropic_key_configured=bool(os.environ.get("ANTHROPIC_API_KEY")),
             openai_key_configured=bool(os.environ.get("OPENAI_API_KEY")),
@@ -3790,8 +3837,10 @@ async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsRes
         principal: The logged-in principal (401 without a session).
 
     Returns:
-        PlatformSettingsResponse: the stored LLM (with the probed model lists
-        and key presence flags), limits, files, retention and security.
+        PlatformSettingsResponse: the stored LLM (with the probed model lists,
+        key presence flags, the model capabilities, the retry limit and the
+        current number of residency orgs), limits, files, retention and
+        security.
 
     Raises:
         HTTPException: 429 when rate-limited, 403 without
@@ -3803,24 +3852,61 @@ async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsRes
 
     from admino.database import get_pool
 
-    stored = await scoped_settings.load_platform_settings(get_pool())
-    return await _platform_settings_response(stored)
+    pool = get_pool()
+    stored = await scoped_settings.load_platform_settings(pool)
+    return await _platform_settings_response(pool, stored)
 
 
 # The 400 of a patch whose merged trash retention minimum exceeds the maximum.
 _TRASH_ORDER_REFUSED: Final = "The trash retention minimum can't exceed the maximum."
+# The 409 of a switch to a non-Swiss LLM provider without the right residency-org
+# count (GH-242). Fixed text: never a provider, model or org value.
+_RESIDENCY_CONFIRMATION_DETAIL: Final = (
+    "The selected provider isn't Swiss-hosted. Confirm the number of organizations "
+    "with data residency to switch."
+)
 
 
-async def _new_platform_llm_client(
-    pool: sessions.Executor, config: AppConfig, patch: SettingsPatchLLM
+def _residency_confirmation_needed(
+    body: PlatformSettingsPatch, stored: scoped_settings.StoredPlatformLLM
+) -> bool:
+    """Whether the patch switches the LLM to a provider outside Switzerland (GH-242).
+
+    True when the patch's ``llm.provider`` is given, is not in
+    ``llm_policy.SWISS_PROVIDERS`` and differs from the stored provider. Any
+    other patch needs no confirmation and ignores a given count.
+    """
+    target = None if body.llm is None else body.llm.provider
+    return not (target is None or target in llm_policy.SWISS_PROVIDERS or target == stored.provider)
+
+
+def _residency_confirmation_refusal(residency_orgs: int) -> JSONResponse:
+    """The 409 of an unconfirmed switch to a non-Swiss LLM provider (GH-242).
+
+    The body is ``{"detail", "reason": "residency_confirmation",
+    "residency_orgs": <current count>}``: fixed text and a count only.
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": _RESIDENCY_CONFIRMATION_DETAIL,
+            "reason": "residency_confirmation",
+            "residency_orgs": residency_orgs,
+        },
+    )
+
+
+def _new_platform_llm_client(
+    config: AppConfig, stored: scoped_settings.StoredPlatformLLM, patch: SettingsPatchLLM
 ) -> LLMClient | None:
     """Validate a platform LLM patch and build the client it needs, before anything is written.
 
-    The given fields are merged over the stored LLM (read from the row, which
-    refreshes the settings cache) and validated as an ``LLMConfig`` (the
-    config's other llm fields kept). A provider change always needs a new
-    client; so does a model change of the vllm or infomaniak provider when it
-    is the active one.
+    The given fields are merged over the stored LLM and validated as an
+    ``LLMConfig`` (the config's other llm fields kept; the retry limit is no
+    ``LLMConfig`` field and stays out of the merge). A provider change always
+    needs a new client; so does a model change of the vllm or infomaniak
+    provider when it is the active one. A capability or retry-limit change
+    alone never does.
 
     Returns:
         The new client, or None when the running one stays.
@@ -3832,8 +3918,8 @@ async def _new_platform_llm_client(
     from admino.config import LLMConfig
     from admino.llm import create_llm_client
 
-    current = (await scoped_settings.load_platform_settings(pool)).llm.model_dump()
-    merged = {**current, **patch.model_dump(exclude_none=True)}
+    current = stored.model_dump(exclude={"max_retries"})
+    merged = {**current, **patch.model_dump(exclude_none=True, exclude={"max_retries"})}
     try:
         new_llm_config = LLMConfig.model_validate({**config.llm.model_dump(mode="json"), **merged})
     except ValidationError as exc:
@@ -3862,20 +3948,28 @@ async def _new_platform_llm_client(
 
 async def patch_platform_settings(
     request: Request, principal: _PrincipalDep, body: PlatformSettingsPatch
-) -> PlatformSettingsResponse:
+) -> PlatformSettingsResponse | JSONResponse:
     """Handle PATCH /api/platform/settings — change the platform defaults (Super Admin).
 
     Any of the five sections (llm, limits, files, retention, security). When
-    ``llm`` is given, its fields are merged over the stored LLM and validated
-    as an ``LLMConfig`` (the config's other llm fields kept); a provider
-    change, or a model change of the active vllm/infomaniak provider, builds
-    the new client BEFORE anything is written (a no-op never does). The
-    changes, the re-timed Super Admin sessions and the
-    ``platform.settings_change`` audit events share one transaction
+    ``llm`` is given, the stored LLM is read from the row (which refreshes the
+    settings cache). A switch to a non-Swiss provider (not infomaniak or
+    vllm) needs ``confirm_residency_orgs`` equal to the current number of
+    residency orgs (GH-242): otherwise the answer is a 409 with nothing built,
+    written or audited. The write counts again under its row lock; a count
+    that changed in between is the same 409 (the new client closed, nothing
+    written). Then the llm fields are merged over the stored LLM and
+    validated as an ``LLMConfig`` (the config's other llm fields kept); a
+    provider change, or a model change of the active vllm/infomaniak provider,
+    builds the new client BEFORE anything is written (a no-op, or a change of
+    the model capabilities or the retry limit alone, never does). The changes,
+    the re-timed Super Admin sessions and the ``platform.settings_change``
+    audit events share one transaction
     (``scoped_settings.update_platform_settings``). Only then is the new
     client swapped in and the old one closed (best-effort); if nothing was
     written, a newly built client is closed and the running one kept. The
-    stored limits apply to the next chat request (no restart).
+    stored limits and retry limit apply to the next chat request (no
+    restart).
 
     Args:
         request: The incoming request (the client IP for the audit event).
@@ -3883,7 +3977,9 @@ async def patch_platform_settings(
         body: Validated PlatformSettingsPatch (422 without echo otherwise).
 
     Returns:
-        PlatformSettingsResponse: the platform settings after the change.
+        PlatformSettingsResponse: the platform settings after the change, or
+        the 409 ``{"detail", "reason": "residency_confirmation",
+        "residency_orgs"}`` of an unconfirmed switch to a non-Swiss provider.
 
     Raises:
         HTTPException: 429 when rate-limited, 403 without
@@ -3901,9 +3997,18 @@ async def patch_platform_settings(
     from admino.database import get_pool
 
     pool = get_pool()
-    new_client = (
-        None if body.llm is None else await _new_platform_llm_client(pool, _config, body.llm)
-    )
+    new_client: LLMClient | None = None
+    # The residency-org count the Super Admin confirmed for a non-Swiss switch;
+    # the write counts again under its row lock (a change in between is a 409).
+    confirmed_residency_orgs: int | None = None
+    if body.llm is not None:
+        stored_llm = (await scoped_settings.load_platform_settings(pool)).llm
+        if _residency_confirmation_needed(body, stored_llm):
+            residency_orgs = await organizations.count_residency_orgs(pool)
+            if body.confirm_residency_orgs != residency_orgs:
+                return _residency_confirmation_refusal(residency_orgs)
+            confirmed_residency_orgs = residency_orgs
+        new_client = _new_platform_llm_client(_config, stored_llm, body.llm)
 
     try:
         stored = await scoped_settings.update_platform_settings(
@@ -3911,11 +4016,14 @@ async def patch_platform_settings(
             actor=principal,
             patch=body,
             ip=request.client.host if request.client is not None else None,
+            expected_residency_orgs=confirmed_residency_orgs,
         )
     except Exception as exc:
         # Nothing was written: the running client stays, the new one is retired.
         if new_client is not None:
             await _close_llm_client(new_client)
+        if isinstance(exc, scoped_settings.ResidencyConfirmationError):
+            return _residency_confirmation_refusal(exc.residency_orgs)
         if isinstance(exc, scoped_settings.InvalidPlatformSettingsError):
             raise HTTPException(status_code=400, detail=_TRASH_ORDER_REFUSED) from None
         raise
@@ -3931,7 +4039,7 @@ async def patch_platform_settings(
         _agent._llm = new_client
         await _close_llm_client(old_client)
         logger.info("LLM client re-initialised after a platform LLM change.")
-    return await _platform_settings_response(stored)
+    return await _platform_settings_response(pool, stored)
 
 
 # ---------------------------------------------------------------------------

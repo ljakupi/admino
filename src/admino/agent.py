@@ -57,12 +57,25 @@ Security notes:
 - Every ``system``-role message in caller-supplied history (leading or
   mid-conversation) is dropped before use — it could be persisted prompt
   injection. Only a count is logged, never the content.
+- Model policy (GH-242, ``admino.llm_policy``, the V1 bridge of #174's
+  gateway): right after the H-2 session check, a run whose org has data
+  residency on (``tool_policy.data_residency``) and whose client isn't Swiss
+  (``provider`` not infomaniak/vllm, or missing: fail closed) ends at once
+  with status "error" and ``error_code="residency_blocked"``: no LLM call, no
+  dispatch (not even a resumed confirmation's tool), no recorder call. Every
+  LLM call goes through ``llm_policy.chat`` with the run's residency flag and
+  ``llm_max_retries``, so a transient failure is retried on the same client
+  with the same context; the agent never passes a user/org id, email or name
+  to the client.
 - Exceptions from the LLM client are caught and converted into a safe
-  "error" AgentResult. An ``LLMError`` with ``user_facing=True`` carries a
-  fixed, actionable provider message (no response body or SDK cause) and is
-  shown verbatim; every other exception gets the generic reply.
-  ``MemoryError`` and ``RecursionError`` are re-raised (mirroring the
-  registry pattern).
+  "error" AgentResult carrying the ``LLMError``'s ``code`` as ``error_code``
+  (None for an uncoded error and any other exception). An ``LLMError`` with
+  ``user_facing=True`` carries a fixed, actionable provider message (no
+  response body or SDK cause) and becomes the run's response (the API's
+  English fallback; the PWA shows the translation of ``error_code``); every
+  other exception gets the generic reply. The failure is logged by type, HTTP status and code
+  only, never message text. ``MemoryError`` and ``RecursionError`` are
+  re-raised (mirroring the registry pattern).
 - Malformed LLM output (e.g. validation errors on LLM responses) is
   converted to an assistant message with a generic note and returned —
   never crashes the loop.
@@ -85,6 +98,7 @@ from datetime import UTC, datetime, timedelta
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
+from admino import llm_policy
 from admino.llm import LLMError
 from admino.models import (
     AgentConfig,
@@ -101,7 +115,7 @@ from admino.tools.registry import ToolCallResult, dispatch_tool_call, get_regist
 if TYPE_CHECKING:
     from admino.access import Principal
     from admino.llm import LLMClient
-    from admino.models import ToolPolicy
+    from admino.models import LLMErrorCode, ToolPolicy
     from admino.permissions import PermissionState
     from admino.tools.registry import ToolDescription
 
@@ -258,20 +272,23 @@ class Agent:
             tool_policy: The requesting org's tool policy (required, GH-161):
                 its permissions, promoted tier-2 pairs and enabled services
                 decide this run's tools payload, tools line and every
-                dispatch. It applies to this run only.
+                dispatch; its ``data_residency`` (GH-242) blocks a non-Swiss
+                client. It applies to this run only.
             pending_confirmation: If set, a previously-issued confirmation is
                 being resumed. The first tool call in this turn is dispatched
                 with this value so ``registry.dispatch_tool_call`` can verify
                 identity/expiry.
             agent_config: This run's limits (``max_tool_calls``,
-                ``max_context_messages``, ``confirmation_timeout_s``; GH-160:
-                the stored platform limits). None: the construction-time
-                config. Applies to this run only.
+                ``max_context_messages``, ``confirmation_timeout_s``,
+                ``llm_max_retries``; GH-160/GH-242: the stored platform
+                limits). None: the construction-time config. Applies to this
+                run only.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
             history (user/assistant/tool messages only — never the system
-            message), and a summary of tool calls made during the run.
+            message), a summary of tool calls made during the run and, for a
+            coded LLM failure, its ``error_code``.
         """
         config = self._config if agent_config is None else agent_config
         # GH-162: the run's tool context, derived once from the principal (never
@@ -320,6 +337,19 @@ class Agent:
                 history=working_history,
                 tool_records=[],
                 message="Pending confirmation session mismatch.",
+            )
+
+        # GH-242: data residency — a residency org never reaches a non-Swiss
+        # provider. Checked before anything is dispatched or sent to the LLM.
+        try:
+            llm_policy.check_residency(self._llm, data_residency=tool_policy.data_residency)
+        except LLMError as exc:
+            logger.warning("Agent run blocked by data residency (code %s)", exc.code)
+            return self._terminal_error(
+                history=working_history,
+                tool_records=[],
+                message=exc.message,
+                error_code=exc.code,
             )
 
         tool_records: list[ToolCallRecord] = []
@@ -382,30 +412,43 @@ class Agent:
                 max_messages=config.max_context_messages,
             )
             try:
-                response = await self._llm.chat(context, tools=tools_payload)
+                # GH-242: the model policy (residency guard + bounded retries on
+                # this same client with this same context).
+                response = await llm_policy.chat(
+                    self._llm,
+                    context,
+                    tools_payload,
+                    data_residency=tool_policy.data_residency,
+                    max_retries=config.llm_max_retries,
+                )
             except (MemoryError, RecursionError):
                 raise
             except Exception as exc:
-                # Logged by type (and, for an LLMError, its HTTP status) only,
-                # never a message: no provider text reaches the log (GH-158).
-                # A user-facing LLMError carries a fixed, actionable message
-                # (e.g. "set INFOMANIAK_API_TOKEN") that is shown verbatim; every
-                # other failure gets the generic reply.
+                # Logged by type (and, for an LLMError, its HTTP status and
+                # code) only, never a message: no provider text reaches the log
+                # (GH-158). A user-facing LLMError carries a fixed, actionable
+                # message (e.g. "set INFOMANIAK_API_TOKEN") that becomes the
+                # response (the PWA shows the code's translation instead);
+                # every other failure gets the generic reply.
                 reply = _LLM_ERROR_MESSAGE
+                error_code: LLMErrorCode | None = None
                 if isinstance(exc, LLMError):
                     logger.error(
-                        "LLM chat call failed: %s (status %s)",
+                        "LLM chat call failed: %s (status %s, code %s)",
                         type(exc).__name__,
                         exc.status_code,
+                        exc.code,
                     )
                     if exc.user_facing:
                         reply = exc.message
+                    error_code = exc.code
                 else:
                     logger.error("LLM chat call failed: %s", type(exc).__name__)
                 return self._terminal_error(
                     history=working_history,
                     tool_records=tool_records,
                     message=reply,
+                    error_code=error_code,
                 )
 
             # 2. Text-only response → we are done.
@@ -695,8 +738,9 @@ class Agent:
         history: list[LLMMessage],
         tool_records: list[ToolCallRecord],
         message: str,
+        error_code: LLMErrorCode | None = None,
     ) -> AgentResult:
-        """Build a terminal error result with a safe message."""
+        """Build a terminal error result with a safe message and its LLM error code."""
         history.append(LLMMessage(role="assistant", content=message))
         # L-3: Log a "run terminated" message mirroring _terminal_limit.
         logger.info("Agent run terminated: error (%d tool calls)", len(tool_records))
@@ -705,6 +749,7 @@ class Agent:
             response=message,
             history=history,
             tool_calls=tool_records,
+            error_code=error_code,
         )
 
 

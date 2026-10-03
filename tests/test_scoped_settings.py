@@ -751,7 +751,11 @@ class TestModuleSurface:
             ("reset_user_settings", {"actor"}),
             ("get_org_settings", {"actor"}),
             ("update_org_settings", {"actor", "patch", "ip"}),
-            ("update_platform_settings", {"actor", "patch", "ip"}),
+            # GH-242: the residency-org count the route confirmed (optional).
+            (
+                "update_platform_settings",
+                {"actor", "patch", "ip", "expected_residency_orgs"},
+            ),
         ],
     )
     def test_scoped_settings_actor_patch_and_ip_are_keyword_only(

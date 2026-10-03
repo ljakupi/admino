@@ -206,6 +206,35 @@ over HTTP. Its route catalog lives in `tests/tenancy_world.py`. Every registered
 a row there, every role is tried on every route, and every content route has a cross-org
 case. A route added without its row fails the suite.
 
+## The LLM provider and data residency
+
+The active LLM provider sees the conversation, so admino limits what reaches it and what
+comes back from it. The full behavior is in
+[Configuration → LLM providers](configuration.md#data-residency-and-the-provider).
+
+- **Residency fails closed.** When an organization's data residency policy is on, its chat
+  runs call only a Swiss provider (Infomaniak or the local vLLM container). With any other
+  provider, or a client that doesn't say which provider it is, the run ends with the error
+  code `residency_blocked` before any LLM call or tool call, a tool call approved earlier
+  included. The policy is read from the database on every run.
+- **A non-Swiss switch is confirmed.** `PATCH /api/platform/settings` switches to Claude or
+  OpenAI only with `confirm_residency_orgs` equal to the current number of residency
+  organizations. Otherwise it answers `409` (`reason: residency_confirmation`) after the
+  rate limit and the role check, before anything is built or written: no setting, no
+  audit event, the running provider kept. The write counts again under the platform row
+  lock, so a residency change between the check and the write gets the same `409`.
+- **No identifiers.** No user or organization ID, name or email address is sent to a
+  provider: no `user`, `metadata`, `safety_identifier`, `prompt_cache_key` or `store`
+  field, and no `OpenAI-Organization` / `OpenAI-Project` header, even when
+  `OPENAI_ORG_ID` / `OPENAI_PROJECT_ID` are set. `tests/test_llm_no_identifiers.py`
+  checks every provider's requests.
+- **No provider text.** A provider's error message, response body or error code never
+  reaches a chat response or a log line. A failed reply carries an `error_code`, which the
+  PWA translates; errors are logged by type, HTTP status and code only.
+- **Bounded retries.** Only timeouts, connection errors, 429 and 5xx answers are retried,
+  at most `llm.max_retries` times (0–5), on the same provider and model; a `Retry-After`
+  above 10 seconds isn't retried. The provider SDKs' own retries are off.
+
 ## Logs and error tracking
 
 Application logs hold IDs, counts, sizes, statuses and durations only. Message text,
@@ -219,7 +248,8 @@ call, an OAuth connection, a crash) and scans everything the log handler wrote.
   carries the same ID. With `LOG_FORMAT=json` each line is one JSON object (`ts`,
   `level`, `logger`, `message`, `request_id`), ready for a log collector.
 - **No tracebacks.** An exception is logged by its class name only, never its message
-  or a traceback: either can hold a database password or part of an email. An
+  or a traceback: either can hold a database password or part of an email. An LLM error
+  is logged by its HTTP status and error code too, never the provider's text. An
   unhandled exception is one line, `Unhandled exception: <ClassName>` with the request
   ID, and the client gets a generic 500 `{"detail": "Internal error"}` with the same
   `X-Request-ID`, so a report can be matched to its log line.

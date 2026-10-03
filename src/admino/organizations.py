@@ -13,7 +13,10 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
 - ``list_orgs`` returns every organization's metadata.
 - ``update_limits`` changes the given plan limits (seats, monthly budget,
   storage quota); ``set_residency`` switches the data residency policy. Both
-  are refused while a deletion is pending.
+  are refused while a deletion is pending. ``count_residency_orgs`` (GH-242)
+  counts the organizations whose residency is on, of every status: the
+  number the Super Admin confirms before a switch to a non-Swiss LLM
+  provider. It has no capability check of its own (the route checks).
 - Status transitions: ``deactivate_org`` (active -> deactivated),
   ``reactivate_org`` (deactivated -> active), ``schedule_deletion`` (active or
   deactivated -> pending_deletion, ``purge_after = now() +`` the stored
@@ -41,15 +44,17 @@ Operator for ``create_org`` only), the org id, the validated request models
 configured public URL and the client IP; the attachments root (purge); the
 stored grace period (``scoped_settings.current_platform_settings``).
 Outputs: ``OrgSummary`` (org metadata only), a list of them, ``CreatedOrg``,
-the number of orgs purged. Errors: ``PermissionError``, ``OrgNotFoundError``,
-``InvalidOrgStatusError``, ``accounts.DuplicateEmailError`` (a taken admin
-email), ``AuditRecordError``.
+the number of orgs purged, the number of residency orgs. Errors:
+``PermissionError``, ``OrgNotFoundError``, ``InvalidOrgStatusError``,
+``accounts.DuplicateEmailError`` (a taken admin email), ``AuditRecordError``.
 
 Security notes:
 - Authorization through ``access.can`` before any query: ``org.create`` (or
   the Operator, for ``create_org`` only), ``org.lifecycle.manage`` (list and
   status transitions), ``org.limits.manage``, ``org.residency.manage``. Only a
-  Super Admin has them; every other function refuses the Operator.
+  Super Admin has them; every other function refuses the Operator. The one
+  exception is ``count_residency_orgs``, an internal read of a single count
+  (no org id, name or other metadata): its caller checks the capability.
 - Fail closed: every change and its audit event share one transaction, so a
   failed audit write rolls the change back. A taken admin email rolls the
   whole creation back: no org, no permission rows, no account, no audit row.
@@ -673,6 +678,25 @@ async def set_residency(
             metadata={"enabled": row["data_residency"], "previous": old["data_residency"]},
         )
     return _summary(row)
+
+
+async def count_residency_orgs(executor: sessions.Executor) -> int:
+    """Return how many organizations have their data residency policy on (GH-242).
+
+    Every status counts (active, deactivated, pending deletion): the Super
+    Admin confirms this number before switching the platform LLM to a
+    non-Swiss provider. No capability check: the platform settings route
+    checks ``Capability.PLATFORM_DEFAULTS_MANAGE`` first. One read; nothing
+    is written.
+
+    Args:
+        executor: The pool, or a connection.
+
+    Returns:
+        The number of organizations whose ``data_residency`` is on.
+    """
+    # One statement, owned by scoped_settings (its update counts again in the write).
+    return await scoped_settings.count_residency_orgs(executor)
 
 
 def _remove_org_files(path: Path) -> None:

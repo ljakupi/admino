@@ -92,7 +92,8 @@ make run
 Open **http://localhost:8000** and log in (see
 [Create the first Super Admin](docs/getting-started.md#5-create-the-first-super-admin)). With
 `INFOMANIAK_API_TOKEN` set you're ready to chat on Qwen3.5 (Infomaniak). Without it,
-admino still boots and the chat tells you which variable to set. To use local **vLLM**,
+admino still boots: the startup log names the variable to set, and the chat says the model
+isn't set up yet. To use local **vLLM**,
 **Claude** or **OpenAI**, switch the provider (see
 [Configuration → LLM providers](docs/configuration.md#llm-providers)).
 
@@ -110,8 +111,8 @@ make vllm-down   # stop just the vllm container when done
 Then set `llm.provider: "vllm"` in `config/config.yaml` (or `LLM_PROVIDER=vllm`) and restart.
 
 The agent reaches the vllm container at `http://vllm:8000/v1` over the shared internal
-Docker bridge. Until the container is ready, admino boots and replies with a friendly
-"model unavailable" message rather than crashing.
+Docker bridge. Until the container is ready, admino boots and the chat says the AI service
+is temporarily unavailable rather than crashing.
 
 **Trade-offs:** CPU inference is slow (a few tokens/sec); a smaller model like
 `Qwen/Qwen3-1.7B-Instruct-2507` is snappier. Docker Desktop needs **~12–16 GB RAM**

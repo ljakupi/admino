@@ -1105,10 +1105,10 @@ class TestOpenAIUserFacingErrors:
         ("cls", "status"),
         [
             (openai.BadRequestError, 400),
-            (openai.APIStatusError, 413),
+            # GH-242: 413 is context_too_long (user-facing), tested in test_llm_error_codes.
             (openai.UnprocessableEntityError, 422),
         ],
-        ids=["400", "413", "422"],
+        ids=["400", "422"],
     )
     async def test_openai_other_4xx_not_user_facing(
         self, monkeypatch: pytest.MonkeyPatch, cls: type[Any], status: int

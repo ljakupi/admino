@@ -78,6 +78,8 @@ _SUPER_ADMIN = Principal(user_id=_USER_ID, kind="super_admin")
 class _ScriptedLLM:
     """Returns the scripted responses in order."""
 
+    provider = "infomaniak"
+
     def __init__(self, responses: list[LLMResponse]) -> None:
         self._responses = list(responses)
 

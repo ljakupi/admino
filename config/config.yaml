@@ -39,7 +39,7 @@ llm:
   # nor used for training. Set INFOMANIAK_API_TOKEN (Infomaniak Manager → API
   # tokens, scope `ai-tools`) in the environment; INFOMANIAK_PRODUCT_ID is
   # optional and auto-discovered. Without the token admino still boots and chat
-  # replies explain what to set.
+  # replies say the assistant isn't configured yet.
   # "vllm" (opt-in, local) is a first-class, OpenAI-compatible local server that
   # runs as a docker-compose CPU container (Apple Silicon + Linux). Start it with
   # `make start-local` (provisions the model on first run), then set provider to
@@ -72,6 +72,13 @@ llm:
   # Both IDs stay set so switching to a cloud provider needs no model edit.
   anthropic_model: "claude-sonnet-4-6"
   openai_model: "gpt-4o"
+
+  # The active model's capabilities: the most input tokens it accepts
+  # (1000 to 2000000) and whether it accepts images. Like the provider and the
+  # model IDs, they are re-applied on every start; the Super Admin edits them
+  # in Platform → Defaults until the next restart.
+  max_input_tokens: 200000
+  image_input: true
 
 # Seeds the platform settings on the first start; later edits here don't apply.
 limits:

@@ -26,6 +26,10 @@ Security notes:
   path and the dedicated routes) and hides its input from validation errors.
   ``OrgSeats`` (GH-165) carries two counts only: the org's used seats and its
   limit.
+- LLM error codes (GH-242): ``LLMErrorCode`` is the closed set of stable
+  codes a failed run carries (``AgentResult.error_code``,
+  ``ChatResponse.error_code``); the UI translates them, so no provider text
+  is ever shown.
 - Super Admin user administration (GH-167): ``PlatformUserSummary`` carries
   account metadata only (no hash, token, org id or kind); ``OrgMetadata``
   counts and sizes only, never org content. ``PlatformReinviteRequest`` has
@@ -96,7 +100,7 @@ import zoneinfo
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Annotated, Any, Final, Literal
+from typing import Annotated, Any, Final, Literal, get_args
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
 from pydantic import (
@@ -218,6 +222,20 @@ def _strip_credentials(value: str) -> str:
 # ---------------------------------------------------------------------------
 # API request/response models (server.py imports these)
 # ---------------------------------------------------------------------------
+
+
+LLMErrorCode = Literal[
+    "not_configured",
+    "missing_model",
+    "provider_unavailable",
+    "rate_limited",
+    "timeout",
+    "residency_blocked",
+    "context_too_long",
+]
+"""Stable code of a user-facing LLM failure (GH-242); the UI shows its translation."""
+
+LLM_ERROR_CODES: Final[frozenset[str]] = frozenset(get_args(LLMErrorCode))
 
 
 class ChatMessage(BaseModel):
@@ -414,6 +432,14 @@ class ChatResponse(BaseModel):
         ),
     )
 
+    error_code: LLMErrorCode | None = Field(
+        default=None,
+        description=(
+            "The run's LLM error code (GH-242) when ``status='error'``: the PWA"
+            " shows its translation. None on success and for uncoded errors."
+        ),
+    )
+
 
 class ConfirmRequest(BaseModel):
     """Incoming POST /confirm request body.
@@ -596,6 +622,15 @@ class AgentConfig(BaseModel):
         le=3600.0,
         description="Seconds before an unconfirmed action is automatically denied.",
     )
+    llm_max_retries: int = Field(
+        default=0,
+        ge=0,
+        le=5,
+        description=(
+            "Retries of a transient LLM failure per call (GH-242: the stored"
+            " platform llm.max_retries)."
+        ),
+    )
 
 
 class PendingConfirmation(BaseModel):
@@ -695,6 +730,13 @@ class AgentResult(BaseModel):
         description=(
             "Set when ``status == 'awaiting_confirmation'``. The caller must"
             " persist this and pass it back on the resumption call."
+        ),
+    )
+    error_code: LLMErrorCode | None = Field(
+        default=None,
+        description=(
+            "Set when ``status == 'error'`` and the failure is a coded LLM error"
+            " (GH-242); None for any other outcome."
         ),
     )
 
@@ -1313,6 +1355,10 @@ class OneDriveSearchArgs(BaseModel):
 # platform_settings model columns is the same rule.
 _MODEL_NAME_RE: Final[re.Pattern[str]] = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}")
 _MODEL_NAME_ERROR: Final = "Model name contains invalid characters."
+# GH-242: the platform model's max input tokens and the LLM retry limit (the
+# CHECKs of migration 0022).
+_MaxInputTokens = Annotated[int, Field(ge=1000, le=2_000_000)]
+_LLMMaxRetries = Annotated[int, Field(ge=0, le=5)]
 
 
 class SettingsLLM(BaseModel):
@@ -1331,6 +1377,13 @@ class SettingsLLM(BaseModel):
     vllm_model: str = Field(default="", max_length=200)
     # Model IDs the local vLLM endpoint reports as served (empty if unreachable).
     vllm_available_models: list[str] = Field(default_factory=list)
+    # GH-242: the active model's capabilities and the retry limit.
+    max_input_tokens: _MaxInputTokens = 200_000
+    image_input: bool = True
+    max_retries: _LLMMaxRetries = 2
+    # The number of orgs whose data residency is on: what a switch to a
+    # non-Swiss provider affects (a count only).
+    residency_orgs: int = Field(default=0, ge=0)
     # Boolean flags — never expose actual API key or token values.
     anthropic_key_configured: bool = False
     openai_key_configured: bool = False
@@ -1469,8 +1522,9 @@ class ToolsSettings(BaseModel):
 class SettingsPatchLLM(BaseModel):
     """Partial platform LLM settings for PATCH /api/platform/settings.
 
-    Only the provider and the four model names can be changed: every other
-    key (an endpoint URL, a timeout, a key) is refused. A model name must
+    Only the provider, the four model names and (GH-242) the active model's
+    max input tokens, image input and the retry limit can be changed: every
+    other key (an endpoint URL, a timeout, a key) is refused. A model name must
     fully match ``[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}``, the database CHECK of
     migration 0013 (so a trailing newline is refused here, not by the
     database). Validation errors never repeat the input.
@@ -1483,6 +1537,10 @@ class SettingsPatchLLM(BaseModel):
     openai_model: str | None = Field(default=None, max_length=200)
     infomaniak_model: str | None = Field(default=None, max_length=200)
     vllm_model: str | None = Field(default=None, max_length=200)
+    # GH-242: strict, so a bool, float or string is refused.
+    max_input_tokens: Annotated[StrictInt, Field(ge=1000, le=2_000_000)] | None = None
+    image_input: StrictBool | None = None
+    max_retries: Annotated[StrictInt, Field(ge=0, le=5)] | None = None
 
     @field_validator("anthropic_model", "openai_model", "infomaniak_model", "vllm_model")
     @classmethod
@@ -1761,6 +1819,9 @@ class PlatformSettingsPatch(BaseModel):
     files: PlatformFilesPatch | None = None
     retention: PlatformRetentionPatch | None = None
     security: PlatformSecurityPatch | None = None
+    # GH-242: not a setting. A switch to a non-Swiss provider needs it equal to
+    # the number of residency orgs (the route checks it).
+    confirm_residency_orgs: Annotated[StrictInt, Field(ge=0, le=1_000_000)] | None = None
 
     @model_validator(mode="after")
     def _check_something_given(self) -> PlatformSettingsPatch:
@@ -1793,6 +1854,9 @@ class ToolPolicy(BaseModel):
     promoted: frozenset[tuple[str, str]] = frozenset()
     # Every tool name -> whether the org enabled the service.
     enabled_tools: dict[str, bool] = Field(default_factory=dict)
+    # GH-242: the org's data residency policy. Under it, the run makes no LLM
+    # call unless the running provider is Swiss (admino.llm_policy).
+    data_residency: bool = False
 
 
 class PermissionEntry(BaseModel):

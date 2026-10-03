@@ -18,10 +18,20 @@ Outputs:
   return the product id used in every product-scoped URL.
 
 Construction never raises for a missing token, product id or model and performs
-no I/O: those problems surface as user-facing ``LLMError`` chat replies. The SDK
-client is built lazily on first use (``max_retries=0``; retries belong to the
+no I/O: those problems surface as coded ``LLMError`` chat replies (GH-242). The
+SDK client is built lazily on first use (``max_retries=0``: one ``chat()`` is
+one request; retries belong to ``admino.llm_policy``, the V1 bridge of #174's
 gateway). ``_new_http_client`` is the only place an ``httpx.AsyncClient`` is
 constructed (discovery, model listing and the SDK all go through it).
+
+Error codes: a missing token, a non-digit INFOMANIAK_PRODUCT_ID, no AI product
+or several of them are ``not_configured``; a missing model ``missing_model``.
+Chat, stream (also mid-stream) and discovery failures map through the shared
+catalogue: a timeout is ``timeout``, a transport error ``provider_unavailable``,
+401/403 ``not_configured``, 404 ``missing_model`` (chat only; a discovery 404 is
+internal), 429 ``rate_limited`` and 5xx ``provider_unavailable`` (both with the
+response's Retry-After), a chat 400/413 whose input exceeds the context
+``context_too_long``; other statuses stay internal.
 
 Request shape follows Infomaniak's documented schema for
 ``POST /2/ai/{product_id}/openai/v1/chat/completions``: the output cap is sent as
@@ -41,10 +51,11 @@ Security notes:
 - The token is read from the environment only; it is sent solely as the
   ``Authorization`` header and is never logged or put in an error message.
 - Errors carry fixed catalogue messages (see ``admino.llm``): never an SDK
-  ``exc.message``, a response body, or the ``account_name`` / ``product_name``
-  returned by discovery. SDK errors are raised ``from None`` so the response
-  body does not travel with the ``LLMError``. Logs contain only safe metadata
-  (exception type, HTTP status).
+  ``exc.message``, a response body, its error code (those only classify a
+  context-length failure), or the ``account_name`` / ``product_name`` returned
+  by discovery. SDK errors are raised ``from None`` so the response body does
+  not travel with the ``LLMError``. Logs contain only safe metadata (exception
+  type, HTTP status).
 - No end-user or account identifier is sent (no ``user``, ``safety_identifier``,
   ``prompt_cache_key``, ``metadata``; the SDK's env-derived OpenAI organization
   and project headers are cleared).
@@ -72,7 +83,9 @@ from admino.llm import (
     LLMUsage,
     missing_model_error,
     not_configured_error,
+    parse_retry_after,
     provider_status_error,
+    sdk_status_error,
     strip_control_chars,
     validate_tools_payload,
 )
@@ -161,17 +174,20 @@ async def discover_product_id(token: str, *, timeout_s: float = _METADATA_TIMEOU
         The product id as a string of ASCII digits.
 
     Raises:
-        LLMError: user-facing for no product, several products (asks for
-            INFOMANIAK_PRODUCT_ID), a rejected token, rate limiting, 5xx and
-            transport failures; internal (``user_facing=False``) for any other
-            status or a malformed payload. Messages never contain the response
-            body, the account/product names, or the token.
+        LLMError: coded (user-facing) for no product or several products
+            (``not_configured``, asks for INFOMANIAK_PRODUCT_ID), a rejected
+            token (``not_configured``), rate limiting (``rate_limited``), 5xx
+            and transport failures (``provider_unavailable``) and timeouts
+            (``timeout``); internal (code None) for any other status or a
+            malformed payload. Messages never contain the response body, the
+            account/product names, or the token.
     """
     try:
         response = await _authorized_get(f"{INFOMANIAK_API_BASE}/1/ai", token, timeout_s)
     except httpx.RequestError as exc:
         logger.warning("Infomaniak product discovery failed: %s", type(exc).__name__)
-        raise provider_status_error(_LABEL, None) from None
+        timed_out = isinstance(exc, httpx.TimeoutException)
+        raise provider_status_error(_LABEL, None, timed_out=timed_out) from None
     if not response.is_success:
         status = response.status_code
         logger.warning("Infomaniak product discovery failed: HTTP %d", status)
@@ -183,6 +199,7 @@ async def discover_product_id(token: str, *, timeout_s: float = _METADATA_TIMEOU
             key_env=_AUTH_ENV_VAR,
             key_noun=_KEY_NOUN,
             internal_message=_DISCOVERY_FAILED_MESSAGE,
+            retry_after_s=parse_retry_after(response.headers),
         )
 
     try:
@@ -198,9 +215,9 @@ async def discover_product_id(token: str, *, timeout_s: float = _METADATA_TIMEOU
         logger.warning("Infomaniak product discovery returned an unexpected payload")
         raise LLMError(_DISCOVERY_MALFORMED_MESSAGE)
     if not products:
-        raise LLMError(_NO_PRODUCT_MESSAGE, user_facing=True)
+        raise LLMError(_NO_PRODUCT_MESSAGE, code="not_configured")
     if len(products) > 1:
-        raise LLMError(_SEVERAL_PRODUCTS_MESSAGE, user_facing=True)
+        raise LLMError(_SEVERAL_PRODUCTS_MESSAGE, code="not_configured")
     product_id = products[0].get("product_id") if isinstance(products[0], dict) else None
     if type(product_id) is not int or not _PRODUCT_ID_RE.fullmatch(str(product_id)):
         logger.warning("Infomaniak product discovery returned an invalid product id")
@@ -209,19 +226,35 @@ async def discover_product_id(token: str, *, timeout_s: float = _METADATA_TIMEOU
 
 
 def _api_error(exc: Exception) -> LLMError:
-    """Map an SDK / transport failure to the fixed catalogue (no message or body)."""
+    """Map an SDK / transport failure to the fixed catalogue (no message or body).
+
+    The SDK's error code and message only classify a context-length 400; they
+    are never logged or kept.
+    """
     import openai
 
-    status: int | None
     if isinstance(exc, openai.APIStatusError):
-        status = exc.status_code
-    elif isinstance(exc, openai.APIConnectionError | httpx.TransportError):
-        status = None  # includes timeouts
-    else:
+        logger.warning(
+            "Infomaniak request failed: %s (HTTP %s)", type(exc).__name__, exc.status_code
+        )
+        return sdk_status_error(
+            _LABEL,
+            exc.status_code,
+            headers=exc.response.headers,
+            error_code=exc.code,
+            sdk_message=exc.message,
+            key_env=_AUTH_ENV_VAR,
+            key_noun=_KEY_NOUN,
+        )
+    if not isinstance(exc, openai.APIConnectionError | httpx.TransportError):
         logger.warning("Infomaniak request failed: %s", type(exc).__name__)
         return LLMError(_UNEXPECTED_ERROR_MESSAGE)
-    logger.warning("Infomaniak request failed: %s (HTTP %s)", type(exc).__name__, status)
-    return provider_status_error(_LABEL, status, key_env=_AUTH_ENV_VAR, key_noun=_KEY_NOUN)
+    logger.warning("Infomaniak request failed: %s (no response)", type(exc).__name__)
+    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream.
+    timed_out = isinstance(exc, openai.APITimeoutError | httpx.TimeoutException)
+    return provider_status_error(
+        _LABEL, None, key_env=_AUTH_ENV_VAR, key_noun=_KEY_NOUN, timed_out=timed_out
+    )
 
 
 def _usage(usage: CompletionUsage | None) -> LLMUsage | None:
@@ -374,6 +407,8 @@ class InfomaniakClient:
     errors, never by the constructor.
     """
 
+    provider: Final = "infomaniak"
+
     def __init__(self, config: LLMConfig) -> None:
         """Read the token, product id and model; no I/O, no setup validation errors.
 
@@ -413,12 +448,12 @@ class InfomaniakClient:
         """Return INFOMANIAK_PRODUCT_ID, or discover it (cached after success only).
 
         Raises:
-            LLMError: user-facing for a missing token or a non-digit
+            LLMError: ``not_configured`` for a missing token or a non-digit
                 INFOMANIAK_PRODUCT_ID; otherwise as ``discover_product_id``.
         """
         token = self._require_token()
         if self._product_id_invalid:
-            raise LLMError(_INVALID_PRODUCT_ID_MESSAGE, user_facing=True)
+            raise LLMError(_INVALID_PRODUCT_ID_MESSAGE, code="not_configured")
         if self._product_id is None:
             self._product_id = await discover_product_id(token)
         return self._product_id
@@ -461,7 +496,7 @@ class InfomaniakClient:
             try:
                 validate_tools_payload(tools)
             except ValueError as exc:
-                raise LLMError(message=str(exc)) from exc
+                raise LLMError(message=str(exc)) from None
             kwargs["tools"] = _convert_tools_to_openai(tools)
         return await self._sdk_client(), kwargs
 
@@ -532,7 +567,8 @@ class InfomaniakClient:
             tool_calls, model, usage, done).
 
         Raises:
-            LLMError: Catalogue errors; HTTP errors are raised before any delta.
+            LLMError: Catalogue errors; HTTP errors are raised before any delta,
+                a transport failure or timeout may also come after one.
         """
         import openai
 

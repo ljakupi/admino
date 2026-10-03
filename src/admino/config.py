@@ -6,7 +6,10 @@ permission rules live in permissions.py; their in-code defaults
 GH-161). Deployment config (server, egress, database, log level and
 format) comes from config.yaml and its env overrides only; the platform LLM
 and limits are stored in ``platform_settings`` (``admino.scoped_settings``,
-GH-159), seeded from this config.
+GH-159), seeded from this config. The llm section's provider, models and
+(GH-242) the active model's capabilities (``max_input_tokens``,
+``image_input``) are stored again on every start; the LLM retry limit is a
+platform setting only, never read from this file.
 
 Environment variable overrides are supported for deployment flexibility.
 Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
@@ -241,7 +244,8 @@ class LLMConfig(BaseModel):
 
     A missing API key/token or model never fails validation for any provider:
     admino boots, logs a WARNING naming the env var or model field (never a
-    credential value), and chat replies explain what to set. Cloud providers
+    credential value), and chat replies report the setup problem (error code
+    ``not_configured`` or ``missing_model``, GH-242). Cloud providers
     also log where messages are processed, because they leave the machine.
     """
 
@@ -317,6 +321,20 @@ class LLMConfig(BaseModel):
         description="Maximum tokens in LLM response (sent as max_tokens to every provider).",
     )
 
+    # -- The active model's capabilities (GH-242) --
+    # Platform settings like the provider and models: stored in
+    # platform_settings on every start, edited by the Super Admin.
+    max_input_tokens: int = Field(
+        default=200_000,
+        ge=1000,
+        le=2_000_000,
+        description="Maximum input tokens the active model accepts.",
+    )
+    image_input: bool = Field(
+        default=True,
+        description="Whether the active model accepts images as input.",
+    )
+
     @field_validator("infomaniak_model", "anthropic_model", "openai_model", "vllm_model")
     @classmethod
     def validate_model_name(cls, v: str | None) -> str | None:
@@ -354,21 +372,23 @@ class LLMConfig(BaseModel):
 
         Never raises for a missing API key/token or model on any provider: admino
         boots, a WARNING names the env var or the model field (never a credential
-        value), and chat replies explain what to set. Validation does NOT probe
+        value), and chat replies report the setup problem (GH-242: by error
+        code, translated in the UI). Validation does NOT probe
         the network. Cloud providers also log where messages are processed.
         """
         key_env = _PROVIDER_KEY_ENV.get(self.provider)
         if key_env and not os.environ.get(key_env, "").strip():
             logger.warning(
                 "llm.provider is '%s' but the %s env var is not set. admino starts "
-                "anyway; chat replies will ask for it until it is set on the server.",
+                "anyway; chat replies report it as not configured until it is set "
+                "on the server.",
                 self.provider,
                 key_env,
             )
         if not self.active_model_name:
             logger.warning(
                 "llm.provider is '%s' but llm.%s_model is not set. admino starts "
-                "anyway; chat replies will ask for a model; the Super Admin sets it "
+                "anyway; chat replies report a missing model; the Super Admin sets it "
                 "with PATCH /api/platform/settings.",
                 self.provider,
                 self.provider,

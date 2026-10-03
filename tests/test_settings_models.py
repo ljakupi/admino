@@ -417,10 +417,25 @@ class TestPlatformSettingsPatch:
         """GH-160: llm is one of five optional sections (it was the only, required one)."""
         fields = _model("PlatformSettingsPatch").model_fields
 
-        assert set(fields) == {"llm", "limits", "files", "retention", "security"}
+        # GH-242: the request-level residency confirmation, and the active
+        # model's capabilities and retry limit in the llm section.
+        assert set(fields) == {
+            "llm",
+            "limits",
+            "files",
+            "retention",
+            "security",
+            "confirm_residency_orgs",
+        }
         assert SettingsPatchLLM in typing.get_args(fields["llm"].annotation)
         assert not fields["llm"].is_required()
-        assert set(SettingsPatchLLM.model_fields) == {"provider", *_MODEL_FIELDS}
+        assert set(SettingsPatchLLM.model_fields) == {
+            "provider",
+            *_MODEL_FIELDS,
+            "max_input_tokens",
+            "image_input",
+            "max_retries",
+        }
 
     @pytest.mark.parametrize("provider", _PROVIDERS)
     def test_platform_settings_patch_provider_is_accepted(self, provider: str) -> None:

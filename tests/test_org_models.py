@@ -854,7 +854,7 @@ class TestOrgResponses:
 # 9. GH-161: ToolPolicy (one org's permissions for one agent run)
 # ---------------------------------------------------------------------------
 
-_POLICY_FIELDS = frozenset({"permissions", "promoted", "enabled_tools"})
+_POLICY_FIELDS = frozenset({"permissions", "promoted", "enabled_tools", "data_residency"})
 _NEWLINE = chr(0x0A)
 _PASSWORD = "Correct-Horse-Battery-Staple-42"
 _PASSWORD_MARKER = "Pw-Marker-7f3a9c"

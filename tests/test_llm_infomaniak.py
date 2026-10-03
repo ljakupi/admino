@@ -1515,7 +1515,8 @@ class TestInfomaniakErrorMapping:
                 assert phrase in exc.message
         _assert_not_leaked(exc, caplog, marker, _TOKEN)
 
-    @pytest.mark.parametrize("status", [400, 413, 422])
+    # GH-242: 413 is context_too_long (user-facing), tested in test_llm_error_codes.
+    @pytest.mark.parametrize("status", [400, 422])
     async def test_infomaniak_chat_other_4xx_is_internal_error(
         self,
         client: Any,
