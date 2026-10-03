@@ -1301,6 +1301,89 @@ class TestOwnUserAccountRoutes:
         b_view = client.get("/api/me/settings", headers=victim.cookie)
         assert b_view.json()["appearance"]["theme"] == "dark"
 
+    @covers(("GET", "/api/me"))
+    def test_cross_org_my_account_get_reads_only_the_callers_row(
+        self, world: World, client: TestClient
+    ) -> None:
+        """GH-166: B's editor has a name, timezone and instructions of its own; A's
+        editor sees only its own account, and none of B's values."""
+        victim = world.b["editor"]
+        world.db.users[victim.user_id].update(
+            name="B Editor Quasar",
+            timezone="Asia/Tokyo",
+            personal_instructions="B-secret-166 instructions",
+        )
+        caller = world.a["editor"]
+
+        a_view = client.get("/api/me", headers=caller.cookie)
+        b_view = client.get("/api/me", headers=victim.cookie)
+
+        assert a_view.status_code == 200, a_view.text
+        assert a_view.json()["email"] == caller.email
+        for marker in (victim.email, "Quasar", "Asia/Tokyo", "B-secret-166"):
+            assert marker not in a_view.text
+        assert b_view.json()["personal_instructions"] == "B-secret-166 instructions"  # control
+
+    @covers(("PATCH", "/api/me"))
+    def test_cross_org_my_account_patch_changes_only_the_callers_row(
+        self, world: World, client: TestClient
+    ) -> None:
+        """GH-166: A's editor changes its profile; every other account's row (B's
+        included) is exactly as it was."""
+        caller = world.a["editor"]
+        others = {
+            account.user_id: copy.deepcopy(world.db.users[account.user_id])
+            for account in world.everyone()
+            if account != caller
+        }
+
+        response = client.patch(
+            "/api/me",
+            json={
+                "name": "A Editor Renamed",
+                "response_language": "it",
+                "timezone": "Europe/Paris",
+                "personal_instructions": "A's own instructions.",
+            },
+            headers=caller.cookie,
+        )
+
+        assert response.status_code == 200, response.text
+        assert world.db.users[caller.user_id]["timezone"] == "Europe/Paris"
+        assert {user_id: world.db.users[user_id] for user_id in others} == others
+
+    @covers(("POST", "/api/me/password"))
+    def test_cross_org_my_password_change_ends_only_the_callers_sessions(
+        self, world: World, client: TestClient
+    ) -> None:
+        """GH-166: A's editor changes its password: its own sessions end; every other
+        account (B's included) keeps its session and its password; the audit row is
+        org A's."""
+        caller = world.a["editor"]
+        world.db.open_session(caller.user_id)
+        others = [account for account in world.everyone() if account != caller]
+        hashes = {
+            account.user_id: world.db.users[account.user_id]["password_hash"] for account in others
+        }
+
+        response = client.post(
+            "/api/me/password",
+            json={"current_password": PASSWORD, "new_password": "tenancy-Changed-166-meadow"},
+            headers=caller.cookie,
+        )
+
+        assert response.status_code == 204, response.text
+        assert world.db.sessions_of(caller.user_id) == []
+        assert [world.db.session_revoked(account.token) for account in others] == [False] * 6
+        assert {
+            account.user_id: world.db.users[account.user_id]["password_hash"] for account in others
+        } == hashes
+        assert client.get("/api/auth/me", headers=world.b["editor"].cookie).status_code == 200
+        rows = world.db.audit_rows("password.change")
+        assert [(_plain(row["org_id"]), row["target_ids"]) for row in rows] == [
+            (world.org_a, [str(caller.user_id)])
+        ]
+
 
 class TestOwnUserOAuthRoutes:
     """Per-user connections, and the data residency of the caller's own org."""

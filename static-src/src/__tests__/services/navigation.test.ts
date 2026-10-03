@@ -16,7 +16,8 @@
  *   edits the permission matrix and the critical permissions under
  *   Organization, so there is no Permissions entry).
  * - Viewer: Chat, Permissions, Settings (no Tools).
- * - Super Admin: Platform only (no chat UI).
+ * - Super Admin: Settings, Platform (issue #166: Settings shows only the
+ *   account sections; still no chat UI).
  * - Logged out: nothing.
  *
  * There is still no Activity entry. Every entry carries a catalog `labelKey`
@@ -101,7 +102,7 @@ describe('navigation navItemsFor (issue #155)', () => {
     ['editor', ['/chat', '/tools', '/permissions', '/settings']],
     ['org_admin', ['/chat', '/tools', '/organization', '/settings']],
     ['viewer', ['/chat', '/permissions', '/settings']],
-    ['super_admin', ['/platform']],
+    ['super_admin', ['/settings', '/platform']],
     [null, []],
   ] as Array<[ShellRole | null, string[]]>)('shows %s exactly %j, in NAV_ITEMS order', (role, expected) => {
     expect(navItemsFor(role).map((item) => item.to)).toEqual(expected);

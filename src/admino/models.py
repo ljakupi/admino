@@ -10,9 +10,10 @@ the ``audit_events`` table, validated by ``admino.audit_events``.
 Security notes:
 - No secrets, tokens, passwords, or credentials are stored in any model field,
   except ``LoginRequest.password``, ``PasswordResetConfirmRequest.token`` /
-  ``new_password``, ``InvitationAcceptRequest.password`` and
-  ``CriticalPermissionPromote.password``: ``SecretStr`` values (hidden from
-  repr/str) that live only for their request and are never logged or echoed.
+  ``new_password``, ``InvitationAcceptRequest.password``,
+  ``CriticalPermissionPromote.password`` and ``PasswordChangeRequest``'s two
+  passwords: ``SecretStr`` values (hidden from repr/str) that live only for
+  their request and are never logged or echoed.
   Invitation models carry no token, hash or link.
 - Organization models (GH-154) carry org metadata only: no content, and
   ``OrgCreateResponse`` no token or link. ``OrgCreateRequest`` and
@@ -25,6 +26,13 @@ Security notes:
   path and the dedicated routes) and hides its input from validation errors.
   ``OrgSeats`` (GH-165) carries two counts only: the org's used seats and its
   limit.
+- Account self-service (GH-166): ``MyAccountResponse`` carries the caller's
+  own email, name, languages, timezone and personal instructions only (no id,
+  hash, org, role or kind). ``MyAccountPatch`` and ``PasswordChangeRequest``
+  refuse unknown keys (the account, its email, role and org come from the
+  session) and hide their input from validation errors; the timezone must be
+  a name of the runtime's tz database, and its error never repeats it. The
+  two passwords are ``SecretStr``.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -75,8 +83,10 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
 
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
+import zoneinfo
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
@@ -2331,6 +2341,156 @@ class OrgUserPatch(BaseModel):
             msg = "Give a role, a name or an email to change."
             raise ValueError(msg)
         return self
+
+
+# ---------------------------------------------------------------------------
+# Account self-service API models (GH-166): the caller's own account only
+# ---------------------------------------------------------------------------
+
+UiLanguage = Literal["de", "fr", "en"]
+ResponseLanguage = Literal["de", "fr", "it", "en"]
+
+# The bounds of migration 0021's users.timezone and users.personal_instructions.
+_TIMEZONE_MAX_LENGTH: Final = 64
+_PERSONAL_INSTRUCTIONS_MAX_LENGTH: Final = 1500
+# Control characters personal instructions may keep: tab, newline, carriage return.
+_INSTRUCTIONS_ALLOWED_CONTROLS: Final = frozenset("\t\n\r")
+# Format characters they may keep: the zero-width non-joiner and joiner, which
+# some scripts and emoji sequences need. Every other format character (bidi
+# overrides and isolates, direction marks, zero-width space, BOM) is refused:
+# the instructions reach the system prompt (#170).
+_INSTRUCTIONS_ALLOWED_FORMATS: Final = frozenset("\u200c\u200d")
+# Categories refused outright: surrogates and line/paragraph separators.
+_INSTRUCTIONS_BANNED_CATEGORIES: Final = frozenset({"Cs", "Zl", "Zp"})
+# The account fields a patch can't clear: a null for them is refused.
+_NOT_NULLABLE_ACCOUNT_FIELDS: Final = ("name", "ui_language", "timezone", "personal_instructions")
+
+
+@functools.cache
+def _available_timezones() -> frozenset[str]:
+    """The IANA zone names of the runtime's tz database, read once."""
+    return frozenset(zoneinfo.available_timezones())
+
+
+class MyAccountResponse(BaseModel):
+    """GET and PATCH /api/me response: the caller's own account (GH-166).
+
+    Read from the caller's own users row. No id, hash, token, org, role or
+    account kind. ``name`` is None only for a Super Admin created without
+    one; ``response_language`` None means the org's default; ``timezone``
+    None means not preset yet (consumers use Europe/Zurich);
+    ``personal_instructions`` ``""`` means none.
+    """
+
+    email: str = Field(max_length=254)
+    name: str | None = Field(max_length=120)
+    ui_language: UiLanguage
+    response_language: ResponseLanguage | None
+    timezone: str | None = Field(max_length=_TIMEZONE_MAX_LENGTH)
+    personal_instructions: str = Field(max_length=_PERSONAL_INSTRUCTIONS_MAX_LENGTH)
+
+
+class MyAccountPatch(BaseModel):
+    """PATCH /api/me request body: change the caller's own account (GH-166).
+
+    Any of the five fields; presence is ``model_fields_set``, and at least one
+    must be given. ``response_language`` given as null means "use the org
+    default"; a null name, UI language, timezone or instructions is refused
+    (``""`` clears the instructions). The name is stripped, then 1 to 120
+    characters without control, format, surrogate or line/paragraph separator
+    characters. The timezone is a name of the runtime's tz database, exactly
+    as written. The instructions are kept verbatim (not stripped): at most
+    1500 code points, no control character but tab, newline and carriage
+    return, no format character but the zero-width non-joiner and joiner, no
+    surrogate and no line/paragraph separator. The email, password, role, org
+    and kind are never
+    chosen here: unknown fields are refused. Validation errors never repeat
+    the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    ui_language: UiLanguage | None = None
+    response_language: ResponseLanguage | None = None
+    timezone: str | None = Field(default=None, min_length=1, max_length=_TIMEZONE_MAX_LENGTH)
+    personal_instructions: str | None = Field(
+        default=None, max_length=_PERSONAL_INSTRUCTIONS_MAX_LENGTH
+    )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _strip_name(cls, value: object) -> object:
+        """Strip surrounding whitespace from the name before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str | None:
+        """Refuse control, format, surrogate and line/paragraph separator characters."""
+        if value is not None and any(
+            unicodedata.category(char) in _USER_NAME_BANNED_CATEGORIES for char in value
+        ):
+            msg = "The name must not contain control or formatting characters."
+            raise ValueError(msg)
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str | None) -> str | None:
+        """Accept a known IANA zone name only; the message never includes the value."""
+        if value is not None and value not in _available_timezones():
+            msg = "Unknown timezone."
+            raise ValueError(msg)
+        return value
+
+    @field_validator("personal_instructions")
+    @classmethod
+    def _check_personal_instructions(cls, value: str | None) -> str | None:
+        """Refuse control, format, surrogate and line/paragraph separator characters.
+
+        Tab, newline and carriage return, and the zero-width non-joiner and
+        joiner, are kept.
+        """
+        if value is not None and any(
+            (category := unicodedata.category(char)) in _INSTRUCTIONS_BANNED_CATEGORIES
+            or (category == "Cc" and char not in _INSTRUCTIONS_ALLOWED_CONTROLS)
+            or (category == "Cf" and char not in _INSTRUCTIONS_ALLOWED_FORMATS)
+            for char in value
+        ):
+            msg = "The personal instructions must not contain control or formatting characters."
+            raise ValueError(msg)
+        return value
+
+    @model_validator(mode="after")
+    def _check_given_fields(self) -> MyAccountPatch:
+        """Refuse an empty patch, and a null for a field that can't be cleared."""
+        given = self.model_fields_set
+        if not given:
+            msg = "Give at least one field to change."
+            raise ValueError(msg)
+        if any(
+            field in given and getattr(self, field) is None
+            for field in _NOT_NULLABLE_ACCOUNT_FIELDS
+        ):
+            msg = "Only response_language can be null."
+            raise ValueError(msg)
+        return self
+
+
+class PasswordChangeRequest(BaseModel):
+    """POST /api/me/password request body: the caller's current and new password (GH-166).
+
+    Both are ``SecretStr`` (hidden from repr/str/JSON) and kept as typed. The
+    bounds only cap the body: ``admino.auth.reauthenticate`` checks the
+    current password and the password policy decides the new one. Unknown
+    fields are refused; validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    current_password: SecretStr = Field(min_length=1, max_length=1024)
+    new_password: SecretStr = Field(min_length=1, max_length=1024)
 
 
 # ---------------------------------------------------------------------------
