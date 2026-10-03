@@ -77,6 +77,19 @@ export const en = {
   'toast.criticalPermissions.disabled': 'Disabled: {permission}',
   'toast.criticalPermissions.disableFailed.title': 'Disable failed',
 
+  // --- toast.orgUsers (Organization console's Users tab, issue #165) ------
+  'toast.orgUsers.invited': 'Invitation sent',
+  'toast.orgUsers.roleChanged': 'Role changed',
+  'toast.orgUsers.profileSaved': 'Changes saved',
+  'toast.orgUsers.deactivated': 'User deactivated',
+  'toast.orgUsers.reactivated': 'User reactivated',
+  'toast.orgUsers.deleted': 'User deleted',
+  'toast.orgUsers.passwordResetSent': 'Password reset email sent',
+  'toast.orgUsers.loggedOut': 'User logged out everywhere',
+  'toast.orgUsers.invitationResent': 'Invitation resent',
+  'toast.orgUsers.invitationRevoked': 'Invitation revoked',
+  'toast.orgUsers.failed': 'Action failed',
+
   // --- settings (fallback error strings) ------------------------------------
   'settings.error.loadFailed': 'Failed to load settings',
   'settings.error.saveFailed': 'Failed to save settings',
@@ -256,6 +269,98 @@ export const en = {
   'organization.services.subtitle': 'Turn tool services on or off for everyone in this organization.',
   'organization.services.residencyLocked':
     "Your organization's data residency policy keeps data in Switzerland, so Google and Microsoft accounts can't be used.",
+
+  // --- organization tabs (Users | Permissions & services, issue #165) -----
+  'organization.tabs.users': 'Users',
+  'organization.tabs.permissions': 'Permissions & services',
+
+  // --- orgUsers (Organization console's Users tab, issue #165) ------------
+  'orgUsers.title': 'Users',
+  'orgUsers.search.label': 'Search',
+  'orgUsers.search.placeholder': 'Search by name or email',
+  'orgUsers.filter.label': 'Status',
+  'orgUsers.filter.all': 'All',
+  'orgUsers.filter.active': 'Active',
+  'orgUsers.filter.deactivated': 'Deactivated',
+  'orgUsers.filter.invited': 'Invited',
+  'orgUsers.seats': '{used} / {limit} seats',
+  'orgUsers.seatsFull': 'No seats left. Deactivate a user or upgrade your plan to invite more people.',
+  'orgUsers.status.active': 'Active',
+  'orgUsers.status.deactivated': 'Deactivated',
+  'orgUsers.status.invited': 'Invited',
+  'orgUsers.status.expired': 'Expired',
+  'orgUsers.you': 'You',
+  'orgUsers.lastLogin': 'Last login: {date}',
+  'orgUsers.neverLoggedIn': 'Never logged in',
+  'orgUsers.invitations.title': 'Pending invitations',
+  'orgUsers.invitations.sent': 'Sent {date}',
+  'orgUsers.invitations.expires': 'Expires {date}',
+  'orgUsers.empty.users': 'No users match your search.',
+  'orgUsers.empty.invitations': 'No pending invitations.',
+  'orgUsers.actions.menu': 'Actions for {name}',
+  'orgUsers.actions.changeRole': 'Change role',
+  'orgUsers.actions.edit': 'Edit name and email',
+  'orgUsers.actions.deactivate': 'Deactivate',
+  'orgUsers.actions.reactivate': 'Reactivate',
+  'orgUsers.actions.resetPassword': 'Reset password',
+  'orgUsers.actions.forceLogout': 'Log out everywhere',
+  'orgUsers.actions.delete': 'Delete',
+  'orgUsers.actions.resend': 'Resend',
+  'orgUsers.actions.revoke': 'Revoke',
+
+  // --- orgUsers.invite (invite sheet, issue #165) --------------------------
+  'orgUsers.invite.button': 'Invite user',
+  'orgUsers.invite.heading': 'Invite a user',
+  'orgUsers.invite.email.label': 'Email',
+  'orgUsers.invite.role.label': 'Role',
+  'orgUsers.invite.submit': 'Send invitation',
+
+  // --- orgUsers.edit (edit name/email sheet, issue #165) -------------------
+  'orgUsers.edit.heading': 'Edit user',
+  'orgUsers.edit.name.label': 'Full name',
+  'orgUsers.edit.email.label': 'Email',
+  'orgUsers.edit.emailHint':
+    "Changing the email updates this person's login; they'll need to use the new address next time.",
+  'orgUsers.edit.submit': 'Save changes',
+
+  // --- orgUsers.confirm (confirm sheet copy per row action, issue #165) ----
+  'orgUsers.confirm.role.heading': 'Change role?',
+  'orgUsers.confirm.role.subtext': '{name} will become {role}.',
+  'orgUsers.confirm.role.confirm': 'Change role',
+  'orgUsers.confirm.deactivate.heading': 'Deactivate {name}?',
+  'orgUsers.confirm.deactivate.subtext': "They'll lose access immediately and can be reactivated later.",
+  'orgUsers.confirm.deactivate.confirm': 'Deactivate',
+  'orgUsers.confirm.reactivate.heading': 'Reactivate {name}?',
+  'orgUsers.confirm.reactivate.subtext': "They'll regain access and a seat will be used.",
+  'orgUsers.confirm.reactivate.confirm': 'Reactivate',
+  'orgUsers.confirm.resetPassword.heading': 'Reset password?',
+  'orgUsers.confirm.resetPassword.subtext':
+    '{name} will receive an email with instructions to set a new password.',
+  'orgUsers.confirm.resetPassword.confirm': 'Send reset email',
+  'orgUsers.confirm.forceLogout.heading': 'Log out {name} everywhere?',
+  'orgUsers.confirm.forceLogout.subtext': 'This ends every active session immediately.',
+  'orgUsers.confirm.forceLogout.confirm': 'Log out',
+  'orgUsers.confirm.delete.heading': 'Delete {name}?',
+  'orgUsers.confirm.delete.subtext': 'This permanently removes their account. This cannot be undone.',
+  'orgUsers.confirm.delete.confirm': 'Delete',
+  'orgUsers.confirm.revoke.heading': 'Revoke this invitation?',
+  'orgUsers.confirm.revoke.subtext': '{name} will no longer be able to accept it.',
+  'orgUsers.confirm.revoke.confirm': 'Revoke',
+  'orgUsers.confirm.selfWarning': 'This is your own account.',
+
+  // --- orgUsers.error (translated messages; a backend detail is never shown, issue #165) --
+  'orgUsers.error.lastAdmin':
+    'An organization needs at least one active Org Admin. Make another user an Org Admin first.',
+  'orgUsers.error.emailTaken': 'That email address is already used by someone in this organization.',
+  'orgUsers.error.seatLimit': 'Your organization has no free seats left.',
+  'orgUsers.error.invalidStatus': "That action doesn't apply to this user's current status.",
+  'orgUsers.error.userNotFound': 'This user could not be found.',
+  'orgUsers.error.invitationNotFound': 'This invitation could not be found.',
+  'orgUsers.error.invalidInput': "Some of the information you entered isn't valid.",
+  'orgUsers.error.invalidEmail': 'Enter a valid email address.',
+  'orgUsers.error.rateLimited': 'Too many attempts. Please wait a moment and try again.',
+  'orgUsers.error.forbidden': "You don't have permission to do that.",
+  'orgUsers.error.generic': 'Something went wrong. Please try again.',
 
   // --- toolsPage (my connections, OAuth callback, issue #162) ------------
   'toolsPage.accounts.title': 'My connections',

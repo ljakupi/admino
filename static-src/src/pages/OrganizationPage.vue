@@ -8,20 +8,37 @@
  *
  * Issue #162: the Org Admin's per-service switches move here too
  * (`OrgServicesCard.vue`), gated the same way by `canManageOrgSettings`.
+ *
+ * Issue #165: a Users tab (`OrgUsersPanel.vue`) joins the Permissions &
+ * services tab. The active tab is driven by the `?tab=` query
+ * (`services/orgUsers.ts`'s `orgTabFrom`, Users is the default) so the tab
+ * survives a reload or a shared link; switching tabs updates the query with
+ * `router.replace` (no new history entry).
  */
 import { computed } from 'vue';
+import { useRoute, useRouter } from 'vue-router';
 import { Building2 } from 'lucide-vue-next';
 import EmptyState from '@/components/EmptyState.vue';
 import PermissionMatrix from '@/components/PermissionMatrix.vue';
 import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
 import OrgServicesCard from '@/components/OrgServicesCard.vue';
+import OrgUsersPanel from '@/components/OrgUsersPanel.vue';
 import { useAuthStore } from '@/stores/auth';
 import { canManageOrgPermissions, canManageOrgSettings } from '@/services/access';
+import { orgTabFrom, type OrgTab } from '@/services/orgUsers';
 import { t } from '@/i18n';
 
+const route = useRoute();
+const router = useRouter();
 const auth = useAuthStore();
 const canManage = computed(() => canManageOrgPermissions(auth.role));
 const canManageServices = computed(() => canManageOrgSettings(auth.role));
+const activeTab = computed<OrgTab>(() => orgTabFrom(route.query.tab));
+
+function selectTab(tab: OrgTab): void {
+  if (tab === activeTab.value) return;
+  void router.replace({ query: { ...route.query, tab } });
+}
 </script>
 
 <template>
@@ -29,11 +46,36 @@ const canManageServices = computed(() => canManageOrgSettings(auth.role));
     <template v-if="canManage">
       <header class="page-header">
         <h1>{{ t('nav.organization') }}</h1>
+        <div class="tabs" role="tablist">
+          <button
+            type="button"
+            role="tab"
+            class="tab-btn"
+            :class="{ on: activeTab === 'users' }"
+            :aria-selected="activeTab === 'users'"
+            @click="selectTab('users')"
+          >
+            {{ t('organization.tabs.users') }}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="tab-btn"
+            :class="{ on: activeTab === 'permissions' }"
+            :aria-selected="activeTab === 'permissions'"
+            @click="selectTab('permissions')"
+          >
+            {{ t('organization.tabs.permissions') }}
+          </button>
+        </div>
       </header>
       <div class="page-content">
-        <OrgServicesCard v-if="canManageServices" />
-        <PermissionMatrix />
-        <CriticalPermissionsCard />
+        <OrgUsersPanel v-if="activeTab === 'users'" />
+        <template v-else>
+          <OrgServicesCard v-if="canManageServices" />
+          <PermissionMatrix />
+          <CriticalPermissionsCard />
+        </template>
       </div>
     </template>
     <EmptyState
@@ -66,13 +108,41 @@ const canManageServices = computed(() => canManageOrgSettings(auth.role));
   font-size: 20px;
   letter-spacing: -0.02em;
   color: var(--color-text);
+  margin-bottom: var(--space-3);
+}
+
+.tabs {
+  display: inline-flex;
+  gap: 4px;
+  padding: 3px;
+  background: var(--color-bg-elevated);
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
+
+.tab-btn {
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  padding: 8px 14px;
+  min-height: 44px;
+  border-radius: 6px;
+  border: 0;
+  background: transparent;
+  color: #475560;
+  cursor: pointer;
+}
+
+.tab-btn.on {
+  background: #F5F7F5;
+  color: var(--color-text);
 }
 
 .page-content {
   flex: 1;
   overflow-y: auto;
   padding: 24px;
-  max-width: 720px;
+  max-width: 960px;
   margin: 0 auto;
   width: 100%;
   display: flex;

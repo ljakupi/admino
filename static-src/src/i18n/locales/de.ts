@@ -75,6 +75,19 @@ export const de: Record<MessageKey, Message> = {
   'toast.criticalPermissions.disabled': 'Deaktiviert: {permission}',
   'toast.criticalPermissions.disableFailed.title': 'Deaktivieren fehlgeschlagen',
 
+  // --- toast.orgUsers (Organization console's Users tab, issue #165) ------
+  'toast.orgUsers.invited': 'Einladung gesendet',
+  'toast.orgUsers.roleChanged': 'Rolle geändert',
+  'toast.orgUsers.profileSaved': 'Änderungen gespeichert',
+  'toast.orgUsers.deactivated': 'Benutzer deaktiviert',
+  'toast.orgUsers.reactivated': 'Benutzer reaktiviert',
+  'toast.orgUsers.deleted': 'Benutzer gelöscht',
+  'toast.orgUsers.passwordResetSent': 'E-Mail zum Zurücksetzen des Passworts gesendet',
+  'toast.orgUsers.loggedOut': 'Benutzer überall abgemeldet',
+  'toast.orgUsers.invitationResent': 'Einladung erneut gesendet',
+  'toast.orgUsers.invitationRevoked': 'Einladung widerrufen',
+  'toast.orgUsers.failed': 'Aktion fehlgeschlagen',
+
   // --- settings (fallback error strings) ------------------------------------
   'settings.error.loadFailed': 'Einstellungen konnten nicht geladen werden',
   'settings.error.saveFailed': 'Einstellungen konnten nicht gespeichert werden',
@@ -258,6 +271,100 @@ export const de: Record<MessageKey, Message> = {
     'Schalten Sie Tool-Dienste für alle Mitglieder dieser Organisation ein oder aus.',
   'organization.services.residencyLocked':
     'Die Data-Residency-Richtlinie Ihrer Organisation hält Daten in der Schweiz, daher können Google- und Microsoft-Konten nicht genutzt werden.',
+
+  // --- organization tabs (Users | Permissions & services, issue #165) -----
+  'organization.tabs.users': 'Benutzer',
+  'organization.tabs.permissions': 'Berechtigungen & Dienste',
+
+  // --- orgUsers (Organization console's Users tab, issue #165) ------------
+  'orgUsers.title': 'Benutzer',
+  'orgUsers.search.label': 'Suche',
+  'orgUsers.search.placeholder': 'Nach Name oder E-Mail suchen',
+  'orgUsers.filter.label': 'Status',
+  'orgUsers.filter.all': 'Alle',
+  'orgUsers.filter.active': 'Aktiv',
+  'orgUsers.filter.deactivated': 'Deaktiviert',
+  'orgUsers.filter.invited': 'Eingeladen',
+  'orgUsers.seats': '{used} / {limit} Plätze',
+  'orgUsers.seatsFull':
+    'Keine Plätze mehr verfügbar. Deaktivieren Sie einen Nutzer oder erweitern Sie Ihr Abo, um weitere Personen einzuladen.',
+  'orgUsers.status.active': 'Aktiv',
+  'orgUsers.status.deactivated': 'Deaktiviert',
+  'orgUsers.status.invited': 'Eingeladen',
+  'orgUsers.status.expired': 'Abgelaufen',
+  'orgUsers.you': 'Sie',
+  'orgUsers.lastLogin': 'Letzte Anmeldung: {date}',
+  'orgUsers.neverLoggedIn': 'Noch nie angemeldet',
+  'orgUsers.invitations.title': 'Ausstehende Einladungen',
+  'orgUsers.invitations.sent': 'Gesendet am {date}',
+  'orgUsers.invitations.expires': 'Läuft ab am {date}',
+  'orgUsers.empty.users': 'Keine Benutzer entsprechen Ihrer Suche.',
+  'orgUsers.empty.invitations': 'Keine ausstehenden Einladungen.',
+  'orgUsers.actions.menu': 'Aktionen für {name}',
+  'orgUsers.actions.changeRole': 'Rolle ändern',
+  'orgUsers.actions.edit': 'Name und E-Mail bearbeiten',
+  'orgUsers.actions.deactivate': 'Deaktivieren',
+  'orgUsers.actions.reactivate': 'Reaktivieren',
+  'orgUsers.actions.resetPassword': 'Passwort zurücksetzen',
+  'orgUsers.actions.forceLogout': 'Überall abmelden',
+  'orgUsers.actions.delete': 'Löschen',
+  'orgUsers.actions.resend': 'Erneut senden',
+  'orgUsers.actions.revoke': 'Widerrufen',
+
+  // --- orgUsers.invite (invite sheet, issue #165) --------------------------
+  'orgUsers.invite.button': 'Benutzer einladen',
+  'orgUsers.invite.heading': 'Einen Benutzer einladen',
+  'orgUsers.invite.email.label': 'E-Mail',
+  'orgUsers.invite.role.label': 'Rolle',
+  'orgUsers.invite.submit': 'Einladung senden',
+
+  // --- orgUsers.edit (edit name/email sheet, issue #165) -------------------
+  'orgUsers.edit.heading': 'Benutzer bearbeiten',
+  'orgUsers.edit.name.label': 'Vollständiger Name',
+  'orgUsers.edit.email.label': 'E-Mail',
+  'orgUsers.edit.emailHint':
+    'Durch die Änderung der E-Mail-Adresse ändert sich der Login dieser Person; sie muss sich beim nächsten Mal mit der neuen Adresse anmelden.',
+  'orgUsers.edit.submit': 'Änderungen speichern',
+
+  // --- orgUsers.confirm (confirm sheet copy per row action, issue #165) ----
+  'orgUsers.confirm.role.heading': 'Rolle ändern?',
+  'orgUsers.confirm.role.subtext': '{name} wird zu {role}.',
+  'orgUsers.confirm.role.confirm': 'Rolle ändern',
+  'orgUsers.confirm.deactivate.heading': '{name} deaktivieren?',
+  'orgUsers.confirm.deactivate.subtext':
+    'Die Person verliert sofort den Zugriff und kann später wieder reaktiviert werden.',
+  'orgUsers.confirm.deactivate.confirm': 'Deaktivieren',
+  'orgUsers.confirm.reactivate.heading': '{name} reaktivieren?',
+  'orgUsers.confirm.reactivate.subtext': 'Die Person erhält den Zugriff zurück und es wird ein Platz belegt.',
+  'orgUsers.confirm.reactivate.confirm': 'Reaktivieren',
+  'orgUsers.confirm.resetPassword.heading': 'Passwort zurücksetzen?',
+  'orgUsers.confirm.resetPassword.subtext':
+    '{name} erhält eine E-Mail mit Anweisungen zum Festlegen eines neuen Passworts.',
+  'orgUsers.confirm.resetPassword.confirm': 'Reset-E-Mail senden',
+  'orgUsers.confirm.forceLogout.heading': '{name} überall abmelden?',
+  'orgUsers.confirm.forceLogout.subtext': 'Dies beendet sofort alle aktiven Sitzungen.',
+  'orgUsers.confirm.forceLogout.confirm': 'Abmelden',
+  'orgUsers.confirm.delete.heading': '{name} löschen?',
+  'orgUsers.confirm.delete.subtext': 'Dies entfernt das Konto dauerhaft. Dies kann nicht rückgängig gemacht werden.',
+  'orgUsers.confirm.delete.confirm': 'Löschen',
+  'orgUsers.confirm.revoke.heading': 'Diese Einladung widerrufen?',
+  'orgUsers.confirm.revoke.subtext': '{name} kann sie nicht mehr annehmen.',
+  'orgUsers.confirm.revoke.confirm': 'Widerrufen',
+  'orgUsers.confirm.selfWarning': 'Dies ist Ihr eigenes Konto.',
+
+  // --- orgUsers.error (translated messages; a backend detail is never shown, issue #165) --
+  'orgUsers.error.lastAdmin':
+    'Eine Organisation benötigt mindestens einen aktiven Org Admin. Machen Sie zuerst eine andere Person zum Org Admin.',
+  'orgUsers.error.emailTaken': 'Diese E-Mail-Adresse wird bereits von einer Person in dieser Organisation verwendet.',
+  'orgUsers.error.seatLimit': 'Ihre Organisation hat keine freien Plätze mehr.',
+  'orgUsers.error.invalidStatus': 'Diese Aktion ist für den aktuellen Status dieser Person nicht möglich.',
+  'orgUsers.error.userNotFound': 'Dieser Benutzer wurde nicht gefunden.',
+  'orgUsers.error.invitationNotFound': 'Diese Einladung wurde nicht gefunden.',
+  'orgUsers.error.invalidInput': 'Einige der eingegebenen Angaben sind ungültig.',
+  'orgUsers.error.invalidEmail': 'Geben Sie eine gültige E-Mail-Adresse ein.',
+  'orgUsers.error.rateLimited': 'Zu viele Versuche. Bitte warten Sie einen Moment und versuchen Sie es erneut.',
+  'orgUsers.error.forbidden': 'Sie haben keine Berechtigung für diese Aktion.',
+  'orgUsers.error.generic': 'Etwas ist schiefgelaufen. Bitte versuchen Sie es erneut.',
 
   // --- toolsPage (my connections, OAuth callback, issue #162) ------------
   'toolsPage.accounts.title': 'Meine Verbindungen',

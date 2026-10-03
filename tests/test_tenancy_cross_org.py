@@ -12,7 +12,8 @@ Viewer, plus a Super Admin):
   caller reaches its own org's resource, and org B still reaches its own.
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
-  promotions, the permission summary, invitations, the user list).
+  promotions, the permission summary, invitations, the user list and its
+  seat usage).
 - The org user routes of GH-164 (PATCH, deactivate, reactivate, DELETE,
   password reset): every kind of org B account (its last Org Admin, a member,
   a deactivated user, an invited account) is a 404 "User not found" for org
@@ -1135,6 +1136,36 @@ class TestOwnOrgRoutes:
         operator = [str(world.super_admin.user_id), world.super_admin.email]
         assert [mark for mark in [*b_marks, *operator] if mark in a_view.text] == []
         assert [mark for mark in [*a_marks, *operator] if mark in b_view.text] == []
+
+    @covers(("GET", "/api/org/users"))
+    def test_cross_org_org_user_seats_count_only_the_callers_org(
+        self, world: World, client: TestClient
+    ) -> None:
+        """GH-165: org A (12 seats) and org B (40 seats) each hold their three members.
+        A invites one user; B invites one, has a pending and an expired invited account, a
+        deactivated user and three more Editors. A's seats are {"used": 4, "limit": 12}
+        (B's active and invited users never count, A's own limit), B's {"used": 9,
+        "limit": 40}; neither is shifted by the other org or by the Super Admin."""
+        world.db.add_org(world.org_a, seats=12)
+        world.db.add_org(world.org_b, seats=40)
+        _invite(client, world.a["org_admin"], _A_INVITEE)
+        _invite(client, world.b["org_admin"], _B_INVITEE)
+        _b_invited(world)
+        expired = world.db.add_account(
+            role="viewer", org_id=world.org_b, status="invited", name=None, password_hash=None
+        )
+        world.db.add_invitation(expired, sent_ago=timedelta(days=10))
+        _b_deactivated(world, client)
+        for _ in range(3):
+            world.db.add_account(role="editor", org_id=world.org_b)
+
+        a_view = client.get("/api/org/users", headers=world.a["org_admin"].cookie)
+        b_view = client.get("/api/org/users", headers=world.b["org_admin"].cookie)
+
+        assert a_view.status_code == 200, a_view.text
+        assert b_view.status_code == 200, b_view.text
+        assert a_view.json().get("seats") == {"used": 4, "limit": 12}
+        assert b_view.json().get("seats") == {"used": 9, "limit": 40}
 
 
 # ---------------------------------------------------------------------------

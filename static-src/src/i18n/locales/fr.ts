@@ -74,6 +74,19 @@ export const fr: Record<MessageKey, Message> = {
   'toast.criticalPermissions.disabled': 'Désactivé : {permission}',
   'toast.criticalPermissions.disableFailed.title': 'Échec de la désactivation',
 
+  // --- toast.orgUsers (Organization console's Users tab, issue #165) ------
+  'toast.orgUsers.invited': 'Invitation envoyée',
+  'toast.orgUsers.roleChanged': 'Rôle modifié',
+  'toast.orgUsers.profileSaved': 'Modifications enregistrées',
+  'toast.orgUsers.deactivated': 'Utilisateur désactivé',
+  'toast.orgUsers.reactivated': 'Utilisateur réactivé',
+  'toast.orgUsers.deleted': 'Utilisateur supprimé',
+  'toast.orgUsers.passwordResetSent': 'E-mail de réinitialisation du mot de passe envoyé',
+  'toast.orgUsers.loggedOut': 'Utilisateur déconnecté partout',
+  'toast.orgUsers.invitationResent': 'Invitation renvoyée',
+  'toast.orgUsers.invitationRevoked': 'Invitation révoquée',
+  'toast.orgUsers.failed': "Échec de l'action",
+
   // --- settings (fallback error strings) ------------------------------------
   'settings.error.loadFailed': 'Impossible de charger les paramètres',
   'settings.error.saveFailed': "Impossible d'enregistrer les paramètres",
@@ -256,6 +269,100 @@ export const fr: Record<MessageKey, Message> = {
     'Activez ou désactivez les services pour tous les membres de cette organisation.',
   'organization.services.residencyLocked':
     "La politique de résidence des données de votre organisation conserve les données en Suisse, les comptes Google et Microsoft ne peuvent donc pas être utilisés.",
+
+  // --- organization tabs (Users | Permissions & services, issue #165) -----
+  'organization.tabs.users': 'Utilisateurs',
+  'organization.tabs.permissions': 'Autorisations et services',
+
+  // --- orgUsers (Organization console's Users tab, issue #165) ------------
+  'orgUsers.title': 'Utilisateurs',
+  'orgUsers.search.label': 'Rechercher',
+  'orgUsers.search.placeholder': 'Rechercher par nom ou e-mail',
+  'orgUsers.filter.label': 'Statut',
+  'orgUsers.filter.all': 'Tous',
+  'orgUsers.filter.active': 'Actifs',
+  'orgUsers.filter.deactivated': 'Désactivés',
+  'orgUsers.filter.invited': 'Invités',
+  'orgUsers.seats': '{used} / {limit} sièges',
+  'orgUsers.seatsFull':
+    "Plus aucun siège disponible. Désactivez un utilisateur ou passez à un forfait supérieur pour inviter davantage de personnes.",
+  'orgUsers.status.active': 'Actif',
+  'orgUsers.status.deactivated': 'Désactivé',
+  'orgUsers.status.invited': 'Invité',
+  'orgUsers.status.expired': 'Expiré',
+  'orgUsers.you': 'Vous',
+  'orgUsers.lastLogin': 'Dernière connexion : {date}',
+  'orgUsers.neverLoggedIn': 'Jamais connecté',
+  'orgUsers.invitations.title': 'Invitations en attente',
+  'orgUsers.invitations.sent': 'Envoyée le {date}',
+  'orgUsers.invitations.expires': 'Expire le {date}',
+  'orgUsers.empty.users': "Aucun utilisateur ne correspond à votre recherche.",
+  'orgUsers.empty.invitations': 'Aucune invitation en attente.',
+  'orgUsers.actions.menu': 'Actions pour {name}',
+  'orgUsers.actions.changeRole': 'Changer le rôle',
+  'orgUsers.actions.edit': "Modifier le nom et l'e-mail",
+  'orgUsers.actions.deactivate': 'Désactiver',
+  'orgUsers.actions.reactivate': 'Réactiver',
+  'orgUsers.actions.resetPassword': 'Réinitialiser le mot de passe',
+  'orgUsers.actions.forceLogout': 'Déconnecter partout',
+  'orgUsers.actions.delete': 'Supprimer',
+  'orgUsers.actions.resend': 'Renvoyer',
+  'orgUsers.actions.revoke': 'Révoquer',
+
+  // --- orgUsers.invite (invite sheet, issue #165) --------------------------
+  'orgUsers.invite.button': 'Inviter un utilisateur',
+  'orgUsers.invite.heading': 'Inviter un utilisateur',
+  'orgUsers.invite.email.label': 'E-mail',
+  'orgUsers.invite.role.label': 'Rôle',
+  'orgUsers.invite.submit': "Envoyer l'invitation",
+
+  // --- orgUsers.edit (edit name/email sheet, issue #165) -------------------
+  'orgUsers.edit.heading': "Modifier l'utilisateur",
+  'orgUsers.edit.name.label': 'Nom complet',
+  'orgUsers.edit.email.label': 'E-mail',
+  'orgUsers.edit.emailHint':
+    "La modification de l'e-mail change l'identifiant de connexion de cette personne ; elle devra utiliser la nouvelle adresse la prochaine fois.",
+  'orgUsers.edit.submit': 'Enregistrer les modifications',
+
+  // --- orgUsers.confirm (confirm sheet copy per row action, issue #165) ----
+  'orgUsers.confirm.role.heading': 'Changer le rôle ?',
+  'orgUsers.confirm.role.subtext': '{name} deviendra {role}.',
+  'orgUsers.confirm.role.confirm': 'Changer le rôle',
+  'orgUsers.confirm.deactivate.heading': 'Désactiver {name} ?',
+  'orgUsers.confirm.deactivate.subtext':
+    "Cette personne perdra l'accès immédiatement et pourra être réactivée plus tard.",
+  'orgUsers.confirm.deactivate.confirm': 'Désactiver',
+  'orgUsers.confirm.reactivate.heading': 'Réactiver {name} ?',
+  'orgUsers.confirm.reactivate.subtext': "Cette personne retrouvera l'accès et un siège sera utilisé.",
+  'orgUsers.confirm.reactivate.confirm': 'Réactiver',
+  'orgUsers.confirm.resetPassword.heading': 'Réinitialiser le mot de passe ?',
+  'orgUsers.confirm.resetPassword.subtext':
+    "{name} recevra un e-mail avec les instructions pour définir un nouveau mot de passe.",
+  'orgUsers.confirm.resetPassword.confirm': "Envoyer l'e-mail de réinitialisation",
+  'orgUsers.confirm.forceLogout.heading': 'Déconnecter {name} partout ?',
+  'orgUsers.confirm.forceLogout.subtext': 'Cela met fin immédiatement à toutes les sessions actives.',
+  'orgUsers.confirm.forceLogout.confirm': 'Déconnecter',
+  'orgUsers.confirm.delete.heading': 'Supprimer {name} ?',
+  'orgUsers.confirm.delete.subtext': 'Cela supprime définitivement le compte. Cette action est irréversible.',
+  'orgUsers.confirm.delete.confirm': 'Supprimer',
+  'orgUsers.confirm.revoke.heading': 'Révoquer cette invitation ?',
+  'orgUsers.confirm.revoke.subtext': "{name} ne pourra plus l'accepter.",
+  'orgUsers.confirm.revoke.confirm': 'Révoquer',
+  'orgUsers.confirm.selfWarning': "Il s'agit de votre propre compte.",
+
+  // --- orgUsers.error (translated messages; a backend detail is never shown, issue #165) --
+  'orgUsers.error.lastAdmin':
+    "Une organisation a besoin d'au moins un administrateur actif. Faites d'abord d'une autre personne un administrateur de l'organisation.",
+  'orgUsers.error.emailTaken': 'Cette adresse e-mail est déjà utilisée par une personne de cette organisation.',
+  'orgUsers.error.seatLimit': "Votre organisation n'a plus de siège disponible.",
+  'orgUsers.error.invalidStatus': "Cette action ne s'applique pas au statut actuel de cette personne.",
+  'orgUsers.error.userNotFound': 'Cet utilisateur est introuvable.',
+  'orgUsers.error.invitationNotFound': 'Cette invitation est introuvable.',
+  'orgUsers.error.invalidInput': 'Certaines informations saisies ne sont pas valides.',
+  'orgUsers.error.invalidEmail': 'Saisissez une adresse e-mail valide.',
+  'orgUsers.error.rateLimited': 'Trop de tentatives. Veuillez patienter un instant puis réessayer.',
+  'orgUsers.error.forbidden': "Vous n'avez pas la permission d'effectuer cette action.",
+  'orgUsers.error.generic': "Une erreur s'est produite. Veuillez réessayer.",
 
   // --- toolsPage (my connections, OAuth callback, issue #162) ------------
   'toolsPage.accounts.title': 'Mes connexions',

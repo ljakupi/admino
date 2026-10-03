@@ -23,6 +23,8 @@ Security notes:
   only (no hash, token, org id or kind); ``OrgUserPatch`` refuses unknown keys
   (the org, the target, the status and the kind come from the session, the
   path and the dedicated routes) and hides its input from validation errors.
+  ``OrgSeats`` (GH-165) carries two counts only: the org's used seats and its
+  limit.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -2259,10 +2261,27 @@ class OrgUserSummary(BaseModel):
     last_login_at: datetime | None
 
 
+class OrgSeats(BaseModel):
+    """The read-only seat usage of the caller's org (GH-165).
+
+    ``used`` counts the org's active and invited users (expired invitations
+    included), the rule a new invitation is checked against; ``limit`` is the
+    org's seats. ``used`` may exceed ``limit`` when the seats were lowered
+    below the org's users, so there is no cross-field check.
+    """
+
+    used: int = Field(ge=0)
+    limit: int = Field(ge=0)
+
+
 class OrgUserListResponse(BaseModel):
-    """GET /api/org/users response: the org's active and deactivated users, oldest first."""
+    """GET /api/org/users response: the org's active and deactivated users, oldest first.
+
+    ``seats`` is the org's seat usage (GH-165), shown next to the list.
+    """
 
     users: list[OrgUserSummary]
+    seats: OrgSeats
 
 
 class OrgUserPatch(BaseModel):

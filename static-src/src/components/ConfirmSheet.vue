@@ -9,6 +9,8 @@ defineProps<{
   subtext?: string;
   confirmLabel?: string;
   variant?: 'neutral' | 'destructive';
+  /** While the confirmed action runs: both buttons are disabled and Confirm shows a spinner. */
+  busy?: boolean;
 }>();
 
 defineEmits<{
@@ -19,15 +21,17 @@ defineEmits<{
 
 <template>
   <Teleport to="body">
-    <div class="sheet-backdrop" @click.self="$emit('cancel')">
+    <div class="sheet-backdrop" @click.self="!busy && $emit('cancel')">
       <div class="sheet" role="dialog" aria-modal="true">
         <div class="sheet-handle" />
         <h3 class="sheet-heading">{{ heading }}</h3>
         <p v-if="subtext" class="sheet-subtext caption">{{ subtext }}</p>
+        <slot />
         <div class="sheet-actions">
-          <BaseButton variant="secondary" @click="$emit('cancel')">{{ t('common.cancel') }}</BaseButton>
+          <BaseButton variant="secondary" :disabled="busy" @click="$emit('cancel')">{{ t('common.cancel') }}</BaseButton>
           <BaseButton
             :variant="variant === 'destructive' ? 'destructive' : 'primary'"
+            :loading="busy"
             @click="$emit('confirm')"
           >
             {{ confirmLabel ?? t('common.confirm') }}

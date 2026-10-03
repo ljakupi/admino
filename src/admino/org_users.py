@@ -1,6 +1,7 @@
 """Org Admin user management: list, change, deactivate, reactivate and delete users (GH-164).
 
-An Org Admin lists the users of their org (``list_org_users``), changes one
+An Org Admin lists the users of their org (``list_org_users``) with its seat
+usage (``seat_usage``, GH-165), changes one
 user's role, name or email (``update_org_user``), deactivates or reactivates
 them (``deactivate_org_user``, ``reactivate_org_user``), deletes them
 (``delete_org_user``) or sends them a password reset link
@@ -11,8 +12,9 @@ Inputs: the database pool, the acting ``Principal`` (always the org's Org
 Admin: the org is ``actor.org_id``), the target user id, the client IP, plus
 an ``OrgUserPatch`` (a change) or the configured public URL
 (``server.public_url``, for the reactivation and reset emails).
-Outputs: a list of ``OrgUserSummary`` (listing), one ``OrgUserSummary`` (a
-change, a deactivation, a reactivation), None (deletion, reset). Errors:
+Outputs: a list of ``OrgUserSummary`` (listing), an ``OrgSeats`` (seat
+usage), one ``OrgUserSummary`` (a change, a deactivation, a reactivation),
+None (deletion, reset). Errors:
 ``PermissionError``, ``accounts.UserNotInOrgError``,
 ``accounts.LastAdminError``, ``accounts.DuplicateEmailError``,
 ``invitations.SeatLimitError``, ``InvalidUserStatusError`` and
@@ -23,6 +25,11 @@ An invited account (invitations have their own routes, GH-153), a deleted
 one, a Super Admin and another org's user are all "not found". Each action
 runs in one transaction on one connection: the checks, the change, its email
 and its audit event commit or roll back together.
+- The seat usage is two reads, no transaction: ``limit`` is the org's seats,
+  ``used`` its active and invited users (expired invitations included), the
+  rule a new invitation is checked against (``invitations._SEATS_TAKEN_SQL``,
+  #153). Deactivated and deleted users don't count. Nothing is written,
+  audited or logged.
 - A change runs the last-admin guard first when the new role isn't
   org_admin. An email change queues the content-free ``email_changed`` notice
   before the UPDATE (the outbox copies the address from the users row, so it
@@ -49,8 +56,8 @@ other actions lock the target's row (``FOR UPDATE``) while they check its
 status; a reactivation locks the org row after it.
 
 Security notes:
-- Authorization through ``access.can`` before any query: listing needs
-  ``Capability.ORG_USERS_VIEW``; every other action
+- Authorization through ``access.can`` before any query: listing and the seat
+  usage need ``Capability.ORG_USERS_VIEW``; every other action
   ``Capability.ORG_USERS_MANAGE``, and a role change also
   ``Capability.ORG_USERS_ROLE_CHANGE``. A Super Admin (no org) is refused.
 - Tenant isolation at the data layer: every statement is scoped by the
@@ -84,7 +91,7 @@ from admino.email_templates import (
     AccountDeactivatedParams,
     EmailChangedParams,
 )
-from admino.models import OrgUserPatch, OrgUserSummary
+from admino.models import OrgSeats, OrgUserPatch, OrgUserSummary
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -114,6 +121,7 @@ _TARGET_SQL: Final = """
     FOR UPDATE
 """
 _ORG_NAME_SQL: Final = "SELECT name FROM organizations WHERE id = $1"
+_ORG_SEATS_SQL: Final = "SELECT seats FROM organizations WHERE id = $1"
 # The status and profile UPDATEs match the locked target's row: exactly one row
 # comes back. A NULL keeps the stored value: only the changed fields are written.
 _UPDATE_SQL: Final = """
@@ -221,6 +229,27 @@ async def list_org_users(pool: asyncpg.Pool, *, actor: Principal) -> list[OrgUse
     org_id = _authorize(actor, Capability.ORG_USERS_VIEW)
     rows = await pool.fetch(_LIST_SQL, org_id)
     return [_summary(row) for row in rows]
+
+
+async def seat_usage(pool: asyncpg.Pool, *, actor: Principal) -> OrgSeats:
+    """Return the seat usage of the actor's org; read-only (GH-165).
+
+    Args:
+        pool: The database pool.
+        actor: The Org Admin listing (the org is theirs).
+
+    Returns:
+        The org's seats (``limit``) and its active and invited users that
+        aren't deleted (``used``, the rule ``invitations.ensure_free_seat``
+        checks). ``used`` may exceed ``limit`` after the seats were lowered.
+
+    Raises:
+        PermissionError: Without ``Capability.ORG_USERS_VIEW``; no query is issued.
+    """
+    org_id = _authorize(actor, Capability.ORG_USERS_VIEW)
+    limit = await pool.fetchval(_ORG_SEATS_SQL, org_id)
+    used = await pool.fetchval(invitations._SEATS_TAKEN_SQL, org_id)
+    return OrgSeats(used=used, limit=limit)
 
 
 async def update_org_user(
