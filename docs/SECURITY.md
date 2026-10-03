@@ -196,6 +196,10 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
 - **Operator blindness.** The Super Admin reaches only the platform routes and their own
   account. Platform responses carry metadata and counts, never content, titles or file
   names.
+- **No impersonation.** The Super Admin can deactivate or reactivate an organization's
+  user, send them a password reset link and re-invite an organization's first Org Admin,
+  each recorded in that organization's audit log. They can't set a password, see a reset
+  or invitation link or token, change an existing user's email address, or act as a user.
 
 The tenant isolation suite, `tests/test_tenancy*.py`, checks all of this route by route
 over HTTP. Its route catalog lives in `tests/tenancy_world.py`. Every registered route has

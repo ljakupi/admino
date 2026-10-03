@@ -26,6 +26,12 @@ Security notes:
   path and the dedicated routes) and hides its input from validation errors.
   ``OrgSeats`` (GH-165) carries two counts only: the org's used seats and its
   limit.
+- Super Admin user administration (GH-167): ``PlatformUserSummary`` carries
+  account metadata only (no hash, token, org id or kind); ``OrgMetadata``
+  counts and sizes only, never org content. ``PlatformReinviteRequest`` has
+  one optional email (the invitation rules), refuses unknown keys (the org,
+  the target, the role and the language come from the path, the contract and
+  the session) and hides its input from validation errors.
 - Account self-service (GH-166): ``MyAccountResponse`` carries the caller's
   own email, name, languages, timezone and personal instructions only (no id,
   hash, org, role or kind). ``MyAccountPatch`` and ``PasswordChangeRequest``
@@ -2341,6 +2347,80 @@ class OrgUserPatch(BaseModel):
             msg = "Give a role, a name or an email to change."
             raise ValueError(msg)
         return self
+
+
+# ---------------------------------------------------------------------------
+# Super Admin user administration API models (GH-167): account metadata and
+# counts only, no credential and no org content
+# ---------------------------------------------------------------------------
+
+
+class PlatformUserSummary(BaseModel):
+    """One account of an org as the Super Admin sees it (users list and status responses).
+
+    Account metadata only: no password hash, token, org id or account kind.
+    Unlike ``OrgUserSummary``, an invited account is listed too (status
+    ``invited``, no name, never logged in), so the Super Admin can re-invite an
+    org's first Org Admin. A deleted account is never listed.
+    """
+
+    id: PlainUUID
+    name: str | None = Field(max_length=120)
+    email: str = Field(max_length=254)
+    role: MemberRole
+    status: Literal["active", "deactivated", "invited"]
+    created_at: datetime
+    last_login_at: datetime | None
+
+
+class PlatformUserListResponse(BaseModel):
+    """GET /api/platform/orgs/{org_id}/users response: the org's accounts, oldest first."""
+
+    users: list[PlatformUserSummary]
+
+
+class OrgMetadata(BaseModel):
+    """GET /api/platform/orgs/{org_id}/metadata response: counts and sizes only.
+
+    ``seats`` follows the invitation seat rule (``OrgSeats``). The storage,
+    chat and file counts are 0 until chats and attachments exist (#176,
+    #187). Never a title, a name or any other org content.
+    """
+
+    seats: OrgSeats
+    storage_used_bytes: int = Field(ge=0)
+    chat_count: int = Field(ge=0)
+    file_count: int = Field(ge=0)
+
+
+class PlatformReinviteRequest(BaseModel):
+    """POST /api/platform/orgs/{org_id}/users/{user_id}/invitation request body.
+
+    No email (absent or null) resends the invited Org Admin's invitation with a
+    new link; an email replaces the invited account with a new invitation to
+    that address. The email follows ``InvitationCreateRequest.email``'s rules
+    exactly (stripped, capitalization kept); an empty or blank string is
+    refused, not taken as "no email". The org, the target, the role (always
+    org_admin) and the language come from the path, the contract and the
+    session: unknown fields are refused. Validation errors never repeat the
+    input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    email: str | None = Field(default=None, min_length=3, max_length=254)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _strip_email(cls, value: object) -> object:
+        """Strip surrounding whitespace before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("email")
+    @classmethod
+    def _check_email(cls, value: str | None) -> str | None:
+        """The invitation email rules; the messages never include the address."""
+        return None if value is None else _check_invite_email(value)
 
 
 # ---------------------------------------------------------------------------

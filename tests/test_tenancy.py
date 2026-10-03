@@ -302,6 +302,41 @@ def _platform_org(method: str, suffix: str, json: dict[str, Any] | None = None) 
     return build
 
 
+def _platform_org_user(action: str, target: Callable[[World], str]) -> _Builder:
+    """A Super Admin action on one of org A's accounts, on org A's path (GH-167)."""
+
+    def build(world: World, _caller: Account, _client: TestClient) -> _Request:
+        return _Request("POST", f"/api/platform/orgs/{world.org_a}/users/{target(world)}/{action}")
+
+    return build
+
+
+def _org_a_viewer(world: World) -> str:
+    """Org A's active Viewer (never the org's last Org Admin)."""
+    return str(world.a["viewer"].user_id)
+
+
+def _org_a_deactivated(world: World) -> str:
+    """A fresh deactivated Editor of org A (org A has free seats)."""
+    return _org_a_member(world, status="deactivated")
+
+
+def _platform_reinvite(world: World, _caller: Account, _client: TestClient) -> _Request:
+    """Resend (the empty body) the invitation of a fresh org whose first Org Admin is
+    still invited, so the org has no active Org Admin (GH-167)."""
+    org_id = world.db.add_org(name="Org C of GH-167")
+    invited = world.db.add_account(
+        role="org_admin",
+        org_id=org_id,
+        status="invited",
+        name=None,
+        password_hash=None,
+        email="org-c-first-admin-167@example.ch",
+    )
+    world.db.add_invitation(invited)
+    return _Request("POST", f"/api/platform/orgs/{org_id}/users/{invited}/invitation", {})
+
+
 _TOKEN_163: Final = "invitation-or-reset-token-of-gh163-not-a-real-one-xx"
 
 # Every catalog row: a request that passes request validation for the route
@@ -418,6 +453,19 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ("PATCH", "/api/platform/orgs/{org_id}/residency"): _platform_org(
         "PATCH", "/residency", {"enabled": True}
     ),
+    # GH-167: org A's accounts and metadata; the user actions on org A's accounts.
+    ("GET", "/api/platform/orgs/{org_id}/users"): _platform_org("GET", "/users"),
+    ("GET", "/api/platform/orgs/{org_id}/metadata"): _platform_org("GET", "/metadata"),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/deactivate"): _platform_org_user(
+        "deactivate", _org_a_viewer
+    ),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/reactivate"): _platform_org_user(
+        "reactivate", _org_a_deactivated
+    ),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/password-reset"): _platform_org_user(
+        "password-reset", _org_a_viewer
+    ),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/invitation"): _platform_reinvite,
     ("GET", "/api/platform/diagnostics"): _plain("GET", "/api/platform/diagnostics"),
     ("GET", "/api/platform/settings"): _plain("GET", "/api/platform/settings"),
     ("PATCH", "/api/platform/settings"): _plain(
@@ -443,6 +491,8 @@ _BODY_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("PATCH", "/api/platform/orgs/{org_id}/limits"),
         ("PATCH", "/api/platform/orgs/{org_id}/residency"),
         ("PATCH", "/api/platform/settings"),
+        # GH-167: the optional re-invite body (no body, {} or {"email": ...}).
+        ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/invitation"),
     }
 )
 
@@ -841,8 +891,14 @@ class TestProjectRoles:
 
 _CONTENT_FIELD: Final = re.compile(r"(?:^|_)(?:title|name|content|file_?name)s?(?:$|_)")
 # (model, field) pairs allowed on platform responses: the org name and user
-# account metadata (#139 §5). Each entry must actually be encountered.
-_PLATFORM_FIELD_ALLOWLIST: Final[frozenset[tuple[str, str]]] = frozenset({("OrgSummary", "name")})
+# account metadata (#139 §5): a user's name in the Super Admin's users list
+# (GH-167). Each entry must actually be encountered.
+_PLATFORM_FIELD_ALLOWLIST: Final[frozenset[tuple[str, str]]] = frozenset(
+    {("OrgSummary", "name"), ("PlatformUserSummary", "name")}
+)
+# Platform routes that answer an empty body (no response model): a 204, or the
+# 202 of a Super Admin-triggered password reset (GH-167).
+_EMPTY_BODY_STATUSES: Final = frozenset({202, 204})
 
 
 class TestOperatorBlindness:
@@ -866,14 +922,15 @@ class TestOperatorBlindness:
 
     def test_tenancy_platform_responses_have_no_content_fields(self, app: FastAPI) -> None:
         """Platform response models (walked through nested models, lists and unions)
-        have no title/name/content/file name field except the allowlisted org name."""
+        have no title/name/content/file name field except the allowlisted org name and
+        user name (account metadata); a route without a model answers 202 or 204."""
         roots: list[type[BaseModel]] = []
         undeclared: list[str] = []
         for (method, path), route in _api_routes(app).items():
             if not path.startswith("/api/platform/"):
                 continue
             models = _models_in(route.response_model)
-            if not models and route.status_code != 204:
+            if not models and route.status_code not in _EMPTY_BODY_STATUSES:
                 undeclared.append(f"{method} {path}")
             roots.extend(models)
         tree = _model_tree(roots)

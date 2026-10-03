@@ -224,6 +224,9 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
   future Org Admin sets their name and password and is logged in as the organization's Org
   Admin. They can then invite everyone else.
 - An address that already has an account is refused, and nothing is created.
+- With SMTP configured, if the link expires or went to the wrong address, the Super Admin
+  can send the invitation again, or to another address, until the organization has an
+  active Org Admin (see [Organizations](configuration.md#organizations-super-admin)).
 
 ## 7. Your first chat
 

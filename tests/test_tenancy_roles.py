@@ -11,7 +11,9 @@ and one prepared request per route (``_SETUPS``, keyed by (method, path)):
 whatever the request needs exists in the caller's org (a pending invitation,
 a second member, a fresh active or deactivated member to manage (GH-164), a
 second session, a pending confirmation or promotion, an OAuth connection, a
-target org for the platform routes).
+target org for the platform routes, a fresh active or deactivated user of org
+B for the Super Admin's user actions and an org whose first Org Admin is still
+invited for the re-invite (GH-167)).
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -131,6 +133,8 @@ _TARGET_EMAIL: Final = "roles-target-163@example.ch"
 _MANAGED_EMAIL: Final = "roles-managed-164@example.ch"
 _NEW_ORG_ADMIN_EMAIL: Final = "roles-new-admin-163@example.ch"
 _REFRESH_TOKEN: Final = "fake-refresh-token-gh163"
+_PLATFORM_TARGET_EMAIL: Final = "roles-platform-target-167@example.ch"
+_FIRST_ADMIN_EMAIL: Final = "roles-first-admin-167@example.ch"
 
 
 @dataclass(frozen=True)
@@ -307,6 +311,40 @@ def _org_b_in(status: str, method: str, suffix: str) -> Callable[[World, Account
     return prepare
 
 
+def _org_b_user(action: str, *, status: str = "active") -> Callable[[World, Account], _Request]:
+    """A Super Admin user action (GH-167) on a fresh Editor of org B in ``status``.
+
+    An active one has a live session (a refused deactivation must leave it); a
+    deactivated one has none. Org B keeps free seats and its own Org Admin.
+    """
+
+    def prepare(world: World, _caller: Account) -> _Request:
+        target = world.db.add_account(
+            role="editor", org_id=world.org_b, status=status, email=_PLATFORM_TARGET_EMAIL
+        )
+        if status == "active":
+            world.db.open_session(target)
+        return _Request("POST", f"/api/platform/orgs/{world.org_b}/users/{target}/{action}")
+
+    return prepare
+
+
+def _reinvite_first_org_admin(world: World, _caller: Account) -> _Request:
+    """A fresh active org whose first Org Admin is still invited (so it has no active
+    Org Admin): resend that invitation, with no request body (GH-167)."""
+    org_id = world.db.add_org(name="Rollen Einladung AG")
+    invited = world.db.add_account(
+        role="org_admin",
+        org_id=org_id,
+        status="invited",
+        name=None,
+        password_hash=None,
+        email=_FIRST_ADMIN_EMAIL,
+    )
+    world.db.add_invitation(invited)
+    return _Request("POST", f"/api/platform/orgs/{org_id}/users/{invited}/invitation")
+
+
 _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     # --- own account ---
     ("POST", "/api/auth/logout"): _Setup(_plain("POST", "/api/auth/logout"), 204),
@@ -426,6 +464,21 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     ),
     ("PATCH", "/api/platform/orgs/{org_id}/residency"): _Setup(
         _org_b("PATCH", "residency", json={"enabled": True}), 200
+    ),
+    # GH-167: org B's accounts and metadata; the user actions on a user of org B.
+    ("GET", "/api/platform/orgs/{org_id}/users"): _Setup(_org_b("GET", "users"), 200),
+    ("GET", "/api/platform/orgs/{org_id}/metadata"): _Setup(_org_b("GET", "metadata"), 200),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/deactivate"): _Setup(
+        _org_b_user("deactivate"), 200
+    ),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/reactivate"): _Setup(
+        _org_b_user("reactivate", status="deactivated"), 200
+    ),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/password-reset"): _Setup(
+        _org_b_user("password-reset"), 202
+    ),
+    ("POST", "/api/platform/orgs/{org_id}/users/{user_id}/invitation"): _Setup(
+        _reinvite_first_org_admin, 200
     ),
     ("GET", "/api/platform/diagnostics"): _Setup(_plain("GET", "/api/platform/diagnostics"), 200),
     ("GET", "/api/platform/settings"): _Setup(_plain("GET", "/api/platform/settings"), 200),
@@ -601,7 +654,7 @@ class TestRoleCaseCoverage:
 
     def test_tenancy_roles_success_statuses_are_documented_ones(self) -> None:
         """Every setup expects a success status: 200, 201, 202 (an admin-triggered
-        password reset, GH-164) or 204."""
+        password reset, GH-164 and GH-167) or 204."""
         assert {
             key: setup.status
             for key, setup in _SETUPS.items()

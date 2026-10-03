@@ -21,6 +21,9 @@ Inputs: a ``FakeDb``. Outputs:
 Adding a route: give it a ``RouteSpec`` row in ``ROUTES`` and its cases in the
 suite. The completeness tests in tests/test_tenancy.py fail for a registered
 route without a row, and for a capability that is neither routed nor pending.
+GH-167's two capabilities (``platform.org_metadata.view``,
+``platform.users.manage``) are named by value through ``_capability`` so the
+catalog imports before access.py defines them (see its docstring).
 
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
@@ -32,7 +35,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal
+from typing import TYPE_CHECKING, Final, Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
@@ -227,6 +230,27 @@ _OA_ED: Final[frozenset[Role]] = frozenset({"org_admin", "editor"})
 _MEMBERS: Final[frozenset[Role]] = frozenset({"org_admin", "editor", "viewer"})
 _ALL: Final[frozenset[Role]] = frozenset(ROLES)
 
+
+def _capability(value: str) -> Capability:
+    """The Capability member with ``value``, or the bare value while access.py lacks it.
+
+    A StrEnum member equals and hashes as its value, so every lookup by member
+    (``ROLE_MATRIX[Capability.X]``, ``capability in routed``) works either way.
+    Until the member exists, the completeness tests (``ROLE_MATRIX`` against
+    ``Capability``) fail on the unknown value instead of the whole suite
+    failing to import.
+    """
+    try:
+        return Capability(value)
+    except ValueError:
+        return cast("Capability", value)
+
+
+# GH-167: an org's users list and metadata; deactivate, reactivate, password
+# reset and re-invite of an org's users.
+_PLATFORM_ORG_METADATA_VIEW: Final = _capability("platform.org_metadata.view")
+_PLATFORM_USERS_MANAGE: Final = _capability("platform.users.manage")
+
 ROLE_MATRIX: Final[MappingProxyType[Capability, frozenset[Role]]] = MappingProxyType(
     {
         # Create orgs; set plan limits; deactivate, delete; residency policy
@@ -242,6 +266,9 @@ ROLE_MATRIX: Final[MappingProxyType[Capability, frozenset[Role]]] = MappingProxy
         Capability.AUDIT_VIEW_PLATFORM: _SA,
         # Platform diagnostics (GH-158): provider, model, reachability
         Capability.PLATFORM_DIAGNOSTICS_VIEW: _SA,
+        # Super Admin user administration and org metadata (GH-167)
+        _PLATFORM_ORG_METADATA_VIEW: _SA,
+        _PLATFORM_USERS_MANAGE: _SA,
         # Manage users and invitations in own org
         Capability.ORG_USERS_VIEW: _OA,
         Capability.ORG_USERS_INVITE: _OA,
@@ -526,6 +553,49 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         "/api/platform/orgs/{org_id}/residency",
         "platform",
         Capability.ORG_RESIDENCY_MANAGE,
+        "none",
+    ),
+    # GH-167: an org's accounts and metadata, and the Super Admin's user actions.
+    RouteSpec(
+        "GET",
+        "/api/platform/orgs/{org_id}/users",
+        "platform",
+        _PLATFORM_ORG_METADATA_VIEW,
+        "none",
+    ),
+    RouteSpec(
+        "GET",
+        "/api/platform/orgs/{org_id}/metadata",
+        "platform",
+        _PLATFORM_ORG_METADATA_VIEW,
+        "none",
+    ),
+    RouteSpec(
+        "POST",
+        "/api/platform/orgs/{org_id}/users/{user_id}/deactivate",
+        "platform",
+        _PLATFORM_USERS_MANAGE,
+        "none",
+    ),
+    RouteSpec(
+        "POST",
+        "/api/platform/orgs/{org_id}/users/{user_id}/reactivate",
+        "platform",
+        _PLATFORM_USERS_MANAGE,
+        "none",
+    ),
+    RouteSpec(
+        "POST",
+        "/api/platform/orgs/{org_id}/users/{user_id}/password-reset",
+        "platform",
+        _PLATFORM_USERS_MANAGE,
+        "none",
+    ),
+    RouteSpec(
+        "POST",
+        "/api/platform/orgs/{org_id}/users/{user_id}/invitation",
+        "platform",
+        _PLATFORM_USERS_MANAGE,
         "none",
     ),
     RouteSpec(

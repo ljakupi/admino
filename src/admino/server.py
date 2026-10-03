@@ -51,6 +51,19 @@ Routes:
   org stays deactivated); audited.
 - PATCH /api/platform/orgs/{org_id}/residency — Sets an org's data residency
   policy; audited in the org's own log.
+- GET  /api/platform/orgs/{org_id}/users — An org's active, deactivated and
+  invited accounts (Super Admin).
+- GET  /api/platform/orgs/{org_id}/metadata — An org's seat usage, storage
+  used and chat and file counts (Super Admin).
+- POST /api/platform/orgs/{org_id}/users/{user_id}/deactivate, .../reactivate
+  — Deactivates (ending every session of the user) or reactivates a user of
+  the org (Super Admin); audited in the org's own log.
+- POST /api/platform/orgs/{org_id}/users/{user_id}/password-reset — Emails a
+  user of the org a password reset link (Super Admin); audited in the org's
+  own log.
+- POST /api/platform/orgs/{org_id}/users/{user_id}/invitation — Resends or
+  replaces the invitation of an org's invited Org Admin while the org has no
+  active one (Super Admin); audited in the org's own log.
 - GET  /api/platform/diagnostics — The database status, the active LLM provider
   and model, and whether the LLM looks reachable (Super Admin).
 - POST /api/message       — Send a user message; returns ChatResponse.
@@ -170,6 +183,25 @@ Security notes:
   nothing written. Each route spends a per-user bucket before any database
   work (deactivate/reactivate share one, as do schedule/cancel), and the org
   name, the admin email, the token and the link are never logged.
+- Platform user administration (GH-167, ``admino.platform_users``): only a
+  Super Admin reaches it, through ``access.can`` in the service
+  (``platform.org_metadata.view`` for the users list and the metadata,
+  ``platform.users.manage`` for the four actions); every member role gets
+  403 before any query. Each route spends a per-user bucket first
+  (deactivate/reactivate share one). The path's org scopes the user:
+  another org's user, an unknown id, a deleted account and a Super Admin
+  (the caller included) are the same 404. The reads are account metadata,
+  counts and sizes only, and write and audit nothing. Every action is
+  audited in the affected org's log (actor kind ``super_admin``); a failed
+  audit write is a 500 with nothing changed. The last-admin guard applies
+  (409 ``last_admin``). Reset and invitation links are built from
+  ``server.public_url`` only and travel in the email only: no response
+  carries a token or a link, and no route sets a password, changes an
+  existing user's email or acts as another user. A re-invite with an email
+  replaces only an invited account (in the caller's session language); it
+  checks the refused-send budget above before any database work (429 once
+  spent), and its ``email_taken`` or ``seat_limit`` refusal spends one token.
+  No cookie is set or cleared, and no name, email, token or link is logged.
 - Settings scopes (GH-159, ``admino.scoped_settings``): each route spends a
   per-user bucket, then checks its capability before any database work or
   provider probe: ``account.manage`` for /api/me/settings and its reset (the
@@ -332,7 +364,7 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Path, Query, Request, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -354,6 +386,7 @@ from admino import (
     organizations,
     password_reset,
     passwords,
+    platform_users,
     scoped_settings,
     session_management,
     sessions,
@@ -387,6 +420,7 @@ from admino.models import (
     OrgCreateResponse,
     OrgLimitsPatch,
     OrgListResponse,
+    OrgMetadata,
     OrgResidencyPatch,
     OrgSettingsPatch,
     OrgSettingsResponse,
@@ -403,8 +437,11 @@ from admino.models import (
     PermissionsResponse,
     PermissionsSummaryResponse,
     PlatformDiagnosticsResponse,
+    PlatformReinviteRequest,
     PlatformSettingsPatch,
     PlatformSettingsResponse,
+    PlatformUserListResponse,
+    PlatformUserSummary,
     SessionListResponse,
     SettingsLLM,
     SSEEvent,
@@ -774,8 +811,9 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/org/invitations/resend": (0.2, 5),
     "/api/auth/invitations/get": (1.0, 10),
     "/api/auth/invitations/accept": (0.2, 5),
-    # Refused invitation sends (email taken, no free seat) and refused email
-    # changes (email taken, GH-164), per user and shared by both: a burst of 5,
+    # Refused invitation sends (email taken, no free seat), refused email
+    # changes (email taken, GH-164) and refused re-invite replacements (email
+    # taken, no free seat, GH-167), per user and shared by all: a burst of 5,
     # then one a minute, so probing whether an email exists on the platform
     # stays slow.
     "/api/org/invitations/refused": (1 / 60, 5),
@@ -788,6 +826,15 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/platform/orgs/status": (0.5, 5),
     "/api/platform/orgs/deletion": (0.2, 5),
     "/api/platform/orgs/residency": (0.5, 5),
+    # Super Admin user administration and org metadata (GH-167), per Super
+    # Admin. Deactivating and reactivating share one bucket; one reset email
+    # per minute after a burst of 3. A re-invite with an email also checks and
+    # spends the refused budget above.
+    "/api/platform/orgs/users/get": (1.0, 10),
+    "/api/platform/orgs/metadata/get": (1.0, 10),
+    "/api/platform/orgs/users/status": (0.5, 5),
+    "/api/platform/orgs/users/password-reset": (1 / 60, 3),
+    "/api/platform/orgs/users/invitation": (0.2, 5),
     # GH-158: the public health check, per IP. Generous: the PWA polls it every
     # 10 seconds per tab and the container healthcheck hits it too.
     "/health": (5.0, 30),
@@ -807,8 +854,9 @@ _MAX_RATE_BUCKETS: int = 10_000
 _rate_buckets: OrderedDict[tuple[str, str], _TokenBucket] = OrderedDict()
 # The route key of the per-IP budget for cookies that resolve to no session.
 _SESSION_FAILURE_ROUTE: Final = "/api/auth/session"
-# The route key of the per-user budget for refused invitation sends and refused
-# email changes (one "does this email exist" budget).
+# The route key of the per-user budget for refused invitation sends, refused
+# email changes and refused re-invite replacements (one "does this email exist"
+# budget).
 _INVITE_REFUSED_ROUTE: Final = "/api/org/invitations/refused"
 
 
@@ -2912,6 +2960,341 @@ async def patch_platform_org_residency(
     )
 
 
+# ---------------------------------------------------------------------------
+# Platform user administration route handlers (GH-167), Super Admin only
+# ---------------------------------------------------------------------------
+
+_HAS_ACTIVE_ADMIN_BODY: Final = {
+    "detail": platform_users.HAS_ACTIVE_ADMIN_MESSAGE,
+    "reason": "has_active_admin",
+}
+
+
+async def _platform_user_change[T](
+    change: Awaitable[T], *, refused_caller: str | None = None
+) -> T | JSONResponse:
+    """Await one ``platform_users`` action and map its refusals to responses.
+
+    Audit failures propagate (a 500 with nothing changed).
+
+    Args:
+        change: The action.
+        refused_caller: The caller whose refused budget an ``email_taken`` or
+            ``seat_limit`` refusal spends one token of (a re-invite with an
+            email); None spends nothing.
+
+    Returns:
+        What the action returned, or a 409 ``{"detail", "reason"}``:
+        ``last_admin`` when it would leave the org without an active Org
+        Admin, ``invalid_status`` when the user's or the org's status doesn't
+        allow it, ``seat_limit`` when the org has no free seat,
+        ``email_taken`` when a user with the replacement email exists anywhere
+        on the platform, ``has_active_admin`` when a re-invite finds an active
+        Org Admin.
+
+    Raises:
+        HTTPException: 403 without the action's capability; 404 for an unknown
+            org, or when the user isn't a non-deleted account of the path's org
+            (one body for an unknown id, another org's user, a deleted account
+            and a Super Admin).
+    """
+    try:
+        return await change
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except organizations.OrgNotFoundError:
+        raise HTTPException(status_code=404, detail=organizations.ORG_NOT_FOUND_MESSAGE) from None
+    except accounts.UserNotInOrgError:
+        raise HTTPException(status_code=404, detail=org_users.USER_NOT_FOUND_MESSAGE) from None
+    except accounts.LastAdminError as exc:
+        return JSONResponse(status_code=409, content={"detail": str(exc), "reason": "last_admin"})
+    except org_users.InvalidUserStatusError:
+        return JSONResponse(status_code=409, content=_INVALID_USER_STATUS_BODY)
+    except organizations.InvalidOrgStatusError:
+        return JSONResponse(status_code=409, content=_INVALID_ORG_STATUS_BODY)
+    except platform_users.OrgHasActiveAdminError:
+        return JSONResponse(status_code=409, content=_HAS_ACTIVE_ADMIN_BODY)
+    except (invitations.SeatLimitError, accounts.DuplicateEmailError) as exc:
+        if refused_caller is not None:
+            _spend_budget(_INVITE_REFUSED_ROUTE, refused_caller)
+        if isinstance(exc, accounts.DuplicateEmailError):
+            return JSONResponse(status_code=409, content=_EMAIL_TAKEN_BODY)
+        return JSONResponse(status_code=409, content=_SEAT_LIMIT_BODY)
+
+
+async def get_platform_org_users(
+    principal: _PrincipalDep, org_id: UUID
+) -> PlatformUserListResponse:
+    """Handle GET /api/platform/orgs/{org_id}/users — an org's accounts.
+
+    Read-only: nothing is written or audited.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization, in any status (a UUID; anything else is a 422).
+
+    Returns:
+        PlatformUserListResponse: the org's active, deactivated and invited
+        accounts, oldest first (each one's id, name, email, role, status,
+        created date and last login); account metadata only.
+
+    Raises:
+        HTTPException: 403 without ``Capability.PLATFORM_ORG_METADATA_VIEW``;
+            404 for an unknown org; 429 when rate-limited.
+    """
+    _check_rate_limit("/api/platform/orgs/users/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        users = await platform_users.list_users(get_pool(), actor=principal, org_id=org_id)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except organizations.OrgNotFoundError:
+        raise HTTPException(status_code=404, detail=organizations.ORG_NOT_FOUND_MESSAGE) from None
+    return PlatformUserListResponse(users=users)
+
+
+async def get_platform_org_metadata(principal: _PrincipalDep, org_id: UUID) -> OrgMetadata:
+    """Handle GET /api/platform/orgs/{org_id}/metadata — an org's seats and counts.
+
+    Read-only: nothing is written or audited.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+        org_id: The organization, in any status (a UUID; anything else is a 422).
+
+    Returns:
+        OrgMetadata: the seats used (active and invited users) and the limit,
+        the storage used and the chat and file counts (0 until chats and
+        attachments exist); counts and sizes only.
+
+    Raises:
+        HTTPException: 403 without ``Capability.PLATFORM_ORG_METADATA_VIEW``;
+            404 for an unknown org; 429 when rate-limited.
+    """
+    _check_rate_limit("/api/platform/orgs/metadata/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    try:
+        return await platform_users.org_metadata(get_pool(), actor=principal, org_id=org_id)
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Forbidden") from None
+    except organizations.OrgNotFoundError:
+        raise HTTPException(status_code=404, detail=organizations.ORG_NOT_FOUND_MESSAGE) from None
+
+
+async def post_platform_org_user_deactivate(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+    user_id: UUID,
+) -> PlatformUserSummary | JSONResponse:
+    """Handle POST /api/platform/orgs/{org_id}/users/{user_id}/deactivate — deactivate a user.
+
+    Works in any org status. Every session of the user ends at once and they
+    are emailed; their connections, notes and settings are kept. Recorded in
+    the org's own log.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The user's organization (a UUID; anything else is a 422).
+        user_id: The user to deactivate (a UUID; anything else is a 422).
+
+    Returns:
+        The user's PlatformUserSummary (status "deactivated"), or a 409
+        ``last_admin`` for the org's last active Org Admin, ``invalid_status``
+        when the user is deactivated or invited.
+
+    Raises:
+        HTTPException: 403 without ``Capability.PLATFORM_USERS_MANAGE``; 404
+            for an unknown org or when the user isn't an account of that org
+            (one body); 429 when rate-limited (the bucket it shares with
+            reactivating).
+    """
+    _check_rate_limit("/api/platform/orgs/users/status", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _platform_user_change(
+        platform_users.deactivate_user(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            user_id=user_id,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def post_platform_org_user_reactivate(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+    user_id: UUID,
+) -> PlatformUserSummary | JSONResponse:
+    """Handle POST /api/platform/orgs/{org_id}/users/{user_id}/reactivate — reactivate a user.
+
+    Refused while the org's deletion is pending. Needs a free seat (active and
+    invited users count); the user is emailed a login link built from
+    ``server.public_url`` only. Recorded in the org's own log.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The user's organization (a UUID; anything else is a 422).
+        user_id: The user to reactivate (a UUID; anything else is a 422).
+
+    Returns:
+        The user's PlatformUserSummary (status "active"), or a 409
+        ``invalid_status`` while the org's deletion is pending or when the
+        user is active or invited, ``seat_limit`` when the org has no free
+        seat.
+
+    Raises:
+        HTTPException: 403 without ``Capability.PLATFORM_USERS_MANAGE``; 404
+            for an unknown org or when the user isn't an account of that org
+            (one body); 429 when rate-limited (the bucket it shares with
+            deactivating).
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    _check_rate_limit("/api/platform/orgs/users/status", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    return await _platform_user_change(
+        platform_users.reactivate_user(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            user_id=user_id,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+
+
+async def post_platform_org_user_password_reset(
+    request: Request,
+    principal: _PrincipalDep,
+    org_id: UUID,
+    user_id: UUID,
+) -> Response:
+    """Handle POST /api/platform/orgs/{org_id}/users/{user_id}/password-reset — email a reset link.
+
+    The password reset email of GH-151, its link built from
+    ``server.public_url`` only; the token and the link never reach the Super
+    Admin. Recorded in the org's own log.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (401 without a session).
+        org_id: The user's organization (a UUID; anything else is a 422).
+        user_id: The user who gets the link (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 202 response, or a 409 ``invalid_status`` unless the org and
+        the user are active.
+
+    Raises:
+        HTTPException: 403 without ``Capability.PLATFORM_USERS_MANAGE``; 404
+            for an unknown org or when the user isn't an account of that org
+            (one body); 429 when rate-limited.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    _check_rate_limit("/api/platform/orgs/users/password-reset", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    result = await _platform_user_change(
+        platform_users.trigger_password_reset(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            user_id=user_id,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+        )
+    )
+    if isinstance(result, JSONResponse):
+        return result
+    return Response(status_code=202)
+
+
+async def post_platform_org_user_invitation(
+    request: Request,
+    session: _SessionDep,
+    org_id: UUID,
+    user_id: UUID,
+    body: Annotated[PlatformReinviteRequest | None, Body()] = None,
+) -> InvitationSummary | JSONResponse:
+    """Handle POST /api/platform/orgs/{org_id}/users/{user_id}/invitation — re-invite an Org Admin.
+
+    Only for an invited Org Admin of an active org that has no active Org
+    Admin. Without an email (no body, ``{}`` or ``{"email": null}``) the
+    invitation is sent again with a new link and the old one stops working.
+    With an email the invited account is replaced by a new org_admin
+    invitation to that address, in the caller's session language. Links are
+    built from ``server.public_url`` only; the response carries neither the
+    token nor the link. Recorded in the org's own log.
+
+    Args:
+        request: The incoming request (the client IP for the audit events).
+        session: The resolved session (401 without one).
+        org_id: The organization (a UUID; anything else is a 422).
+        user_id: The invited Org Admin (a UUID; anything else is a 422).
+        body: Validated PlatformReinviteRequest, or None (a resend).
+
+    Returns:
+        The InvitationSummary (the same invitation with its new dates for a
+        resend, the new one for a replacement), or a 409 ``{"detail",
+        "reason"}``: ``invalid_status`` unless the org is active and the user
+        an invited Org Admin with a pending invitation, ``has_active_admin``
+        when the org has an active Org Admin, ``email_taken`` when a user with
+        the email exists anywhere on the platform, ``seat_limit`` when the org
+        has no free seat. ``email_taken`` and ``seat_limit`` change nothing,
+        record only the ``invitation.refuse`` audit event and spend one token
+        of the caller's refused budget (shared with refused invitation sends
+        and email changes).
+
+    Raises:
+        HTTPException: 403 without ``Capability.PLATFORM_USERS_MANAGE``; 404
+            for an unknown org or when the user isn't an account of that org
+            (one body); 429 when rate-limited or, for a body with an email,
+            when the caller has spent their refused budget (checked before any
+            database work).
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    principal = session.principal
+    caller = _user_caller(principal)
+    _check_rate_limit("/api/platform/orgs/users/invitation", caller)
+    email = body.email if body is not None else None
+    if email is not None and _budget_exhausted(_INVITE_REFUSED_ROUTE, caller):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+    from admino.database import get_pool
+
+    return await _platform_user_change(
+        platform_users.reinvite_org_admin(
+            get_pool(),
+            actor=principal,
+            org_id=org_id,
+            user_id=user_id,
+            email=email,
+            language=session.ui_language,
+            public_url=_config.server.public_url,
+            ip=request.client.host if request.client is not None else None,
+        ),
+        # Only a replacement probes an email: a resend never touches the budget.
+        refused_caller=None if email is None else caller,
+    )
+
+
 async def _platform_limits() -> PlatformLimits:
     """The stored platform limits (GH-160), read through the settings cache."""
     from admino.database import get_pool
@@ -4596,6 +4979,29 @@ def create_app(
     app.patch("/api/platform/orgs/{org_id}/residency", response_model=OrgSummary)(
         patch_platform_org_residency
     )
+    app.get("/api/platform/orgs/{org_id}/users", response_model=PlatformUserListResponse)(
+        get_platform_org_users
+    )
+    app.get("/api/platform/orgs/{org_id}/metadata", response_model=OrgMetadata)(
+        get_platform_org_metadata
+    )
+    app.post(
+        "/api/platform/orgs/{org_id}/users/{user_id}/deactivate",
+        response_model=PlatformUserSummary,
+    )(post_platform_org_user_deactivate)
+    app.post(
+        "/api/platform/orgs/{org_id}/users/{user_id}/reactivate",
+        response_model=PlatformUserSummary,
+    )(post_platform_org_user_reactivate)
+    app.post(
+        "/api/platform/orgs/{org_id}/users/{user_id}/password-reset",
+        status_code=202,
+        response_model=None,
+    )(post_platform_org_user_password_reset)
+    app.post(
+        "/api/platform/orgs/{org_id}/users/{user_id}/invitation",
+        response_model=InvitationSummary,
+    )(post_platform_org_user_invitation)
     app.get("/api/platform/diagnostics", response_model=PlatformDiagnosticsResponse)(
         get_platform_diagnostics
     )
