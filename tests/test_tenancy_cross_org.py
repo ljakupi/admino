@@ -23,10 +23,20 @@ Viewer, plus a Super Admin):
 - ``own_user`` routes: only the caller's own data: sessions, settings, the
   account, logout, OAuth connections (and the data residency of the caller's
   own org), the in-memory chat history and the SSE stream.
+- The Super Admin's user routes of GH-167 (deactivate, reactivate, password
+  reset and re-invite under ``/api/platform/orgs/{org_id}/users/{user_id}``):
+  the org in the path scopes the user. Org B's account on org A's path is a
+  404 "User not found" exactly like an unknown id, whatever the account's kind
+  (never a 409 that would tell its state), the id isn't echoed, and nothing
+  changes: no row, session, reset token, invitation, email or audit row. The
+  same request on org B's path succeeds. Org A's users list and metadata hold
+  org A's accounts and seats only.
 
 Completeness: every test registers the routes it covers with ``@covers``. A
 test asserts the covered set equals every ``ROUTES`` row whose isolation isn't
 "none", so a later issue that adds a tenant route must add its case here.
+Platform rows are isolation "none", so the GH-167 cases are tied to the
+registered ``/api/platform/orgs/{org_id}/users/{user_id}/...`` routes instead.
 
 Inputs: the FakeDb world, a stub agent (``agent.run`` is an AsyncMock), fake
 OAuth client credentials and a fresh Fernet key per test.
@@ -50,6 +60,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.fernet import Fernet
+from fastapi.routing import APIRoute
 
 from admino import oauth, org_permissions, server
 from admino.models import LLMMessage, PendingConfirmation, ToolCall
@@ -1598,6 +1609,194 @@ class TestOwnUserChatRoutes:
 
 
 # ---------------------------------------------------------------------------
+# 3b. Platform user routes (GH-167): the org in the path scopes the user
+# ---------------------------------------------------------------------------
+
+# The Super Admin's user actions, each with its success status on the user's own org.
+_PLATFORM_USER_ACTIONS: Final[dict[str, int]] = {
+    "deactivate": 200,
+    "reactivate": 200,
+    "password-reset": 202,
+    "invitation": 200,
+}
+_PLATFORM_USER_PREFIX: Final = "/api/platform/orgs/{org_id}/users/{user_id}"
+_B_FIRST_ADMIN: Final = "b-first-admin-167@example.ch"
+_A_PLATFORM_INVITED: Final = "a-invited-167@example.ch"
+
+
+def _platform_user_action(
+    client: TestClient, caller: Account, org_id: uuid.UUID, user_id: str, action: str
+) -> httpx.Response:
+    """POST /api/platform/orgs/{org_id}/users/{user_id}/{action} as ``caller``, no body
+    (a re-invite without a body resends)."""
+    return client.post(
+        f"/api/platform/orgs/{org_id}/users/{user_id}/{action}", headers=caller.cookie
+    )
+
+
+def _platform_target(world: World, action: str) -> str:
+    """The org B account ``action`` applies to on org B's own path; its id.
+
+    An active Editor (deactivate, password reset; it has a second session and a
+    live reset token), a deactivated Viewer (reactivate), or B's first Org
+    Admin, still invited with a pending invitation, while neither org has an
+    active Org Admin (re-invite: on org A's path a leaked target would be
+    resent, not refused for another reason).
+    """
+    if action == "reactivate":
+        return _deactivated(world, world.org_b, _B_DEACTIVATED)
+    if action == "invitation":
+        for members in (world.a, world.b):
+            world.db.users[members["org_admin"].user_id]["status"] = "deactivated"
+        invited = world.db.add_account(
+            role="org_admin",
+            org_id=world.org_b,
+            status="invited",
+            name=None,
+            password_hash=None,
+            email=_B_FIRST_ADMIN,
+        )
+        world.db.add_invitation(invited)
+        return str(invited)
+    editor = world.b["editor"].user_id
+    world.db.open_session(editor)  # a second device
+    world.db.add_reset_token(editor)
+    return str(editor)
+
+
+_PLATFORM_ACTION_PARAMS: Final = list(_PLATFORM_USER_ACTIONS)
+
+
+class TestPlatformUserRoutes:
+    """The Super Admin on org A's path with org B's accounts: 404, and nothing changes."""
+
+    @pytest.mark.parametrize("kind", _FOREIGN_KINDS)
+    @pytest.mark.parametrize("action", _PLATFORM_ACTION_PARAMS)
+    def test_cross_org_platform_user_action_on_any_kind_of_other_org_account_is_404(
+        self, world: World, client: TestClient, action: str, kind: str
+    ) -> None:
+        """B's last Org Admin, Editor, Viewer, a deactivated user and an invited account are
+        each a 404 "User not found" on org A's path, never a 409 (last_admin,
+        invalid_status, seat_limit, has_active_admin) that would tell the account's
+        state; nothing changes."""
+        target = _foreign_account(world, kind)
+        before = _state(world.db)
+
+        response = _platform_user_action(client, world.super_admin, world.org_a, target, action)
+
+        assert (response.status_code, response.json()) == (404, _USER_NOT_FOUND)
+        assert _state(world.db) == before
+
+    @pytest.mark.parametrize("action", _PLATFORM_ACTION_PARAMS)
+    def test_cross_org_platform_user_action_answers_exactly_like_an_unknown_user(
+        self, world: World, client: TestClient, action: str
+    ) -> None:
+        """No existence leak: org B's account on org A's path and a never-issued id get the
+        same 404 body, and neither the body nor a header repeats B's id."""
+        target = _platform_target(world, action)
+        caller = world.super_admin
+
+        foreign = _platform_user_action(client, caller, world.org_a, target, action)
+        unknown = _platform_user_action(client, caller, world.org_a, str(uuid.uuid4()), action)
+
+        assert (unknown.status_code, unknown.json()) == (404, _USER_NOT_FOUND)
+        assert (foreign.status_code, foreign.json()) == (unknown.status_code, unknown.json())
+        assert target not in foreign.text
+        assert all(target not in value for value in foreign.headers.values())
+
+    @pytest.mark.parametrize("action", _PLATFORM_ACTION_PARAMS)
+    def test_cross_org_platform_user_action_keeps_the_other_orgs_user(
+        self, world: World, client: TestClient, action: str
+    ) -> None:
+        """B's account keeps its row (status, role, email), its sessions, its reset token,
+        its invitation (the link it was sent still works) and the queued emails; no audit
+        row is written, and an active user is still logged in."""
+        target = _platform_target(world, action)
+        user_id = uuid.UUID(target)
+        user_before = copy.deepcopy(world.db.users[user_id])
+        sessions_before = sorted(str(row["session_id"]) for row in world.db.sessions_of(user_id))
+        token_before = copy.deepcopy(world.db.tokens.get(user_id))
+        invitation_before = copy.deepcopy(world.db.invitation_of(user_id))
+        outbox_before = copy.deepcopy(world.db.outbox)
+        audit_before = copy.deepcopy(world.db.audit_rows())
+
+        response = _platform_user_action(client, world.super_admin, world.org_a, target, action)
+
+        assert (response.status_code, response.json()) == (404, _USER_NOT_FOUND)
+        assert world.db.users[user_id] == user_before
+        assert sorted(str(row["session_id"]) for row in world.db.sessions_of(user_id)) == (
+            sessions_before
+        )
+        assert world.db.tokens.get(user_id) == token_before
+        assert world.db.invitation_of(user_id) == invitation_before
+        assert world.db.outbox == outbox_before
+        assert world.db.audit_rows() == audit_before
+        if user_before["status"] == "active":
+            assert len(sessions_before) == 2
+            assert token_before is not None
+            me = client.get("/api/auth/me", headers=world.b["editor"].cookie)
+            assert me.status_code == 200, me.text
+
+    @pytest.mark.parametrize("action", _PLATFORM_ACTION_PARAMS)
+    def test_cross_org_platform_user_action_succeeds_on_the_users_own_org_path(
+        self, world: World, client: TestClient, action: str
+    ) -> None:
+        """Control: after the 404 on org A's path, the same request on org B's path gets the
+        route's success status (the path's org is the boundary, not a broken route)."""
+        target = _platform_target(world, action)
+        caller = world.super_admin
+
+        refused = _platform_user_action(client, caller, world.org_a, target, action)
+        response = _platform_user_action(client, caller, world.org_b, target, action)
+
+        assert (refused.status_code, refused.json()) == (404, _USER_NOT_FOUND)
+        assert response.status_code == _PLATFORM_USER_ACTIONS[action], response.text
+
+    def test_cross_org_platform_users_list_and_metadata_hold_only_the_path_org(
+        self, world: World, client: TestClient
+    ) -> None:
+        """Org A's users list has exactly A's accounts (active, deactivated, invited), no id
+        or email of org B and not the Super Admin; A's seats count A's active and invited
+        accounts against A's limit, whatever org B holds."""
+        world.db.add_org(world.org_a, seats=12)
+        a_off = _a_deactivated(world, client)
+        a_invited = world.db.add_account(
+            role="viewer",
+            org_id=world.org_a,
+            status="invited",
+            name=None,
+            password_hash=None,
+            email=_A_PLATFORM_INVITED,
+        )
+        world.db.add_invitation(a_invited)
+        b_off = _b_deactivated(world, client)
+        b_invited = _b_invited(world)
+        for _ in range(3):
+            world.db.add_account(role="editor", org_id=world.org_b)
+        caller = world.super_admin
+
+        users = client.get(f"/api/platform/orgs/{world.org_a}/users", headers=caller.cookie)
+        metadata = client.get(f"/api/platform/orgs/{world.org_a}/metadata", headers=caller.cookie)
+
+        assert users.status_code == 200, users.text
+        a_ids = {str(account.user_id) for account in world.a.values()} | {a_off, str(a_invited)}
+        assert {entry["id"] for entry in users.json()["users"]} == a_ids
+        others = [
+            b_off,
+            b_invited,
+            _B_DEACTIVATED,
+            _B_INVITED,
+            *(str(account.user_id) for account in world.b.values()),
+            *(account.email for account in world.b.values()),
+            str(caller.user_id),
+            caller.email,
+        ]
+        assert [mark for mark in others if mark in users.text] == []
+        assert metadata.status_code == 200, metadata.text
+        assert metadata.json()["seats"] == {"used": 4, "limit": 12}
+
+
+# ---------------------------------------------------------------------------
 # 4. Completeness: every tenant route has a cross-org case here
 # ---------------------------------------------------------------------------
 
@@ -1642,6 +1841,23 @@ def test_cross_org_coverage_names_real_tests() -> None:
 
     assert named
     assert named <= tests, sorted(named - tests)
+
+
+@pytest.mark.usefixtures("world")
+def test_cross_org_platform_user_cases_cover_every_registered_platform_user_route() -> None:
+    """GH-167: the routes registered under /api/platform/orgs/{org_id}/users/{user_id}/
+    are exactly the four actions TestPlatformUserRoutes covers (platform rows are
+    isolation "none", so the @covers registry doesn't see them)."""
+    registered = {
+        (method, route.path)
+        for route in make_app().routes
+        if isinstance(route, APIRoute) and route.path.startswith(f"{_PLATFORM_USER_PREFIX}/")
+        for method in route.methods
+    }
+
+    assert registered == {
+        ("POST", f"{_PLATFORM_USER_PREFIX}/{action}") for action in _PLATFORM_USER_ACTIONS
+    }
 
 
 _CASE_CLASSES: Final = (

@@ -26,6 +26,12 @@ Security notes:
   (operator blindness: the platform operator doesn't read an org's settings).
   Editing the matrix and the critical permissions stays
   ``org.permissions.manage``, Org Admin only.
+- GH-167: ``platform.org_metadata.view`` (an org's users list and its
+  metadata: seats, storage, chat and file counts) and
+  ``platform.users.manage`` (deactivate, reactivate, password reset and
+  re-invite an org's users) are Super Admin only: no member role, malformed
+  principal or the Operator gets them. They are separate from the Org Admin's
+  ``org.users.*`` capabilities, which the Super Admin still doesn't hold.
 """
 
 from __future__ import annotations
@@ -79,6 +85,9 @@ _EXPECTED_MATRIX: dict[str, frozenset[str]] = {
     "audit.view.platform": _SA_ONLY,
     # Platform diagnostics: LLM provider, model and reachability (GH-158)
     "platform.diagnostics.view": _SA_ONLY,
+    # Super Admin user administration and org metadata (GH-167)
+    "platform.org_metadata.view": _SA_ONLY,
+    "platform.users.manage": _SA_ONLY,
     # Row 5 — Manage users and invitations in own org
     "org.users.view": _ORG_ADMIN_ONLY,
     "org.users.invite": _ORG_ADMIN_ONLY,
@@ -180,6 +189,8 @@ _PLATFORM_CAPABILITIES: tuple[str, ...] = (
     "usage.view.platform",
     "audit.view.platform",
     "platform.diagnostics.view",
+    "platform.org_metadata.view",
+    "platform.users.manage",
 )
 
 # Strings that are not capability values: denied for every role, never raising.
@@ -980,3 +991,99 @@ class TestOperatorConstructionSites:
         """admin_cli.py references Operator; server.py never does (not even an import)."""
         assert _operator_references(_SRC_DIR / "admin_cli.py") != []
         assert _operator_references(_SRC_DIR / "server.py") == []
+
+
+# ---------------------------------------------------------------------------
+# 8. GH-167: Super Admin user administration and org metadata
+# ---------------------------------------------------------------------------
+
+# (member name, value) of the two GH-167 capabilities, from the contract.
+_GH167_CAPABILITIES: tuple[tuple[str, str], ...] = (
+    ("PLATFORM_ORG_METADATA_VIEW", "platform.org_metadata.view"),
+    ("PLATFORM_USERS_MANAGE", "platform.users.manage"),
+)
+_GH167_NAMES: tuple[str, ...] = tuple(name for name, _value in _GH167_CAPABILITIES)
+
+
+def _gh167_capability(name: str) -> Capability:
+    """A GH-167 capability, looked up at call time (new in GH-167)."""
+    capability = getattr(Capability, name, None)
+    assert capability is not None, f"access.Capability must define {name}"
+    return capability
+
+
+class TestPlatformUserAdminCapabilities:
+    """The users list, the org metadata and the user actions are the Super Admin's only."""
+
+    @pytest.mark.parametrize(("name", "value"), _GH167_CAPABILITIES)
+    def test_access_platform_user_admin_capability_has_contract_value(
+        self, name: str, value: str
+    ) -> None:
+        assert _gh167_capability(name).value == value
+
+    @pytest.mark.parametrize("name", _GH167_NAMES)
+    def test_access_platform_user_admin_capability_is_granted_to_super_admin(
+        self, name: str
+    ) -> None:
+        assert can(_super_admin(), _gh167_capability(name)) is True
+
+    @pytest.mark.parametrize("role", _MEMBER_ROLES)
+    @pytest.mark.parametrize("name", _GH167_NAMES)
+    def test_access_platform_user_admin_capability_is_refused_to_member_role(
+        self, name: str, role: str
+    ) -> None:
+        """An Org Admin manages its own org's users through org.users.*, never through the
+        platform capability; Editors and Viewers get neither."""
+        assert can(_principal(role), _gh167_capability(name)) is False
+
+    @pytest.mark.parametrize("name", _GH167_NAMES)
+    def test_access_platform_user_admin_capability_is_held_by_the_super_admin_only(
+        self, name: str
+    ) -> None:
+        capability = _gh167_capability(name)
+
+        assert {role for role in _ROLES if can(_principal(role), capability)} == {_SA}
+
+    @pytest.mark.parametrize("name", _GH167_NAMES)
+    def test_access_platform_user_admin_capability_is_refused_to_the_operator(
+        self, name: str
+    ) -> None:
+        """The admin CLI's Operator is no account: it gets no user administration either."""
+        capability = _gh167_capability(name)
+
+        assert can(_operator_cls()(), capability) is False
+
+    @pytest.mark.parametrize("forged", _FORGED_PRINCIPALS)
+    @pytest.mark.parametrize("name", _GH167_NAMES)
+    def test_access_platform_user_admin_capability_is_refused_to_a_malformed_principal(
+        self, name: str, forged: Callable[[], Any]
+    ) -> None:
+        """A member forged into a Super Admin (or any inconsistent principal) can't
+        administer another org's users."""
+        capability = _gh167_capability(name)
+
+        assert can(forged(), capability) is False
+
+    @pytest.mark.parametrize("name", _GH167_NAMES)
+    def test_access_platform_user_admin_capability_as_plain_string_is_denied(
+        self, name: str
+    ) -> None:
+        """Only the Capability member grants: its plain value gets the Super Admin nothing."""
+        capability = _gh167_capability(name)
+
+        assert can(_super_admin(), capability.value) is False  # type: ignore[arg-type]
+
+    def test_access_platform_user_admin_is_separate_from_org_user_admin(self) -> None:
+        """The Super Admin holds the two platform capabilities and none of the Org Admin's
+        org.users.*; the Org Admin holds org.users.* and neither platform one."""
+        capabilities = (
+            _gh167_capability("PLATFORM_ORG_METADATA_VIEW"),
+            _gh167_capability("PLATFORM_USERS_MANAGE"),
+            Capability.ORG_USERS_VIEW,
+            Capability.ORG_USERS_INVITE,
+            Capability.ORG_USERS_ROLE_CHANGE,
+            Capability.ORG_USERS_MANAGE,
+        )
+
+        assert [can(_super_admin(), c) for c in capabilities] == [True, True] + [False] * 4
+        assert [can(_member(_OA), c) for c in capabilities] == [False, False] + [True] * 4

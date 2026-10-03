@@ -491,6 +491,43 @@ An organization's status can only move this way: active ⇄ deactivated, active 
 deactivated → pending deletion, pending deletion → deactivated (cancelled). Anything else,
 and changing limits or residency while a deletion is pending, answers `409`.
 
+**Users and metadata.** The Super Admin also sees each organization's accounts and usage,
+and can help with an account. These routes are for the Super Admin only too. The two reads
+change nothing and aren't recorded; every action is recorded in the organization's audit
+log, without names or email addresses.
+
+- `GET /api/platform/orgs/{id}/users` lists the organization's active, deactivated and
+  invited accounts, oldest first: name (none yet for an invited account), email address,
+  role, status, when the account was created and when the user last logged in. Account
+  details only, never what the users store.
+- `GET /api/platform/orgs/{id}/metadata` returns the seat usage, `seats: {"used",
+  "limit"}` (counted like an invitation: active users and pending invitations), the storage
+  used in bytes, and the number of chats and files. The last three are `0` until chats and
+  attachments arrive in a later release.
+- `POST /api/platform/orgs/{id}/users/{user_id}/deactivate` ends every session of the user
+  at once and emails them; their connections, notes and settings are kept.
+  `.../reactivate` needs a free seat and emails the user a link to log in; it's refused
+  while the organization's deletion is pending. An organization always keeps at least one
+  active Org Admin, for the Super Admin too: deactivating the last one answers `409` with
+  the reason `last_admin`.
+- `POST /api/platform/orgs/{id}/users/{user_id}/password-reset` sends the user the same
+  email as **Forgot your password?**. The Super Admin never sees the link. The organization
+  and the user must be active.
+- `POST /api/platform/orgs/{id}/users/{user_id}/invitation` re-invites the organization's
+  primary admin: its invited Org Admin, only while the organization is active and has no
+  active Org Admin (say the first invitation expired or went to the wrong address). Without
+  a body, or with `{}`, it sends the invitation again with a new link: the old link stops
+  working and the 72 hours start over. With `{"email": "..."}` it replaces the invited
+  account with a new invitation to that address, in the Super Admin's language. A refusal
+  (`email_taken`, or `seat_limit` without a free seat) keeps the old invitation and counts
+  toward the Super Admin's [refused-send limit](#accounts-and-sessions).
+
+The other `409` reasons are `invalid_status` (the user's or the organization's status
+doesn't allow it) and `has_active_admin` (the organization already has an active Org Admin,
+who handles its invitations). A user of another organization, or a Super Admin, answers
+`404`, like an unknown one. There is no way to set a user's password, read a link or
+token, change an existing user's email address, or act as a user.
+
 ## Email (SMTP)
 
 admino sends transactional email through **one SMTP account for the whole platform**:

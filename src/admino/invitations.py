@@ -13,6 +13,12 @@ own transaction through ``send_first_admin_invitation``: the same rules, on
 the caller's connection, by a Super Admin or the admin CLI's ``Operator``,
 optionally without queueing the email; it hands the one-time accept link back
 to the caller (the CLI shows it on the terminal when there is no SMTP).
+The Super Admin's re-invite of an org's first Org Admin (GH-167,
+``admino.platform_users.reinvite_org_admin``) runs the same steps inside its
+own transaction through the connection-level helpers: ``rotate_invitation``
+(the resend), ``revoke_pending_invitation`` (the revoke) and
+``send_invitation`` (the send, into an org row the caller locked); a refused
+send is recorded with ``record_refusal`` after the rollback.
 
 Inputs: the database pool (or, for ``send_first_admin_invitation``, a
 connection inside the caller's transaction); the acting ``Principal`` (or
@@ -62,7 +68,10 @@ Security notes:
   resending need ``Capability.ORG_USERS_INVITE``, listing
   ``Capability.ORG_USERS_VIEW``, the first Org Admin ``Capability.ORG_CREATE``.
   ``send_first_admin_invitation`` runs inside its caller's transaction and
-  leaves authorization to that caller (``organizations.create_org``). An
+  leaves authorization to that caller (``organizations.create_org``), and so
+  do the connection-level helpers (``send_invitation``,
+  ``rotate_invitation``, ``revoke_pending_invitation``; GH-167's
+  ``platform_users`` checks ``Capability.PLATFORM_USERS_MANAGE``). An
   ``Operator`` is audited as actor kind 'operator', with no user id.
 - Tenant isolation at the data layer: every org statement is scoped by the
   actor's org id. Another org's invitation, an unknown id and an accepted one
@@ -295,7 +304,7 @@ def _params(org_name: str, accept_link: str, expires_at: datetime) -> Invitation
     return InvitationParams(org_name=org_name, accept_link=accept_link, expires_at=expires_at)
 
 
-async def _record_refusal(
+async def record_refusal(
     pool: asyncpg.Pool,
     *,
     actor: Principal,
@@ -306,7 +315,16 @@ async def _record_refusal(
 ) -> None:
     """Record a refused send as ``invitation.refuse``, after its transaction rolled back.
 
-    Content-free: the role and which refusal it was, never the email.
+    Content-free: the role and which refusal it was (``email_taken`` for a
+    ``DuplicateEmailError``, otherwise ``seat_limit``), never the email.
+
+    Args:
+        pool: The database pool (the refused transaction is already gone).
+        actor: Who tried to send the invitation.
+        org_id: The org's log the event belongs to.
+        role: The member role of the refused invitation.
+        error: The refusal: a ``DuplicateEmailError`` or a ``SeatLimitError``.
+        ip: The client address, if known.
 
     Raises:
         AuditRecordError: If the event can't be recorded.
@@ -369,7 +387,7 @@ async def ensure_free_seat(conn: PoolConnectionProxy, org_id: UUID) -> Record:
     return org
 
 
-async def _send(
+async def send_invitation(
     conn: PoolConnectionProxy,
     *,
     org: Record,
@@ -386,11 +404,29 @@ async def _send(
 
     Checks the seats, inserts the invited users row and the invitation, queues
     the email (unless ``queue_email`` is False) and records
-    ``invitation.create`` (see the module docstring).
+    ``invitation.create`` (see the module docstring). The caller has locked the
+    org row (``FOR UPDATE``) and decided the authorization; on a refusal it
+    rolls its transaction back and may record it (``record_refusal``).
+
+    Args:
+        conn: A connection inside the caller's transaction.
+        org: The locked org row (its ``name`` and ``seats``).
+        org_id: The org to invite into.
+        actor: Who invites: a Principal, or the Operator at the terminal.
+        email: The invitee's email.
+        role: The member role the invitee gets.
+        language: The invitee's UI language, used for the email too.
+        public_url: The configured origin the link is built from.
+        ip: The client address, if known.
+        queue_email: Whether to queue the invitation email.
+
+    Returns:
+        The SentInvitation: the InvitationSummary and the one-time accept link.
 
     Raises:
         SeatLimitError: If the org has no free seat (nothing is inserted).
         DuplicateEmailError: If a user with the email already exists.
+        AuditRecordError: If the audit event can't be recorded.
     """
     await _check_free_seat(conn, org=org, org_id=org_id)
     try:
@@ -472,7 +508,7 @@ async def create_invitation(
     _require(actor, Capability.ORG_USERS_INVITE)
     try:
         async with pool.acquire() as conn, conn.transaction():
-            sent = await _send(
+            sent = await send_invitation(
                 conn,
                 org=await _lock_org(conn, actor.org_id),
                 org_id=actor.org_id,
@@ -485,7 +521,7 @@ async def create_invitation(
                 queue_email=True,
             )
     except (accounts.DuplicateEmailError, SeatLimitError) as exc:
-        await _record_refusal(pool, actor=actor, org_id=actor.org_id, role=role, error=exc, ip=ip)
+        await record_refusal(pool, actor=actor, org_id=actor.org_id, role=role, error=exc, ip=ip)
         raise
     return sent.summary
 
@@ -535,7 +571,7 @@ async def send_first_admin_invitation(
     org = await _lock_org(conn, org_id)
     if await conn.fetchval(_ORG_HAS_USERS_SQL, org_id):
         raise OrgHasUsersError
-    return await _send(
+    return await send_invitation(
         conn,
         org=org,
         org_id=org_id,
@@ -597,7 +633,7 @@ async def invite_first_org_admin(
                 queue_email=True,
             )
     except (accounts.DuplicateEmailError, SeatLimitError) as exc:
-        await _record_refusal(pool, actor=actor, org_id=org_id, role="org_admin", error=exc, ip=ip)
+        await record_refusal(pool, actor=actor, org_id=org_id, role="org_admin", error=exc, ip=ip)
         raise
     return sent.summary
 
@@ -632,6 +668,49 @@ async def list_invitations(pool: asyncpg.Pool, *, actor: Principal) -> list[Invi
     ]
 
 
+async def revoke_pending_invitation(
+    conn: PoolConnectionProxy,
+    *,
+    actor: Principal,
+    org_id: UUID | None,
+    invitation_id: UUID,
+    ip: str | None,
+) -> None:
+    """Revoke a pending invitation of an org, inside the caller's transaction.
+
+    Deletes the invited users row (the foreign keys cascade to its invitation,
+    queued email, sessions and reset token, which frees the email and the seat)
+    and records ``invitation.revoke`` by ``actor`` in that org's log. The
+    caller decides the authorization.
+
+    Args:
+        conn: A connection inside the caller's transaction.
+        actor: Who revokes it.
+        org_id: The org the invitation must belong to (a bind parameter).
+        invitation_id: The invitation to revoke (expired ones included).
+        ip: The client address, if known.
+
+    Raises:
+        InvitationNotFoundError: If it isn't a pending invitation of the org;
+            nothing is deleted or audited.
+        AuditRecordError: If the audit event can't be recorded.
+    """
+    user_id = await conn.fetchval(_REVOKE_SQL, invitation_id, org_id)
+    if user_id is None:
+        raise InvitationNotFoundError
+    await audit_events.record(
+        conn,
+        action=AuditAction.INVITATION_REVOKE,
+        actor_kind=actor.kind,
+        actor_user_id=actor.user_id,
+        org_id=org_id,
+        target_type=TargetType.INVITATION,
+        target_ids=(invitation_id,),
+        ip=ip,
+        metadata={"user_id": user_id},
+    )
+
+
 async def revoke_invitation(
     pool: asyncpg.Pool, *, actor: Principal, invitation_id: UUID, ip: str | None
 ) -> None:
@@ -653,20 +732,78 @@ async def revoke_invitation(
     """
     _require(actor, Capability.ORG_USERS_INVITE)
     async with pool.acquire() as conn, conn.transaction():
-        user_id = await conn.fetchval(_REVOKE_SQL, invitation_id, actor.org_id)
-        if user_id is None:
-            raise InvitationNotFoundError
-        await audit_events.record(
-            conn,
-            action=AuditAction.INVITATION_REVOKE,
-            actor_kind=actor.kind,
-            actor_user_id=actor.user_id,
-            org_id=actor.org_id,
-            target_type=TargetType.INVITATION,
-            target_ids=(invitation_id,),
-            ip=ip,
-            metadata={"user_id": user_id},
+        await revoke_pending_invitation(
+            conn, actor=actor, org_id=actor.org_id, invitation_id=invitation_id, ip=ip
         )
+
+
+async def rotate_invitation(
+    conn: PoolConnectionProxy,
+    *,
+    actor: Principal,
+    org_id: UUID | None,
+    invitation_id: UUID,
+    public_url: str,
+    ip: str | None,
+) -> InvitationSummary:
+    """Send a pending invitation of an org again with a new link, inside the caller's transaction.
+
+    The token is rotated (the old link stops working), ``sent_at`` becomes now
+    and ``expires_at`` 72 hours later (an expired invitation included; no free
+    seat is needed). The invitation email still queued with the old link is
+    cancelled, a new one is queued and ``invitation.resend`` is recorded by
+    ``actor`` in that org's log. The caller decides the authorization.
+
+    Args:
+        conn: A connection inside the caller's transaction.
+        actor: Who resends it.
+        org_id: The org the invitation must belong to (a bind parameter).
+        invitation_id: The invitation to resend (expired ones included).
+        public_url: The configured origin the link is built from.
+        ip: The client address, if known.
+
+    Returns:
+        The invitation's InvitationSummary with the new dates.
+
+    Raises:
+        InvitationNotFoundError: If it isn't a pending invitation of the org;
+            nothing changes.
+        AuditRecordError: If the audit event can't be recorded.
+    """
+    token = secrets.token_urlsafe(_TOKEN_BYTES)
+    row = await conn.fetchrow(
+        _RESEND_SQL, _hash_token(token), INVITATION_LIFETIME, invitation_id, org_id
+    )
+    if row is None:
+        raise InvitationNotFoundError
+    # The old link no longer works: its still-queued email must not go out.
+    await email_outbox.cancel_pending(
+        conn, user_id=row["user_id"], template=EmailTemplate.INVITATION
+    )
+    await email_outbox.enqueue_email(
+        conn,
+        user_id=row["user_id"],
+        params=_params(row["org_name"], _accept_link(public_url, token), row["expires_at"]),
+    )
+    await audit_events.record(
+        conn,
+        action=AuditAction.INVITATION_RESEND,
+        actor_kind=actor.kind,
+        actor_user_id=actor.user_id,
+        org_id=org_id,
+        target_type=TargetType.INVITATION,
+        target_ids=(row["id"],),
+        ip=ip,
+        metadata={"role": row["role"], "user_id": row["user_id"]},
+    )
+    return InvitationSummary(
+        id=row["id"],
+        email=row["email"],
+        role=row["role"],
+        sent_at=row["sent_at"],
+        expires_at=row["expires_at"],
+        expired=False,
+    )
 
 
 async def resend_invitation(
@@ -701,41 +838,16 @@ async def resend_invitation(
             changes and the old link keeps working.
     """
     _require(actor, Capability.ORG_USERS_INVITE)
-    token = secrets.token_urlsafe(_TOKEN_BYTES)
     async with pool.acquire() as conn, conn.transaction():
-        row = await conn.fetchrow(
-            _RESEND_SQL, _hash_token(token), INVITATION_LIFETIME, invitation_id, actor.org_id
-        )
-        if row is None:
-            raise InvitationNotFoundError
-        # The old link no longer works: its still-queued email must not go out.
-        await email_outbox.cancel_pending(
-            conn, user_id=row["user_id"], template=EmailTemplate.INVITATION
-        )
-        await email_outbox.enqueue_email(
+        summary = await rotate_invitation(
             conn,
-            user_id=row["user_id"],
-            params=_params(row["org_name"], _accept_link(public_url, token), row["expires_at"]),
-        )
-        await audit_events.record(
-            conn,
-            action=AuditAction.INVITATION_RESEND,
-            actor_kind=actor.kind,
-            actor_user_id=actor.user_id,
+            actor=actor,
             org_id=actor.org_id,
-            target_type=TargetType.INVITATION,
-            target_ids=(row["id"],),
+            invitation_id=invitation_id,
+            public_url=public_url,
             ip=ip,
-            metadata={"role": row["role"], "user_id": row["user_id"]},
         )
-    return InvitationSummary(
-        id=row["id"],
-        email=row["email"],
-        role=row["role"],
-        sent_at=row["sent_at"],
-        expires_at=row["expires_at"],
-        expired=False,
-    )
+    return summary
 
 
 async def get_invitation(pool: asyncpg.Pool, token: str) -> InvitationDetails:
