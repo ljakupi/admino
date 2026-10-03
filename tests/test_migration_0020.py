@@ -17,11 +17,12 @@ What these tests pin down:
 - ``email_outbox_template_key_check`` is dropped, then added again with a list
   that is 0006's 7 template keys plus ``email_changed`` (8 keys, each once): the
   content-free notice that goes to a user's old address on an email change.
-- The exact sync of both SQL lists with the live Python catalogs lives here now:
-  the action list equals ``{a.value for a in AuditAction}`` and the template
-  key list equals ``{t.value for t in EmailTemplate}`` (moved from
-  tests/test_migration_0016.py and tests/test_migration_0006.py, which keep
-  subset checks).
+- The exact sync of the template key list with the live Python catalog lives
+  here: it equals ``{t.value for t in EmailTemplate}`` (moved from
+  tests/test_migration_0006.py, which keeps a subset check). The action list's
+  exact sync with ``AuditAction`` moved on to tests/test_migration_0021.py
+  (GH-166's ``password.change``): here 0020's list is a subset of the live
+  catalog and still lists its own 48 actions.
 - Nothing else: only ``audit_events`` and ``email_outbox`` are altered, and only
   those two constraints; no CREATE of any kind (no table, so no new grant is
   owed to the runtime role, see tests/test_migration_0018.py), no other DROP,
@@ -420,16 +421,24 @@ class TestMigration0020ActionCatalog:
         """The literal byte for byte (lowercase, dotted)."""
         assert _NEW_ACTION in _added_actions()
 
-    def test_migration_0020_action_check_matches_audit_action(self) -> None:
-        """The live catalog sync (moved here from test_migration_0016.py): the SQL action
-        list equals AuditAction's values exactly."""
-        assert set(_added_actions()) == _live_actions()
+    def test_migration_0020_action_check_is_still_in_audit_action(self) -> None:
+        """Every action 0020 allows is still an AuditAction (none was dropped).
 
-    def test_migration_0020_live_action_catalog_has_the_contract_size(self) -> None:
+        A shipped migration never changes, so 0020's list stays its 48 actions. The
+        catalog grows by replacing the audit_events_action_check constraint in a later
+        migration (0021 for GH-166's password.change), so the exact sync with the
+        live AuditAction lives in that migration's tests (tests/test_migration_0021.py).
+        """
+        assert set(_added_actions()) <= _live_actions()
+
+    def test_migration_0020_action_check_still_lists_its_own_48_actions(self) -> None:
+        """0020's list is its own 48 actions, whatever the live catalog has grown to."""
+        listed = set(_added_actions())
         live = _live_actions()
 
+        assert len(listed) == _ACTION_CATALOG_SIZE
         assert _NEW_ACTION in live
-        assert len(live) == _ACTION_CATALOG_SIZE
+        assert len(live) >= _ACTION_CATALOG_SIZE
 
 
 # ---------------------------------------------------------------------------

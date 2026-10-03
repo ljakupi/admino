@@ -39,9 +39,11 @@ export function shellRole(me: MeResponse | null | undefined): ShellRole | null {
 
 // Issue #161: the Org Admin edits the permission matrix and critical
 // permissions under Organization (no separate Permissions entry); Editors
-// and Viewers get the read-only Permissions summary instead.
+// and Viewers get the read-only Permissions summary instead. Issue #166: the
+// Super Admin gets Settings too (showing only the account sections); it is
+// still not offered any chat UI, and its landing route stays /platform.
 const AREA_MATRIX: Record<ShellRole, readonly Area[]> = {
-  super_admin: ['platform'],
+  super_admin: ['platform', 'settings'],
   org_admin: ['chat', 'tools', 'organization', 'settings'],
   editor: ['chat', 'tools', 'permissions', 'settings'],
   viewer: ['chat', 'permissions', 'settings'],

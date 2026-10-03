@@ -1,5 +1,7 @@
 /**
- * Auth store (issue #155: auth pages and role-aware app shell).
+ * Auth store (issue #155: auth pages and role-aware app shell; issue #166
+ * adds `applyAccount` and `forgetSession`, and fires the account store's
+ * timezone preset after a login / invitation accept).
  *
  * Owns who is logged in: `me` (the `GET /api/auth/me` payload, or `null`),
  * `loaded`, `role` (`shellRole(me)`, fails closed) and `isAuthenticated`
@@ -14,9 +16,10 @@ import { ApiError } from '@/api/client';
 import { setLocale, t } from '@/i18n';
 import { browserLocale } from '@/services/locale';
 import { shellRole, type ShellRole } from '@/services/access';
+import { useAccountStore } from './account';
 import { useChatStore } from './chat';
 import { useToastStore } from './toasts';
-import type { MeResponse } from '@/api/types';
+import type { MeResponse, MyAccount } from '@/api/types';
 
 export type LoginOutcome = 'ok' | 'invalid' | 'rate_limited' | 'error';
 
@@ -69,6 +72,8 @@ export const useAuthStore = defineStore('auth', () => {
   async function loadMe(): Promise<boolean> {
     try {
       applyProfile(await getMe());
+      // Fire-and-forget: never delays or changes the outcome of this call.
+      void useAccountStore().presetTimezone();
       return true;
     } catch {
       applyLoggedOut();
@@ -89,17 +94,29 @@ export const useAuthStore = defineStore('auth', () => {
     return (await loadMe()) ? 'ok' : 'error';
   }
 
+  /**
+   * Everything `logout()` does once the session is over locally: forgets the
+   * user, clears the chat, resets the account store and returns to the
+   * browser's language — without calling the logout API and without a
+   * session-expired toast (a password change or revoking the current
+   * session already ended the session server-side).
+   */
+  function forgetSession(): void {
+    me.value = null;
+    loaded.value = true;
+    lastUserId.value = null;
+    useChatStore().clearThread();
+    useAccountStore().reset();
+    setLocale(browserLocale());
+  }
+
   async function logout(): Promise<void> {
     try {
       await apiLogout();
     } catch {
       // The session may already be gone server-side — log out locally regardless.
     }
-    me.value = null;
-    loaded.value = true;
-    lastUserId.value = null;
-    useChatStore().clearThread();
-    setLocale(browserLocale());
+    forgetSession();
   }
 
   /** Called by the global 401 handler. The first 401 of a session shows one toast and forgets the user. */
@@ -108,6 +125,13 @@ export const useAuthStore = defineStore('auth', () => {
     useToastStore().add('warning', t('auth.sessionExpired.title'), t('auth.sessionExpired.body'));
     me.value = null;
     return true;
+  }
+
+  /** Signed in: the profile's languages and the UI locale follow the saved account. Logged out: no-op. */
+  function applyAccount(account: MyAccount): void {
+    if (me.value === null) return;
+    me.value = { ...me.value, ui_language: account.ui_language, response_language: account.response_language };
+    setLocale(account.ui_language);
   }
 
   return {
@@ -119,6 +143,8 @@ export const useAuthStore = defineStore('auth', () => {
     login,
     loadMe,
     logout,
+    forgetSession,
     handleUnauthorized,
+    applyAccount,
   };
 });

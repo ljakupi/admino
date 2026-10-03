@@ -1,17 +1,18 @@
 """Content-free, append-only audit event store: action catalog, record(), retention purge (GH-146).
 
-Every security-relevant action (logins and lockouts, password resets, session
-revocations and forced logouts, invitations, role and profile changes,
-activations, sharing changes, deletions and restores, exports, Org Admin access
-to other users' projects, org and platform settings, org tool permissions,
-Super Admin actions, residency policy, break-glass sessions, agent tool calls) is
+Every security-relevant action (logins and lockouts, password resets and
+changes, session revocations and forced logouts, invitations, role and profile
+changes, activations, sharing changes, deletions and restores, exports, Org
+Admin access to other users' projects, org and platform settings, org tool
+permissions, Super Admin actions, residency policy, break-glass sessions, agent
+tool calls) is
 written through ``record()`` as one row of the ``audit_events`` table
 (migration 0005; the action catalog CHECK is replaced by migration 0009 for
 GH-152's session actions, by migration 0010 for GH-153's invitation.resend
 and invitation.refuse, by migration 0016 for GH-161's
 org.permission_change, org.permission_promote, org.permission_promote_cancel
-and org.permission_demote, and by migration 0020 for GH-164's
-user.profile_change).
+and org.permission_demote, by migration 0020 for GH-164's user.profile_change,
+and by migration 0021 for GH-166's password.change).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -92,6 +93,8 @@ class AuditAction(StrEnum):
     # Password resets (action names, not secrets: S105 matches the member names)
     PASSWORD_RESET_REQUEST = "password_reset.request"  # noqa: S105
     PASSWORD_RESET_COMPLETE = "password_reset.complete"  # noqa: S105
+    # A user changing their own password, which ends their sessions (GH-166)
+    PASSWORD_CHANGE = "password.change"  # noqa: S105
     # A user ending one of their sessions; an Org Admin's forced logout (GH-152)
     SESSION_REVOKE = "session.revoke"
     SESSION_FORCE_LOGOUT = "session.force_logout"
@@ -177,6 +180,7 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.LOGIN_LOCKOUT: "any",
         AuditAction.PASSWORD_RESET_REQUEST: "any",
         AuditAction.PASSWORD_RESET_COMPLETE: "any",
+        AuditAction.PASSWORD_CHANGE: "any",
         AuditAction.SESSION_REVOKE: "any",
         AuditAction.SESSION_FORCE_LOGOUT: "org",
         AuditAction.INVITATION_CREATE: "org",

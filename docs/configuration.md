@@ -157,14 +157,17 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 
 | Scope | Who changes it | Route | What it holds |
 | --- | --- | --- | --- |
-| **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows only these. |
+| **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows these next to **My account**. |
 | **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins switch them under **Organization → Services**. The response also carries the organization's data residency policy (`data_residency`, read-only here). |
 | **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. |
 
-- The UI and response languages belong to your account, not to these settings.
+- The UI and response languages, the timezone and the personal instructions belong to your
+  account, not to these settings (see **My account** under
+  [Accounts and sessions](#accounts-and-sessions)).
 - `POST /api/me/settings/reset` resets only your own settings to the defaults: light theme,
-  tool-approval pings on, task-done pings off. Your connected accounts and languages, and the
-  organization and platform settings, stay as they are.
+  tool-approval pings on, task-done pings off. Your connected accounts, your account (name,
+  languages, timezone, personal instructions), and the organization and platform settings,
+  stay as they are.
 - Organization and platform changes are recorded in the audit log: which fields changed,
   a tool's old and new on/off state, and a platform number's old and new value. Model names
   are never recorded.
@@ -239,8 +242,8 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   only stores its SHA-256 hash.
 - **Ending a session** deletes it at once, and its cookie stops working on the next
   request: logging out, ending one of your sessions, an Org Admin's forced logout,
-  deactivating or deleting a user, and a password reset (all three end every session of
-  the account). Sessions that expired or went idle are deleted every hour.
+  deactivating or deleting a user, a password reset, and a password change (all four end
+  every session of the account). Sessions that expired or went idle are deleted every hour.
 - **Your sessions**: `GET /api/me/sessions` lists the sessions you're logged in with (when
   each started and was last used, until when it can last, its IP address and browser, and
   which one is the current one). `DELETE /api/me/sessions/{id}` ends one of them, for
@@ -295,6 +298,37 @@ The request always answers `202` the same way, whether the address exists or not
 nobody can use it to find out which accounts exist. Reset requests and completed resets
 are recorded in the audit log, without the email address. Only a hash of the link's token
 is stored.
+
+**My account.** Every account, the Super Admin's included, manages itself under
+**Settings → My account**. `GET /api/me` reads your account and `PATCH /api/me` changes
+any of its fields; both only ever reach your own account.
+
+- **Profile**: your name. Your email address is shown but can't be changed here: an Org
+  Admin changes it (see **Managing users** below).
+- **UI language** (`ui_language`: German, French or English) applies at once, without
+  reloading the page.
+- **Response language** (`response_language`: German, French, Italian or English) is the
+  language the assistant answers in. `null` means your organization's default.
+- **Timezone** (`timezone`, an IANA name such as `Europe/Zurich`) is preset from your
+  browser at your first login, or set to Europe/Zurich when the browser's zone isn't
+  known. You can change it at any time.
+- **Personal instructions** (`personal_instructions`, up to 1,500 characters, `""` clears
+  them) tell the assistant about you. The hint says what pays off: "Your name and role,
+  your company, the tone you want, how to sign off". admino stores them now; a later
+  release adds them to the assistant's instructions, so its answers fit you.
+- The Super Admin has no chat, so their page has no response language and no personal
+  instructions.
+- **Password**: `POST /api/me/password` with your current password and a new one that
+  follows the password rules above. The change ends every session of your account,
+  including the one you changed it from, so you log in again with the new password. It's
+  recorded in the audit log as `password.change`, with the number of sessions that ended.
+  A wrong current password answers `403` and counts toward the brute-force protection
+  above like a failed login; while the account is locked, even the right one is refused.
+- **Sessions**: the page lists your sessions (browser or agent, IP address, last used)
+  and lets you end any of them, as described under **Your sessions** above.
+
+Changes to your name, languages, timezone and personal instructions aren't recorded in the
+audit log, and their content is never logged.
 
 **Invitations.** An Org Admin invites people into their organization with an email
 address and a role (Org Admin, Editor or Viewer): `POST /api/org/invitations`. The
@@ -385,7 +419,7 @@ What you see depends on your role:
 | Org Admin | Chat, Tools, Organization, Settings |
 | Editor | Chat, Tools, Permissions (read-only), Settings |
 | Viewer | Chat (read-only: projects shared with you, with no message box), Permissions (read-only) and Settings |
-| Super Admin | Platform only (no chat) |
+| Super Admin | Platform, and Settings with only My account and About (no chat) |
 
 The Organization page has two tabs. **Users** lists the organization's users and pending
 invitations, with a search box and a status filter (all, active, deactivated, invited). It

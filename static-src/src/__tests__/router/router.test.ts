@@ -20,7 +20,8 @@
  *   /platform, members → /chat); a logged-in user never sees /login.
  *   Issue #161: an Org Admin pushing /permissions ends on /chat (the matrix
  *   lives under Organization); Editors and Viewers open the read-only
- *   /permissions summary.
+ *   /permissions summary. Issue #166: the Super Admin opens /settings (the
+ *   account sections) but still lands on /platform.
  *
  * `@/api/auth` is mocked (only `getMe` answers); no app or component is
  * mounted. Page components are lazy imports the router resolves on
@@ -257,7 +258,9 @@ describe('router guards per role', () => {
     ['org_admin', '/platform', '/chat'],
     ['super_admin', '/chat', '/platform'],
     ['super_admin', '/', '/platform'],
-    ['super_admin', '/settings', '/platform'],
+    ['super_admin', '/settings', '/settings'],
+    ['super_admin', '/organization', '/platform'],
+    ['super_admin', '/permissions', '/platform'],
     ['super_admin', '/tools', '/platform'],
     ['super_admin', '/platform', '/platform'],
   ] as Array<[Role, string, string]>)('%s pushing %s ends on %s', async (role, target, expected) => {
@@ -276,6 +279,12 @@ describe('router guards per role', () => {
     loggedInAs('super_admin');
 
     expect((await landing('/login')).path).toBe('/platform');
+  });
+
+  it('lets a logged-in Super Admin open /settings (issue #166: the account sections)', async () => {
+    loggedInAs('super_admin');
+
+    expect((await landing('/settings')).path).toBe('/settings');
   });
 
   it('follows a safe ?redirect= when a logged-in editor opens /login', async () => {

@@ -70,6 +70,7 @@ from tests.db_fakes import FakeDb
 from tests.tenancy_world import (
     CLIENT_IP,
     MEMBER_ROLES,
+    NEW_PASSWORD,
     PASSWORD,
     PENDING_CAPABILITIES,
     PROJECT_ROLES,
@@ -340,6 +341,13 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
         "PATCH", "/api/me/settings", {"appearance": {"theme": "dark"}}
     ),
     ("POST", "/api/me/settings/reset"): _plain("POST", "/api/me/settings/reset"),
+    ("GET", "/api/me"): _plain("GET", "/api/me"),
+    ("PATCH", "/api/me"): _plain("PATCH", "/api/me", {"timezone": "Europe/Zurich"}),
+    # A real change (204): it ends the caller's sessions, but every test builds its own
+    # world and sends this request once.
+    ("POST", "/api/me/password"): _plain(
+        "POST", "/api/me/password", {"current_password": PASSWORD, "new_password": NEW_PASSWORD}
+    ),
     # --- org users and invitations ---
     ("GET", "/api/org/users"): _plain("GET", "/api/org/users"),
     ("PATCH", "/api/org/users/{user_id}"): _org_user_patch,
@@ -422,6 +430,8 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
 _BODY_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
     {
         ("PATCH", "/api/me/settings"),
+        ("PATCH", "/api/me"),
+        ("POST", "/api/me/password"),
         ("PATCH", "/api/org/users/{user_id}"),
         ("POST", "/api/org/invitations"),
         ("PATCH", "/api/org/settings"),

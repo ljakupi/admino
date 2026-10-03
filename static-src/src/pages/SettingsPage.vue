@@ -1,12 +1,17 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import {
-  Key, Palette, Bell, Info, TriangleAlert,
+  User, Key, Palette, Bell, Info, TriangleAlert,
   Plus, Github, LogOut,
 } from 'lucide-vue-next';
+import AccountProfileCard from '@/components/AccountProfileCard.vue';
+import AccountPasswordCard from '@/components/AccountPasswordCard.vue';
+import AccountSessionsCard from '@/components/AccountSessionsCard.vue';
 import BaseToggle from '@/components/BaseToggle.vue';
 import ConfirmSheet from '@/components/ConfirmSheet.vue';
+import { defaultSettingsSection, settingsSectionsFor, type SettingsSectionId } from '@/services/settingsSections';
+import { useAccountStore } from '@/stores/account';
 import { useSettingsStore } from '@/stores/settings';
 import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
@@ -18,21 +23,27 @@ const { t } = useI18n();
 const route = useRoute();
 const router = useRouter();
 const settings = useSettingsStore();
+const account = useAccountStore();
 const auth = useAuthStore();
 const chatStore = useChatStore();
 const toasts = useToastStore();
 
 const showResetConfirm = ref(false);
-const activeSection = ref(route.hash === '#danger' ? 'danger' : 'appearance');
+
+// Issue #166: which sections a role may see (the Super Admin only gets
+// My account and About); the hash picks the one that opens first.
+const sections = computed<readonly SettingsSectionId[]>(() => settingsSectionsFor(auth.role));
+const activeSection = ref<SettingsSectionId | null>(defaultSettingsSection(auth.role, route.hash));
 
 // --- Subnav definition ---
-const NAV: {
+const NAV_GROUPS: {
   groupKey: MessageKey;
-  items: { id: string; labelKey: MessageKey; icon: typeof Key; danger?: boolean }[];
+  items: { id: SettingsSectionId; labelKey: MessageKey; icon: typeof Key; danger?: boolean }[];
 }[] = [
   {
     groupKey: 'settings.nav.group.account',
     items: [
+      { id: 'account', labelKey: 'settings.nav.account', icon: User },
       { id: 'session', labelKey: 'settings.nav.session', icon: Key },
     ],
   },
@@ -52,6 +63,13 @@ const NAV: {
   },
 ];
 
+const NAV = computed(() =>
+  NAV_GROUPS.map((group) => ({
+    ...group,
+    items: group.items.filter((item) => sections.value.includes(item.id)),
+  })).filter((group) => group.items.length > 0),
+);
+
 // --- Session section ---
 const draftSessionId = ref('');
 
@@ -60,8 +78,11 @@ function syncDrafts() {
 }
 
 onMounted(async () => {
-  await settings.loadSettings();
-  syncDrafts();
+  void account.load();
+  if (sections.value.includes('session')) {
+    await settings.loadSettings();
+    syncDrafts();
+  }
 });
 
 // --- Notifications ---
@@ -123,6 +144,13 @@ async function handleResetConfirmed() {
         <div v-if="settings.error" class="error-banner">
           {{ t('settings.error.loadBanner', { error: settings.error }) }}
         </div>
+
+        <!-- ── MY ACCOUNT (issue #166) ── -->
+        <template v-if="activeSection === 'account'">
+          <AccountProfileCard />
+          <AccountPasswordCard />
+          <AccountSessionsCard />
+        </template>
 
         <!-- ── SESSION ── -->
         <template v-if="activeSection === 'session'">
@@ -416,191 +444,10 @@ async function handleResetConfirmed() {
   font-size: var(--fs-caption);
 }
 
-/* ── Section header ── */
-.section-head {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.section-title {
-  font-family: var(--font-display);
-  font-weight: var(--fw-bold);
-  font-size: 22px;
-  letter-spacing: -0.015em;
-  color: var(--color-text);
-}
-
-.section-sub {
-  font-size: 13px;
-  color: var(--color-text-muted);
-}
-
-/* ── Setting card ── */
-.s-card {
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border);
-  border-radius: 12px;
-  overflow: hidden;
-}
-
-/* ── Setting row ── */
-.s-row {
-  display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 20px;
-  align-items: center;
-  padding: 18px 20px;
-  border-bottom: 1px solid var(--color-border);
-}
-
-.s-row:last-child {
-  border-bottom: 0;
-}
-
-.s-row.stack {
-  grid-template-columns: 1fr;
-  align-items: stretch;
-  gap: 10px;
-}
-
-.row-label {
-  font-weight: var(--fw-semibold);
-  font-size: 14px;
-  color: var(--color-text);
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.row-hint {
-  font-size: 12.5px;
-  color: var(--color-text-muted);
-  font-weight: var(--fw-regular);
-}
-
-/* ── Inputs ── */
-.s-input {
-  min-height: 38px;
-  padding: 8px 12px;
-  background: var(--color-bg-elevated);
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-input);
-  font: inherit;
-  font-size: 13.5px;
-  color: var(--color-text);
-  transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
-  max-width: 280px;
-  width: 100%;
-}
-
-.s-input:focus {
-  outline: 0;
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px rgba(7, 94, 84, 0.12);
-}
-
-.s-input.mono {
-  font-family: var(--font-mono);
-}
-
-.s-row.stack .s-input {
-  max-width: 100%;
-}
-
-/* ── Buttons ── */
-.s-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 9px 16px;
-  border-radius: var(--radius-input);
-  font: inherit;
-  font-size: 13.5px;
-  font-weight: var(--fw-semibold);
-  border: 1px solid transparent;
-  cursor: pointer;
-  transition: background-color var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
-  white-space: nowrap;
-}
-
-.s-btn.primary {
-  background: var(--color-primary);
-  color: var(--color-text-on-dark);
-  border-color: var(--color-primary);
-}
-
-.s-btn.primary:hover {
-  background: var(--color-primary-hover);
-  border-color: var(--color-primary-hover);
-}
-
-.s-btn.secondary {
-  background: var(--color-bg-elevated);
-  color: var(--color-text);
-  border-color: var(--color-border-strong);
-}
-
-.s-btn.secondary:hover {
-  background: #F5F7F5;
-  border-color: var(--color-text-muted);
-}
-
-.s-btn.danger {
-  background: var(--color-bg-elevated);
-  color: #C73B3B;
-  border-color: #E0C7C7;
-}
-
-.s-btn.danger:hover {
-  background: var(--color-error-soft);
-  border-color: var(--color-error);
-  color: #B82F2F;
-}
-
-.s-btn.small {
-  padding: 6px 12px;
-  font-size: 12.5px;
-}
-
-/* ── Segmented control (new pill style) ── */
-.seg {
-  display: inline-flex;
-  gap: 3px;
-  background: #F5F7F5;
-  padding: 3px;
-  border-radius: var(--radius-input);
-  border: 1px solid var(--color-border);
-}
-
-.seg-btn {
-  padding: 6px 14px;
-  font: inherit;
-  font-size: 13px;
-  font-weight: var(--fw-medium);
-  background: transparent;
-  border: 0;
-  color: #475560;
-  border-radius: 6px;
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
-}
-
-.seg-btn:hover:not(.active):not(:disabled) {
-  color: var(--color-text);
-}
-
-.seg-btn.active {
-  background: var(--color-bg-elevated);
-  color: var(--color-text);
-  box-shadow: 0 1px 2px rgba(17, 27, 33, 0.06);
-}
-
-.seg-btn:disabled {
-  color: #B8C2C8;
-  cursor: not-allowed;
-}
+/* .section-head/.section-title/.section-sub, .s-card, .s-row (+ :last-child,
+   .stack), .row-label/.row-hint, .s-input (+ :focus, .mono), .s-btn (+
+   variants/hover) and .seg/.seg-btn now live in src/styles/global.css —
+   shared by this page and the My account cards (issue #166). */
 
 .soon-badge {
   display: inline-block;

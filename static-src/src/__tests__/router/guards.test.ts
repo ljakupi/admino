@@ -21,7 +21,9 @@
  *      #161: an Org Admin opening /permissions goes home (the matrix lives
  *      under Organization); an Editor or Viewer may open the read-only
  *      /permissions summary but not /organization.
- *   d) Otherwise the navigation proceeds (`true`).
+ *   d) Otherwise the navigation proceeds (`true`). Issue #166: the Super
+ *      Admin may open /settings (the account sections); its home stays
+ *      /platform.
  */
 import { describe, it, expect } from 'vitest';
 import { PUBLIC_PATHS, resolveNavigation, safeRedirect } from '@/router/guards';
@@ -41,7 +43,7 @@ const HOME: Record<ShellRole, string> = {
 };
 
 const ALLOWED: Record<ShellRole, readonly Area[]> = {
-  super_admin: ['platform'],
+  super_admin: ['platform', 'settings'],
   org_admin: ['chat', 'tools', 'organization', 'settings'],
   editor: ['chat', 'tools', 'permissions', 'settings'],
   viewer: ['chat', 'permissions', 'settings'],
@@ -216,7 +218,7 @@ describe('guards resolveNavigation per role', () => {
     ['org_admin', 'permissions', '/chat'],
     ['org_admin', 'platform', '/chat'],
     ['super_admin', 'chat', '/platform'],
-    ['super_admin', 'settings', '/platform'],
+    ['super_admin', 'organization', '/platform'],
     ['super_admin', 'tools', '/platform'],
   ] as Array<[ShellRole, Area, string]>)('sends %s from /%s to %s', (role, area, home) => {
     expect(resolveNavigation(areaTarget(area), role)).toEqual({ path: home });
@@ -228,5 +230,9 @@ describe('guards resolveNavigation per role', () => {
     ['org_admin', 'organization'],
   ] as Array<[ShellRole, Area]>)('lets %s open /%s (issue #161)', (role, area) => {
     expect(resolveNavigation(areaTarget(area), role)).toBe(true);
+  });
+
+  it('lets the Super Admin open /settings (issue #166: the account sections)', () => {
+    expect(resolveNavigation(areaTarget('settings'), 'super_admin')).toBe(true);
   });
 });

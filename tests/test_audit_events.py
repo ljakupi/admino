@@ -1,5 +1,5 @@
 """Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153,
-GH-161, GH-164).
+GH-161, GH-164, GH-166).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
@@ -8,7 +8,8 @@ Super Admin action, residency policy, break-glass sessions, agent tool calls,
 since GH-152 a user revoking one of their sessions and an Org Admin's forced
 logout, since GH-153 an invitation sent again, and since GH-161 an Org Admin
 changing, promoting, demoting or cancelling the promotion of one of the org's
-tool permissions, and since GH-164 an Org Admin changing a user's name or email)
+tool permissions, since GH-164 an Org Admin changing a user's name or email,
+and since GH-166 a user changing their own password)
 is recorded through one
 service function, record(), as a row in the append-only audit_events table
 (migration 0005, tests/test_migration_0005.py).
@@ -51,6 +52,13 @@ What these tests pin down:
   address is taken (``{"email_taken": True}``). The target is the user; the
   name and the email are never in the row: a metadata value that is an email
   address or a name is refused by the existing content validator.
+- GH-166: one more any-scoped action, ``password.change`` (49 in all): a user
+  changed their own password from the account page, which ended their
+  sessions. A member's event carries their org; a Super Admin's has none. The
+  target is the user themself; the metadata is ``{"sessions_revoked": int}``
+  only: the password, the hash and the email are never in the row (free text
+  is refused by the existing content validator). Self-service profile edits
+  (name, languages, timezone, personal instructions) are not audited.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -220,6 +228,8 @@ _ANY_SCOPED: frozenset[str] = frozenset(
         "user.delete",
         # GH-152: a user (member or Super Admin) deletes one of their own sessions.
         "session.revoke",
+        # GH-166: a user changes their own password from the account page.
+        "password.change",
     }
 )
 _CATALOG: frozenset[str] = _ORG_SCOPED | _PLATFORM_SCOPED | _ANY_SCOPED
@@ -235,6 +245,7 @@ _ISSUE_CATEGORIES: list[Any] = [
     pytest.param({"login.success", "login.failure"}, id="logins-success-and-failure"),
     pytest.param({"login.lockout"}, id="lockouts"),
     pytest.param({"password_reset.request", "password_reset.complete"}, id="password-resets"),
+    pytest.param({"password.change"}, id="password-changes"),
     pytest.param(
         {
             "invitation.create",
@@ -660,12 +671,13 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 48 actions of the spec (GH-146's 39, GH-152's
+        """The catalog has exactly the 49 actions of the spec (GH-146's 39, GH-152's
         session.revoke and session.force_logout, GH-153's invitation.resend and
         invitation.refuse, GH-161's four org.permission_* actions, GH-164's
-        user.profile_change): nothing missing, nothing extra."""
+        user.profile_change, GH-166's password.change): nothing missing, nothing
+        extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 48
+        assert len(AuditAction) == 49
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:
@@ -3161,4 +3173,183 @@ class TestUserProfileChangeAction:
 
         _assert_no_content(str(caught.value), "quokka", _ORG, _USER, _MARKER)
         _assert_no_content(repr(caught.value), "quokka", _ORG, _USER, _MARKER)
+        assert caught.value.__cause__ is None
+
+
+# ---------------------------------------------------------------------------
+# GH-166: password.change (a user changes their own password)
+# ---------------------------------------------------------------------------
+
+_PASSWORD_CHANGE = "password.change"
+
+# Content in place of (or next to) the revoked-session count: always refused.
+_PASSWORD_CHANGE_CONTENT_METADATA: list[Any] = [
+    pytest.param({"sessions_revoked": 2, "new_password": "Correct Horse 42"}, id="new-password"),
+    pytest.param({"sessions_revoked": 2, "old_password": "hunter2 hunter2"}, id="old-password"),
+    pytest.param({"password": "Tr0ub4dor&3"}, id="password-key"),
+    pytest.param({"sessions_revoked": "all of them"}, id="count-as-free-text"),
+    pytest.param({"sessions_revoked": 2, "email": "ada@example.ch"}, id="email"),
+    pytest.param({"sessions_revoked": 2, "hash": "$argon2id$v=19$m=65536"}, id="hash"),
+    pytest.param({"sessions_revoked": 2, "name": "Ada Lovelace"}, id="name"),
+]
+
+
+def _password_change() -> AuditAction:
+    """The AuditAction for password.change (raises ValueError until it exists)."""
+    return AuditAction(_PASSWORD_CHANGE)
+
+
+def _password_change_record_kwargs(**overrides: Any) -> dict[str, Any]:
+    """record() keyword arguments for the contract's row: a member changed their password."""
+    kwargs: dict[str, Any] = {
+        "action": _password_change(),
+        "actor_kind": "member",
+        "actor_user_id": _USER,
+        "org_id": _ORG,
+        "target_type": TargetType.USER,
+        "target_ids": [_USER],
+        "ip": _IP,
+        "metadata": {"sessions_revoked": 2},
+    }
+    kwargs.update(overrides)
+    return kwargs
+
+
+class TestPasswordChangeAction:
+    """GH-166's any-scoped password.change and its count-only metadata."""
+
+    def test_audit_events_password_change_member_has_contract_value(self) -> None:
+        """AuditAction.PASSWORD_CHANGE is "password.change"."""
+        member = getattr(AuditAction, "PASSWORD_CHANGE", None)
+
+        assert member is not None, "AuditAction must define PASSWORD_CHANGE"
+        assert member.value == _PASSWORD_CHANGE
+        assert AuditAction(_PASSWORD_CHANGE) is member
+
+    def test_audit_events_password_change_is_any_scoped(self) -> None:
+        """A member's change lands in their org's log; a Super Admin's has no org."""
+        assert ACTION_SCOPES[_password_change()] == "any"
+
+    def test_audit_events_password_change_member_event_carries_the_org(self) -> None:
+        """A member changing their own password: their org, themself as the target."""
+        action = _password_change()
+
+        event = _event(
+            action=action,
+            target_type=TargetType.USER,
+            target_ids=(_USER,),
+            metadata={"sessions_revoked": 2},
+        )
+
+        assert event.action == action
+        assert event.org_id == _ORG
+        assert event.target_ids == (_USER,)
+        assert event.metadata == {"sessions_revoked": 2}
+        assert type(event.metadata["sessions_revoked"]) is int
+
+    def test_audit_events_password_change_super_admin_event_has_no_org(self) -> None:
+        """The Super Admin changing their own password: no org."""
+        action = _password_change()
+
+        event = _event(
+            action=action,
+            actor_kind="super_admin",
+            actor_user_id=_SUPER_ADMIN,
+            org_id=None,
+            target_type=TargetType.USER,
+            target_ids=(_SUPER_ADMIN,),
+            metadata={"sessions_revoked": 1},
+        )
+
+        assert event.org_id is None
+        assert event.actor_kind == "super_admin"
+
+    @pytest.mark.parametrize("count", [0, 1, 2, 37])
+    def test_audit_events_password_change_session_count_is_valid(self, count: int) -> None:
+        """{"sessions_revoked": <int>} validates and stays an int."""
+        action = _password_change()
+
+        event = _event(
+            action=action,
+            target_type=TargetType.USER,
+            target_ids=(_USER,),
+            metadata={"sessions_revoked": count},
+        )
+
+        assert event.metadata == {"sessions_revoked": count}
+        assert type(event.metadata["sessions_revoked"]) is int
+
+    @pytest.mark.parametrize("metadata", _PASSWORD_CHANGE_CONTENT_METADATA)
+    def test_audit_events_password_change_content_metadata_is_refused(
+        self, metadata: dict[str, Any]
+    ) -> None:
+        """A password, a hash, an email, a name or free text as a value is content: refused."""
+        action = _password_change()
+
+        with pytest.raises(ValidationError):
+            _event(
+                action=action, target_type=TargetType.USER, target_ids=(_USER,), metadata=metadata
+            )
+
+    async def test_audit_events_record_password_change_member_is_stored(
+        self, conn: MagicMock
+    ) -> None:
+        """The contract's row: the member as the actor and the target, their org, the
+        client IP and the revoked-session count."""
+        await record(conn, **_password_change_record_kwargs())
+
+        row = _inserted_row(conn)
+        assert row["action"] == _PASSWORD_CHANGE
+        assert row["org_id"] == _ORG
+        assert (row["actor_kind"], row["actor_user_id"]) == ("member", _USER)
+        assert row["target_type"] == "user"
+        assert json.loads(row["target_ids"]) == [str(_USER)]
+        assert str(row["ip"]) == _IP
+        assert json.loads(row["metadata"]) == {"sessions_revoked": 2}
+
+    async def test_audit_events_record_password_change_super_admin_is_stored(
+        self, conn: MagicMock
+    ) -> None:
+        """The Super Admin's row has no org."""
+        kwargs = _password_change_record_kwargs(
+            actor_kind="super_admin",
+            actor_user_id=_SUPER_ADMIN,
+            org_id=None,
+            target_ids=[_SUPER_ADMIN],
+            metadata={"sessions_revoked": 1},
+        )
+
+        await record(conn, **kwargs)
+
+        row = _inserted_row(conn)
+        assert row["action"] == _PASSWORD_CHANGE
+        assert row["org_id"] is None
+        assert (row["actor_kind"], row["actor_user_id"]) == ("super_admin", _SUPER_ADMIN)
+        assert json.loads(row["metadata"]) == {"sessions_revoked": 1}
+
+    @pytest.mark.parametrize("metadata", _PASSWORD_CHANGE_CONTENT_METADATA)
+    async def test_audit_events_record_password_change_content_is_refused(
+        self, conn: MagicMock, metadata: dict[str, Any]
+    ) -> None:
+        """record() refuses content (AuditRecordError) and writes nothing."""
+        kwargs = _password_change_record_kwargs(metadata=metadata)
+
+        with pytest.raises(AuditRecordError):
+            await record(conn, **kwargs)
+
+        conn.execute.assert_not_awaited()
+
+    async def test_audit_events_record_password_change_error_repeats_no_password(
+        self, conn: MagicMock
+    ) -> None:
+        """The refusal carries neither the rejected password nor the IDs."""
+        kwargs = _password_change_record_kwargs(
+            metadata={"sessions_revoked": 2, "new_password": "Quokka Marmalade 7"}
+        )
+
+        with pytest.raises(AuditRecordError) as caught:
+            await record(conn, **kwargs)
+
+        _assert_no_content(str(caught.value), "Quokka", "Marmalade", _ORG, _USER)
+        _assert_no_content(repr(caught.value), "Quokka", "Marmalade", _ORG, _USER)
         assert caught.value.__cause__ is None

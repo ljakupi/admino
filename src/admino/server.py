@@ -18,6 +18,10 @@ Routes:
 - GET  /api/me/sessions   — The caller's live sessions, the current one marked.
 - DELETE /api/me/sessions/{session_id} — Ends one of the caller's sessions
   (clears the cookie when it is the current one); audited.
+- GET/PATCH /api/me       — The caller's own name, languages, timezone and
+  personal instructions (every role).
+- POST /api/me/password   — Changes the caller's own password, ends every
+  session of the caller and clears the cookie; audited.
 - POST /api/org/users/{user_id}/logout — An Org Admin ends every session of a
   user of their org; audited.
 - GET  /api/org/users     — The active and deactivated users of the caller's org.
@@ -106,6 +110,20 @@ Security notes:
   Admin's own org. Another user's session, or a user outside the org, is the
   same 404 as an unknown id. Path ids are typed as UUIDs: anything else is a
   422 that doesn't include the input value.
+- Account self-service (GH-166, ``admino.my_account``): each route spends a
+  per-user bucket, then needs ``Capability.ACCOUNT_MANAGE`` (every role, the
+  Super Admin included) before any database work, and only ever reads or
+  writes the caller's own users row (from the session, never a request
+  value). The patch refuses unknown keys (email, role, org, kind) and a 422
+  never echoes the input. A password change checks the policy first (a 422
+  with its reason, nothing counted), then the current password through
+  ``auth.reauthenticate`` (a wrong one counts in the login throttle like a
+  failed login; a locked account or IP is refused; both are 403
+  "Re-authentication failed.", never 401). It ends every session of the
+  caller (the cookie is cleared) and is audited as ``password.change`` in the
+  same transaction (a failed audit write is a 500 with nothing changed).
+  Profile edits aren't audited. No password, name, email, timezone or
+  instructions is logged.
 - Invitations: sending, revoking and resending need
   ``Capability.ORG_USERS_INVITE``, listing ``Capability.ORG_USERS_VIEW``, and
   every statement is scoped to the Org Admin's own org: another org's
@@ -330,6 +348,7 @@ from admino import (
     auth,
     invitations,
     login_throttle,
+    my_account,
     org_permissions,
     org_users,
     organizations,
@@ -359,6 +378,8 @@ from admino.models import (
     LLMMessage,
     LoginRequest,
     MeResponse,
+    MyAccountPatch,
+    MyAccountResponse,
     OAuthAuthorizeResponse,
     OAuthConnectionStatus,
     OAuthServiceStatus,
@@ -373,6 +394,7 @@ from admino.models import (
     OrgUserListResponse,
     OrgUserPatch,
     OrgUserSummary,
+    PasswordChangeRequest,
     PasswordResetConfirmRequest,
     PasswordResetRequest,
     PendingConfirmation,
@@ -731,6 +753,11 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     # Session management (GH-152), per user.
     "/api/me/sessions/get": (1.0, 10),
     "/api/me/sessions/delete": (0.5, 5),
+    # Account self-service (GH-166), per user. A password change costs a
+    # re-authentication and an Argon2 hash: a burst of 3, then one every 10 seconds.
+    "/api/me/get": (1.0, 10),
+    "/api/me/patch": (0.5, 5),
+    "/api/me/password": (0.1, 3),
     "/api/org/users/logout": (0.5, 5),
     # Org Admin user management (GH-164), per user. Deactivating and
     # reactivating share one bucket; one reset email per minute after a burst of 3.
@@ -1831,6 +1858,121 @@ async def post_org_user_logout(
     except accounts.UserNotInOrgError:
         raise HTTPException(status_code=404, detail="User not found") from None
     return Response(status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Account self-service route handlers (GH-166)
+# ---------------------------------------------------------------------------
+
+
+async def get_my_account(principal: _PrincipalDep) -> MyAccountResponse:
+    """Handle GET /api/me — the caller's own profile, languages, timezone and instructions.
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+
+    Returns:
+        MyAccountResponse read from the caller's own users row.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ACCOUNT_MANAGE`` (both before any database work);
+            404 when the account is deleted or missing.
+    """
+    _check_rate_limit("/api/me/get", _user_caller(principal))
+    _require_capability(principal, Capability.ACCOUNT_MANAGE)
+
+    from admino.database import get_pool
+
+    try:
+        return await my_account.get_account(get_pool(), principal=principal)
+    except my_account.AccountNotFoundError:
+        raise HTTPException(status_code=404, detail=my_account.ACCOUNT_NOT_FOUND_MESSAGE) from None
+
+
+async def patch_my_account(principal: _PrincipalDep, body: MyAccountPatch) -> MyAccountResponse:
+    """Handle PATCH /api/me — change the caller's own name, languages, timezone or instructions.
+
+    Only the given fields change; not audited (the user's own preferences).
+
+    Args:
+        principal: The logged-in principal (401 without a session).
+        body: Validated MyAccountPatch (422 without echo otherwise).
+
+    Returns:
+        MyAccountResponse with the stored values after the change.
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ACCOUNT_MANAGE`` (both before any database work);
+            404 when the account is deleted or missing.
+    """
+    _check_rate_limit("/api/me/patch", _user_caller(principal))
+    _require_capability(principal, Capability.ACCOUNT_MANAGE)
+
+    from admino.database import get_pool
+
+    try:
+        return await my_account.update_account(get_pool(), principal=principal, patch=body)
+    except my_account.AccountNotFoundError:
+        raise HTTPException(status_code=404, detail=my_account.ACCOUNT_NOT_FOUND_MESSAGE) from None
+
+
+async def post_my_password(
+    request: Request, principal: _PrincipalDep, body: PasswordChangeRequest
+) -> Response:
+    """Handle POST /api/me/password — change the caller's own password.
+
+    The new password must pass the policy (checked first), then the current
+    one is re-checked through the login throttle. On success every session of
+    the caller ends, this browser's included (``password.change`` is
+    recorded): answers 204 and clears the session cookie.
+
+    Args:
+        request: The incoming request (the client IP for the throttle and the
+            audit event).
+        principal: The logged-in principal (401 without a session).
+        body: Validated PasswordChangeRequest; both passwords are SecretStr.
+
+    Returns:
+        An empty 204 response that clears the session cookie, or a 422
+        ``{"detail": <policy message>, "reason": <reason>}`` when the password
+        policy refuses the new password (nothing changes).
+
+    Raises:
+        HTTPException: 429 when rate-limited, 403 without
+            ``Capability.ACCOUNT_MANAGE`` (both before any database work);
+            403 "Re-authentication failed." for a wrong current password or a
+            locked account or IP (never 401: the session stays valid); 404
+            when the account is deleted or missing.
+
+    Security notes:
+        The passwords are never logged or echoed. A failed audit write is a
+        500 with the password and the sessions unchanged.
+    """
+    _check_rate_limit("/api/me/password", _user_caller(principal))
+    _require_capability(principal, Capability.ACCOUNT_MANAGE)
+
+    from admino.database import get_pool
+
+    try:
+        await my_account.change_password(
+            get_pool(),
+            principal=principal,
+            current_password=body.current_password.get_secret_value(),
+            new_password=body.new_password.get_secret_value(),
+            ip=request.client.host if request.client is not None else None,
+        )
+    except my_account.AccountNotFoundError:
+        raise HTTPException(status_code=404, detail=my_account.ACCOUNT_NOT_FOUND_MESSAGE) from None
+    except my_account.WrongPasswordError:
+        raise HTTPException(status_code=403, detail=_REAUTH_FAILED_DETAIL) from None
+    except passwords.PasswordPolicyError as exc:
+        return JSONResponse(status_code=422, content={"detail": str(exc), "reason": exc.reason})
+
+    response = Response(status_code=204)
+    _clear_session_cookie(response)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -4404,6 +4546,9 @@ def create_app(
     app.delete("/api/me/sessions/{session_id}", status_code=204, response_model=None)(
         delete_my_session
     )
+    app.get("/api/me", response_model=MyAccountResponse)(get_my_account)
+    app.patch("/api/me", response_model=MyAccountResponse)(patch_my_account)
+    app.post("/api/me/password", status_code=204, response_model=None)(post_my_password)
     app.post("/api/org/users/{user_id}/logout", status_code=204, response_model=None)(
         post_org_user_logout
     )

@@ -11,7 +11,9 @@
  *   Anything else, including prototype keys as role names, is `null`.
  * - `canAccessArea(role, area)` (issue #161 moves the Org Admin's permission
  *   editing under Organization and gives Editors and Viewers the read-only
- *   Permissions summary): Super Admin → Platform only; Org Admin → Chat,
+ *   Permissions summary; issue #166 gives the Super Admin the Settings area,
+ *   showing only the account sections): Super Admin → Platform and
+ *   Settings (still no chat UI); Org Admin → Chat,
  *   Tools, Organization, Settings (no Permissions page); Editor → Chat,
  *   Tools, Permissions, Settings; Viewer → Chat, Permissions, Settings;
  *   `null` → nothing. Unknown areas and unknown roles are always refused
@@ -53,7 +55,7 @@ const ROLES: readonly ShellRole[] = ['super_admin', 'org_admin', 'editor', 'view
 const AREAS: readonly Area[] = ['chat', 'tools', 'permissions', 'organization', 'settings', 'platform'];
 
 const ALLOWED: Record<ShellRole, readonly Area[]> = {
-  super_admin: ['platform'],
+  super_admin: ['platform', 'settings'],
   org_admin: ['chat', 'tools', 'organization', 'settings'],
   editor: ['chat', 'tools', 'permissions', 'settings'],
   viewer: ['chat', 'permissions', 'settings'],
@@ -139,9 +141,9 @@ describe('access canAccessArea', () => {
     expect(canAccessArea(null, area)).toBe(false);
   });
 
-  it('gives each role exactly its issue #161 areas', () => {
+  it('gives each role exactly its issue #161 / #166 areas', () => {
     expect(Object.fromEntries(ROLES.map((role) => [role, AREAS.filter((area) => canAccessArea(role, area))]))).toEqual({
-      super_admin: ['platform'],
+      super_admin: ['settings', 'platform'],
       org_admin: ['chat', 'tools', 'organization', 'settings'],
       editor: ['chat', 'tools', 'permissions', 'settings'],
       viewer: ['chat', 'permissions', 'settings'],
@@ -152,8 +154,12 @@ describe('access canAccessArea', () => {
     expect(ROLES.filter((role) => canAccessArea(role, 'permissions'))).toEqual(['editor', 'viewer']);
   });
 
-  it('gives a Super Admin nothing but the platform (no chat UI)', () => {
-    expect(AREAS.filter((area) => canAccessArea('super_admin', area))).toEqual(['platform']);
+  it('gives a Super Admin nothing but the settings and the platform (no chat UI, issue #166)', () => {
+    expect(AREAS.filter((area) => canAccessArea('super_admin', area))).toEqual(['settings', 'platform']);
+  });
+
+  it('lets the Super Admin open Settings (issue #166: the account sections)', () => {
+    expect(canAccessArea('super_admin', 'settings')).toBe(true);
   });
 
   it.each(['admin', 'activity', '', '__proto__', 'constructor', 'toString', 'Chat'])(

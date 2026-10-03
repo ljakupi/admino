@@ -53,6 +53,7 @@ from admino.oauth import encrypt_refresh_token
 from tests.db_fakes import FakeDb
 from tests.tenancy_world import (
     FORBIDDEN,
+    NEW_PASSWORD,
     PASSWORD,
     PENDING_CAPABILITIES,
     ROLE_MATRIX,
@@ -317,6 +318,18 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
         _plain("PATCH", "/api/me/settings", json={"appearance": {"theme": "dark"}}), 200
     ),
     ("POST", "/api/me/settings/reset"): _Setup(_plain("POST", "/api/me/settings/reset"), 200),
+    ("GET", "/api/me"): _Setup(_plain("GET", "/api/me"), 200),
+    ("PATCH", "/api/me"): _Setup(_plain("PATCH", "/api/me", json={"timezone": "Asia/Tokyo"}), 200),
+    # A real change (204); each case builds its own world, so ending the caller's
+    # sessions affects no other case.
+    ("POST", "/api/me/password"): _Setup(
+        _plain(
+            "POST",
+            "/api/me/password",
+            json={"current_password": PASSWORD, "new_password": NEW_PASSWORD},
+        ),
+        204,
+    ),
     # --- org users and invitations ---
     ("GET", "/api/org/users"): _Setup(_plain("GET", "/api/org/users"), 200),
     ("PATCH", "/api/org/users/{user_id}"): _Setup(_patch_org_user, 200),

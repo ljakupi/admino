@@ -62,6 +62,8 @@ MEMBER_ROLES: Final[tuple[MemberRole, ...]] = ("org_admin", "editor", "viewer")
 
 SESSION_COOKIE: Final = "admino_session"
 PASSWORD: Final = "tenancy-Suite-163-quartz"
+# The valid new password of the suite's POST /api/me/password requests (GH-166).
+NEW_PASSWORD: Final = "tenancy-Changed-166-meadow"
 CLIENT_IP: Final = "203.0.113.163"
 FORBIDDEN: Final = {"detail": "Forbidden"}
 UNAUTHORIZED: Final = {"detail": "Unauthorized"}
@@ -371,6 +373,10 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     RouteSpec("GET", "/api/me/settings", "account", Capability.ACCOUNT_MANAGE, "own_user"),
     RouteSpec("PATCH", "/api/me/settings", "account", Capability.ACCOUNT_MANAGE, "own_user"),
     RouteSpec("POST", "/api/me/settings/reset", "account", Capability.ACCOUNT_MANAGE, "own_user"),
+    # GH-166: the caller's own profile, languages, timezone, instructions and password.
+    RouteSpec("GET", "/api/me", "account", Capability.ACCOUNT_MANAGE, "own_user"),
+    RouteSpec("PATCH", "/api/me", "account", Capability.ACCOUNT_MANAGE, "own_user"),
+    RouteSpec("POST", "/api/me/password", "account", Capability.ACCOUNT_MANAGE, "own_user"),
     # --- org users and invitations ---
     RouteSpec("GET", "/api/org/users", "member", Capability.ORG_USERS_VIEW, "own_org"),
     RouteSpec(

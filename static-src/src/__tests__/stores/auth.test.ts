@@ -22,10 +22,30 @@
  * - The chat thread is cleared when a different user signs in after an
  *   expiry; the same user signing back in keeps it.
  *
- * `@/api/auth` is mocked; error cases use the real `ApiError` class.
+ * Issue #166 (account self-service) adds:
+ *
+ * - `applyAccount(account)`: signed in, `me.ui_language` /
+ *   `me.response_language` and the UI locale follow the saved account;
+ *   logged out it does nothing.
+ * - `forgetSession()`: everything `logout()` does after its API call (forget
+ *   the user, clear the chat, reset the account store, back to the browser's
+ *   language) without calling `POST /api/auth/logout` and without a
+ *   session-expired toast (a password change or revoking the current session
+ *   already ended the session server-side). `logout()` = API call +
+ *   `forgetSession()`.
+ * - After a successful `login()` or `loadMe()` (invitation accept), the
+ *   account store's `presetTimezone()` runs fire-and-forget: it never delays
+ *   or changes the outcome. Resuming a session (`ensureLoaded()`) and a failed
+ *   login never preset.
+ *
+ * `@/api/auth` and `@/api/account` are mocked; error cases use the real
+ * `ApiError` class. `@/api/account` and the account store are new in #166, so
+ * this file never imports them: the account API is a virtual `vi.mock` with
+ * hoisted fns, and the account store's state is read through Pinia (store id
+ * `'account'`). A fresh Pinia per test stands for a fresh app load.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createPinia, setActivePinia } from 'pinia';
+import { createPinia, getActivePinia, setActivePinia } from 'pinia';
 import { getMe, login as apiLogin, logout as apiLogout } from '@/api/auth';
 import { ApiError } from '@/api/client';
 import { locale, setLocale, t } from '@/i18n';
@@ -33,7 +53,7 @@ import { de } from '@/i18n/locales/de';
 import { useAuthStore } from '@/stores/auth';
 import { useChatStore } from '@/stores/chat';
 import { useToastStore } from '@/stores/toasts';
-import type { MeResponse, ThreadItem } from '@/api/types';
+import type { MeResponse, MyAccount, ThreadItem } from '@/api/types';
 
 vi.mock('@/api/auth', () => ({
   login: vi.fn(),
@@ -43,6 +63,25 @@ vi.mock('@/api/auth', () => ({
   confirmPasswordReset: vi.fn(),
   getInvitation: vi.fn(),
   acceptInvitation: vi.fn(),
+}));
+
+// #166: the auth store now reaches the account store, whose API module is new.
+// Hoisted fns + a factory (no static import) so this file still loads before
+// `@/api/account` exists.
+const accountApi = vi.hoisted(() => ({
+  getMyAccount: vi.fn<() => Promise<unknown>>(),
+  patchMyAccount: vi.fn<(patch: unknown) => Promise<unknown>>(),
+  changeMyPassword: vi.fn<(current: string, next: string) => Promise<void>>(),
+  listMySessions: vi.fn<() => Promise<unknown[]>>(),
+  revokeMySession: vi.fn<(id: string) => Promise<void>>(),
+}));
+
+vi.mock('@/api/account', () => ({
+  getMyAccount: accountApi.getMyAccount,
+  patchMyAccount: accountApi.patchMyAccount,
+  changeMyPassword: accountApi.changeMyPassword,
+  listMySessions: accountApi.listMySessions,
+  revokeMySession: accountApi.revokeMySession,
 }));
 
 const mockedGetMe = vi.mocked(getMe);
@@ -135,6 +174,53 @@ async function signInAs(me: MeResponse): Promise<void> {
   if (outcome !== 'ok') throw new Error(`test setup: expected login to succeed, got ${outcome}`);
 }
 
+const BROWSER_ZONE = 'America/New_York';
+
+function account(overrides: Partial<MyAccount> = {}): MyAccount {
+  return {
+    email: EMAIL,
+    name: 'Alice Example',
+    ui_language: 'en',
+    response_language: null,
+    timezone: 'Europe/Zurich',
+    personal_instructions: '',
+    ...overrides,
+  };
+}
+
+/** Makes `Intl.DateTimeFormat().resolvedOptions().timeZone` report `zone`. */
+function stubBrowserTimezone(zone: string): void {
+  const base = new Intl.DateTimeFormat('en').resolvedOptions();
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions').mockReturnValue({ ...base, timeZone: zone });
+}
+
+/** Lets every queued promise callback (the fire-and-forget preset included) run. */
+function flushPromises(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** `promise`'s value, or `'still pending'` when it hasn't settled within `ms`. */
+function settledWithin<T>(promise: Promise<T>, ms: number): Promise<T | 'still pending'> {
+  return Promise.race([
+    promise,
+    new Promise<'still pending'>((resolve) => setTimeout(() => resolve('still pending'), ms)),
+  ]);
+}
+
+/** The account store's state as Pinia keeps it (store id 'account'); undefined until the store exists. */
+function accountStoreState(): Record<string, unknown> | undefined {
+  return getActivePinia()?.state.value['account'];
+}
+
+/** Signs in through `login` while the timezone preset finds a NULL zone and stores the browser's one. */
+async function signInWithPreset(me: MeResponse): Promise<void> {
+  const ui = me.ui_language as MyAccount['ui_language'];
+  accountApi.getMyAccount.mockResolvedValueOnce(account({ ui_language: ui, timezone: null }));
+  accountApi.patchMyAccount.mockResolvedValueOnce(account({ ui_language: ui, timezone: BROWSER_ZONE }));
+  await signInAs(me);
+  await flushPromises();
+}
+
 beforeEach(() => {
   localStorage.clear();
   sessionStorage.clear();
@@ -144,6 +230,11 @@ beforeEach(() => {
   mockedLogout.mockReset();
   setLocale('en');
   stubBrowserLanguages(['en-US']);
+  for (const mock of Object.values(accountApi)) mock.mockReset();
+  // By default the timezone preset finds a stored zone and PATCHes nothing.
+  accountApi.getMyAccount.mockResolvedValue(account());
+  accountApi.patchMyAccount.mockResolvedValue(account());
+  stubBrowserTimezone(BROWSER_ZONE);
 });
 
 afterEach(() => {
@@ -568,5 +659,296 @@ describe('authStore user switch after an expiry', () => {
       thread: ['m-seed'],
       authenticated: true,
     });
+  });
+});
+
+// --- applyAccount (#166) --------------------------------------------------
+
+describe('authStore applyAccount', () => {
+  it("makes the signed-in profile's languages and the UI locale follow the saved account", async () => {
+    await signInAs(member({ ui_language: 'en', response_language: null }));
+    const auth = useAuthStore();
+
+    auth.applyAccount(account({ ui_language: 'de', response_language: 'it' }));
+
+    expect({ me: auth.me, role: auth.role, locale: locale.value }).toEqual({
+      me: member({ ui_language: 'de', response_language: 'it' }),
+      role: 'editor',
+      locale: 'de',
+    });
+  });
+
+  it('sets the response language back to the org default (null)', async () => {
+    await signInAs(member({ response_language: 'fr' }));
+    const auth = useAuthStore();
+
+    auth.applyAccount(account({ response_language: null }));
+
+    expect(auth.me).toEqual(member({ response_language: null }));
+  });
+
+  it.each([
+    ['nobody ever signed in', async () => {}],
+    [
+      'the session expired',
+      async () => {
+        await signInAs(member());
+        useAuthStore().handleUnauthorized();
+      },
+    ],
+  ])('does nothing when %s', async (_label, arrange) => {
+    await arrange();
+    const auth = useAuthStore();
+    const loadedBefore = auth.loaded;
+
+    auth.applyAccount(account({ ui_language: 'fr', response_language: 'it' }));
+
+    expect({ me: auth.me, loaded: auth.loaded === loadedBefore, locale: locale.value }).toEqual({
+      me: null,
+      loaded: true,
+      locale: 'en',
+    });
+  });
+});
+
+// --- forgetSession (#166) -------------------------------------------------
+
+describe('authStore forgetSession', () => {
+  it("forgets the user, clears the chat and returns to the browser's language without the logout API", async () => {
+    stubBrowserLanguages(['de-CH']);
+    await signInAs(member({ ui_language: 'fr' }));
+    seedThread();
+    const auth = useAuthStore();
+
+    auth.forgetSession();
+    await flushPromises();
+
+    expect({
+      me: auth.me,
+      loaded: auth.loaded,
+      isAuthenticated: auth.isAuthenticated,
+      thread: useChatStore().thread,
+      locale: locale.value,
+      logoutCalls: mockedLogout.mock.calls.length,
+      toasts: useToastStore().toasts,
+    }).toEqual({
+      me: null,
+      loaded: true,
+      isAuthenticated: false,
+      thread: [],
+      locale: 'de',
+      logoutCalls: 0,
+      toasts: [],
+    });
+  });
+
+  it('resets the account store', async () => {
+    await signInWithPreset(member());
+    const before = accountStoreState()?.account;
+
+    useAuthStore().forgetSession();
+    await flushPromises();
+
+    expect({ before, after: accountStoreState()?.account }).toEqual({
+      before: account({ timezone: BROWSER_ZONE }),
+      after: null,
+    });
+  });
+
+  it('marks the store loaded even when it was never loaded, so the router guard sees a logged-out user', () => {
+    const auth = useAuthStore();
+
+    auth.forgetSession();
+
+    expect({ me: auth.me, loaded: auth.loaded, logoutCalls: mockedLogout.mock.calls.length }).toEqual({
+      me: null,
+      loaded: true,
+      logoutCalls: 0,
+    });
+  });
+});
+
+describe('authStore logout resets the account store (#166)', () => {
+  it('still calls the logout API, then resets the account store', async () => {
+    await signInWithPreset(member());
+    const before = accountStoreState()?.account;
+    mockedLogout.mockResolvedValueOnce(undefined);
+
+    await useAuthStore().logout();
+
+    expect({ before, after: accountStoreState()?.account, logoutCalls: mockedLogout.mock.calls.length }).toEqual({
+      before: account({ timezone: BROWSER_ZONE }),
+      after: null,
+      logoutCalls: 1,
+    });
+  });
+
+  it('resets the account store even when the logout call fails', async () => {
+    await signInWithPreset(member());
+    mockedLogout.mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'));
+
+    await expect(useAuthStore().logout()).resolves.toBeUndefined();
+    expect({ account: accountStoreState()?.account, logoutCalls: mockedLogout.mock.calls.length }).toEqual({
+      account: null,
+      logoutCalls: 1,
+    });
+  });
+});
+
+// --- Timezone preset after login / invitation accept (#166) ----------------
+
+describe('authStore timezone preset', () => {
+  it("presets a NULL timezone to the browser's zone after a successful login", async () => {
+    accountApi.getMyAccount.mockResolvedValueOnce(account({ timezone: null }));
+    accountApi.patchMyAccount.mockResolvedValueOnce(account({ timezone: BROWSER_ZONE }));
+    mockedLogin.mockResolvedValueOnce(undefined);
+    mockedGetMe.mockResolvedValueOnce(member());
+
+    const outcome = await useAuthStore().login(EMAIL, PASSWORD);
+    await flushPromises();
+
+    expect({
+      outcome,
+      getCalls: accountApi.getMyAccount.mock.calls.length,
+      patchArgs: accountApi.patchMyAccount.mock.calls,
+      presetAfterProfile: mockedGetMe.mock.invocationCallOrder[0] < (accountApi.getMyAccount.mock.invocationCallOrder[0] ?? 0),
+    }).toEqual({
+      outcome: 'ok',
+      getCalls: 1,
+      patchArgs: [[{ timezone: BROWSER_ZONE }]],
+      presetAfterProfile: true,
+    });
+  });
+
+  it('makes no PATCH after a login when a timezone is already stored', async () => {
+    accountApi.getMyAccount.mockResolvedValueOnce(account({ timezone: 'Asia/Tokyo' }));
+
+    await signInAs(member());
+    await flushPromises();
+
+    expect({
+      getCalls: accountApi.getMyAccount.mock.calls.length,
+      patchCalls: accountApi.patchMyAccount.mock.calls.length,
+    }).toEqual({ getCalls: 1, patchCalls: 0 });
+  });
+
+  it("presets after a successful loadMe (invitation accept)", async () => {
+    accountApi.getMyAccount.mockResolvedValueOnce(account({ timezone: null }));
+    accountApi.patchMyAccount.mockResolvedValueOnce(account({ timezone: BROWSER_ZONE }));
+    mockedGetMe.mockResolvedValueOnce(member({ role: 'viewer' }));
+
+    const ok = await useAuthStore().loadMe();
+    await flushPromises();
+
+    expect({
+      ok,
+      getCalls: accountApi.getMyAccount.mock.calls.length,
+      patchArgs: accountApi.patchMyAccount.mock.calls,
+    }).toEqual({ ok: true, getCalls: 1, patchArgs: [[{ timezone: BROWSER_ZONE }]] });
+  });
+
+  it("returns 'ok' from login without waiting for a preset that never settles", async () => {
+    accountApi.getMyAccount.mockReturnValueOnce(new Promise<never>(() => {}));
+    mockedLogin.mockResolvedValueOnce(undefined);
+    mockedGetMe.mockResolvedValueOnce(member());
+
+    const outcome = await settledWithin(useAuthStore().login(EMAIL, PASSWORD), 200);
+
+    expect({ outcome, getCalls: accountApi.getMyAccount.mock.calls.length, me: useAuthStore().me }).toEqual({
+      outcome: 'ok',
+      getCalls: 1,
+      me: member(),
+    });
+  });
+
+  it('returns true from loadMe without waiting for a preset that never settles', async () => {
+    accountApi.getMyAccount.mockReturnValueOnce(new Promise<never>(() => {}));
+    mockedGetMe.mockResolvedValueOnce(member());
+
+    const ok = await settledWithin(useAuthStore().loadMe(), 200);
+
+    expect({ ok, getCalls: accountApi.getMyAccount.mock.calls.length }).toEqual({ ok: true, getCalls: 1 });
+  });
+
+  it.each([
+    ['GET /api/me fails with a 500', () => accountApi.getMyAccount.mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'))],
+    ['GET /api/me fails with a network error', () => accountApi.getMyAccount.mockRejectedValueOnce(new TypeError('Failed to fetch'))],
+    [
+      'the PATCH fails with a 500',
+      () => {
+        accountApi.getMyAccount.mockResolvedValueOnce(account({ timezone: null }));
+        accountApi.patchMyAccount.mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'));
+      },
+    ],
+  ])("keeps login's 'ok' and the signed-in profile when the preset's %s", async (_label, arrange) => {
+    arrange();
+    mockedLogin.mockResolvedValueOnce(undefined);
+    mockedGetMe.mockResolvedValueOnce(member());
+    const auth = useAuthStore();
+
+    const outcome = await auth.login(EMAIL, PASSWORD);
+    await flushPromises();
+
+    expect({
+      outcome,
+      getCalls: accountApi.getMyAccount.mock.calls.length,
+      me: auth.me,
+      isAuthenticated: auth.isAuthenticated,
+      toasts: useToastStore().toasts,
+    }).toEqual({ outcome: 'ok', getCalls: 1, me: member(), isAuthenticated: true, toasts: [] });
+  });
+
+  it('never presets when resuming a session with ensureLoaded (a later login does)', async () => {
+    mockedGetMe.mockResolvedValueOnce(member());
+    await useAuthStore().ensureLoaded();
+    await flushPromises();
+    const afterEnsureLoaded = accountApi.getMyAccount.mock.calls.length;
+
+    await signInAs(member());
+    await flushPromises();
+
+    expect({ afterEnsureLoaded, afterLogin: accountApi.getMyAccount.mock.calls.length }).toEqual({
+      afterEnsureLoaded: 0,
+      afterLogin: 1,
+    });
+  });
+
+  it.each([
+    ['a 401 from the login call', () => mockedLogin.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'))],
+    ['a 429 from the login call', () => mockedLogin.mockRejectedValueOnce(new ApiError(429, 'Too Many Requests'))],
+    [
+      'a failing profile load after the login call',
+      () => {
+        mockedLogin.mockResolvedValueOnce(undefined);
+        mockedGetMe.mockRejectedValueOnce(new ApiError(500, 'Internal Server Error'));
+      },
+    ],
+  ])('never presets after a failed login (%s); a later successful one does', async (_label, arrange) => {
+    arrange();
+    const failed = await useAuthStore().login(EMAIL, PASSWORD);
+    await flushPromises();
+    const afterFailed = accountApi.getMyAccount.mock.calls.length;
+
+    await signInAs(member());
+    await flushPromises();
+
+    expect({ failedOk: failed === 'ok', afterFailed, afterOk: accountApi.getMyAccount.mock.calls.length }).toEqual({
+      failedOk: false,
+      afterFailed: 0,
+      afterOk: 1,
+    });
+  });
+
+  it('never presets after a failed loadMe; a later successful one does', async () => {
+    mockedGetMe.mockRejectedValueOnce(new ApiError(401, 'Unauthorized'));
+    await useAuthStore().loadMe();
+    await flushPromises();
+    const afterFailed = accountApi.getMyAccount.mock.calls.length;
+    mockedGetMe.mockResolvedValueOnce(member());
+
+    await useAuthStore().loadMe();
+    await flushPromises();
+
+    expect({ afterFailed, afterOk: accountApi.getMyAccount.mock.calls.length }).toEqual({ afterFailed: 0, afterOk: 1 });
   });
 });

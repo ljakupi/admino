@@ -286,3 +286,48 @@ export interface OrgInvitation {
 export interface OrgInvitationListResponse {
   invitations: OrgInvitation[];
 }
+
+// Account self-service (issue #166: profile, languages, timezone, personal
+// instructions, password change, sessions).
+
+export type UiLanguage = 'de' | 'fr' | 'en';
+export type ResponseLanguage = 'de' | 'fr' | 'it' | 'en';
+
+/** `GET`/`PATCH /api/me` — the caller's own account. */
+export interface MyAccount {
+  email: string;
+  /** `null` only for a Super Admin created without a name. */
+  name: string | null;
+  ui_language: UiLanguage;
+  /** `null` means "use the organization default". */
+  response_language: ResponseLanguage | null;
+  /** `null` means not preset yet; consumers treat it as Europe/Zurich. */
+  timezone: string | null;
+  /** `''` means none set. */
+  personal_instructions: string;
+}
+
+/** `PATCH /api/me` body: only the fields being changed. `response_language: null` clears it back to the org default. */
+export interface MyAccountPatch {
+  name?: string;
+  ui_language?: UiLanguage;
+  response_language?: ResponseLanguage | null;
+  timezone?: string;
+  personal_instructions?: string;
+}
+
+/** One of the caller's own active sessions, from `GET /api/me/sessions`. */
+export interface SessionSummary {
+  id: string;
+  created_at: string;
+  last_seen_at: string;
+  expires_at: string;
+  ip: string | null;
+  user_agent: string | null;
+  current: boolean;
+}
+
+/** `GET /api/me/sessions` response wrapper. */
+export interface SessionListResponse {
+  sessions: SessionSummary[];
+}

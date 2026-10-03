@@ -186,6 +186,15 @@ Organizations and invitations (GH-153):
   password_reset_tokens WHERE user_id = $n`` deletes the user's reset token.
   Queued emails record their ``recipient_address``, copied from the users row
   when queued (an email change notifies the old address).
+- GH-166: ``users`` gains ``timezone`` (NULL or an IANA-shaped name, at most
+  64 characters) and ``personal_instructions`` (NOT NULL, default '', at most
+  1500 characters), checked like migration 0021's CHECKs, and
+  ``response_language`` is checked too (NULL or de/fr/it/en). A users SELECT
+  whose select list names either new column runs on the reader. The reader
+  evaluates ``CASE WHEN <$n boolean | predicate> THEN <value> ELSE <value>
+  END`` as a value (one WHEN branch). A ``fetchval`` users lookup by id that
+  selects one column (``SELECT email FROM users WHERE id = $1``) returns that
+  column.
 - ``after_invitation_lookup`` runs once, right after the first SELECT on
   invitations bound to a token hash (a concurrent accept, revoke, rotation or
   expiry between the lookup and the transaction).
@@ -384,6 +393,9 @@ _USER_COLUMNS: Final = frozenset(
         "status",
         "ui_language",
         "response_language",
+        # GH-166: migration 0021's account self-service columns.
+        "timezone",
+        "personal_instructions",
         "created_at",
         "last_login_at",
         "deleted_at",
@@ -624,6 +636,21 @@ _AUDIT_REWRITE_RE: Final = re.compile(
 )
 
 
+# GH-166: migration 0021's users_timezone_check (the shape; the app checks the zone exists).
+_TIMEZONE_COLUMN_RE: Final = re.compile(r"[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)*")
+
+
+def _valid_timezone_column(value: Any) -> bool:
+    """True for NULL or a value migration 0021's timezone CHECK accepts."""
+    if value is None:
+        return True
+    return (
+        isinstance(value, str)
+        and 1 <= len(value) <= 64
+        and _TIMEZONE_COLUMN_RE.fullmatch(value) is not None
+    )
+
+
 def norm(sql: str) -> str:
     """Collapse whitespace and lowercase, for formatting-tolerant SQL matching."""
     return re.sub(r"\s+", " ", sql).strip().lower()
@@ -848,6 +875,9 @@ class FakeDb:
         name: str | None = "Some Person",
         created_at: datetime | None = None,
         last_login_at: datetime | None = None,
+        response_language: str | None = None,
+        timezone: str | None = None,
+        personal_instructions: str = "",
     ) -> uuid.UUID:
         """Add an account and return its id (a plain uuid.UUID).
 
@@ -856,6 +886,9 @@ class FakeDb:
         session and reset lookups only; left out, the account follows the
         organizations row. ``created_at`` defaults to one day ago and
         ``last_login_at`` to None (GH-164: the Org Admin user list shows both).
+        ``response_language`` (None: the org default), ``timezone`` (None:
+        not preset yet) and ``personal_instructions`` ('' : none) are the
+        account self-service columns (GH-166, migration 0021).
         """
         user_id = uuid.uuid4()
         is_member = kind == "member"
@@ -873,7 +906,9 @@ class FakeDb:
             "password_hash": password_hash,
             "org_status": org_status if is_member else None,
             "ui_language": ui_language,
-            "response_language": None,
+            "response_language": response_language,
+            "timezone": timezone,
+            "personal_instructions": personal_instructions,
             "created_at": created_at or datetime.now(UTC) - timedelta(days=1),
             "last_login_at": last_login_at,
         }
@@ -1715,7 +1750,13 @@ class FakeDb:
         assert not skip_conflict, f"the fake does ON CONFLICT on login_throttle only: {table}"
         if table == "users":
             row = dict.fromkeys(_USER_COLUMNS)
-            row.update(id=uuid.uuid4(), status="invited", ui_language="en", created_at=now)
+            row.update(
+                id=uuid.uuid4(),
+                status="invited",
+                ui_language="en",
+                personal_instructions="",  # GH-166: migration 0021's default
+                created_at=now,
+            )
             row.update(given)
             row["org_status"] = None
             self.check_row("users", row, changed=set(_USER_COLUMNS), original=None)
@@ -1869,8 +1910,8 @@ class FakeDb:
                 if column in changed and row[column] != original[column]:
                     msg = "users.kind and users.org_id can't change"
                     raise check(msg)
-        for column in ("email", "kind", "status", "ui_language"):
-            if column in changed and row[column] is None:
+        for column in ("email", "kind", "status", "ui_language", "personal_instructions"):
+            if column in changed and row.get(column) is None:
                 msg = f'null value in column "{column}" of relation "users"'
                 raise asyncpg.exceptions.NotNullViolationError(msg)
         if "email" in changed:
@@ -1896,6 +1937,15 @@ class FakeDb:
             ("role", row["role"] in {None, "org_admin", "editor", "viewer"}),
             ("status", row["status"] in {"invited", "active", "deactivated"}),
             ("ui_language", row["ui_language"] in {"de", "fr", "en"}),
+            ("response_language", row.get("response_language") in {None, *_RESPONSE_LANGUAGES}),
+            # GH-166 (migration 0021): an IANA-shaped name of at most 64 characters, or
+            # NULL until the browser presets it; instructions of at most 1500 characters.
+            ("timezone", _valid_timezone_column(row.get("timezone"))),
+            (
+                "personal_instructions",
+                isinstance(row.get("personal_instructions"), str)
+                and len(row["personal_instructions"]) <= 1500,
+            ),
             ("name", row["name"] is None or 1 <= len(row["name"]) <= 120),
             (
                 "password_hash",
@@ -2455,6 +2505,10 @@ class FakeDb:
         if re.search(r"(?:\w+\.)?deleted_at is null", where) and account["deleted_at"] is not None:
             return None
         if method == "fetchval":
+            # GH-166: a single selected users column (e.g. "SELECT email FROM users ...").
+            selected = re.match(r"select (?:\w+\.)?(\w+) from users\b", n)
+            if selected is not None and selected.group(1) in _USER_COLUMNS - {"id"}:
+                return account[selected.group(1)]
             return _pg(account["id"])
         return {
             "id": _pg(account["id"]),
@@ -2655,6 +2709,10 @@ def _runs_on_reader(method: str, n: str, args: tuple[Any, ...]) -> bool:
         return True
     if re.match(r"select exists\b", n) or method == "fetch":
         return True
+    if re.search(r"\b(?:timezone|personal_instructions)\b", n.split(" from ", 1)[0]):
+        # GH-166: a read of the account self-service columns runs on the reader, so
+        # every selected column and predicate (deleted_at) applies.
+        return True
     where = _where(n)
     if re.search(ORG_ID_PARAM_RE, where) is None:
         return False
@@ -2763,6 +2821,19 @@ class _Statement:
         expr = _unwrap(expr)
         if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?)?", expr):
             return self._arg(match.group(1))
+        if match := re.fullmatch(r"case when (.+?) then (.+?) else (.+?) end", _masked(expr)):
+            # GH-166: one WHEN branch; the condition is a boolean bind parameter or a
+            # predicate the reader evaluates (a NULL condition takes the ELSE branch).
+            condition = expr[match.start(1) : match.end(1)]
+            if re.fullmatch(r"\$\d+(?: ?:: ?\w+)?", condition):
+                flag = self.value(condition, ctx)
+                assert flag is None or type(flag) is bool, f"CASE WHEN needs a boolean: {expr}"
+                taken = flag is True
+            else:
+                taken = self.atom(condition, ctx)
+            branch = match.group(2) if taken else match.group(3)
+            start = match.start(2) if taken else match.start(3)
+            return self.value(expr[start : start + len(branch)], ctx)
         if match := re.fullmatch(
             r"(?:interval ?'(\d+) ?([a-z]+?)s?'|'(\d+) ?([a-z]+?)s?' ?:: ?interval)", expr
         ):
