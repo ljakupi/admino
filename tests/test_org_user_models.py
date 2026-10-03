@@ -1,10 +1,10 @@
-"""Tests for the Org Admin user-management API models in admino.models (GH-164).
+"""Tests for the Org Admin user-management API models in admino.models (GH-164, GH-165).
 
 ``GET /api/org/users`` answers ``OrgUserListResponse`` (a list of
-``OrgUserSummary``); ``PATCH /api/org/users/{user_id}`` takes an
-``OrgUserPatch`` and, like the status routes, answers one ``OrgUserSummary``.
-The models are new, so each test looks them up on ``admino.models`` at call
-time and fails on its own until they exist.
+``OrgUserSummary`` plus the org's seat usage, ``OrgSeats``, GH-165);
+``PATCH /api/org/users/{user_id}`` takes an ``OrgUserPatch`` and, like the
+status routes, answers one ``OrgUserSummary``. Each test looks the models up
+on ``admino.models`` at call time, so a missing model fails only its own tests.
 
 What these tests pin down:
 - ``OrgUserSummary`` has exactly ``id``, ``name``, ``email``, ``role``,
@@ -14,7 +14,11 @@ What these tests pin down:
   (an invited or deleted account is never a user here). ``name`` and
   ``last_login_at`` may be null. ``id`` is a plain ``uuid.UUID`` (an asyncpg
   UUID is converted), serialized as a string.
-- ``OrgUserListResponse`` is ``{"users": [OrgUserSummary, ...]}``.
+- ``OrgUserListResponse`` is ``{"users": [OrgUserSummary, ...], "seats": OrgSeats}``;
+  ``seats`` is required (GH-165).
+- ``OrgSeats`` (GH-165) is the read-only seat usage of the caller's org:
+  exactly ``used`` and ``limit``, both integers >= 0 (``used`` may exceed
+  ``limit`` when an org's seats were lowered below its users).
 - ``OrgUserPatch`` (unknown fields refused: ``org_id``, ``user_id``,
   ``status``, ``kind``, ``password`` ...): any of ``role``, ``name`` and
   ``email``, a null counting as not given, at least one given. ``role`` is a
@@ -53,6 +57,7 @@ _SUMMARY_FIELDS = frozenset(
     {"id", "name", "email", "role", "status", "created_at", "last_login_at"}
 )
 _PATCH_FIELDS = frozenset({"role", "name", "email"})
+_SEATS_FIELDS = frozenset({"used", "limit"})
 _MEMBER_ROLES = ("org_admin", "editor", "viewer")
 
 # Field names that would carry a credential, a scope or the account kind.
@@ -97,6 +102,14 @@ def _summary_data(**overrides: Any) -> dict[str, Any]:
 
 def _summary(**overrides: Any) -> Any:
     return _model("OrgUserSummary").model_validate(_summary_data(**overrides))
+
+
+def _seats_data(**overrides: Any) -> dict[str, Any]:
+    return {"used": 7, "limit": 10, **overrides}
+
+
+def _seats(**overrides: Any) -> Any:
+    return _model("OrgSeats").model_validate(_seats_data(**overrides))
 
 
 def _patch(**values: Any) -> Any:
@@ -227,10 +240,11 @@ class TestOrgUserSummary:
 
 
 class TestOrgUserListResponse:
-    """GET /api/org/users: {"users": [...]}."""
+    """GET /api/org/users: {"users": [...], "seats": {"used", "limit"}}."""
 
-    def test_org_user_models_list_response_has_only_users(self) -> None:
-        assert set(_model("OrgUserListResponse").model_fields) == {"users"}
+    def test_org_user_models_list_response_has_users_and_seats(self) -> None:
+        """GH-165 adds the seat usage next to the users: exactly those two fields."""
+        assert set(_model("OrgUserListResponse").model_fields) == {"users", "seats"}
 
     def test_org_user_models_list_response_holds_summaries(self) -> None:
         first = _summary()
@@ -238,35 +252,135 @@ class TestOrgUserListResponse:
             id=uuid.uuid4(), name=None, email="b@example.ch", role="viewer", status="deactivated"
         )
 
-        response = _model("OrgUserListResponse")(users=[first, second])
+        response = _model("OrgUserListResponse")(users=[first, second], seats=_seats())
 
         assert response.users == [first, second]
         assert all(isinstance(user, _model("OrgUserSummary")) for user in response.users)
 
     def test_org_user_models_list_response_validates_rows_into_summaries(self) -> None:
-        response = _model("OrgUserListResponse").model_validate({"users": [_summary_data()]})
+        response = _model("OrgUserListResponse").model_validate(
+            {"users": [_summary_data()], "seats": _seats_data()}
+        )
 
         assert isinstance(response.users[0], _model("OrgUserSummary"))
 
+    def test_org_user_models_list_response_validates_seats_into_org_seats(self) -> None:
+        response = _model("OrgUserListResponse").model_validate(
+            {"users": [], "seats": {"used": 3, "limit": 10}}
+        )
+
+        assert isinstance(response.seats, _model("OrgSeats"))
+        assert (response.seats.used, response.seats.limit) == (3, 10)
+
     def test_org_user_models_list_response_json_shape(self) -> None:
-        response = _model("OrgUserListResponse")(users=[_summary()])
+        response = _model("OrgUserListResponse")(users=[_summary()], seats=_seats(used=3, limit=10))
 
         dumped = json.loads(response.model_dump_json())
 
-        assert set(dumped) == {"users"}
+        assert set(dumped) == {"users", "seats"}
         assert len(dumped["users"]) == 1
         assert set(dumped["users"][0]) == _SUMMARY_FIELDS
+        assert dumped["seats"] == {"used": 3, "limit": 10}
 
     def test_org_user_models_list_response_may_be_empty(self) -> None:
-        response = _model("OrgUserListResponse")(users=[])
+        response = _model("OrgUserListResponse")(users=[], seats=_seats(used=0, limit=10))
 
-        assert json.loads(response.model_dump_json()) == {"users": []}
+        assert json.loads(response.model_dump_json()) == {
+            "users": [],
+            "seats": {"used": 0, "limit": 10},
+        }
+
+    def test_org_user_models_list_response_requires_seats(self) -> None:
+        """A list without the seat usage is refused: the field is required, not defaulted."""
+        with pytest.raises(ValidationError) as caught:
+            _model("OrgUserListResponse").model_validate({"users": [_summary_data()]})
+
+        errors = caught.value.errors(include_input=False, include_url=False)
+        assert [(error["loc"], error["type"]) for error in errors] == [(("seats",), "missing")]
+
+    def test_org_user_models_list_response_validates_the_seats(self) -> None:
+        """A negative count inside ``seats`` is refused at ("seats", "used")."""
+        with pytest.raises(ValidationError) as caught:
+            _model("OrgUserListResponse").model_validate(
+                {"users": [], "seats": {"used": -1, "limit": 10}}
+            )
+
+        errors = caught.value.errors(include_input=False, include_url=False)
+        assert [error["loc"] for error in errors] == [("seats", "used")]
 
     def test_org_user_models_list_response_refuses_an_invited_row(self) -> None:
         with pytest.raises(ValidationError):
             _model("OrgUserListResponse").model_validate(
-                {"users": [_summary_data(status="invited")]}
+                {"users": [_summary_data(status="invited")], "seats": _seats_data()}
             )
+
+
+# ---------------------------------------------------------------------------
+# 2b. OrgSeats (GH-165)
+# ---------------------------------------------------------------------------
+
+
+class TestOrgSeats:
+    """The read-only seat usage of the caller's org: {"used": int, "limit": int}."""
+
+    def test_org_user_models_seats_has_exactly_used_and_limit(self) -> None:
+        assert set(_model("OrgSeats").model_fields) == _SEATS_FIELDS
+
+    def test_org_user_models_seats_is_documented(self) -> None:
+        assert (_model("OrgSeats").__doc__ or "").strip() != ""
+
+    def test_org_user_models_seats_keeps_the_values_as_ints(self) -> None:
+        seats = _seats(used=7, limit=10)
+
+        assert (seats.used, seats.limit) == (7, 10)
+        assert type(seats.used) is int
+        assert type(seats.limit) is int
+
+    def test_org_user_models_seats_json_has_exactly_used_and_limit(self) -> None:
+        assert json.loads(_seats(used=7, limit=10).model_dump_json()) == {"used": 7, "limit": 10}
+
+    def test_org_user_models_seats_accepts_zero(self) -> None:
+        seats = _seats(used=0, limit=0)
+
+        assert (seats.used, seats.limit) == (0, 0)
+
+    def test_org_user_models_seats_may_exceed_the_limit(self) -> None:
+        """An org whose seats were lowered below its users still reports both numbers
+        (no cross-field rule: the list must never fail for such an org)."""
+        seats = _seats(used=12, limit=10)
+
+        assert (seats.used, seats.limit) == (12, 10)
+
+    @pytest.mark.parametrize("field", sorted(_SEATS_FIELDS))
+    def test_org_user_models_seats_requires_field(self, field: str) -> None:
+        data = _seats_data()
+        del data[field]
+
+        with pytest.raises(ValidationError) as caught:
+            _model("OrgSeats").model_validate(data)
+
+        errors = caught.value.errors(include_input=False, include_url=False)
+        assert [(error["loc"], error["type"]) for error in errors] == [((field,), "missing")]
+
+    @pytest.mark.parametrize("field", sorted(_SEATS_FIELDS))
+    @pytest.mark.parametrize("value", [-1, -100])
+    def test_org_user_models_seats_refuses_a_negative_number(self, field: str, value: int) -> None:
+        with pytest.raises(ValidationError) as caught:
+            _seats(**{field: value})
+
+        errors = caught.value.errors(include_input=False, include_url=False)
+        assert [error["loc"] for error in errors] == [(field,)]
+
+    @pytest.mark.parametrize("field", sorted(_SEATS_FIELDS))
+    @pytest.mark.parametrize(
+        "value", [None, "seven", 1.5, [], {}], ids=["none", "word", "float", "list", "dict"]
+    )
+    def test_org_user_models_seats_refuses_a_non_integer(self, field: str, value: Any) -> None:
+        with pytest.raises(ValidationError) as caught:
+            _seats(**{field: value})
+
+        errors = caught.value.errors(include_input=False, include_url=False)
+        assert [error["loc"] for error in errors] == [(field,)]
 
 
 # ---------------------------------------------------------------------------

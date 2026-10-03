@@ -2177,16 +2177,19 @@ async def _forget_user(user_id: UUID) -> None:
 
 
 async def get_org_users(principal: _PrincipalDep) -> OrgUserListResponse:
-    """Handle GET /api/org/users — the active and deactivated users of the caller's org.
+    """Handle GET /api/org/users — the users of the caller's org and its seat usage.
 
-    Invited accounts aren't listed here (GET /api/org/invitations lists them).
+    Invited accounts aren't listed here (GET /api/org/invitations lists them),
+    but they take a seat: ``seats.used`` counts the active and invited users,
+    ``seats.limit`` is the org's seats (GH-165).
 
     Args:
         principal: The logged-in principal (401 without a session).
 
     Returns:
-        OrgUserListResponse, oldest first: each user's id, name, email, role,
-        status, created date and last login.
+        OrgUserListResponse: the active and deactivated users, oldest first
+        (each user's id, name, email, role, status, created date and last
+        login), and the org's seat usage.
 
     Raises:
         HTTPException: 403 without ``Capability.ORG_USERS_VIEW``, 429 when
@@ -2197,10 +2200,12 @@ async def get_org_users(principal: _PrincipalDep) -> OrgUserListResponse:
     from admino.database import get_pool
 
     try:
-        users = await org_users.list_org_users(get_pool(), actor=principal)
+        return OrgUserListResponse(
+            users=await org_users.list_org_users(get_pool(), actor=principal),
+            seats=await org_users.seat_usage(get_pool(), actor=principal),
+        )
     except PermissionError:
         raise HTTPException(status_code=403, detail="Forbidden") from None
-    return OrgUserListResponse(users=users)
 
 
 async def patch_org_user(

@@ -1,10 +1,11 @@
-"""Tests for admino.org_users: listing and changing the users of an org (GH-164).
+"""Tests for admino.org_users: listing and changing the users of an org (GH-164, GH-165).
 
 ``list_org_users(pool, *, actor)`` returns the caller's org's users and
 ``update_org_user(pool, *, actor, user_id, patch, ip)`` changes one user's role,
 name or email (``admino.models.OrgUserPatch``). Both return
-``admino.models.OrgUserSummary`` values. (Deactivate, reactivate, delete and the
-admin-triggered password reset are covered in another file.)
+``admino.models.OrgUserSummary`` values. ``seat_usage(pool, *, actor)`` (GH-165)
+returns the org's ``admino.models.OrgSeats``. (Deactivate, reactivate, delete
+and the admin-triggered password reset are covered in another file.)
 
 What these tests pin down:
 - Authorization comes first, through ``access.can``: listing needs
@@ -35,6 +36,14 @@ What these tests pin down:
   nothing is changed or queued.
 - No name or email in any audit row or log line; the module imports no server,
   agent, LLM, tools or OAuth module and builds no SQL from values.
+- Seat usage (GH-165): ``ORG_USERS_VIEW`` is checked before any query (an Editor,
+  a Viewer or a Super Admin gets ``PermissionError`` and nothing is queried);
+  ``limit`` is the org's ``organizations.seats``; ``used`` counts the org's
+  ``active`` and ``invited`` users that aren't deleted (an expired invitation
+  still holds its seat; deactivated and deleted users, other orgs' users and
+  Super Admins never count), the same rule ``create_invitation`` enforces
+  (``invitations._SEATS_TAKEN_SQL``). Read-only: nothing written, audited or
+  logged; every statement is bound to the actor's org id.
 
 All database calls go to the in-memory fake of tests/db_fakes.py. No real
 PostgreSQL connections are made.
@@ -59,7 +68,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
-from admino import access, accounts, org_users
+from admino import access, accounts, invitations, models, org_users
 from admino.access import Capability, Principal
 from admino.audit_events import AuditRecordError
 from admino.models import OrgUserPatch, OrgUserSummary
@@ -1545,3 +1554,382 @@ class TestNoContent:
         text = caplog.text.lower()
         assert "marker" not in text
         assert "example.test" not in text
+
+
+# ---------------------------------------------------------------------------
+# 11. seat_usage (GH-165)
+# ---------------------------------------------------------------------------
+
+_SEATS = 10
+# Far past the 72 h invitation lifetime: the invitation has expired, the account is
+# still an invited users row.
+_EXPIRED_AGO = timedelta(days=10)
+
+
+def _seats_model() -> Any:
+    """admino.models.OrgSeats, looked up at call time (it is new in GH-165)."""
+    model = getattr(models, "OrgSeats", None)
+    assert model is not None, "admino.models must define OrgSeats"
+    return model
+
+
+async def _seat_usage(db: FakeDb, actor: Principal) -> Any:
+    """Call org_users.seat_usage(pool, actor=...) (new in GH-165)."""
+    seat_usage = getattr(org_users, "seat_usage", None)
+    assert seat_usage is not None, "admino.org_users must define seat_usage"
+    return await seat_usage(db.pool, actor=actor)
+
+
+def _plain_arg(value: Any) -> Any:
+    """A bind argument with an asyncpg UUID made a plain uuid.UUID (anything else as is)."""
+    if isinstance(value, uuid.UUID) or type(value).__name__ == "UUID":
+        return uuid.UUID(str(value))
+    return value
+
+
+def _numbers(seats: Any) -> tuple[int, int]:
+    """(used, limit) of an OrgSeats, after checking its type."""
+    assert isinstance(seats, _seats_model()), type(seats)
+    return seats.used, seats.limit
+
+
+def _invited_account(
+    db: FakeDb, org_id: uuid.UUID = ORG_ID, *, sent_ago: timedelta = timedelta(0)
+) -> uuid.UUID:
+    """An invited account (no name or password yet) with its invitation, sent ``sent_ago``."""
+    user_id = db.add_account(
+        role="editor", org_id=org_id, status="invited", name=None, password_hash=None
+    )
+    db.add_invitation(user_id, sent_ago=sent_ago)
+    return user_id
+
+
+def _mixed_org(db: FakeDb) -> Principal:
+    """ORG_ID (10 seats) with users of every kind, OTHER_ORG_ID with its own; the admin.
+
+    Counted in ORG_ID: the admin, an Editor, a Viewer, a second Org Admin, a pending and
+    an expired invited account (6). Not counted: a deactivated user, a deleted active
+    and a deleted invited account, a Super Admin, and every OTHER_ORG_ID account.
+    """
+    db.add_org(ORG_ID, seats=_SEATS)
+    _, admin = _admin(db)
+    db.add_account(role="editor")
+    db.add_account(role="viewer")
+    db.add_account(role="org_admin")
+    _invited_account(db)
+    _invited_account(db, sent_ago=_EXPIRED_AGO)
+    db.add_account(role="editor", status="deactivated")
+    db.add_account(role="editor", deleted_at=datetime.now(UTC) - timedelta(days=2))
+    db.add_account(
+        role="viewer",
+        status="invited",
+        name=None,
+        password_hash=None,
+        deleted_at=datetime.now(UTC) - timedelta(days=1),
+    )
+    db.add_account(kind="super_admin", role=None)
+    db.add_org(OTHER_ORG_ID, seats=3)
+    db.add_account(role="org_admin", org_id=OTHER_ORG_ID)
+    db.add_account(role="editor", org_id=OTHER_ORG_ID)
+    _invited_account(db, OTHER_ORG_ID)
+    _invited_account(db, OTHER_ORG_ID, sent_ago=_EXPIRED_AGO)
+    return admin
+
+
+class TestSeatUsageSurface:
+    """seat_usage(pool, *, actor) -> OrgSeats."""
+
+    def test_org_users_seat_usage_signature_is_keyword_only(self) -> None:
+        """seat_usage(pool, *, actor), a coroutine function."""
+        seat_usage = getattr(org_users, "seat_usage", None)
+        assert seat_usage is not None, "admino.org_users must define seat_usage"
+        params = list(inspect.signature(seat_usage).parameters.values())
+
+        assert [p.name for p in params] == ["pool", "actor"]
+        assert params[1].kind is inspect.Parameter.KEYWORD_ONLY
+        assert inspect.iscoroutinefunction(seat_usage)
+
+    async def test_org_users_seat_usage_returns_org_seats(self, db: FakeDb) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+
+        seats = await _seat_usage(db, admin)
+
+        assert isinstance(seats, _seats_model())
+        assert type(seats.used) is int
+        assert type(seats.limit) is int
+
+
+class TestSeatUsageAuthorization:
+    """ORG_USERS_VIEW, checked before any statement."""
+
+    @pytest.mark.parametrize("who", _REFUSED)
+    async def test_org_users_seat_usage_refused_without_org_users_view(
+        self, db: FakeDb, who: str
+    ) -> None:
+        """An Editor, a Viewer or a Super Admin: PermissionError and no statement at all."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        db.add_account(role="org_admin")
+        actor = _actor(db, who)
+        db.calls.clear()
+
+        with pytest.raises(PermissionError):
+            await _seat_usage(db, actor)
+
+        assert db.calls == []
+
+    async def test_org_users_seat_usage_checks_org_users_view(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An Org Admin denied ORG_USERS_VIEW (all else granted) is refused, nothing queried."""
+        _, admin = _admin(db)
+        seen = _spy_can(monkeypatch, _deny(Capability.ORG_USERS_VIEW))
+        db.calls.clear()
+
+        with pytest.raises(PermissionError):
+            await _seat_usage(db, admin)
+
+        assert Capability.ORG_USERS_VIEW in seen
+        assert db.calls == []
+
+    async def test_org_users_seat_usage_needs_only_org_users_view(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With every capability but ORG_USERS_VIEW refused, the usage is still returned
+        (reading it needs neither manage nor invite)."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        seen = _spy_can(monkeypatch, lambda _principal, cap: cap is Capability.ORG_USERS_VIEW)
+
+        seats = await _seat_usage(db, admin)
+
+        assert _numbers(seats) == (1, _SEATS)
+        assert Capability.ORG_USERS_VIEW in seen
+
+
+class TestSeatUsageCounts:
+    """used = the org's active and invited users that aren't deleted; limit = its seats."""
+
+    async def test_org_users_seat_usage_of_a_fresh_org_is_its_admin(self, db: FakeDb) -> None:
+        """An org with 10 seats and only its Org Admin: 1 of 10."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+
+        assert _numbers(await _seat_usage(db, admin)) == (1, _SEATS)
+
+    @pytest.mark.parametrize("role", ["org_admin", "editor", "viewer"])
+    async def test_org_users_seat_usage_counts_an_active_member_of_any_role(
+        self, db: FakeDb, role: str
+    ) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        db.add_account(role=role)
+
+        assert _numbers(await _seat_usage(db, admin)) == (2, _SEATS)
+
+    async def test_org_users_seat_usage_counts_a_pending_invitation(self, db: FakeDb) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        _invited_account(db)
+
+        assert _numbers(await _seat_usage(db, admin)) == (2, _SEATS)
+
+    async def test_org_users_seat_usage_counts_an_expired_invitation(self, db: FakeDb) -> None:
+        """An expired invitation still holds its seat until it is revoked."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        invited = _invited_account(db, sent_ago=_EXPIRED_AGO)
+        expiry = next(row["expires_at"] for row in db.invitations.values())
+        assert expiry < datetime.now(UTC), "the invitation must have expired"
+        assert db.users[invited]["status"] == "invited"
+
+        assert _numbers(await _seat_usage(db, admin)) == (2, _SEATS)
+
+    async def test_org_users_seat_usage_skips_a_deactivated_user(self, db: FakeDb) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        db.add_account(role="editor", status="deactivated")
+
+        assert _numbers(await _seat_usage(db, admin)) == (1, _SEATS)
+
+    async def test_org_users_seat_usage_counts_a_user_again_once_reactivated(
+        self, db: FakeDb
+    ) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        user = db.add_account(role="editor", status="deactivated")
+        deactivated = _numbers(await _seat_usage(db, admin))
+        db.users[user]["status"] = "active"
+
+        reactivated = _numbers(await _seat_usage(db, admin))
+
+        assert (deactivated, reactivated) == ((1, _SEATS), (2, _SEATS))
+
+    @pytest.mark.parametrize("status", ["active", "invited"])
+    async def test_org_users_seat_usage_skips_a_deleted_user(self, db: FakeDb, status: str) -> None:
+        """A row with deleted_at set holds no seat, whatever its status."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        invited: dict[str, Any] = {"name": None, "password_hash": None}
+        db.add_account(
+            role="editor",
+            status=status,
+            deleted_at=datetime.now(UTC) - timedelta(days=1),
+            **(invited if status == "invited" else {}),
+        )
+
+        assert _numbers(await _seat_usage(db, admin)) == (1, _SEATS)
+
+    async def test_org_users_seat_usage_skips_a_removed_user(self, db: FakeDb) -> None:
+        """A user whose row is gone (deleted by an Org Admin) no longer counts."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        user = db.add_account(role="editor")
+        before = _numbers(await _seat_usage(db, admin))
+        del db.users[user]
+
+        after = _numbers(await _seat_usage(db, admin))
+
+        assert (before, after) == ((2, _SEATS), (1, _SEATS))
+
+    @pytest.mark.parametrize(
+        "status", ["active", "invited", "deactivated"], ids=["active", "invited", "deactivated"]
+    )
+    async def test_org_users_seat_usage_never_counts_another_orgs_user(
+        self, db: FakeDb, status: str
+    ) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        if status == "invited":
+            _invited_account(db, OTHER_ORG_ID)
+        else:
+            db.add_account(role="editor", org_id=OTHER_ORG_ID, status=status)
+
+        assert _numbers(await _seat_usage(db, admin)) == (1, _SEATS)
+
+    async def test_org_users_seat_usage_never_counts_a_super_admin(self, db: FakeDb) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        db.add_account(kind="super_admin", role=None)
+
+        assert _numbers(await _seat_usage(db, admin)) == (1, _SEATS)
+
+    async def test_org_users_seat_usage_of_a_mixed_org(self, db: FakeDb) -> None:
+        """Every kind of row at once: 6 of ORG_ID's 10 seats are used."""
+        admin = _mixed_org(db)
+
+        assert _numbers(await _seat_usage(db, admin)) == (6, _SEATS)
+
+    async def test_org_users_seat_usage_of_the_other_org_is_its_own(self, db: FakeDb) -> None:
+        """The scope is the actor's org, not a fixed one: OTHER_ORG_ID's admin sees 4 of 3
+        (its admin, its Editor, a pending and an expired invitation; seats lowered below
+        its users) with ORG_ID's users ignored."""
+        _mixed_org(db)
+        other_admin = _principal(
+            db,
+            next(
+                user_id
+                for user_id, row in db.users.items()
+                if row["org_id"] == OTHER_ORG_ID and row["role"] == "org_admin"
+            ),
+        )
+
+        assert _numbers(await _seat_usage(db, other_admin)) == (4, 3)
+
+    async def test_org_users_seat_usage_used_follows_the_invitation_seat_rule(
+        self, db: FakeDb
+    ) -> None:
+        """``used`` is exactly what create_invitation counts as taken
+        (invitations._SEATS_TAKEN_SQL): one rule for the label and the limit check."""
+        admin = _mixed_org(db)
+        taken = await db.pool.fetchval(invitations._SEATS_TAKEN_SQL, ORG_ID)
+
+        seats = await _seat_usage(db, admin)
+
+        assert seats.used == taken
+
+    @pytest.mark.parametrize("limit", [1, 7, 250, 100000])
+    async def test_org_users_seat_usage_limit_is_the_orgs_seats(
+        self, db: FakeDb, limit: int
+    ) -> None:
+        db.add_org(ORG_ID, seats=limit)
+        db.add_org(OTHER_ORG_ID, seats=42)
+        _, admin = _admin(db)
+
+        assert _numbers(await _seat_usage(db, admin)) == (1, limit)
+
+    async def test_org_users_seat_usage_limit_follows_a_seats_change(self, db: FakeDb) -> None:
+        """Read on every call: a Super Admin lowering the seats shows at once."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, admin = _admin(db)
+        first = _numbers(await _seat_usage(db, admin))
+        db.add_org(ORG_ID, seats=4)
+
+        second = _numbers(await _seat_usage(db, admin))
+
+        assert (first, second) == ((1, _SEATS), (1, 4))
+
+
+class TestSeatUsageReadOnly:
+    """Parameterized reads bound to the actor's org; nothing written, audited or logged."""
+
+    async def test_org_users_seat_usage_statements_are_bound_to_the_actor_org(
+        self, db: FakeDb
+    ) -> None:
+        """Every statement binds ORG_ID as a parameter; the users count is scoped by
+        ``org_id = $n``; no id ever appears in the SQL text."""
+        admin_id, admin = _admin(db)
+        db.add_org(OTHER_ORG_ID)
+        db.calls.clear()
+
+        await _seat_usage(db, admin)
+
+        assert db.calls, "seat_usage must read the database"
+        assert all(ORG_ID in [_plain_arg(arg) for arg in call.args] for call in db.calls)
+        assert all(OTHER_ORG_ID not in [_plain_arg(arg) for arg in call.args] for call in db.calls)
+        scoped = [
+            call
+            for call in db.calls
+            if "from users" in call.normalized and re.search(ORG_ID_PARAM_RE, call.normalized)
+        ]
+        assert scoped, [call.normalized for call in db.calls]
+        for call in scoped:
+            match = re.search(ORG_ID_PARAM_RE, call.normalized)
+            assert match is not None
+            assert _plain_arg(call.args[int(match.group(1)) - 1]) == ORG_ID
+        for call in db.calls:
+            assert str(ORG_ID) not in call.sql
+            assert str(admin_id) not in call.sql
+
+    async def test_org_users_seat_usage_only_reads(self, db: FakeDb) -> None:
+        """No INSERT, UPDATE or DELETE, no row lock and no password hash read."""
+        admin = _mixed_org(db)
+        db.calls.clear()
+
+        await _seat_usage(db, admin)
+
+        assert [call.normalized for call in db.calls if _is_write(call)] == []
+        assert all("for update" not in call.normalized for call in db.calls)
+        assert all("password_hash" not in call.normalized for call in db.calls)
+
+    async def test_org_users_seat_usage_changes_nothing_and_audits_nothing(
+        self, db: FakeDb
+    ) -> None:
+        admin = _mixed_org(db)
+        before = _state(db)
+
+        await _seat_usage(db, admin)
+
+        assert _state(db) == before
+        assert db.audit == []
+
+    async def test_org_users_seat_usage_logs_nothing(
+        self, db: FakeDb, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _mixed_org(db)
+        caplog.set_level(logging.DEBUG)
+
+        seats = await _seat_usage(db, admin)
+
+        assert _numbers(seats) == (6, _SEATS)
+        assert [record.name for record in caplog.records if record.name.startswith("admino")] == []

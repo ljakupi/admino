@@ -1,5 +1,7 @@
 """HTTP-layer spec for Org Admin user management: list, change, password reset (GH-164).
 
+GH-165 adds the org's seat usage to the list.
+
 The FastAPI app from ``create_app()`` runs against the in-memory database of
 tests/db_fakes.py (what ``admino.database.get_pool`` returns) with a fake
 config whose ``server.public_url`` is ``https://admino.example.ch``. The real
@@ -9,10 +11,15 @@ runs, through the real ``require_session``; only Argon2 is replaced by a fast
 fake.
 
 What these tests pin down:
-- ``GET /api/org/users`` → 200 ``{"users": [...]}``: the caller's org's active
-  and deactivated users (never an invited account, a deleted user, another
-  org's user or a Super Admin), ordered by ``created_at`` then ``id``, each with
-  exactly ``id, name, email, role, status, created_at, last_login_at``.
+- ``GET /api/org/users`` → 200 ``{"users": [...], "seats": {"used", "limit"}}``:
+  the caller's org's active and deactivated users (never an invited account, a
+  deleted user, another org's user or a Super Admin), ordered by ``created_at``
+  then ``id``, each with exactly ``id, name, email, role, status, created_at,
+  last_login_at``. ``seats`` (GH-165) has exactly ``used`` (the org's active and
+  invited users that aren't deleted, an expired invitation included) and
+  ``limit`` (the org's seats); it follows invitations, revocations,
+  deactivations, reactivations and deletions, and is served from the same
+  ``/api/org/users/get`` bucket.
 - ``PATCH /api/org/users/{user_id}`` ``{role?, name?, email?}`` → 200 with the
   updated summary; a role change writes one ``user.role_change`` audit row, a
   name/email change one ``user.profile_change`` row (IDs, flags and role tokens
@@ -631,8 +638,8 @@ class TestList:
     """The caller's org's active and deactivated users."""
 
     def test_org_users_api_list_shape(self, db: FakeDb) -> None:
-        """200 {"users": [...]}: each item has exactly the summary keys, with the stored
-        name, email, role, status, created date and last login."""
+        """200 {"users": [...], "seats": {...}}: each item has exactly the summary keys,
+        with the stored name, email, role, status, created date and last login."""
         _, token = _admin(db)
         created = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
         last_login = datetime(2026, 9, 30, 8, 15, tzinfo=UTC)
@@ -648,7 +655,7 @@ class TestList:
 
         assert response.status_code == 200
         body = response.json()
-        assert set(body) == {"users"}
+        assert set(body) == {"users", "seats"}
         assert all(set(item) == _SUMMARY_KEYS for item in body["users"])
         item = next(item for item in body["users"] if item["id"] == str(target))
         assert (item["name"], item["email"], item["role"], item["status"]) == (
@@ -1708,3 +1715,186 @@ class TestNoContent:
         assert "markername" not in stored
         assert "reset-password" not in stored
         assert raw.lower() not in stored
+
+
+# ---------------------------------------------------------------------------
+# 13. Seat usage in the list (GH-165)
+# ---------------------------------------------------------------------------
+
+_SEATS = 10
+_KEY_STATUS = "/api/org/users/status"
+_KEY_DELETE = "/api/org/users/delete"
+_KEY_REVOKE = "/api/org/invitations/revoke"
+
+
+def _seats(client: TestClient, token: str) -> dict[str, Any]:
+    """The ``seats`` object of a successful GET /api/org/users."""
+    response = _list(client, token)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "seats" in body, body
+    seats: dict[str, Any] = body["seats"]
+    return seats
+
+
+def _numbers(used: int, limit: int = _SEATS) -> dict[str, int]:
+    return {"used": used, "limit": limit}
+
+
+class TestListSeats:
+    """{"seats": {"used", "limit"}} next to the users, from the same request."""
+
+    @pytest.fixture(autouse=True)
+    def _roomy_lifecycle_buckets(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The flows below call the status, delete and revoke routes a few times each."""
+        for key in (_KEY_STATUS, _KEY_DELETE, _KEY_REVOKE):
+            monkeypatch.setitem(server._RATE_LIMITS, key, (1000.0, 1000))
+
+    def test_org_users_api_seats_has_exactly_used_and_limit(self, db: FakeDb) -> None:
+        """A fresh org with 10 seats and only its Org Admin: {"used": 1, "limit": 10}, both
+        JSON integers."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+
+        seats = _seats(_client(_app()), token)
+
+        assert seats == _numbers(1)
+        assert set(seats) == {"used", "limit"}
+        assert all(type(value) is int for value in seats.values())
+
+    def test_org_users_api_seats_count_active_and_invited_users_only(self, db: FakeDb) -> None:
+        """Counted: the admin, an Editor, a Viewer, a pending and an expired invitation (5).
+        Not counted: a deactivated user, a deleted user, another org's users and
+        invitations, a Super Admin."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        db.add_account(role="editor")
+        db.add_account(role="viewer")
+        _invited(db)
+        expired = db.add_account(role="viewer", status="invited", name=None, password_hash=None)
+        db.add_invitation(expired, sent_ago=timedelta(days=10))
+        db.add_account(role="editor", status="deactivated")
+        db.add_account(deleted_at=_DELETED_AT)
+        _admin(db, org_id=OTHER_ORG_ID)
+        db.add_account(org_id=OTHER_ORG_ID)
+        _invited(db, org_id=OTHER_ORG_ID)
+        db.add_account(kind="super_admin", role=None)
+
+        response = _list(_client(_app()), token)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["seats"] == _numbers(5)
+        assert len(response.json()["users"]) == 4  # the users list itself is unchanged
+
+    @pytest.mark.parametrize("limit", [1, 7, 500])
+    def test_org_users_api_seats_limit_is_the_orgs_seats(self, db: FakeDb, limit: int) -> None:
+        db.add_org(ORG_ID, seats=limit)
+        db.add_org(OTHER_ORG_ID, seats=42)
+        _, token = _admin(db)
+
+        assert _seats(_client(_app()), token) == _numbers(1, limit)
+
+    def test_org_users_api_seats_of_another_org_are_its_own(self, db: FakeDb) -> None:
+        """Org B's admin gets org B's count and limit, whatever org A holds."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        db.add_org(OTHER_ORG_ID, seats=3)
+        _admin(db)
+        db.add_account(role="editor")
+        _invited(db)
+        _, other_token = _admin(db, org_id=OTHER_ORG_ID)
+        _invited(db, org_id=OTHER_ORG_ID)
+
+        assert _seats(_client(_app()), other_token) == _numbers(2, 3)
+
+    def test_org_users_api_seats_follow_an_invitation_and_its_revocation(self, db: FakeDb) -> None:
+        """POST /api/org/invitations takes a seat at once; revoking it frees the seat."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        db.add_account(role="editor")
+        client = _client(_app())
+        before = _seats(client, token)
+
+        invited = _invite(client, token, "seat.invitee@example.ch")
+        assert invited.status_code == 201, invited.text
+        after_invite = _seats(client, token)
+        revoked = client.delete(f"{_INVITES}/{invited.json()['id']}", headers=_cookie(token))
+        assert revoked.status_code == 204, revoked.text
+        after_revoke = _seats(client, token)
+
+        assert (before, after_invite, after_revoke) == (_numbers(2), _numbers(3), _numbers(2))
+
+    def test_org_users_api_seats_follow_deactivation_and_reactivation(self, db: FakeDb) -> None:
+        """A deactivated user frees a seat; reactivating takes it again."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        target = db.add_account(role="editor")
+        client = _client(_app())
+        before = _seats(client, token)
+
+        deactivated = client.post(f"{_user_url(target)}/deactivate", headers=_cookie(token))
+        assert deactivated.status_code == 200, deactivated.text
+        after_deactivate = _seats(client, token)
+        reactivated = client.post(f"{_user_url(target)}/reactivate", headers=_cookie(token))
+        assert reactivated.status_code == 200, reactivated.text
+        after_reactivate = _seats(client, token)
+
+        assert (before, after_deactivate, after_reactivate) == (
+            _numbers(2),
+            _numbers(1),
+            _numbers(2),
+        )
+
+    def test_org_users_api_seats_follow_a_deletion(self, db: FakeDb) -> None:
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        target = db.add_account(role="viewer")
+        client = _client(_app())
+        before = _seats(client, token)
+
+        deleted = client.delete(_user_url(target), headers=_cookie(token))
+        assert deleted.status_code == 204, deleted.text
+
+        assert (before, _seats(client, token)) == (_numbers(2), _numbers(1))
+
+    def test_org_users_api_seats_follow_a_seats_change(self, db: FakeDb) -> None:
+        """Read on every request: a changed seat limit shows on the next GET."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        client = _client(_app())
+        before = _seats(client, token)
+        db.add_org(ORG_ID, seats=4)
+
+        assert (before, _seats(client, token)) == (_numbers(1), _numbers(1, 4))
+
+    def test_org_users_api_seats_use_the_list_bucket_only(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One GET spends one token of /api/org/users/get and no other bucket."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        app = _app()
+        real = server._check_rate_limit
+        keys: list[str] = []
+
+        def spy(route: str, caller: str) -> None:
+            keys.append(route)
+            real(route, caller)
+
+        monkeypatch.setattr(server, "_check_rate_limit", spy)
+
+        seats = _seats(_client(app), token)
+
+        assert seats == _numbers(1)
+        assert keys == [_KEY_LIST]
+
+    def test_org_users_api_seats_change_nothing(self, db: FakeDb) -> None:
+        """Reading the seat usage writes, queues and audits nothing."""
+        db.add_org(ORG_ID, seats=_SEATS)
+        _, token = _admin(db)
+        _invited(db)
+        before = _state(db)
+
+        seats = _seats(_client(_app()), token)
+
+        assert seats == _numbers(2)
+        assert _state(db) == before

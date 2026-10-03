@@ -240,3 +240,49 @@ export interface PermissionSummaryEntry {
 export interface PermissionsSummaryResponse {
   permissions: PermissionSummaryEntry[];
 }
+
+// Org users and invitations (issue #165: Organization console, users and
+// invitations UI; backed by #153's invitations and #164's org users routes).
+
+/** Read-only seat usage of the caller's org, carried on `GET /api/org/users`. */
+export interface OrgSeats {
+  used: number;
+  limit: number;
+}
+
+export type OrgUserStatus = 'active' | 'deactivated';
+
+export interface OrgUser {
+  id: string;
+  name: string | null;
+  email: string;
+  role: MemberRole;
+  status: OrgUserStatus;
+  created_at: string;
+  last_login_at: string | null;
+}
+
+export interface OrgUserListResponse {
+  users: OrgUser[];
+  seats: OrgSeats;
+}
+
+/** `PATCH /api/org/users/{id}` body: only the fields being changed. */
+export interface OrgUserPatch {
+  role?: MemberRole;
+  name?: string;
+  email?: string;
+}
+
+export interface OrgInvitation {
+  id: string;
+  email: string;
+  role: MemberRole;
+  sent_at: string;
+  expires_at: string;
+  expired: boolean;
+}
+
+export interface OrgInvitationListResponse {
+  invitations: OrgInvitation[];
+}

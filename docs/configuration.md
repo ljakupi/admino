@@ -328,7 +328,10 @@ routes. Editors, Viewers and the Super Admin get `403`.
 - `GET /api/org/users` lists the organization's active and deactivated users, oldest
   first: name, email address, role, status, when the account was created and when the user
   last logged in. Invited people aren't listed: until they accept, their accounts are
-  managed with the invitation routes above.
+  managed with the invitation routes above. The response also carries the seat usage,
+  `seats: {"used", "limit"}`: `limit` is the organization's seats, and `used` counts active
+  users and pending invitations (expired ones included), the same count an invitation is
+  checked against.
 - `PATCH /api/org/users/{id}` changes a user's role, name or email address. The new address
   can't belong to any account on the platform yet, in any capitalization. When the address
   changes, admino emails the old address a short notice (without either address), and a
@@ -384,8 +387,18 @@ What you see depends on your role:
 | Viewer | Chat (read-only: projects shared with you, with no message box), Permissions (read-only) and Settings |
 | Super Admin | Platform only (no chat) |
 
-The Organization page holds the organization's services (which tools the agent may use),
-tool permissions and critical permissions. Later releases add users, settings and more.
+The Organization page has two tabs. **Users** lists the organization's users and pending
+invitations, with a search box and a status filter (all, active, deactivated, invited). It
+shows the seat usage, such as "7 / 10 seats". **Invite user** asks for an email address and
+a role. Each user's menu changes their role, edits their name and email address,
+deactivates or reactivates them, sends a password reset link, logs them out everywhere or
+deletes them. Each pending invitation can be sent again or revoked. Every action except
+resending asks for confirmation first, and a refused action shows why, such as "an
+organization needs at least one active Org Admin". The role choices are Org Admin and
+Editor: the Viewer role isn't offered yet, because there's nothing to share with a Viewer
+in this release. **Permissions & services** holds the organization's services (which tools
+the agent may use), tool permissions and critical permissions. Later releases add the
+organization's settings.
 The Tools page is **My connections**: each user connects their own Google and Microsoft
 accounts there (see [Tools → Authentication](tools.md#authentication)). The Permissions page shows Editors and Viewers
 what the agent may do in their organization. The Platform page is a placeholder that a later
