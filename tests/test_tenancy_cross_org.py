@@ -13,7 +13,11 @@ Viewer, plus a Super Admin):
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
   promotions, the permission summary, invitations, the user list and its
-  seat usage).
+  seat usage). GH-169: org A's profile, instructions, session policy and
+  trash retention changes leave org B's org_settings row, organizations row
+  (name, language) and sessions as they were, and are audited for org A only;
+  org A's read never shows org B's name, instructions or policies, even with
+  org B's id in the query.
 - The org user routes of GH-164 (PATCH, deactivate, reactivate, DELETE,
   password reset): every kind of org B account (its last Org Admin, a member,
   a deactivated user, an invited account) is a 404 "User not found" for org
@@ -65,7 +69,7 @@ from fastapi.routing import APIRoute
 from admino import oauth, org_permissions, server
 from admino.models import LLMMessage, PendingConfirmation, ToolCall
 from admino.oauth import encrypt_refresh_token
-from tests.db_fakes import FakeDb
+from tests.db_fakes import ORG_NAME, FakeDb
 from tests.tenancy_world import (
     PASSWORD,
     ROUTES,
@@ -280,6 +284,78 @@ def _switch_off(db: FakeDb, org_id: uuid.UUID, *tools: str) -> None:
     row = db.org_settings[org_id]
     for tool in tools:
         row[f"{tool}_enabled"] = False
+
+
+# GH-169: org B's own profile, instructions and policies (markers A must never see).
+_B_NAME: Final = "Zephyrmarker Beispiel GmbH"
+_B_INSTRUCTIONS: Final = "Zephyrmarker: Anweisungen nur fuer Org B."
+_B_POLICIES: Final = {
+    "session_idle_timeout_minutes": 90,
+    "session_max_lifetime_hours": 6,
+    "trash_retention_days": 10,
+}
+# Org A's sections as build_world leaves them (the defaults; platform trash bounds 0..90).
+_A_SECTIONS: Final = {
+    "profile": {"display_name": ORG_NAME, "default_response_language": "en"},
+    "instructions": "",
+    "security": {"session_idle_timeout_minutes": 60, "session_max_lifetime_hours": 12},
+    "retention": {"trash_retention_days": 30, "trash_min_days": 0, "trash_max_days": 90},
+}
+# One change per GH-169 section (and all of them), sent by org A's Org Admin.
+_A_SECTION_PATCHES: Final = [
+    pytest.param(
+        {"profile": {"display_name": "Org A Neu AG", "default_response_language": "de"}},
+        id="profile",
+    ),
+    pytest.param({"instructions": "Org A: antworte formell."}, id="instructions"),
+    pytest.param(
+        {"security": {"session_idle_timeout_minutes": 30, "session_max_lifetime_hours": 4}},
+        id="security",
+    ),
+    pytest.param({"retention": {"trash_retention_days": 14}}, id="retention"),
+    pytest.param(
+        {
+            "profile": {"display_name": "Org A Neu AG", "default_response_language": "fr"},
+            "instructions": "Org A: antworte formell.",
+            "security": {"session_idle_timeout_minutes": 45, "session_max_lifetime_hours": 2},
+            "retention": {"trash_retention_days": 7},
+        },
+        id="every-section",
+    ),
+]
+
+
+def _seed_org_b_settings(world: World) -> None:
+    """Give org B its own name, language, instructions and policies (build_world made
+    its org_settings row)."""
+    world.db.add_org(world.org_b, name=_B_NAME, default_response_language="it")
+    world.db.org_settings[world.org_b].update(instructions=_B_INSTRUCTIONS, **_B_POLICIES)
+
+
+def _session_policies(world: World, *, inside: uuid.UUID | None = None) -> dict[bytes, Any]:
+    """(idle timeout, created_at, expires_at) of the sessions of org ``inside``'s users, or
+    of every user outside org A when ``inside`` is None (org B's and the Super Admin's)."""
+    owners = {
+        user_id: None if row["org_id"] is None else _plain(row["org_id"])
+        for user_id, row in world.db.users.items()
+    }
+    return {
+        token_hash: (row["idle_timeout_minutes"], row["created_at"], row["expires_at"])
+        for token_hash, row in world.db.sessions.items()
+        if (owners.get(_plain(row["user_id"])) == inside)
+        or (inside is None and owners.get(_plain(row["user_id"])) != world.org_a)
+    }
+
+
+def _org_slice(world: World, org_id: uuid.UUID) -> dict[str, Any]:
+    """Copies of an org's org_settings row, organizations row and its users' sessions."""
+    return copy.deepcopy(
+        {
+            "org_settings": world.db.org_settings_row(org_id),
+            "organization": world.db.orgs[org_id],
+            "sessions": _session_policies(world, inside=org_id),
+        }
+    )
 
 
 def _member(world: World, label: str) -> Account:
@@ -940,6 +1016,53 @@ class TestOwnOrgRoutes:
         rows = world.db.audit_rows("org.settings_change")
         assert rows
         assert _audit_org_ids(rows) == {world.org_a}
+
+    @covers(("GET", "/api/org/settings"))
+    @pytest.mark.parametrize("org_b_in_query", [False, True], ids=["plain", "org-b-id-in-query"])
+    def test_cross_org_org_settings_get_never_shows_the_other_orgs_profile_or_policies(
+        self, world: World, client: TestClient, org_b_in_query: bool
+    ) -> None:
+        """GH-169: B has its own name, language, instructions and policies; A's admin reads
+        A's own (the defaults), even with B's id in the query; B's admin reads B's."""
+        _seed_org_b_settings(world)
+        query = {"org_id": str(world.org_b)} if org_b_in_query else None
+
+        a_view = client.get("/api/org/settings", headers=world.a["org_admin"].cookie, params=query)
+        b_view = client.get("/api/org/settings", headers=world.b["org_admin"].cookie)
+
+        assert a_view.status_code == 200, a_view.text
+        body = a_view.json()
+        assert {section: body.get(section) for section in _A_SECTIONS} == _A_SECTIONS
+        assert "zephyrmarker" not in a_view.text.lower()
+        b_body = b_view.json()
+        assert (b_body["profile"]["display_name"], b_body["instructions"]) == (
+            _B_NAME,
+            _B_INSTRUCTIONS,
+        )  # control: B's seed is visible to B
+
+    @covers(("PATCH", "/api/org/settings"))
+    @pytest.mark.parametrize("body", _A_SECTION_PATCHES)
+    def test_cross_org_org_settings_section_patch_changes_only_the_callers_org(
+        self, world: World, client: TestClient, body: dict[str, Any]
+    ) -> None:
+        """GH-169: A's change reaches A (control) and leaves B's org_settings row,
+        organizations row and sessions, and the Super Admin's sessions, as they were;
+        every audit event names org A."""
+        _seed_org_b_settings(world)
+        a_before = _org_slice(world, world.org_a)
+        b_before = _org_slice(world, world.org_b)
+        outside_before = _session_policies(world)
+
+        response = client.patch("/api/org/settings", json=body, headers=world.a["org_admin"].cookie)
+
+        assert response.status_code == 200, response.text
+        assert _org_slice(world, world.org_a) != a_before
+        assert _org_slice(world, world.org_b) == b_before
+        assert _session_policies(world) == outside_before
+        rows = world.db.audit_rows("org.settings_change")
+        assert rows
+        assert _audit_org_ids(rows) == {world.org_a}
+        assert {tuple(row["target_ids"]) for row in rows} == {(str(world.org_a),)}
 
     @covers(("GET", "/api/org/permissions"))
     def test_cross_org_permission_matrix_get_reads_only_the_callers_org(

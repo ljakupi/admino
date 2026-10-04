@@ -41,6 +41,21 @@
  *   rejects a non-2xx (429 rate limit, 403, 401) with an `ApiError` carrying
  *   the status and the backend's `detail`.
  *
+ * Issue #169 (Organization profile, policies and instructions; contract
+ * GH-169 §7): same functions, paths and signatures. `OrgSettingsResponse`
+ * becomes the full settings response (`profile`, `instructions`,
+ * `security`, `retention` with the platform bounds, `tools`,
+ * `data_residency`, `plan`) and the client resolves it verbatim.
+ * `OrgSettingsPatch` gains the optional `profile`, `instructions`,
+ * `security` and `retention` sections (`tools` becomes optional), and
+ * `patchOrgSettings` sends exactly the given patch as the JSON body (the
+ * instructions verbatim, `""` included) with the session cookie; the
+ * same-origin CSRF check is server-side, so no extra header is expected. A
+ * 400 `{"detail", "reason": "trash_retention_bounds"}` rejects with an
+ * `ApiError` carrying the status and that `reason`. The client is a
+ * pass-through, so these cases are a type change (RED under
+ * `npm run typecheck`, not at runtime).
+ *
  * `fetch` is stubbed; nothing touches the network.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -77,7 +92,12 @@ const DEFAULT_MY_SETTINGS: UserSettingsResponse = {
   notifications: { enabled: true, task_done: false },
 };
 
+/** The full org settings response (issue #169's shape; the #162 tools and residency inside it). */
 const ORG_SETTINGS: OrgSettingsResponse = {
+  profile: { display_name: 'Treuhand Muster AG', default_response_language: 'de' },
+  instructions: 'Antworte förmlich.\nNenne nie Kundennamen.',
+  security: { session_idle_timeout_minutes: 45, session_max_lifetime_hours: 8 },
+  retention: { trash_retention_days: 21, trash_min_days: 7, trash_max_days: 60 },
   tools: {
     gmail: false,
     google_calendar: true,
@@ -88,10 +108,15 @@ const ORG_SETTINGS: OrgSettingsResponse = {
     memory: true,
   },
   data_residency: false,
+  plan: { seats: 25, storage_quota: 10_737_418_240 },
 };
 
 /** A residency org: its stored switches plus `data_residency: true` (issue #162). */
 const RESIDENCY_ORG_SETTINGS: OrgSettingsResponse = {
+  profile: { display_name: 'Fiduciaire Exemple SA', default_response_language: 'fr' },
+  instructions: '',
+  security: { session_idle_timeout_minutes: 15, session_max_lifetime_hours: 72 },
+  retention: { trash_retention_days: 0, trash_min_days: 0, trash_max_days: 90 },
   tools: {
     gmail: true,
     google_calendar: false,
@@ -102,6 +127,29 @@ const RESIDENCY_ORG_SETTINGS: OrgSettingsResponse = {
     memory: false,
   },
   data_residency: true,
+  plan: { seats: 3, storage_quota: 1_073_741_824 },
+};
+
+/**
+ * Contract GH-169 §2: the GET body of a fresh org with no org_settings row
+ * (every column default, residency off, platform retention 0..90).
+ */
+const FRESH_ORG_SETTINGS: OrgSettingsResponse = {
+  profile: { display_name: 'Treuhand Muster AG', default_response_language: 'en' },
+  instructions: '',
+  security: { session_idle_timeout_minutes: 60, session_max_lifetime_hours: 12 },
+  retention: { trash_retention_days: 30, trash_min_days: 0, trash_max_days: 90 },
+  tools: {
+    gmail: true,
+    google_calendar: true,
+    google_drive: true,
+    outlook: true,
+    outlook_calendar: true,
+    onedrive: true,
+    memory: true,
+  },
+  data_residency: false,
+  plan: { seats: 10, storage_quota: 10_737_418_240 },
 };
 
 const GOOGLE_STATUS: OAuthConnectionStatus = {
@@ -474,6 +522,125 @@ describe('settings api patchOrgSettings', () => {
 
     expect(error).toBeInstanceOf(ApiError);
     expect((error as ApiError).status).toBe(403);
+  });
+});
+
+// --- Organization settings: profile, instructions, policies (issue #169) ---
+
+describe('settings api org settings full response (issue #169)', () => {
+  it('getOrgSettings resolves the fresh-org contract body unchanged, every section included', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, FRESH_ORG_SETTINGS));
+
+    const result = await getOrgSettings();
+
+    expect({ result, sections: Object.keys(result).sort() }).toStrictEqual({
+      result: FRESH_ORG_SETTINGS,
+      sections: ['data_residency', 'instructions', 'plan', 'profile', 'retention', 'security', 'tools'],
+    });
+  });
+
+  it('getOrgSettings resolves stored values verbatim (instructions with line breaks, clamped retention, plan)', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    expect(await getOrgSettings()).toStrictEqual(ORG_SETTINGS);
+  });
+
+  it('patchOrgSettings resolves the full response the server returns after the change', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, RESIDENCY_ORG_SETTINGS));
+
+    expect(await patchOrgSettings({ retention: { trash_retention_days: 0 } })).toStrictEqual(RESIDENCY_ORG_SETTINGS);
+  });
+});
+
+describe('settings api patchOrgSettings sections (issue #169)', () => {
+  const patches: Array<[string, OrgSettingsPatch]> = [
+    ['a display name', { profile: { display_name: 'Muster Treuhand GmbH' } }],
+    ['a response language', { profile: { default_response_language: 'it' } }],
+    ['the whole profile', { profile: { display_name: 'Neue AG', default_response_language: 'fr' } }],
+    ['new instructions', { instructions: 'Antworte kurz.\nNenne nie Kundennamen.' }],
+    ['cleared instructions', { instructions: '' }],
+    ['an idle timeout', { security: { session_idle_timeout_minutes: 30 } }],
+    ['a lifetime', { security: { session_max_lifetime_hours: 24 } }],
+    ['the whole security policy', { security: { session_idle_timeout_minutes: 480, session_max_lifetime_hours: 1 } }],
+    ['a retention of 0 days', { retention: { trash_retention_days: 0 } }],
+    [
+      'every section at once',
+      {
+        profile: { display_name: 'Neue AG', default_response_language: 'en' },
+        instructions: 'Réponds poliment.',
+        security: { session_idle_timeout_minutes: 15, session_max_lifetime_hours: 72 },
+        retention: { trash_retention_days: 90 },
+        tools: { memory: false },
+      },
+    ],
+  ];
+
+  it.each(patches)('sends PATCH /api/org/settings with exactly the patch as JSON (%s)', async (_label, patch) => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    await patchOrgSettings(patch);
+
+    expect({ request: sentRequest(), rawBody: sent().init.body }).toStrictEqual({
+      request: { method: 'PATCH', url: '/api/org/settings', body: patch, credentials: 'same-origin' },
+      rawBody: JSON.stringify(patch),
+    });
+  });
+
+  it('sends cleared instructions as exactly {"instructions":""}', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    await patchOrgSettings({ instructions: '' });
+
+    expect(sent().init.body).toBe('{"instructions":""}');
+  });
+
+  it('sends the instructions verbatim (surrounding whitespace, tabs, line breaks, umlauts)', async () => {
+    const instructions = '  Antworte förmlich.\r\n\tNenne nie Kundennamen.\n\n';
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, ORG_SETTINGS));
+
+    await patchOrgSettings({ instructions });
+
+    expect(JSON.parse(String(sent().init.body))).toStrictEqual({ instructions });
+  });
+
+  it('rejects the 400 trash bounds refusal with an ApiError carrying the status and the reason', async () => {
+    const detail = "The trash retention must be within the platform's bounds.";
+    fetchMock.mockResolvedValueOnce(jsonResponse(400, { detail, reason: 'trash_retention_bounds' }, 'Bad Request'));
+
+    const error = await thrownBy(() => patchOrgSettings({ retention: { trash_retention_days: 90 } }));
+
+    expect({
+      isApiError: error instanceof ApiError,
+      status: (error as ApiError).status,
+      reason: (error as ApiError).reason,
+      message: (error as ApiError).message,
+      requests: fetchMock.mock.calls.length,
+    }).toEqual({ isApiError: true, status: 400, reason: 'trash_retention_bounds', message: detail, requests: 1 });
+  });
+
+  it('rejects a 422 refusal (a read-only field named) with an ApiError and no reason', async () => {
+    fetchMock.mockResolvedValueOnce(
+      jsonResponse(422, { detail: [{ loc: ['body', 'data_residency'], msg: 'Extra inputs are not permitted', type: 'extra_forbidden' }] }),
+    );
+
+    const error = await thrownBy(() => patchOrgSettings({ instructions: 'x' }));
+
+    expect({
+      isApiError: error instanceof ApiError,
+      status: (error as ApiError).status,
+      reason: (error as ApiError).reason,
+    }).toEqual({ isApiError: true, status: 422, reason: undefined });
+  });
+
+  it('rejects the per-user rate limit 429 with an ApiError carrying the status', async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(429, { detail: 'Rate limit exceeded' }, 'Too Many Requests'));
+
+    const error = await thrownBy(() => patchOrgSettings({ security: { session_idle_timeout_minutes: 30 } }));
+
+    expect({ isApiError: error instanceof ApiError, status: (error as ApiError).status }).toEqual({
+      isApiError: true,
+      status: 429,
+    });
   });
 });
 

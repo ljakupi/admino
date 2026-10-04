@@ -15,10 +15,12 @@ What these tests pin down:
   refused at every level (``llm``, ``tools``, ``limits``, ``ui_language`` ...);
   strict bools; the theme is one of light, dark, system; at least one leaf
   value must be given (a null counts as not given).
-- ``OrgSettingsPatch`` / ``OrgToolsPatch``: ``tools`` is required; the seven
-  tool names of ``ToolsSettings`` only (an unknown tool such as ``files`` and
-  an ``org_id`` in the body are refused, never ignored); strict bools; at least
-  one tool given.
+- ``OrgSettingsPatch`` / ``OrgToolsPatch``: ``tools`` is an optional section
+  since GH-169 (next to profile, instructions, security and retention, pinned in
+  tests/test_org_settings_models.py); the seven tool names of ``ToolsSettings``
+  only (an unknown tool such as ``files`` and an ``org_id`` in the body are
+  refused, never ignored); strict bools; a tools-only patch needs at least one
+  tool given.
 - ``PlatformSettingsPatch``: ``llm`` is optional (GH-160 adds the ``limits``,
   ``files``, ``retention`` and ``security`` sections, so a ``limits`` key is now
   accepted); any other key is refused; an llm-only patch needs at least one llm
@@ -30,7 +32,8 @@ What these tests pin down:
 - ``UserSettingsResponse``, ``OrgSettingsResponse`` and
   ``PlatformSettingsResponse`` carry exactly their scope's sections (the
   platform one: llm, limits, files, retention, security since GH-160; the org
-  one: tools plus the required, read-only ``data_residency`` bool since GH-162).
+  one: tools plus the required, read-only ``data_residency`` bool since GH-162,
+  and profile, instructions, security, retention and plan since GH-169).
 - Validation errors of the request models never repeat the rejected input.
 - GH-35 (task-done pings): ``SettingsNotifications`` is ``{enabled: True,
   task_done: False}`` by default (pings start off; neither is a master switch
@@ -150,6 +153,22 @@ def _limits(**overrides: int) -> dict[str, int]:
     values = {name: low for name, (low, _) in _LIMIT_BOUNDS.items()}
     values.update(overrides)
     return values
+
+
+# GH-169: the org settings response's other sections (a fresh org's values).
+_ORG_SETTINGS_SECTIONS: dict[str, Any] = {
+    "profile": {"display_name": "Treuhand Muster AG", "default_response_language": "en"},
+    "instructions": "",
+    "security": {"session_idle_timeout_minutes": 60, "session_max_lifetime_hours": 12},
+    "retention": {"trash_retention_days": 30, "trash_min_days": 0, "trash_max_days": 90},
+    "plan": {"seats": 10, "storage_quota": 1024},
+}
+
+
+def _org_settings_sections() -> dict[str, Any]:
+    """Every OrgSettingsResponse field but tools and data_residency (GH-169), as JSON values
+    plus the GH-162 tools."""
+    return {**json.loads(json.dumps(_ORG_SETTINGS_SECTIONS)), "tools": ToolsSettings()}
 
 
 # ---------------------------------------------------------------------------
@@ -312,12 +331,16 @@ class TestOrgSettingsPatch:
         assert set(ToolsSettings.model_fields) == set(_TOOLS)
         assert set(fields) == set(ToolsSettings.model_fields)
 
-    def test_org_settings_patch_has_only_a_required_tools_field(self) -> None:
+    def test_org_settings_patch_tools_is_an_optional_section(self) -> None:
+        """GH-169: tools is one of five optional sections (OrgToolsPatch | None)."""
         fields = _model("OrgSettingsPatch").model_fields
 
-        assert set(fields) == {"tools"}
-        assert fields["tools"].annotation is _model("OrgToolsPatch")
-        assert fields["tools"].is_required()
+        assert set(fields) == {"profile", "instructions", "security", "retention", "tools"}
+        assert set(typing.get_args(fields["tools"].annotation)) == {
+            _model("OrgToolsPatch"),
+            type(None),
+        }
+        assert not fields["tools"].is_required()
 
     @pytest.mark.parametrize("tool", _TOOLS)
     @pytest.mark.parametrize("enabled", [True, False])
@@ -339,7 +362,10 @@ class TestOrgSettingsPatch:
         assert patch.model_dump(exclude_none=True) == {"tools": {"memory": False}}
 
     @pytest.mark.parametrize("payload", [{}, {"tools": None}])
-    def test_org_settings_patch_tools_is_required(self, payload: dict[str, Any]) -> None:
+    def test_org_settings_patch_without_tools_or_another_section_is_rejected(
+        self, payload: dict[str, Any]
+    ) -> None:
+        """GH-169: tools is optional, but a body giving nothing at all is still refused."""
         _rejects(_model("OrgSettingsPatch"), payload)
 
     @pytest.mark.parametrize(
@@ -629,18 +655,28 @@ class TestScopedSettingsResponses:
         }
 
     def test_org_settings_response_shape(self) -> None:
-        """GH-162 adds the org's data residency policy (required, read-only here)."""
+        """GH-162 adds the org's data residency policy (required, read-only here); GH-169
+        adds profile, instructions, security, retention and plan."""
         fields = _model("OrgSettingsResponse").model_fields
 
-        assert set(fields) == {"tools", "data_residency"}
+        assert set(fields) == {
+            "profile",
+            "instructions",
+            "security",
+            "retention",
+            "tools",
+            "data_residency",
+            "plan",
+        }
         assert fields["tools"].annotation is ToolsSettings
         assert fields["data_residency"].annotation is bool
         assert fields["data_residency"].is_required()
 
     def test_org_settings_response_defaults_dump(self) -> None:
-        body = _model("OrgSettingsResponse")(tools=ToolsSettings(), data_residency=False)
+        body = _model("OrgSettingsResponse")(**_org_settings_sections(), data_residency=False)
 
         assert body.model_dump() == {
+            **_ORG_SETTINGS_SECTIONS,
             "tools": dict.fromkeys(_TOOLS, True),
             "data_residency": False,
         }
@@ -648,7 +684,7 @@ class TestScopedSettingsResponses:
     def test_org_settings_response_without_data_residency_is_refused(self) -> None:
         """GH-162: a response can't silently omit the residency policy."""
         with pytest.raises(ValidationError) as error:
-            _model("OrgSettingsResponse")(tools=ToolsSettings())
+            _model("OrgSettingsResponse")(**_org_settings_sections())
 
         assert [tuple(item["loc"]) for item in error.value.errors()] == [("data_residency",)]
 

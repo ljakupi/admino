@@ -10,15 +10,17 @@ of tests/ and is made of five files:
   the FakeDb of tests/db_fakes.py) and the route catalog: ``ROUTES`` (every
   registered API route with its audience, gating capability and isolation
   kind), ``ROLE_MATRIX`` (#139 §2.1 spelled out from the tracker),
-  ``PENDING_CAPABILITIES`` and ``PROJECT_ROLES`` (#139 §2.2).
+  ``PENDING_CAPABILITIES``, ``SERVICE_CAPABILITIES`` and ``PROJECT_ROLES``
+  (#139 §2.2).
 - ``tests/test_tenancy.py`` (this file): the world fixture and its sanity
   check; route enumeration (every registered route has a catalog row and the
   catalog has no stale row, every non-public route depends on
-  ``server.require_session``, every capability is routed or pending, the
-  catalog agrees with ``access.can``); operator blindness (the Super Admin gets
-  403/404 with a bare ``{"detail": ...}`` on every member route, and platform
-  response models carry no title/name/content/file name field except the org
-  name); request bodies (every non-public body model forbids extra fields, so
+  ``server.require_session``, every capability is routed (by a route or by
+  a route's service) or pending, the catalog agrees with ``access.can``);
+  operator blindness (the Super Admin gets 403/404 with a bare
+  ``{"detail": ...}`` on every member route, and platform response models
+  carry no title/name/content/file name field except the org name); request
+  bodies (every non-public body model forbids extra fields, so
   a smuggled ``org_id``/``user_id`` is a 422 that changes nothing and echoes
   nothing; this absorbs #17's "request bodies" line); and rate limiting (every
   non-public route spends a per-user bucket, every public route a per-IP one,
@@ -36,7 +38,8 @@ below (and in ``_BODY_ROUTES`` when it takes a JSON body), its role cases in
 tests/test_tenancy_roles.py and its cross-org case in
 tests/test_tenancy_cross_org.py. The completeness tests of each file fail until
 all of these exist. A capability moves from ``PENDING_CAPABILITIES`` to the row
-of its first route.
+of its first route, or to ``SERVICE_CAPABILITIES`` when it gates part of an
+existing route's service (it must then share that route's roles).
 
 Inputs: the FakeDb world, the app from ``create_app()`` with a stub agent, real
 session cookies. Outputs: assertions only.
@@ -78,6 +81,7 @@ from tests.tenancy_world import (
     ROLE_MATRIX,
     ROLES,
     ROUTES,
+    SERVICE_CAPABILITIES,
     UNAUTHORIZED,
     Account,
     Role,
@@ -777,9 +781,10 @@ class TestCatalogConsistency:
         assert sorted(set(Capability) ^ set(ROLE_MATRIX)) == []
 
     def test_tenancy_every_capability_is_routed_xor_pending(self) -> None:
-        """A capability has a route (a ROUTES row) or a pending issue, never both, never
-        neither."""
+        """A capability has a route (a ROUTES row, or a route's service in
+        SERVICE_CAPABILITIES) or a pending issue, never both, never neither."""
         routed = {spec.capability for spec in ROUTES if spec.capability is not None}
+        routed |= set(SERVICE_CAPABILITIES)
         offenders = [
             f"{cap.value}: routed={cap in routed} pending={cap in PENDING_CAPABILITIES}"
             for cap in Capability
@@ -794,6 +799,37 @@ class TestCatalogConsistency:
     def test_tenancy_no_route_uses_a_pending_capability(self) -> None:
         """A routed capability is no longer pending."""
         assert [route_id(spec) for spec in ROUTES if spec.capability in PENDING_CAPABILITIES] == []
+
+    def test_tenancy_service_capability_routes_are_catalog_rows(self) -> None:
+        """Each SERVICE_CAPABILITIES entry names at least one route, and every route it
+        names is a ROUTES row (its role cases run on that row)."""
+        rows = {(spec.method, spec.path) for spec in ROUTES}
+        offenders = {
+            cap.value: sorted(set(routes) - rows)
+            for cap, routes in SERVICE_CAPABILITIES.items()
+            if not routes or not set(routes) <= rows
+        }
+
+        assert offenders == {}
+
+    def test_tenancy_service_capabilities_share_their_routes_roles(self) -> None:
+        """A service capability has exactly the roles of each route that checks it, so the
+        role cases of the route (tests/test_tenancy_roles.py) cover it too."""
+        specs = {(spec.method, spec.path): spec for spec in ROUTES}
+        offenders = [
+            f"{cap.value} on {method} {path}: {sorted(ROLE_MATRIX[cap])} != "
+            f"{sorted(allowed_roles(specs[(method, path)]))}"
+            for cap, routes in SERVICE_CAPABILITIES.items()
+            for method, path in routes
+            if (method, path) in specs
+            and set(ROLE_MATRIX[cap]) != set(allowed_roles(specs[(method, path)]))
+        ]
+
+        assert offenders == []
+
+    def test_tenancy_no_service_capability_is_pending(self) -> None:
+        """A capability checked by a routed service is no longer pending its issue."""
+        assert sorted(set(SERVICE_CAPABILITIES) & set(PENDING_CAPABILITIES)) == []
 
     def test_tenancy_pending_capabilities_name_their_issue(self) -> None:
         """Each pending capability names the issue that adds its route (e.g. "#185")."""

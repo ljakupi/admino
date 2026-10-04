@@ -1,5 +1,5 @@
 """Tests for admino.sessions — server-side sessions, session policies and the one
-Principal builder (GH-149, GH-152, GH-162).
+Principal builder (GH-149, GH-152, GH-162, GH-169).
 
 A login creates a ``sessions`` row holding the SHA-256 hash of a random 256-bit
 token; the raw token only ever lives in the ``admino_session`` cookie. Every
@@ -16,12 +16,14 @@ What these tests pin down:
   hours (default 12), ``last_seen_at`` touched at most once a minute, the purge
   running at least hourly. ``SESSION_LIFETIME`` is gone.
 - ``SessionPolicy``: a SealedModel with strict int fields inside those bounds and
-  ``idle_timeout`` / ``max_lifetime`` timedelta properties.
-  ``DEFAULT_ORG_SESSION_POLICY`` (members, until #169) is 60 min / 12 h. GH-160
-  retires ``PLATFORM_SESSION_POLICY`` and ``session_policy_for`` from this module:
-  the Super Admin policy is stored in ``platform_settings`` and
+  ``idle_timeout`` / ``max_lifetime`` timedelta properties; ``SessionPolicy()``
+  is 60 min / 12 h (the org_settings column defaults). GH-160 retires
+  ``PLATFORM_SESSION_POLICY`` and ``session_policy_for`` from this module: the
+  Super Admin policy is stored in ``platform_settings`` and
   ``scoped_settings.session_policy_for`` picks a kind's policy (tested in
-  tests/test_scoped_settings.py).
+  tests/test_scoped_settings.py). GH-169 retires ``DEFAULT_ORG_SESSION_POLICY``:
+  a member's policy is their org's stored one, and no module under src/admino
+  names the constant any more.
 - ``apply_super_admin_policy(executor, policy)`` (GH-160): a coroutine issuing one
   ``UPDATE sessions SET idle_timeout_minutes = $1, expires_at = created_at +
   make_interval(hours => $2) WHERE user_id IN (SELECT id FROM users WHERE kind =
@@ -29,6 +31,18 @@ What these tests pin down:
   updated row count. Only Super Admin sessions change; one older than the new
   lifetime, or idle past the new timeout, no longer resolves; members' sessions are
   untouched.
+- ``apply_org_policy(executor, org_id, policy)`` (GH-169): a coroutine issuing one
+  ``UPDATE sessions SET idle_timeout_minutes = $2, expires_at = created_at +
+  make_interval(hours => $3) WHERE user_id IN (SELECT id FROM users WHERE org_id =
+  $1) AND expires_at > now() AND last_seen_at + make_interval(mins =>
+  idle_timeout_minutes) > now()`` with ``(org_id, idle, hours)`` bound (never
+  inlined); it returns the updated row count. Every LIVE session of every user of
+  that org (any role or status) changes; another org's sessions and the Super
+  Admin's never do. One older than the new lifetime, or idle past the new timeout,
+  no longer resolves; a longer lifetime moves the expiry out to ``created_at`` + the
+  lifetime (72 hours at most). A session that had already ended (expired, or idle
+  past its OLD timeout) but isn't purged yet is neither changed nor counted, so a
+  longer policy never brings it back.
 - ``create_session(executor, *, user_id, policy, ip, user_agent)``: one INSERT of
   token_hash, user_id, expires_at (``now() + $n::interval`` on the database clock,
   bound to the policy's lifetime), idle_timeout_minutes (the policy's), the client
@@ -107,6 +121,8 @@ from tests.db_fakes import (
     EXPIRED_RE,
     ID_PARAM_RE,
     IDLE_GONE_RE,
+    LIVE_EXPIRY_RE,
+    LIVE_IDLE_RE,
     NOW_SQL,
     ORG_ID,
     OTHER_ORG_ID,
@@ -531,22 +547,34 @@ class TestSessionPolicy:
 
 
 # ---------------------------------------------------------------------------
-# 3. The org default policy; the platform policy moved out (GH-152, GH-160)
+# 3. No default policies here: org and platform policies are stored
+#    (GH-152, GH-160, GH-169)
 # ---------------------------------------------------------------------------
 
 
 class TestDefaultPolicies:
-    """Members get the org default (until #169 stores org policies). Since GH-160 the
-    Super Admin policy is a stored platform default, picked by
-    scoped_settings.session_policy_for, so this module holds neither a platform policy
-    nor the per-kind lookup."""
+    """Since GH-160 the Super Admin policy is a stored platform default and since GH-169
+    a member's policy is their org's stored one (org_settings), both picked by
+    scoped_settings.session_policy_for, so this module holds neither a platform policy,
+    an org default nor the per-kind lookup. ``SessionPolicy()`` (60 min / 12 h, tested
+    above) equals the org_settings column defaults."""
 
-    def test_sessions_default_org_policy_is_60_minutes_and_12_hours(self) -> None:
-        """DEFAULT_ORG_SESSION_POLICY is a SessionPolicy of 60 minutes idle, 12 hours."""
-        policy = sessions_mod.DEFAULT_ORG_SESSION_POLICY
+    def test_sessions_default_org_policy_is_gone(self) -> None:
+        """GH-169 cleanup: the code default for members (DEFAULT_ORG_SESSION_POLICY) is
+        retired; new sessions take the org's stored policy."""
+        assert not hasattr(sessions_mod, "DEFAULT_ORG_SESSION_POLICY")
 
-        assert type(policy) is sessions_mod.SessionPolicy
-        assert (policy.idle_timeout_minutes, policy.max_lifetime_hours) == (60, 12)
+    def test_sessions_default_org_policy_is_named_nowhere_in_the_source(self) -> None:
+        """No caller of the retired constant remains under src/admino (auth, invitations
+        and scoped_settings read the org's stored policy instead)."""
+        pattern = re.compile(r"\bDEFAULT_ORG_SESSION_POLICY\b")
+        hits = sorted(
+            str(path.relative_to(_SRC_DIR))
+            for path in _SRC_DIR.rglob("*.py")
+            if pattern.search(path.read_text(encoding="utf-8"))
+        )
+
+        assert hits == []
 
     @pytest.mark.parametrize("name", ["PLATFORM_SESSION_POLICY", "session_policy_for"])
     def test_sessions_platform_policy_lookup_is_gone(self, name: str) -> None:
@@ -692,6 +720,308 @@ class TestApplySuperAdminPolicy:
         resolved = await resolve_session(db.pool, token)
         assert resolved is not None
         assert resolved.principal.user_id == admin
+
+
+# ---------------------------------------------------------------------------
+# 3c. apply_org_policy: an org's open sessions follow its policy change (GH-169)
+# ---------------------------------------------------------------------------
+
+# The one statement, normalized: $1 the org, $2 the idle timeout, $3 the lifetime in
+# hours (a uuid cast on $1 and an int cast on $2/$3 are fine), then the two live-only
+# predicates of contract §3 (the shared spellings of tests/db_fakes.py, either order),
+# which read the OLD row values so an ended session is never re-timed.
+_ORG_POLICY_SCOPE = (
+    r"update sessions set idle_timeout_minutes = \$2(?:::int(?:eger|4)?)?, "
+    r"expires_at = created_at \+ make_interval\(hours => \$3(?:::int(?:eger|4)?)?\) "
+    r"where user_id in \(select id from users where org_id = \$1(?:::uuid)?\) "
+)
+_LIVE_ONLY = rf"(?:and {LIVE_EXPIRY_RE} and {LIVE_IDLE_RE}|and {LIVE_IDLE_RE} and {LIVE_EXPIRY_RE})"
+_ORG_POLICY_SQL = re.compile(_ORG_POLICY_SCOPE + _LIVE_ONLY)
+
+
+def _ended_by_expiry(db: FakeDb, user_id: uuid.UUID) -> str:
+    """A session of the user that expired an hour ago (opened 13 hours ago under 12) but
+    isn't purged yet. Its idle side is live (seen 61 minutes ago, 480-minute timeout),
+    so only its expiry has ended it."""
+    return db.open_session(
+        user_id,
+        idle_timeout_minutes=480,
+        last_seen_ago=timedelta(minutes=61),
+        expires_in=-timedelta(hours=1),
+        created_ago=timedelta(hours=13),
+    )
+
+
+def _ended_by_idle(db: FakeDb, user_id: uuid.UUID) -> str:
+    """A session of the user seen 45 minutes ago under a 30-minute idle timeout, not
+    purged yet. Its expiry is hours away, so only its idle timeout has ended it."""
+    return db.open_session(user_id, idle_timeout_minutes=30, last_seen_ago=timedelta(minutes=45))
+
+
+class TestApplyOrgPolicy:
+    """One parameterized UPDATE gives every LIVE session of every user of one org the
+    org's new idle timeout and ``expires_at = created_at + <lifetime>``; another org's
+    sessions and the Super Admin's are never touched, and a session that had already
+    ended stays ended (never re-timed, never counted)."""
+
+    def test_sessions_apply_org_policy_is_a_coroutine(self) -> None:
+        assert inspect.iscoroutinefunction(sessions_mod.apply_org_policy)
+
+    def test_sessions_apply_org_policy_takes_executor_org_id_and_policy(self) -> None:
+        """The contract's signature: (executor, org_id, policy), in this order."""
+        parameters = list(inspect.signature(sessions_mod.apply_org_policy).parameters)
+
+        assert parameters == ["executor", "org_id", "policy"]
+
+    async def test_sessions_apply_org_policy_issues_the_exact_update(self) -> None:
+        """One execute(): the UPDATE of the contract, (org_id, idle, hours) bound as
+        $1, $2, $3."""
+        executor = _StatusExecutor("UPDATE 2")
+
+        await sessions_mod.apply_org_policy(executor, _ORG_ID, _policy(idle=30, lifetime=4))
+
+        assert len(executor.calls) == 1, executor.calls
+        method, sql, args = executor.calls[0]
+        assert method == "execute"
+        assert _ORG_POLICY_SQL.fullmatch(_norm(sql)), sql
+        assert args == (_ORG_ID, 30, 4)
+        assert [type(arg) for arg in args[1:]] == [int, int]
+
+    @pytest.mark.parametrize(
+        ("status", "count"), [("UPDATE 0", 0), ("UPDATE 1", 1), ("UPDATE 17", 17)]
+    )
+    async def test_sessions_apply_org_policy_returns_the_updated_count(
+        self, status: str, count: int
+    ) -> None:
+        executor = _StatusExecutor(status)
+
+        result = await sessions_mod.apply_org_policy(executor, _ORG_ID, _policy())
+
+        assert result == count
+        assert type(result) is int
+
+    async def test_sessions_apply_org_policy_never_inlines_the_values(self) -> None:
+        """The org id and both ints travel as bind values, never in the SQL text."""
+        executor = _StatusExecutor("UPDATE 1")
+
+        await sessions_mod.apply_org_policy(executor, _ORG_ID, _policy(idle=437, lifetime=61))
+
+        _, sql, args = executor.calls[0]
+        assert str(_ORG_ID) not in sql
+        assert _ORG_ID.hex not in sql
+        assert "437" not in sql
+        assert "61" not in sql
+        assert args == (_ORG_ID, 437, 61)
+
+    async def test_sessions_apply_org_policy_retimes_every_session_of_the_org_only(
+        self,
+    ) -> None:
+        """Every role and status of the org follows (Org Admin, Editor, a deactivated
+        Viewer, two sessions of one user); another org's member and the Super Admin keep
+        their rows exactly."""
+        db = FakeDb()
+        admin = db.add_account(org_id=ORG_ID, role="org_admin")
+        editor = db.add_account(org_id=ORG_ID, role="editor")
+        viewer = db.add_account(org_id=ORG_ID, role="viewer", status="deactivated")
+        tokens = [
+            db.open_session(admin),
+            db.open_session(editor),
+            db.open_session(editor),
+            db.open_session(viewer),
+        ]
+        others = [
+            db.open_session(db.add_account(org_id=OTHER_ORG_ID, role="org_admin")),
+            db.open_session(_super_admin(db)),
+        ]
+        others_before = [dict(db.session(token)) for token in others]
+
+        count = await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=30, lifetime=4))
+
+        assert count == 4
+        for token in tokens:
+            row = db.session(token)
+            assert row["idle_timeout_minutes"] == 30
+            assert row["expires_at"] == row["created_at"] + timedelta(hours=4)
+        assert [db.session(token) for token in others] == others_before
+
+    @pytest.mark.parametrize(
+        ("target", "untouched"),
+        [
+            pytest.param(ORG_ID, OTHER_ORG_ID, id="org"),
+            pytest.param(OTHER_ORG_ID, ORG_ID, id="other-org"),
+        ],
+    )
+    async def test_sessions_apply_org_policy_follows_the_given_org(
+        self, target: uuid.UUID, untouched: uuid.UUID
+    ) -> None:
+        """The org is the bound argument: whichever org is given changes, the other
+        never does."""
+        db = FakeDb()
+        changed = db.open_session(db.add_account(org_id=target, role="editor"))
+        kept = db.open_session(db.add_account(org_id=untouched, role="editor"))
+        kept_before = dict(db.session(kept))
+
+        count = await sessions_mod.apply_org_policy(db.pool, target, _policy(idle=45, lifetime=6))
+
+        assert count == 1
+        assert db.session(changed)["idle_timeout_minutes"] == 45
+        assert db.session(kept) == kept_before
+
+    async def test_sessions_apply_org_policy_without_org_sessions_is_zero(self) -> None:
+        """An org whose users hold no session: nothing changes anywhere."""
+        db = FakeDb()
+        db.add_account(org_id=ORG_ID, role="org_admin")
+        other_token = db.open_session(db.add_account(org_id=OTHER_ORG_ID, role="editor"))
+        other_before = dict(db.session(other_token))
+
+        count = await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=30, lifetime=4))
+
+        assert count == 0
+        assert db.session(other_token) == other_before
+
+    async def test_sessions_apply_org_policy_ends_a_session_older_than_the_lifetime(
+        self,
+    ) -> None:
+        """Opened 5 hours ago: live under 12 hours, its expiry in the past under 4."""
+        db = FakeDb()
+        token = db.open_session(
+            db.add_account(org_id=ORG_ID, role="editor"),
+            created_ago=timedelta(hours=5),
+            expires_in=timedelta(hours=7),
+        )
+        assert await resolve_session(db.pool, token) is not None
+
+        await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=60, lifetime=4))
+
+        assert db.session(token)["expires_at"] <= datetime.now(UTC)
+        assert await resolve_session(db.pool, token) is None
+
+    async def test_sessions_apply_org_policy_ends_a_session_idle_past_the_timeout(
+        self,
+    ) -> None:
+        """Seen 40 minutes ago: gone under a 30-minute idle timeout; another org's member
+        and a Super Admin seen as long ago keep their sessions."""
+        db = FakeDb()
+        ago = timedelta(minutes=40)
+        token = db.open_session(db.add_account(org_id=ORG_ID, role="editor"), last_seen_ago=ago)
+        other_token = db.open_session(
+            db.add_account(org_id=OTHER_ORG_ID, role="editor"), last_seen_ago=ago
+        )
+        admin_token = db.open_session(_super_admin(db), last_seen_ago=ago)
+
+        await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=30, lifetime=12))
+
+        assert await resolve_session(db.pool, token) is None
+        assert await resolve_session(db.pool, other_token) is not None
+        assert await resolve_session(db.pool, admin_token) is not None
+
+    async def test_sessions_apply_org_policy_longer_lifetime_extends_the_expiry(
+        self,
+    ) -> None:
+        """Opened 10 hours ago under 12 hours: with 72 hours it expires at created_at +
+        72 hours (never later) and still resolves."""
+        db = FakeDb()
+        token = db.open_session(
+            db.add_account(org_id=ORG_ID, role="editor"),
+            created_ago=timedelta(hours=10),
+            expires_in=timedelta(hours=2),
+        )
+
+        await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=60, lifetime=72))
+
+        row = db.session(token)
+        assert row["expires_at"] == row["created_at"] + timedelta(hours=72)
+        assert await resolve_session(db.pool, token) is not None
+
+    async def test_sessions_apply_org_policy_keeps_a_session_inside_the_policy(
+        self,
+    ) -> None:
+        db = FakeDb()
+        editor = db.add_account(org_id=ORG_ID, role="editor")
+        token = db.open_session(editor)
+
+        await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=30, lifetime=4))
+
+        resolved = await resolve_session(db.pool, token)
+        assert resolved is not None
+        assert resolved.principal.user_id == editor
+
+    async def test_sessions_apply_org_policy_expired_session_stays_ended_under_a_longer_lifetime(
+        self,
+    ) -> None:
+        """Expired an hour ago (12-hour lifetime, not purged yet): 72 hours would put
+        created_at + lifetime 59 hours ahead and a 480-minute idle timeout keeps its idle
+        side live, yet the row is left exactly as it was and still doesn't resolve."""
+        db = FakeDb()
+        token = _ended_by_expiry(db, db.add_account(org_id=ORG_ID, role="editor"))
+        before = dict(db.session(token))
+        assert await resolve_session(db.pool, token) is None
+
+        await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=480, lifetime=72))
+
+        assert db.session(token) == before
+        assert await resolve_session(db.pool, token) is None
+
+    async def test_sessions_apply_org_policy_idle_ended_session_stays_ended_under_a_longer_timeout(
+        self,
+    ) -> None:
+        """Idle 45 minutes under its old 30-minute timeout (not purged yet): a 60-minute
+        timeout would put its idle deadline 15 minutes ahead, yet the row is left exactly
+        as it was and still doesn't resolve."""
+        db = FakeDb()
+        token = _ended_by_idle(db, db.add_account(org_id=ORG_ID, role="editor"))
+        before = dict(db.session(token))
+        assert await resolve_session(db.pool, token) is None
+
+        await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=60, lifetime=12))
+
+        assert db.session(token) == before
+        assert await resolve_session(db.pool, token) is None
+
+    async def test_sessions_apply_org_policy_counts_only_the_live_sessions(self) -> None:
+        """One live, one expired and one idle-ended session of the org: the count is 1, the
+        live one is re-timed as before, the two ended ones keep their rows exactly."""
+        db = FakeDb()
+        editor = db.add_account(org_id=ORG_ID, role="editor")
+        live = db.open_session(editor)
+        ended = [_ended_by_expiry(db, editor), _ended_by_idle(db, editor)]
+        ended_before = [dict(db.session(token)) for token in ended]
+
+        count = await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=480, lifetime=72))
+
+        assert count == 1
+        row = db.session(live)
+        assert row["idle_timeout_minutes"] == 480
+        assert row["expires_at"] == row["created_at"] + timedelta(hours=72)
+        assert [db.session(token) for token in ended] == ended_before
+
+    async def test_sessions_apply_org_policy_with_only_ended_sessions_is_zero(self) -> None:
+        """Every session of the org had already ended: nothing is updated or counted."""
+        db = FakeDb()
+        editor = db.add_account(org_id=ORG_ID, role="editor")
+        ended = [_ended_by_expiry(db, editor), _ended_by_idle(db, editor)]
+        ended_before = [dict(db.session(token)) for token in ended]
+
+        count = await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=480, lifetime=72))
+
+        assert count == 0
+        assert [db.session(token) for token in ended] == ended_before
+
+    async def test_sessions_apply_org_policy_counts_a_live_session_the_new_policy_ends(
+        self,
+    ) -> None:
+        """The WHERE reads the OLD values: seen 40 minutes ago under 60 minutes, the
+        session is live, so it is re-timed and counted, and under 30 minutes it ends."""
+        db = FakeDb()
+        token = db.open_session(
+            db.add_account(org_id=ORG_ID, role="editor"), last_seen_ago=timedelta(minutes=40)
+        )
+
+        count = await sessions_mod.apply_org_policy(db.pool, ORG_ID, _policy(idle=30, lifetime=12))
+
+        assert count == 1
+        assert db.session(token)["idle_timeout_minutes"] == 30
+        assert await resolve_session(db.pool, token) is None
 
 
 # ---------------------------------------------------------------------------

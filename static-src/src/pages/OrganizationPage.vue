@@ -9,8 +9,11 @@
  * Issue #162: the Org Admin's per-service switches move here too
  * (`OrgServicesCard.vue`), gated the same way by `canManageOrgSettings`.
  *
- * Issue #165: a Users tab (`OrgUsersPanel.vue`) joins the Permissions &
- * services tab. The active tab is driven by the `?tab=` query
+ * Issue #169: the services card moved into the Settings tab
+ * (`OrgSettingsPanel.vue`); Permissions keeps the matrix and critical card.
+ *
+ * Issue #165: a Users tab (`OrgUsersPanel.vue`) joins the Permissions
+ * tab. The active tab is driven by the `?tab=` query
  * (`services/orgUsers.ts`'s `orgTabFrom`, Users is the default) so the tab
  * survives a reload or a shared link; switching tabs updates the query with
  * `router.replace` (no new history entry).
@@ -21,10 +24,10 @@ import { Building2 } from 'lucide-vue-next';
 import EmptyState from '@/components/EmptyState.vue';
 import PermissionMatrix from '@/components/PermissionMatrix.vue';
 import CriticalPermissionsCard from '@/components/CriticalPermissionsCard.vue';
-import OrgServicesCard from '@/components/OrgServicesCard.vue';
 import OrgUsersPanel from '@/components/OrgUsersPanel.vue';
+import OrgSettingsPanel from '@/components/OrgSettingsPanel.vue';
 import { useAuthStore } from '@/stores/auth';
-import { canManageOrgPermissions, canManageOrgSettings } from '@/services/access';
+import { canManageOrgPermissions } from '@/services/access';
 import { orgTabFrom, type OrgTab } from '@/services/orgUsers';
 import { t } from '@/i18n';
 
@@ -32,7 +35,6 @@ const route = useRoute();
 const router = useRouter();
 const auth = useAuthStore();
 const canManage = computed(() => canManageOrgPermissions(auth.role));
-const canManageServices = computed(() => canManageOrgSettings(auth.role));
 const activeTab = computed<OrgTab>(() => orgTabFrom(route.query.tab));
 
 function selectTab(tab: OrgTab): void {
@@ -61,6 +63,16 @@ function selectTab(tab: OrgTab): void {
             type="button"
             role="tab"
             class="tab-btn"
+            :class="{ on: activeTab === 'settings' }"
+            :aria-selected="activeTab === 'settings'"
+            @click="selectTab('settings')"
+          >
+            {{ t('organization.tabs.settings') }}
+          </button>
+          <button
+            type="button"
+            role="tab"
+            class="tab-btn"
             :class="{ on: activeTab === 'permissions' }"
             :aria-selected="activeTab === 'permissions'"
             @click="selectTab('permissions')"
@@ -71,8 +83,8 @@ function selectTab(tab: OrgTab): void {
       </header>
       <div class="page-content">
         <OrgUsersPanel v-if="activeTab === 'users'" />
+        <OrgSettingsPanel v-else-if="activeTab === 'settings'" @open-permissions="selectTab('permissions')" />
         <template v-else>
-          <OrgServicesCard v-if="canManageServices" />
           <PermissionMatrix />
           <CriticalPermissionsCard />
         </template>

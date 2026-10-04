@@ -26,7 +26,8 @@ Outputs (the expectations):
 
 Completeness: a new non-public ``ROUTES`` row fails
 ``test_tenancy_roles_every_non_public_route_has_a_setup`` until it gets a
-setup here; a capability that is neither routed nor pending in
+setup here; a capability that is neither routed (by a route, or by the
+service of routes with role cases in ``SERVICE_CAPABILITIES``) nor pending in
 ``PENDING_CAPABILITIES`` fails the §2.1 coverage test.
 
 Security notes:
@@ -61,6 +62,7 @@ from tests.tenancy_world import (
     ROLE_MATRIX,
     ROLES,
     ROUTES,
+    SERVICE_CAPABILITIES,
     Account,
     Role,
     RouteSpec,
@@ -672,8 +674,18 @@ class TestRoleCaseCoverage:
         assert set(by_route) == {(spec.method, spec.path) for spec in _NON_PUBLIC}
 
     def test_tenancy_roles_every_routed_capability_has_role_cases(self) -> None:
-        """§2.1: every capability is either exercised by a role case or pending its issue."""
+        """§2.1: every capability is either exercised by a role case or pending its issue.
+
+        A service capability counts as exercised when every route whose service
+        checks it has role cases (tests/test_tenancy.py pins that it shares their roles).
+        """
         exercised = {spec.capability for spec, _role in _ROLE_CASES if spec.capability is not None}
+        cased_routes = {(spec.method, spec.path) for spec, _role in _ROLE_CASES}
+        exercised |= {
+            capability
+            for capability, routes in SERVICE_CAPABILITIES.items()
+            if routes and set(routes) <= cased_routes
+        }
 
         assert {
             "uncovered": sorted(set(Capability) - exercised - set(PENDING_CAPABILITIES)),

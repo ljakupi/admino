@@ -27,7 +27,8 @@ What these tests pin down:
 - ``GET /api/auth/invitations/{token}`` (public) → 200 exactly ``{"org_name",
   "role", "email"}``; ``POST /api/auth/invitations/{token}/accept {name,
   password}`` (public) → 204 with the ``admino_session`` cookie (HttpOnly,
-  SameSite=Strict, Path=/, Max-Age = the org policy's lifetime, Secure iff
+  SameSite=Strict, Path=/, Max-Age = the lifetime of the invited org's stored
+  session policy (GH-169: its org_settings row), Secure iff
   ``server.cookie_secure``). Every link that can't be used → 404 ``{"detail":
   "This invitation link is invalid or has expired."}`` (a malformed one before
   any database call); a password the policy refuses → 422 ``{"detail",
@@ -63,7 +64,6 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from admino import passwords, server
-from admino import sessions as sessions_mod
 from admino.access import Capability
 from admino.server import create_app
 from tests.db_fakes import (
@@ -1406,22 +1406,25 @@ class TestAcceptRoute:
         )
         assert body["ui_language"] == "fr"
 
-    def test_invitations_api_accept_uses_the_org_session_policy(
-        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setattr(
-            sessions_mod,
-            "DEFAULT_ORG_SESSION_POLICY",
-            sessions_mod.SessionPolicy(idle_timeout_minutes=20, max_lifetime_hours=2),
-        )
+    def test_invitations_api_accept_uses_the_org_session_policy(self, db: FakeDb) -> None:
+        """GH-169: the invited org's stored policy (its org_settings row: 20 minutes / 2
+        hours) sets the cookie's Max-Age and the session row; another org's stored policy
+        (90 minutes / 24 hours) doesn't apply."""
         _, session = _admin(db)
+        db.add_org(OTHER_ORG_ID)
+        db.add_org_settings(ORG_ID, session_idle_timeout_minutes=20, session_max_lifetime_hours=2)
+        db.add_org_settings(
+            OTHER_ORG_ID, session_idle_timeout_minutes=90, session_max_lifetime_hours=24
+        )
         client = _client(_app())
         _, token = _invite(db, client, session)
 
         value, attributes = _session_set_cookie(_accept(client, token))
 
         assert attributes.get("max-age") == "7200"
-        assert db.session(value)["idle_timeout_minutes"] == 20
+        row = db.session(value)
+        assert row["idle_timeout_minutes"] == 20
+        assert row["expires_at"] - row["created_at"] == timedelta(hours=2)
 
     def test_invitations_api_accept_is_audited_with_the_client_ip(self, db: FakeDb) -> None:
         _, session = _admin(db)

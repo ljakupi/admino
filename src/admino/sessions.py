@@ -8,14 +8,14 @@ session, re-reading the user's row, and builds the ``Principal`` from that row
 
 Session policies (GH-152): a session ends after an idle timeout (15 to 480
 minutes, default 60) or at the end of its lifetime (1 to 72 hours, default
-12), whichever comes first. A member gets their org's policy (the default
-until #169 stores it), a Super Admin the platform policy stored in
-``platform_settings`` (GH-160; ``scoped_settings.session_policy_for`` picks a
-kind's policy). Each row stores its own idle timeout and expiry, set at
-login, so a later org policy change doesn't alter open sessions; a changed
-platform policy re-times every open Super Admin session
-(``apply_super_admin_policy``). Ending a session deletes its row, and a
-background job purges the rows that expired or went idle.
+12), whichever comes first. A member gets their org's policy stored in
+``org_settings`` (GH-169), a Super Admin the platform policy stored in
+``platform_settings`` (GH-160); ``scoped_settings.session_policy_for`` picks
+a kind's policy. Each row stores its own idle timeout and expiry, set at
+login. A changed org policy re-times the org's live sessions
+(``apply_org_policy``), a changed platform policy every open Super Admin
+session (``apply_super_admin_policy``). Ending a session deletes its row, and
+a background job purges the rows that expired or went idle.
 
 The OAuth callback (GH-162) re-resolves the session that started an
 authorization by its row id (``resolve_session_by_id``): the same checks as
@@ -24,13 +24,14 @@ the token lookup, but it never touches ``last_seen_at``.
 Inputs: a database executor (the pool or a connection) plus a raw session
 token or (the OAuth callback) a session id; the user id, policy, client IP
 and user agent of a new session; the user or org whose sessions all end; the
-new Super Admin policy.
+new Super Admin policy, or an org and its new policy.
 Outputs: the raw token of a new session (``create_session``), the
 ``AuthenticatedSession`` of a usable session or None (``resolve_session``,
 ``resolve_session_by_id``),
 nothing (``revoke_session``), the number of rows deleted
 (``revoke_user_sessions``, ``revoke_org_sessions``,
-``purge_expired_sessions``) or re-timed (``apply_super_admin_policy``).
+``purge_expired_sessions``) or re-timed (``apply_super_admin_policy``,
+``apply_org_policy``).
 
 Security notes:
 - The one Principal builder: this is the only module that builds an
@@ -55,6 +56,11 @@ Security notes:
 - A Super Admin policy change applies at once: the expiry becomes
   ``created_at`` plus the new lifetime, so a session older than it, or idle
   past the new timeout, stops resolving. Members' sessions are never touched.
+- An org policy change (GH-169) applies the same way to the live sessions of
+  that org's users only, the org a bind parameter: never another org's or a
+  Super Admin's. A session that had already ended (expired, or idle past its
+  old timeout) but isn't purged yet is left alone, so a longer policy never
+  revives it.
 - Only the token's hash is stored or queried; the raw token is never logged
   and never sent to the database. A token that can't be a
   ``secrets.token_urlsafe(32)`` value is refused without a query. Logs carry
@@ -154,6 +160,18 @@ _SUPER_ADMIN_POLICY_SQL: Final = """
     WHERE user_id IN (SELECT id FROM users WHERE kind = 'super_admin')
 """
 
+# GH-169: every LIVE session of one org's users takes the org's new policy.
+# The live predicates read the old row values, so a session that had already
+# ended (not purged yet) is never re-timed back to life.
+_ORG_POLICY_SQL: Final = """
+    UPDATE sessions
+    SET idle_timeout_minutes = $2,
+        expires_at = created_at + make_interval(hours => $3)
+    WHERE user_id IN (SELECT id FROM users WHERE org_id = $1)
+      AND expires_at > now()
+      AND last_seen_at + make_interval(mins => idle_timeout_minutes) > now()
+"""
+
 # The same boundaries resolve_session applies: "<=" means gone.
 _PURGE_SQL: Final = """
     DELETE FROM sessions
@@ -196,10 +214,6 @@ class SessionPolicy(SealedModel):
     def max_lifetime(self) -> timedelta:
         """The maximum lifetime as a timedelta."""
         return timedelta(hours=self.max_lifetime_hours)
-
-
-# The policy a member's new session gets until #169 stores org policies.
-DEFAULT_ORG_SESSION_POLICY: Final = SessionPolicy()
 
 
 class AuthenticatedSession(SealedModel):
@@ -448,6 +462,30 @@ async def apply_super_admin_policy(executor: Executor, policy: SessionPolicy) ->
     """
     status = await executor.execute(
         _SUPER_ADMIN_POLICY_SQL, policy.idle_timeout_minutes, policy.max_lifetime_hours
+    )
+    return _row_count(status)
+
+
+async def apply_org_policy(executor: Executor, org_id: UUID, policy: SessionPolicy) -> int:
+    """Give every live session of an org's users the org's new policy with one UPDATE (GH-169).
+
+    Each live session of a user of that org (any role or status) takes the
+    policy's idle timeout and expires at its ``created_at`` plus the policy's
+    lifetime (on the database clock), so a session older than the new
+    lifetime, or idle past the new timeout, ends at once. A session that had
+    already ended (expired, or idle past its old timeout) is neither changed
+    nor counted. Another org's sessions and the Super Admin's are untouched.
+
+    Args:
+        executor: The pool or a connection (inside the caller's transaction).
+        org_id: The organization whose users' sessions follow the policy.
+        policy: The org's new session policy.
+
+    Returns:
+        The number of session rows updated.
+    """
+    status = await executor.execute(
+        _ORG_POLICY_SQL, org_id, policy.idle_timeout_minutes, policy.max_lifetime_hours
     )
     return _row_count(status)
 

@@ -43,9 +43,11 @@ What these tests pin down (the GH-159 and GH-160 implementation contracts):
   (``InvalidPlatformSettingsError``). A no-op writes nothing; an audit failure
   rolls the row and the sessions back and keeps the cache; the cache takes
   the new settings only after the commit and equals the return value.
-- ``session_policy_for``: "member" is ``sessions.DEFAULT_ORG_SESSION_POLICY``
-  (read at call time, no query), "super_admin" is the stored security
-  policy (cached), anything else a ValueError without a query.
+- ``session_policy_for``: "member" is the member's org's stored policy
+  (GH-169: one org_settings read at call time; a missing row is
+  ``sessions.SessionPolicy()``; the rest in tests/test_org_settings.py),
+  "super_admin" is the stored security policy (cached), anything else a
+  ValueError without a query.
 - Authorization through ``access.can`` before any statement:
   ``account.manage`` for the user scope (every role, the Super Admin
   included), ``org.settings.manage`` for the org scope (Org Admin only),
@@ -78,7 +80,8 @@ What these tests pin down (the GH-159 and GH-160 implementation contracts):
   tenant's org id (another org's value never leaks), returns True when the org
   row is missing (fail closed), needs no capability and writes nothing.
   ``get_org_settings`` / ``update_org_settings`` responses carry
-  ``data_residency`` (the actor's org; the stored switches unchanged), a
+  ``data_residency`` (the actor's org; the stored switches unchanged; GH-169
+  widened the response, so these tests compare its tools and residency), a
   Google/Microsoft switch is still stored and audited while residency is on,
   and ``org_tools_enabled`` keeps returning the stored switches.
 - ``seed_platform_settings``: one upsert; the first boot stores config.yaml's
@@ -516,6 +519,13 @@ def _bound(db: FakeDb, value: uuid.UUID) -> bool:
 def _tools(result: Any) -> dict[str, bool]:
     """The tools of an OrgSettingsResponse as a plain dict."""
     return {tool: getattr(result.tools, tool) for tool in TOOL_NAMES}
+
+
+def _tools_and_residency(result: Any) -> dict[str, Any]:
+    """The tools and data_residency of an OrgSettingsResponse dump (GH-169 widened the
+    response: the other sections are tests/test_org_settings.py's)."""
+    dumped = result.model_dump()
+    return {"tools": dumped["tools"], "data_residency": dumped["data_residency"]}
 
 
 def _user_values(result: Any) -> tuple[str, bool]:
@@ -1950,7 +1960,7 @@ class TestOrgSettingsResidency:
 
         result = await svc.get_org_settings(db.pool, actor=admin)
 
-        assert result.model_dump() == {"tools": _ALL_ON, "data_residency": residency}
+        assert _tools_and_residency(result) == {"tools": _ALL_ON, "data_residency": residency}
         assert type(result.data_residency) is bool
 
     async def test_scoped_settings_get_org_shows_the_stored_switches_under_residency(
@@ -1964,7 +1974,7 @@ class TestOrgSettingsResidency:
 
         result = await svc.get_org_settings(db.pool, actor=admin)
 
-        assert result.model_dump() == {
+        assert _tools_and_residency(result) == {
             "tools": {**_ALL_ON, "outlook": False},
             "data_residency": True,
         }
@@ -1996,7 +2006,7 @@ class TestOrgSettingsResidency:
             db.pool, actor=admin, patch=_org_patch(memory=False), ip=_IP
         )
 
-        assert result.model_dump() == {
+        assert _tools_and_residency(result) == {
             "tools": {**_ALL_ON, "memory": False},
             "data_residency": residency,
         }
@@ -2013,7 +2023,7 @@ class TestOrgSettingsResidency:
             db.pool, actor=admin, patch=_org_patch(gmail=False), ip=_IP
         )
 
-        assert result.model_dump() == {
+        assert _tools_and_residency(result) == {
             "tools": {**_ALL_ON, "gmail": False},
             "data_residency": residency,
         }
@@ -2034,7 +2044,7 @@ class TestOrgSettingsResidency:
         )
 
         assert db.org_tools(ORG_ID) == _ALL_ON
-        assert result.model_dump() == {"tools": _ALL_ON, "data_residency": True}
+        assert _tools_and_residency(result) == {"tools": _ALL_ON, "data_residency": True}
         row = _one(db.audit)
         assert row["action"] == "org.settings_change"
         assert row["metadata"] == {
@@ -3196,29 +3206,35 @@ class TestSuperAdminSessionsFollowThePolicy:
 
 
 class TestSessionPolicyFor:
-    """Members: the org default (until #169); Super Admins: the stored platform policy."""
+    """Members: their org's stored policy (GH-169); Super Admins: the stored platform
+    policy."""
 
-    async def test_scoped_settings_policy_for_member_is_the_org_default_without_a_query(
+    async def test_scoped_settings_policy_for_member_without_an_org_row_is_the_column_default(
         self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """GH-169: no org_settings row reads as SessionPolicy() (60 min / 12 h) with one
+        org_settings query; the platform row is never read."""
         from admino import sessions
 
         monkeypatch.setattr(svc, "_platform_cache", None)
 
-        policy = await svc.session_policy_for(db.pool, "member")
+        policy = await svc.session_policy_for(db.pool, "member", ORG_ID)
 
-        assert policy is sessions.DEFAULT_ORG_SESSION_POLICY
-        assert db.calls == []
+        assert policy == sessions.SessionPolicy()
+        assert re.search(r"\bfrom org_settings\b", _one(db.calls).normalized) is not None
 
-    async def test_scoped_settings_policy_for_member_reads_the_org_default_at_call_time(
-        self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    async def test_scoped_settings_policy_for_member_reads_the_org_policy_at_call_time(
+        self, svc: ModuleType, db: FakeDb
     ) -> None:
-        from admino import sessions
+        """GH-169: the org's stored policy, read again on every call (no cache)."""
+        db.add_org_settings(ORG_ID, session_idle_timeout_minutes=20, session_max_lifetime_hours=2)
+        first = await svc.session_policy_for(db.pool, "member", ORG_ID)
+        db.org_settings[ORG_ID]["session_idle_timeout_minutes"] = 240
 
-        custom = sessions.SessionPolicy(idle_timeout_minutes=20, max_lifetime_hours=2)
-        monkeypatch.setattr(sessions, "DEFAULT_ORG_SESSION_POLICY", custom)
+        second = await svc.session_policy_for(db.pool, "member", ORG_ID)
 
-        assert await svc.session_policy_for(db.pool, "member") is custom
+        assert (first.idle_timeout_minutes, first.max_lifetime_hours) == (20, 2)
+        assert (second.idle_timeout_minutes, second.max_lifetime_hours) == (240, 2)
 
     async def test_scoped_settings_policy_for_super_admin_is_the_cached_platform_policy(
         self, svc: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch

@@ -75,7 +75,10 @@ Routes:
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
   defaults (every role).
-- GET/PATCH /api/org/settings — The Org Admin's own org's tool services; audited.
+- GET/PATCH /api/org/settings — The Org Admin's own org's profile,
+  instructions, session policy (applied to the org's open sessions), trash
+  retention (within the platform's bounds) and tool services, with the data
+  residency and plan read-only; audited.
 - GET/PATCH /api/platform/settings — The platform defaults: LLM (with the
   model capabilities, the retry limit and the number of residency orgs),
   limits, files, retention and security (Super Admin); audited. A switch to a
@@ -210,17 +213,26 @@ Security notes:
 - Settings scopes (GH-159, ``admino.scoped_settings``): each route spends a
   per-user bucket, then checks its capability before any database work or
   provider probe: ``account.manage`` for /api/me/settings and its reset (the
-  caller's own row only), ``org.settings.manage`` for /api/org/settings (the
-  principal's own org only, never a request value),
+  caller's own row only), ``org.settings.manage`` and
+  ``org.instructions.manage`` for /api/org/settings (GH-169; both Org Admin
+  only, the principal's own org only, never a request value),
   ``platform.defaults.manage`` for /api/platform/settings. Org and platform
   changes share one transaction with their audit events (a failed audit write
   is a 500 with nothing written); the platform llm event names the changed
   fields, never a provider or model value, the other sections' events carry
-  old/new ints. A platform LLM switch builds the new client before anything is
+  old/new ints. The org events (one per changed section) name the changed
+  profile fields and the instructions, never their values, and carry old/new
+  ints for the session policy and the trash retention. A changed org session
+  policy re-times the org's live sessions in the same transaction (an ended
+  one is never revived). The org's data residency and plan are read-only (a
+  patch naming them is a 422), and an org trash retention outside the
+  platform's bounds is a 400 ``trash_retention_bounds`` with nothing written.
+  A platform LLM switch builds the new client before anything is
   written (400 with nothing written when it can't be built) and closes the old
   one best-effort. A trash retention minimum above the maximum (merged with
   the stored values) is a 400 with nothing written. The platform response
-  carries key presence flags, never a key.
+  carries key presence flags, never a key, and no platform route returns an
+  org's instructions.
 - Model policy (GH-242, ``admino.llm_policy``): a PATCH switching the
   platform LLM to a provider outside ``llm_policy.SWISS_PROVIDERS``
   (infomaniak, vllm) needs ``confirm_residency_orgs`` equal to the current
@@ -3773,21 +3785,36 @@ async def reset_my_settings(principal: _PrincipalDep) -> UserSettingsResponse:
     return await scoped_settings.reset_user_settings(get_pool(), actor=principal)
 
 
+# The 400 of an org trash retention outside the platform's bounds (GH-169).
+# Fixed text: never the refused value or the bounds.
+_ORG_TRASH_BOUNDS_BODY: Final = {
+    "detail": "The trash retention must be within the platform's bounds.",
+    "reason": "trash_retention_bounds",
+}
+
+
 async def get_org_settings(principal: _PrincipalDep) -> OrgSettingsResponse:
-    """Handle GET /api/org/settings — the tool services of the Org Admin's own org.
+    """Handle GET /api/org/settings — the settings of the Org Admin's own org.
 
     Args:
         principal: The logged-in principal (401 without a session).
 
     Returns:
-        OrgSettingsResponse: the stored switches, or every tool on without a row.
+        OrgSettingsResponse: the profile, instructions, session policy,
+        effective trash retention with the platform's bounds and tool
+        services (column defaults without an org_settings row), plus the
+        read-only data residency and plan.
 
     Raises:
         HTTPException: 429 when rate-limited, 403 without
-            ``Capability.ORG_SETTINGS_MANAGE`` (both before any database work).
+            ``Capability.ORG_SETTINGS_MANAGE`` and
+            ``Capability.ORG_INSTRUCTIONS_MANAGE`` (both before any database work).
     """
     _check_rate_limit("/api/org/settings/get", _user_caller(principal))
     _require_capability(principal, Capability.ORG_SETTINGS_MANAGE)
+    # The response carries the org instructions, so their capability is
+    # required too (defense in depth; the service checks both again).
+    _require_capability(principal, Capability.ORG_INSTRUCTIONS_MANAGE)
 
     from admino.database import get_pool
 
@@ -3796,12 +3823,14 @@ async def get_org_settings(principal: _PrincipalDep) -> OrgSettingsResponse:
 
 async def patch_org_settings(
     request: Request, principal: _PrincipalDep, body: OrgSettingsPatch
-) -> OrgSettingsResponse:
-    """Handle PATCH /api/org/settings — switch tool services of the Org Admin's own org.
+) -> OrgSettingsResponse | JSONResponse:
+    """Handle PATCH /api/org/settings — change the settings of the Org Admin's own org.
 
-    Each real change is an ``org.settings_change`` audit event in the same
-    transaction (an audit failure is a 500 with nothing written). The org's
-    next chat run loads the new switches with its tool policy (GH-161).
+    Each changed section (profile, instructions, security, retention, tools)
+    is one ``org.settings_change`` audit event in the same transaction (an
+    audit failure is a 500 with nothing written). A changed session policy
+    re-times the org's open sessions in that transaction. The org's next chat
+    run loads the new tool switches with its tool policy (GH-161).
 
     Args:
         request: The incoming request (the client IP for the audit event).
@@ -3809,23 +3838,32 @@ async def patch_org_settings(
         body: Validated OrgSettingsPatch (422 without echo otherwise).
 
     Returns:
-        OrgSettingsResponse: the org's switches after the change.
+        OrgSettingsResponse: the org's settings after the change, or a 400
+        ``{"detail", "reason": "trash_retention_bounds"}`` with nothing
+        written when a changed trash retention is outside the platform's
+        bounds.
 
     Raises:
         HTTPException: 429 when rate-limited, 403 without
-            ``Capability.ORG_SETTINGS_MANAGE`` (both before any database work).
+            ``Capability.ORG_SETTINGS_MANAGE`` and
+            ``Capability.ORG_INSTRUCTIONS_MANAGE`` (both before any database work).
     """
     _check_rate_limit("/api/org/settings/patch", _user_caller(principal))
     _require_capability(principal, Capability.ORG_SETTINGS_MANAGE)
+    # Every response carries the instructions: see get_org_settings.
+    _require_capability(principal, Capability.ORG_INSTRUCTIONS_MANAGE)
 
     from admino.database import get_pool
 
-    return await scoped_settings.update_org_settings(
-        get_pool(),
-        actor=principal,
-        patch=body,
-        ip=request.client.host if request.client is not None else None,
-    )
+    try:
+        return await scoped_settings.update_org_settings(
+            get_pool(),
+            actor=principal,
+            patch=body,
+            ip=request.client.host if request.client is not None else None,
+        )
+    except scoped_settings.InvalidOrgSettingsError:
+        return JSONResponse(status_code=400, content=_ORG_TRASH_BOUNDS_BODY)
 
 
 async def get_platform_settings(principal: _PrincipalDep) -> PlatformSettingsResponse:

@@ -31,8 +31,9 @@ destructive actions are **denied by design**. Every call is checked by the
   promoted back.
 - The Tools page shows each service's state: active, turned off by your organization,
   restricted by data residency, or not connected. An Org Admin turns services on or off
-  for the whole organization under **Organization → Services**. A service that is off
-  isn't offered to the agent, even when you're connected.
+  for the whole organization under **Organization → Settings** (**Tools and
+  permissions**). A service that is off isn't offered to the agent, even when you're
+  connected.
 - **Data residency.** When your organization's data residency policy is on, the Google and
   Microsoft tools are disabled: the agent isn't offered them, a call to one is refused,
   and connecting a Google or Microsoft account is refused too. Connections made before are

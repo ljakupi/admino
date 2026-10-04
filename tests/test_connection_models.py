@@ -22,7 +22,9 @@ What these tests pin down:
   ``OAuthServiceStatus``, default a fresh empty list; the old list-of-names
   shape is refused). ``connected`` / ``healthy`` / ``email`` keep their
   defaults and the email validation (pattern, 254 characters, None allowed).
-- ``OrgSettingsResponse`` requires ``data_residency`` (bool) next to ``tools``.
+- ``OrgSettingsResponse`` requires ``data_residency`` (bool) next to ``tools``
+  (and, since GH-169, next to profile, instructions, security, retention and
+  plan).
 
 New symbols are looked up per test, so a missing name fails its own tests and
 not the whole module.
@@ -72,6 +74,14 @@ _BAD_TOOLS: tuple[object, ...] = (
     ["gmail"],
 )
 _VALID_EMAIL = "someone@example.com"
+# GH-169: the org settings response's sections besides tools and data_residency.
+_ORG_SETTINGS_SECTIONS: dict[str, Any] = {
+    "profile": {"display_name": "Treuhand Muster AG", "default_response_language": "en"},
+    "instructions": "",
+    "security": {"session_idle_timeout_minutes": 60, "session_max_lifetime_hours": 12},
+    "retention": {"trash_retention_days": 30, "trash_min_days": 0, "trash_max_days": 90},
+    "plan": {"seats": 10, "storage_quota": 1024},
+}
 
 
 def _attr(name: str) -> Any:
@@ -367,7 +377,9 @@ class TestOrgSettingsResponseResidency:
 
     def test_models_org_settings_response_requires_data_residency(self) -> None:
         with pytest.raises(ValidationError) as error:
-            _model("OrgSettingsResponse").model_validate({"tools": ToolsSettings().model_dump()})
+            _model("OrgSettingsResponse").model_validate(
+                {**_ORG_SETTINGS_SECTIONS, "tools": ToolsSettings().model_dump()}
+            )
 
         assert _error_locs(error) == {("data_residency",)}
         assert {item["type"] for item in error.value.errors()} == {"missing"}
@@ -377,9 +389,12 @@ class TestOrgSettingsResponseResidency:
 
     @pytest.mark.parametrize("residency", [True, False])
     def test_models_org_settings_response_dumps_data_residency(self, residency: bool) -> None:
-        body = _model("OrgSettingsResponse")(tools=ToolsSettings(), data_residency=residency)
+        body = _model("OrgSettingsResponse").model_validate(
+            {**_ORG_SETTINGS_SECTIONS, "tools": ToolsSettings(), "data_residency": residency}
+        )
 
         assert body.model_dump() == {
+            **_ORG_SETTINGS_SECTIONS,
             "tools": ToolsSettings().model_dump(),
             "data_residency": residency,
         }

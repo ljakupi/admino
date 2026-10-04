@@ -90,8 +90,21 @@ function tools(overrides: Partial<ToolsSettings> = {}): ToolsSettings {
   };
 }
 
+/**
+ * A full `GET`/`PATCH /api/org/settings` response (issue #169 extended it with
+ * the profile, instructions, security, retention and plan sections; this store
+ * only reads `tools` and `data_residency`).
+ */
 function orgSettings(dataResidency: boolean, overrides: Partial<ToolsSettings> = {}): OrgSettingsResponse {
-  return { tools: tools(overrides), data_residency: dataResidency };
+  return {
+    profile: { display_name: 'Treuhand Muster AG', default_response_language: 'en' },
+    instructions: '',
+    security: { session_idle_timeout_minutes: 60, session_max_lifetime_hours: 12 },
+    retention: { trash_retention_days: 30, trash_min_days: 0, trash_max_days: 90 },
+    tools: tools(overrides),
+    data_residency: dataResidency,
+    plan: { seats: 10, storage_quota: 10_737_418_240 },
+  };
 }
 
 type Catalog = Record<string, unknown>;

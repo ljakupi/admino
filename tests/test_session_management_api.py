@@ -8,8 +8,10 @@ Argon2 is replaced by a fast fake.
 
 What these tests pin down:
 - ``POST /api/auth/login``: the cookie's Max-Age is the session policy's lifetime
-  (43200 by default; a Super Admin gets the platform policy, a member the org
-  policy), and the stored row carries that policy's idle timeout and expiry.
+  (43200 by default; a Super Admin gets the platform policy, a member the
+  stored policy of their own org: its org_settings row since GH-169, the column
+  defaults 60 minutes / 12 hours without one), and the stored row carries that
+  policy's idle timeout and expiry.
   GH-160: the platform policy is the stored one (the platform settings'
   security section, read through the cache or, when it is empty, from the
   platform_settings row); a change applies to the next Super Admin login.
@@ -60,7 +62,6 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from admino import scoped_settings, server
-from admino import sessions as sessions_mod
 from admino.access import Capability
 from admino.server import _lifespan, create_app
 from tests.conftest import default_test_platform_settings
@@ -253,10 +254,6 @@ class _CanSpy:
                 monkeypatch.setattr(session_management, "can", spy)
 
 
-def _policy(idle: int, lifetime: int) -> Any:
-    return sessions_mod.SessionPolicy(idle_timeout_minutes=idle, max_lifetime_hours=lifetime)
-
-
 def _store_session_policy(monkeypatch: pytest.MonkeyPatch, *, idle: int, lifetime: int) -> None:
     """Make the cached platform settings carry this Super Admin session policy (GH-160).
 
@@ -430,13 +427,12 @@ class TestLoginPolicy:
         assert row["expires_at"] - row["created_at"] == timedelta(hours=2)
         assert db.session(first_token)["idle_timeout_minutes"] == 30
 
-    def test_session_management_api_org_policy_applies_to_members_only(
-        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """With a 2-hour, 20-minute org policy a member gets Max-Age=7200 and a 20-minute
-        row; a Super Admin keeps 43200 / 60 minutes."""
-        monkeypatch.setattr(sessions_mod, "DEFAULT_ORG_SESSION_POLICY", _policy(20, 2))
+    def test_session_management_api_org_policy_applies_to_members_only(self, db: FakeDb) -> None:
+        """GH-169: with the org's stored 2-hour, 20-minute policy (its org_settings row) a
+        member gets Max-Age=7200 and a 20-minute row expiring 2 hours after creation; a
+        Super Admin keeps 43200 / 60 minutes."""
         member = _member(db)
+        db.add_org_settings(ORG_ID, session_idle_timeout_minutes=20, session_max_lifetime_hours=2)
         admin = _super_admin(db)
         client = _client(_app())
 
@@ -444,7 +440,9 @@ class TestLoginPolicy:
         admin_token, admin_cookie = _session_set_cookie(_login(client, db.users[admin]["email"]))
 
         assert member_cookie.get("max-age") == "7200"
-        assert db.session(member_token)["idle_timeout_minutes"] == 20
+        member_row = db.session(member_token)
+        assert member_row["idle_timeout_minutes"] == 20
+        assert member_row["expires_at"] - member_row["created_at"] == timedelta(hours=2)
         assert admin_cookie.get("max-age") == "43200"
         assert db.session(admin_token)["idle_timeout_minutes"] == 60
 

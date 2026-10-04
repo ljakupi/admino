@@ -57,10 +57,12 @@ fast spy. No real PostgreSQL, no SMTP.
 Security notes:
 - The raw token lives only in the queued email's link: never in a table, a
   statement, an audit row, an error or a log line.
-- GH-160: acceptance takes its session policy from
-  ``scoped_settings.session_policy_for(<pool>, "member")`` (the org policy,
-  ``sessions.DEFAULT_ORG_SESSION_POLICY``); the stored Super Admin policy never
-  applies to it.
+- GH-160, GH-169: acceptance takes its session policy from
+  ``scoped_settings.session_policy_for(<pool>, "member", <the invitation's
+  org_id>)``: the invited org's stored policy (its ``org_settings`` row; the
+  column defaults, 60 minutes / 12 hours, without one;
+  ``sessions.DEFAULT_ORG_SESSION_POLICY`` is gone). Another org's policy and
+  the stored Super Admin policy never apply to it.
 - Content-free audit and logs: IDs, roles and the IP only; never an email,
   name, password, token or link.
 - Fail closed: a failed audit write rolls the whole change back.
@@ -1913,15 +1915,13 @@ class TestAcceptInvitation:
         assert session.ui_language == "fr"
 
     async def test_invitations_accept_uses_the_org_session_policy(
-        self, inv: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+        self, inv: ModuleType, db: FakeDb
     ) -> None:
-        """With a 2-hour, 20-minute org policy the session gets exactly that."""
-        monkeypatch.setattr(
-            sessions_mod,
-            "DEFAULT_ORG_SESSION_POLICY",
-            sessions_mod.SessionPolicy(idle_timeout_minutes=20, max_lifetime_hours=2),
-        )
-        await _create(inv, db, _admin(db))
+        """GH-169: with the invited org's stored 2-hour, 20-minute policy (its org_settings
+        row) the session gets exactly that."""
+        admin = _admin(db)
+        db.add_org_settings(ORG_ID, session_idle_timeout_minutes=20, session_max_lifetime_hours=2)
+        await _create(inv, db, admin)
 
         result = await _accept(inv, db, db.invitation_token())
 
@@ -1930,18 +1930,74 @@ class TestAcceptInvitation:
         assert row["idle_timeout_minutes"] == 20
         assert row["expires_at"] - row["created_at"] == timedelta(hours=2)
 
+    async def test_invitations_accept_reads_the_invited_orgs_policy(
+        self, inv: ModuleType, db: FakeDb
+    ) -> None:
+        """GH-169: the policy is read from org_settings with the invitation's org bound; an
+        org without a row gets the column defaults (60 minutes / 12 hours)."""
+        await _create(inv, db, _admin(db))
+        db.calls.clear()
+
+        result = await _accept(inv, db, db.invitation_token())
+
+        reads = [
+            call
+            for call in db.matching(r"\bfrom org_settings\b")
+            if call.method in {"fetchrow", "fetch", "fetchval"}
+        ]
+        assert reads != []
+        assert all(ORG_ID in call.args for call in reads)
+        assert result.max_age_seconds == 43200
+        row = db.session(result.token)
+        assert row["idle_timeout_minutes"] == 60
+        assert row["expires_at"] - row["created_at"] == timedelta(hours=12)
+
+    @pytest.mark.parametrize(
+        ("org_id", "expected"),
+        [
+            pytest.param(ORG_ID, (20, 2), id="org-a"),
+            pytest.param(OTHER_ORG_ID, (90, 24), id="org-b"),
+        ],
+    )
+    async def test_invitations_accept_never_uses_another_orgs_policy(
+        self,
+        inv: ModuleType,
+        db: FakeDb,
+        org_id: uuid.UUID,
+        expected: tuple[int, int],
+    ) -> None:
+        """GH-169: both orgs have a stored policy (A: 20 min / 2 h, B: 90 min / 24 h); an
+        invitation into one org opens a session with that org's policy only."""
+        admin = _admin(db, org_id)
+        db.add_org(ORG_ID)
+        db.add_org(OTHER_ORG_ID)
+        db.add_org_settings(ORG_ID, session_idle_timeout_minutes=20, session_max_lifetime_hours=2)
+        db.add_org_settings(
+            OTHER_ORG_ID, session_idle_timeout_minutes=90, session_max_lifetime_hours=24
+        )
+        await _create(inv, db, admin)
+
+        result = await _accept(inv, db, db.invitation_token())
+
+        idle, lifetime = expected
+        row = db.session(result.token)
+        assert (row["user_id"], row["idle_timeout_minutes"]) == (_invited_id(db), idle)
+        assert row["expires_at"] - row["created_at"] == timedelta(hours=lifetime)
+        assert result.max_age_seconds == lifetime * 3600
+
     async def test_invitations_accept_asks_scoped_settings_for_the_member_policy(
         self, inv: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """GH-160: the policy comes from scoped_settings.session_policy_for(<pool>,
-        "member") (sessions.session_policy_for is retired); a stored Super Admin
-        policy (30 minutes / 8 hours) doesn't touch the member's session."""
+        """GH-160, GH-169: the policy comes from scoped_settings.session_policy_for(<pool>,
+        "member", <the invitation's org_id>) (sessions.session_policy_for is retired); a
+        stored Super Admin policy (30 minutes / 8 hours) doesn't touch the member's
+        session."""
         real = scoped_settings.session_policy_for
-        kinds: list[str] = []
+        calls: list[tuple[Any, str, Any]] = []
 
-        async def spy(executor: Any, kind: str) -> Any:
-            kinds.append(kind)
-            return await real(executor, kind)
+        async def spy(executor: Any, kind: str, org_id: Any = None) -> Any:
+            calls.append((executor, kind, org_id))
+            return await real(executor, kind, org_id)
 
         monkeypatch.setattr(scoped_settings, "session_policy_for", spy)
         data = default_test_platform_settings().model_dump()
@@ -1952,11 +2008,13 @@ class TestAcceptInvitation:
         }
         stored = scoped_settings.StoredPlatformSettings.model_validate(data)
         monkeypatch.setattr(scoped_settings, "_platform_cache", stored)
-        await _create(inv, db, _admin(db))
+        await _create(inv, db, _admin(db, OTHER_ORG_ID))
 
         result = await _accept(inv, db, db.invitation_token())
 
-        assert kinds == ["member"]
+        assert [(executor is db.pool, kind, org_id) for executor, kind, org_id in calls] == [
+            (True, "member", OTHER_ORG_ID)
+        ]
         assert result.max_age_seconds == 43200
         assert db.session(result.token)["idle_timeout_minutes"] == 60
 
