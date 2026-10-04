@@ -27,6 +27,14 @@ What these tests pin down (contract #242 section 1):
   ``Agent.run`` (with one tool round trip) whose principal has canary ids, and
   a server ``POST /api/message`` whose account has a canary email and name,
   produce requests without any of those strings (ids with or without dashes).
+- GH-170: the same holds once the run's system prompt is assembled per request
+  from the org's and the user's settings. Each case also runs with org and
+  personal instructions, a response language and a timezone (an
+  ``Agent.run(prompt_context=PromptContext(...))``; on the server, the account's
+  and its org's stored settings, and an org-name canary): the instructions DO
+  reach the provider (they are part of the prompt, so the scan covers the new
+  slots), the ids, email, name and org name never do. ``Agent(...)`` no longer
+  takes a ``system_prompt``.
 
 Speed: the SDKs' retry backoff sleep (``AsyncAPIClient._sleep_for_retry``) is
 replaced by a no-op, so a client that still retries today fails fast instead of
@@ -93,6 +101,12 @@ _PRINCIPAL: Final = Principal(user_id=_USER_ID, kind="member", org_id=_ORG_ID, r
 # The server-level account's personal data.
 _EMAIL_CANARY: Final = "wire.canary.242@example.ch"
 _NAME_CANARY: Final = "Canaria Wirethal"
+
+_ORG_NAME_CANARY: Final = "Canary Wirethal Treuhand AG"
+# GH-170: instructions are sent to the provider (never identifiers): plain ASCII, so
+# they read the same in every JSON body.
+_ORG_INSTRUCTIONS: Final = "Answer like a careful Bernese notary, org-rule-170"
+_PERSONAL_INSTRUCTIONS: Final = "Keep every reply under five sentences, own-rule-170"
 
 _SESSION_ID: Final = "s-wire-242"
 _SYSTEM_PROMPT: Final = "You are admino."
@@ -572,18 +586,47 @@ def _tool_round_trip(provider: str) -> list[dict[str, Any]]:
     return [_openai_tool_call_completion(), _openai_completion("Done.")]
 
 
+def _instructions_sent(with_instructions: bool) -> list[str]:
+    """The instructions a case's requests must carry (all of them, or none)."""
+    return [_ORG_INSTRUCTIONS, _PERSONAL_INSTRUCTIONS] if with_instructions else []
+
+
+def _run_prompt_context(with_instructions: bool) -> dict[str, Any]:
+    """The ``Agent.run`` keyword of a case: none (the run's default context), or a
+    GH-170 ``PromptContext`` with both instructions, a language and a timezone."""
+    if not with_instructions:
+        return {}
+    from admino.models import PromptContext  # new in GH-170: imported per case
+
+    context = PromptContext(
+        org_instructions=_ORG_INSTRUCTIONS,
+        personal_instructions=_PERSONAL_INSTRUCTIONS,
+        response_language="fr",
+        default_response_language="de",
+        timezone="Europe/Zurich",
+    )
+    return {"prompt_context": context}
+
+
+_INSTRUCTION_CASES: Final = [
+    pytest.param(False, id="no-instructions"),
+    pytest.param(True, id="with-instructions"),
+]
+
+
+@pytest.mark.parametrize("with_instructions", _INSTRUCTION_CASES)
 @pytest.mark.parametrize("provider", PROVIDERS)
 async def test_agent_run_sends_no_principal_ids_to_the_provider(
-    provider: str, wire: _Wire, build: Callable[[str], Any]
+    provider: str, with_instructions: bool, wire: _Wire, build: Callable[[str], Any]
 ) -> None:
-    """A run with a tool round trip never sends the user or org id, dashed or not."""
+    """A run with a tool round trip never sends the user or org id, dashed or not,
+    also when its prompt carries org and personal instructions (which it does send)."""
     register_tool("echo", "say", "Say a short text back", _EchoArgs)(_echo_handler)
     wire.queue = _tool_round_trip(provider)
     agent = Agent(
         llm_client=build(provider),
         tool_call_recorder=_no_op_recorder,
         agent_config=AgentConfig(max_tool_calls=3, max_context_messages=20),
-        system_prompt=_SYSTEM_PROMPT,
     )
 
     result = await agent.run(
@@ -592,10 +635,14 @@ async def test_agent_run_sends_no_principal_ids_to_the_provider(
         history=[],
         principal=_PRINCIPAL,
         tool_policy=_tool_policy(),
+        **_run_prompt_context(with_instructions),
     )
 
     assert result.status == "final", result.response
     assert len(wire.chat_requests) == 2, "the tool result must go back to the provider"
+    assert wire.leaked(_ORG_INSTRUCTIONS, _PERSONAL_INSTRUCTIONS) == _instructions_sent(
+        with_instructions
+    )
     assert wire.leaked(*_id_forms(_USER_ID, _ORG_ID)) == []
 
 
@@ -604,16 +651,30 @@ async def test_agent_run_sends_no_principal_ids_to_the_provider(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("with_instructions", _INSTRUCTION_CASES)
 def test_server_message_sends_no_account_email_name_or_ids_to_the_provider(
-    wire: _Wire, monkeypatch: pytest.MonkeyPatch
+    with_instructions: bool, wire: _Wire, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """POST /api/message for an account with canary personal data keeps it off the wire."""
+    """POST /api/message for an account with canary personal data keeps it (and its org's
+    name) off the wire, also when the org and the account have stored instructions, a
+    language and a timezone (GH-170: loaded per request, and sent)."""
+    org_instructions, personal_instructions = (
+        (_ORG_INSTRUCTIONS, _PERSONAL_INSTRUCTIONS) if with_instructions else ("", "")
+    )
     db = FakeDb()
-    db.add_org(_ORG_ID, data_residency=False)
+    db.add_org(_ORG_ID, name=_ORG_NAME_CANARY, data_residency=False)
     db.add_permissions(_ORG_ID)
-    db.add_org_settings(_ORG_ID)
+    db.add_org_settings(_ORG_ID, instructions=org_instructions)
     db.add_platform_settings()
-    user_id = db.add_account(role="editor", org_id=_ORG_ID, email=_EMAIL_CANARY, name=_NAME_CANARY)
+    user_id = db.add_account(
+        role="editor",
+        org_id=_ORG_ID,
+        email=_EMAIL_CANARY,
+        name=_NAME_CANARY,
+        response_language="it" if with_instructions else None,
+        timezone="Europe/Zurich" if with_instructions else None,
+        personal_instructions=personal_instructions,
+    )
     token = db.open_session(user_id)
     use_fake_database(monkeypatch, db)
     use_roomy_rate_limits(monkeypatch)
@@ -622,7 +683,6 @@ def test_server_message_sends_no_account_email_name_or_ids_to_the_provider(
         llm_client=InfomaniakClient(_config("infomaniak")),
         tool_call_recorder=_no_op_recorder,
         agent_config=AgentConfig(max_tool_calls=3, max_context_messages=20),
-        system_prompt=_SYSTEM_PROMPT,
     )
     client = make_client(create_app(agent=agent, config=make_config()))
 
@@ -635,4 +695,10 @@ def test_server_message_sends_no_account_email_name_or_ids_to_the_provider(
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "final", response.text
     assert wire.chat_requests, "the message must have reached the provider"
-    assert wire.leaked(_EMAIL_CANARY, _NAME_CANARY, *_id_forms(user_id, _ORG_ID)) == []
+    assert wire.leaked(_ORG_INSTRUCTIONS, _PERSONAL_INSTRUCTIONS) == _instructions_sent(
+        with_instructions
+    )
+    assert (
+        wire.leaked(_EMAIL_CANARY, _NAME_CANARY, _ORG_NAME_CANARY, *_id_forms(user_id, _ORG_ID))
+        == []
+    )

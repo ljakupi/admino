@@ -489,7 +489,6 @@ def app(llm: _FakeLLM) -> FastAPI:
         agent_config=AgentConfig(
             max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0
         ),
-        system_prompt="You are admino.",
     )
     return create_app(agent=agent, config=_config())
 

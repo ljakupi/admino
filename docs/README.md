@@ -19,6 +19,7 @@ read **[Permissions](permissions.md)** and the **[Security Model](SECURITY.md)**
 - **[Tools](tools.md)** — every tool and action admino ships with today, and what's still on the roadmap.
 - **[Configuration](configuration.md)** — LLM providers, `config.yaml`, data & storage, and accounts and sessions.
 - **[Security Model](SECURITY.md)** — egress containment, the root→non-root privilege drop, capabilities, and the threat model.
+- **[Prompt evaluation](prompt-evaluation.md)** — the manual checklist an operator runs on a live model after a change to the assistant's instructions or the model.
 
 ## Quick links
 

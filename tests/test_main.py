@@ -26,11 +26,15 @@ covering:
   the config and returns only the overlaid ``AppConfig``; after migrations and
   the platform seed it awaits ``org_permissions.seed_missing_orgs(pool)`` (the
   defaults for every org without permission rows) — no global permission seed
-  or load, no tools gate. main() builds ``Agent(llm_client, tool_call_recorder,
-  agent_config, system_prompt)`` without ``permissions_config`` /
-  ``tools_enabled`` and never builds the default permissions config;
-  ``_build_system_prompt(config)`` has no tool line (the agent adds the run's
-  tools line per run).
+  or load, no tools gate. main() builds the Agent without ``permissions_config``
+  / ``tools_enabled`` and never builds the default permissions config.
+- GH-170: the startup-built system prompt is gone. main() builds
+  ``Agent(llm_client, tool_call_recorder, agent_config)`` (no ``system_prompt``)
+  and has no ``_build_system_prompt``: each run assembles its own prompt. The
+  GH-143 and GH-161 prompt guarantees now hold for the per-request base prompt,
+  ``prompt_assembly.base_prompt(tools=..., response_language=...)``: no local file
+  paths or file-tool guidance, a tools line naming only the tools it is given,
+  and the confirmation, dynamic-permission and no-substitution guidance kept.
 - GH-156: uvicorn runs one process (``workers=1``) with ``proxy_headers=False``,
   so its own X-Forwarded-* handling (which trusts 127.0.0.1 or the
   FORWARDED_ALLOW_IPS env var) never runs; the app's ``server.trusted_proxies``
@@ -257,7 +261,8 @@ class TestMainHappyPath:
     ) -> None:
         """GH-161 (replaces the GH-80 tools_enabled wiring): the Agent gets only its
         stateless collaborators; the org's permissions, promotions and enabled services
-        arrive with each run's ToolPolicy."""
+        arrive with each run's ToolPolicy. GH-170: no ``system_prompt`` either, each
+        run assembles its own from the org's and the user's settings."""
         main(config_path=Path("c.yaml"))
 
         mock_deps["Agent"].assert_called_once()
@@ -266,7 +271,6 @@ class TestMainHappyPath:
             "llm_client",
             "tool_call_recorder",
             "agent_config",
-            "system_prompt",
         }
 
 
@@ -311,97 +315,121 @@ class TestMainWithoutFilesTool:
         assert violations == []
 
 
-class TestBuildSystemPromptWithoutFilesTool:
-    """The system prompt no longer advertises local file paths (GH-143)."""
+# GH-170: every response language base_prompt takes (None: none resolved).
+_RESPONSE_LANGUAGES: tuple[str | None, ...] = (None, "de", "fr", "it", "en")
+# The guidance of the old startup prompt that the base prompt keeps (case-insensitive).
+_KEPT_GUIDANCE: tuple[str, ...] = (
+    "confirmation",
+    "permissions can change during a conversation",
+    "never refuse based on earlier",
+    "never substitute",
+    "not available",
+)
+# Retired text of the old startup prompt: admino is no longer a local personal assistant,
+# and promotions moved from the Critical Permissions page to the Org Admin (GH-161).
+_RETIRED_TEXT: tuple[str, ...] = ("local personal AI assistant", "Critical Permissions")
 
-    @staticmethod
-    def _legacy_config() -> Any:
-        """An AppConfig validated from a dict that still carries a legacy files section."""
-        from admino.config import AppConfig
 
-        return AppConfig.model_validate(
-            {
-                "llm": {"provider": "anthropic", "anthropic_model": "claude-sonnet-4-6"},
-                "auth": {"mode": "vpn"},
-                "files": {
-                    "allowed_paths": [
-                        {
-                            "path": "/app/documents",
-                            "label": "Documents (~/Downloads/admino)",
-                            "access": "readwrite",
-                        }
-                    ],
-                    "max_read_chars": 10000,
-                },
-            }
+def _tool(tool: str, action: str) -> Any:
+    """A registry ToolDescription with an empty argument schema."""
+    from admino.tools.registry import ToolDescription
+
+    return ToolDescription(
+        tool=tool,
+        action=action,
+        description=f"{tool}.{action} (GH-170 spec).",
+        parameters_schema={"type": "object", "properties": {}},
+    )
+
+
+def _base_prompt(*, tools: list[Any], response_language: str | None) -> str:
+    """``prompt_assembly.base_prompt`` (imported here: the module is new in GH-170, and
+    the rest of this file must still collect without it)."""
+    from admino import prompt_assembly
+
+    return prompt_assembly.base_prompt(tools=tools, response_language=response_language)
+
+
+class TestBasePromptWithoutFilesTool:
+    """GH-170 port of the GH-143 / GH-161 ``main._build_system_prompt`` tests: main.py
+    builds no prompt any more, and the per-request base prompt
+    (``prompt_assembly.base_prompt``) keeps their guarantees: no local file paths or
+    file-tool guidance, and a tools line naming the run's own tools only."""
+
+    def test_main_has_no_build_system_prompt(self) -> None:
+        """The startup-built prompt is gone: each run assembles its own."""
+        assert not hasattr(main_module, "_build_system_prompt")
+
+    @pytest.mark.parametrize("response_language", _RESPONSE_LANGUAGES)
+    def test_base_prompt_has_no_file_paths_block(self, response_language: str | None) -> None:
+        """The 'following file paths are available' block stays gone."""
+        prompt = _base_prompt(
+            tools=[_tool("memory", "recall")], response_language=response_language
         )
 
-    def _prompt(self) -> str:
-        from admino.main import _build_system_prompt
-        from admino.tools.registry import ToolDescription
+        assert "file paths are available" not in prompt.lower()
 
-        fake_tool = ToolDescription(
-            tool="memory",
-            action="recall",
-            description="Recall a note.",
-            parameters_schema={"type": "object", "properties": {}},
+    @pytest.mark.parametrize("response_language", _RESPONSE_LANGUAGES)
+    def test_base_prompt_does_not_leak_legacy_path_or_label(
+        self, response_language: str | None
+    ) -> None:
+        """The legacy files.allowed_paths path and label never reach the prompt."""
+        prompt = _base_prompt(
+            tools=[_tool("memory", "recall")], response_language=response_language
         )
-        with patch("admino.tools.registry.get_registered_tools", return_value=[fake_tool]):
-            return _build_system_prompt(self._legacy_config())
 
-    def test_system_prompt_has_no_file_paths_block(self) -> None:
-        """The 'following file paths are available' block is gone."""
-        assert "file paths are available" not in self._prompt().lower()
+        assert ("/app/documents" in prompt, "Downloads/admino" in prompt) == (False, False)
 
-    def test_system_prompt_does_not_leak_legacy_path_or_label(self) -> None:
-        """A legacy files.allowed_paths entry never reaches the prompt."""
-        prompt = self._prompt()
-        assert "/app/documents" not in prompt
-        assert "Downloads/admino" not in prompt
-
-    def test_system_prompt_has_no_file_tool_instructions(self) -> None:
-        """The 'When using file tools' guidance is gone."""
-        assert "file tools" not in self._prompt().lower()
-
-    def test_system_prompt_no_longer_lists_registered_tools(self) -> None:
-        """GH-161 spec change: the static tool summary is gone — the agent appends the
-        run's own tools line (from the org's policy) to every run instead."""
-        prompt = self._prompt()
-
-        assert "You have access to the following tools" not in prompt
-        assert "memory (recall)" not in prompt
-
-    def test_build_system_prompt_takes_only_the_config(self) -> None:
-        """GH-161: _build_system_prompt(config) — no permissions_config parameter."""
-        from admino.main import _build_system_prompt
-
-        assert list(inspect.signature(_build_system_prompt).parameters) == ["config"]
-
-    def test_system_prompt_keeps_the_rest_of_the_text(self) -> None:
-        """Only the tool line is removed; every other line is unchanged."""
-        assert self._prompt() == "\n".join(
-            [
-                "You are admino, a local personal AI assistant.",
-                "Some actions may require user confirmation before execution.",
-                "",
-                "IMPORTANT: Tool permissions can change during a conversation. If a tool "
-                "call was previously denied, the user may have since promoted it. Always "
-                "attempt the tool call when the user asks — never refuse based on earlier "
-                "denials in the conversation. The permission engine will re-evaluate each "
-                "call independently.",
-                "",
-                "CRITICAL — never substitute a different tool or action for the one the "
-                "user actually requested. If the exact capability the user asked for is "
-                "not available to you (not in your tool list, disabled, or not permitted), "
-                "STOP and tell the user that action is not available and why — for example, "
-                "that it needs to be enabled or promoted in Critical Permissions. Do NOT "
-                "approximate the request with a different tool. This is absolute for "
-                "mutating actions: never turn an update into a create, or send to a "
-                "different recipient/channel. A duplicate or wrong write is worse than "
-                "doing nothing.",
-                "",
-            ]
+    @pytest.mark.parametrize("response_language", _RESPONSE_LANGUAGES)
+    def test_base_prompt_has_no_file_tool_instructions(self, response_language: str | None) -> None:
+        """The 'When using file tools' guidance stays gone."""
+        prompt = _base_prompt(
+            tools=[_tool("memory", "recall")], response_language=response_language
         )
+
+        assert "file tools" not in prompt.lower()
+
+    def test_base_prompt_names_only_the_tools_it_is_given(self) -> None:
+        """GH-161 kept (was: the static tool summary is gone): the tools line, the base
+        prompt's last line, names exactly the run's tools, never what the registry holds."""
+        registered = [_tool("memory", "recall"), _tool("registry_only", "leak")]
+        with patch("admino.tools.registry.get_registered_tools", return_value=registered):
+            prompt = _base_prompt(tools=[_tool("memory", "recall")], response_language=None)
+
+        assert (prompt.splitlines()[-1], "registry_only" in prompt) == (
+            "You have access to the following tools: memory (recall).",
+            False,
+        )
+
+    def test_base_prompt_takes_only_the_runs_tools_and_language(self) -> None:
+        """GH-161 kept (was: _build_system_prompt(config) only): no config and no
+        permission state, just the keyword-only ``tools`` and ``response_language``."""
+        from admino import prompt_assembly
+
+        parameters = inspect.signature(prompt_assembly.base_prompt).parameters.values()
+
+        assert [(parameter.name, parameter.kind) for parameter in parameters] == [
+            ("tools", inspect.Parameter.KEYWORD_ONLY),
+            ("response_language", inspect.Parameter.KEYWORD_ONLY),
+        ]
+
+    @pytest.mark.parametrize("response_language", _RESPONSE_LANGUAGES)
+    def test_base_prompt_keeps_the_guidance_of_the_startup_prompt(
+        self, response_language: str | None
+    ) -> None:
+        """Was: the exact text of the startup prompt. The base prompt starts with "You are
+        admino", keeps its confirmation, dynamic-permission and no-substitution guidance,
+        and drops the retired text."""
+        prompt = _base_prompt(
+            tools=[_tool("memory", "recall")], response_language=response_language
+        )
+        lowered = prompt.lower()
+
+        assert (
+            prompt.startswith("You are admino"),
+            [phrase for phrase in _KEPT_GUIDANCE if phrase not in lowered],
+            [text for text in _RETIRED_TEXT if text.lower() in lowered],
+        ) == (True, [], [])
 
 
 # ---------------------------------------------------------------------------

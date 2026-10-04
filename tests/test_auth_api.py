@@ -29,6 +29,11 @@ What these tests pin down:
   their password, other roles get 403, the old bearer body grants nothing,
   demotion and cancelling a cooldown work on the org's stored rows (the shared
   tests/db_fakes.py database). The agent receives the caller's Principal.
+- GH-170: each chat run gets the caller's ``PromptContext``, loaded from the
+  database on every request (``scoped_settings.load_prompt_context`` against the
+  shared tests/db_fakes.py database): the user's response language, timezone
+  and personal instructions and the org's default language and instructions,
+  so a change applies to the next message.
 
 All database and LLM calls are faked. No network, no real PostgreSQL.
 
@@ -440,6 +445,7 @@ class _FakeAgent:
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
         tool_policy: Any = None,
+        prompt_context: Any = None,
     ) -> AgentResult:
         self.run_calls.append(
             {
@@ -450,6 +456,8 @@ class _FakeAgent:
                 "agent_config": agent_config,
                 # GH-161: the run's own org policy (specified in tests/test_permissions_api.py).
                 "tool_policy": tool_policy,
+                # GH-170: the caller's prompt context, loaded per request.
+                "prompt_context": prompt_context,
             }
         )
         return AgentResult(
@@ -1893,6 +1901,69 @@ class TestCriticalPromotionSessions:
 
         assert model is not None
         assert set(model.model_fields) == {"password"}
+
+
+class TestChatPromptContext:
+    """GH-170: the chat routes load the caller's prompt context from the database on
+    every request (the real ``scoped_settings.load_prompt_context``)."""
+
+    def test_auth_api_message_runs_with_the_callers_stored_prompt_context(
+        self, org_db: SharedFakeDb
+    ) -> None:
+        """The user's language, timezone and instructions and the org's default
+        language and instructions reach agent.run as the run's PromptContext."""
+        org_db.add_org(_ORG_ID, default_response_language="it")
+        org_db.add_org_settings(_ORG_ID, instructions="Answer formally.")
+        user_id = org_db.add_account(
+            role="editor",
+            org_id=_ORG_ID,
+            password_hash=shared_fake_hash(_PASSWORD),
+            response_language="fr",
+            timezone="Asia/Kolkata",
+            personal_instructions="Use bullet points.",
+        )
+        token = org_db.open_session(user_id)
+        agent = _FakeAgent()
+
+        response = _client(_app(agent)).post(
+            "/api/message", json=_CHAT_BODY, headers=_cookie(token)
+        )
+
+        assert response.status_code == 200, response.text
+        assert agent.run_calls[0]["prompt_context"] == models.PromptContext(
+            org_instructions="Answer formally.",
+            personal_instructions="Use bullet points.",
+            response_language="fr",
+            default_response_language="it",
+            timezone="Asia/Kolkata",
+        )
+
+    def test_auth_api_prompt_context_changes_apply_to_the_next_message(
+        self, org_db: SharedFakeDb
+    ) -> None:
+        """No cache, no restart: the user's new language and the org's new instructions
+        are in the very next run's context."""
+        org_db.add_org_settings(_ORG_ID)
+        user_id = org_db.add_account(
+            role="editor",
+            org_id=_ORG_ID,
+            password_hash=shared_fake_hash(_PASSWORD),
+            response_language="fr",
+        )
+        token = org_db.open_session(user_id)
+        agent = _FakeAgent()
+        client = _client(_app(agent))
+
+        first = client.post("/api/message", json=_CHAT_BODY, headers=_cookie(token))
+        org_db.users[user_id]["response_language"] = "de"
+        org_db.org_settings[_ORG_ID]["instructions"] = "New org rule."
+        second = client.post("/api/message", json=_CHAT_BODY, headers=_cookie(token))
+
+        assert (first.status_code, second.status_code) == (200, 200)
+        assert [
+            (call["prompt_context"].response_language, call["prompt_context"].org_instructions)
+            for call in agent.run_calls
+        ] == [("fr", ""), ("de", "New org rule.")]
 
 
 # ---------------------------------------------------------------------------

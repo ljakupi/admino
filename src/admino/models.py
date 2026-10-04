@@ -53,6 +53,11 @@ Security notes:
   ``OrgCreateRequest.name``'s rule and the instructions (at most 8000 code
   points, kept verbatim; #170 puts them into the prompt) to the personal
   instructions' character rule, and hides its input from validation errors.
+- Prompt context (GH-170): ``PromptContext`` holds exactly the five inputs of
+  a run's system prompt (org and personal instructions, the user's and the
+  org's response language, the timezone), never an account identifier; it
+  is frozen, refuses unknown keys, bounds every text by its column's limit
+  and hides its input from validation errors.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -2784,6 +2789,34 @@ class OrgSettingsPatch(BaseModel):
             msg = "Give at least one setting to change."
             raise ValueError(msg)
         return self
+
+
+# ---------------------------------------------------------------------------
+# Prompt context (GH-170): the per-user, per-org inputs of a run's system prompt
+# ---------------------------------------------------------------------------
+
+
+class PromptContext(BaseModel):
+    """The per-user, per-org inputs of one run's system prompt (GH-170).
+
+    Read from the caller's own rows by ``scoped_settings.load_prompt_context``
+    and assembled by ``admino.prompt_assembly``. ``response_language`` is the
+    user's own preference and ``default_response_language`` the org's (the
+    assembler resolves the fallback); ``timezone`` None means Europe/Zurich
+    (an unknown name falls back the same way when the date line is built).
+    ``PromptContext()`` is the empty context: no instructions, no language,
+    the default timezone. No account identifier (id, email, name, org name,
+    role) is a field, and unknown keys are refused, so none can reach a
+    prompt. Frozen; validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    org_instructions: str = Field(default="", max_length=_ORG_INSTRUCTIONS_MAX_LENGTH)
+    personal_instructions: str = Field(default="", max_length=_PERSONAL_INSTRUCTIONS_MAX_LENGTH)
+    response_language: ResponseLanguage | None = None
+    default_response_language: ResponseLanguage | None = None
+    timezone: str | None = Field(default=None, max_length=_TIMEZONE_MAX_LENGTH)
 
 
 # ---------------------------------------------------------------------------

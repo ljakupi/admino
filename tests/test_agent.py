@@ -21,6 +21,16 @@ Covers:
   call, never returned in history, never duplicated across turns; the current
   user message is always in context; caller-supplied system messages are
   dropped with a content-free warning.
+- GH-170: ``Agent(system_prompt=...)`` is gone (``Agent.__init__`` takes
+  ``llm_client``, ``tool_call_recorder``, ``agent_config`` and an optional
+  ``clock``). The per-run system message is
+  ``prompt_assembly.system_prompt(<the run's PromptContext>, tools=<the run's
+  advertised tools>, now=<the run's clock reading>)``: the base prompt (ending
+  with the run's tools line), the instruction sections, then the date line.
+  Tests that pin the exact system message inject the fixed clock ``_NOW`` and
+  build the expected text with ``_system_content``; the rest build the agent
+  with the three collaborators only. The new behaviour itself is specified in
+  tests/test_agent_prompt.py.
 - GH-147: tool calls are audited through an injected ``ToolCallRecorder``
   (``Agent(tool_call_recorder=...)``). Every dispatch, whatever its outcome,
   makes exactly one recorder call carrying only the session id, the raw tool
@@ -39,9 +49,9 @@ Covers:
   ``_promoted`` or ``_tools_enabled`` attributes; ``Agent.run`` takes a
   required keyword-only ``tool_policy`` (``models.ToolPolicy``: the requesting
   org's permissions, promoted tier-2 pairs and enabled services). The tools
-  payload, every dispatch and the per-run system message (configured prompt +
-  "\n\n" + the run's tools line) use that run's policy only — concurrent
-  runs with different policies never see each other's.
+  payload, every dispatch and the per-run system message's tools line use
+  that run's policy only — concurrent runs with different policies never see
+  each other's.
 - GH-162: the agent derives each run's tool context once from the run's
   principal (``TenantContext.from_principal``) and passes it as ``tenant=`` to
   every ``dispatch_tool_call`` (the first dispatch of a turn and the resume
@@ -66,6 +76,7 @@ import ast
 import asyncio
 import inspect
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -104,7 +115,7 @@ from admino.tools.registry import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
     from admino.models import ToolPolicy
     from admino.tools.registry import ToolHandler
@@ -276,20 +287,29 @@ def _policy(
     )
 
 
+# GH-170: the fixed clock reading of every test that pins the exact system message.
+_NOW = datetime(2026, 10, 4, 17, 5, tzinfo=UTC)
+
+
+def _fixed_clock() -> datetime:
+    """An injected ``Agent(clock=...)`` that always reads ``_NOW``."""
+    return _NOW
+
+
 def _new_agent(
     fake_llm: Any,
     recorder: RecordingRecorder,
     config: AgentConfig,
     *,
-    system_prompt: str = "",
+    clock: Callable[[], datetime] | None = None,
 ) -> Agent:
-    """Construct an Agent with the GH-161 constructor (no permission state)."""
-    return Agent(
-        llm_client=fake_llm,
-        tool_call_recorder=recorder,
-        agent_config=config,
-        system_prompt=system_prompt,
-    )
+    """Construct an Agent (GH-161: no permission state; GH-170: no startup prompt).
+
+    ``clock`` is passed only when given, so the tests that don't pin the system
+    message build the agent with exactly the three collaborators.
+    """
+    extra: dict[str, Any] = {} if clock is None else {"clock": clock}
+    return Agent(llm_client=fake_llm, tool_call_recorder=recorder, agent_config=config, **extra)
 
 
 class _PolicyBoundAgent:
@@ -316,30 +336,64 @@ def _build_agent(
     permissions: PermissionsConfig,
     config: AgentConfig,
     *,
-    system_prompt: str = "",
+    clock: Callable[[], datetime] | None = None,
     tools_enabled: dict[str, bool] | None = None,
     promoted: frozenset[tuple[str, str]] = frozenset(),
 ) -> _PolicyBoundAgent:
     """Build an Agent and bind the run policy made of ``permissions`` & co."""
-    agent = _new_agent(fake_llm, recorder, config, system_prompt=system_prompt)
+    agent = _new_agent(fake_llm, recorder, config, clock=clock)
     return _PolicyBoundAgent(
         agent, _policy(permissions, promoted=promoted, enabled_tools=tools_enabled)
     )
 
 
-def _system_content(system_prompt: str, tools: str | None) -> str:
-    """The expected per-run system message (GH-161).
+def _system_content(tools: str | None, *, context: Any = None) -> str:
+    """The expected per-run system message at the fixed clock ``_NOW`` (GH-161, GH-170).
 
     ``tools`` is the expected tool listing (e.g. ``"echo (say/write), memory
     (recall)"``: tools sorted, each tool's actions sorted and joined by "/"),
-    or None when the run advertises no tool.
+    or None when the run advertises no tool. The message is
+    ``prompt_assembly.system_prompt(context, tools=<that listing>, now=_NOW)``
+    (``context`` None: ``PromptContext()``), and it must carry the literal tools
+    line as the base prompt's last line. Imported lazily, so the rest of this
+    file collects without GH-170.
     """
+    from admino import prompt_assembly
+    from admino.models import PromptContext
+
+    descriptions = [
+        ToolDescription(tool=tool, action=action, description="test", parameters_schema={})
+        for tool, actions in re.findall(r"([a-z_]+) \(([a-z_/]+)\)", tools or "")
+        for action in actions.split("/")
+    ]
+    expected: str = prompt_assembly.system_prompt(
+        PromptContext() if context is None else context, tools=descriptions, now=_NOW
+    )
     line = (
         f"You have access to the following tools: {tools}."
         if tools
         else "You have no tools available."
     )
-    return f"{system_prompt}\n\n{line}" if system_prompt else line
+    assert f"\n\n{line}\n\n" in expected, "the tools line must end the base prompt"
+    return expected
+
+
+def _rich_context() -> Any:
+    """A GH-170 ``PromptContext`` with every field set (imported lazily)."""
+    from admino.models import PromptContext
+
+    return PromptContext(
+        org_instructions="ORG-INSTR-5c1e Address customers formally.",
+        personal_instructions="PERSONAL-INSTR-8a2d Keep it short.",
+        response_language="fr",
+        default_response_language="de",
+        timezone="America/New_York",
+    )
+
+
+def _context_kwargs(context: str) -> dict[str, Any]:
+    """``Agent.run`` keywords for a named context: "default" passes none, "rich" one."""
+    return {} if context == "default" else {"prompt_context": _rich_context()}
 
 
 def _text_response(content: str) -> LLMResponse:
@@ -386,8 +440,8 @@ def _assert_gh140_context_invariants(
     """Assert the GH-140 context-window contract for ONE LLM call.
 
     - Exactly one system message, at index 0, equal to ``expected_system`` —
-      the run's system message (GH-161: always present, since it carries the
-      run's tools line even when no prompt is configured).
+      the run's system message (always present: GH-170's assembled prompt,
+      which carries the run's tools line and date line).
     - The current user message is present exactly once.
     - The message right after the pinned current user message is never an
       orphaned ``tool`` result — and, more generally, no ``tool`` message is
@@ -1590,19 +1644,20 @@ class TestAgentContextTrimming:
         GH-140 rewrite: this test previously passed two caller-supplied leading
         system messages and asserted both were sent. Under GH-140 the agent is
         the sole source of system content (caller system messages are dropped),
-        so the preserved system message is the agent's configured prompt.
+        so the preserved system message is the agent's own (GH-170: the
+        assembled prompt, pinned with the fixed clock).
         """
         history: list[LLMMessage] = [LLMMessage(role="user", content=f"u-{i}") for i in range(50)]
 
         config = AgentConfig(max_tool_calls=3, max_context_messages=6, confirmation_timeout_s=60.0)
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(fake, recorder, permissions_config, config, system_prompt="sys")
+        agent = _build_agent(fake, recorder, permissions_config, config, clock=_fixed_clock)
 
         await agent.run("latest", session_id="s", history=history, principal=_PRINCIPAL)
 
         sent = fake.received_messages[0]
         assert sent[0].role == "system"
-        assert sent[0].content == _system_content("sys", None)
+        assert sent[0].content == _system_content(None)
         assert len(_system_messages(sent)) == 1
         assert "latest" in [m.content for m in sent]
 
@@ -1757,7 +1812,7 @@ class TestAgentRunConfigOverride:
             recorder,
             permissions_config,
             _limits(max_context_messages=40),
-            system_prompt="sys",
+            clock=_fixed_clock,
         )
 
         await agent.run(
@@ -1772,7 +1827,7 @@ class TestAgentRunConfigOverride:
         assert len(sent) == 6
         _assert_gh140_context_invariants(
             sent,
-            expected_system=_system_content("sys", None),
+            expected_system=_system_content(None),
             current_user="latest",
             max_context_messages=6,
         )
@@ -2865,9 +2920,6 @@ class TestAgentToolsEnabledAllTrue:
 # 15. System prompt ownership across turns (GH-140)
 # ===========================================================================
 
-_SYS = "SYS PROMPT"
-# GH-161: the per-run system message of a run that advertises no tool.
-_SYS_NO_TOOLS = _system_content(_SYS, None)
 _INJECTED_LEADING_SYS = "INJECTED-SYS-7f3a"
 _INJECTED_MID_SYS = "MID-SYS-9c2b"
 _PROMOTION_NOTICE = (
@@ -2901,6 +2953,7 @@ async def _run_text_turns(
     permissions: PermissionsConfig,
     *,
     turns: int = 25,
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[FakeLLM, list[LLMMessage]]:
     """Run ``turns`` text-only turns, feeding ``result.history`` back each time.
 
@@ -2909,7 +2962,7 @@ async def _run_text_turns(
     """
     config = AgentConfig(max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0)
     fake = FakeLLM([_text_response(f"reply-{i}") for i in range(turns)])
-    agent = _build_agent(fake, recorder, permissions, config, system_prompt=_SYS)
+    agent = _build_agent(fake, recorder, permissions, config, clock=clock)
     history: list[LLMMessage] = []
     for i in range(turns):
         result = await agent.run(f"turn-{i}", session_id="s", history=history, principal=_PRINCIPAL)
@@ -2922,7 +2975,8 @@ async def _run_terminal_path(
     recorder: RecordingRecorder,
     permissions: PermissionsConfig,
 ) -> AgentResult:
-    """Drive one ``Agent.run`` (system prompt configured) to the named terminal path."""
+    """Drive one ``Agent.run`` to the named terminal path (GH-170: the agent always
+    sends its assembled system prompt; there is no unconfigured case any more)."""
     register_tool("echo", "say", "Echo text", EchoArgs)(echo_handler)
     register_tool("echo", "write", "Write echo", EchoArgs)(echo_handler)
     config = AgentConfig(max_tool_calls=2, max_context_messages=20, confirmation_timeout_s=60.0)
@@ -2947,7 +3001,7 @@ async def _run_terminal_path(
         fake.raise_on_call = RuntimeError("boom")
     if path == "audit_failure":
         recorder.fail_with = AuditRecordError()
-    agent = _build_agent(fake, recorder, permissions, config, system_prompt=_SYS)
+    agent = _build_agent(fake, recorder, permissions, config)
 
     pending: PendingConfirmation | None = None
     if path == "session_mismatch":
@@ -2969,9 +3023,14 @@ async def _confirm_then_resume(
     permissions: PermissionsConfig,
     config: AgentConfig,
     *,
-    system_prompt: str = "SYS",
+    clock: Callable[[], datetime] | None = None,
+    context: str = "default",
 ) -> tuple[FakeLLM, AgentResult, AgentResult]:
-    """Run a confirm-gated turn, then resume it exactly as ``/api/confirm`` does."""
+    """Run a confirm-gated turn, then resume it exactly as ``/api/confirm`` does.
+
+    ``context`` names the run's prompt context (see ``_context_kwargs``); both
+    runs get it, as the server passes it to the resumed run too.
+    """
     register_tool("echo", "write", "Write echo", EchoArgs)(echo_handler)
     fake = FakeLLM(
         [
@@ -2986,9 +3045,15 @@ async def _confirm_then_resume(
             _text_response("Written."),
         ]
     )
-    agent = _build_agent(fake, recorder, permissions, config, system_prompt=system_prompt)
+    agent = _build_agent(fake, recorder, permissions, config, clock=clock)
 
-    first = await agent.run("please write x", session_id="s", history=[], principal=_PRINCIPAL)
+    first = await agent.run(
+        "please write x",
+        session_id="s",
+        history=[],
+        principal=_PRINCIPAL,
+        **_context_kwargs(context),
+    )
     assert first.pending_confirmation is not None
     second = await agent.run(
         "",
@@ -2996,6 +3061,7 @@ async def _confirm_then_resume(
         history=first.history,
         pending_confirmation=first.pending_confirmation,
         principal=_PRINCIPAL,
+        **_context_kwargs(context),
     )
     return fake, first, second
 
@@ -3022,9 +3088,9 @@ class TestAgentSystemPromptHistory:
 
     - ``AgentResult.history`` holds only user / assistant / tool messages, on
       every terminal path.
-    - Every LLM call carries exactly one system message (the agent's own
-      prompt plus the run's tools line, at index 0 — GH-161: just the tools
-      line when no prompt is configured).
+    - Every LLM call carries exactly one system message, at index 0: the
+      run's assembled prompt (GH-170: base prompt with the run's tools line,
+      instruction sections, date line).
     - The system prompt and the current user message are always sent (the
       floor), the current user message exactly once; older messages fill the
       remaining budget, most recent first, in chronological order; the message
@@ -3042,13 +3108,12 @@ class TestAgentSystemPromptHistory:
         permissions_config: PermissionsConfig,
     ) -> None:
         """Feeding result.history back for 25 turns never duplicates the prompt."""
-        fake, _ = await _run_text_turns(recorder, permissions_config)
+        fake, _ = await _run_text_turns(recorder, permissions_config, clock=_fixed_clock)
+        system = _system_content(None)
 
         assert fake.calls == 25
         for i, call in enumerate(fake.received_messages):
-            assert _roles_and_contents(_system_messages(call)) == [("system", _SYS_NO_TOOLS)], (
-                f"turn {i}"
-            )
+            assert _roles_and_contents(_system_messages(call)) == [("system", system)], f"turn {i}"
             assert call[0].role == "system", f"turn {i}"
             assert (call[-1].role, call[-1].content) == ("user", f"turn-{i}"), f"turn {i}"
             assert len(call) <= 20, f"turn {i}"
@@ -3077,7 +3142,8 @@ class TestAgentSystemPromptHistory:
         With ``max_context_messages=20`` the floor is [system, current user]
         (2 messages), so the 18 most recent prior messages fill the rest.
         """
-        fake, _ = await _run_text_turns(recorder, permissions_config)
+        fake, _ = await _run_text_turns(recorder, permissions_config, clock=_fixed_clock)
+        system = _system_content(None)
 
         for i, call in enumerate(fake.received_messages):
             prior = [
@@ -3085,7 +3151,7 @@ class TestAgentSystemPromptHistory:
                 for j in range(i)
                 for pair in (("user", f"turn-{j}"), ("assistant", f"reply-{j}"))
             ]
-            expected = [("system", _SYS_NO_TOOLS), *prior[-18:], ("user", f"turn-{i}")]
+            expected = [("system", system), *prior[-18:], ("user", f"turn-{i}")]
             assert _roles_and_contents(call) == expected, f"turn {i}"
 
     async def test_agent_25_tool_turns_each_llm_call_has_one_system_and_current_user_once(
@@ -3110,7 +3176,7 @@ class TestAgentSystemPromptHistory:
             )
             responses.append(_text_response(f"reply-{i}"))
         fake = FakeLLM(responses)
-        agent = _build_agent(fake, recorder, permissions_config, agent_config, system_prompt=_SYS)
+        agent = _build_agent(fake, recorder, permissions_config, agent_config, clock=_fixed_clock)
 
         history: list[LLMMessage] = []
         for i in range(25):
@@ -3122,7 +3188,7 @@ class TestAgentSystemPromptHistory:
             for call in fake.received_messages[first_call:]:
                 _assert_gh140_context_invariants(
                     call,
-                    expected_system=_system_content(_SYS, "echo (say)"),
+                    expected_system=_system_content("echo (say)"),
                     current_user=f"turn-{i}",
                     max_context_messages=agent_config.max_context_messages,
                 )
@@ -3188,7 +3254,7 @@ class TestAgentSystemPromptHistory:
                 _text_response("done"),
             ]
         )
-        agent = _build_agent(fake, recorder, permissions_config, config, system_prompt=_SYS)
+        agent = _build_agent(fake, recorder, permissions_config, config, clock=_fixed_clock)
 
         result = await agent.run(
             "CURRENT-REQUEST", session_id="s", history=prior, principal=_PRINCIPAL
@@ -3199,40 +3265,25 @@ class TestAgentSystemPromptHistory:
         for call in fake.received_messages:
             _assert_gh140_context_invariants(
                 call,
-                expected_system=_system_content(_SYS, "echo (say)"),
+                expected_system=_system_content("echo (say)"),
                 current_user="CURRENT-REQUEST",
                 max_context_messages=max_context_messages,
             )
             assert _is_ordered_subsequence(call[1:], result.history)
 
-    @pytest.mark.parametrize(
-        ("system_prompt", "expected_floor"),
-        [
-            pytest.param(
-                _SYS,
-                [("system", _system_content(_SYS, "echo (say)")), ("user", "CURRENT-REQUEST")],
-                id="with_system_prompt",
-            ),
-            pytest.param(
-                "",
-                [("system", _system_content("", "echo (say)")), ("user", "CURRENT-REQUEST")],
-                id="without_system_prompt",
-            ),
-        ],
-    )
+    @pytest.mark.parametrize("context", ["default", "rich"])
     async def test_agent_max_context_one_sends_exactly_the_floor(
         self,
         recorder: RecordingRecorder,
         permissions_config: PermissionsConfig,
-        system_prompt: str,
-        expected_floor: list[tuple[str, str]],
+        context: str,
     ) -> None:
         """``max_context_messages=1``: every call is exactly [system, current user].
 
         The floor (system message + current user message) is always sent even
         though it exceeds the budget — including on the post-tool LLM call.
-        GH-161: without a configured prompt the system message is the run's
-        tools line alone.
+        GH-170: the with/without-system-prompt cases became runs without a
+        prompt context and with one that sets every field.
         """
         register_tool("echo", "say", "Echo text", EchoArgs)(echo_handler)
         config = AgentConfig(max_tool_calls=5, max_context_messages=1, confirmation_timeout_s=60.0)
@@ -3253,14 +3304,25 @@ class TestAgentSystemPromptHistory:
                 _text_response("done"),
             ]
         )
-        agent = _build_agent(
-            fake, recorder, permissions_config, config, system_prompt=system_prompt
-        )
+        agent = _build_agent(fake, recorder, permissions_config, config, clock=_fixed_clock)
 
         result = await agent.run(
-            "CURRENT-REQUEST", session_id="s", history=prior, principal=_PRINCIPAL
+            "CURRENT-REQUEST",
+            session_id="s",
+            history=prior,
+            principal=_PRINCIPAL,
+            **_context_kwargs(context),
         )
 
+        expected_floor = [
+            (
+                "system",
+                _system_content(
+                    "echo (say)", context=None if context == "default" else _rich_context()
+                ),
+            ),
+            ("user", "CURRENT-REQUEST"),
+        ]
         assert result.status == "final"
         assert [_roles_and_contents(call) for call in fake.received_messages] == [
             expected_floor,
@@ -3277,16 +3339,14 @@ class TestAgentSystemPromptHistory:
     ) -> None:
         """Leading and mid-conversation caller system messages never reach the LLM."""
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(
-            fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
-        )
+        agent = _build_agent(fake, recorder, permissions_config, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
         )
 
         sent = fake.received_messages[0]
-        expected = _system_content("REAL SYS", None)
+        expected = _system_content(None)
         assert _roles_and_contents(_system_messages(sent)) == [("system", expected)]
         assert sent[0].content == expected
 
@@ -3298,9 +3358,7 @@ class TestAgentSystemPromptHistory:
     ) -> None:
         """Injected system text is absent from every message the LLM receives."""
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(
-            fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
-        )
+        agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         await agent.run(
             "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
@@ -3318,9 +3376,7 @@ class TestAgentSystemPromptHistory:
     ) -> None:
         """Caller system messages are stripped; the u1/a1 turns survive in order."""
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(
-            fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
-        )
+        agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         result = await agent.run(
             "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
@@ -3333,27 +3389,28 @@ class TestAgentSystemPromptHistory:
             ("assistant", "ok"),
         ]
 
-    async def test_agent_without_system_prompt_sends_only_the_tools_line_as_system(
+    async def test_agent_without_prompt_context_sends_only_the_default_system_prompt(
         self,
         recorder: RecordingRecorder,
         permissions_config: PermissionsConfig,
         agent_config: AgentConfig,
     ) -> None:
-        """With no configured prompt the only system message is the run's tools line.
+        """With no prompt context the only system message is the default-context prompt.
 
-        GH-161 spec change: it used to be zero system messages; the agent now
-        always sends the run's tools line, and caller system messages are still
-        dropped.
+        GH-161 spec change: it used to be zero system messages; the agent then
+        always sent the run's tools line. GH-170: without ``prompt_context`` it
+        sends ``system_prompt(PromptContext(), ...)``; caller system messages
+        are still dropped.
         """
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(fake, recorder, permissions_config, agent_config)
+        agent = _build_agent(fake, recorder, permissions_config, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
         )
 
         assert _roles_and_contents(_system_messages(fake.received_messages[0])) == [
-            ("system", "You have no tools available.")
+            ("system", _system_content(None))
         ]
 
     async def test_agent_caller_leading_system_message_logs_content_free_warning(
@@ -3371,9 +3428,7 @@ class TestAgentSystemPromptHistory:
             LLMMessage(role="assistant", content="a1"),
         ]
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(
-            fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
-        )
+        agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         await agent.run("next", session_id="s", history=history, principal=_PRINCIPAL)
 
@@ -3390,9 +3445,7 @@ class TestAgentSystemPromptHistory:
         """Leading + mid caller system messages: warned about, content never logged."""
         caplog.set_level(logging.DEBUG)
         fake = FakeLLM([_text_response("ok")])
-        agent = _build_agent(
-            fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
-        )
+        agent = _build_agent(fake, recorder, permissions_config, agent_config)
 
         await agent.run(
             "next", session_id="s", history=_tainted_caller_history(), principal=_PRINCIPAL
@@ -3414,9 +3467,7 @@ class TestAgentSystemPromptHistory:
         """Feeding the agent's own returned history back never triggers the warning."""
         caplog.set_level(logging.DEBUG)
         fake = FakeLLM([_text_response("first"), _text_response("second")])
-        agent = _build_agent(
-            fake, recorder, permissions_config, agent_config, system_prompt="REAL SYS"
-        )
+        agent = _build_agent(fake, recorder, permissions_config, agent_config)
         prior = [
             LLMMessage(role="user", content="earlier"),
             LLMMessage(role="assistant", content="earlier reply"),
@@ -3448,12 +3499,14 @@ class TestAgentSystemPromptHistory:
         agent_config: AgentConfig,
     ) -> None:
         """Resuming (user_message="") sends one system prompt and the original request."""
-        fake, _, _ = await _confirm_then_resume(recorder, permissions_config, agent_config)
+        fake, _, _ = await _confirm_then_resume(
+            recorder, permissions_config, agent_config, clock=_fixed_clock
+        )
 
         assert fake.calls == 2
         resume_call = fake.received_messages[1]
         assert _roles_and_contents(_system_messages(resume_call)) == [
-            ("system", _system_content("SYS", "echo (write)"))
+            ("system", _system_content("echo (write)"))
         ]
         assert resume_call[0].role == "system"
         assert len(_user_indices(resume_call, "please write x")) == 1
@@ -3473,14 +3526,12 @@ class TestAgentSystemPromptHistory:
         assert second.history[-2].tool_call_id == "call_write_1"
 
     @pytest.mark.parametrize("max_context_messages", [1, 2, 3])
-    @pytest.mark.parametrize(
-        "system_prompt", ["SYS", ""], ids=["with_system_prompt", "without_system_prompt"]
-    )
+    @pytest.mark.parametrize("context", ["default", "rich"])
     async def test_agent_resume_pins_resumed_user_message_under_tiny_budget(
         self,
         recorder: RecordingRecorder,
         permissions_config: PermissionsConfig,
-        system_prompt: str,
+        context: str,
         max_context_messages: int,
     ) -> None:
         """Resume keeps the same floor as a normal turn: the resumed user request.
@@ -3488,6 +3539,8 @@ class TestAgentSystemPromptHistory:
         GH-140 security review (Medium): with no pinned message, the resume call
         trimmed down to ``[system]`` — or to an empty list without a system
         prompt — so the LLM summarised an approved action with no context.
+        GH-170: the with/without-system-prompt cases became runs without a
+        prompt context and with one that sets every field.
         """
         config = AgentConfig(
             max_tool_calls=5,
@@ -3495,13 +3548,15 @@ class TestAgentSystemPromptHistory:
             confirmation_timeout_s=60.0,
         )
         fake, _, second = await _confirm_then_resume(
-            recorder, permissions_config, config, system_prompt=system_prompt
+            recorder, permissions_config, config, clock=_fixed_clock, context=context
         )
 
         assert second.status == "final"
         _assert_gh140_context_invariants(
             fake.received_messages[1],
-            expected_system=_system_content(system_prompt, "echo (write)"),
+            expected_system=_system_content(
+                "echo (write)", context=None if context == "default" else _rich_context()
+            ),
             current_user="please write x",
             max_context_messages=max_context_messages,
         )
@@ -3530,16 +3585,14 @@ class TestAgentSystemPromptHistory:
     ) -> None:
         """The user-role PERMISSION UPDATE notice appended by the server still works."""
         fake = FakeLLM([_text_response("hi"), _text_response("sure")])
-        agent = _build_agent(fake, recorder, permissions_config, agent_config, system_prompt="SYS")
+        agent = _build_agent(fake, recorder, permissions_config, agent_config, clock=_fixed_clock)
 
         first = await agent.run("hello", session_id="s", history=[], principal=_PRINCIPAL)
         history = [*first.history, LLMMessage(role="user", content=_PROMOTION_NOTICE)]
         second = await agent.run("next", session_id="s", history=history, principal=_PRINCIPAL)
 
         call = fake.received_messages[1]
-        assert _roles_and_contents(_system_messages(call)) == [
-            ("system", _system_content("SYS", None))
-        ]
+        assert _roles_and_contents(_system_messages(call)) == [("system", _system_content(None))]
         assert call[0].role == "system"
         assert ("user", _PROMOTION_NOTICE) in _roles_and_contents(call)
         assert (call[-1].role, call[-1].content) == ("user", "next")
@@ -3566,7 +3619,6 @@ _ORG_B_PRINCIPAL = Principal(
 )
 _STORE = ToolCall(tool="memory", action="store", args={"text": "note"})
 _SEND = ToolCall(tool="gmail", action="send", args={"text": "mail"})
-_NO_TOOLS_LINE = "You have no tools available."
 
 
 def _all_services(**overrides: bool) -> dict[str, bool]:
@@ -3597,13 +3649,14 @@ class TestAgentHoldsNoPermissionState:
         assert removed not in inspect.signature(Agent.__init__).parameters
 
     def test_agent_init_takes_exactly_the_stateless_collaborators(self) -> None:
-        """Agent(*, llm_client, tool_call_recorder, agent_config, system_prompt="")."""
+        """Agent(*, llm_client, tool_call_recorder, agent_config, clock=None) (GH-170: the
+        startup system_prompt is gone; the optional clock feeds the date line)."""
         params = dict(inspect.signature(Agent.__init__).parameters)
         params.pop("self")
 
-        assert set(params) == {"llm_client", "tool_call_recorder", "agent_config", "system_prompt"}
+        assert set(params) == {"llm_client", "tool_call_recorder", "agent_config", "clock"}
         assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
-        assert params["system_prompt"].default == ""
+        assert params["clock"].default is None
 
     @pytest.mark.parametrize(
         ("removed", "value"),
@@ -3640,7 +3693,7 @@ class TestAgentHoldsNoPermissionState:
         self, recorder: RecordingRecorder, agent_config: AgentConfig, attribute: str
     ) -> None:
         """No agent-wide _permissions / _promoted / _tools_enabled exists to mutate."""
-        agent = _new_agent(FakeLLM([]), recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(FakeLLM([]), recorder, agent_config)
 
         assert not hasattr(agent, attribute)
 
@@ -3959,11 +4012,12 @@ async def _run_orgs_concurrently(
     call: ToolCall,
     *,
     a_first: bool,
+    clock: Callable[[], datetime] | None = None,
 ) -> tuple[_InterleavingLLM, AgentResult, AgentResult]:
     """Run org A's and org B's requests concurrently on ONE agent; return both results."""
     _register_store_and_send()
     llm = _InterleavingLLM({"run-A": call, "run-B": call})
-    agent = _new_agent(llm, recorder, config, system_prompt="SYS")
+    agent = _new_agent(llm, recorder, config, clock=clock)
     policy_a = _policy(_permissions(org_a[0]), **org_a[1])
     policy_b = _policy(_permissions(org_b[0]), **org_b[1])
     run_a = agent.run(
@@ -4046,19 +4100,19 @@ class TestAgentConcurrentRunsAreIsolated:
     ) -> None:
         """Org A's system message lists A's tools; org B's says none are available."""
         llm, _, _ = await _run_orgs_concurrently(
-            recorder, agent_config, org_a, org_b, call, a_first=a_first
+            recorder, agent_config, org_a, org_b, call, a_first=a_first, clock=_fixed_clock
         )
 
         assert {
             m.content for messages, _ in llm.calls["run-A"] for m in _system_messages(messages)
-        } == {_system_content("SYS", a_tools)}
+        } == {_system_content(a_tools)}
         assert {
             m.content for messages, _ in llm.calls["run-B"] for m in _system_messages(messages)
-        } == {_system_content("SYS", None)}
+        } == {_system_content(None)}
 
 
 class TestAgentPerRunSystemMessage:
-    """The system message is the configured prompt plus the run's tools line."""
+    """The system message's base prompt ends with the run's tools line (GH-161, GH-170)."""
 
     async def test_agent_system_message_is_prompt_blank_line_then_sorted_tools(
         self, recorder: RecordingRecorder, agent_config: AgentConfig
@@ -4080,18 +4134,14 @@ class TestAgentPerRunSystemMessage:
             }
         )
         fake = FakeLLM([_text_response("ok")])
-        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(fake, recorder, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "hi", session_id="s", history=[], principal=_PRINCIPAL, tool_policy=_policy(permissions)
         )
 
         assert _roles_and_contents(_system_messages(fake.received_messages[0])) == [
-            (
-                "system",
-                "SYS\n\nYou have access to the following tools: "
-                "echo (say/write), gmail (read), memory (recall/store).",
-            )
+            ("system", _system_content("echo (say/write), gmail (read), memory (recall/store)"))
         ]
 
     async def test_agent_system_message_lists_only_advertised_actions(
@@ -4114,7 +4164,7 @@ class TestAgentPerRunSystemMessage:
             }
         )
         fake = FakeLLM([_text_response("ok")])
-        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(fake, recorder, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "hi",
@@ -4124,9 +4174,7 @@ class TestAgentPerRunSystemMessage:
             tool_policy=_policy(permissions, enabled_tools=_all_services(memory=False)),
         )
 
-        assert fake.received_messages[0][0].content == (
-            "SYS\n\nYou have access to the following tools: gmail (read)."
-        )
+        assert fake.received_messages[0][0].content == _system_content("gmail (read)")
 
     @pytest.mark.parametrize(
         "register", [False, True], ids=["nothing-registered", "everything-denied"]
@@ -4138,7 +4186,7 @@ class TestAgentPerRunSystemMessage:
         if register:
             register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
         fake = FakeLLM([_text_response("ok")])
-        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(fake, recorder, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "hi",
@@ -4149,23 +4197,27 @@ class TestAgentPerRunSystemMessage:
         )
 
         assert _roles_and_contents(_system_messages(fake.received_messages[0])) == [
-            ("system", "SYS\n\nYou have no tools available.")
+            ("system", _system_content(None))
         ]
 
     @pytest.mark.parametrize(
-        ("state", "expected"),
-        [
-            ("allow", "You have access to the following tools: memory (store)."),
-            ("deny", _NO_TOOLS_LINE),
-        ],
+        ("state", "listing"),
+        [("allow", "memory (store)"), ("deny", None)],
     )
-    async def test_agent_system_message_without_prompt_is_only_the_tools_line(
-        self, recorder: RecordingRecorder, agent_config: AgentConfig, state: str, expected: str
+    async def test_agent_system_message_without_prompt_context_is_the_default_prompt(
+        self,
+        recorder: RecordingRecorder,
+        agent_config: AgentConfig,
+        state: str,
+        listing: str | None,
     ) -> None:
-        """system_prompt="" → the system message is the tools line alone, first."""
+        """No prompt_context → the default-context prompt with the run's tools line, first.
+
+        GH-170 replaces the removed ``system_prompt=""`` case (the tools line alone).
+        """
         register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
         fake = FakeLLM([_text_response("ok")])
-        agent = _new_agent(fake, recorder, agent_config)
+        agent = _new_agent(fake, recorder, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "hi",
@@ -4176,7 +4228,7 @@ class TestAgentPerRunSystemMessage:
         )
 
         sent = fake.received_messages[0]
-        assert _roles_and_contents(_system_messages(sent)) == [("system", expected)]
+        assert _roles_and_contents(_system_messages(sent)) == [("system", _system_content(listing))]
         assert sent[0].role == "system"
 
     async def test_agent_system_message_follows_each_runs_policy(
@@ -4185,7 +4237,7 @@ class TestAgentPerRunSystemMessage:
         """Same agent: the tools line is rebuilt per run, never carried over."""
         register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
         fake = FakeLLM([_text_response("a"), _text_response("b"), _text_response("c")])
-        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(fake, recorder, agent_config, clock=_fixed_clock)
 
         for state in ("allow", "deny", "allow"):
             await agent.run(
@@ -4197,9 +4249,9 @@ class TestAgentPerRunSystemMessage:
             )
 
         assert [call[0].content for call in fake.received_messages] == [
-            "SYS\n\nYou have access to the following tools: memory (store).",
-            "SYS\n\nYou have no tools available.",
-            "SYS\n\nYou have access to the following tools: memory (store).",
+            _system_content("memory (store)"),
+            _system_content(None),
+            _system_content("memory (store)"),
         ]
 
     async def test_agent_system_message_is_the_same_on_every_call_of_a_run(
@@ -4208,7 +4260,7 @@ class TestAgentPerRunSystemMessage:
         """A tool round trip re-sends the same single system message."""
         register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
         fake = FakeLLM(_tool_then_text(_STORE))
-        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(fake, recorder, agent_config, clock=_fixed_clock)
 
         await agent.run(
             "store it",
@@ -4218,7 +4270,7 @@ class TestAgentPerRunSystemMessage:
             tool_policy=_store_policy("allow"),
         )
 
-        expected = "SYS\n\nYou have access to the following tools: memory (store)."
+        expected = _system_content("memory (store)")
         assert [_roles_and_contents(_system_messages(call)) for call in fake.received_messages] == [
             [("system", expected)],
             [("system", expected)],
@@ -4230,7 +4282,7 @@ class TestAgentPerRunSystemMessage:
         """Neither the prompt nor the tools line leaks into AgentResult.history."""
         register_tool("memory", "store", "Store a note", EchoArgs)(echo_handler)
         fake = FakeLLM(_tool_then_text(_STORE))
-        agent = _new_agent(fake, recorder, agent_config, system_prompt="SYS")
+        agent = _new_agent(fake, recorder, agent_config)
 
         result = await agent.run(
             "store it",
