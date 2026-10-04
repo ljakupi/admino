@@ -23,7 +23,8 @@ Startup sequence:
 8. Instantiate the Agent with all dependencies, including the tool-call
    recorder that writes one ``tool.call`` audit event per dispatch. The agent
    holds no permission state: the server loads the requesting org's tool
-   policy for every run (GH-161).
+   policy for every run (GH-161). Nor is a system prompt built at startup:
+   each run assembles its own (``admino.prompt_assembly``, GH-170).
 9. Create the FastAPI app via server.create_app().
 10. Start uvicorn with single-worker constraint.
 
@@ -244,50 +245,6 @@ def _import_tool_modules() -> None:
         except Exception:
             logger.error("Failed to import tool module %s", module_name)
             raise
-
-
-def _build_system_prompt(config: object) -> str:
-    """Build the static system prompt from the validated application config.
-
-    Tells the LLM that some actions need user confirmation and that it must
-    never substitute a different action for the one the user asked for. It
-    names no tools: the agent appends each run's tools line, built from the
-    requesting org's policy (GH-161).
-
-    Args:
-        config: Validated AppConfig instance.
-
-    Returns:
-        A system prompt string, or empty string if nothing meaningful to say.
-    """
-    from admino.config import AppConfig
-
-    if not isinstance(config, AppConfig):
-        return ""
-
-    lines: list[str] = [
-        "You are admino, a local personal AI assistant.",
-        "Some actions may require user confirmation before execution.",
-        "",
-        "IMPORTANT: Tool permissions can change during a conversation. If a tool "
-        "call was previously denied, the user may have since promoted it. Always "
-        "attempt the tool call when the user asks — never refuse based on earlier "
-        "denials in the conversation. The permission engine will re-evaluate each "
-        "call independently.",
-        "",
-        "CRITICAL — never substitute a different tool or action for the one the "
-        "user actually requested. If the exact capability the user asked for is "
-        "not available to you (not in your tool list, disabled, or not permitted), "
-        "STOP and tell the user that action is not available and why — for example, "
-        "that it needs to be enabled or promoted in Critical Permissions. Do NOT "
-        "approximate the request with a different tool. This is absolute for "
-        "mutating actions: never turn an update into a create, or send to a "
-        "different recipient/channel. A duplicate or wrong write is worse than "
-        "doing nothing.",
-        "",
-    ]
-
-    return "\n".join(lines)
 
 
 def _session_chat_id(session_id: str) -> uuid.UUID:
@@ -517,13 +474,13 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 8. Build system prompt from config and instantiate the Agent
+    # 8. Instantiate the Agent
     # ------------------------------------------------------------------
     # GH-161: the Agent holds no permission state; the server passes the
-    # requesting org's ToolPolicy to every run.
+    # requesting org's ToolPolicy to every run. GH-170: nor a system prompt;
+    # each run assembles its own from the org's and the user's settings.
     from admino.agent import Agent
 
-    system_prompt = _build_system_prompt(config)
     # Logged below; fall back to the provider name when no model is set (chat
     # then asks the user to choose one).
     model_name = config.llm.active_model_name or config.llm.provider
@@ -533,7 +490,6 @@ def main(
         # GH-147: every dispatch is recorded as a tool.call audit event.
         tool_call_recorder=_build_tool_call_recorder(),
         agent_config=agent_config,
-        system_prompt=system_prompt,
     )
     logger.info(
         "Agent initialized with model %s (provider=%s)",

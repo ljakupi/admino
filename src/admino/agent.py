@@ -18,10 +18,17 @@ Architecture & boundaries:
 - Conversation history is owned by the *caller*; the system message is owned
   by the *agent*. The agent copies the caller's history, mutates the local
   list, and returns it as part of :class:`admino.models.AgentResult` — it
-  only ever holds user/assistant/tool messages. The system message (the
-  configured prompt plus the run's tools line) is added to each LLM call's
-  context and never returned in history, so it cannot accumulate across
-  turns (GH-140).
+  only ever holds user/assistant/tool messages. The system message is added
+  to each LLM call's context and never returned in history, so it cannot
+  accumulate across turns (GH-140).
+- Layered prompt (GH-170): every LLM call's context is built by
+  ``admino.prompt_assembly.assemble`` from the run's
+  :class:`admino.models.PromptContext` (the org's and the user's
+  instructions, languages and timezone; the server loads it per request),
+  the run's advertised tools and the run's clock reading (read once per
+  run), so every call of a run carries the same system message: the base
+  prompt ending with the run's tools line, the instruction sections, then
+  the date line. There is no startup-built prompt.
 - The agent holds no permission state and there is no module-level mutable
   state (GH-161). Every run gets the requesting org's
   :class:`admino.models.ToolPolicy` (its permissions, promoted tier-2 pairs
@@ -87,6 +94,11 @@ Security notes:
 - The tools line names only the tool/action pairs advertised in that run's
   tools payload (the registry's names, never LLM output), so it can't reveal
   a pair the run's policy denies or switches off.
+- Instructions can't widen what a run may do: they sit in their own
+  sections after the base prompt, and every tool call still goes through
+  ``dispatch_tool_call`` with the run's policy. No instruction text, language
+  or timezone is logged, and no user/org id, email or name is put into the
+  prompt.
 """
 
 from __future__ import annotations
@@ -95,16 +107,18 @@ import logging
 import re
 import time
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
-from admino import llm_policy
+from admino import llm_policy, prompt_assembly
 from admino.llm import LLMError
 from admino.models import (
     AgentConfig,
     AgentResult,
     LLMMessage,
     PendingConfirmation,
+    PromptContext,
     ToolCall,
     ToolCallRecord,
 )
@@ -113,6 +127,8 @@ from admino.tenancy import NoTenantContextError, TenantContext
 from admino.tools.registry import ToolCallResult, dispatch_tool_call, get_registered_tools
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from admino.access import Principal
     from admino.llm import LLMClient
     from admino.models import LLMErrorCode, ToolPolicy
@@ -142,7 +158,6 @@ _AUDIT_UNAVAILABLE_MESSAGE: str = "Internal error: audit unavailable."
 # GH-162: the outcome of a tool call in a run without a tool context (a
 # principal without an organization): nothing is dispatched.
 _NO_ORG_CONTEXT_MESSAGE: str = "No organization context."
-_NO_TOOLS_LINE: str = "You have no tools available."
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +226,7 @@ class Agent:
         llm_client: LLMClient,
         tool_call_recorder: ToolCallRecorder,
         agent_config: AgentConfig,
-        system_prompt: str = "",
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         """Initialise the agent with its collaborators.
 
@@ -224,16 +239,14 @@ class Agent:
             agent_config: Runtime limits (``max_tool_calls``,
                 ``max_context_messages``, ``confirmation_timeout_s``) of a run
                 that is given none.
-            system_prompt: Optional static prompt (file paths, operator
-                constraints and other context). Each run sends it, followed by
-                a blank line and that run's tools line, as the one system
-                message, first, on every LLM call. It is never added to the
-                history returned to the caller.
+            clock: Returns the current timezone-aware time for the system
+                prompt's date line, read once per run (GH-170). None: the
+                current UTC time.
         """
         self._llm = llm_client
         self._record_tool_call = tool_call_recorder
         self._config = agent_config
-        self._system_prompt = system_prompt
+        self._clock: Callable[[], datetime] = partial(datetime.now, UTC) if clock is None else clock
 
     # ------------------------------------------------------------------
     # Public API
@@ -249,15 +262,18 @@ class Agent:
         tool_policy: ToolPolicy,
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
+        prompt_context: PromptContext | None = None,
     ) -> AgentResult:
         """Run the agent loop for a single user message.
 
         The method appends the user message to a copy of ``history``, then
         enters the LLM/tool loop until the LLM produces plain text, a tool
         call needs confirmation, ``max_tool_calls`` is exhausted, or an error
-        occurs. Each LLM call gets the run's system message (the configured
-        prompt plus the run's tools line) and a trimmed window of the
-        history in which the current user message is always kept.
+        occurs. Each LLM call gets the run's system message
+        (``prompt_assembly.system_prompt`` over ``prompt_context``, the run's
+        advertised tools and the run's clock reading: the same on every call
+        of the run) and a trimmed window of the history in which the current
+        user message is always kept.
 
         Args:
             user_message: The user's message text. Must already be validated
@@ -283,6 +299,9 @@ class Agent:
                 ``llm_max_retries``; GH-160/GH-242: the stored platform
                 limits). None: the construction-time config. Applies to this
                 run only.
+            prompt_context: The org's and the user's prompt inputs
+                (instructions, response languages, timezone; GH-170), loaded
+                by the caller for this request. None: ``PromptContext()``.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
@@ -300,9 +319,9 @@ class Agent:
         except NoTenantContextError:
             tenant = None
         # Work on a local copy so we never mutate the caller's list. The
-        # system message is NOT stored here: it is added per LLM call by
-        # _build_context, so the returned history never carries it and it
-        # cannot pile up when the caller feeds the history back (GH-140).
+        # system message is NOT stored here: prompt_assembly adds it per LLM
+        # call, so the returned history never carries it and it cannot pile
+        # up when the caller feeds the history back (GH-140).
         working_history: list[LLMMessage] = _drop_system_messages(history)
         # Index of this turn's user message, pinned into every context window.
         # On resume there is no new user message, so the request being resumed
@@ -366,11 +385,12 @@ class Agent:
             promoted=tool_policy.promoted,
         )
         tools_payload: list[dict[str, object]] = _tool_descriptions_to_payload(descriptions)
-        # GH-161: the run's system message names exactly what it advertises.
-        tools_line = _tools_line(descriptions)
-        system_message = (
-            f"{self._system_prompt}\n\n{tools_line}" if self._system_prompt else tools_line
-        )
+        # GH-170: the system message's inputs are fixed for the whole run, so
+        # every LLM call of it carries the same prompt: the context, the
+        # advertised descriptions (GH-161: the tools line names exactly what
+        # the run advertises) and one clock reading.
+        prompt_inputs = PromptContext() if prompt_context is None else prompt_context
+        now = self._clock()
         # Carry a one-shot pending_confirmation that is applied to the FIRST
         # dispatch only, then cleared. This matches the server contract:
         # a confirmation resumes exactly one tool call.
@@ -405,11 +425,15 @@ class Agent:
         # by a batch of tool dispatches.
         for _iteration in range(config.max_tool_calls + 1):
             # 1. Call the LLM with the system message + a trimmed context window.
-            context = _build_context(
-                working_history,
-                system_message=system_message,
-                current_idx=current_idx,
-                max_messages=config.max_context_messages,
+            context = prompt_assembly.assemble(
+                prompt_inputs,
+                tools=descriptions,
+                now=now,
+                history=_context_window(
+                    working_history,
+                    current_idx=current_idx,
+                    max_messages=config.max_context_messages,
+                ),
             )
             try:
                 # GH-242: the model policy (residency guard + bounded retries on
@@ -761,8 +785,8 @@ class Agent:
 def _drop_system_messages(history: list[LLMMessage]) -> list[LLMMessage]:
     """Return a copy of caller-supplied ``history`` without ``system`` messages.
 
-    The agent is the only source of system content (its configured prompt
-    plus the run's tools line, added per LLM call by :func:`_build_context`).
+    The agent is the only source of system content (the run's assembled
+    prompt, added per LLM call by ``prompt_assembly.assemble``).
     A ``system`` message in caller history — leading or mid-conversation — is
     either a stale copy of that message or persisted prompt injection, so all
     of them are dropped.
@@ -776,19 +800,19 @@ def _drop_system_messages(history: list[LLMMessage]) -> list[LLMMessage]:
     return kept
 
 
-def _build_context(
+def _context_window(
     history: list[LLMMessage],
     *,
-    system_message: str,
     current_idx: int | None,
     max_messages: int,
 ) -> list[LLMMessage]:
-    """Build the message list for one LLM call.
+    """Return the history part of one LLM call's context.
 
     ``history`` must hold no ``system`` messages (see
-    :func:`_drop_system_messages`). The result is:
+    :func:`_drop_system_messages`). ``prompt_assembly.assemble`` puts the
+    run's system message before the result, so ``max_messages`` counts it.
+    The result is:
 
-    - the run's ``system_message`` once, at index 0 (omitted when empty);
     - the current user message ``history[current_idx]``, exactly once — the
       system message and this message are the floor and are always sent, even
       when they alone exceed ``max_messages``;
@@ -797,24 +821,23 @@ def _build_context(
       orphaned ``tool`` results).
 
     ``current_idx`` is ``None`` only when the history holds no user message to
-    pin; the result is then the system message plus the trimmed history.
+    pin; the result is then the trimmed history alone.
 
     The pinned message goes back to its chronological position: a window that
     reaches into the messages before it holds every message after it, and the
     first message after it is the assistant turn answering it, so no orphaned
     ``tool`` result can follow it.
     """
-    system = [LLMMessage(role="system", content=system_message)] if system_message else []
+    budget = max_messages - 1  # the system message
     if current_idx is None:
-        budget = max_messages - len(system)
         # Guard budget <= 0 so _trim_context does not emit its L-5 warning.
-        return system + (_trim_context(history, budget) if budget > 0 else [])
+        return _trim_context(history, budget) if budget > 0 else []
     pinned = history[current_idx]
     after = history[current_idx + 1 :]
-    budget = max_messages - len(system) - 1
+    budget -= 1  # the pinned message
     tail = _trim_context(history[:current_idx] + after, budget) if budget > 0 else []
     insert_at = max(0, len(tail) - len(after))
-    return [*system, *tail[:insert_at], pinned, *tail[insert_at:]]
+    return [*tail[:insert_at], pinned, *tail[insert_at:]]
 
 
 def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessage]:
@@ -822,7 +845,7 @@ def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessa
 
     System messages at the head of history are preserved; only non-system
     messages are trimmed from the middle/front. The agent calls this via
-    :func:`_build_context` on history that is already free of system
+    :func:`_context_window` on history that is already free of system
     messages, so there it simply keeps the most recent messages; the
     system-message handling here is defence in depth.
 
@@ -882,23 +905,6 @@ def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:
         else:
             filtered.append(msg)
     return filtered
-
-
-def _tools_line(descriptions: list[ToolDescription]) -> str:
-    """Return the system message's line naming the tools a run advertises.
-
-    Built from the same descriptions as the run's tools payload: tools sorted
-    by name, each with its sorted actions joined by "/", e.g. ``"You have
-    access to the following tools: gmail (read/search), memory (store)."``.
-    Without any tool: ``"You have no tools available."``.
-    """
-    actions: dict[str, set[str]] = {}
-    for desc in descriptions:
-        actions.setdefault(desc.tool, set()).add(desc.action)
-    if not actions:
-        return _NO_TOOLS_LINE
-    listing = ", ".join(f"{tool} ({'/'.join(sorted(actions[tool]))})" for tool in sorted(actions))
-    return f"You have access to the following tools: {listing}."
 
 
 def _tool_descriptions_to_payload(

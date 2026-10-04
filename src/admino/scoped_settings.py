@@ -27,7 +27,10 @@ owner, and this module is the service behind their routes and the startup:
   run, without a capability check (an internal read: every member's run
   needs it); it returns the stored switches, residency not applied.
   ``org_residency`` (GH-162) reads the org's ``data_residency`` policy the
-  same way.
+  same way, and ``load_prompt_context`` (GH-170) a chat run's prompt
+  inputs: the org's instructions and default response language and the
+  user's response language, timezone and personal instructions, in one
+  read of a live user of the tenant's org.
 - ``platform_settings`` (one row, the Super Admin): the LLM provider, one
   model per provider, (GH-242, migration 0022) the active model's
   capabilities (``max_input_tokens``, ``image_input``) and the LLM retry
@@ -64,10 +67,10 @@ Inputs: the database pool (or a connection, for the platform reads); the
 acting ``Principal`` (from the session), the validated patch models
 (``UserSettingsPatch``, ``OrgSettingsPatch``, ``PlatformSettingsPatch``) and
 the client IP; the ``AppConfig`` (startup); an account kind and, for a
-member, their org id.
+member, their org id; a chat run's ``TenantContext``.
 Outputs: ``UserSettingsResponse``, ``OrgSettingsResponse``,
 ``StoredPlatformSettings``, an org's switches (tool name -> bool) and its
-residency flag, the
+residency flag, a run's ``PromptContext``, the
 overlaid ``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
 ``AuditRecordError``, ``InvalidPlatformSettingsError`` (the merged trash
 minimum exceeds the maximum), ``InvalidOrgSettingsError`` (a changed org trash
@@ -83,7 +86,10 @@ Security notes:
   reaches no org's settings; member roles never reach a platform default.
 - Tenant isolation: the org is always ``TenantContext.from_principal(actor)``
   and the user always ``actor.user_id``, both bind parameters; never a
-  request value.
+  request value. The internal reads take the run's ``TenantContext``: the
+  prompt inputs only match a live user whose org is the tenant's org.
+- The org and personal instructions are content: they are read for the
+  prompt and never logged or audited by the prompt-context read.
 - Fail closed: an org without an organizations row reads as residency on.
   An org or platform change, its row locks (``FOR UPDATE``; for an org both
   its org_settings and its organizations row) and its audit events share one
@@ -136,6 +142,7 @@ from admino.models import (
     PlatformLimits,
     PlatformRetention,
     PlatformSecurity,
+    PromptContext,
     SettingsAppearance,
     SettingsNotifications,
     ToolsSettings,
@@ -263,6 +270,15 @@ _ORG_PROFILE_UPDATE_SQL: Final = """
         default_response_language = coalesce($3, default_response_language),
         updated_at = now()
     WHERE id = $1
+"""
+# GH-170: a chat run's prompt inputs; only a live user of the tenant's org matches.
+_PROMPT_CONTEXT_SQL: Final = """
+    SELECT u.response_language, u.timezone, u.personal_instructions,
+           o.default_response_language, s.instructions AS org_instructions
+    FROM users u
+    JOIN organizations o ON o.id = u.org_id
+    LEFT JOIN org_settings s ON s.org_id = o.id
+    WHERE u.id = $1 AND u.org_id = $2 AND u.deleted_at IS NULL
 """
 # GH-169: a member's new session takes their org's stored policy.
 _MEMBER_POLICY_SQL: Final = """
@@ -866,6 +882,36 @@ async def org_tools_enabled(executor: sessions.Executor, tenant: TenantContext) 
     row: Record | None = await executor.fetchrow(_ORG_SQL, tenant.org_id)
     tools = ToolsSettings() if row is None else ToolsSettings.model_validate(dict(row))
     return tools.model_dump()
+
+
+async def load_prompt_context(executor: sessions.Executor, tenant: TenantContext) -> PromptContext:
+    """Return the tenant user's prompt inputs, for a chat run's system prompt (GH-170).
+
+    One read of the user's row (response language, timezone, personal
+    instructions), their org's row (default response language) and the org's
+    settings row (instructions). No capability check: an internal read (every
+    member's run needs it). Only a live user of the tenant's org matches;
+    nothing is written or logged.
+
+    Args:
+        executor: The pool, or a connection.
+        tenant: The org scope and user of the run.
+
+    Returns:
+        The ``PromptContext``; ``PromptContext()`` when the user is deleted,
+        unknown or not in the tenant's org. A missing org_settings row reads as
+        no org instructions.
+    """
+    row: Record | None = await executor.fetchrow(_PROMPT_CONTEXT_SQL, tenant.user_id, tenant.org_id)
+    if row is None:
+        return PromptContext()
+    return PromptContext(
+        org_instructions=row["org_instructions"] or "",
+        personal_instructions=row["personal_instructions"] or "",
+        response_language=row["response_language"],
+        default_response_language=row["default_response_language"],
+        timezone=row["timezone"],
+    )
 
 
 async def count_residency_orgs(executor: sessions.Executor) -> int:

@@ -289,6 +289,14 @@ Security notes:
   requesting org's tool policy (its matrix, promoted tier-2 pairs and enabled
   services) and passes it as ``tool_policy``, so one org's settings never
   reach another org's runs.
+- Prompt context per run (GH-170): every chat run (a message, an approved
+  confirmation) also loads the caller's ``PromptContext``
+  (``scoped_settings.load_prompt_context`` with
+  ``TenantContext.from_principal``: the org's instructions and default
+  response language, the user's response language, timezone and personal
+  instructions; no account identifier) and passes it as ``prompt_context``,
+  so a change applies to the next message. The instructions are content:
+  never logged; a failing load is the generic 500 with no run started.
 - Platform defaults apply without a restart (GH-160): the chat routes read
   the stored limits through the settings cache on every request (the message
   length, and each agent run's tool-call, context and confirmation limits
@@ -3369,6 +3377,11 @@ async def post_message(
     applies without a restart). The org's due critical permission promotions
     are completed first, and the policy (the org's data residency included)
     is loaded on every request (GH-161), so a change applies to the next run.
+    So is the caller's prompt context (GH-170,
+    ``scoped_settings.load_prompt_context``: the org's instructions and default
+    response language, the user's response language, timezone and personal
+    instructions), passed to the run as ``prompt_context``. A failing load
+    escapes before the run: the generic 500, nothing of it echoed or logged.
 
     Args:
         body: Validated ChatRequest with message and session_id.
@@ -3397,7 +3410,9 @@ async def post_message(
             status_code=422,
             detail=f"Message exceeds maximum length of {max_len} characters",
         )
-    policy = await org_permissions.load_tool_policy(pool, TenantContext.from_principal(principal))
+    tenant = TenantContext.from_principal(principal)
+    policy = await org_permissions.load_tool_policy(pool, tenant)
+    prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
     session_id = body.session_id
     key = _chat_key(principal.user_id, session_id)
@@ -3432,6 +3447,7 @@ async def post_message(
                 principal=principal,
                 tool_policy=policy,
                 agent_config=_run_config(platform),
+                prompt_context=prompt_context,
             )
         except (MemoryError, RecursionError):
             raise
@@ -3543,7 +3559,10 @@ async def post_confirm(
     run with the caller's principal, the stored platform limits and LLM retry
     limit (read on every request, GH-160, GH-242) and their org's tool policy
     as it is now (loaded again, after completing the org's due promotions;
-    GH-161). Under the org's data residency a resumed run whose LLM provider
+    GH-161). An approved resume also loads the caller's prompt context again
+    (GH-170), so a change made while the confirmation was pending applies; a
+    failing load is the generic 500 with nothing resumed, echoed or logged.
+    Under the org's data residency a resumed run whose LLM provider
     has meanwhile become non-Swiss ends with ``residency_blocked`` before the
     approved tool is dispatched (the agent's guard). Another user's pending
     confirmation is never found (404).
@@ -3572,7 +3591,8 @@ async def post_confirm(
     pool = get_pool()
     await _resolve_due_promotions(pool, principal)
     platform = await _platform_run_settings()
-    policy = await org_permissions.load_tool_policy(pool, TenantContext.from_principal(principal))
+    tenant = TenantContext.from_principal(principal)
+    policy = await org_permissions.load_tool_policy(pool, tenant)
 
     session_id = body.session_id
     key = _chat_key(principal.user_id, session_id)
@@ -3617,8 +3637,11 @@ async def post_confirm(
                 pending_confirmation=None,
             )
 
-        # Approved — resume the agent with the pending confirmation.
+        # Approved — resume the agent with the pending confirmation and the
+        # prompt context as it is now (GH-170: a change made while the
+        # confirmation was pending applies to the resumed run).
         history = _sessions.get(key, [])
+        prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
         logger.info(
             "Resuming agent for session %s after confirmation %s",
@@ -3635,6 +3658,7 @@ async def post_confirm(
                 tool_policy=policy,
                 pending_confirmation=pending,
                 agent_config=_run_config(platform),
+                prompt_context=prompt_context,
             )
         except (MemoryError, RecursionError):
             raise
