@@ -344,3 +344,151 @@ export interface SessionSummary {
 export interface SessionListResponse {
   sessions: SessionSummary[];
 }
+
+// --- Platform console (issue #168: Super Admin; routes from #154, #167, #160, #242) ---
+
+export type OrgStatus = 'active' | 'deactivated' | 'pending_deletion';
+
+/** An organization as the Super Admin sees it: metadata only, never content. */
+export interface PlatformOrg {
+  id: string;
+  name: string;
+  status: OrgStatus;
+  seats: number;
+  /** Decimal string, e.g. "100.00". */
+  monthly_budget_chf: string;
+  /** Bytes. */
+  storage_quota: number;
+  data_residency: boolean;
+  deletion_requested_at: string | null;
+  purge_after: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlatformOrgListResponse {
+  organizations: PlatformOrg[];
+}
+
+export interface PlatformOrgCreateRequest {
+  name: string;
+  primary_admin_email: string;
+  seats: number;
+  monthly_budget_chf: string;
+  storage_quota: number;
+}
+
+export interface PlatformOrgCreateResponse {
+  organization: PlatformOrg;
+  invitation: OrgInvitation;
+}
+
+export interface PlatformOrgLimitsPatch {
+  seats?: number;
+  monthly_budget_chf?: string;
+  storage_quota?: number;
+}
+
+export type PlatformUserStatus = 'active' | 'deactivated' | 'invited';
+
+export interface PlatformUser {
+  id: string;
+  name: string | null;
+  email: string;
+  role: MemberRole;
+  status: PlatformUserStatus;
+  created_at: string;
+  last_login_at: string | null;
+}
+
+export interface PlatformUserListResponse {
+  users: PlatformUser[];
+}
+
+export interface PlatformOrgMetadata {
+  seats: OrgSeats;
+  storage_used_bytes: number;
+  chat_count: number;
+  file_count: number;
+}
+
+export type LlmProvider = 'infomaniak' | 'anthropic' | 'openai' | 'vllm';
+
+export interface PlatformSettingsLLM {
+  provider: LlmProvider;
+  anthropic_model: string;
+  openai_model: string;
+  infomaniak_model: string;
+  vllm_model: string;
+  infomaniak_available_models: string[];
+  vllm_available_models: string[];
+  max_input_tokens: number;
+  image_input: boolean;
+  max_retries: number;
+  residency_orgs: number;
+  anthropic_key_configured: boolean;
+  openai_key_configured: boolean;
+  infomaniak_token_configured: boolean;
+}
+
+export interface PlatformLimits {
+  max_tool_calls_per_message: number;
+  max_pending_confirmations: number;
+  confirmation_timeout_s: number;
+  max_message_length: number;
+  max_context_messages: number;
+}
+
+export interface PlatformFiles {
+  max_file_size_mb: number;
+  max_files_per_message: number;
+  max_pages_per_file: number;
+  render_dpi: number;
+}
+
+export interface PlatformRetention {
+  trash_min_days: number;
+  trash_max_days: number;
+  audit_months: number;
+  org_deletion_grace_days: number;
+}
+
+export interface PlatformSecurity {
+  rate_limit_per_minute: number;
+  lockout_after_failures: number;
+  lockout_window_minutes: number;
+  lockout_minutes: number;
+  session_idle_timeout_minutes: number;
+  session_max_lifetime_hours: number;
+}
+
+export interface PlatformSettings {
+  llm: PlatformSettingsLLM;
+  limits: PlatformLimits;
+  files: PlatformFiles;
+  retention: PlatformRetention;
+  security: PlatformSecurity;
+}
+
+export type PlatformLLMPatch = Partial<
+  Pick<
+    PlatformSettingsLLM,
+    | 'provider'
+    | 'infomaniak_model'
+    | 'vllm_model'
+    | 'anthropic_model'
+    | 'openai_model'
+    | 'max_input_tokens'
+    | 'image_input'
+    | 'max_retries'
+  >
+>;
+
+export interface PlatformSettingsPatch {
+  llm?: PlatformLLMPatch;
+  limits?: Partial<PlatformLimits>;
+  files?: Partial<PlatformFiles>;
+  retention?: Partial<PlatformRetention>;
+  security?: Partial<PlatformSecurity>;
+  confirm_residency_orgs?: number;
+}
