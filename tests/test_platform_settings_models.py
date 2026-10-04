@@ -452,7 +452,8 @@ class TestPlatformSettingsPatchSections:
     def test_platform_settings_patch_fields_are_the_five_sections(self) -> None:
         model = _model("PlatformSettingsPatch")
 
-        assert set(model.model_fields) == set(_PATCH_SECTIONS)
+        # GH-242: plus the request-level residency confirmation (not a section).
+        assert set(model.model_fields) == {*_PATCH_SECTIONS, "confirm_residency_orgs"}
         assert model.model_config.get("extra") == "forbid"
         assert model.model_config.get("hide_input_in_errors") is True
 

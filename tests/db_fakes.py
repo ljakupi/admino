@@ -41,7 +41,11 @@ The settings scopes (GH-159, migration 0013):
   3600, ``max_message_length`` 1 to 100000, ``max_context_messages`` 1 to 200),
   the platform defaults of migration 0014 (GH-160, ``PLATFORM_DEFAULTS``: each
   an INTEGER NOT NULL with a default and a BETWEEN CHECK, plus
-  ``trash_min_days <= trash_max_days``) and ``updated_at`` (NOT NULL, default
+  ``trash_min_days <= trash_max_days``), the platform model's capabilities
+  and retry limit of migration 0022 (GH-242, ``PLATFORM_LLM_LIMITS``:
+  ``max_input_tokens`` 1000 to 2000000, default 200000, and
+  ``llm_max_retries`` 0 to 5, default 2, INTEGER NOT NULL; ``image_input``
+  BOOLEAN NOT NULL, default true) and ``updated_at`` (NOT NULL, default
   now()).
 - ``org_settings`` (``org_settings``, keyed by org id): ``org_id`` (primary
   key, references organizations ON DELETE CASCADE), the seven
@@ -485,8 +489,24 @@ PLATFORM_DEFAULTS: Final[dict[str, tuple[int, int, int]]] = {
     "session_idle_timeout_minutes": (60, 15, 480),
     "session_max_lifetime_hours": (12, 1, 72),
 }
+# GH-242: the platform model's capabilities and LLM retry limit (migration 0022),
+# column -> (default, low, high): each an INTEGER NOT NULL with a DEFAULT and a
+# BETWEEN CHECK. ``image_input`` is a BOOLEAN NOT NULL DEFAULT true.
+PLATFORM_LLM_LIMITS: Final[dict[str, tuple[int, int, int]]] = {
+    "max_input_tokens": (200000, 1000, 2000000),
+    "llm_max_retries": (2, 0, 5),
+}
 _PLATFORM_SETTINGS_COLUMNS: Final = frozenset(
-    {"id", "llm_provider", *MODEL_COLUMNS, *LIMIT_BOUNDS, *PLATFORM_DEFAULTS, "updated_at"}
+    {
+        "id",
+        "llm_provider",
+        *MODEL_COLUMNS,
+        *PLATFORM_LLM_LIMITS,
+        "image_input",
+        *LIMIT_BOUNDS,
+        *PLATFORM_DEFAULTS,
+        "updated_at",
+    }
 )
 _ORG_SETTINGS_COLUMNS: Final = frozenset(
     {"org_id", *(f"{tool}_enabled" for tool in TOOL_NAMES), "updated_at"}
@@ -539,6 +559,8 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
         "id": "bool",
         "llm_provider": "text",
         **dict.fromkeys(MODEL_COLUMNS, "text"),
+        **dict.fromkeys(PLATFORM_LLM_LIMITS, "int"),
+        "image_input": "bool",
         **dict.fromkeys(LIMIT_BOUNDS, "int"),
         **dict.fromkeys(PLATFORM_DEFAULTS, "int"),
         "updated_at": "timestamptz",
@@ -1074,7 +1096,9 @@ class FakeDb:
         Defaults: the LLMConfig and LimitsConfig defaults (provider infomaniak,
         its model and vllm's set, the Anthropic and OpenAI models NULL; 10, 3,
         300, 4000 and 20), migration 0014's column defaults for the platform
-        defaults (``PLATFORM_DEFAULTS``), updated now. Any column can be given.
+        defaults (``PLATFORM_DEFAULTS``) and migration 0022's for the model
+        capabilities and retry limit (``PLATFORM_LLM_LIMITS``, image input
+        true), updated now. Any column can be given.
         """
         unknown = set(columns) - _PLATFORM_SETTINGS_COLUMNS
         assert not unknown, f"platform_settings has no column {sorted(unknown)}"
@@ -1086,6 +1110,8 @@ class FakeDb:
             "vllm_model": "Qwen/Qwen3-4B-Instruct-2507",
             "anthropic_model": None,
             "openai_model": None,
+            **{column: default for column, (default, _, _) in PLATFORM_LLM_LIMITS.items()},
+            "image_input": True,
             "max_tool_calls_per_message": 10,
             "max_pending_confirmations": 3,
             "confirmation_timeout_s": 300,
@@ -1536,6 +1562,8 @@ class FakeDb:
         if table == "platform_settings":
             row["id"] = True
             row.update({column: default for column, (default, _, _) in PLATFORM_DEFAULTS.items()})
+            row.update({column: default for column, (default, _, _) in PLATFORM_LLM_LIMITS.items()})
+            row["image_input"] = True
         elif table == "org_settings":
             row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
         elif table == "user_settings":
@@ -1640,6 +1668,10 @@ class FakeDb:
             rules.extend(
                 (column, low <= row[column] <= high)
                 for column, (_, low, high) in PLATFORM_DEFAULTS.items()
+            )
+            rules.extend(
+                (column, low <= row[column] <= high)
+                for column, (_, low, high) in PLATFORM_LLM_LIMITS.items()
             )
             rules.append(("trash_bounds", row["trash_min_days"] <= row["trash_max_days"]))
         elif table == "user_settings":

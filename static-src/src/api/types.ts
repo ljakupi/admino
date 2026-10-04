@@ -44,12 +44,25 @@ export interface PendingConfirmationSummary {
 
 export type ChatStatus = 'final' | 'awaiting_confirmation' | 'limit_reached' | 'error';
 
+// LLM error codes (issue #242: V1 model policy) — mirrors the backend's
+// `models.LLMErrorCode` Literal exactly.
+export type LLMErrorCode =
+  | 'not_configured'
+  | 'missing_model'
+  | 'provider_unavailable'
+  | 'rate_limited'
+  | 'timeout'
+  | 'residency_blocked'
+  | 'context_too_long';
+
 export interface ChatResponse {
   session_id: string;
   response: string;
   tool_calls: ToolCallRecord[];
   status: ChatStatus;
   pending_confirmation: PendingConfirmationSummary | null;
+  /** Set when `status === 'error'`; the chat store shows `chat.error.<code>` (or `.generic`) instead of `response` (issue #242, D3). */
+  error_code?: LLMErrorCode | null;
 }
 
 export interface ConfirmRequest {

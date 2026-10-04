@@ -9,15 +9,26 @@ GPT responds with ``tool_calls`` in the assistant message. This module
 translates between admino's tool format and OpenAI's native format.
 
 Errors: a missing OPENAI_API_KEY or model does not fail construction; ``chat()``
-raises a user-facing ``LLMError`` ("OpenAI isn't configured; set OPENAI_API_KEY",
-"No OpenAI model is set …") instead. SDK failures map to the shared catalogue in
-``llm.py``: 401/403, 404, 429, 5xx, timeouts and connection errors become fixed
-user-facing messages; other statuses stay internal (``user_facing=False``).
+raises a coded ``LLMError`` ("OpenAI isn't configured; set OPENAI_API_KEY" =
+``not_configured``, "No OpenAI model is set …" = ``missing_model``) instead.
+SDK failures map to the shared catalogue in ``llm.py`` (GH-242): a timeout is
+``timeout``, a connection error ``provider_unavailable``, 401/403
+``not_configured``, 404 ``missing_model``, 429 ``rate_limited`` and 5xx
+``provider_unavailable`` (both with the response's Retry-After), a 400/413
+whose input exceeds the context ``context_too_long``; other statuses stay
+internal (code None, ``user_facing=False``, "OpenAI API returned HTTP <n>").
+The SDK never retries (``max_retries=0``): one ``chat()`` is exactly one HTTP
+request; retries belong to ``admino.llm_policy``.
 
 Security notes:
 - API key is read from OPENAI_API_KEY env var, never from config files.
 - No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
-- User-facing error messages are fixed strings: no response body or SDK cause.
+- Error messages are fixed strings: never the SDK message, a response body or
+  the body's error code (those only classify a context-length failure).
+- No end-user or account identifier is sent: no ``user``, ``metadata``,
+  ``safety_identifier``, ``prompt_cache_key`` or ``store`` key, and the SDK's
+  env-derived ``OpenAI-Organization`` / ``OpenAI-Project`` headers
+  (OPENAI_ORG_ID / OPENAI_PROJECT_ID) are cleared.
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -26,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import ValidationError
 
@@ -38,6 +49,7 @@ from admino.llm import (
     not_configured_error,
     provider_status_error,
     sanitize_content,
+    sdk_status_error,
     strip_control_chars,
     validate_tools_payload,
 )
@@ -249,6 +261,8 @@ class OpenAIClient:
     protocol so it is interchangeable with the other LLMClient backends.
     """
 
+    provider: Final = "openai"
+
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the OpenAI client.
 
@@ -275,11 +289,17 @@ class OpenAIClient:
         api_key = os.environ.get(_API_KEY_ENV, "")
         self._api_key_configured = bool(api_key)
         # Built even without a key so close() stays uniform; chat() refuses to
-        # send a request until the key is configured.
+        # send a request until the key is configured. No SDK retries: one chat()
+        # is one request (the model policy decides about retries).
         self._client = openai.AsyncOpenAI(
             api_key=api_key,
             timeout=float(config.timeout_s),
+            max_retries=0,
         )
+        # The SDK fills these from OPENAI_ORG_ID / OPENAI_PROJECT_ID: account
+        # identifiers that are never sent.
+        self._client.organization = None
+        self._client.project = None
 
     async def chat(
         self,
@@ -299,9 +319,10 @@ class OpenAIClient:
             Parsed LLMResponse.
 
         Raises:
-            LLMError: User-facing when the key or model is missing, the key is
-                rejected, the model is unknown, the rate limit is hit, or OpenAI
-                is unavailable (5xx, timeout, connection); internal otherwise.
+            LLMError: Coded (user-facing) when the key or model is missing, the
+                key is rejected, the model is unknown, the rate limit is hit,
+                OpenAI is unavailable (5xx, connection), the request timed out or
+                the input is too long; internal otherwise.
             ValueError: If stream=True is passed.
         """
         if stream:
@@ -325,25 +346,29 @@ class OpenAIClient:
             try:
                 validate_tools_payload(tools)
             except ValueError as exc:
-                raise LLMError(message=str(exc), status_code=None) from exc
+                raise LLMError(message=str(exc), status_code=None) from None
             kwargs["tools"] = _convert_tools_to_openai(tools)
 
         try:
             response = await self._client.chat.completions.create(**kwargs)
+        except openai.APITimeoutError:
+            # Checked first: a subclass of APIConnectionError. Raised ``from None``
+            # so the SDK exception (and any response body) never travels with it.
+            raise provider_status_error(
+                _LABEL, None, key_env=_API_KEY_ENV, timed_out=True
+            ) from None
         except openai.APIConnectionError:
-            # Also covers APITimeoutError (a subclass). Raised ``from None`` so the
-            # SDK exception (and any response body) never travels with the error.
             raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
         except openai.APIStatusError as exc:
-            # exc.message is OpenAI's own error description — not the request
-            # body, does not contain conversation content. It only reaches the
-            # internal (log-only) message; user-facing messages are fixed.
-            api_error = strip_control_chars(str(exc.message))[:500]
-            raise provider_status_error(
+            # exc.code / exc.message are OpenAI's text: they only classify a
+            # context-length 400 and never reach the LLMError.
+            raise sdk_status_error(
                 _LABEL,
                 exc.status_code,
+                headers=exc.response.headers,
+                error_code=exc.code,
+                sdk_message=exc.message,
                 key_env=_API_KEY_ENV,
-                internal_message=f"OpenAI API returned HTTP {exc.status_code}: {api_error}",
             ) from None
 
         # Extract the first choice

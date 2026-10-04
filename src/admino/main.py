@@ -17,7 +17,7 @@ Startup sequence:
 5. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
-   — chat replies explain what to set.
+   — chat replies report the setup problem by error code (GH-242).
 6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
 7. Build the AgentConfig from the validated limits.
 8. Instantiate the Agent with all dependencies, including the tool-call
@@ -196,7 +196,7 @@ async def _check_infomaniak_startup(client: InfomaniakClient) -> None:
     if not os.environ.get("INFOMANIAK_API_TOKEN", "").strip():
         logger.warning(
             "INFOMANIAK_API_TOKEN is not set. admino starts anyway; chat replies "
-            "will ask for it. Create a token with the 'ai-tools' scope in the "
+            "report it as not configured. Create a token with the 'ai-tools' scope in the "
             "Infomaniak Manager and set it on the server."
         )
         return

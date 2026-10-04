@@ -42,6 +42,22 @@ export const fr: Record<MessageKey, Message> = {
   'chat.header.menu': 'Menu',
   'chat.toolCall.expired': 'Expiré',
 
+  // --- chat errors (issue #242: V1 model policy, decision D3 — affiché à la
+  // place de la réponse anglaise de secours du backend pour une réponse d'erreur) ---
+  'chat.error.not_configured':
+    "Ce modèle d'IA n'est pas encore configuré. Demandez à votre administrateur de le configurer.",
+  'chat.error.missing_model':
+    "Le modèle d'IA configuré n'est pas disponible. Demandez à votre administrateur de vérifier la configuration.",
+  'chat.error.provider_unavailable':
+    "Le service d'IA est temporairement indisponible. Veuillez patienter un instant et réessayer.",
+  'chat.error.rate_limited': 'Trop de demandes pour le moment. Veuillez patienter un instant et réessayer.',
+  'chat.error.timeout': "Le service d'IA a mis trop de temps à répondre. Veuillez réessayer.",
+  'chat.error.residency_blocked':
+    "La politique de résidence des données de votre organisation n'autorise pas le modèle d'IA actuel. Demandez à votre administrateur de passer à un modèle autorisé.",
+  'chat.error.context_too_long':
+    "Cette conversation est devenue trop longue pour le modèle d'IA. Démarrez une nouvelle discussion.",
+  'chat.error.generic': 'Une erreur est survenue en répondant à ce message. Veuillez réessayer.',
+
   // --- toast (shared) ----------------------------------------------------
   'toast.common.saved': 'Enregistré',
   'toast.common.saveFailed.title': "Échec de l'enregistrement",
@@ -577,6 +593,15 @@ export const fr: Record<MessageKey, Message> = {
   // --- platform page (placeholder, Super Admin console, issue #155) ---------
   'platform.empty.heading': 'Console de la plateforme',
   'platform.empty.subtext': 'La console de la plateforme apparaîtra ici.',
+
+  // --- platform defaults: residency confirmation (issue #242, D1; #168 renders the dialog) ---
+  'platform.defaults.residencyConfirm.title': 'Confirmer un hébergement hors de Suisse',
+  'platform.defaults.residencyConfirm.body': {
+    one: '{count} organisation exige actuellement une résidence des données en Suisse et sera concernée par ce changement.',
+    other:
+      '{count} organisations exigent actuellement une résidence des données en Suisse et seront concernées par ce changement.',
+  },
+  'platform.defaults.residencyConfirm.confirm': 'Changer quand même',
 
   // --- chat page (read-only viewer, issue #155) -----------------------------
   'chat.viewerEmpty.heading': "Rien n'a encore été partagé avec vous",

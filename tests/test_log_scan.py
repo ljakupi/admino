@@ -387,6 +387,8 @@ def _log_sink(log_format: str) -> Iterator[io.StringIO]:
 class _ScriptedLLM:
     """Replies (or raises) in script order; records the messages of every call."""
 
+    provider = "infomaniak"
+
     def __init__(self, script: list[LLMResponse | Exception]) -> None:
         self._script = list(script)
         self.calls: list[list[LLMMessage]] = []

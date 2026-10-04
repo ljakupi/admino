@@ -235,8 +235,9 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
    emails you a reset link. See
    [Accounts and sessions](configuration.md#accounts-and-sessions).
 3. With `INFOMANIAK_API_TOKEN` set, the default Infomaniak model answers right away.
-   If the token is missing, admino still starts and the chat replies that Infomaniak
-   isn't configured. To use local **vLLM** (after `make start-local`; allow a few
+   If the token is missing, admino still starts: the startup log names the variable to
+   set, and the chat says the AI model isn't set up yet. To use local **vLLM** (after
+   `make start-local`; allow a few
    minutes for the model to load), **Claude** or **OpenAI** (set the matching API key in
    `.env` first), switch the provider in `config.yaml` or as the Super Admin (see
    [Switching providers](configuration.md#llm-providers)).
@@ -351,14 +352,23 @@ security rules.
 
 ## Troubleshooting
 
-- **"Infomaniak isn't configured; set INFOMANIAK_API_TOKEN".** Add the token to `.env`
-  (see [Create the Infomaniak token](#create-the-infomaniak-token)) and restart. If the chat
-  says the token was rejected, check it has the `ai-tools` scope. If it asks for
-  `INFOMANIAK_PRODUCT_ID`, your token sees several AI products: set the one to use.
-- **"admino replies with 'model unavailable' or 'model starting'."** The vLLM container
-  isn't ready yet. Either run `make start-local` and wait a few minutes for the model to
-  load (CPU inference takes time on first start), or switch back to Infomaniak (see
-  [Switching providers](configuration.md#llm-providers)).
+- **The chat says "This AI model isn't set up yet."** (error code `not_configured`) The
+  provider's key or token is missing or was rejected. For Infomaniak, add the token to
+  `.env` (see [Create the Infomaniak token](#create-the-infomaniak-token)) and restart; the
+  startup log names what's missing. If it's set, check it has the `ai-tools` scope. If the
+  startup log asks for `INFOMANIAK_PRODUCT_ID`, your token sees several AI products: set
+  the one to use.
+- **The chat says "The AI service is temporarily unavailable."** (error code
+  `provider_unavailable`) With vLLM, the container isn't ready yet. Either run
+  `make start-local` and wait a few minutes for the model to load (CPU inference takes time
+  on first start), or switch back to Infomaniak (see
+  [Switching providers](configuration.md#llm-providers)). admino already retried the
+  request a few times (see [LLM errors and retries](configuration.md#llm-errors-and-retries)).
+- **The chat says the data residency policy doesn't allow the current AI model.** (error
+  code `residency_blocked`) Your organization's data residency policy is on and the active
+  provider is Claude or OpenAI. The Super Admin switches back to Infomaniak or vLLM, or
+  turns the organization's policy off (see
+  [Data residency and the provider](configuration.md#data-residency-and-the-provider)).
 - **`PG_APP_PASSWORD environment variable is required but not set`** (or the migration
   says `PG_PASSWORD` or `PG_APP_PASSWORD` is missing). Set both in `.env`. For local dev,
   load `.env` into your shell first: `set -a; source .env; set +a`.

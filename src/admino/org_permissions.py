@@ -15,7 +15,10 @@ every chat run loads its own org's policy:
   gating (GH-162): when ``scoped_settings.org_residency`` is on, the Google
   and Microsoft tools (``RESIDENCY_BLOCKED_TOOLS``) read as switched off, so
   the run doesn't advertise them, dispatch refuses them and the summary
-  shows them "disabled"; the stored switches are untouched.
+  shows them "disabled"; the stored switches are untouched. The same read
+  sets the policy's ``data_residency`` (GH-242), which the agent checks
+  before any LLM call: a residency org's run never reaches a non-Swiss
+  provider.
 - The matrix (``Capability.ORG_PERMISSIONS_MANAGE``): ``get_org_permissions``
   reads it; ``update_org_permission`` changes one pair (the normalized value
   of ``validate_permissions_config``) and records ``org.permission_change``.
@@ -323,7 +326,8 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
     default-deny). For a residency org (GH-162: the fail-closed
     ``scoped_settings.org_residency``) every ``RESIDENCY_BLOCKED_TOOLS`` tool
     reads as switched off, whatever its stored switch says, so the run
-    neither advertises nor dispatches it.
+    neither advertises nor dispatches it, and (GH-242) the policy's
+    ``data_residency`` is True, so the run refuses a non-Swiss LLM provider.
 
     Args:
         executor: The pool, or a connection.
@@ -331,7 +335,9 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
 
     Returns:
         The frozen ToolPolicy: the validated config of the org's rows, the
-        tier-2 pairs it stores as 'confirm', and its effective tool switches.
+        tier-2 pairs it stores as 'confirm', its effective tool switches and
+        its residency flag (True for a residency org and for a missing org
+        row, fail closed; False otherwise).
     """
     rows = await executor.fetch(_ORG_ROWS_SQL, tenant.org_id)
     raw: dict[str, dict[str, str]] = {}
@@ -345,12 +351,14 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
             state = "deny"
         raw.setdefault(tool, {})[action] = state
     enabled_tools = await scoped_settings.org_tools_enabled(executor, tenant)
-    if await scoped_settings.org_residency(executor, tenant):
+    data_residency = await scoped_settings.org_residency(executor, tenant)
+    if data_residency:
         enabled_tools = {**enabled_tools, **dict.fromkeys(RESIDENCY_BLOCKED_TOOLS, False)}
     return ToolPolicy(
         permissions=validate_permissions_config(raw),
         promoted=frozenset(promoted),
         enabled_tools=enabled_tools,
+        data_residency=data_residency,
     )
 
 

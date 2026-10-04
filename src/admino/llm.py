@@ -11,27 +11,47 @@ Provider modules:
 - ``llm_anthropic.py`` — Anthropic Claude backend (opt-in)
 - ``llm_openai.py`` — OpenAI backend (opt-in)
 
-User-facing errors: setup and availability problems (missing key or model,
-rejected key, unknown model, rate limit, provider unavailable) are raised as
-``LLMError(user_facing=True)`` with a fixed, actionable message that the agent
-shows in the chat verbatim. Every other failure stays ``user_facing=False`` and
-the chat shows a generic reply. The helpers below build the shared catalogue.
+User-facing errors (GH-242): setup and availability problems carry a stable
+``code`` (``admino.models.LLMErrorCode``: not_configured, missing_model,
+provider_unavailable, rate_limited, timeout, residency_blocked,
+context_too_long) and a fixed English message; a coded ``LLMError`` is always
+user-facing, the PWA shows the code's translation and the agent's ``response``
+keeps the English text. ``retryable`` is True for provider_unavailable,
+rate_limited and timeout only (``admino.llm_policy`` retries those). Every
+other failure is uncoded and ``user_facing=False``: the chat shows a generic
+reply. The helpers below build the shared catalogue:
+- ``provider_status_error`` maps an HTTP status (or a timeout / transport
+  failure) to its code; 429/5xx carry ``retry_after_s``.
+- ``sdk_status_error`` maps an SDK HTTP status error: Retry-After read with
+  ``parse_retry_after``, a 400/413 classified with ``is_context_too_long``.
+
+Inputs: provider statuses, response headers, and (for classification only)
+the provider's error code and message. Outputs: ``LLMError`` instances.
 
 Security notes:
 - No credentials are stored or logged by this module.
+- No provider text ever reaches an ``LLMError``: its message (and so ``str()``
+  and ``repr()``) is a fixed catalogue text or "<label> API returned HTTP
+  <status>". The provider's error code and message are only matched against
+  fixed phrases by ``is_context_too_long``; they are never stored or logged.
 - LLM output is sanitized: control characters stripped, length bounded.
 - Tool call arguments are validated for size and nesting depth.
-- Callers log an LLMError by its type and status_code only (GH-158), never
-  its message, __cause__ or repr(), so no provider text or HTTP response body
-  (conversation context) reaches the log.
+- Callers log an LLMError by its type, status_code and code only (GH-158),
+  never its message, __cause__ or repr(), so no provider text or HTTP response
+  body (conversation context) reaches the log.
 - Only the configured provider's SDK is imported (lazy import in factory).
 """
 
 from __future__ import annotations
 
+import email.utils
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+import math
+import re
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -40,6 +60,7 @@ from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
     from admino.config import LLMConfig
+    from admino.models import LLMErrorCode
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +77,28 @@ _MAX_TOOLS_PAYLOAD: int = 65536
 # ---------------------------------------------------------------------------
 
 
+# Codes of transient failures: the model policy may retry them.
+_RETRYABLE_CODES: Final[frozenset[str]] = frozenset(
+    {"provider_unavailable", "rate_limited", "timeout"}
+)
+
+
 class LLMError(Exception):
     """Base error for all LLM provider failures.
 
-    Callers log only the type and ``status_code``, never ``message`` or
-    ``__cause__``, to keep provider text and HTTP response bodies out of logs.
+    Callers log only the type, ``status_code`` and ``code``, never ``message``
+    or ``__cause__``, to keep provider text and HTTP response bodies out of logs.
 
     Attributes:
-        message: Human-readable error description.
+        message: Human-readable error description (fixed text, never provider text).
         status_code: HTTP status code if available, None for connection errors.
         user_facing: True when ``message`` is a fixed, actionable text meant for
             the chat (it never embeds a response body or SDK cause). False means
-            the agent replaces it with a generic reply.
+            the agent replaces it with a generic reply. Always True for a coded
+            error.
+        code: The stable error code (GH-242) the UI translates, or None for an
+            uncoded error.
+        retry_after_s: The provider's Retry-After in seconds (429/5xx), or None.
     """
 
     def __init__(
@@ -76,11 +107,21 @@ class LLMError(Exception):
         status_code: int | None = None,
         *,
         user_facing: bool = False,
+        code: LLMErrorCode | None = None,
+        retry_after_s: float | None = None,
     ) -> None:
         self.message = message
         self.status_code = status_code
-        self.user_facing = user_facing
+        self.code: LLMErrorCode | None = code
+        # A coded error is always shown: the UI translates its code.
+        self.user_facing = user_facing or code is not None
+        self.retry_after_s = retry_after_s
         super().__init__(message)
+
+    @property
+    def retryable(self) -> bool:
+        """True for a transient failure (provider_unavailable, rate_limited, timeout)."""
+        return self.code in _RETRYABLE_CODES
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +130,7 @@ class LLMError(Exception):
 
 
 def not_configured_error(label: str, env_var: str) -> LLMError:
-    """Return the user-facing error for a missing API key or token.
+    """Return the ``not_configured`` error for a missing API key or token.
 
     Args:
         label: Provider name shown to the user (e.g. "Infomaniak", "Claude").
@@ -97,15 +138,15 @@ def not_configured_error(label: str, env_var: str) -> LLMError:
     """
     return LLMError(
         message=f"{label} isn't configured; set {env_var} on the server.",
-        user_facing=True,
+        code="not_configured",
     )
 
 
 def missing_model_error(label: str) -> LLMError:
-    """Return the user-facing error for a provider without a model."""
+    """Return the ``missing_model`` error for a provider without a model."""
     return LLMError(
         message=f"No {label} model is set; ask your administrator to choose one.",
-        user_facing=True,
+        code="missing_model",
     )
 
 
@@ -116,26 +157,51 @@ def provider_status_error(
     key_env: str | None = None,
     key_noun: str = "API key",
     internal_message: str | None = None,
+    timed_out: bool = False,
+    retry_after_s: float | None = None,
+    context_too_long: bool = False,
 ) -> LLMError:
-    """Map a provider HTTP status (or a transport failure) to an LLMError.
+    """Map a provider HTTP status (or a timeout / transport failure) to an LLMError.
 
-    401/403 (only when the provider uses a key), 404, 429, 5xx and transport
-    failures (``status_code=None``) become fixed user-facing messages. Any other
-    status is internal: ``internal_message`` (or a bare status line) with
-    ``user_facing=False``. Response bodies are never part of the message.
+    - no status: ``timeout`` when ``timed_out``, else ``provider_unavailable``;
+    - 401/403: ``not_configured`` (only when the provider uses a key);
+    - 404: ``missing_model``;
+    - 429: ``rate_limited``, 5xx: ``provider_unavailable`` (both carry
+      ``retry_after_s``);
+    - 400/413 with ``context_too_long``: ``context_too_long``.
+
+    Any other status is internal: ``internal_message`` (or a bare status line),
+    code None, ``user_facing=False``. Response bodies are never part of the
+    message.
 
     Args:
         label: Provider name shown to the user.
         status_code: HTTP status, or None for timeouts and connection errors.
         key_env: Env var holding the credential; None for keyless providers.
         key_noun: What the credential is called ("API key" or "API token").
-        internal_message: Log-only message for statuses outside the catalogue.
+        internal_message: Log-only fixed message for statuses outside the catalogue.
+        timed_out: The request timed out (meaningful without a status only).
+        retry_after_s: The provider's Retry-After in seconds (kept for 429/5xx).
+        context_too_long: ``is_context_too_long`` classified the failure.
     """
+    if status_code is None:
+        if timed_out:
+            return LLMError(
+                message=(
+                    f"{label} is temporarily unavailable (the request timed out). "
+                    "Please try again in a moment."
+                ),
+                code="timeout",
+            )
+        return LLMError(
+            message=f"{label} is temporarily unavailable. Please try again in a moment.",
+            code="provider_unavailable",
+        )
     if status_code in (401, 403) and key_env:
         return LLMError(
             message=f"{label} rejected the {key_noun}; check {key_env} on the server.",
             status_code=status_code,
-            user_facing=True,
+            code="not_configured",
         )
     if status_code == 404:
         return LLMError(
@@ -144,24 +210,161 @@ def provider_status_error(
                 "ask your administrator to choose another one."
             ),
             status_code=status_code,
-            user_facing=True,
+            code="missing_model",
         )
     if status_code == 429:
         return LLMError(
             message=f"{label} rate limit reached; wait a moment and try again.",
             status_code=status_code,
-            user_facing=True,
+            code="rate_limited",
+            retry_after_s=retry_after_s,
         )
-    if status_code is None or status_code >= 500:
+    if status_code >= 500:
         return LLMError(
             message=f"{label} is temporarily unavailable. Please try again in a moment.",
             status_code=status_code,
-            user_facing=True,
+            code="provider_unavailable",
+            retry_after_s=retry_after_s,
+        )
+    if context_too_long and status_code in (400, 413):
+        return LLMError(
+            message=(
+                f"The conversation is too long for the {label} model; "
+                "start a new chat or shorten your message."
+            ),
+            status_code=status_code,
+            code="context_too_long",
         )
     return LLMError(
         message=internal_message or f"{label} API returned HTTP {status_code}",
         status_code=status_code,
     )
+
+
+def sdk_status_error(
+    label: str,
+    status_code: int,
+    *,
+    headers: Mapping[str, str] | None,
+    error_code: object,
+    sdk_message: object,
+    key_env: str | None = None,
+    key_noun: str = "API key",
+) -> LLMError:
+    """Map an SDK HTTP status error through the catalogue.
+
+    The Retry-After comes from ``headers``; a 400/413 is classified by
+    ``is_context_too_long`` from the provider's error code and message, which
+    are then dropped: neither is stored, logged or part of the returned error.
+
+    Args:
+        label: Provider name shown to the user.
+        status_code: The HTTP status of the error response.
+        headers: The error response's headers (a non-mapping counts as none).
+        error_code: The body's error code (e.g. ``context_length_exceeded``);
+            anything but a str is ignored.
+        sdk_message: The SDK's error message; anything but a str is ignored.
+        key_env: Env var holding the credential; None for keyless providers.
+        key_noun: What the credential is called ("API key" or "API token").
+    """
+    return provider_status_error(
+        label,
+        status_code,
+        key_env=key_env,
+        key_noun=key_noun,
+        retry_after_s=parse_retry_after(headers),
+        context_too_long=is_context_too_long(
+            status_code,
+            error_code if isinstance(error_code, str) else None,
+            sdk_message if isinstance(sdk_message, str) else None,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Retry-After and context-length classification
+# ---------------------------------------------------------------------------
+
+# A non-negative decimal number: no sign, exponent, NaN or infinity spelling.
+_DECIMAL_RE: Final = re.compile(r"[0-9]+(?:\.[0-9]+)?")
+
+# Phrases (lower-case) of a provider's "the input is too long" 400 message.
+_CONTEXT_PHRASES: Final[tuple[str, ...]] = (
+    "context length",
+    "context_length",
+    "maximum context",
+    "context window",
+    "prompt is too long",
+    "input is too long",
+    "too many tokens",
+)
+
+
+def _non_negative_number(value: str | None) -> float | None:
+    """Parse a non-negative finite decimal number; anything else is None."""
+    if value is None or not _DECIMAL_RE.fullmatch(value.strip()):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def parse_retry_after(
+    headers: Mapping[str, str] | None, *, now: datetime | None = None
+) -> float | None:
+    """Return the provider's requested retry delay in seconds, or None.
+
+    Header names match case-insensitively. ``retry-after-ms`` (milliseconds)
+    wins when it is a non-negative finite number; else ``retry-after`` as
+    seconds, or as an HTTP-date (seconds from ``now``, at least 0.0). Missing,
+    negative, NaN, infinite or unparsable values give None. The value is not
+    capped here (the model policy decides what is too long).
+
+    Args:
+        headers: Response headers (a dict or ``httpx.Headers``); a non-mapping
+            counts as none.
+        now: The current time for an HTTP-date (default: now, UTC).
+    """
+    if not isinstance(headers, Mapping):
+        return None
+    lowered = {str(name).lower(): value for name, value in headers.items()}
+    millis = _non_negative_number(lowered.get("retry-after-ms"))
+    if millis is not None:
+        return millis / 1000.0
+    raw = lowered.get("retry-after")
+    seconds = _non_negative_number(raw)
+    if seconds is not None or raw is None:
+        return seconds
+    try:
+        when = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    current = now or datetime.now(UTC)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    return max(0.0, (when - current).total_seconds())
+
+
+def is_context_too_long(
+    status_code: int | None, error_code: str | None, message: str | None
+) -> bool:
+    """Return True when a provider failure means the input exceeds the model's context.
+
+    413 always; a 400 whose error code is ``context_length_exceeded`` or whose
+    message contains a known phrase (case-insensitive). Classification only:
+    ``error_code`` and ``message`` are never stored or logged.
+    """
+    if status_code == 413:
+        return True
+    if status_code != 400:
+        return False
+    if error_code == "context_length_exceeded":
+        return True
+    if not message:
+        return False
+    lowered = message.lower()
+    return any(phrase in lowered for phrase in _CONTEXT_PHRASES)
 
 
 # ---------------------------------------------------------------------------
@@ -402,7 +605,14 @@ class LLMClient(Protocol):
 
     Each provider (Anthropic, OpenAI) implements this protocol.
     The agent loop uses this interface exclusively — it is provider-agnostic.
+    ``provider`` names the backend ("infomaniak", "vllm", "anthropic",
+    "openai"): the model policy's residency guard (GH-242) reads it.
     """
+
+    @property
+    def provider(self) -> str:
+        """The backend's provider name."""
+        ...
 
     async def chat(
         self,

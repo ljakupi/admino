@@ -12,35 +12,40 @@ Inputs/outputs:
   sanitized ``LLMResponse`` (content, tool_calls, model, done).
 - ``VLLMClient.close()`` releases the underlying HTTP client.
 
-Errors (provider label "vLLM"): a missing/empty ``vllm_model`` does not fail
-construction; ``chat()`` raises the user-facing "No vLLM model is set …" error
-instead. Connection/timeout failures raise a user-facing "starting or
-unavailable" message pointing to ``make start-local``; 404, 429 and 5xx map to
-the shared catalogue in ``llm.py``. vLLM has no key, so every other status
-(including 401/403) stays internal (``user_facing=False``).
+Errors (provider label "vLLM", GH-242 codes): a missing/empty ``vllm_model``
+does not fail construction; ``chat()`` raises the "No vLLM model is set …"
+error (``missing_model``) instead. Connection failures (``provider_unavailable``)
+and timeouts (``timeout``) carry a "starting or unavailable" message pointing to
+``make start-local``; 404, 429, 5xx and a 400/413 whose input exceeds the
+context map to the shared catalogue in ``llm.py`` (429/5xx with the response's
+Retry-After). vLLM has no key, so every other status (including 401/403) stays
+internal (code None, ``user_facing=False``, "vLLM API returned HTTP <n>"). The
+SDK never retries (``max_retries=0``): retries belong to ``admino.llm_policy``.
 
 Security notes:
 - Local-only: requests go to ``config.vllm_base_url`` (a local endpoint). No
   message content ever leaves the machine when the endpoint is local.
 - No API key is read from the environment — the local server needs none, so a
   fixed non-empty dummy key is sent to satisfy the SDK.
-- Connection/timeout failures map to a FRIENDLY ``LLMError`` that never embeds
-  the raw SDK cause/response body (the served model may still be loading).
-  User-facing messages are fixed strings.
+- Error messages are fixed strings: never the SDK message, a response body or
+  the body's error code (those only classify a context-length failure).
+- No end-user or account identifier is sent: no ``user``/``metadata``-style
+  body key, and the SDK's env-derived OpenAI organization and project headers
+  (OPENAI_ORG_ID / OPENAI_PROJECT_ID) are cleared.
 - LLM output is sanitized by the shared llm.py utilities.
 - Does not import from agent.py, server.py, or tools/.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from admino.llm import (
     LLMError,
     LLMResponse,
     missing_model_error,
-    provider_status_error,
     sanitize_content,
+    sdk_status_error,
     strip_control_chars,
     validate_tools_payload,
 )
@@ -82,6 +87,8 @@ class VLLMClient:
     other backends. Needs no API key (a dummy placeholder is sent).
     """
 
+    provider: Final = "vllm"
+
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the vLLM client.
 
@@ -108,11 +115,17 @@ class VLLMClient:
         self._max_tokens = config.max_response_tokens
         self._base_url = config.vllm_base_url
         # No API key is read from the environment — the local server needs none.
+        # No SDK retries: one chat() is one request (the model policy retries).
         self._client = openai.AsyncOpenAI(
             base_url=config.vllm_base_url,
             api_key=_DUMMY_API_KEY,
             timeout=float(config.timeout_s),
+            max_retries=0,
         )
+        # The SDK fills these from OPENAI_ORG_ID / OPENAI_PROJECT_ID: OpenAI
+        # account identifiers that are never sent.
+        self._client.organization = None
+        self._client.project = None
 
     async def chat(
         self,
@@ -132,9 +145,10 @@ class VLLMClient:
             Parsed LLMResponse.
 
         Raises:
-            LLMError: User-facing when the model is missing, the endpoint is
-                starting/unreachable, the model is unknown (404), the rate limit
-                is hit or the endpoint fails (5xx); internal otherwise.
+            LLMError: Coded (user-facing) when the model is missing, the endpoint
+                is starting/unreachable or timed out, the model is unknown (404),
+                the rate limit is hit, the endpoint fails (5xx) or the input is
+                too long; internal otherwise.
             ValueError: If stream=True is passed.
         """
         if stream:
@@ -156,30 +170,30 @@ class VLLMClient:
             try:
                 validate_tools_payload(tools)
             except ValueError as exc:
-                raise LLMError(message=str(exc), status_code=None) from exc
+                raise LLMError(message=str(exc), status_code=None) from None
             kwargs["tools"] = _convert_tools_to_openai(tools)
 
         try:
             response = await self._client.chat.completions.create(**kwargs)
-        except openai.APIConnectionError:
-            # Also covers APITimeoutError (a subclass). The local server may still
-            # be loading the model, or be down. Surface a friendly message; raised
+        except openai.APIConnectionError as exc:
+            # Includes APITimeoutError (a subclass). The local server may still be
+            # loading the model, or be down: a friendly message, raised
             # ``from None`` so the SDK cause/body never travels with the error.
+            timed_out = isinstance(exc, openai.APITimeoutError)
             raise LLMError(
                 message=_VLLM_UNAVAILABLE_MESSAGE,
-                status_code=None,
-                user_facing=True,
+                code="timeout" if timed_out else "provider_unavailable",
             ) from None
         except openai.APIStatusError as exc:
-            # exc.message is the endpoint's own error description — not the request
-            # body and does not contain conversation content. It only reaches the
-            # internal (log-only) message; user-facing messages are fixed. No
-            # key_env: vLLM has no key, so 401/403 stay internal.
-            api_error = strip_control_chars(str(exc.message))[:500]
-            raise provider_status_error(
+            # exc.code / exc.message are the endpoint's text: they only classify a
+            # context-length 400 and never reach the LLMError. No key_env: vLLM
+            # has no key, so 401/403 stay internal.
+            raise sdk_status_error(
                 _LABEL,
                 exc.status_code,
-                internal_message=f"vLLM endpoint returned HTTP {exc.status_code}: {api_error}",
+                headers=exc.response.headers,
+                error_code=exc.code,
+                sdk_message=exc.message,
             ) from None
 
         # Extract the first choice

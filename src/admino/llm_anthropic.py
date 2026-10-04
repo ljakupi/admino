@@ -10,18 +10,25 @@ JSON input. This module translates between admino's tool format
 (``{"type": "function", "function": {...}}``) and
 Anthropic's native format.
 
-Errors (provider label "Claude"): a missing ANTHROPIC_API_KEY or model does not
-fail construction; ``chat()`` raises a user-facing ``LLMError`` ("Claude isn't
-configured; set ANTHROPIC_API_KEY", "No Claude model is set …") instead. SDK
-failures map to the shared catalogue in ``llm.py``: 401/403, 404, 429, any
-status >= 500 (including 529 "overloaded"), timeouts and connection errors
-become fixed user-facing messages; other statuses stay internal
-(``user_facing=False``).
+Errors (provider label "Claude", GH-242 codes): a missing ANTHROPIC_API_KEY or
+model does not fail construction; ``chat()`` raises a coded ``LLMError``
+("Claude isn't configured; set ANTHROPIC_API_KEY" = ``not_configured``, "No
+Claude model is set …" = ``missing_model``) instead. SDK failures map to the
+shared catalogue in ``llm.py``: a timeout is ``timeout``, a connection error
+``provider_unavailable``, 401/403 ``not_configured``, 404 ``missing_model``,
+429 ``rate_limited`` and any status >= 500 (including 529 "overloaded")
+``provider_unavailable`` (both with the response's Retry-After), a 413 or a
+400 "prompt is too long" ``context_too_long``; other statuses stay internal
+(code None, ``user_facing=False``, "Claude API returned HTTP <n>"). The SDK
+never retries (``max_retries=0``): retries belong to ``admino.llm_policy``.
 
 Security notes:
 - API key is read from ANTHROPIC_API_KEY env var, never from config files.
 - No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
-- User-facing error messages are fixed strings: no response body or SDK cause.
+- Error messages are fixed strings: never the SDK message or a response body
+  (the message only classifies a context-length failure).
+- No end-user identifier is sent: the request body holds model, messages,
+  max_tokens, system and tools only (never ``metadata``).
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -30,7 +37,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from pydantic import ValidationError
 
@@ -42,6 +49,7 @@ from admino.llm import (
     not_configured_error,
     provider_status_error,
     sanitize_content,
+    sdk_status_error,
     strip_control_chars,
     validate_tools_payload,
 )
@@ -284,6 +292,8 @@ class AnthropicClient:
     protocol so it is interchangeable with the other LLMClient backends.
     """
 
+    provider: Final = "anthropic"
+
     def __init__(self, config: LLMConfig) -> None:
         """Initialize the Anthropic client.
 
@@ -310,10 +320,12 @@ class AnthropicClient:
         api_key = os.environ.get(_API_KEY_ENV, "")
         self._api_key_configured = bool(api_key)
         # Built even without a key so close() stays uniform; chat() refuses to
-        # send a request until the key is configured.
+        # send a request until the key is configured. No SDK retries: one chat()
+        # is one request (the model policy decides about retries).
         self._client = anthropic.AsyncAnthropic(
             api_key=api_key,
             timeout=float(config.timeout_s),
+            max_retries=0,
         )
 
     async def chat(
@@ -334,9 +346,10 @@ class AnthropicClient:
             Parsed LLMResponse.
 
         Raises:
-            LLMError: User-facing when the key or model is missing, the key is
-                rejected, the model is unknown, the rate limit is hit, or Claude
-                is unavailable (5xx, timeout, connection); internal otherwise.
+            LLMError: Coded (user-facing) when the key or model is missing, the
+                key is rejected, the model is unknown, the rate limit is hit,
+                Claude is unavailable (5xx, connection), the request timed out or
+                the prompt is too long; internal otherwise.
             ValueError: If stream=True is passed.
         """
         if stream:
@@ -366,28 +379,31 @@ class AnthropicClient:
             try:
                 validate_tools_payload(tools)
             except ValueError as exc:
-                raise LLMError(message=str(exc), status_code=None) from exc
+                raise LLMError(message=str(exc), status_code=None) from None
             kwargs["tools"] = _convert_tools_to_anthropic(tools)
 
         try:
             response = await self._client.messages.create(**kwargs)
+        except anthropic.APITimeoutError:
+            # Checked first: a subclass of APIConnectionError. Raised ``from None``
+            # so the SDK exception (and any response body) never travels with it.
+            raise provider_status_error(
+                _LABEL, None, key_env=_API_KEY_ENV, timed_out=True
+            ) from None
         except anthropic.APIConnectionError:
-            # Also covers APITimeoutError (a subclass). Raised ``from None`` so the
-            # SDK exception (and any response body) never travels with the error.
             raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
         except anthropic.APIStatusError as exc:
-            # exc.message is Anthropic's own error description (e.g. validation
-            # errors for invalid tool names). It is NOT the request body and
-            # does not contain conversation content. It only reaches the
-            # internal (log-only) message; user-facing messages are fixed.
             # Mapping goes by status code, so 529 "overloaded" (a plain
-            # APIStatusError) is treated like any other 5xx.
-            api_error = strip_control_chars(str(exc.message))[:500]
-            raise provider_status_error(
+            # APIStatusError) is treated like any other 5xx. Anthropic's error
+            # bodies carry a type but no code: exc.message alone classifies a
+            # context-length 400 and never reaches the LLMError.
+            raise sdk_status_error(
                 _LABEL,
                 exc.status_code,
+                headers=exc.response.headers,
+                error_code=None,
+                sdk_message=exc.message,
                 key_env=_API_KEY_ENV,
-                internal_message=f"Anthropic API returned HTTP {exc.status_code}: {api_error}",
             ) from None
 
         # Extract text content

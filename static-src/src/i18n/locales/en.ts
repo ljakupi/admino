@@ -45,6 +45,20 @@ export const en = {
   'chat.header.menu': 'Menu',
   'chat.toolCall.expired': 'Expired',
 
+  // --- chat errors (issue #242: V1 model policy, decision D3 — shown instead
+  // of the backend's English `response` fallback for an error reply) -------
+  'chat.error.not_configured': "This AI model isn't set up yet. Ask your administrator to configure it.",
+  'chat.error.missing_model':
+    'The configured AI model is unavailable. Ask your administrator to check the setup.',
+  'chat.error.provider_unavailable':
+    'The AI service is temporarily unavailable. Please wait a moment and try again.',
+  'chat.error.rate_limited': 'Too many requests right now. Please wait a moment and try again.',
+  'chat.error.timeout': 'The AI service took too long to respond. Please try again.',
+  'chat.error.residency_blocked':
+    "Your organization's data residency policy doesn't allow the current AI model. Ask your administrator to switch to a compliant model.",
+  'chat.error.context_too_long': 'This conversation has grown too long for the AI model to handle. Start a new chat.',
+  'chat.error.generic': 'Something went wrong answering that message. Please try again.',
+
   // --- toast (shared) ----------------------------------------------------
   'toast.common.saved': 'Saved',
   'toast.common.saveFailed.title': 'Save failed',
@@ -568,6 +582,14 @@ export const en = {
   // --- platform page (placeholder, Super Admin console, issue #155) ---------
   'platform.empty.heading': 'Platform console',
   'platform.empty.subtext': 'The platform console will appear here.',
+
+  // --- platform defaults: residency confirmation (issue #242, D1; #168 renders the dialog) ---
+  'platform.defaults.residencyConfirm.title': 'Confirm non-Swiss data residency',
+  'platform.defaults.residencyConfirm.body': {
+    one: '{count} organization currently requires Swiss data residency and will be affected by this change.',
+    other: '{count} organizations currently require Swiss data residency and will be affected by this change.',
+  },
+  'platform.defaults.residencyConfirm.confirm': 'Switch anyway',
 
   // --- chat page (read-only viewer, issue #155) -----------------------------
   'chat.viewerEmpty.heading': 'Nothing shared with you yet',

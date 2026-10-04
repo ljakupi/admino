@@ -2685,6 +2685,8 @@ _GH140_ECHO_WRITE_SYSTEM = (
 class _RecordingLLM:
     """Scripted LLM stand-in that records every context window it receives."""
 
+    provider = "infomaniak"
+
     def __init__(self, responses: list[LLMResponse]) -> None:
         self._responses: list[LLMResponse] = list(responses)
         self.received_messages: list[list[LLMMessage]] = []

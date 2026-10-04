@@ -41,9 +41,10 @@ logged, and never sent to the browser.
 
 **When something is missing, admino still boots.** A missing API key or model, a rejected
 key, a rate limit or an unreachable provider never stops startup or a provider switch.
-The chat replies with what's wrong and what to do (for example "Infomaniak isn't
-configured; set INFOMANIAK_API_TOKEN on the server"). Unexpected internal errors get a
-generic "try again" reply and are logged without message content.
+The startup log names what to set (for example "the INFOMANIAK_API_TOKEN env var is not
+set"), and the chat shows a short message in the user's language, such as "This AI model
+isn't set up yet. Ask your administrator to configure it." See
+[LLM errors and retries](#llm-errors-and-retries).
 
 **Switching providers.** The provider is a platform setting: it applies to every
 organization, and only the Super Admin can change it.
@@ -54,11 +55,82 @@ organization, and only the Super Admin can change it.
 - Or, as the Super Admin, `PATCH /api/platform/settings` with e.g.
   `{"llm": {"provider": "vllm"}}` (see [Settings](#settings-mine-organization-platform)).
   The switch applies at once, until the next restart. There's no page for it yet; the
-  Platform console adds one.
+  Platform console adds one. A switch to Claude or OpenAI needs the
+  [residency confirmation](#data-residency-and-the-provider).
 - Model IDs live in `config.yaml` under `llm` (`infomaniak_model`, `vllm_model`,
   `anthropic_model`, `openai_model`); all stay set so switching needs no model edit. The
   API key still comes from the environment.
 - Point the OpenAI provider at any OpenAI-compatible server with `OPENAI_BASE_URL`.
+
+### Data residency and the provider
+
+Infomaniak and the local vLLM container are the **Swiss providers**: Infomaniak processes
+requests in Switzerland, and vLLM runs on your own server. Claude (Anthropic) and OpenAI
+aren't.
+
+- **Residency organizations stay on Swiss providers.** When an organization's
+  [data residency policy](#organizations-super-admin) is on and the active provider isn't
+  `infomaniak` or `vllm`, its chats make no LLM call at all: each message ends with the
+  error code `residency_blocked`, and a tool call approved after such a switch doesn't
+  run. Organizations without the policy keep chatting.
+- **Switching to Claude or OpenAI needs a confirmation.** The Super Admin confirms how
+  many organizations the switch affects: the PATCH carries `confirm_residency_orgs` equal
+  to the current number of organizations with data residency on, of every status
+  (`llm.residency_orgs` in `GET /api/platform/settings`). For example, with no such
+  organization: `{"llm": {"provider": "anthropic"}, "confirm_residency_orgs": 0}`. A
+  missing or wrong number answers `409`
+  `{"detail": "…", "reason": "residency_confirmation", "residency_orgs": 3}` with the
+  current number, and nothing changes: no setting is written, nothing is recorded, and
+  the running provider stays. The number is counted again when the switch is written: if
+  an organization's data residency changed in between, the answer is the same `409` with
+  the new number.
+- A switch to `infomaniak` or `vllm`, or a patch that keeps the provider, needs no
+  confirmation; a given `confirm_residency_orgs` is ignored. `confirm_residency_orgs` is
+  not a setting: a patch that gives only it answers `422`.
+- Setting a non-Swiss provider in `config.yaml` (or `LLM_PROVIDER`) and restarting needs no
+  confirmation, since only someone with access to the server can do it. The residency
+  guard applies all the same.
+- **No identifiers reach a provider.** admino never sends a user or organization ID, a
+  name or an email address to any provider: no `user`, `metadata`, `safety_identifier`,
+  `prompt_cache_key` or `store` field, and no `OpenAI-Organization` or `OpenAI-Project`
+  header, even when `OPENAI_ORG_ID` or `OPENAI_PROJECT_ID` is set in the environment.
+
+### LLM errors and retries
+
+A chat reply that fails has `status: "error"`, and the `POST /api/message` and
+`POST /api/confirm/{id}` responses carry its `error_code`:
+
+| `error_code` | What happened |
+| --- | --- |
+| `not_configured` | The provider's API key or token is missing or was rejected (401/403), or the Infomaniak product can't be determined. |
+| `missing_model` | No model is set for the provider, or the provider doesn't know it (404). |
+| `provider_unavailable` | The provider can't be reached, or it failed (5xx). |
+| `rate_limited` | The provider refused the request for its rate limit (429). |
+| `timeout` | The provider didn't answer within `llm.timeout_s`. |
+| `context_too_long` | The conversation is longer than the model accepts (400/413). Start a new chat. |
+| `residency_blocked` | The organization's data residency policy is on and the provider isn't Swiss (see [above](#data-residency-and-the-provider)). |
+
+Any other failure has `error_code: null`. The chat shows the code's translated text
+(English, German or French), or a generic "Something went wrong" text when there's no
+code. The response's `response` field holds an English fallback text. **Provider text is
+never shown or logged**: no provider message, response body or provider error code
+reaches a response or a log line. Errors are logged by their type, HTTP status and code
+only.
+
+**Retries.** A `timeout`, `provider_unavailable` or `rate_limited` failure is retried up to
+`llm.max_retries` times (a [platform default](#platform-defaults): 2, from 0 to 5, `0`
+turns retries off). Every other failure fails at once.
+
+- Before each retry admino waits the provider's `Retry-After` (or `retry-after-ms`) when
+  it sends one, up to 10 seconds. A longer `Retry-After` isn't retried: the reply fails
+  at once.
+- Without one it waits an exponential backoff with jitter: up to 1, 2, 4, then 8 seconds
+  (at most 8), each at least half of that.
+- A retry sends the same request to the same provider and model, never to another one. A
+  streamed reply is retried only before its first piece has arrived.
+- The provider SDKs' own retries are off, so each attempt is exactly one request and the
+  limit above is the only one. Each retry logs one warning with its code, attempt number
+  and delay.
 
 ## Infomaniak AI Services (default)
 
@@ -68,7 +140,7 @@ admino talks to Infomaniak's OpenAI-compatible endpoint
 | Variable | Required | Notes |
 | --- | --- | --- |
 | `INFOMANIAK_API_TOKEN` | yes | Create it in the Infomaniak Manager → **API tokens** with the **`ai-tools`** scope. Sent as `Authorization: Bearer …` to `api.infomaniak.com` only. |
-| `INFOMANIAK_PRODUCT_ID` | no | Your AI Tools product ID (a number). When unset, admino discovers it at startup with `GET https://api.infomaniak.com/1/ai`. If the token sees several products, the startup log and the chat ask you to set it. |
+| `INFOMANIAK_PRODUCT_ID` | no | Your AI Tools product ID (a number). When unset, admino discovers it at startup with `GET https://api.infomaniak.com/1/ai`. If the token sees several products, the startup log asks you to set it, and the chat says the model isn't set up yet. |
 
 **Models.** The default is `Qwen/Qwen3.5-397B-A17B-FP8` (`llm.infomaniak_model`), with
 `Qwen/Qwen3.5-122B-A10B-FP8` as the smaller alternative. Both take text and images, accept
@@ -79,7 +151,8 @@ configured.
 **Privacy.** Processing happens in Infomaniak's data centers in Switzerland. Infomaniak
 states that queries are neither recorded nor used to train models or improve its
 services. admino sends no account identifiers: the OpenAI `user` field isn't set, and no
-names or email addresses are added to prompts.
+names or email addresses are added to prompts (see
+[No identifiers reach a provider](#data-residency-and-the-provider)).
 
 **Reasoning ("thinking").** Qwen3.5 thinks before answering by default. admino turns this
 off with `reasoning_effort: "none"`, the switch Infomaniak documents for its chat API. As a
@@ -88,9 +161,11 @@ safety net it never reads the `reasoning_content` / `reasoning` fields and strip
 never reaches the chat.
 
 **Errors.** A rejected token (401/403), a rate limit (429) and temporary failures (5xx,
-timeouts) come back as short chat messages. Response bodies are never logged. Retries are
-left to the upcoming LLM gateway. Billing is per token: set a spending limit on the
-product in the Infomaniak Manager.
+timeouts) come back as error codes the chat shows as short translated messages; rate
+limits and temporary failures are retried first (see
+[LLM errors and retries](#llm-errors-and-retries)). Response bodies are never logged.
+Billing is per token, retries included: set a spending limit on the product in the
+Infomaniak Manager.
 
 ## Local vLLM (CPU container)
 
@@ -144,7 +219,7 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | --- | --- |
 | `server` | Bind `host` / `port` for the ASGI server, the session cookie's `cookie_secure` flag, the `public_url` users open admino at, and the `trusted_proxies` whose `X-Forwarded-*` headers are believed (see [Production deployment](#production-deployment-tls-reverse-proxy)). |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
-| `llm` | `provider`, request `timeout_s`, and the cloud `*_model` IDs. The provider and model IDs are also [platform settings](#settings-mine-organization-platform); this section is applied again at every start. |
+| `llm` | `provider`, request `timeout_s`, the cloud `*_model` IDs, and the active model's capabilities: `max_input_tokens` (the most input tokens it accepts, default 200000, from 1000 to 2000000) and `image_input` (whether it accepts images, default `true`). The provider, the model IDs and the capabilities are also [platform settings](#platform-defaults); this section is applied again at every start. The retry limit isn't in `config.yaml`: it's a platform setting only. |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. Change them with `PATCH /api/platform/settings` instead. |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 | `log_level` | Top-level key: `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. The `LOG_LEVEL` env var overrides it. |
@@ -159,7 +234,7 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 | --- | --- | --- | --- |
 | **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows these next to **My account**. |
 | **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins switch them under **Organization → Services**. The response also carries the organization's data residency policy (`data_residency`, read-only here). |
-| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider and a model per provider, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. |
+| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider, a model per provider, the active model's capabilities and the LLM retry limit, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. The response also carries the number of organizations with data residency on (`llm.residency_orgs`, read-only). |
 
 - The UI and response languages, the timezone and the personal instructions belong to your
   account, not to these settings (see **My account** under
@@ -169,8 +244,9 @@ Settings have three scopes. Each has an owner and its own route; any other role 
   languages, timezone, personal instructions), and the organization and platform settings,
   stay as they are.
 - Organization and platform changes are recorded in the audit log: which fields changed,
-  a tool's old and new on/off state, and a platform number's old and new value. Model names
-  are never recorded.
+  a tool's old and new on/off state, and a platform number's old and new value. An `llm`
+  change records only which fields changed: the provider, model names, capabilities and
+  retry limit are never recorded.
 - A tool service an organization switches off is off for that organization only. Each
   chat run reads its own organization's services, so other organizations aren't affected.
 - When the organization's data residency policy is on, the Google and Microsoft services
@@ -189,6 +265,9 @@ the response holds every section after the change.
 
 | Section | Field | Default | Range | Used by |
 | --- | --- | --- | --- | --- |
+| `llm` | `max_input_tokens` | from `config.yaml` (200,000) | 1,000–2,000,000 | the active model's input limit (later release) |
+| `llm` | `image_input` | from `config.yaml` (`true`) | `true` / `false` | image attachments (later release) |
+| `llm` | `max_retries` | 2 | 0–5 | every message ([retries](#llm-errors-and-retries)) |
 | `limits` | `max_tool_calls_per_message` | from `config.yaml` (10) | 1–100 | every message |
 | `limits` | `max_pending_confirmations` | from `config.yaml` (3) | 1–50 | — |
 | `limits` | `confirmation_timeout_s` | from `config.yaml` (300) | 10–3600 | every message |
@@ -210,6 +289,14 @@ the response holds every section after the change.
 
 - A change applies without a restart: the next message, login attempt, deletion schedule
   or audit purge uses the new value.
+- `llm.max_input_tokens` and `llm.image_input` come from `config.yaml` again at every start,
+  like the provider and the model IDs, so a change here lasts until the next restart; edit
+  `config.yaml` to keep it. `llm.max_retries` isn't in `config.yaml`: a stored value is
+  kept across restarts. A change of these three alone never replaces the running
+  provider client.
+- The `llm` section also takes the `provider` and the four model IDs (see
+  [Switching providers](#llm-providers)). `llm.residency_orgs` in the response is a count,
+  not a setting.
 - **The Super Admin session policy applies to open sessions too.** Every open Super Admin
   session takes the new idle timeout, and its end moves to its start plus the new
   lifetime. A session older than a shortened lifetime ends at once, your own included.
@@ -485,7 +572,9 @@ the Super Admin did.
   or `false`. New organizations start with it on. The change is recorded in the
   organization's audit log, where its Org Admins see it. While it's on, the organization's
   Google and Microsoft tools are disabled and its members can't connect those accounts;
-  connections made before are kept but inactive until it's turned off.
+  connections made before are kept but inactive until it's turned off. Its chats also
+  reach only a Swiss LLM provider (see
+  [Data residency and the provider](#data-residency-and-the-provider)).
 
 An organization's status can only move this way: active ⇄ deactivated, active or
 deactivated → pending deletion, pending deletion → deactivated (cancelled). Anything else,

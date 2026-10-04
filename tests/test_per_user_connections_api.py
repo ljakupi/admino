@@ -223,6 +223,8 @@ class _FakeLLM:
     scripted tool call (counted by the assistant turns after the user message), then a
     final reply. Concurrent chats are told apart by their user message."""
 
+    provider = "infomaniak"
+
     def __init__(self) -> None:
         self._scripts: dict[str, list[ToolCall]] = {}
         self.calls: list[_LLMCall] = []

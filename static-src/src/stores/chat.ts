@@ -5,7 +5,8 @@ import { useSettingsStore } from './settings';
 import { useConnectionStore } from './connection';
 import { useToastStore } from './toasts';
 import { ApiError } from '@/api/client';
-import { t } from '@/i18n';
+import { chatErrorKey } from '@/services/chatErrors';
+import { t, type MessageKey } from '@/i18n';
 import type {
   ThreadItem,
   ChatMessage,
@@ -105,8 +106,18 @@ export const useChatStore = defineStore('chat', () => {
       thread.value.push({ type: 'tool_call', data: tcUI });
     }
 
-    // Add agent response
-    if (res.response) {
+    // Add agent response. An error reply (issue #242, D3) always shows a
+    // translated text keyed off `error_code`, never the backend's English
+    // `response` fallback — even when that fallback is empty.
+    if (res.status === 'error') {
+      const msg: ChatMessage = {
+        id: uid(),
+        role: 'agent',
+        content: t(chatErrorKey(res.error_code) as MessageKey),
+        timestamp: new Date(),
+      };
+      thread.value.push({ type: 'message', data: msg });
+    } else if (res.response) {
       const msg: ChatMessage = {
         id: uid(),
         role: 'agent',

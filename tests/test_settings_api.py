@@ -236,7 +236,7 @@ _SCOPE_TABLES = {"me": "user_settings", "org": "org_settings", "platform": "plat
 _DEFAULT_BODIES: dict[str, dict[str, Any]] = {
     "me_patch": {"appearance": {"theme": "dark"}},
     "org_patch": {"tools": {"gmail": False}},
-    "platform_patch": {"llm": {"provider": "openai"}},
+    "platform_patch": {"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
 }
 _MATRIX = [
     pytest.param(action, role, id=f"{action}-{role}") for action in _ACTIONS for role in _ROLES
@@ -264,6 +264,12 @@ _LLM_RESPONSE_KEYS = frozenset(
         "anthropic_key_configured",
         "openai_key_configured",
         "infomaniak_token_configured",
+        # GH-242: the active model's capabilities, the retry limit and the
+        # residency-org count.
+        "max_input_tokens",
+        "image_input",
+        "max_retries",
+        "residency_orgs",
     }
 )
 
@@ -1565,6 +1571,11 @@ class TestPlatformGet:
             "anthropic_key_configured": True,
             "openai_key_configured": False,
             "infomaniak_token_configured": False,
+            # GH-242: migration 0022's defaults; both orgs have no residency.
+            "max_input_tokens": 200000,
+            "image_input": True,
+            "max_retries": 2,
+            "residency_orgs": 0,
         }
 
     def test_settings_api_platform_get_shows_the_stored_provider_not_the_config(
@@ -1651,7 +1662,10 @@ class TestPlatformPatch:
         old_client = agent._llm
 
         response = _call(
-            _client(app), "platform_patch", token, body={"llm": {"provider": "openai"}}
+            _client(app),
+            "platform_patch",
+            token,
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
         )
 
         assert response.status_code == 200, response.text
@@ -1792,7 +1806,10 @@ class TestPlatformPatch:
         before = _state(db)
 
         response = _call(
-            _client(app), "platform_patch", token, body={"llm": {"provider": "openai"}}
+            _client(app),
+            "platform_patch",
+            token,
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
         )
 
         assert (response.status_code, response.json()) == (400, _CLIENT_FAILED)
@@ -1813,7 +1830,7 @@ class TestPlatformPatch:
             _client(app, raise_server_exceptions=False),
             "platform_patch",
             token,
-            body={"llm": {"provider": "openai"}},
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
         )
 
         assert response.status_code == 500
@@ -1835,7 +1852,10 @@ class TestPlatformPatch:
         agent._llm.close.side_effect = RuntimeError("teardown zephyrmarker detail")
 
         response = _call(
-            _client(app), "platform_patch", token, body={"llm": {"provider": "openai"}}
+            _client(app),
+            "platform_patch",
+            token,
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
         )
 
         assert response.status_code == 200, response.text
@@ -1896,7 +1916,12 @@ class TestLiveConfigFollowsTheSwitch:
         _, token = _login(db, "super_admin")
         client = _client(app)
 
-        switched = _call(client, "platform_patch", token, body={"llm": {"provider": "openai"}})
+        switched = _call(
+            client,
+            "platform_patch",
+            token,
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
+        )
         diagnostics = client.get("/api/platform/diagnostics", headers=_headers(token))
 
         assert switched.status_code == 200, switched.text
@@ -1913,7 +1938,10 @@ class TestLiveConfigFollowsTheSwitch:
         probes.create.side_effect = ValueError("no client")
 
         response = _call(
-            _client(app), "platform_patch", token, body={"llm": {"provider": "openai"}}
+            _client(app),
+            "platform_patch",
+            token,
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
         )
 
         assert response.status_code == 400
@@ -1930,7 +1958,7 @@ class TestLiveConfigFollowsTheSwitch:
             _client(app, raise_server_exceptions=False),
             "platform_patch",
             token,
-            body={"llm": {"provider": "openai"}},
+            body={"llm": {"provider": "openai"}, "confirm_residency_orgs": 0},
         )
 
         assert response.status_code == 500
@@ -2067,7 +2095,10 @@ class TestNoContentInLogs:
             client,
             "platform_patch",
             platform,
-            body={"llm": {"provider": "openai", "openai_model": "Zephyrmarker-o1"}},
+            body={
+                "llm": {"provider": "openai", "openai_model": "Zephyrmarker-o1"},
+                "confirm_residency_orgs": 0,
+            },
         )
         assert failed.status_code == 400
         refused = _call(
@@ -2341,6 +2372,7 @@ class TestPlatformDefaultsPatch:
             token,
             body={
                 "llm": {"provider": "openai"},
+                "confirm_residency_orgs": 0,
                 "limits": {"max_message_length": 10},
                 "security": {"lockout_minutes": 30},
                 "files": {"render_dpi": 150},
@@ -2381,7 +2413,11 @@ class TestPlatformDefaultsPatch:
             _client(app),
             "platform_patch",
             token,
-            body={"llm": {"provider": "openai"}, "limits": {"max_message_length": 10}},
+            body={
+                "llm": {"provider": "openai"},
+                "confirm_residency_orgs": 0,
+                "limits": {"max_message_length": 10},
+            },
         )
 
         assert (response.status_code, response.json()) == (400, _CLIENT_FAILED)
@@ -2485,6 +2521,7 @@ class TestPlatformDefaultsPatch:
             token,
             body={
                 "llm": {"provider": "openai"},
+                "confirm_residency_orgs": 0,
                 "retention": {"trash_min_days": 60, "trash_max_days": 30},
             },
         )
