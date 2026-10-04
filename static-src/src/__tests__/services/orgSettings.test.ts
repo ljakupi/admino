@@ -46,7 +46,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { ApiError } from '@/api/client';
 import type { OrgSettingsPatch, OrgSettingsResponse, ToolsSettings } from '@/api/types';
-import { setLocale } from '@/i18n';
+import { formatNumber, setLocale } from '@/i18n';
 import { de } from '@/i18n/locales/de';
 import { en } from '@/i18n/locales/en';
 import { fr } from '@/i18n/locales/fr';
@@ -63,6 +63,8 @@ import {
   draftFrom,
   instructionsRemaining,
   orgSettingsErrorMessage,
+  orgSettingsIssueText,
+  planStorageLabel,
   validateOrgSettingsDraft,
   type OrgSettingsDraft,
   type OrgSettingsIssue,
@@ -728,5 +730,230 @@ describe('orgSettings services logging', () => {
     orgSettingsErrorMessage(new Error(SECRET_DETAIL));
 
     expect(spies.map((spy) => spy.mock.calls.length)).toEqual([0, 0, 0, 0, 0]);
+  });
+});
+
+// --- Issue texts (logic moved out of OrgSettingsPanel.vue) ---------------------------------
+
+/**
+ * `orgSettingsIssueText(issue, settings)` is
+ * `t(ORG_SETTINGS_ISSUE_KEYS[issue], params)` with the bounds the validator
+ * enforces as params: the name and instructions maxima, the idle timeout and
+ * lifetime ranges, and the trash retention range taken from the RESPONSE's
+ * platform bounds (SETTINGS: 7..60), or 0..90 when nothing is loaded yet.
+ * Params are plain numbers (`String(n)` in the text), never `{…}` leftovers.
+ */
+const ISSUE_PARAMS: ReadonlyArray<readonly [OrgSettingsIssue, Record<string, number>]> = [
+  ['name_required', {}],
+  ['name_too_long', { max: 120 }],
+  ['instructions_too_long', { max: 8000 }],
+  ['idle_timeout_range', { min: 15, max: 480 }],
+  ['lifetime_range', { min: 1, max: 72 }],
+  ['trash_retention_range', { min: 7, max: 60 }],
+];
+
+const ISSUE_TEXT_CASES = LOCALES.flatMap((locale) =>
+  ISSUE_PARAMS.map(([issue, params]) => [locale, issue, params] as const),
+);
+
+const TRASH_RANGE_KEY = 'organization.settings.issue.trashRetentionRange';
+
+/** True when `n` appears in `text` as a whole number (so "1" is not found inside "15"). */
+function showsNumber(text: string, n: number): boolean {
+  return new RegExp(`(^|\\D)${n}(\\D|$)`).test(text);
+}
+
+describe('orgSettings orgSettingsIssueText', () => {
+  it.each(ISSUE_TEXT_CASES)('gives the %s catalog text of %s with its params filled in', (locale, issue, params) => {
+    setLocale(locale);
+
+    expect(orgSettingsIssueText(issue, SETTINGS)).toBe(
+      catalogText(locale, ORG_SETTINGS_ISSUE_KEYS[issue], params),
+    );
+  });
+
+  it.each(LOCALES)('leaves no placeholder and shows every bound as a number in %s', (locale) => {
+    setLocale(locale);
+
+    const texts = ISSUE_PARAMS.map(([issue, params]) => ({
+      issue,
+      params,
+      text: orgSettingsIssueText(issue, SETTINGS),
+    }));
+
+    expect({
+      unfilled: texts.filter(({ text }) => text.includes('{') || text.includes('}')).map(({ issue }) => issue),
+      missing: texts.flatMap(({ issue, params, text }) =>
+        Object.values(params)
+          .filter((n) => !showsNumber(text, n))
+          .map((n) => `${issue}:${n}`),
+      ),
+      blank: texts.filter(({ text }) => text.trim() === '').map(({ issue }) => issue),
+    }).toEqual({ unfilled: [], missing: [], blank: [] });
+  });
+
+  it.each(LOCALES)('falls back to 0..90 days for the trash retention when no settings are loaded (%s)', (locale) => {
+    setLocale(locale);
+
+    expect(orgSettingsIssueText('trash_retention_range', null)).toBe(
+      catalogText(locale, TRASH_RANGE_KEY, { min: 0, max: 90 }),
+    );
+  });
+
+  it('takes the trash retention bounds from the response, whatever they are', () => {
+    expect([
+      orgSettingsIssueText('trash_retention_range', withBounds(14, 45, 20)),
+      orgSettingsIssueText('trash_retention_range', withBounds(0, 90, 30)),
+    ]).toEqual([
+      catalogText('en', TRASH_RANGE_KEY, { min: 14, max: 45 }),
+      catalogText('en', TRASH_RANGE_KEY, { min: 0, max: 90 }),
+    ]);
+  });
+
+  it('gives every other issue the same text with or without loaded settings', () => {
+    const others = ISSUE_PARAMS.filter(([issue]) => issue !== 'trash_retention_range');
+
+    expect({
+      withoutSettings: others.map(([issue]) => orgSettingsIssueText(issue, null)),
+      withSettings: others.map(([issue]) => orgSettingsIssueText(issue, SETTINGS)),
+    }).toEqual({
+      withoutSettings: others.map(([issue, params]) => catalogText('en', ORG_SETTINGS_ISSUE_KEYS[issue], params)),
+      withSettings: others.map(([issue, params]) => catalogText('en', ORG_SETTINGS_ISSUE_KEYS[issue], params)),
+    });
+  });
+
+  it('follows the active locale: the same issue gives three distinct catalog texts', () => {
+    const texts = LOCALES.map((locale) => {
+      setLocale(locale);
+      return orgSettingsIssueText('idle_timeout_range', SETTINGS);
+    });
+
+    expect({ distinct: new Set(texts).size, texts }).toEqual({
+      distinct: 3,
+      texts: LOCALES.map((locale) =>
+        catalogText(locale, 'organization.settings.issue.idleTimeoutRange', { min: 15, max: 480 }),
+      ),
+    });
+  });
+
+  it('never changes the settings it reads and never writes to the console', () => {
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => undefined),
+    );
+    const before = snapshot(SETTINGS);
+
+    const texts = ISSUE_PARAMS.map(([issue]) => orgSettingsIssueText(issue, SETTINGS));
+
+    expect({
+      count: texts.length,
+      settings: SETTINGS,
+      console: spies.map((spy) => spy.mock.calls.length),
+    }).toEqual({ count: 6, settings: before, console: [0, 0, 0, 0, 0] });
+  });
+});
+
+// --- Plan storage label (logic moved out of OrgSettingsPanel.vue) --------------------------
+
+/**
+ * `planStorageLabel(bytes)` is `t('organization.settings.data.storage', { size })`
+ * with `size` = the GiB value (bytes / 1024^3, binary, not 1000^3) formatted by
+ * `@/i18n`'s `formatNumber` with at most one fraction digit (rounded, no
+ * trailing ".0"), then ONE plain space (U+0020) and "GiB". The en sizes are
+ * pinned literally; de/fr read the real Swiss formatter so Intl data never
+ * makes the test flaky (de-CH writes "1.5", fr-CH "1,5"; both group
+ * thousands).
+ */
+const GIB = 1024 ** 3;
+const STORAGE_KEY = 'organization.settings.data.storage';
+
+const STORAGE_CASES: ReadonlyArray<readonly [string, number, string]> = [
+  ['10 GiB', 10 * GIB, '10 GiB'],
+  ['1.5 GiB', 1.5 * GIB, '1.5 GiB'],
+  ['0 bytes', 0, '0 GiB'],
+  ['1 GiB and 1 byte (rounded, no trailing .0)', GIB + 1, '1 GiB'],
+  ['1.25 GiB (one fraction digit, rounded half up)', 1.25 * GIB, '1.3 GiB'],
+  ['2.75 GiB (rounded, not truncated)', 2.75 * GIB, '2.8 GiB'],
+  ['10 GiB less 1 byte (rounds up to 10)', 10 * GIB - 1, '10 GiB'],
+  ['512 MiB', 512 * 1024 ** 2, '0.5 GiB'],
+];
+
+/** Quotas whose Swiss formatting differs by locale (decimal separator, thousands grouping). */
+const LOCALE_STORAGE_BYTES: readonly number[] = [
+  10 * GIB,
+  1.5 * GIB,
+  0,
+  GIB + 1,
+  1.25 * GIB,
+  2.75 * GIB,
+  1024 * GIB,
+  1536.5 * GIB,
+];
+
+function expectedStorageLabel(locale: CatalogLocale, bytes: number): string {
+  return catalogText(locale, STORAGE_KEY, {
+    size: `${formatNumber(bytes / GIB, { maximumFractionDigits: 1 })} GiB`,
+  });
+}
+
+describe('orgSettings planStorageLabel', () => {
+  it.each(STORAGE_CASES)('labels %s (%i bytes) with the size "%s" in en', (_label, bytes, size) => {
+    expect(planStorageLabel(bytes)).toBe(catalogText('en', STORAGE_KEY, { size }));
+  });
+
+  it.each(LOCALES)('formats the GiB value with the active %s number format (formatNumber, one fraction digit)', (locale) => {
+    setLocale(locale);
+
+    expect(LOCALE_STORAGE_BYTES.map((bytes) => planStorageLabel(bytes))).toEqual(
+      LOCALE_STORAGE_BYTES.map((bytes) => expectedStorageLabel(locale, bytes)),
+    );
+  });
+
+  it('groups thousands of GiB with the locale separator (1024 GiB is not "1024 GiB")', () => {
+    setLocale('en');
+
+    const label = planStorageLabel(1024 * GIB);
+
+    expect({ label, plain: label.includes('1024 GiB') }).toEqual({
+      label: expectedStorageLabel('en', 1024 * GIB),
+      plain: false,
+    });
+  });
+
+  it('follows the active locale: 1.5 GiB gives three distinct labels from their own catalogs', () => {
+    const labels = LOCALES.map((locale) => {
+      setLocale(locale);
+      return planStorageLabel(1.5 * GIB);
+    });
+
+    expect({ distinct: new Set(labels).size, labels }).toEqual({
+      distinct: 3,
+      labels: LOCALES.map((locale) => {
+        setLocale(locale);
+        return expectedStorageLabel(locale, 1.5 * GIB);
+      }),
+    });
+  });
+
+  it.each(LOCALES)('joins the number and "GiB" with one plain space, never a non-breaking one (%s)', (locale) => {
+    setLocale(locale);
+
+    const labels = [1.5 * GIB, 1024 * GIB, GIB + 1, 0].map((bytes) => planStorageLabel(bytes));
+
+    expect(
+      labels.filter((label) => !/\d GiB/.test(label) || /[  ]GiB/.test(label) || label.includes('{')),
+    ).toEqual([]);
+  });
+
+  it('never writes to the console', () => {
+    const spies = (['log', 'info', 'warn', 'error', 'debug'] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => undefined),
+    );
+
+    const label = planStorageLabel(SETTINGS.plan.storage_quota);
+
+    expect({ label, console: spies.map((spy) => spy.mock.calls.length) }).toEqual({
+      label: catalogText('en', STORAGE_KEY, { size: '10 GiB' }),
+      console: [0, 0, 0, 0, 0],
+    });
   });
 });
