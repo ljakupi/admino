@@ -740,15 +740,26 @@ class TestUnhandledExceptions:
         # GH-160: the route reads the platform limits through the settings cache
         # (primed by conftest). GH-161: the run's org policy is stubbed, so the
         # MagicMock pool is never queried and the agent run is what fails.
+        # GH-170: the per-request prompt context load is stubbed the same way.
+        from admino import models
         from admino.models import ToolPolicy
         from admino.permissions import PermissionsConfig
 
+        prompt_context_cls = getattr(models, "PromptContext", None)
+        prompt_context = (
+            prompt_context_cls() if prompt_context_cls is not None else MagicMock(name="context")
+        )
         pool = patch("admino.database.get_pool", MagicMock(return_value=MagicMock(name="pool")))
         policy = patch(
             "admino.org_permissions.load_tool_policy",
             AsyncMock(return_value=ToolPolicy(permissions=PermissionsConfig())),
         )
-        with pool, policy, configured_logging() as logs:
+        context = patch(
+            "admino.scoped_settings.load_prompt_context",
+            AsyncMock(return_value=prompt_context),
+            create=True,
+        )
+        with pool, policy, context, configured_logging() as logs:
             async with _client(app) as client:
                 response = await client.post(
                     "/api/message", json={"message": "hello", "session_id": "chat-1"}

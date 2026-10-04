@@ -328,7 +328,6 @@ def agent(llm: _FakeLLM) -> Agent:
         agent_config=AgentConfig(
             max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0
         ),
-        system_prompt="You are admino.",
     )
 
 

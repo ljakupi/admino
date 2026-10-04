@@ -31,6 +31,15 @@ Tests the FastAPI application created by ``create_app()``, covering:
   ``org_permissions.load_tool_policy`` (stubbed here: the pool is a MagicMock);
   the rate-limit table carries the /api/org/permissions*,
   /api/org/critical-permissions* and /api/permissions/summary keys.
+- GH-170: each chat run (POST /api/message, an approved POST /api/confirm) gets
+  the caller's ``PromptContext``, loaded on every request through
+  ``scoped_settings.load_prompt_context(pool, tenant)`` with the caller's own
+  ``TenantContext`` (stubbed here: the pool is a MagicMock) and passed as
+  ``agent.run(..., prompt_context=...)``; a failing load is a generic 500. A
+  real Agent (fixed clock) sends exactly one system message per LLM call, at
+  index 0: ``prompt_assembly.system_prompt(<loaded context>, tools=<the run's
+  advertised tools>, now=<the clock>)``, never accumulated over turns or a
+  confirmation resume.
 
 Callers are logged in through ``tests.auth_helpers.login`` (a dependency
 override of ``server.require_session``); ``resolved_session`` drives the real
@@ -58,7 +67,7 @@ from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import BaseModel, Field
 
-from admino import scoped_settings
+from admino import models, scoped_settings
 from admino.agent import Agent
 from admino.llm import LLMResponse
 from admino.models import (
@@ -71,7 +80,8 @@ from admino.models import (
 )
 from admino.permissions import PermissionsConfig, ToolPermissions
 from admino.server import create_app
-from admino.tools.registry import clear_registry, register_tool
+from admino.tenancy import TenantContext
+from admino.tools.registry import ToolDescription, clear_registry, register_tool
 from tests.auth_helpers import (
     TEST_MEMBER_ID,
     TEST_SESSION_TOKEN,
@@ -87,7 +97,7 @@ if TYPE_CHECKING:
     from collections.abc import Generator
 
     from admino.access import MemberRole, Principal
-    from admino.models import ToolPolicy
+    from admino.models import PromptContext, ToolPolicy
     from admino.sessions import AuthenticatedSession
 
 
@@ -166,10 +176,12 @@ class FakeAgent:
         tool_policy: ToolPolicy,
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
+        prompt_context: PromptContext | None = None,
     ) -> AgentResult:
         """Record the call (GH-149: ``principal`` is a required keyword; GH-160: the
         run's ``agent_config`` from the stored platform limits; GH-161: the requesting
-        org's ``tool_policy`` is a required keyword too) and reply."""
+        org's ``tool_policy`` is a required keyword too; GH-170: the caller's
+        ``prompt_context``, loaded per request) and reply."""
         self.run_calls.append(
             {
                 "user_message": user_message,
@@ -179,6 +191,7 @@ class FakeAgent:
                 "tool_policy": tool_policy,
                 "pending_confirmation": pending_confirmation,
                 "agent_config": agent_config,
+                "prompt_context": prompt_context,
             }
         )
         if self._call_index >= len(self._results):
@@ -213,6 +226,41 @@ def org_tool_policy(monkeypatch: pytest.MonkeyPatch) -> AsyncMock | None:
     load = AsyncMock(return_value=ToolPolicy(permissions=_STUB_ORG_PERMISSIONS))
     monkeypatch.setattr("admino.org_permissions.load_tool_policy", load)
     return load
+
+
+# What the stubbed prompt context load returns while ``models.PromptContext`` doesn't
+# exist yet (GH-170): a distinct object, so "the run got the loaded context" can never
+# pass on a None that nobody loaded.
+_NO_PROMPT_CONTEXT_YET = object()
+
+
+def _prompt_context(**fields: Any) -> PromptContext:
+    """A ``models.PromptContext`` (GH-170); fails the calling test while it's missing."""
+    from admino.models import PromptContext
+
+    return PromptContext(**fields)
+
+
+@pytest.fixture(autouse=True)
+def prompt_context_loader(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    """Stub the per-run prompt context load of the chat routes (GH-170).
+
+    POST /api/message and POST /api/confirm load the caller's ``PromptContext``
+    (org and personal instructions, response languages, timezone) through
+    ``scoped_settings.load_prompt_context(pool, tenant)`` on every request; this
+    suite's pool is a MagicMock, so the load returns ``PromptContext()`` (no
+    instructions, no language, the default timezone). ``raising=False`` and the
+    lazy model lookup keep the suite importable before GH-170.
+    """
+    model = getattr(models, "PromptContext", None)
+    load = AsyncMock(return_value=_NO_PROMPT_CONTEXT_YET if model is None else model())
+    monkeypatch.setattr(scoped_settings, "load_prompt_context", load, raising=False)
+    return load
+
+
+def _loaded_tenant(call: Any) -> Any:
+    """The tenant one ``load_prompt_context(pool, tenant)`` call got."""
+    return call.args[1] if len(call.args) > 1 else call.kwargs["tenant"]
 
 
 @pytest.fixture(autouse=True)
@@ -666,6 +714,165 @@ class TestAgentReceivesPrincipal:
             org_tool_policy.return_value,
             org_tool_policy.return_value,
         ]
+
+
+def _awaiting_confirmation() -> tuple[PendingConfirmation, AgentResult]:
+    """A pending confirmation on chat ``sess1`` and the run result that awaits it."""
+    pending = _make_pending_confirmation(session_id="sess1")
+    awaiting = _make_agent_result(
+        status="awaiting_confirmation",
+        response="Requires confirmation.",
+        pending_confirmation=pending,
+    )
+    return pending, awaiting
+
+
+async def _approve(client: AsyncClient, pending: PendingConfirmation) -> Any:
+    """POST /api/confirm approving ``pending`` on chat ``sess1``."""
+    return await client.post(
+        f"/api/confirm/{pending.confirmation_id}",
+        json={
+            "session_id": "sess1",
+            "confirmation_id": pending.confirmation_id,
+            "approved": True,
+        },
+    )
+
+
+class TestPromptContextPerRun:
+    """GH-170: every chat run gets the caller's prompt context, loaded per request.
+
+    ``scoped_settings.load_prompt_context(pool, tenant)`` runs on every POST
+    /api/message and approved POST /api/confirm with the caller's own
+    ``TenantContext``; its result is passed as ``agent.run(prompt_context=...)``.
+    A change of the org's instructions or default language, or of the user's
+    language, timezone or instructions, applies to the next message (no cache, no
+    restart). A failing load is a generic 500 and the run never starts.
+    """
+
+    pytestmark = pytest.mark.asyncio
+
+    async def test_server_post_message_runs_with_the_loaded_prompt_context(
+        self, prompt_context_loader: AsyncMock
+    ) -> None:
+        loaded = _prompt_context(org_instructions="Answer formally.", response_language="it")
+        prompt_context_loader.return_value = loaded
+        agent = FakeAgent([_make_agent_result()])
+        app = _make_app(agent)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/message", json=_MESSAGE_BODY)
+
+        assert resp.status_code == 200
+        prompt_context_loader.assert_awaited_once()
+        assert agent.run_calls[0]["prompt_context"] is loaded
+
+    async def test_server_post_message_loads_the_prompt_context_for_the_callers_tenant(
+        self, prompt_context_loader: AsyncMock
+    ) -> None:
+        session = member_session("org_admin", user_id=_OTHER_USER_ID)
+        app = _make_app(FakeAgent([_make_agent_result()]), session=session)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/message", json=_MESSAGE_BODY)
+
+        assert resp.status_code == 200
+        prompt_context_loader.assert_awaited_once()
+        tenant = _loaded_tenant(prompt_context_loader.await_args)
+        assert isinstance(tenant, TenantContext)
+        assert (tenant.org_id, tenant.user_id) == (
+            session.principal.org_id,
+            session.principal.user_id,
+        )
+
+    async def test_server_post_confirm_runs_with_its_own_freshly_loaded_prompt_context(
+        self, prompt_context_loader: AsyncMock
+    ) -> None:
+        """The resumed run gets the context the confirm request loaded, for the caller's
+        tenant (never the one the message loaded)."""
+        at_message = _prompt_context(response_language="de")
+        at_confirm = _prompt_context(response_language="fr", timezone="America/New_York")
+        prompt_context_loader.side_effect = [at_message, at_confirm]
+        pending, awaiting = _awaiting_confirmation()
+        agent = FakeAgent([awaiting, _make_agent_result(response="Done.")])
+        session = member_session("editor", user_id=_OTHER_USER_ID)
+        app = _make_app(agent, session=session)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "create", "session_id": "sess1"})
+            resp = await _approve(c, pending)
+
+        assert resp.status_code == 200
+        assert agent.run_calls[1]["pending_confirmation"] is not None
+        assert [call["prompt_context"] for call in agent.run_calls] == [at_message, at_confirm]
+        assert {
+            (_loaded_tenant(call).org_id, _loaded_tenant(call).user_id)
+            for call in prompt_context_loader.await_args_list
+        } == {(session.principal.org_id, session.principal.user_id)}
+
+    async def test_server_each_message_loads_the_prompt_context_again(
+        self, prompt_context_loader: AsyncMock
+    ) -> None:
+        """A changed setting applies to the very next message: nothing is cached."""
+        before = _prompt_context(default_response_language="de")
+        after = _prompt_context(default_response_language="fr", org_instructions="New rule.")
+        prompt_context_loader.side_effect = [before, after]
+        agent = FakeAgent([_make_agent_result(), _make_agent_result()])
+        app = _make_app(agent)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "a", "session_id": "sess1"})
+            await c.post("/api/message", json={"message": "b", "session_id": "sess1"})
+
+        assert prompt_context_loader.await_count == 2
+        assert [call["prompt_context"] for call in agent.run_calls] == [before, after]
+
+    async def test_server_each_user_loads_the_prompt_context_of_their_own_tenant(
+        self, prompt_context_loader: AsyncMock
+    ) -> None:
+        """Two users on one app: each load gets the tenant of its own request."""
+        agent = FakeAgent([_make_agent_result(), _make_agent_result()])
+        first = member_session("editor")
+        second = member_session("org_admin", user_id=_OTHER_USER_ID)
+        app = _make_app(agent, session=first)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "a", "session_id": "sess-a"})
+            login(app, second)
+            await c.post("/api/message", json={"message": "b", "session_id": "sess-b"})
+
+        assert [_loaded_tenant(call).user_id for call in prompt_context_loader.await_args_list] == [
+            first.principal.user_id,
+            second.principal.user_id,
+        ]
+
+    @pytest.mark.parametrize("route", ["message", "confirm"])
+    async def test_server_prompt_context_load_failure_is_a_generic_500(
+        self,
+        prompt_context_loader: AsyncMock,
+        route: str,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failing load answers 500 ``{"detail": "Internal error"}``, the run never
+        starts, and nothing of the error reaches the body or a log line."""
+        secret = "Org instructions: SECRET-7f3a-never-echoed"
+        pending, awaiting = _awaiting_confirmation()
+        agent = FakeAgent([awaiting])
+        app = _make_app(agent)
+        caplog.set_level(logging.DEBUG)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            if route == "message":
+                prompt_context_loader.side_effect = RuntimeError(secret)
+                resp = await c.post("/api/message", json=_MESSAGE_BODY)
+                runs_expected = 0
+            else:
+                prompt_context_loader.side_effect = [
+                    prompt_context_loader.return_value,
+                    RuntimeError(secret),
+                ]
+                await c.post("/api/message", json={"message": "create", "session_id": "sess1"})
+                resp = await _approve(c, pending)
+                runs_expected = 1
+
+        assert (resp.status_code, resp.json()) == (500, {"detail": "Internal error"})
+        assert len(agent.run_calls) == runs_expected
+        assert secret not in resp.text
+        assert not [r for r in caplog.records if secret in r.getMessage()]
 
 
 class TestPostMessage:
@@ -2674,12 +2881,38 @@ class TestSessionLocks:
 # ---------------------------------------------------------------------------
 
 _GH140_SESSION = "sess-gh140"
-_GH140_SYSTEM_PROMPT = "SYS"
-# GH-161: the agent's per-run system message = its prompt + "\n\n" + the run's tools line.
-_GH140_NO_TOOLS_SYSTEM = f"{_GH140_SYSTEM_PROMPT}\n\nYou have no tools available."
-_GH140_ECHO_WRITE_SYSTEM = (
-    f"{_GH140_SYSTEM_PROMPT}\n\nYou have access to the following tools: echo (write)."
-)
+# GH-170: the agent has no static prompt any more; each run's system message is
+# prompt_assembly.system_prompt(<the run's prompt context>, tools=<its advertised
+# tools>, now=<one clock reading>). The injected clock is fixed, so the expected
+# message (ending with this date line) is exact.
+_GH140_NOW = datetime(2026, 10, 4, 17, 5, tzinfo=UTC)
+_GH140_DATE_LINE = "Current date and time: Sunday, 2026-10-04 19:05 (Europe/Zurich, UTC+02:00)."
+_GH140_ECHO_WRITE_LINE = "You have access to the following tools: echo (write)."
+
+
+def _gh140_system(context: PromptContext | None = None, *, echo_write: bool = False) -> str:
+    """The system message of a run: ``prompt_assembly.system_prompt`` over ``context``
+    (default ``PromptContext()``, what the stubbed load returns), the advertised tools
+    (none, or echo.write, which the stubbed org policy sets to confirm) and the fixed
+    clock."""
+    from admino.models import PromptContext
+    from admino.prompt_assembly import system_prompt
+
+    tools = (
+        [
+            ToolDescription(
+                tool="echo",
+                action="write",
+                description="Write echo",
+                parameters_schema=_EchoArgs.model_json_schema(),
+            )
+        ]
+        if echo_write
+        else []
+    )
+    return system_prompt(
+        context if context is not None else PromptContext(), tools=tools, now=_GH140_NOW
+    )
 
 
 class _RecordingLLM:
@@ -2726,7 +2959,9 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
     Uses a REAL ``admino.agent.Agent`` (only the LLM is faked) so the
     server's store-and-replay of ``result.history`` through ``_sessions`` is
     exercised end to end. Before the fix, every turn stored the agent's system
-    prompt in the session and the next turn prepended it again.
+    prompt in the session and the next turn prepended it again. GH-170: the
+    system message is the assembled one (``_gh140_system``) built from the
+    prompt context the route loaded for that request, with a fixed clock.
     """
 
     pytestmark = pytest.mark.asyncio
@@ -2745,7 +2980,8 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
     @staticmethod
     def _make_real_agent(llm: _RecordingLLM, tool_call_recorder: AsyncMock) -> Agent:
         """GH-161: no permission state on the agent; each run gets the org policy the
-        ``org_tool_policy`` stub loads (echo.write = confirm)."""
+        ``org_tool_policy`` stub loads (echo.write = confirm). GH-170: no
+        ``system_prompt`` (removed); the clock is fixed at ``_GH140_NOW``."""
         return Agent(
             llm_client=llm,  # type: ignore[arg-type]
             tool_call_recorder=tool_call_recorder,
@@ -2754,7 +2990,7 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
                 max_context_messages=20,
                 confirmation_timeout_s=60.0,
             ),
-            system_prompt=_GH140_SYSTEM_PROMPT,
+            clock=lambda: _GH140_NOW,
         )
 
     async def _post_turns(
@@ -2785,12 +3021,37 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         self, tool_call_recorder: AsyncMock
     ) -> None:
         llm, statuses = await self._post_turns(tool_call_recorder)
+        expected = _gh140_system()
 
         assert statuses == [200] * 25
         assert len(llm.received_messages) == 25
         for i, call in enumerate(llm.received_messages):
-            assert _system_pairs(call) == [("system", _GH140_NO_TOOLS_SYSTEM)], f"turn {i}"
+            assert _system_pairs(call) == [("system", expected)], f"turn {i}"
             assert call[0].role == "system", f"turn {i}"
+            assert call[0].content.splitlines()[-1] == _GH140_DATE_LINE, f"turn {i}"
+
+    async def test_server_message_each_turn_sends_its_loaded_prompt_context(
+        self, tool_call_recorder: AsyncMock, prompt_context_loader: AsyncMock
+    ) -> None:
+        """GH-170 end to end: the context the route loads for a request is the one in
+        that turn's system message, so a changed setting applies to the next turn."""
+        first = _prompt_context(
+            org_instructions="Sign every answer with: the team.",
+            response_language="fr",
+            timezone="Asia/Kolkata",
+        )
+        second = _prompt_context(
+            personal_instructions="Use bullet points.", default_response_language="it"
+        )
+        prompt_context_loader.side_effect = [first, second]
+
+        llm, statuses = await self._post_turns(tool_call_recorder, turns=2)
+
+        assert statuses == [200, 200]
+        assert [_system_pairs(call) for call in llm.received_messages] == [
+            [("system", _gh140_system(first))],
+            [("system", _gh140_system(second))],
+        ]
 
     async def test_server_message_25_turns_each_llm_call_ends_with_posted_message(
         self, tool_call_recorder: AsyncMock
@@ -2860,8 +3121,11 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         assert resp2.status_code == 200
         assert resp2.json()["status"] == "final"
         assert len(llm.received_messages) == 2
-        resume_call = llm.received_messages[1]
-        assert _system_pairs(resume_call) == [("system", _GH140_ECHO_WRITE_SYSTEM)]
+        first_call, resume_call = llm.received_messages
+        expected = _gh140_system(echo_write=True)
+        assert _GH140_ECHO_WRITE_LINE in expected
+        assert _system_pairs(first_call) == [("system", expected)]
+        assert _system_pairs(resume_call) == [("system", expected)]
         assert resume_call[0].role == "system"
         assert (
             _system_pairs(server._sessions[server._chat_key(TEST_MEMBER_ID, _GH140_SESSION)]) == []

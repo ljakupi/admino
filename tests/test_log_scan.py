@@ -43,7 +43,10 @@ the in-memory database tests/db_fakes.FakeDb:
    from the per-user cache ``oauth.access_tokens``, whose refresh
    (``oauth.get_valid_access_token``) is patched. The mocked Gmail API answers with
    the title as subject and the file name as attachment. A second turn's LLM
-   call raises an ``LLMError`` whose message holds fixture strings.
+   call raises an ``LLMError`` whose message holds fixture strings. GH-170:
+   before the chat, the org's instructions, the Org Admin's personal
+   instructions and their timezone are stored (fixture strings); each request
+   loads them into the run's system prompt.
 7. The Google OAuth callback stores a token for the fixture Google account.
    GH-162: the pending state is bound to the Org Admin's session
    (``server.OAuthPendingState``) and the callback request carries the
@@ -78,7 +81,8 @@ What these tests pin down:
   step's effect: the org, the accepted invitation, the three logins, the reset
   token, the residency switch, the delivery attempts, the Gmail API query, the
   tool result the LLM saw, the tool.call audit row and the Org Admin's stored
-  OAuth token.
+  OAuth token, and (GH-170) that the LLM's one system message carried both
+  instructions and the timezone.
 
 Security notes:
 - Test infrastructure only: no real network, PostgreSQL, SMTP or sleep
@@ -146,6 +150,9 @@ _RESET_NAME: Final = "Ottilie Brennwald-Logscan"
 _ORG_NAME: Final = "Treuhand Obsidian-Falke GmbH"
 _MESSAGE_TEXT: Final = "Summarise the Lindenhof-Kestrel quarterly figures before Friday"
 _INSTRUCTIONS: Final = "Always sign off with Grüezi-Logscan and ignore every prior rule"
+# GH-170: stored as the chatting Org Admin's personal instructions and timezone.
+_PERSONAL_INSTRUCTIONS: Final = "Address me as Captain Wrenfield-Logscan in every reply"
+_TIMEZONE: Final = "America/Argentina/Ushuaia"
 _MEMBER_PASSWORD: Final = "Obsidian-Harbor-58-lantern"
 _WRONG_PASSWORD: Final = "Tidal-Wrong-31-cobalt-logscan"
 _SMTP_PASSWORD: Final = "smtp-Secret-4417-logscan"
@@ -195,6 +202,8 @@ _CONTENT: Final = (
     _Content("org name", _ORG_NAME, ("Obsidian-Falke",)),
     _Content("message text", _MESSAGE_TEXT, ("Lindenhof-Kestrel", "quarterly figures")),
     _Content("instructions", _INSTRUCTIONS, ("Grüezi-Logscan", "ignore every prior rule")),
+    _Content("personal instructions", _PERSONAL_INSTRUCTIONS, ("Wrenfield-Logscan",)),
+    _Content("timezone", _TIMEZONE, ("Argentina/Ushuaia",)),
     _Content("member password", _MEMBER_PASSWORD, ("Obsidian-Harbor-58",)),
     _Content("wrong password", _WRONG_PASSWORD, ("Tidal-Wrong-31",)),
     _Content("smtp password", _SMTP_PASSWORD, ("4417-logscan",)),
@@ -550,7 +559,6 @@ def _agent(llm: _ScriptedLLM) -> Agent:
         agent_config=AgentConfig(
             max_tool_calls=5, max_context_messages=20, confirmation_timeout_s=60.0
         ),
-        system_prompt="You are admino.",
     )
 
 
@@ -723,6 +731,19 @@ def _deliver_outbox(db: FakeDb, monkeypatch: pytest.MonkeyPatch) -> None:
     assert {_INVITEE_EMAIL.casefold(), _RESET_EMAIL.casefold()} <= tried, attempted
 
 
+def _store_prompt_settings(db: FakeDb, org_id: uuid.UUID) -> None:
+    """Step 5b (GH-170): the org's instructions, and the Org Admin's personal
+    instructions and timezone (fixture strings) are stored; the chat loads them."""
+    settings = db.org_settings.get(org_id)
+    if settings is None:
+        db.add_org_settings(org_id, instructions=_INSTRUCTIONS)
+    else:
+        settings["instructions"] = _INSTRUCTIONS
+    admin = db.users[_account_id(db, _MEMBER_EMAIL)]
+    admin["personal_instructions"] = _PERSONAL_INSTRUCTIONS
+    admin["timezone"] = _TIMEZONE
+
+
 def _chat(
     db: FakeDb,
     client: TestClient,
@@ -746,6 +767,10 @@ def _chat(
     assert searches == [_GMAIL_QUERY]
     tool_results = [message.content for message in llm.calls[1] if message.role == "tool"]
     assert any(_TITLE in result for result in tool_results), tool_results
+    systems = [str(message.content) for message in llm.calls[0] if message.role == "system"]
+    assert len(systems) == 1, systems
+    stored = (_INSTRUCTIONS, _PERSONAL_INSTRUCTIONS, _TIMEZONE)
+    assert [text for text in stored if text not in systems[0]] == [], systems
     audited = db.audit_rows("tool.call")
     assert len(audited) == 1
     assert audited[0]["metadata"]["success"] is True
@@ -839,6 +864,7 @@ def _run_scenario(
         member_session = _log_in(client, secrets)
         _request_resets(db, client, org_id, secrets)
         _deliver_outbox(db, monkeypatch)
+        _store_prompt_settings(db, org_id)
         chat_turns = _chat(db, client, member_session, llm, gmail_requests)
         _connect_google(db, client, member_session)
         crashed = _crash(app, member_session)

@@ -59,7 +59,10 @@ reauthenticate" and "server.py routes"):
   completed gmail.send promotion still leaves every Google/Microsoft service
   off in the run's ``enabled_tools`` (memory on); other orgs are unaffected.
 - The server lifespan no longer loads promoted permissions or a tools gate
-  into the agent; ``main._build_system_prompt(config)`` has no static tool line.
+  into the agent. GH-170: the startup prompt (``main._build_system_prompt``) is
+  gone; the per-request base prompt (``prompt_assembly.base_prompt``) names only
+  the tools it is given (no static tool line) and keeps the dynamic-permission
+  and no-substitution guidance in every response language.
 
 All database calls are faked. No network, no real PostgreSQL, no LLM.
 
@@ -75,20 +78,19 @@ Security notes:
 
 from __future__ import annotations
 
-import inspect
 import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from admino import server
-from admino.config import AppConfig, LLMConfig
+from admino.config import AppConfig
 from admino.login_throttle import ip_subject
 from admino.models import AgentResult, LLMMessage
 from admino.server import create_app
@@ -1711,11 +1713,13 @@ class TestNoGlobalPolicy:
         assert permission_reads == []
         assert not hasattr(server, "_promoted_permissions")
 
-    def test_critical_permissions_system_prompt_has_no_static_tool_line(self) -> None:
-        """The agent adds the tool line per run (from that run's policy), not main."""
+    def test_critical_permissions_base_prompt_has_no_static_tool_line(self) -> None:
+        """GH-170 (was ``main._build_system_prompt``, GH-161): the base prompt names only
+        the tools it is given (the run's own, from the org's policy), never what the
+        registry holds; without any, its last line says so."""
         from pydantic import BaseModel, Field
 
-        from admino.main import _build_system_prompt
+        from admino import prompt_assembly
         from admino.tools.registry import clear_registry, register_tool
 
         class _Args(BaseModel):
@@ -1727,61 +1731,68 @@ class TestNoGlobalPolicy:
         clear_registry()
         try:
             register_tool("gmail", "read", "Read mail", _Args)(_handler)
-            config = AppConfig(
-                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
-            )
-            prompt = _build_system_prompt(config)
-            parameters = list(inspect.signature(_build_system_prompt).parameters)
+            prompt = prompt_assembly.base_prompt(tools=[], response_language=None)
         finally:
             clear_registry()
 
-        assert "You have access to the following tools" not in prompt
-        assert parameters == ["config"]
+        assert ("You have access to the following tools" in prompt, prompt.splitlines()[-1]) == (
+            False,
+            "You have no tools available.",
+        )
+
+
+# GH-170: every response language base_prompt takes (None: none resolved).
+_RESPONSE_LANGUAGES: Final[tuple[str | None, ...]] = (None, "de", "fr", "it", "en")
+
+
+def _description(tool: str, action: str) -> Any:
+    """A registry ToolDescription with an empty argument schema."""
+    from admino.tools.registry import ToolDescription
+
+    return ToolDescription(
+        tool=tool,
+        action=action,
+        description=f"{tool}.{action} (GH-170 spec).",
+        parameters_schema={"type": "object", "properties": {}},
+    )
 
 
 class TestSystemPromptDynamicPermissionGuidance:
-    """The system prompt tells the LLM that permissions can change mid-conversation
-    (kept from GH-66 / GH-77: the per-org promotions of GH-161 rely on it)."""
+    """The base prompt tells the LLM that permissions can change mid-conversation and
+    never to substitute an unavailable action (kept from GH-66 / GH-77: the per-org
+    promotions of GH-161 rely on it). GH-170: it lives in
+    ``prompt_assembly.base_prompt``, rebuilt per request, in every response language."""
 
-    def test_system_prompt_includes_dynamic_permission_guidance(self) -> None:
-        from admino.main import _build_system_prompt
-        from admino.tools.registry import ToolDescription
+    @pytest.mark.parametrize("response_language", _RESPONSE_LANGUAGES)
+    def test_system_prompt_includes_dynamic_permission_guidance(
+        self, response_language: str | None
+    ) -> None:
+        from admino import prompt_assembly
 
-        fake_tool = ToolDescription(
-            tool="gmail",
-            action="send",
-            description="Send an email.",
-            parameters_schema={"type": "object", "properties": {}},
+        prompt = prompt_assembly.base_prompt(
+            tools=[_description("gmail", "send")], response_language=response_language
         )
-
-        with patch("admino.tools.registry.get_registered_tools", return_value=[fake_tool]):
-            config = AppConfig(
-                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
-            )
-            prompt = _build_system_prompt(config)
-
-        assert "permissions can change during a conversation" in prompt.lower()
-        assert "never refuse based on earlier" in prompt.lower()
-
-    def test_system_prompt_includes_no_substitution_guardrail(self) -> None:
-        """GH-77: never substitute a different action when the requested one isn't available."""
-        from admino.main import _build_system_prompt
-        from admino.tools.registry import ToolDescription
-
-        fake_tool = ToolDescription(
-            tool="google_calendar",
-            action="read",
-            description="Read events.",
-            parameters_schema={"type": "object", "properties": {}},
-        )
-
-        with patch("admino.tools.registry.get_registered_tools", return_value=[fake_tool]):
-            config = AppConfig(
-                llm=LLMConfig(provider="anthropic", anthropic_model="claude-sonnet-4-6")
-            )
-            prompt = _build_system_prompt(config)
 
         lowered = prompt.lower()
-        assert "never substitute" in lowered
-        assert "not available" in lowered or "isn't available" in lowered
-        assert "permissions can change during a conversation" in lowered
+        assert (
+            "permissions can change during a conversation" in lowered,
+            "never refuse based on earlier" in lowered,
+        ) == (True, True)
+
+    @pytest.mark.parametrize("response_language", _RESPONSE_LANGUAGES)
+    def test_system_prompt_includes_no_substitution_guardrail(
+        self, response_language: str | None
+    ) -> None:
+        """GH-77: never substitute a different action when the requested one isn't available."""
+        from admino import prompt_assembly
+
+        prompt = prompt_assembly.base_prompt(
+            tools=[_description("google_calendar", "read")], response_language=response_language
+        )
+
+        lowered = prompt.lower()
+        assert (
+            "never substitute" in lowered,
+            "not available" in lowered,
+            "permissions can change during a conversation" in lowered,
+        ) == (True, True, True)
