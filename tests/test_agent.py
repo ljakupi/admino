@@ -63,6 +63,10 @@ Covers:
   real recorder raises for such a principal, so the run still ends with
   "Internal error: audit unavailable."). Test handlers take ``**_`` so they
   accept the new ``tenant`` keyword.
+- GH-243: the recorder protocol gains an eighth required keyword-only
+  ``escalated: bool`` and every recorder call carries a real ``bool`` for it
+  (the dispatch result's flag); the escalation behaviour itself is specified in
+  tests/test_agent_untrusted.py.
 - Security invariants: no forbidden imports (server, database, audit_events,
   the removed NDJSON audit module, asyncpg), no raw content in logs.
 
@@ -160,10 +164,19 @@ class FakeLLM:
         return self._responses.pop(0)
 
 
-# The seven keyword arguments of a ToolCallRecorder call (GH-147 + the GH-149
-# principal), and nothing else.
+# The eight keyword arguments of a ToolCallRecorder call (GH-147 + the GH-149
+# principal + the GH-243 escalated flag), and nothing else.
 _RECORDER_KWARGS: frozenset[str] = frozenset(
-    {"principal", "session_id", "tool", "action", "decision", "success", "duration_ms"}
+    {
+        "principal",
+        "session_id",
+        "tool",
+        "action",
+        "decision",
+        "success",
+        "duration_ms",
+        "escalated",
+    }
 )
 
 # The logged-in member every run in this suite acts for (GH-149).
@@ -2286,8 +2299,9 @@ class TestToolCallRecorderContract:
         assert recorder_type is not None, "admino.agent must export ToolCallRecorder"
         assert getattr(recorder_type, "_is_protocol", False) is True
 
-    def test_agent_tool_call_recorder_takes_seven_keyword_only_arguments(self) -> None:
-        """The protocol's __call__ takes exactly the seven keywords (incl. principal)."""
+    def test_agent_tool_call_recorder_takes_eight_keyword_only_arguments(self) -> None:
+        """The protocol's __call__ takes exactly the eight keywords (incl. principal and
+        the GH-243 escalated flag)."""
         recorder_type = getattr(agent_module, "ToolCallRecorder", None)
         assert recorder_type is not None
 
@@ -2375,10 +2389,10 @@ class TestToolCallRecorderPerDispatch:
         assert duration >= 0
 
     @pytest.mark.parametrize("case", _DISPATCH_CASES)
-    async def test_agent_dispatch_outcome_records_only_the_seven_keywords(
+    async def test_agent_dispatch_outcome_records_only_the_eight_keywords(
         self, recorder: RecordingRecorder, agent_config: AgentConfig, case: _DispatchCase
     ) -> None:
-        """No args, no output, no error text: the seven keywords and nothing else."""
+        """No args, no output, no error text: the eight keywords and nothing else."""
         await _run_case(case, recorder, agent_config)
 
         assert set(recorder.calls[0]) == _RECORDER_KWARGS
@@ -2592,7 +2606,7 @@ class TestToolCallRecorderCarriesNoContent:
     async def test_agent_recorder_values_are_plain_types(
         self, recorder: RecordingRecorder, agent_config: AgentConfig
     ) -> None:
-        """str ids and names, a decision token, a real bool and an int."""
+        """str ids and names, a decision token, real bools and an int."""
         await self._run_markers(recorder, agent_config, echo_handler, {"text": "x"})
 
         call = recorder.calls[0]
@@ -2602,6 +2616,7 @@ class TestToolCallRecorderCarriesNoContent:
         assert call["decision"] in {"allow", "confirm", "deny"}
         assert type(call["success"]) is bool
         assert type(call["duration_ms"]) is int
+        assert type(call.get("escalated")) is bool
 
 
 _RECORDER_ERRORS: list[Any] = [

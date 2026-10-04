@@ -5,7 +5,9 @@ during ``POST /api/message``. So its cross-org case runs end to end: the app
 from ``create_app()`` drives a REAL ``Agent`` (with the real tool-call
 recorder of ``main._build_tool_call_recorder()``), the registry holds the
 REAL ``memory.store`` / ``memory.recall`` / ``memory.list`` handlers (wrapped
-by a spy that records which tenant each invocation ran for), and the LLM is a
+by a spy that records which tenant each invocation ran for; registered with
+their real ``side_effect`` classification, GH-243: only ``store`` changes
+something), and the LLM is a
 scripted fake (``_FakeLLM``: each user message picks a script of tool calls;
 it records every message text it is fed and the tool results of the turn).
 The database is the FakeDb world of tests/tenancy_world.py: orgs A and B with
@@ -18,7 +20,8 @@ Inputs: the world, the fake LLM's scripts. Outputs (asserted):
 - Org B's users (Editor and Org Admin) never recall, list or overwrite org A's
   note: ``recall`` answers "not found", ``list`` "No memories stored.", a
   ``store`` of the same key keeps A's note and lands in B's own row (with B's
-  org id); A's recall still returns A's value.
+  org id); A's recall still returns A's value. A found note and a non-empty
+  key list reach the LLM as one wrapped untrusted block (GH-243, ``_as_fed``).
 - LLM-supplied ``org_id`` / ``user_id`` tool arguments naming org A (#17's
   tenancy line, "tool arguments") are refused with the existing
   "unexpected fields" result: the handler isn't invoked and no memory
@@ -101,6 +104,14 @@ _EXTRA_REFUSED: Final = "Argument validation failed: unexpected fields are not p
 
 # A memory statement: SELECT ... FROM memory, INSERT INTO memory, UPDATE memory.
 _MEMORY_SQL: Final = r"(?:\bfrom memory\b|\binto memory\b|^update memory\b)"
+
+# GH-243: a found note / non-empty key list is ONE wrapped untrusted block,
+# <untrusted_content_B kind="memory" label="...">\n<text>\n</untrusted_content_B>.
+_WRAPPED: Final = re.compile(
+    r'<untrusted_content_(?P<b>[0-9a-f]{16}) kind="(?P<kind>[^"]*)" label="(?P<label>[^"<>]*)">\n'
+    r"(?P<text>.*)\n</untrusted_content_(?P=b)>",
+    re.DOTALL,
+)
 
 _B_READERS: Final = [
     pytest.param("editor", id="org-b-editor"),
@@ -247,9 +258,9 @@ def handlers(monkeypatch: pytest.MonkeyPatch) -> _Handlers:
     ]
     for action, schema, handler in real:
         function = f"memory.{action}"
-        registry.register_tool("memory", action, f"{function} (GH-163 suite)", schema)(
-            spy.wrap(function, handler)
-        )
+        registry.register_tool(
+            "memory", action, f"{function} (GH-163 suite)", schema, side_effect=action == "store"
+        )(spy.wrap(function, handler))
     return spy
 
 
@@ -301,6 +312,26 @@ def _recall() -> Step:
 
 def _list() -> Step:
     return ("memory", "list", {})
+
+
+def _as_fed(results: list[str]) -> list[str | tuple[str, str, str]]:
+    """The tool results as the LLM got them: a wrapped one as (kind, label, text), a plain
+    one as is."""
+    fed: list[str | tuple[str, str, str]] = []
+    for result in results:
+        match = _WRAPPED.fullmatch(result)
+        fed.append((match["kind"], match["label"], match["text"]) if match else result)
+    return fed
+
+
+def _note(value: str) -> tuple[str, str, str]:
+    """The note under ``_KEY`` as memory.recall wraps it (GH-243)."""
+    return ("memory", f"memory note {_KEY}", value)
+
+
+def _keys(text: str) -> tuple[str, str, str]:
+    """A non-empty key list as memory.list wraps it (GH-243)."""
+    return ("memory", "memory keys", text)
 
 
 def _seed_a_note(client: TestClient, world: World, llm: _FakeLLM) -> Account:
@@ -395,7 +426,7 @@ class TestCrossOrgNotes:
         assert llm.results_of(probe) == [_NOT_FOUND]
         assert _A_SECRET not in llm.seen_in(probe)
         assert _A_SECRET not in probed.text
-        assert llm.results_of(check) == [_A_SECRET]
+        assert _as_fed(llm.results_of(check)) == [_note(_A_SECRET)]
         assert handlers.calls[mark.handler_calls :][0] == _HandlerCall(
             "memory.recall", reader.user_id, world.org_b
         )
@@ -451,10 +482,10 @@ class TestCrossOrgNotes:
         assert world.db.memories_of(writer.user_id) == {_KEY: _B_VALUE}
         assert plain(world.db.memory[(writer.user_id, _KEY)]["org_id"]) == world.org_b
         assert plain(world.db.memory[(owner.user_id, _KEY)]["org_id"]) == world.org_a
-        assert llm.results_of(recalled_b) == [_B_VALUE]
+        assert _as_fed(llm.results_of(recalled_b)) == [_note(_B_VALUE)]
         assert _A_SECRET not in llm.seen_in(recalled_b)
         assert _A_SECRET not in first.text + second.text
-        assert llm.results_of(recalled_a) == [_A_SECRET]
+        assert _as_fed(llm.results_of(recalled_a)) == [_note(_A_SECRET)]
         assert [call.function for call in handlers.calls[mark.handler_calls :]] == [
             "memory.store",
             "memory.recall",
@@ -594,7 +625,12 @@ class TestStatementsBindTheCaller:
         response = _chat(client, caller, message)
 
         _ok(response)
-        assert llm.results_of(message) == [_STORED, _B_VALUE, _KEY, _EXTRA_REFUSED]
+        assert _as_fed(llm.results_of(message)) == [
+            _STORED,
+            _note(_B_VALUE),
+            _keys(_KEY),
+            _EXTRA_REFUSED,
+        ]
         statements = _memory_statements(world, mark.statements)
         assert len(statements) == 3, [call.sql for call in statements]
         assert len(world.db.audit_rows("tool.call")[mark.audit_rows :]) == 4

@@ -6,7 +6,9 @@ in-memory database of tests/db_fakes.py (what ``admino.database.get_pool``
 returns). The real ``require_session``, ``org_permissions.load_tool_policy``,
 ``scoped_settings``, registry dispatch and tool handlers run; the registry
 holds the real memory handlers and the real connector handlers of the six
-Google/Microsoft tools. Only the LLM is a fake (``_FakeLLM``: each chat's user
+Google/Microsoft tools, each with its real ``side_effect`` classification
+(GH-243: only ``memory.store`` and ``gmail.send`` change something). Only the
+LLM is a fake (``_FakeLLM``: each chat's user
 message picks a script of tool calls; it records the ``tools`` payload and the
 tool results it is fed), and every connector module's HTTP client points at a
 mocked provider API (``_Api``), so no network call is ever made. Users are
@@ -17,7 +19,9 @@ What these tests pin down (GH-162, contract sections 5, 7, 8, 9 and 10):
   calling user's notes. Another user of the same org, or of another org,
   never reads, lists or overwrites them; a store of the same key keeps both
   users' notes. Every memory statement binds the caller's user id AND org id
-  (from the server-side context), never another user's.
+  (from the server-side context), never another user's. A found note and a
+  non-empty key list reach the LLM as one wrapped untrusted block (GH-243,
+  ``_as_fed``).
 - An LLM-supplied ``user_id`` / ``org_id`` / ``tenant`` / ``session_id``
   argument is refused with the existing "unexpected fields" result: the
   handler isn't called, and the next plain call still runs for the caller.
@@ -173,6 +177,18 @@ _REGISTERED: Final[list[tuple[str, str, type[Any], Callable[..., Any]]]] = [
     ("outlook_calendar", "list", OutlookCalendarListArgs, outlook_calendar.outlook_calendar_list),
     ("onedrive", "search", OneDriveSearchArgs, onedrive.onedrive_search),
 ]
+
+# The registered actions that change something (GH-243 contract section 2); every other
+# one is registered with side_effect=False, as in production.
+_SIDE_EFFECTS: Final = frozenset({("memory", "store"), ("gmail", "send")})
+
+# GH-243: a found note / non-empty key list is ONE wrapped untrusted block,
+# <untrusted_content_B kind="memory" label="...">\n<text>\n</untrusted_content_B>.
+_WRAPPED: Final = re.compile(
+    r'<untrusted_content_(?P<b>[0-9a-f]{16}) kind="(?P<kind>[^"]*)" label="(?P<label>[^"<>]*)">\n'
+    r"(?P<text>.*)\n</untrusted_content_(?P=b)>",
+    re.DOTALL,
+)
 
 # One valid call per residency-blocked tool (tool, action, args).
 _CONNECTOR_CALLS: Final = [
@@ -422,7 +438,13 @@ def _own_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(registry, "_REGISTRY", {})
     monkeypatch.setattr(registry, "_FROZEN", False)
     for tool, action, schema, handler in _REGISTERED:
-        registry.register_tool(tool, action, f"{tool}.{action} (GH-162 spec)", schema)(handler)
+        registry.register_tool(
+            tool,
+            action,
+            f"{tool}.{action} (GH-162 spec)",
+            schema,
+            side_effect=(tool, action) in _SIDE_EFFECTS,
+        )(handler)
 
 
 @pytest.fixture(autouse=True)
@@ -533,6 +555,26 @@ def _search(query: str = "from:auditor@example.ch") -> Step:
     return ("gmail", "search", {"query": query})
 
 
+def _as_fed(results: list[str]) -> list[str | tuple[str, str, str]]:
+    """The tool results as the LLM got them: a wrapped one as (kind, label, text), a plain
+    one as is."""
+    fed: list[str | tuple[str, str, str]] = []
+    for result in results:
+        match = _WRAPPED.fullmatch(result)
+        fed.append((match["kind"], match["label"], match["text"]) if match else result)
+    return fed
+
+
+def _note(value: str, key: str = _KEY) -> tuple[str, str, str]:
+    """A note as memory.recall wraps it (GH-243)."""
+    return ("memory", f"memory note {key}", value)
+
+
+def _keys(text: str) -> tuple[str, str, str]:
+    """A non-empty key list as memory.list wraps it (GH-243)."""
+    return ("memory", "memory keys", text)
+
+
 def _tenants_of(getter: AsyncMock) -> list[Any]:
     """The tenant each await of a token getter received (None: no tenant given)."""
     tenants: list[Any] = []
@@ -591,7 +633,7 @@ class TestMemoryIsolation:
         assert db.memories_of(b.id) == {}
         assert llm.results_of(recalled_b) == [_NOT_FOUND]
         assert _A_SECRET not in second.text
-        assert llm.results_of(recalled_a) == [_A_SECRET]
+        assert _as_fed(llm.results_of(recalled_a)) == [_note(_A_SECRET)]
 
     @pytest.mark.parametrize("reader_org", [ORG_ID, OTHER_ORG_ID], ids=["same-org", "other-org"])
     def test_per_user_connections_recall_never_returns_another_users_note(
@@ -631,8 +673,8 @@ class TestMemoryIsolation:
         assert db.memories_of(a.id) == {_KEY: _A_SECRET}
         assert db.memories_of(b.id) == {_KEY: _B_VALUE}
         assert plain(db.memory[(b.id, _KEY)]["org_id"]) == writer_org
-        assert llm.results_of(recalled_b) == [_B_VALUE]
-        assert llm.results_of(recalled_a) == [_A_SECRET]
+        assert _as_fed(llm.results_of(recalled_b)) == [_note(_B_VALUE)]
+        assert _as_fed(llm.results_of(recalled_a)) == [_note(_A_SECRET)]
         assert _A_SECRET not in second.text
 
     def test_per_user_connections_list_shows_only_the_callers_keys(
@@ -657,9 +699,9 @@ class TestMemoryIsolation:
         ]
 
         _ok(*responses)
-        assert llm.results_of(messages["a"]) == ["alpha-note\nplan"]
-        assert llm.results_of(messages["b"]) == ["beta-note"]
-        assert llm.results_of(messages["c"]) == ["gamma-note"]
+        assert _as_fed(llm.results_of(messages["a"])) == [_keys("alpha-note\nplan")]
+        assert _as_fed(llm.results_of(messages["b"])) == [_keys("beta-note")]
+        assert _as_fed(llm.results_of(messages["c"])) == [_keys("gamma-note")]
         assert llm.results_of(messages["newcomer"]) == [_NO_MEMORIES]
 
     def test_per_user_connections_memory_statements_bind_the_callers_user_and_org(
@@ -681,7 +723,7 @@ class TestMemoryIsolation:
         response = _chat(_client(app), b, message)
 
         _ok(response)
-        assert llm.results_of(message) == [_STORED, _B_VALUE, _KEY]
+        assert _as_fed(llm.results_of(message)) == [_STORED, _note(_B_VALUE), _keys(_KEY)]
         statements = [call for call in db.calls[since:] if _matches(call, _MEMORY_SQL)]
         assert statements, "no memory statement ran"
         for call in statements:
@@ -861,10 +903,10 @@ class TestResidency:
         response = _chat(_client(app), user, message)
 
         _ok(response)
-        assert llm.results_of(message) == [
+        assert _as_fed(llm.results_of(message)) == [
             "Tool 'gmail' is disabled.",
             "Tool 'outlook' is disabled.",
-            "my own plan",
+            _note("my own plan"),
         ]
         refresh.assert_not_awaited()
         assert [call.sql for call in db.calls[since:] if _matches(call, _OAUTH_TOKENS_SQL)] == []
@@ -993,7 +1035,7 @@ class TestRolesAndDemotion:
         restored = _chat(client, user, message, chat_id="restored")
 
         _ok(restored)
-        assert llm.results_of(message)[0] == "my own plan"
+        assert _as_fed(llm.results_of(message))[0] == _note("my own plan")
         _assert_only_tenant(getters["gmail"], user.tenant(restored_role))
         assert [row["decision"] for row in _tool_audit(db)] == ["allow", "allow"]
 
@@ -1171,7 +1213,7 @@ class TestNoContentInLogs:
 
         _ok(*responses)
         assert llm.results_of(stored) == [f"Stored memory: {_NOTE_KEY}"]
-        assert llm.results_of(searched)[0] == _NOTE_VALUE
+        assert _as_fed(llm.results_of(searched))[0] == _note(_NOTE_VALUE, key=_NOTE_KEY)
         assert llm.results_of(probed)[0] == f"No memory found for key: {_NOTE_KEY}"
         text = _app_log_text(caplog)
         for marker in (_NOTE_KEY, _NOTE_VALUE, _TOKEN_A, _TOKEN_B, "Zephyr-Kestrel"):

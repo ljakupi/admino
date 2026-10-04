@@ -2093,7 +2093,7 @@ def _member_principal() -> Any:
 
 
 def _recorder_kwargs(**overrides: Any) -> dict[str, Any]:
-    """The seven keywords the agent passes to the recorder."""
+    """The eight keywords the agent passes to the recorder (GH-243 added escalated)."""
     kwargs: dict[str, Any] = {
         "principal": _member_principal(),
         "session_id": "s-abc",
@@ -2102,6 +2102,7 @@ def _recorder_kwargs(**overrides: Any) -> dict[str, Any]:
         "decision": "allow",
         "success": True,
         "duration_ms": 12,
+        "escalated": False,
     }
     kwargs.update(overrides)
     return kwargs
@@ -2134,6 +2135,7 @@ class TestBuildToolCallRecorder:
             decision="allow",
             success=True,
             duration_ms=12,
+            escalated=False,
         )
 
     @pytest.mark.asyncio

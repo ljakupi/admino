@@ -2578,6 +2578,7 @@ def _tool_call_kwargs(**overrides: Any) -> dict[str, Any]:
         "decision": "allow",
         "success": True,
         "duration_ms": 42,
+        "escalated": False,
     }
     kwargs.update(overrides)
     return kwargs
@@ -2609,7 +2610,7 @@ class TestRecordToolCall:
         assert row["ip"] is None
 
     @pytest.mark.asyncio
-    async def test_metadata_is_exactly_the_five_fields(self, conn: MagicMock) -> None:
+    async def test_metadata_is_exactly_the_six_fields(self, conn: MagicMock) -> None:
         await _record_tool_call()(conn, **_tool_call_kwargs())
 
         metadata = json.loads(_inserted_row(conn)["metadata"])
@@ -2619,6 +2620,7 @@ class TestRecordToolCall:
             "decision": "allow",
             "success": True,
             "duration_ms": 42,
+            "escalated": False,
         }
 
     @pytest.mark.asyncio
