@@ -237,7 +237,7 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 | Scope | Who changes it | Route | What it holds |
 | --- | --- | --- | --- |
 | **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows these next to **My account**. |
-| **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins switch them under **Organization → Services**. The response also carries the organization's data residency policy (`data_residency`, read-only here). |
+| **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | The organization's profile (name, default response language), instructions, session policy, trash retention, and which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins edit them under **Organization → Settings** (see [Organization settings](#organization-settings)). The response also carries the organization's data residency policy (`data_residency`) and plan (`plan.seats`, `plan.storage_quota`), both read-only here. |
 | **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider, a model per provider, the active model's capabilities and the LLM retry limit, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. The Super Admin edits them under **Platform → Defaults**. The response also carries the number of organizations with data residency on (`llm.residency_orgs`, read-only). |
 
 - The UI and response languages, the timezone and the personal instructions belong to your
@@ -248,19 +248,84 @@ Settings have three scopes. Each has an owner and its own route; any other role 
   languages, timezone, personal instructions), and the organization and platform settings,
   stay as they are.
 - Organization and platform changes are recorded in the audit log: which fields changed,
-  a tool's old and new on/off state, and a platform number's old and new value. An `llm`
+  a tool's old and new on/off state, and a number's old and new value. An `llm`
   change records only which fields changed: the provider, model names, capabilities and
-  retry limit are never recorded.
+  retry limit are never recorded. Neither are an organization's name, default response
+  language and instructions, only that they changed.
 - A tool service an organization switches off is off for that organization only. Each
   chat run reads its own organization's services, so other organizations aren't affected.
 - When the organization's data residency policy is on, the Google and Microsoft services
-  are off whatever their switch says, and **Organization → Services** shows them locked.
+  are off whatever their switch says, and **Organization → Settings** shows them locked.
   Their stored switches are kept for when residency is off.
 - The tool permission matrix and critical promotions are per organization too. See
   [Permissions → Per organization](permissions.md#per-organization).
 - Upgrading from a version with the single `settings` table drops it: everyone starts from
   the defaults (light theme, tool-approval pings on, task-done pings off, every tool
   service on), and the platform settings start from `config.yaml`.
+
+### Organization settings
+
+`PATCH /api/org/settings` takes any of these fields; each is optional, but a request
+needs at least one. The response holds every section after the change, like
+`GET /api/org/settings`. Org Admins edit the same settings on the **Settings** tab of the
+**Organization** page, in the sections **Profile**, **Instructions**, **Security**,
+**Data and plan**, **Tools and permissions** and **Web access**. Each field shows its
+range; **Save changes** sends only what you changed, and **Discard changes** drops your
+edits.
+
+```json
+{"profile": {"display_name": "Treuhand Muster AG", "default_response_language": "de"},
+ "instructions": "Answer in a formal tone. Our fiscal year ends in June.",
+ "security": {"session_idle_timeout_minutes": 30, "session_max_lifetime_hours": 8},
+ "retention": {"trash_retention_days": 14},
+ "tools": {"gmail": false}}
+```
+
+| Field | Default | Range | What it sets |
+| --- | --- | --- | --- |
+| `profile.display_name` | the name the organization was created with | 1–120 characters | the organization's name |
+| `profile.default_response_language` | `en` | `de`, `fr`, `it`, `en` | the default for members who haven't chosen a response language (later release) |
+| `instructions` | `""` | up to 8,000 characters | the organization's instructions for the assistant |
+| `security.session_idle_timeout_minutes` | 60 | 15–480 | the members' sessions |
+| `security.session_max_lifetime_hours` | 12 | 1–72 | the members' sessions |
+| `retention.trash_retention_days` | 30 | 0–90, within the platform's trash bounds | the organization's trash (later release) |
+| `tools.<service>` | on | on / off | which tool services the agent may use |
+
+- **Instructions** (`""` clears them) are kept exactly as typed. Control and formatting
+  characters are refused, except tabs, line breaks, zero-width joiners and zero-width
+  non-joiners. They're meant for guidance that
+  fits every member, so don't put secrets or personal data in them. admino stores them
+  and the default response language now; a later release applies both to every chat of
+  the organization.
+- **The session policy applies to open sessions too.** New sessions of the organization's
+  members take it at login. A change applies at once to every open session of the
+  organization's users: it takes the new idle timeout, and its end moves to its start plus
+  the new lifetime. A session older than a shortened lifetime, or idle longer than a
+  shortened timeout, ends at once, your own included. A session that had already ended
+  stays ended when you lengthen the policy. Super Admin sessions follow the
+  [platform's policy](#platform-defaults), never an organization's.
+- **Trash retention** must lie within the Super Admin's trash bounds
+  (`retention.trash_min_days` to `retention.trash_max_days` in the
+  [platform defaults](#platform-defaults)). A changed value outside them answers `400`
+  (`"reason": "trash_retention_bounds"`), and nothing is changed. When the Super Admin
+  narrows the bounds later, your stored value stays, and the response shows it clamped
+  into the new bounds, with the bounds next to it (`trash_min_days`, `trash_max_days`).
+- **Read-only here**: the data residency policy (`data_residency`, set by the Super
+  Admin, see [Organizations](#organizations-super-admin)), the plan (`plan.seats` and
+  `plan.storage_quota` in bytes; there's no budget in this release) and the trash bounds.
+  **Data and plan** shows them. A request naming one of them, an unknown field or a value
+  out of range answers `422`, without echoing any value you sent.
+- **Tools and permissions** holds the service switches, a **Custom mailboxes** row that
+  isn't available yet, and a link to the **Permissions** tab (tool permissions and
+  critical permissions). **Web access** is a placeholder for a later release.
+- **Audit.** Every change is recorded in the organization's audit log, as one
+  `org.settings_change` event per changed section (profile, instructions, security,
+  retention, tools). The profile and instructions events name the changed fields only,
+  never the name, the language or the text. The security and retention events carry the
+  old and new numbers, and the security event also the number of open sessions it
+  changed. The tools event carries each changed service's old and new state. A value
+  that's the same as the stored one isn't a change: a request without a real change
+  changes and records nothing. A failed audit write answers `500`, and nothing is changed.
 
 ### Platform defaults
 
@@ -283,7 +348,7 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `files` | `max_files_per_message` | 10 | 1–50 | attachments (later release) |
 | `files` | `max_pages_per_file` | 100 | 1–1000 | attachments (later release) |
 | `files` | `render_dpi` | 150 | 72–300 | page images (later release) |
-| `retention` | `trash_min_days`, `trash_max_days` | 0, 90 | 0–90, min ≤ max | the bounds of each organization's trash retention (later release) |
+| `retention` | `trash_min_days`, `trash_max_days` | 0, 90 | 0–90, min ≤ max | the bounds of each [organization's trash retention](#organization-settings) |
 | `retention` | `audit_months` | 12 | 6–84 | the daily audit purge |
 | `retention` | `org_deletion_grace_days` | 30 | 7–90 | the next organization deletion you schedule |
 | `security` | `rate_limit_per_minute` | 20 | 1–600 | per-user request limit (later release) |
@@ -326,11 +391,13 @@ There's no public sign-up. The first account, a Super Admin, is created on the s
   these settings change, your hash is upgraded at your next login. A password has 12 to 128
   characters, isn't your email address, and isn't one of the 100,000 most common passwords.
   That list is bundled with admino, so nothing is sent anywhere to check a password.
-- **Sessions** end after 60 minutes without activity, and after 12 hours at most, even
-  when you stay active. That's your organization's session policy; a later release lets
-  Org Admins change it (15 to 480 minutes idle, 1 to 72 hours at most). Super Admins get
-  the platform's session policy, a [platform default](#platform-defaults) with the same
-  defaults. Your browser only holds a random token in
+- **Sessions** end after a time without activity (60 minutes by default), and after a
+  maximum lifetime (12 hours by default), even when you stay active. That's your
+  organization's session policy: Org Admins change it under **Organization → Settings**
+  (15 to 480 minutes idle, 1 to 72 hours at most), and a change applies to the
+  organization's open sessions too (see [Organization settings](#organization-settings)).
+  Super Admins get the platform's session policy, a [platform default](#platform-defaults)
+  with the same defaults. Your browser only holds a random token in
   the `admino_session` cookie (`HttpOnly`, `SameSite=Strict`, `Secure`), and the database
   only stores its SHA-256 hash.
 - **Ending a session** deletes it at once, and its cookie stops working on the next
@@ -514,7 +581,7 @@ What you see depends on your role:
 | Viewer | Chat (read-only: projects shared with you, with no message box), Permissions (read-only) and Settings |
 | Super Admin | Platform, and Settings with only My account and About (no chat) |
 
-The Organization page has two tabs. **Users** lists the organization's users and pending
+The Organization page has three tabs. **Users** lists the organization's users and pending
 invitations, with a search box and a status filter (all, active, deactivated, invited). It
 shows the seat usage, such as "7 / 10 seats". **Invite user** asks for an email address and
 a role. Each user's menu changes their role, edits their name and email address,
@@ -523,9 +590,10 @@ deletes them. Each pending invitation can be sent again or revoked. Every action
 resending asks for confirmation first, and a refused action shows why, such as "an
 organization needs at least one active Org Admin". The role choices are Org Admin and
 Editor: the Viewer role isn't offered yet, because there's nothing to share with a Viewer
-in this release. **Permissions & services** holds the organization's services (which tools
-the agent may use), tool permissions and critical permissions. Later releases add the
-organization's settings.
+in this release. **Settings** holds the organization's profile, instructions, session
+policy, trash retention and services (which tools the agent may use), with its data
+residency and plan read-only (see [Organization settings](#organization-settings)).
+**Permissions** holds the tool permissions and critical permissions.
 The Tools page is **My connections**: each user connects their own Google and Microsoft
 accounts there (see [Tools → Authentication](tools.md#authentication)). The Permissions page shows Editors and Viewers
 what the agent may do in their organization. The Platform page is the Super Admin's console (see

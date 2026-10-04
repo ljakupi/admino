@@ -43,6 +43,16 @@ Security notes:
   session) and hide their input from validation errors; the timezone must be
   a name of the runtime's tz database, and its error never repeats it. The
   two passwords are ``SecretStr``.
+- Organization settings (GH-169): ``OrgSettingsResponse`` carries the
+  caller's own org's profile, instructions, session policy, trash retention
+  (with the platform's bounds) and tool services, and, read-only, its
+  residency flag and plan (seats and storage quota; no budget).
+  ``OrgSettingsPatch`` refuses those read-only fields and any unknown key at
+  every level (an org id included), takes strict ints for the session policy
+  and the trash retention, holds the display name to
+  ``OrgCreateRequest.name``'s rule and the instructions (at most 8000 code
+  points, kept verbatim; #170 puts them into the prompt) to the personal
+  instructions' character rule, and hides its input from validation errors.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -1606,23 +1616,12 @@ class UserSettingsPatch(BaseModel):
         return self
 
 
-class OrgSettingsResponse(BaseModel):
-    """GET/PATCH /api/org/settings response: the Org Admin's own org's tool services.
-
-    ``data_residency`` (GH-162) is the org's residency policy, read-only here:
-    when on, the Google and Microsoft services are off for every run whatever
-    their stored switch says.
-    """
-
-    tools: ToolsSettings
-    data_residency: bool
-
-
 class OrgToolsPatch(BaseModel):
     """The tool services to switch on or off; a null (or a missing tool) is not given.
 
-    Strict bools only; an unknown tool (e.g. the removed ``files`` toggle) is
-    refused, never ignored.
+    The ``tools`` section of ``OrgSettingsPatch`` (GH-169). Strict bools only;
+    an unknown tool (e.g. the removed ``files`` toggle) is refused, never
+    ignored.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
@@ -1634,26 +1633,6 @@ class OrgToolsPatch(BaseModel):
     outlook_calendar: bool | None = None
     onedrive: bool | None = None
     memory: bool | None = None
-
-
-class OrgSettingsPatch(BaseModel):
-    """PATCH /api/org/settings request body: at least one tool service to change.
-
-    The org is always the caller's own: an ``org_id`` (or any other key) in
-    the body is refused. Validation errors never repeat the input.
-    """
-
-    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
-
-    tools: OrgToolsPatch
-
-    @model_validator(mode="after")
-    def _check_something_given(self) -> OrgSettingsPatch:
-        """Refuse a patch that names no tool."""
-        if not self.tools.model_dump(exclude_none=True):
-            msg = "Give at least one tool to change."
-            raise ValueError(msg)
-        return self
 
 
 # The bounds of each platform default (GH-160), shared by its response and
@@ -2202,6 +2181,17 @@ StorageQuotaBytes = Annotated[StrictInt, Field(ge=0, le=2**53 - 1)]
 _ORG_NAME_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
 
 
+def _check_org_name(value: str) -> str:
+    """Refuse an org name with a control, format, surrogate or line/paragraph separator.
+
+    The message never includes the name.
+    """
+    if any(unicodedata.category(char) in _ORG_NAME_BANNED_CATEGORIES for char in value):
+        msg = "The name must not contain control or formatting characters."
+        raise ValueError(msg)
+    return value
+
+
 class OrgCreateRequest(BaseModel):
     """POST /api/platform/orgs request body (and the create-org CLI's input).
 
@@ -2234,10 +2224,7 @@ class OrgCreateRequest(BaseModel):
     @classmethod
     def _check_name(cls, value: str) -> str:
         """Refuse control, format, surrogate and line/paragraph separator characters."""
-        if any(unicodedata.category(char) in _ORG_NAME_BANNED_CATEGORIES for char in value):
-            msg = "The name must not contain control or formatting characters."
-            raise ValueError(msg)
-        return value
+        return _check_org_name(value)
 
     @field_validator("primary_admin_email")
     @classmethod
@@ -2510,6 +2497,21 @@ _INSTRUCTIONS_BANNED_CATEGORIES: Final = frozenset({"Cs", "Zl", "Zp"})
 _NOT_NULLABLE_ACCOUNT_FIELDS: Final = ("name", "ui_language", "timezone", "personal_instructions")
 
 
+def _has_refused_instruction_char(value: str) -> bool:
+    """True when instructions hold a character they must not (personal and org alike).
+
+    Refused: every control character but tab, newline and carriage return,
+    every format character but the zero-width non-joiner and joiner,
+    surrogates and line/paragraph separators.
+    """
+    return any(
+        (category := unicodedata.category(char)) in _INSTRUCTIONS_BANNED_CATEGORIES
+        or (category == "Cc" and char not in _INSTRUCTIONS_ALLOWED_CONTROLS)
+        or (category == "Cf" and char not in _INSTRUCTIONS_ALLOWED_FORMATS)
+        for char in value
+    )
+
+
 @functools.cache
 def _available_timezones() -> frozenset[str]:
     """The IANA zone names of the runtime's tz database, read once."""
@@ -2596,12 +2598,7 @@ class MyAccountPatch(BaseModel):
         Tab, newline and carriage return, and the zero-width non-joiner and
         joiner, are kept.
         """
-        if value is not None and any(
-            (category := unicodedata.category(char)) in _INSTRUCTIONS_BANNED_CATEGORIES
-            or (category == "Cc" and char not in _INSTRUCTIONS_ALLOWED_CONTROLS)
-            or (category == "Cf" and char not in _INSTRUCTIONS_ALLOWED_FORMATS)
-            for char in value
-        ):
+        if value is not None and _has_refused_instruction_char(value):
             msg = "The personal instructions must not contain control or formatting characters."
             raise ValueError(msg)
         return value
@@ -2635,6 +2632,158 @@ class PasswordChangeRequest(BaseModel):
 
     current_password: SecretStr = Field(min_length=1, max_length=1024)
     new_password: SecretStr = Field(min_length=1, max_length=1024)
+
+
+# ---------------------------------------------------------------------------
+# Organization settings API models (GH-169): the Org Admin's own org only
+# ---------------------------------------------------------------------------
+
+# The bound of migration 0023's org_settings.instructions.
+_ORG_INSTRUCTIONS_MAX_LENGTH: Final = 8000
+
+
+class OrgProfile(BaseModel):
+    """The org's profile: its name (``organizations.name``) and default response language."""
+
+    display_name: str = Field(max_length=120)
+    default_response_language: ResponseLanguage
+
+
+class OrgSecurity(BaseModel):
+    """The session policy a member's new session takes (the ``admino.sessions`` bounds)."""
+
+    session_idle_timeout_minutes: _IdleTimeoutMinutes
+    session_max_lifetime_hours: _LifetimeHours
+
+
+class OrgRetention(BaseModel):
+    """The org's trash retention and the platform's trash bounds (read-only).
+
+    ``trash_retention_days`` is the effective value: the stored one clamped
+    into ``[trash_min_days, trash_max_days]``.
+    """
+
+    trash_retention_days: _TrashDays
+    trash_min_days: _TrashDays
+    trash_max_days: _TrashDays
+
+
+class OrgPlan(BaseModel):
+    """The org's plan limits, read-only: seats and the storage quota in bytes (no budget)."""
+
+    seats: int
+    storage_quota: int
+
+
+class OrgSettingsResponse(BaseModel):
+    """GET/PATCH /api/org/settings response: the Org Admin's own org's settings.
+
+    The profile, the instructions, the session policy, the trash retention
+    and the tool services are editable; ``data_residency`` (GH-162, when on
+    the Google and Microsoft services are off for every run whatever their
+    stored switch says) and the plan are the Super Admin's, read-only here.
+    """
+
+    profile: OrgProfile
+    instructions: str = Field(max_length=_ORG_INSTRUCTIONS_MAX_LENGTH)
+    security: OrgSecurity
+    retention: OrgRetention
+    tools: ToolsSettings
+    data_residency: bool
+    plan: OrgPlan
+
+
+class OrgProfilePatch(BaseModel):
+    """The profile to change; a null is not given.
+
+    The display name follows ``OrgCreateRequest.name``'s rule exactly:
+    stripped, then 1 to 120 characters without control, format, surrogate or
+    line/paragraph separator characters.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=120)
+    default_response_language: ResponseLanguage | None = None
+
+    @field_validator("display_name", mode="before")
+    @classmethod
+    def _strip(cls, value: object) -> object:
+        """Strip surrounding whitespace before the length checks."""
+        return _strip_if_str(value)
+
+    @field_validator("display_name")
+    @classmethod
+    def _check_display_name(cls, value: str | None) -> str | None:
+        """Refuse control, format, surrogate and line/paragraph separator characters."""
+        return None if value is None else _check_org_name(value)
+
+
+class OrgSecurityPatch(BaseModel):
+    """The session policy to change: strict ints within the bounds, a null not given."""
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    session_idle_timeout_minutes: _IdleTimeoutMinutes | None = None
+    session_max_lifetime_hours: _LifetimeHours | None = None
+
+
+class OrgRetentionPatch(BaseModel):
+    """The trash retention to change: a strict int of 0 to 90 days, a null not given.
+
+    The platform's trash bounds are not checked here: the service checks a
+    changed value against them.
+    """
+
+    model_config = ConfigDict(strict=True, extra="forbid", hide_input_in_errors=True)
+
+    trash_retention_days: _TrashDays | None = None
+
+
+class OrgSettingsPatch(BaseModel):
+    """PATCH /api/org/settings request body: the org settings to change (GH-169).
+
+    Five optional sections: profile, instructions, security, retention and
+    tools. A null anywhere counts as not given, and at least one value must be
+    given (an empty section is none). The instructions are kept verbatim (not
+    stripped; ``""`` clears them): at most 8000 code points under the personal
+    instructions' character rule. The org is always the caller's own, and the
+    residency, the plan and the platform's trash bounds are read-only: any
+    other key, at any level, is refused. Validation errors never repeat the
+    input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    profile: OrgProfilePatch | None = None
+    instructions: str | None = Field(default=None, max_length=_ORG_INSTRUCTIONS_MAX_LENGTH)
+    security: OrgSecurityPatch | None = None
+    retention: OrgRetentionPatch | None = None
+    tools: OrgToolsPatch | None = None
+
+    @field_validator("instructions")
+    @classmethod
+    def _check_instructions(cls, value: str | None) -> str | None:
+        """Refuse control, format, surrogate and line/paragraph separator characters.
+
+        Tab, newline and carriage return, and the zero-width non-joiner and
+        joiner, are kept.
+        """
+        if value is not None and _has_refused_instruction_char(value):
+            msg = "The instructions must not contain control or formatting characters."
+            raise ValueError(msg)
+        return value
+
+    @model_validator(mode="after")
+    def _check_something_given(self) -> OrgSettingsPatch:
+        """Refuse a patch that gives no value in any section."""
+        sections = (self.profile, self.security, self.retention, self.tools)
+        if self.instructions is None and not any(
+            section.model_dump(exclude_none=True) for section in sections if section
+        ):
+            msg = "Give at least one setting to change."
+            raise ValueError(msg)
+        return self
 
 
 # ---------------------------------------------------------------------------

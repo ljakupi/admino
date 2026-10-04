@@ -1,4 +1,4 @@
-"""The settings scopes: platform, organization and user settings (GH-159, GH-160).
+"""The settings scopes: platform, organization and user settings (GH-159, GH-160, GH-169).
 
 Migration 0013 replaced the old key/value ``settings`` table with one table per
 owner, and this module is the service behind their routes and the startup:
@@ -10,15 +10,24 @@ owner, and this module is the service behind their routes and the startup:
   defaults again (``Capability.ACCOUNT_MANAGE``). Not audited: the user scope
   is not in the audit catalog.
 - ``org_settings`` (each organization, its Org Admin): the enabled tool
-  services. ``get_org_settings`` / ``update_org_settings`` read and change the
-  caller's own org's row (``Capability.ORG_SETTINGS_MANAGE``); each real
-  change is an ``org.settings_change`` audit event. ``org_tools_enabled``
-  (GH-161) reads a tenant org's switches for a chat run, without a
-  capability check (an internal read: every member's run needs it); it
-  returns the stored switches, residency not applied. ``org_residency``
-  (GH-162) reads the org's ``data_residency`` policy the same way; both org
-  settings responses carry it, read-only (a Google or Microsoft switch can
-  still be stored while it is on).
+  services and (GH-169, migration 0023) the org instructions, the session
+  policy and the trash retention; the org's profile (``organizations.name``
+  and ``default_response_language``) is edited with them.
+  ``get_org_settings`` / ``update_org_settings`` read and change the caller's
+  own org's rows (``Capability.ORG_SETTINGS_MANAGE`` and
+  ``Capability.ORG_INSTRUCTIONS_MANAGE``: every response carries the
+  instructions); each changed section is an ``org.settings_change`` audit
+  event. The responses also carry, read-only, the org's ``data_residency``
+  (a Google or Microsoft switch can still be stored while it is on), its
+  plan (seats, storage quota) and the platform's trash bounds; a changed
+  trash retention must lie within them (``InvalidOrgSettingsError``), and
+  the retention shown is the stored one clamped into them. A changed session
+  policy re-times the org's live sessions (``sessions.apply_org_policy``).
+  ``org_tools_enabled`` (GH-161) reads a tenant org's switches for a chat
+  run, without a capability check (an internal read: every member's run
+  needs it); it returns the stored switches, residency not applied.
+  ``org_residency`` (GH-162) reads the org's ``data_residency`` policy the
+  same way.
 - ``platform_settings`` (one row, the Super Admin): the LLM provider, one
   model per provider, (GH-242, migration 0022) the active model's
   capabilities (``max_input_tokens``, ``image_input``) and the LLM retry
@@ -42,25 +51,31 @@ owner, and this module is the service behind their routes and the startup:
   is empty), ``load_platform_settings`` (startup, the platform settings page)
   reads the row and replaces it, and a successful update replaces it after
   its commit. Consumers read every platform default through it;
-  ``session_policy_for`` picks a new session's policy (a member: the org
-  default until #169; a Super Admin: the stored platform policy).
+  ``session_policy_for`` picks a new session's policy (a member: their org's
+  stored policy, read from org_settings on every call; a Super Admin: the
+  stored platform policy).
 
-A missing user or org row reads as the defaults (theme light, tool-approval
-pings on, task-done pings off, every tool on) and a read writes nothing; an
-update creates the row from the column defaults first.
+A missing user or org_settings row reads as the column defaults (theme
+light, tool-approval pings on, task-done pings off; every tool on, no
+instructions, 60 minutes idle, 12 hours lifetime, 30 days trash) and a read
+writes nothing; an update creates the row from the column defaults first.
 
 Inputs: the database pool (or a connection, for the platform reads); the
 acting ``Principal`` (from the session), the validated patch models
 (``UserSettingsPatch``, ``OrgSettingsPatch``, ``PlatformSettingsPatch``) and
-the client IP; the ``AppConfig`` (startup); an account kind.
+the client IP; the ``AppConfig`` (startup); an account kind and, for a
+member, their org id.
 Outputs: ``UserSettingsResponse``, ``OrgSettingsResponse``,
 ``StoredPlatformSettings``, an org's switches (tool name -> bool) and its
 residency flag, the
 overlaid ``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
 ``AuditRecordError``, ``InvalidPlatformSettingsError`` (the merged trash
-minimum exceeds the maximum), ``ResidencyConfirmationError`` (the confirmed
-residency-org count changed before the write), ``RuntimeError`` (no platform row: startup
-always seeds it first), ``ValueError`` (no session policy for the kind).
+minimum exceeds the maximum), ``InvalidOrgSettingsError`` (a changed org trash
+retention outside the platform's trash bounds), ``ResidencyConfirmationError``
+(the confirmed residency-org count changed before the write), ``LookupError``
+(the org settings of an org without an organizations row), ``RuntimeError``
+(no platform row: startup always seeds it first), ``ValueError`` (no session
+policy for the kind, or a member without an org id).
 
 Security notes:
 - Authorization through ``access.can`` before any statement: a refused actor
@@ -70,22 +85,33 @@ Security notes:
   and the user always ``actor.user_id``, both bind parameters; never a
   request value.
 - Fail closed: an org without an organizations row reads as residency on.
-  An org or platform change, its row lock (``FOR UPDATE``) and
-  its audit events share one transaction on one connection, so a failed audit
-  write rolls the change back (for the platform, the re-timed Super Admin
-  sessions too). A no-op writes nothing and records nothing; an invalid
-  merged retention is refused before any write. The cache only takes values
-  that were committed: an update replaces it after its commit, and a read
-  that began before an update committed never overwrites the update's value.
-- A Super Admin session-policy change applies to the open Super Admin
-  sessions in the same transaction (``sessions.apply_super_admin_policy``):
-  a session older than the new lifetime, or idle past the new timeout, ends.
-- No content in audit rows: org events carry one ``<tool>_old`` /
-  ``<tool>_new`` bool pair per changed tool; the platform llm event carries
-  the names of the changed fields mapped to True (``max_retries``, never the
-  column name), never a provider, model, input window or retry value; the
-  other platform events carry ``<field>_old`` / ``<field>_new`` ints (and
-  ``sessions_updated``, a count). Nothing is logged here.
+  An org or platform change, its row locks (``FOR UPDATE``; for an org both
+  its org_settings and its organizations row) and its audit events share one
+  transaction on one connection, so a failed audit write rolls the change
+  back (the re-timed sessions too). A no-op changes no value and records
+  nothing (an org no-op may still create the org's missing org_settings row
+  from the column defaults, which read the same as no row); an invalid
+  merged platform retention, or a changed org retention
+  outside the platform's bounds, is refused before any write. The cache only
+  takes values that were committed: an update replaces it after its commit,
+  and a read that began before an update committed never overwrites the
+  update's value.
+- A session-policy change applies to the open sessions it governs in the
+  same transaction: the Super Admin's to every open Super Admin session
+  (``sessions.apply_super_admin_policy``), an org's to the live sessions of
+  that org's users only (``sessions.apply_org_policy``). A session older than
+  the new lifetime, or idle past the new timeout, ends.
+- No content in audit rows: the org profile event names the changed fields
+  only (never the org name or language), the instructions event is
+  ``{"instructions": True}`` (never the text, its length or a hash), the org
+  security and retention events carry ``<field>_old`` / ``<field>_new`` ints
+  (security adds ``sessions_updated``, a count) and the tools event one
+  ``<tool>_old`` / ``<tool>_new`` bool pair per changed tool; the platform llm
+  event carries the names of the changed fields mapped to True
+  (``max_retries``, never the column name), never a provider, model, input
+  window or retry value; the other platform events carry ``<field>_old`` /
+  ``<field>_new`` ints (and ``sessions_updated``, a count). Nothing is logged
+  here.
 - Parameterized SQL only: every statement is a constant, every value a bind
   parameter.
 - Imports only access, tenancy, audit_events, models, config and sessions
@@ -95,7 +121,8 @@ Security notes:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final, Literal
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -117,6 +144,9 @@ from admino.models import (
 from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from uuid import UUID
+
     import asyncpg
     from asyncpg import Record
 
@@ -168,17 +198,28 @@ _ORG_ENSURE_SQL: Final = """
     INSERT INTO org_settings (org_id) VALUES ($1)
     ON CONFLICT (org_id) DO NOTHING
 """
+# GH-169: the org settings page reads the whole row (the tools by tool name).
+_ORG_SETTINGS_SQL: Final = """
+    SELECT gmail_enabled AS gmail, google_calendar_enabled AS google_calendar,
+           google_drive_enabled AS google_drive, outlook_enabled AS outlook,
+           outlook_calendar_enabled AS outlook_calendar, onedrive_enabled AS onedrive,
+           memory_enabled AS memory, instructions, session_idle_timeout_minutes,
+           session_max_lifetime_hours, trash_retention_days
+    FROM org_settings
+    WHERE org_id = $1
+"""
 # Locked until the transaction ends: concurrent changes of one org serialize.
 _ORG_LOCK_SQL: Final = """
     SELECT gmail_enabled AS gmail, google_calendar_enabled AS google_calendar,
            google_drive_enabled AS google_drive, outlook_enabled AS outlook,
            outlook_calendar_enabled AS outlook_calendar, onedrive_enabled AS onedrive,
-           memory_enabled AS memory
+           memory_enabled AS memory, instructions, session_idle_timeout_minutes,
+           session_max_lifetime_hours, trash_retention_days
     FROM org_settings
     WHERE org_id = $1
     FOR UPDATE
 """
-# $2 to $8 follow _TOOLS; a NULL parameter keeps the stored value.
+# $2 to $12 follow _ORG_SETTINGS_FIELDS; a NULL parameter keeps the stored value.
 _ORG_UPDATE_SQL: Final = """
     UPDATE org_settings
     SET gmail_enabled = coalesce($2, gmail_enabled),
@@ -188,12 +229,46 @@ _ORG_UPDATE_SQL: Final = """
         outlook_calendar_enabled = coalesce($6, outlook_calendar_enabled),
         onedrive_enabled = coalesce($7, onedrive_enabled),
         memory_enabled = coalesce($8, memory_enabled),
+        instructions = coalesce($9, instructions),
+        session_idle_timeout_minutes = coalesce($10, session_idle_timeout_minutes),
+        session_max_lifetime_hours = coalesce($11, session_max_lifetime_hours),
+        trash_retention_days = coalesce($12, trash_retention_days),
         updated_at = now()
     WHERE org_id = $1
     RETURNING gmail_enabled AS gmail, google_calendar_enabled AS google_calendar,
               google_drive_enabled AS google_drive, outlook_enabled AS outlook,
               outlook_calendar_enabled AS outlook_calendar, onedrive_enabled AS onedrive,
-              memory_enabled AS memory
+              memory_enabled AS memory, instructions, session_idle_timeout_minutes,
+              session_max_lifetime_hours, trash_retention_days
+"""
+# GH-169: the org's profile and its read-only residency and plan.
+_ORG_PROFILE_SQL: Final = """
+    SELECT name AS display_name, default_response_language, data_residency, seats,
+           storage_quota_bytes
+    FROM organizations
+    WHERE id = $1
+"""
+# Locked with the org_settings row: a concurrent profile change waits.
+_ORG_PROFILE_LOCK_SQL: Final = """
+    SELECT name AS display_name, default_response_language, data_residency, seats,
+           storage_quota_bytes
+    FROM organizations
+    WHERE id = $1
+    FOR UPDATE
+"""
+# A NULL parameter keeps the stored value.
+_ORG_PROFILE_UPDATE_SQL: Final = """
+    UPDATE organizations
+    SET name = coalesce($2, name),
+        default_response_language = coalesce($3, default_response_language),
+        updated_at = now()
+    WHERE id = $1
+"""
+# GH-169: a member's new session takes their org's stored policy.
+_MEMBER_POLICY_SQL: Final = """
+    SELECT session_idle_timeout_minutes, session_max_lifetime_hours
+    FROM org_settings
+    WHERE org_id = $1
 """
 
 # The singleton row (id defaults to true). On a later boot config.yaml's llm
@@ -327,6 +402,10 @@ class InvalidPlatformSettingsError(ValueError):
     """The patch merged into the stored values is invalid (trash minimum above maximum)."""
 
 
+class InvalidOrgSettingsError(ValueError):
+    """A changed org trash retention is outside the platform's trash bounds (GH-169)."""
+
+
 class ResidencyConfirmationError(Exception):
     """The residency-org count the route confirmed changed before the write (GH-242).
 
@@ -357,6 +436,37 @@ _SESSION_FIELDS: Final = frozenset({"session_idle_timeout_minutes", "session_max
 _TRASH_ORDER_ERROR: Final = "The trash retention minimum can't exceed the maximum."
 _NO_SESSION_POLICY: Final = "No session policy for this account kind."
 
+# GH-169: every org settings response carries the org instructions, so reading
+# or changing any org setting needs both capabilities (both the Org Admin's).
+_ORG_SETTINGS_CAPABILITIES: Final = (
+    Capability.ORG_SETTINGS_MANAGE,
+    Capability.ORG_INSTRUCTIONS_MANAGE,
+)
+# The org_settings fields in the parameter order of _ORG_UPDATE_SQL ($2 on).
+_ORG_SETTINGS_FIELDS: Final = (
+    *_TOOLS,
+    "instructions",
+    "session_idle_timeout_minutes",
+    "session_max_lifetime_hours",
+    "trash_retention_days",
+)
+# What a missing org_settings row reads as: the column defaults of migrations
+# 0013 (every tool on) and 0023.
+_ORG_SETTINGS_DEFAULTS: Final = MappingProxyType(
+    {
+        **ToolsSettings().model_dump(),
+        "instructions": "",
+        "session_idle_timeout_minutes": sessions.DEFAULT_IDLE_TIMEOUT_MINUTES,
+        "session_max_lifetime_hours": sessions.DEFAULT_LIFETIME_HOURS,
+        "trash_retention_days": 30,
+    }
+)
+# The org sections whose events name the changed fields only: never a name, a
+# language or the instructions (nor their length).
+_NAMES_ONLY_ORG_SECTIONS: Final = frozenset({"profile", "instructions"})
+_NO_ORG_ROW: Final = "The organization doesn't exist."
+_TRASH_BOUNDS_ERROR: Final = "The trash retention must be within the platform's bounds."
+
 # The one in-process cache of the platform row (a single process, #139 §4.6).
 _platform_cache: StoredPlatformSettings | None = None
 # Bumped when an update replaces the cache: a read that began earlier doesn't
@@ -364,9 +474,9 @@ _platform_cache: StoredPlatformSettings | None = None
 _cache_generation: int = 0
 
 
-def _require(actor: Principal, capability: Capability) -> None:
-    """Raise PermissionError unless the actor has the capability (before any query)."""
-    if not can(actor, capability):
+def _require(actor: Principal, *capabilities: Capability) -> None:
+    """Raise PermissionError unless the actor has every capability (before any query)."""
+    if not all(can(actor, capability) for capability in capabilities):
         msg = "Forbidden"
         raise PermissionError(msg)
 
@@ -517,100 +627,216 @@ async def reset_user_settings(pool: asyncpg.Pool, *, actor: Principal) -> UserSe
     )
 
 
+# Any (here and in the org helpers below): the stored values are asyncpg
+# record values, each of its column's type.
+def _org_response(stored: Mapping[str, Any], bounds: PlatformRetention) -> OrgSettingsResponse:
+    """The OrgSettingsResponse of an org's stored values (org_settings and organizations).
+
+    The trash retention shown is the stored value clamped into the platform's
+    trash bounds, which come along read-only.
+    """
+    retention = min(
+        max(stored["trash_retention_days"], bounds.trash_min_days), bounds.trash_max_days
+    )
+    return OrgSettingsResponse.model_validate(
+        {
+            "profile": {
+                "display_name": stored["display_name"],
+                "default_response_language": stored["default_response_language"],
+            },
+            "instructions": stored["instructions"],
+            "security": {
+                "session_idle_timeout_minutes": stored["session_idle_timeout_minutes"],
+                "session_max_lifetime_hours": stored["session_max_lifetime_hours"],
+            },
+            "retention": {
+                "trash_retention_days": retention,
+                "trash_min_days": bounds.trash_min_days,
+                "trash_max_days": bounds.trash_max_days,
+            },
+            "tools": {tool: stored[tool] for tool in _TOOLS},
+            "data_residency": stored["data_residency"],
+            "plan": {"seats": stored["seats"], "storage_quota": stored["storage_quota_bytes"]},
+        }
+    )
+
+
 async def get_org_settings(pool: asyncpg.Pool, *, actor: Principal) -> OrgSettingsResponse:
-    """Return the tool services of the actor's own org (every tool on without a row).
+    """Return the actor's own org's settings (the column defaults without an org_settings row).
+
+    The effective trash retention is the stored ``trash_retention_days``
+    clamped into the platform's trash bounds (``min(max(stored, min_days),
+    max_days)``): a stored value may lie outside bounds the Super Admin
+    narrowed after it was set. Any later consumer of the stored retention
+    (a trash purge job) must apply the same clamp, never the raw column.
 
     Args:
         pool: The database pool.
         actor: The Org Admin asking.
 
     Returns:
-        The OrgSettingsResponse: the stored switches (a missing row reads as
-        every tool enabled and nothing is written) and the org's residency
-        policy (``org_residency``).
+        The OrgSettingsResponse: the profile (the organizations row), the
+        instructions, the session policy, the trash retention (clamped into
+        the platform's bounds, which come along) and the tool switches (the
+        org_settings row; a missing row reads as the column defaults and
+        nothing is written), and the read-only residency and plan.
 
     Raises:
-        PermissionError: Without ``Capability.ORG_SETTINGS_MANAGE``; no query
-            is issued.
+        PermissionError: Without ``Capability.ORG_SETTINGS_MANAGE`` and
+            ``Capability.ORG_INSTRUCTIONS_MANAGE``; no query is issued.
+        LookupError: If the org has no organizations row.
     """
-    _require(actor, Capability.ORG_SETTINGS_MANAGE)
-    tenant = TenantContext.from_principal(actor)
-    row: Record | None = await pool.fetchrow(_ORG_SQL, tenant.org_id)
-    tools = ToolsSettings() if row is None else ToolsSettings.model_validate(dict(row))
-    return OrgSettingsResponse(tools=tools, data_residency=await org_residency(pool, tenant))
+    _require(actor, *_ORG_SETTINGS_CAPABILITIES)
+    org_id = TenantContext.from_principal(actor).org_id
+    org: Record | None = await pool.fetchrow(_ORG_PROFILE_SQL, org_id)
+    if org is None:
+        raise LookupError(_NO_ORG_ROW)
+    settings: Record | None = await pool.fetchrow(_ORG_SETTINGS_SQL, org_id)
+    stored = {**(_ORG_SETTINGS_DEFAULTS if settings is None else settings), **org}
+    return _org_response(stored, (await current_platform_settings(pool)).retention)
+
+
+def _given(section: BaseModel | None) -> dict[str, Any]:
+    """The values a patch section gives (a null section or field gives none)."""
+    return {} if section is None else section.model_dump(exclude_none=True)
+
+
+def _org_changes(stored: Mapping[str, Any], patch: OrgSettingsPatch) -> dict[str, dict[str, Any]]:
+    """Per section (in event order), the given values that differ from the stored ones.
+
+    The display name is compared as the model stripped it, the instructions
+    verbatim.
+    """
+    given = {
+        "profile": _given(patch.profile),
+        "instructions": {} if patch.instructions is None else {"instructions": patch.instructions},
+        "security": _given(patch.security),
+        "retention": _given(patch.retention),
+        "tools": _given(patch.tools),
+    }
+    changes: dict[str, dict[str, Any]] = {}
+    for section, values in given.items():
+        changed = {field: value for field, value in values.items() if stored[field] != value}
+        if changed:
+            changes[section] = changed
+    return changes
 
 
 async def update_org_settings(
     pool: asyncpg.Pool, *, actor: Principal, patch: OrgSettingsPatch, ip: str | None
 ) -> OrgSettingsResponse:
-    """Switch the given tool services of the actor's own org; audit the real changes.
+    """Change the given settings of the actor's own org; audit each changed section.
 
-    One transaction: the org's row is created from the defaults if missing and
-    locked, only the tools whose value changes are written, and
-    ``org.settings_change`` records one ``<tool>_old`` / ``<tool>_new`` pair
-    per changed tool. A patch that changes nothing writes and records nothing.
+    One transaction on one connection: the org's org_settings row is created
+    from the defaults if missing and locked, the organizations row is locked,
+    and only the values that differ from the stored ones are written (one
+    UPDATE per table, the organizations row only for a profile change). A
+    changed trash retention outside the platform's trash bounds is refused
+    before any write. A changed session policy re-times the org's live
+    sessions (``sessions.apply_org_policy``) with the merged policy. Each
+    changed section records one ``org.settings_change`` event, in the order
+    profile, instructions, security, retention, tools: the profile and
+    instructions events name the changed fields only (``{<field>: True}``),
+    the others carry ``<field>_old`` / ``<field>_new`` values, and the
+    security event adds ``sessions_updated``. A patch that changes nothing
+    changes no value and records nothing; it may create the org's missing
+    org_settings row from the column defaults (which read the same as no
+    row). Only a changed trash retention is checked against the platform's
+    bounds: a stored one may lie outside bounds narrowed later, so the
+    response clamps it (see ``get_org_settings``).
 
     Args:
         pool: The database pool.
         actor: The Org Admin changing them.
-        patch: The validated tools to switch.
+        patch: The validated settings to change.
         ip: The client address, if known.
 
     Returns:
-        The org's OrgSettingsResponse after the change, with the org's
-        residency policy (read-only: a Google or Microsoft switch is stored
-        even while residency is on; the run's policy applies residency).
+        The org's OrgSettingsResponse after the change (as ``get_org_settings``
+        reads it).
 
     Raises:
-        PermissionError: Without ``Capability.ORG_SETTINGS_MANAGE``; no query
-            is issued.
-        AuditRecordError: If the audit event can't be recorded; nothing
-            changes.
+        PermissionError: Without ``Capability.ORG_SETTINGS_MANAGE`` and
+            ``Capability.ORG_INSTRUCTIONS_MANAGE``; no query is issued.
+        InvalidOrgSettingsError: If a changed trash retention is outside the
+            platform's trash bounds; nothing changes.
+        AuditRecordError: If an audit event can't be recorded; nothing
+            changes (the sessions included).
     """
-    _require(actor, Capability.ORG_SETTINGS_MANAGE)
-    tenant = TenantContext.from_principal(actor)
-    org_id = tenant.org_id
+    _require(actor, *_ORG_SETTINGS_CAPABILITIES)
+    org_id = TenantContext.from_principal(actor).org_id
     async with pool.acquire() as conn, conn.transaction():
         await conn.execute(_ORG_ENSURE_SQL, org_id)
-        # The row exists now: the locking SELECT yields exactly one row.
+        # The row exists now (its foreign key needs the organizations row):
+        # each locking SELECT yields exactly one row.
         (locked,) = await conn.fetch(_ORG_LOCK_SQL, org_id)
-        old = ToolsSettings.model_validate(dict(locked))
-        residency = await org_residency(conn, tenant)
-        changed: dict[str, bool] = {
-            tool: enabled
-            for tool, enabled in patch.tools.model_dump(exclude_none=True).items()
-            if getattr(old, tool) != enabled
+        (org,) = await conn.fetch(_ORG_PROFILE_LOCK_SQL, org_id)
+        bounds = (await current_platform_settings(conn)).retention
+        old = {**locked, **org}
+        changes = _org_changes(old, patch)
+        trash = changes.get("retention", {}).get("trash_retention_days")
+        if trash is not None and not bounds.trash_min_days <= trash <= bounds.trash_max_days:
+            raise InvalidOrgSettingsError(_TRASH_BOUNDS_ERROR)
+        if not changes:
+            return _org_response(old, bounds)
+        new = dict(old)
+        settings = {
+            field: value
+            for section, changed in changes.items()
+            if section != "profile"
+            for field, value in changed.items()
         }
-        if not changed:
-            return OrgSettingsResponse(tools=old, data_residency=residency)
-        (row,) = await conn.fetch(_ORG_UPDATE_SQL, org_id, *(changed.get(tool) for tool in _TOOLS))
-        metadata: dict[str, MetadataValue] = {}
-        for tool in _TOOLS:
-            if tool in changed:
-                metadata |= {f"{tool}_old": getattr(old, tool), f"{tool}_new": changed[tool]}
+        if settings:
+            (row,) = await conn.fetch(
+                _ORG_UPDATE_SQL, org_id, *(settings.get(field) for field in _ORG_SETTINGS_FIELDS)
+            )
+            new |= row
+        if profile := changes.get("profile"):
+            await conn.execute(
+                _ORG_PROFILE_UPDATE_SQL,
+                org_id,
+                profile.get("display_name"),
+                profile.get("default_response_language"),
+            )
+            new |= profile
+        sessions_updated: int | None = None
+        if "security" in changes:
+            sessions_updated = await sessions.apply_org_policy(
+                conn,
+                org_id,
+                sessions.SessionPolicy(
+                    idle_timeout_minutes=new["session_idle_timeout_minutes"],
+                    max_lifetime_hours=new["session_max_lifetime_hours"],
+                ),
+            )
         actor_kind, actor_user_id = audit_events.actor_columns(actor)
-        await audit_events.record(
-            conn,
-            action=AuditAction.ORG_SETTINGS_CHANGE,
-            actor_kind=actor_kind,
-            actor_user_id=actor_user_id,
-            org_id=org_id,
-            target_type=TargetType.ORGANIZATION,
-            target_ids=(org_id,),
-            ip=ip,
-            metadata=metadata,
-        )
-    return OrgSettingsResponse(
-        tools=ToolsSettings.model_validate(dict(row)), data_residency=residency
-    )
+        # _org_changes keeps the event order: profile, instructions, security,
+        # retention, tools.
+        for section, changed in changes.items():
+            await audit_events.record(
+                conn,
+                action=AuditAction.ORG_SETTINGS_CHANGE,
+                actor_kind=actor_kind,
+                actor_user_id=actor_user_id,
+                org_id=org_id,
+                target_type=TargetType.ORGANIZATION,
+                target_ids=(org_id,),
+                ip=ip,
+                metadata=_event_metadata(
+                    old,
+                    changed,
+                    names_only=section in _NAMES_ONLY_ORG_SECTIONS,
+                    sessions_updated=sessions_updated if section == "security" else None,
+                ),
+            )
+    return _org_response(new, bounds)
 
 
 async def org_residency(executor: sessions.Executor, tenant: TenantContext) -> bool:
     """Return whether the tenant org's data residency policy is on (GH-162).
 
     No capability check: an internal read (a chat run's tool policy, the
-    OAuth routes, the org settings responses). Only the tenant's org row is
-    read; nothing is written.
+    OAuth routes). Only the tenant's org row is read; nothing is written.
 
     Args:
         executor: The pool, or a connection.
@@ -733,24 +959,39 @@ async def current_platform_settings(executor: sessions.Executor) -> StoredPlatfo
     return await _read_into_cache(executor)
 
 
-async def session_policy_for(executor: sessions.Executor, kind: str) -> sessions.SessionPolicy:
-    """Return the policy a new session of an account kind gets.
+async def session_policy_for(
+    executor: sessions.Executor, kind: str, org_id: UUID | None = None
+) -> sessions.SessionPolicy:
+    """Return the policy a new session of an account gets.
 
     Args:
-        executor: The pool or a connection (read only on a cache miss).
-        kind: The account's kind: "member" (the org default until #169, no
-            query) or "super_admin" (the stored platform policy).
+        executor: The pool or a connection.
+        kind: The account's kind: "member" (their org's stored policy, read
+            with one org_settings query; GH-169) or "super_admin" (the stored
+            platform policy, read only on a cache miss).
+        org_id: The member's org (a bind parameter); ignored for a Super
+            Admin.
 
     Returns:
-        The SessionPolicy, read when called.
+        The SessionPolicy, read when called. A member's org without an
+        org_settings row gets ``SessionPolicy()`` (the column defaults, 60
+        minutes / 12 hours).
 
     Raises:
-        ValueError: For any other kind (there is no default policy); no query
-            is issued.
+        ValueError: For a member without an org id, or any other kind (there
+            is no default policy); no query is issued.
         RuntimeError: If a Super Admin's policy can't be read (no platform row).
     """
     if kind == "member":
-        return sessions.DEFAULT_ORG_SESSION_POLICY
+        if org_id is None:
+            raise ValueError(_NO_SESSION_POLICY)
+        row: Record | None = await executor.fetchrow(_MEMBER_POLICY_SQL, org_id)
+        if row is None:
+            return sessions.SessionPolicy()
+        return sessions.SessionPolicy(
+            idle_timeout_minutes=row["session_idle_timeout_minutes"],
+            max_lifetime_hours=row["session_max_lifetime_hours"],
+        )
     if kind == "super_admin":
         return _super_admin_policy((await current_platform_settings(executor)).security)
     raise ValueError(_NO_SESSION_POLICY)
@@ -812,21 +1053,27 @@ def _check_retention(stored: PlatformRetention, changed: dict[str, str | int]) -
         raise InvalidPlatformSettingsError(_TRASH_ORDER_ERROR) from None
 
 
+# Any: the stored values of a section (a platform model dump or org record values).
 def _event_metadata(
-    section: str, old: BaseModel, changed: dict[str, str | int], sessions_updated: int | None
+    old: Mapping[str, Any],
+    changed: Mapping[str, MetadataValue],
+    *,
+    names_only: bool,
+    sessions_updated: int | None,
 ) -> dict[str, MetadataValue]:
-    """The metadata of one section's ``platform.settings_change`` event.
+    """The content-free metadata of one changed section's settings-change event.
 
-    llm: the changed field names mapped to True (never a provider or model
-    value). An int section: ``<field>_old`` / ``<field>_new`` per changed
-    field; security adds ``sessions_updated`` when the session policy changed.
+    ``names_only`` (the platform llm, the org profile and instructions): the
+    changed field names mapped to True, never a value. Otherwise
+    ``<field>_old`` / ``<field>_new`` per changed field, plus
+    ``sessions_updated`` (a count) when given.
     """
-    if section == "llm":
+    if names_only:
         return dict.fromkeys(changed, True)
     metadata: dict[str, MetadataValue] = {}
     for field, value in changed.items():
-        metadata |= {f"{field}_old": getattr(old, field), f"{field}_new": value}
-    if section == "security" and sessions_updated is not None:
+        metadata |= {f"{field}_old": old[field], f"{field}_new": value}
+    if sessions_updated is not None:
         metadata["sessions_updated"] = sessions_updated
     return metadata
 
@@ -916,7 +1163,10 @@ async def update_platform_settings(
                 org_id=None,
                 ip=ip,
                 metadata=_event_metadata(
-                    section, getattr(stored, section), changed, sessions_updated
+                    getattr(stored, section).model_dump(),
+                    changed,
+                    names_only=section == "llm",
+                    sessions_updated=sessions_updated if section == "security" else None,
                 ),
             )
     _cache_generation += 1

@@ -21,10 +21,10 @@ A login succeeds when the account exists, the password matches, the user is
 active and not deleted, and the user is a Super Admin or a member of an active
 organization. It then re-hashes a password stored with older Argon2
 parameters, stamps ``last_login_at``, opens a session with the account's
-session policy (``scoped_settings.session_policy_for``: the org policy for a
-member, the stored platform policy for a Super Admin), resets the account's
-failure count, releases its own IP reservation and records ``login.success``,
-all in one transaction. Every other outcome records ``login.failure`` and
+session policy (``scoped_settings.session_policy_for``: a member's own org's
+stored policy (GH-169), the stored platform policy for a Super Admin), resets
+the account's failure count, releases its own IP reservation and records
+``login.success``, all in one transaction. Every other outcome records ``login.failure`` and
 raises the same ``LoginFailedError``; the failure at the lockout threshold
 then locks the account and/or the IP and records a ``login.lockout`` per lock
 (account first, then IP).
@@ -231,7 +231,7 @@ async def login(
         raise LoginFailedError
 
     user_id = account["id"]
-    policy = await scoped_settings.session_policy_for(pool, account["kind"])
+    policy = await scoped_settings.session_policy_for(pool, account["kind"], account["org_id"])
     new_hash = None
     if passwords.needs_rehash(stored_hash):
         new_hash = await asyncio.to_thread(passwords.hash_password, password)

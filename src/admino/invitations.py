@@ -61,7 +61,8 @@ cancels the invitation email still queued with the old link
 link, then the password policy, and then in one transaction marks the
 invitation used, activates the user with
 the name and the Argon2 hash, stamps ``last_login_at``, opens a session with
-the org's session policy and records ``invitation.accept``.
+the invited org's stored session policy (``scoped_settings.session_policy_for``
+with the invitation's org; GH-169) and records ``invitation.accept``.
 
 Security notes:
 - Authorization through ``access.can`` before any query: sending, revoking and
@@ -915,7 +916,7 @@ async def accept_invitation(
     new_hash = await asyncio.to_thread(passwords.hash_password, password)
 
     user_id = row["user_id"]
-    policy = await scoped_settings.session_policy_for(pool, "member")
+    policy = await scoped_settings.session_policy_for(pool, "member", row["org_id"])
     async with pool.acquire() as conn, conn.transaction():
         invitation_id = await conn.fetchval(_MARK_ACCEPTED_SQL, token_hash)
         if invitation_id is None:

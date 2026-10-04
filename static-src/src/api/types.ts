@@ -154,15 +154,45 @@ export interface UserSettingsPatch {
   notifications?: { enabled?: boolean; task_done?: boolean };
 }
 
-/** `GET`/`PATCH /api/org/settings` — Org Admin only: which tool services are enabled. */
+export interface OrgProfile {
+  display_name: string;
+  default_response_language: ResponseLanguage;
+}
+
+export interface OrgSecurity {
+  session_idle_timeout_minutes: number;
+  session_max_lifetime_hours: number;
+}
+
+export interface OrgRetention {
+  trash_retention_days: number;
+  trash_min_days: number;
+  trash_max_days: number;
+}
+
+export interface OrgPlan {
+  seats: number;
+  storage_quota: number;
+}
+
+/** `GET`/`PATCH /api/org/settings` — Org Admin only (issues #162, #169). */
 export interface OrgSettingsResponse {
+  profile: OrgProfile;
+  instructions: string;
+  security: OrgSecurity;
+  retention: OrgRetention;
   tools: ToolsSettings;
-  /** The org's data residency policy (read-only here; issue #162). */
+  /** The org's data residency policy (read-only here). */
   data_residency: boolean;
+  plan: OrgPlan;
 }
 
 export interface OrgSettingsPatch {
-  tools: Partial<ToolsSettings>;
+  profile?: Partial<OrgProfile>;
+  instructions?: string;
+  security?: Partial<OrgSecurity>;
+  retention?: { trash_retention_days?: number };
+  tools?: Partial<ToolsSettings>;
 }
 
 // OAuth connections (issue #162: per-user connections, residency gating).

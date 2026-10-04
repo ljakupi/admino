@@ -290,7 +290,7 @@ revokes the token at the provider and deletes it.
 
 - Viewers can't chat, so they have no connections.
 - An Org Admin turns services on or off for the whole organization under
-  **Organization → Services**.
+  **Organization → Settings**, in **Tools and permissions**.
 - When your organization's data residency policy is on, the Google and Microsoft tools are
   disabled and connecting an account is refused. Connections made before are kept but
   inactive; you can still disconnect them.

@@ -203,11 +203,11 @@ export function orgUserErrorMessage(error: unknown, subject: ErrorSubject = 'use
 
 // --- Tabs ------------------------------------------------------------------------------
 
-export type OrgTab = 'users' | 'permissions';
+export type OrgTab = 'users' | 'settings' | 'permissions';
 
-/** The `?tab=` query value mapped to a tab: `'permissions'` only for exactly that string, else `'users'`. */
+/** The `?tab=` query value mapped to a tab: `'settings'` / `'permissions'` only for exactly those strings, else `'users'`. */
 export function orgTabFrom(value: unknown): OrgTab {
-  return value === 'permissions' ? 'permissions' : 'users';
+  return value === 'permissions' || value === 'settings' ? value : 'users';
 }
 
 // --- Confirm sheet copy ----------------------------------------------------------------
