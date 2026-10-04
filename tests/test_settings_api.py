@@ -123,6 +123,11 @@ GH-162 (data residency) adds, on the org scope:
   under ``tools``, is a 422 like any unknown key (no echo, nothing written,
   the org keeps its policy).
 
+GH-169 widens the org settings response (profile, instructions, security,
+retention and plan beside ``tools`` and ``data_residency``; specified in
+tests/test_org_settings_api.py). The GH-159/162 tests here compare its
+``tools`` and ``data_residency`` members (``_org_view``).
+
 All database calls are faked. No network, no real PostgreSQL, no LLM.
 
 Security notes:
@@ -1255,6 +1260,13 @@ class TestMySettings:
 # ---------------------------------------------------------------------------
 
 
+def _org_view(response: httpx.Response) -> dict[str, Any]:
+    """The ``tools`` and ``data_residency`` members of an org settings response (GH-169
+    adds the other sections, specified in tests/test_org_settings_api.py)."""
+    body = response.json()
+    return {"tools": body.get("tools"), "data_residency": body.get("data_residency")}
+
+
 def _enabled_tools_of_runs(agent: MagicMock) -> list[dict[str, bool]]:
     """The enabled services each agent run received (``tool_policy.enabled_tools``)."""
     enabled: list[dict[str, bool]] = []
@@ -1273,7 +1285,7 @@ class TestOrgSettings:
         response = _call(_client(app), "org_get", token)
 
         assert response.status_code == 200, response.text
-        assert response.json() == {"tools": _ALL_ON, "data_residency": False}
+        assert _org_view(response) == {"tools": _ALL_ON, "data_residency": False}
 
     def test_settings_api_org_patch_is_stored_returned_and_audited(
         self, db: FakeDb, app: FastAPI
@@ -1285,7 +1297,7 @@ class TestOrgSettings:
 
         expected = {**_ALL_ON, "gmail": False, "outlook": False}
         assert response.status_code == 200, response.text
-        assert response.json() == {"tools": expected, "data_residency": False}
+        assert _org_view(response) == {"tools": expected, "data_residency": False}
         assert db.org_tools(ORG_ID) == expected
         event = _one(db.audit)
         assert event["action"] == "org.settings_change"
@@ -1317,8 +1329,8 @@ class TestOrgSettings:
         read_a = _call(client, "org_get", token_a)
 
         assert patched.status_code == 200, patched.text
-        assert read_b.json() == {"tools": _ALL_ON, "data_residency": False}
-        assert read_a.json() == {"tools": {**_ALL_ON, "gmail": False}, "data_residency": False}
+        assert _org_view(read_b) == {"tools": _ALL_ON, "data_residency": False}
+        assert _org_view(read_a) == {"tools": {**_ALL_ON, "gmail": False}, "data_residency": False}
         assert OTHER_ORG_ID not in db.org_settings
         assert _uuid(_one(db.audit)["org_id"]) == ORG_ID
 
@@ -1438,7 +1450,7 @@ class TestOrgSettingsDataResidency:
         response = _call(_client(app), "org_get", token)
 
         assert response.status_code == 200, response.text
-        assert response.json() == {"tools": _ALL_ON, "data_residency": residency}
+        assert _org_view(response) == {"tools": _ALL_ON, "data_residency": residency}
 
     def test_settings_api_org_settings_report_each_admins_own_orgs_residency(
         self, db: FakeDb, app: FastAPI
@@ -1489,7 +1501,7 @@ class TestOrgSettingsDataResidency:
 
         expected = {**_ALL_ON, tool: False}
         assert response.status_code == 200, response.text
-        assert response.json() == {"tools": expected, "data_residency": True}
+        assert _org_view(response) == {"tools": expected, "data_residency": True}
         assert db.org_tools(ORG_ID) == expected
         event = _one(db.audit)
         assert event["action"] == "org.settings_change"
@@ -1509,7 +1521,7 @@ class TestOrgSettingsDataResidency:
         response = _call(_client(app), "org_patch", token, body={"tools": {"outlook": False}})
 
         assert response.status_code == 200, response.text
-        assert response.json() == {
+        assert _org_view(response) == {
             "tools": {**_ALL_ON, "outlook": False},
             "data_residency": True,
         }
@@ -1535,7 +1547,7 @@ class TestOrgSettingsDataResidency:
         assert _state(db) == before
         assert db.orgs[ORG_ID]["data_residency"] is True
         assert read.status_code == 200, read.text
-        assert read.json() == {"tools": _ALL_ON, "data_residency": True}
+        assert _org_view(read) == {"tools": _ALL_ON, "data_residency": True}
 
 
 # ---------------------------------------------------------------------------

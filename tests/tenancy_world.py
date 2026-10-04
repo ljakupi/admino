@@ -15,12 +15,20 @@ Inputs: a ``FakeDb``. Outputs:
 - The catalog: ``ROUTES`` (every registered API route, classified),
   ``ROLE_MATRIX`` (#139 §2.1, written from the tracker, never from
   ``access.py``), ``PENDING_CAPABILITIES`` (capabilities without a route yet,
-  with the issue that adds it) and ``PROJECT_ROLES`` (#139 §2.2, pending
-  until project routes exist).
+  with the issue that adds it), ``SERVICE_CAPABILITIES`` (capabilities a
+  routed service checks in addition to its route's capability, with those
+  routes) and ``PROJECT_ROLES`` (#139 §2.2, pending until project routes
+  exist).
 
 Adding a route: give it a ``RouteSpec`` row in ``ROUTES`` and its cases in the
 suite. The completeness tests in tests/test_tenancy.py fail for a registered
 route without a row, and for a capability that is neither routed nor pending.
+A capability moves from ``PENDING_CAPABILITIES`` to the row of its first
+route, or to ``SERVICE_CAPABILITIES`` when it gates part of an existing
+route's service (GH-169: ``org.instructions.manage``, checked by the org
+settings service behind GET/PATCH /api/org/settings). A service capability
+must have exactly its routes' roles in ``ROLE_MATRIX``, so the role cases of
+those routes cover it.
 GH-167's two capabilities (``platform.org_metadata.view``,
 ``platform.users.manage``) are named by value through ``_capability`` so the
 catalog imports before access.py defines them (see its docstring).
@@ -309,13 +317,13 @@ ROLE_MATRIX: Final[MappingProxyType[Capability, frozenset[Role]]] = MappingProxy
 )
 
 # Capabilities whose routes don't exist yet, and the issue that adds them. That
-# issue moves its capability from here into a ROUTES row with HTTP cases.
+# issue moves its capability from here into a ROUTES row with HTTP cases (or
+# into SERVICE_CAPABILITIES when an existing route's service checks it).
 PENDING_CAPABILITIES: Final[MappingProxyType[Capability, str]] = MappingProxyType(
     {
         Capability.PLATFORM_REGISTRY_MANAGE: "#173",
         Capability.USAGE_VIEW_PLATFORM: "#183",
         Capability.AUDIT_VIEW_PLATFORM: "#171",
-        Capability.ORG_INSTRUCTIONS_MANAGE: "#169",
         Capability.ORG_MODELS_MANAGE: "#173",
         Capability.TEMPLATE_ORG_MANAGE: "#205",
         Capability.ORG_LETTERHEAD_MANAGE: "#207",
@@ -330,6 +338,23 @@ PENDING_CAPABILITIES: Final[MappingProxyType[Capability, str]] = MappingProxyTyp
         Capability.EXPORT_CREATE: "#206",
         Capability.USAGE_VIEW_OWN: "#183",
     }
+)
+
+# Capabilities a routed service checks in addition to its route's capability,
+# and the routes whose service checks them. No route of their own: the role
+# cases of these routes cover them, so their ROLE_MATRIX roles equal the route
+# capability's (tests/test_tenancy.py checks it). GH-169: the org settings
+# service carries the org instructions in every response, so both GET and
+# PATCH /api/org/settings require ``org.instructions.manage`` too.
+SERVICE_CAPABILITIES: Final[MappingProxyType[Capability, tuple[tuple[str, str], ...]]] = (
+    MappingProxyType(
+        {
+            Capability.ORG_INSTRUCTIONS_MANAGE: (
+                ("GET", "/api/org/settings"),
+                ("PATCH", "/api/org/settings"),
+            ),
+        }
+    )
 )
 
 # #139 §2.2 project roles: (capability, roles that have it). No project route

@@ -1,4 +1,4 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-162).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-169).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
@@ -49,7 +49,15 @@ The settings scopes (GH-159, migration 0013):
   now()).
 - ``org_settings`` (``org_settings``, keyed by org id): ``org_id`` (primary
   key, references organizations ON DELETE CASCADE), the seven
-  ``<tool>_enabled`` BOOLEANs (NOT NULL, default true) and ``updated_at``.
+  ``<tool>_enabled`` BOOLEANs (NOT NULL, default true), the org policies of
+  migration 0023 (GH-169): ``instructions`` (TEXT NOT NULL, default '', CHECK
+  ``char_length(instructions) <= 8000``) and ``ORG_POLICY_COLUMNS`` (each an
+  INTEGER NOT NULL with a default and a BETWEEN CHECK:
+  ``session_idle_timeout_minutes`` 15 to 480, default 60,
+  ``session_max_lifetime_hours`` 1 to 72, default 12, ``trash_retention_days``
+  0 to 90, default 30), and ``updated_at``. ``add_org_settings`` seeds a row
+  (every column a keyword argument) and ``org_settings_row(org_id)`` reads a
+  copy back.
 - ``user_settings`` (``user_settings``, keyed by user id): ``user_id``
   (primary key, references users ON DELETE CASCADE), ``theme`` (NOT NULL,
   default 'light', one of light / dark / system), ``notifications_enabled``
@@ -261,6 +269,17 @@ The sessions table is the schema after migration 0009 (GH-152):
   users WHERE kind = 'super_admin')`` changes every Super Admin session (and
   no member's), after checking both CHECKs on every row; it answers
   ``UPDATE <count>``.
+- GH-169: the same statement scoped ``WHERE user_id IN (SELECT id FROM users
+  WHERE org_id = $n) AND expires_at > now() AND last_seen_at +
+  make_interval(mins => idle_timeout_minutes) > now()``
+  (``admino.sessions.apply_org_policy``, contract §3) changes every LIVE
+  session of every user of that org (any role, status or deletion), never
+  another org's or a Super Admin's, with the same CHECKs; it answers
+  ``UPDATE <count of the live rows>``. The live predicates read the OLD row
+  values: a session that had already ended (expired, or idle past its old
+  timeout) is neither changed nor counted. The form without both live
+  predicates is refused (AssertionError), as is any other session-policy
+  UPDATE the fake doesn't know.
 
 Semantics the tests rely on:
 - ``pool.acquire()`` yields a new connection; ``conn.transaction()`` snapshots
@@ -383,6 +402,21 @@ _SUPER_ADMIN_POLICY_RE: Final = re.compile(
     r"expires_at = created_at \+ make_interval\(hours => \$(?P<hours>\d+)(?:::int(?:eger|4)?)?\) "
     r"where user_id in \(select id from users where kind = 'super_admin'\)"
 )
+# GH-169: an org's session policy applied to every LIVE session of its users
+# (admino.sessions.apply_org_policy, contract §3), normalized. The WHERE carries
+# both live predicates (any spelling LIVE_EXPIRY_RE / LIVE_IDLE_RE accept, in
+# either order), read against the OLD row values: a session that had already
+# ended is never re-timed (so never revived by a longer policy). The form without
+# them is not this statement any more.
+_ORG_POLICY_SCOPE: Final = (
+    r"update sessions set idle_timeout_minutes = \$(?P<idle>\d+)(?:::int(?:eger|4)?)?, "
+    r"expires_at = created_at \+ make_interval\(hours => \$(?P<hours>\d+)(?:::int(?:eger|4)?)?\) "
+    r"where user_id in \(select id from users where org_id = \$(?P<org>\d+)(?:::uuid)?\) "
+)
+_LIVE_ONLY: Final = (
+    rf"(?:and {LIVE_EXPIRY_RE} and {LIVE_IDLE_RE}|and {LIVE_IDLE_RE} and {LIVE_EXPIRY_RE})"
+)
+_ORG_POLICY_RE: Final = re.compile(_ORG_POLICY_SCOPE + _LIVE_ONLY)
 
 # The columns of the tables the SQL reader models (migrations 0004 and 0010).
 _USER_COLUMNS: Final = frozenset(
@@ -508,8 +542,23 @@ _PLATFORM_SETTINGS_COLUMNS: Final = frozenset(
         "updated_at",
     }
 )
+# GH-169: migration 0023's org policies, column -> (default, low, high): each an
+# INTEGER NOT NULL with a DEFAULT and a BETWEEN CHECK. ``instructions`` is a
+# TEXT NOT NULL DEFAULT '' with CHECK (char_length(instructions) <= 8000).
+ORG_POLICY_COLUMNS: Final[dict[str, tuple[int, int, int]]] = {
+    "session_idle_timeout_minutes": (60, 15, 480),
+    "session_max_lifetime_hours": (12, 1, 72),
+    "trash_retention_days": (30, 0, 90),
+}
+ORG_INSTRUCTIONS_MAX: Final = 8000
 _ORG_SETTINGS_COLUMNS: Final = frozenset(
-    {"org_id", *(f"{tool}_enabled" for tool in TOOL_NAMES), "updated_at"}
+    {
+        "org_id",
+        *(f"{tool}_enabled" for tool in TOOL_NAMES),
+        "instructions",
+        *ORG_POLICY_COLUMNS,
+        "updated_at",
+    }
 )
 _USER_SETTINGS_COLUMNS: Final = frozenset(
     {"user_id", "theme", "notifications_enabled", "notifications_task_done", "updated_at"}
@@ -568,6 +617,8 @@ _SETTINGS_TYPES: Final[dict[str, dict[str, str]]] = {
     "org_settings": {
         "org_id": "uuid",
         **{f"{tool}_enabled": "bool" for tool in TOOL_NAMES},
+        "instructions": "text",
+        **dict.fromkeys(ORG_POLICY_COLUMNS, "int"),
         "updated_at": "timestamptz",
     },
     "user_settings": {
@@ -945,18 +996,24 @@ class FakeDb:
         expires_in: timedelta = timedelta(hours=12),
         ip: str | None = None,
         user_agent: str | None = None,
+        created_ago: timedelta | None = None,
     ) -> str:
         """Store a session for the user and return its raw token.
 
         By default the session is live: seen just now, 60 minutes idle timeout,
         expiring in 12 hours. ``last_seen_ago`` / ``expires_in`` build idle or
         expired sessions (a row the purge job hasn't deleted yet).
+        ``created_ago`` (GH-169) pins ``created_at`` to that long ago (default:
+        the earlier of the last-seen time and an hour before the expiry).
         """
         token = secrets.token_urlsafe(32)
         now = datetime.now(UTC)
         last_seen_at = now - last_seen_ago
         expires_at = now + expires_in
-        created_at = min(last_seen_at, expires_at - timedelta(hours=1))
+        if created_ago is not None:
+            created_at = now - created_ago
+        else:
+            created_at = min(last_seen_at, expires_at - timedelta(hours=1))
         self.sessions[sha256(token)] = {
             "session_id": uuid.uuid4(),
             "user_id": user_id,
@@ -1126,21 +1183,37 @@ class FakeDb:
         return row
 
     def add_org_settings(
-        self, org_id: uuid.UUID, *, updated_at: datetime | None = None, **tools: bool
+        self,
+        org_id: uuid.UUID,
+        *,
+        instructions: str = "",
+        session_idle_timeout_minutes: int = 60,
+        session_max_lifetime_hours: int = 12,
+        trash_retention_days: int = 30,
+        updated_at: datetime | None = None,
+        **tools: bool,
     ) -> dict[str, Any]:
-        """Store an org's org_settings row (GH-159); every tool not given is enabled.
+        """Store an org's org_settings row (GH-159, GH-169); every tool not given is enabled.
 
         ``tools`` are tool names (``gmail=False``), stored as ``<tool>_enabled``.
+        The policy columns of migration 0023 default to its column defaults
+        (instructions '', 60 minutes idle, 12 hours lifetime, 30 days trash) and
+        are checked like its CHECKs (a value out of bounds is a CheckViolationError,
+        a wrong type a DataError).
         """
         unknown = set(tools) - set(TOOL_NAMES)
         assert not unknown, f"no such tool {sorted(unknown)}"
         row: dict[str, Any] = {
             "org_id": org_id,
             **{f"{tool}_enabled": tools.get(tool, True) for tool in TOOL_NAMES},
+            "instructions": instructions,
+            "session_idle_timeout_minutes": session_idle_timeout_minutes,
+            "session_max_lifetime_hours": session_max_lifetime_hours,
+            "trash_retention_days": trash_retention_days,
             "updated_at": updated_at or datetime.now(UTC),
         }
         self.check_settings("org_settings", row, original=None)
-        self.org_settings[org_id] = row
+        self.org_settings[row["org_id"]] = row
         return row
 
     def add_user_settings(
@@ -1272,6 +1345,11 @@ class FakeDb:
     def platform_row(self) -> dict[str, Any] | None:
         """The platform_settings row, if there is one."""
         return self.platform_settings[0] if self.platform_settings else None
+
+    def org_settings_row(self, org_id: uuid.UUID) -> dict[str, Any] | None:
+        """A copy of an org's stored org_settings row (GH-169), None without a row."""
+        row = self.org_settings.get(_canonical(org_id))
+        return dict(row) if row is not None else None
 
     def org_tools(self, org_id: uuid.UUID) -> dict[str, bool] | None:
         """The stored tool switches of an org by tool name (None without a row)."""
@@ -1466,6 +1544,12 @@ class FakeDb:
             return self._delete_sessions(method, n, args)
         if policy := _SUPER_ADMIN_POLICY_RE.fullmatch(n):
             return self._apply_super_admin_policy(policy, args)
+        if policy := _ORG_POLICY_RE.fullmatch(n):
+            return self._apply_org_policy(policy, args)
+        assert not re.match(r"update sessions set idle_timeout_minutes\b", n), (
+            f"a session-policy UPDATE the fake doesn't know (GH-169: the org form needs "
+            f"both live-only predicates of contract §3): {n}"
+        )
         if n.startswith("update sessions"):
             return self._touch_session(n, args)
         if method == "fetch" and re.search(r"\bfrom sessions\b", n):
@@ -1566,6 +1650,8 @@ class FakeDb:
             row["image_input"] = True
         elif table == "org_settings":
             row.update({f"{tool}_enabled": True for tool in TOOL_NAMES})
+            row["instructions"] = ""
+            row.update({column: default for column, (default, _, _) in ORG_POLICY_COLUMNS.items()})
         elif table == "user_settings":
             row.update(theme="light", notifications_enabled=True, notifications_task_done=False)
         elif table == "oauth_tokens":
@@ -1674,6 +1760,12 @@ class FakeDb:
                 for column, (_, low, high) in PLATFORM_LLM_LIMITS.items()
             )
             rules.append(("trash_bounds", row["trash_min_days"] <= row["trash_max_days"]))
+        elif table == "org_settings":
+            rules.append(("instructions", len(row["instructions"]) <= ORG_INSTRUCTIONS_MAX))
+            rules.extend(
+                (column, low <= row[column] <= high)
+                for column, (_, low, high) in ORG_POLICY_COLUMNS.items()
+            )
         elif table == "user_settings":
             rules.append(("theme", row["theme"] in THEMES))
         elif table == "permissions":
@@ -2426,16 +2518,64 @@ class FakeDb:
         run on every changed row before any row changes (one statement: all or
         nothing); members' sessions are never touched.
         """
-        idle = args[int(match["idle"]) - 1]
-        hours = args[int(match["hours"]) - 1]
-        if type(idle) is not int or type(hours) is not int:
-            msg = "invalid input for query argument: int expected"
-            raise asyncpg.exceptions.DataError(msg)
         rows = [
             row
             for row in self.sessions.values()
             if self.users.get(row["user_id"], {}).get("kind") == "super_admin"
         ]
+        return self._retime_sessions(rows, match, args)
+
+    def _apply_org_policy(self, match: re.Match[str], args: tuple[Any, ...]) -> str:
+        """GH-169: every LIVE session of every user of one org takes a new idle timeout
+        and expiry.
+
+        The org is the bound ``$n`` of ``WHERE user_id IN (SELECT id FROM users
+        WHERE org_id = $n)``: every user of that org whatever its role, status or
+        deleted_at, never another org's user and never a Super Admin (whose
+        org_id is NULL). The two live predicates (``expires_at > now()`` and
+        ``last_seen_at + idle_timeout_minutes > now()``) are read against the OLD
+        row values, the boundary resolve_session and the purge use: a session
+        that had already ended (expired, or idle past its old timeout) but isn't
+        purged yet is neither changed nor counted, so a longer policy never
+        revives it. Same CHECKs (on the changed rows only) and all-or-nothing as
+        the Super Admin form; answers ``UPDATE <live rows of the org>``.
+        """
+        org = args[int(match["org"]) - 1]
+        if isinstance(org, str):
+            try:
+                org = uuid.UUID(org)
+            except ValueError:
+                msg = "invalid input for query argument: uuid expected"
+                raise asyncpg.exceptions.DataError(msg) from None
+        if not isinstance(org, uuid.UUID):
+            msg = "invalid input for query argument: uuid expected"
+            raise asyncpg.exceptions.DataError(msg)
+        now = datetime.now(UTC)
+        rows = [
+            row
+            for row in self.sessions.values()
+            if (owner := self.users.get(row["user_id"])) is not None
+            and owner.get("org_id") is not None
+            and _canonical(owner["org_id"]) == _canonical(org)
+            and row["expires_at"] > now
+            and row["last_seen_at"] + timedelta(minutes=row["idle_timeout_minutes"]) > now
+        ]
+        return self._retime_sessions(rows, match, args)
+
+    def _retime_sessions(
+        self, rows: list[dict[str, Any]], match: re.Match[str], args: tuple[Any, ...]
+    ) -> str:
+        """Set ``idle_timeout_minutes`` and ``expires_at = created_at + hours`` on rows.
+
+        Both bound values must be ints (DataError); migration 0009's CHECKs run
+        on every row before any row changes (CheckViolationError, nothing
+        changed). Answers ``UPDATE <count>``.
+        """
+        idle = args[int(match["idle"]) - 1]
+        hours = args[int(match["hours"]) - 1]
+        if type(idle) is not int or type(hours) is not int:
+            msg = "invalid input for query argument: int expected"
+            raise asyncpg.exceptions.DataError(msg)
         for row in rows:
             if not 15 <= idle <= 480:
                 msg = "sessions idle_timeout_minutes check"

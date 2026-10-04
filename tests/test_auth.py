@@ -11,14 +11,18 @@ What these tests pin down:
   org, the client IP), and a frozen ``LoginResult`` returned: the raw token (kept
   out of its repr) and the cookie's ``max_age_seconds``. A hash with older
   parameters is rehashed with the current ones; a current hash is left alone.
-- Session policy (GH-152, GH-160): the session is opened with
-  ``scoped_settings.session_policy_for(<pool>, <the account's kind>)``: a
-  member's row stores the org policy's idle timeout and lifetime
-  (``sessions.DEFAULT_ORG_SESSION_POLICY``), a Super Admin's the stored
-  platform policy's (the cached platform settings' ``security``
-  ``session_idle_timeout_minutes`` / ``session_max_lifetime_hours``), and
-  ``max_age_seconds`` is that lifetime in seconds (43200 by default). A change
-  of the stored policy applies to the next Super Admin login.
+- Session policy (GH-152, GH-160, GH-169): the session is opened with
+  ``scoped_settings.session_policy_for(<pool>, <the account's kind>, <the
+  account's org_id>)``: a member's row stores the idle timeout and lifetime of
+  the account's OWN org as stored in ``org_settings``
+  (``session_idle_timeout_minutes`` / ``session_max_lifetime_hours``, read with
+  the org id bound; an org without a row gets the column defaults, 60 minutes /
+  12 hours; ``sessions.DEFAULT_ORG_SESSION_POLICY`` is gone), a Super
+  Admin's (org id None) the stored platform policy's (the cached platform
+  settings' ``security`` section), and ``max_age_seconds`` is that lifetime in
+  seconds (43200 by default). A change of either stored policy applies to the
+  next login, without a restart; another org's policy never applies, and a
+  failed login asks for no policy.
 - Failure, for every cause (unknown email, wrong password, invited user without
   a password, deactivated or deleted user, user of a deactivated or
   pending-deletion org): the same ``LoginFailedError("Invalid email or password")``,
@@ -82,6 +86,7 @@ _IP = "203.0.113.7"
 _USER_AGENT = "Mozilla/5.0 (auth-test)"
 _USER_ID = uuid.UUID("6a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d")
 _ORG_ID = uuid.UUID("b7c8d9e0-f1a2-4b3c-9d4e-5f6a7b8c9d0e")
+_OTHER_ORG_ID = uuid.UUID("c8d9e0f1-a2b3-4c4d-8e5f-6a7b8c9d0e1f")
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 
 
@@ -103,6 +108,11 @@ def _is_throttle_sql(sql: str) -> bool:
     return re.search(r"\blogin_throttle\b", normalized) is not None or (
         normalized.startswith("select") and " from " not in normalized and "sha256" in normalized
     )
+
+
+def _is_org_settings_sql(sql: str) -> bool:
+    """True for a statement on the org_settings table (GH-169: the org's session policy)."""
+    return re.search(r"\borg_settings\b", _norm(sql)) is not None
 
 
 def _only_digests_the_email(sql: str, args: tuple[Any, ...]) -> bool:
@@ -154,20 +164,44 @@ class _FakeConnection:
 
 
 class _FakePool(_FakeConnection):
-    """The pool: records every call made through it or through acquired connections."""
+    """The pool: records every call made through it or through acquired connections.
 
-    def __init__(self, account: dict[str, Any] | None) -> None:
+    ``org_policies`` (GH-169) seeds org_settings rows of the shared fake, org id
+    -> (session_idle_timeout_minutes, session_max_lifetime_hours); an org left
+    out has no row. ``set_org_policy`` changes (or adds) one between logins.
+    """
+
+    def __init__(
+        self,
+        account: dict[str, Any] | None,
+        *,
+        org_policies: dict[uuid.UUID, tuple[int, int]] | None = None,
+    ) -> None:
         super().__init__(self)
         self.account = account
         self.calls: list[tuple[str, str, tuple[Any, ...]]] = []
         # GH-157: the login throttle's statements run on the shared fake's
         # login_throttle table (a fresh counter per pool: no delay, no lockout).
+        # GH-169: the org_settings statements run on its org_settings table (the
+        # generic SQL reader: only the predicates the statement states apply).
         self.throttle = FakeDb()
+        for org_id, (idle, lifetime) in (org_policies or {}).items():
+            self.set_org_policy(org_id, idle=idle, lifetime=lifetime)
+
+    def set_org_policy(self, org_id: uuid.UUID, *, idle: int, lifetime: int) -> None:
+        """Store (or replace) an org's org_settings row with this session policy (its
+        organizations row first: the foreign key)."""
+        self.throttle.add_org(org_id)
+        self.throttle.org_settings.pop(org_id, None)
+        self.throttle.add_org_settings(
+            org_id, session_idle_timeout_minutes=idle, session_max_lifetime_hours=lifetime
+        )
 
     def run(self, method: str, sql: str, args: tuple[Any, ...]) -> Any:
-        """Record a call and answer it: the throttle's statements go to its table."""
+        """Record a call and answer it: the throttle's and the org_settings statements go
+        to the shared fake's tables."""
         self.calls.append((method, sql, args))
-        if _is_throttle_sql(sql):
+        if _is_throttle_sql(sql) or _is_org_settings_sql(sql):
             return self.throttle.handle(method, sql, args, "pool", None)
         if method == "fetchrow":
             return self.answer_fetchrow(sql)
@@ -583,8 +617,10 @@ class TestLoginSessionPolicy:
     """The session's idle timeout and lifetime come from scoped_settings.session_policy_for.
 
     GH-160: a Super Admin's policy is the stored platform policy (the security
-    section of the cached platform settings); a member keeps
-    sessions.DEFAULT_ORG_SESSION_POLICY.
+    section of the cached platform settings). GH-169: a member's is the stored
+    policy of the account's own org (its org_settings row, the column defaults
+    60 minutes / 12 hours without one); sessions.DEFAULT_ORG_SESSION_POLICY is
+    gone.
     """
 
     async def test_auth_login_member_session_uses_the_org_default(self, current_hash: str) -> None:
@@ -597,6 +633,110 @@ class TestLoginSessionPolicy:
         assert row["idle_timeout_minutes"] == 60
         assert row["expires_at"] == NowPlus(timedelta(hours=12))
         assert result.max_age_seconds == 43200
+
+    async def test_auth_login_member_session_uses_the_stored_org_policy(
+        self, current_hash: str
+    ) -> None:
+        """GH-169: with the org's stored 20-minute / 2-hour policy the member's row stores 20
+        and now() + 2 h, and Max-Age is 7200."""
+        pool = _FakePool(_member(current_hash), org_policies={_ORG_ID: (20, 2)})
+
+        result = await _login(pool)
+
+        row = _session_insert(pool)
+        assert (row["idle_timeout_minutes"], row["expires_at"]) == (
+            20,
+            NowPlus(timedelta(hours=2)),
+        )
+        assert result.max_age_seconds == 7200
+
+    @pytest.mark.parametrize(("idle", "lifetime"), [(15, 1), (480, 72)])
+    async def test_auth_login_member_session_stores_the_stored_org_bounds(
+        self, current_hash: str, idle: int, lifetime: int
+    ) -> None:
+        """GH-169: the stored org policy's extremes (15 min / 1 h and 480 min / 72 h) land
+        in the row and the cookie unchanged."""
+        pool = _FakePool(_member(current_hash), org_policies={_ORG_ID: (idle, lifetime)})
+
+        result = await _login(pool)
+
+        row = _session_insert(pool)
+        assert (row["idle_timeout_minutes"], row["expires_at"]) == (
+            idle,
+            NowPlus(timedelta(hours=lifetime)),
+        )
+        assert result.max_age_seconds == lifetime * 3600
+
+    async def test_auth_login_member_without_an_org_settings_row_gets_the_column_defaults(
+        self, current_hash: str
+    ) -> None:
+        """GH-169: the policy is read from org_settings with the account's org id bound; an
+        org without a row gets the column defaults (60 / now() + 12 h / 43200)."""
+        pool = _FakePool(_member(current_hash))
+
+        result = await _login(pool)
+
+        reads = [
+            call
+            for call in pool.matching(r"\bfrom org_settings\b")
+            if call[0] in {"fetchrow", "fetch", "fetchval"}
+        ]
+        assert reads != []
+        assert all(_ORG_ID in args for _, _, args in reads)
+        row = _session_insert(pool)
+        assert (row["idle_timeout_minutes"], row["expires_at"]) == (
+            60,
+            NowPlus(timedelta(hours=12)),
+        )
+        assert result.max_age_seconds == 43200
+
+    async def test_auth_login_member_never_gets_another_orgs_policy(
+        self, current_hash: str
+    ) -> None:
+        """GH-169: both orgs have a stored policy (A: 20 min / 2 h, B: 90 min / 24 h); a
+        member of A gets A's and a member of B gets B's."""
+        policies = {_ORG_ID: (20, 2), _OTHER_ORG_ID: (90, 24)}
+        pool_a = _FakePool(_member(current_hash), org_policies=policies)
+        pool_b = _FakePool(
+            _member(current_hash, org_id=PgUUID(str(_OTHER_ORG_ID))), org_policies=policies
+        )
+
+        result_a = await _login(pool_a)
+        result_b = await _login(pool_b)
+
+        row_a = _session_insert(pool_a)
+        row_b = _session_insert(pool_b)
+        assert (row_a["idle_timeout_minutes"], row_a["expires_at"], result_a.max_age_seconds) == (
+            20,
+            NowPlus(timedelta(hours=2)),
+            7200,
+        )
+        assert (row_b["idle_timeout_minutes"], row_b["expires_at"], result_b.max_age_seconds) == (
+            90,
+            NowPlus(timedelta(hours=24)),
+            86400,
+        )
+
+    async def test_auth_login_after_an_org_policy_change_member_gets_the_new_values(
+        self, current_hash: str
+    ) -> None:
+        """AC (GH-169): after the org's stored policy changes (20 min / 2 h to 45 min / 6 h),
+        the member's next login stores the new values without a restart (nothing cached);
+        the earlier login's session carried the old ones."""
+        pool = _FakePool(_member(current_hash), org_policies={_ORG_ID: (20, 2)})
+        before = await _login(pool)
+
+        pool.set_org_policy(_ORG_ID, idle=45, lifetime=6)
+        after = await _login(pool)
+
+        inserts = [
+            insert_values(sql, args) for _, sql, args in pool.matching(r"insert into sessions")
+        ]
+        assert [(row["idle_timeout_minutes"], row["expires_at"]) for row in inserts] == [
+            (20, NowPlus(timedelta(hours=2))),
+            (45, NowPlus(timedelta(hours=6))),
+        ]
+        assert (before.max_age_seconds, after.max_age_seconds) == (7200, 21600)
 
     async def test_auth_login_super_admin_session_uses_the_platform_default(
         self, current_hash: str
@@ -683,11 +823,14 @@ class TestLoginSessionPolicy:
     async def test_auth_login_org_policy_applies_to_members_only(
         self, current_hash: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """With a 20-minute / 2-hour org policy the member's row stores 20 and now() + 2 h
-        and Max-Age is 7200; a Super Admin keeps 60 / 12 h / 43200."""
-        monkeypatch.setattr(sessions_mod, "DEFAULT_ORG_SESSION_POLICY", _policy(20, 2))
-        member_pool = _FakePool(_member(current_hash))
-        admin_pool = _FakePool(_super_admin(current_hash))
+        """GH-169: with the org's stored 20-minute / 2-hour policy and a stored 30-minute /
+        8-hour platform policy, the member's row stores 20 and now() + 2 h (Max-Age 7200)
+        and a Super Admin's 30 and now() + 8 h (Max-Age 28800); a Super Admin's login
+        reads no org_settings row."""
+        _store_session_policy(monkeypatch, idle=30, lifetime=8)
+        policies = {_ORG_ID: (20, 2)}
+        member_pool = _FakePool(_member(current_hash), org_policies=policies)
+        admin_pool = _FakePool(_super_admin(current_hash), org_policies=policies)
 
         member = await _login(member_pool)
         admin = await _login(admin_pool)
@@ -700,48 +843,58 @@ class TestLoginSessionPolicy:
         assert member.max_age_seconds == 7200
         admin_row = _session_insert(admin_pool)
         assert (admin_row["idle_timeout_minutes"], admin_row["expires_at"]) == (
-            60,
-            NowPlus(timedelta(hours=12)),
+            30,
+            NowPlus(timedelta(hours=8)),
         )
-        assert admin.max_age_seconds == 43200
+        assert admin.max_age_seconds == 28800
+        assert admin_pool.matching(r"\borg_settings\b") == []
 
-    async def test_auth_login_asks_scoped_settings_for_the_accounts_kind(
+    async def test_auth_login_asks_scoped_settings_for_the_accounts_kind_and_org(
         self, current_hash: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The policy comes from scoped_settings.session_policy_for(<pool>, account kind)
-        (GH-160; sessions.session_policy_for is retired)."""
+        """The policy comes from scoped_settings.session_policy_for(<pool>, <account kind>,
+        <account org_id>) (GH-160; GH-169 adds the org id): a member's own org, a Super
+        Admin's None."""
         real = scoped_settings.session_policy_for
-        kinds: list[str] = []
+        calls: list[tuple[Any, str, Any]] = []
 
-        async def spy(executor: Any, kind: str) -> Any:
-            kinds.append(kind)
-            return await real(executor, kind)
+        async def spy(executor: Any, kind: str, org_id: Any = None) -> Any:
+            calls.append((executor, kind, org_id))
+            return await real(executor, kind, org_id)
 
         monkeypatch.setattr(scoped_settings, "session_policy_for", spy)
+        member_pool = _FakePool(_member(current_hash))
+        admin_pool = _FakePool(_super_admin(current_hash))
 
-        await _login(_FakePool(_member(current_hash)))
-        await _login(_FakePool(_super_admin(current_hash)))
+        await _login(member_pool)
+        await _login(admin_pool)
 
-        assert kinds == ["member", "super_admin"]
+        assert [
+            (executor is pool, kind, org_id)
+            for (executor, kind, org_id), pool in zip(calls, [member_pool, admin_pool], strict=True)
+        ] == [(True, "member", _ORG_ID), (True, "super_admin", None)]
 
     @pytest.mark.parametrize("cause", ["wrong-password", "deactivated", "unknown-email"])
     async def test_auth_login_failure_asks_for_no_policy(
         self, cause: str, current_hash: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A failed login opens no session, so it needs no policy."""
+        """A failed login opens no session, so it needs no policy: session_policy_for isn't
+        called and no org_settings row is read (GH-169)."""
         calls: list[Any] = []
 
-        async def spy(executor: Any, kind: str) -> Any:
-            calls.append(kind)
+        async def spy(executor: Any, kind: str, org_id: Any = None) -> Any:
+            calls.append((kind, org_id))
             return _policy(60, 12)
 
         monkeypatch.setattr(scoped_settings, "session_policy_for", spy)
         account, password = _failure_case(cause, current_hash)
+        pool = _FakePool(account, org_policies={_ORG_ID: (20, 2)})
 
         with pytest.raises(LoginFailedError):
-            await _login(_FakePool(account), password=password)
+            await _login(pool, password=password)
 
         assert calls == []
+        assert pool.matching(r"\borg_settings\b") == []
 
 
 class TestLoginRehash:

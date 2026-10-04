@@ -30,7 +30,9 @@
  *   backend's `detail` / the error's message (#139 §5: error responses are
  *   never echoed).
  * - `orgTabFrom`: the `?tab=` query value → 'permissions' only for exactly
- *   'permissions', else 'users'.
+ *   'permissions', else 'users'. Issue #169 adds the Settings tab: 'settings'
+ *   (exactly that string) → 'settings'; case, whitespace or array variants
+ *   still fall back to 'users'.
  * - `confirmCopy`: the confirm sheet copy per pending action (catalog keys,
  *   `{name}` / `{role}` substituted, destructive flags, the self-warning
  *   appended for deactivate / delete / role on your own account).
@@ -63,6 +65,7 @@ import {
   seatLabel,
   seatsFull,
   type DirectoryFilter,
+  type OrgTab,
   type PendingKind,
   type StatusFilter,
 } from '@/services/orgUsers';
@@ -693,6 +696,30 @@ describe('orgTabFrom', () => {
       expect(orgTabFrom(value)).toBe('users');
     },
   );
+
+  // Issue #169: the Organization page gets a Settings tab (`?tab=settings`).
+
+  it("maps 'settings' to the settings tab (issue #169)", () => {
+    expect(orgTabFrom('settings')).toBe('settings');
+  });
+
+  it('maps every tab value to itself, users, settings and permissions (issue #169)', () => {
+    const tabs: OrgTab[] = ['users', 'settings', 'permissions'];
+
+    expect(tabs.map((tab) => orgTabFrom(tab))).toEqual(['users', 'settings', 'permissions']);
+  });
+
+  it("selects the settings tab only for the exact string 'settings'; near misses fall back to users (issue #169)", () => {
+    const nearMisses: unknown[] = ['SETTINGS', 'Settings', ' settings', 'settings ', 'settings\n', ['settings'], { tab: 'settings' }];
+
+    expect({
+      exact: orgTabFrom('settings'),
+      nearMisses: nearMisses.map((value) => orgTabFrom(value)),
+    }).toEqual({
+      exact: 'settings',
+      nearMisses: ['users', 'users', 'users', 'users', 'users', 'users', 'users'],
+    });
+  });
 });
 
 // --- Confirm sheet copy ----------------------------------------------------------------
