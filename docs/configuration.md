@@ -54,9 +54,9 @@ organization, and only the Super Admin can change it.
   start.
 - Or, as the Super Admin, `PATCH /api/platform/settings` with e.g.
   `{"llm": {"provider": "vllm"}}` (see [Settings](#settings-mine-organization-platform)).
-  The switch applies at once, until the next restart. There's no page for it yet; the
-  Platform console adds one. A switch to Claude or OpenAI needs the
-  [residency confirmation](#data-residency-and-the-provider).
+  The switch applies at once, until the next restart. In the PWA, use
+  **Platform → Defaults → Model**: pick the provider and its model, then **Save**. A switch
+  to Claude or OpenAI needs the [residency confirmation](#data-residency-and-the-provider).
 - Model IDs live in `config.yaml` under `llm` (`infomaniak_model`, `vllm_model`,
   `anthropic_model`, `openai_model`); all stay set so switching needs no model edit. The
   API key still comes from the environment.
@@ -84,6 +84,10 @@ aren't.
   the running provider stays. The number is counted again when the switch is written: if
   an organization's data residency changed in between, the answer is the same `409` with
   the new number.
+  In **Platform → Defaults**, **Save** opens a confirmation dialog that names the number
+  of organizations with data residency on and sends it for you when you confirm **Switch
+  anyway**. If that number changed in the meantime, the dialog stays open with the new
+  number, and your edits are kept.
 - A switch to `infomaniak` or `vllm`, or a patch that keeps the provider, needs no
   confirmation; a given `confirm_residency_orgs` is ignored. `confirm_residency_orgs` is
   not a setting: a patch that gives only it answers `422`.
@@ -234,7 +238,7 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 | --- | --- | --- | --- |
 | **Mine** | every account | `GET` / `PATCH /api/me/settings`, `POST /api/me/settings/reset` | Theme, tool-approval pings and task-done pings. The **Settings** page shows these next to **My account**. |
 | **Organization** | Org Admin | `GET` / `PATCH /api/org/settings` | Which tool services the agent may use: Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive and memory. Org Admins switch them under **Organization → Services**. The response also carries the organization's data residency policy (`data_residency`, read-only here). |
-| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider, a model per provider, the active model's capabilities and the LLM retry limit, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. The response also carries the number of organizations with data residency on (`llm.residency_orgs`, read-only). |
+| **Platform** | Super Admin | `GET` / `PATCH /api/platform/settings` | The LLM provider, a model per provider, the active model's capabilities and the LLM retry limit, the platform limits, and the [platform defaults](#platform-defaults): file limits, retention, and security. The Super Admin edits them under **Platform → Defaults**. The response also carries the number of organizations with data residency on (`llm.residency_orgs`, read-only). |
 
 - The UI and response languages, the timezone and the personal instructions belong to your
   account, not to these settings (see **My account** under
@@ -261,7 +265,9 @@ Settings have three scopes. Each has an owner and its own route; any other role 
 ### Platform defaults
 
 `PATCH /api/platform/settings` takes any of these sections. Each field is optional, and
-the response holds every section after the change.
+the response holds every section after the change. **Platform → Defaults** shows the same
+sections (Model, Limits, Files, Retention, Security) as one form, with each field's range
+next to it; **Save** stays off until something changed, and **Reset** drops your edits.
 
 | Section | Field | Default | Range | Used by |
 | --- | --- | --- | --- | --- |
@@ -522,8 +528,8 @@ the agent may use), tool permissions and critical permissions. Later releases ad
 organization's settings.
 The Tools page is **My connections**: each user connects their own Google and Microsoft
 accounts there (see [Tools → Authentication](tools.md#authentication)). The Permissions page shows Editors and Viewers
-what the agent may do in their organization. The Platform page is a placeholder that a later
-release fills in. The server checks every request on its own, so a hidden page's API still
+what the agent may do in their organization. The Platform page is the Super Admin's console (see
+[Organizations](#organizations-super-admin)). The server checks every request on its own, so a hidden page's API still
 refuses a role that isn't allowed to use it.
 
 ## Organizations (Super Admin)
@@ -533,6 +539,23 @@ them, and sets their data residency policy. These routes are for the Super Admin
 (`403` for everyone else), and they return organization metadata only, never content.
 Every change is recorded in the organization's own audit log, so its Org Admins see what
 the Super Admin did.
+
+The PWA offers all of this under **Platform → Organizations**. The list shows each
+organization's name, status, seat limit, storage quota, data residency and, while a
+deletion is pending, the deletion date; there is no budget column in this release. **Create
+organization** takes the name, the first Org Admin's email, the seats, the monthly budget
+(CHF) and the storage quota (GiB), prefilled with the defaults. Each row's menu offers,
+depending on the organization's status, **Edit limits** (a form with **Save limits**, which
+saves directly), **Deactivate** / **Reactivate**, **Schedule deletion** / **Cancel
+deletion** and the data residency switch (**Require Swiss residency** / **Lift Swiss
+residency**); the status and residency actions each ask for a confirmation first. While a
+deletion is pending, only **Cancel deletion** is offered. Opening an organization shows its
+**organization detail**: the seat usage, the storage used and the number of chats and files
+(counts only, never content), and its users. Each user's menu offers what fits their status:
+**Deactivate**, **Reactivate**, **Send password reset** (active users of an active
+organization) and, for an invited Org Admin of an active organization that has no active
+Org Admin yet, **Re-invite** (leave the email blank to resend to the same address, or enter
+a new one to replace it).
 
 - **Create**: `POST /api/platform/orgs` with `name`, `primary_admin_email`, `seats`,
   `monthly_budget_chf`, `storage_quota` (in bytes) and optionally `status` (`active` by

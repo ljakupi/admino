@@ -194,13 +194,14 @@ python -m admino.admin_cli create-superadmin --email you@example.ch --name 'Your
   logged.
 
 Then log in at **http://localhost:8000** with that email and password. The Super Admin
-only sees the Platform page (which later releases fill in) and has no chat; chat needs a
-member account in an organization.
+only sees the Platform console (**Platform → Organizations** and **Defaults**) and has no
+chat; chat needs a member account in an organization.
 
 ## 6. Create an organization
 
 Chat happens inside an organization. Create one and invite its first Org Admin from the
-command line (the Super Admin can also do it with `POST /api/platform/orgs`, see
+command line (the Super Admin can also use **Platform → Organizations → Create
+organization**, or `POST /api/platform/orgs`, see
 [Organizations](configuration.md#organizations-super-admin)):
 
 ```bash
@@ -225,8 +226,8 @@ the invitation email is in English; set them with `--seats`, `--budget-chf`,
   Admin. They can then invite everyone else.
 - An address that already has an account is refused, and nothing is created.
 - With SMTP configured, if the link expires or went to the wrong address, the Super Admin
-  can send the invitation again, or to another address, until the organization has an
-  active Org Admin (see [Organizations](configuration.md#organizations-super-admin)).
+  can send the invitation again, or to another address, from the organization's detail
+  under **Platform → Organizations**, until the organization has an active Org Admin (see [Organizations](configuration.md#organizations-super-admin)).
 
 ## 7. Your first chat
 
