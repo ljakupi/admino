@@ -32,9 +32,14 @@ Security notes:
   instructions and attachments follow it, each inside its own delimited
   section, introduced as preferences that can't override the rules above.
 - ``sanitize_section`` strips control, format (bidi overrides, zero-width
-  characters, BOM), surrogate and line/paragraph separator characters from
-  every section's text, then removes every section marker until none can
-  re-form, so a section can't close itself early or forge another one.
+  space, BOM; the zero-width non-joiner and joiner stay, as some scripts and
+  emoji need them), surrogate and line/paragraph separator characters from
+  every section's text, then removes every exact section marker (any case and
+  inner whitespace) until none can re-form. Look-alikes (a joiner or
+  non-joiner inside the name, attributes, a space for the underscore, NFKC
+  look-alikes) stay, so the sections are guidance to the model: tool
+  permissions are enforced by the permission engine at dispatch. Untrusted
+  text (attachments, GH-189) needs GH-243's boundary on top.
 - No account identifier can reach a slot: ``PromptContext`` has no id, email,
   name or role field, and no function here takes one.
 - The response language is resolved here (user preference, else the org
