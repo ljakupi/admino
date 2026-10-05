@@ -28,8 +28,9 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
   is kept. Login, sessions, resets and invitation links already refuse an org
   that isn't active.
 - ``purge_due_orgs`` irreversibly removes every org whose grace period is
-  over, each in its own transaction: its users first (the foreign keys
-  cascade to their sessions, invitations, queued email and reset tokens),
+  over, each in its own transaction: its chats locked first (see the
+  race-free transitions below), then its users (the foreign keys cascade to
+  their chats, sessions, invitations, queued email and reset tokens),
   then its audit events and the org row itself (cascading to its settings and
   permission rows), both through one call of the database function
   ``purge_org_audit_events`` (migrations 0011 and 0019), then its directory
@@ -62,6 +63,11 @@ Security notes:
   status is checked. The purge re-checks each due org under that lock, so a
   concurrent cancel wins; the database function refuses an org that isn't
   pending and due, a second, independent gate on the irreversible step.
+  Before that lock, the purge locks every chat of the org (trashed ones
+  included) in id order, the order of the org-wide promotion notice
+  (``chats``' S12a lock): the notice holds the chats while its insert takes a
+  key-share lock on the org row, so chats first, then the org row, leaves no
+  lock cycle between the two (GH-265).
 - The database owns the deletion window (migration 0019): a trigger stamps
   the request date, refuses a purge date less than 7 days away and freezes
   both dates while the deletion is pending, for every role. Only the
@@ -200,6 +206,18 @@ _DUE_SQL: Final = """
     SELECT id FROM organizations
     WHERE status = 'pending_deletion' AND purge_after <= now()
     ORDER BY purge_after, id
+"""
+# Every chat of the org, trashed ones included (the users cascade removes them
+# all), locked in id order: the same order as the promotion notice's lock
+# (chats S12a), so the purge and a notice can't lock the same chats in opposite
+# orders (GH-265). It runs before the org row's lock: the notice's message
+# INSERT takes a key-share lock on the org row while it holds the chats, so a
+# purge holding the org row while it waits for the chats would deadlock.
+_LOCK_CHATS_SQL: Final = """
+    SELECT id FROM chats
+    WHERE org_id = $1
+    ORDER BY id
+    FOR UPDATE
 """
 # The locked re-check: a deletion cancelled since the due lookup matches nothing.
 _LOCK_DUE_SQL: Final = """
@@ -714,13 +732,17 @@ def _remove_org_files(path: Path) -> None:
 async def _purge_org(pool: asyncpg.Pool, org_id: UUID, attachments_root: Path) -> bool:
     """Purge one due org in its own transaction; return False if it is no longer due.
 
-    In order: lock the org and re-check it is due; delete its users (cascading
-    to their rows); call ``purge_org_audit_events``, which removes the org's
-    audit events and then the organization row; record ``org.purge``; remove
-    the org's files last. The app never removes the organization row itself:
-    the runtime role has no DELETE privilege on organizations.
+    In order: lock the org's chats in id order (GH-265: the promotion notice's
+    order, and before the org row, which the notice's insert also locks);
+    lock the org and re-check it is due; delete its users (cascading to their
+    rows, the chats included); call ``purge_org_audit_events``, which removes
+    the org's audit events and then the organization row; record
+    ``org.purge``; remove the org's files last. The app never removes the
+    organization row itself: the runtime role has no DELETE privilege on
+    organizations.
     """
     async with pool.acquire() as conn, conn.transaction():
+        await conn.fetch(_LOCK_CHATS_SQL, org_id)
         if await conn.fetchval(_LOCK_DUE_SQL, org_id) is None:
             return False
         users_purged = _deleted_count(await conn.execute(_DELETE_USERS_SQL, org_id))
