@@ -1,9 +1,18 @@
 """Tests for automatic chat titles (``admino.chat_titles``, GH-179 contract section 3).
 
 After a chat's first exchange the server asks the chat's model for a title in
-the background. This file covers the pure parts of that module and the model
-call; the background task (``title_chat``), the repository compare-and-set,
-the clients' per-call ``max_tokens`` and the routes have their own files.
+the background. This file covers the pure parts of that module, the model call
+and ``title_chat``'s signature; the background task's behaviour (``title_chat``),
+the repository compare-and-set, the clients' per-call ``max_tokens`` and the
+routes have their own files.
+
+- Module surface (GH-264 contract sections 2 and 3): the two helpers this module
+  takes from ``models`` are public, ``models.sanitize_display_text`` and
+  ``models.CHAT_TITLE_BANNED_CATEGORIES`` (``{"Cc", "Cf", "Zl", "Zp", "Cs"}``);
+  the private names are gone, no module under ``src/admino/`` names them, and
+  this module imports no underscore-prefixed name from any ``admino`` module.
+  Every keyword-only parameter of ``title_chat`` has no default,
+  ``external_content`` included, so no caller can leave it out.
 
 - ``build_title_messages(user, assistant)``: exactly a fixed system prompt and
   one user message ``"User:\\n{u}\\n\\nAssistant:\\n{a}"``, each excerpt stripped,
@@ -14,15 +23,26 @@ the clients' per-call ``max_tokens`` and the routes have their own files.
 - ``sanitize_title(raw)``: the model reply, in order: reasoning blocks removed,
   the first non-empty line, a leading heading marker / ``title:`` label
   dropped, surrounding quote and emphasis characters stripped (these two steps
-  repeat until stable, so ``**Title:** X`` is ``X``), credentials redacted and
-  control characters stripped as for a stored message (NFKC included), banned
-  title characters (Cc, Cf, Cs, Zl, Zp) removed, whitespace collapsed,
-  credentials redacted once more (a key split by a removed invisible character),
-  trailing dots removed, then truncated. ``""`` when nothing usable remains,
-  else always a valid ``models.ChatTitle`` of at most 80 characters.
-- ``fallback_title(user_message)``: the first user message, redacted, cleaned,
-  single-spaced, redacted once more and truncated (no markdown, label or quote
-  stripping).
+  repeat until stable, so ``**Title:** X`` is ``X``), banned title characters
+  (Cc, Cf, Cs, Zl, Zp; whitespace still separates words) removed before the
+  redaction, so a key split by one is joined first (GH-264 security audit L-2),
+  credentials redacted and control characters stripped as for a stored message
+  (NFKC included), banned characters removed, whitespace collapsed, trailing
+  dots removed, then truncated. ``""`` when nothing usable remains, else always
+  a valid ``models.ChatTitle`` of at most 80 characters.
+- ``fallback_title(user_message)``: the first user message, cleaned the same
+  way (banned characters removed before the redaction), single-spaced and
+  truncated (no markdown, label or quote stripping).
+- Long keys (GH-264): a 164-character ``sk-proj-`` key and a 108-character
+  ``sk-ant-api03-`` key with ``_`` become exactly one ``[CREDENTIAL_REDACTED]``
+  in a model title and in a fallback title, alone or in a sentence whose text
+  is kept; no 8-character chunk of either key survives. The keys are built at
+  runtime (tests/credential_keys.py); the rule itself is pinned in
+  tests/test_credential_redaction.py.
+- The sanitizer cases are one per distinct rule (GH-264): one per character
+  group for the quotes and emphasis stripped or kept, and one per Unicode
+  category and removal path (the models control table or the banned-category
+  step) for the characters removed.
 - ``generate_title``: one ``llm_policy.chat`` call (looked up at call time) with
   those messages, no tools and ``max_tokens=TITLE_MAX_TOKENS`` (40), through
   the residency guard and the retries; the sanitized reply, or the fallback on
@@ -41,7 +61,9 @@ import asyncio
 import dataclasses
 import inspect
 import random
+import re
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -50,11 +72,14 @@ from pydantic import TypeAdapter, ValidationError
 from admino import llm_policy, models
 from admino.llm import LLMError, LLMResponse
 from admino.models import LLMMessage, ToolCall
+from tests.credential_keys import anthropic_api03_key, openai_project_key, surviving_chunks
 from tests.log_capture import configured_logging
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from types import ModuleType
+
+    from tests.credential_keys import ApiKey
 
 # Characters built with chr(): typographic quotes and invisible characters are
 # unreadable (or flagged as ambiguous) as literals.
@@ -68,7 +93,7 @@ NBSP = chr(0x00A0)
 SHY = chr(0x00AD)  # soft hyphen (Cf), not in models' control table
 ZWSP = chr(0x200B)  # zero width space (Cf), in the control table
 RLO = chr(0x202E)  # right-to-left override (Cf), in the control table
-RLI, PDI = chr(0x2067), chr(0x2069)  # bidi isolates (Cf), not in the control table
+RLI, PDI = chr(0x2067), chr(0x2069)  # bidi isolates (Cf), in the control table
 WORD_JOINER = chr(0x2060)  # word joiner (Cf), not in the control table
 DEL = chr(0x7F)  # delete (Cc), not in the control table
 BOM = chr(0xFEFF)
@@ -376,6 +401,91 @@ class TestModuleSurface:
             ("data_residency", keyword, True),
             ("max_retries", keyword, True),
         ]
+
+    def test_chat_titles_title_chat_signature_has_no_keyword_default(self, ct: ModuleType) -> None:
+        """GH-264 contract section 3: ``external_content`` is required, so no caller fails open."""
+        assert inspect.iscoroutinefunction(ct.title_chat)
+        params = inspect.signature(ct.title_chat).parameters
+        shape = [
+            (name, param.kind, param.default is inspect.Parameter.empty)
+            for name, param in params.items()
+        ]
+        positional = inspect.Parameter.POSITIONAL_OR_KEYWORD
+        keyword = inspect.Parameter.KEYWORD_ONLY
+        assert shape == [
+            ("pool", positional, True),
+            ("tenant", positional, True),
+            ("chat_id", positional, True),
+            ("get_client", keyword, True),
+            ("user_message", keyword, True),
+            ("assistant_message", keyword, True),
+            ("run_failed", keyword, True),
+            ("external_content", keyword, True),
+            ("data_residency", keyword, True),
+            ("max_retries", keyword, True),
+        ]
+        assert params["external_content"].annotation in (bool, "bool")
+
+    def test_chat_titles_models_helpers_have_public_names(self) -> None:
+        """GH-264 contract section 2: the display-text sanitizer and the banned categories."""
+        assert callable(models.sanitize_display_text)
+        banned = models.CHAT_TITLE_BANNED_CATEGORIES
+        assert (type(banned), banned) == (frozenset, frozenset({"Cc", "Cf", "Zl", "Zp", "Cs"}))
+
+    def test_chat_titles_models_private_helper_names_are_removed(self) -> None:
+        """Renamed, not aliased: the private names are gone from ``models``."""
+        old = ("_sanitize_display_text", "_CHAT_TITLE_BANNED_CATEGORIES")
+        assert [name for name in old if hasattr(models, name)] == []
+
+    def test_chat_titles_imports_no_private_admino_name(self, ct: ModuleType) -> None:
+        """No ``from admino.x import _name`` and no ``x._name`` on an imported admino module."""
+        tree = ast.parse(inspect.getsource(ct))
+        admino_modules: set[str] = set()
+        private: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ""
+                if node.level or module == "admino" or module.startswith("admino."):
+                    private.extend(
+                        f"{module}.{alias.name}"
+                        for alias in node.names
+                        if alias.name.startswith("_")
+                    )
+                    if node.level or module == "admino":
+                        # ``from admino import chats`` binds a module.
+                        admino_modules.update(alias.asname or alias.name for alias in node.names)
+            elif isinstance(node, ast.Import):
+                admino_modules.update(
+                    alias.asname or alias.name.split(".")[0]
+                    for alias in node.names
+                    if alias.name.split(".")[0] == "admino"
+                )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Attribute):
+                continue
+            root: ast.expr = node.value
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if (
+                isinstance(root, ast.Name)
+                and root.id in admino_modules
+                and node.attr.startswith("_")
+                and not node.attr.startswith("__")
+            ):
+                private.append(ast.unparse(node))
+        assert private == []
+
+    def test_chat_titles_no_module_names_the_old_private_helpers(self) -> None:
+        """No module under src/admino/ names ``_sanitize_display_text`` or the old banned set."""
+        package = Path(inspect.getfile(models)).parent
+        old_name = re.compile(r"(?<!\w)(?:_sanitize_display_text|_CHAT_TITLE_BANNED_CATEGORIES)\b")
+        hits = [
+            f"{path.relative_to(package)}:{number}"
+            for path in sorted(package.rglob("*.py"))
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+            if old_name.search(line)
+        ]
+        assert hits == []
 
     def test_chat_titles_imports_only_the_allowed_modules(self, ct: ModuleType) -> None:
         """Stdlib, chats, llm, llm_policy, logs, models; asyncpg / tenancy for typing only."""
@@ -685,38 +795,23 @@ class TestSanitizeHeadingAndLabel:
 
 
 class TestSanitizeQuotes:
-    """Step 4: quote and emphasis characters are stripped from both ends."""
+    """Step 4: quote and emphasis characters are stripped from both ends.
+
+    One case per character group the step names: ASCII quotes, markdown emphasis
+    (a run of it), English typographic quotes, the German low-high pair and
+    guillemets.
+    """
 
     @pytest.mark.parametrize(
         ("opening", "closing"),
         [
             ('"', '"'),
-            ("'", "'"),
-            ("`", "`"),
-            ("*", "*"),
             ("**", "**"),
-            ("_", "_"),
             (LDQUO, RDQUO),
-            (LSQUO, RSQUO),
             (BDQUO, LDQUO),
             (LAQUO, RAQUO),
-            (RAQUO, LAQUO),
-            (LSAQUO, RSAQUO),
         ],
-        ids=[
-            "double",
-            "single",
-            "backtick",
-            "star",
-            "bold",
-            "underscore",
-            "curly-double",
-            "curly-single",
-            "german-low-high",
-            "guillemets",
-            "guillemets-reversed",
-            "single-guillemets",
-        ],
+        ids=["double", "bold", "curly-double", "german-low-high", "guillemets"],
     )
     def test_chat_titles_sanitize_strips_surrounding_quotes(
         self, ct: ModuleType, opening: str, closing: str
@@ -729,8 +824,8 @@ class TestSanitizeQuotes:
 
     @pytest.mark.parametrize(
         "raw",
-        ['The "best" plan', "Don't panic", "snake_case naming", "It's *really* good"],
-        ids=["inner-double", "apostrophe", "inner-underscore", "inner-emphasis"],
+        ['The "best" plan', "It's *really* good"],
+        ids=["inner-double", "inner-emphasis"],
     )
     def test_chat_titles_sanitize_keeps_inner_quotes(self, ct: ModuleType, raw: str) -> None:
         assert ct.sanitize_title(raw) == raw
@@ -781,12 +876,17 @@ class TestSanitizeLabelBehindEmphasis:
 
 
 class TestSanitizeCredentialsAndCharacters:
-    """Steps 5 and 6: redaction, NFKC and banned characters, whitespace collapse."""
+    """Steps 5 and 6: redaction, NFKC and banned characters, whitespace collapse.
+
+    The removed characters are one case per Unicode category and removal path:
+    Cc and Cf removed by the models control table (NUL, RLO) or only as a banned
+    category (DEL, the soft hyphen), Cs, and the line breaks Zl, Zp and Cc (NEL).
+    """
 
     def test_chat_titles_sanitize_redacts_an_api_key(self, ct: ModuleType) -> None:
         raw = "Rotate sk-" + "a" * 24
         assert ct.sanitize_title(raw) == "Rotate " + models._REDACTED
-        assert ct.sanitize_title(raw) == models._sanitize_display_text(raw)
+        assert ct.sanitize_title(raw) == models.sanitize_display_text(raw)
 
     def test_chat_titles_sanitize_redacts_a_bearer_token(self, ct: ModuleType) -> None:
         raw = "Use Bearer abc123def456 now"
@@ -808,34 +908,8 @@ class TestSanitizeCredentialsAndCharacters:
 
     @pytest.mark.parametrize(
         "char",
-        [
-            chr(0x00),
-            chr(0x1B),
-            chr(0x7F),
-            chr(0x9B),
-            SHY,
-            ZWSP,
-            RLO,
-            RLI,
-            PDI,
-            WORD_JOINER,
-            BOM,
-            SURROGATE,
-        ],
-        ids=[
-            "nul",
-            "esc",
-            "del",
-            "csi",
-            "soft-hyphen",
-            "zwsp",
-            "rlo",
-            "rli",
-            "pdi",
-            "word-joiner",
-            "bom",
-            "surrogate",
-        ],
+        [chr(0x00), DEL, RLO, SHY, SURROGATE],
+        ids=["nul", "del", "rlo", "soft-hyphen", "surrogate"],
     )
     def test_chat_titles_sanitize_removes_control_and_format_characters(
         self, ct: ModuleType, char: str
@@ -844,8 +918,8 @@ class TestSanitizeCredentialsAndCharacters:
 
     @pytest.mark.parametrize(
         "char",
-        [LINE_SEP, PARA_SEP, NEL, chr(0x0B), chr(0x0C), chr(0x1C)],
-        ids=["line-sep", "para-sep", "nel", "vt", "ff", "fs"],
+        [LINE_SEP, PARA_SEP, NEL],
+        ids=["line-sep", "para-sep", "nel"],
     )
     def test_chat_titles_sanitize_removes_line_separators(self, ct: ModuleType, char: str) -> None:
         result = ct.sanitize_title(f"Budget{char}review")
@@ -860,7 +934,6 @@ class TestSanitizeCredentialsAndCharacters:
             (f"Budget{NBSP}review", "Budget review"),
             (f"Budget{OGHAM_SPACE}{OGHAM_SPACE}review", "Budget review"),
             (f"Budget {SHY} review", "Budget review"),
-            (f"Budget {ZWSP}{RLI} \t review", "Budget review"),
             ("   Budget review   ", "Budget review"),
         ],
         ids=[
@@ -869,7 +942,6 @@ class TestSanitizeCredentialsAndCharacters:
             "nbsp",
             "unicode-space",
             "removed-char-between-spaces",
-            "mixed",
             "ends",
         ],
     )
@@ -1041,15 +1113,15 @@ class TestFallbackTitle:
 
 
 # ===========================================================================
-# 5b. The second redaction (sanitize_title and fallback_title)
+# 5b. Credentials split by an invisible character (sanitize_title and fallback_title)
 # ===========================================================================
 
 
 def _split_credential(kind: str, char: str) -> tuple[str, str, str]:
     """(text with a credential split by ``char``, the same text joined, the expected title).
 
-    ``models._sanitize_display_text`` keeps ``char``, so the first redaction
-    misses the split credential; removing ``char`` in step 6 joins it again.
+    ``models.sanitize_display_text`` keeps ``char``, so redacting the raw text
+    misses the split credential; removing ``char`` joins it again.
     """
     if kind == "key":
         joined = "Key sk-" + "a" * 24
@@ -1059,11 +1131,11 @@ def _split_credential(kind: str, char: str) -> tuple[str, str, str]:
 
 
 class TestSecondRedaction:
-    """Step 6 (amended): credentials are redacted once more after banned characters go.
+    """Step 6 (amended): a credential split by a banned character is redacted.
 
-    A soft hyphen, a word joiner or DEL inside a credential hides it from the
-    first redaction (``models._CONTROL_CHAR_TABLE`` keeps them); step 6 removes
-    them and would hand a clean, unredacted credential to the title.
+    A soft hyphen, a word joiner or DEL inside a credential hides it from
+    ``models.sanitize_display_text`` (``models._CONTROL_CHAR_TABLE`` keeps
+    them); removing them would hand a clean, unredacted credential to the title.
     """
 
     @pytest.mark.parametrize(
@@ -1075,9 +1147,9 @@ class TestSecondRedaction:
         self, ct: ModuleType, function: str, kind: str, char: str
     ) -> None:
         raw, joined, expected = _split_credential(kind, char)
-        assert models._REDACTED not in models._sanitize_display_text(raw)  # first pass misses it
+        assert models._REDACTED not in models.sanitize_display_text(raw)  # first pass misses it
         result = getattr(ct, function)(raw)
-        assert result == expected == models._sanitize_display_text(joined)
+        assert result == expected == models.sanitize_display_text(joined)
         assert _invariant_violation(result) is None
 
     @pytest.mark.parametrize("function", ["sanitize_title", "fallback_title"])
@@ -1089,6 +1161,71 @@ class TestSecondRedaction:
         result = getattr(ct, function)(raw)
         assert result == f"Use {models._REDACTED} " + " ".join(["word"] * 10) + ELLIPSIS
         assert _invariant_violation(result) is None
+
+
+class TestKeySplitPastTheMinimum:
+    """Security audit L-2: a key split after its 20th key character is redacted whole.
+
+    Split 40 characters into the body of the 164-character ``sk-proj-`` key, the
+    part before the invisible character is already a key on its own. Redacting
+    before the character goes would redact only that head; removing the
+    character afterwards joins the tail (which doesn't start with ``sk-``) onto
+    the marker, and no later pass can match it. The banned characters go before
+    the redaction, so the key is joined first and becomes one marker.
+    """
+
+    @pytest.mark.parametrize(
+        "char", [SHY, WORD_JOINER, DEL], ids=["soft-hyphen", "word-joiner", "del"]
+    )
+    @pytest.mark.parametrize("function", ["sanitize_title", "fallback_title"])
+    def test_chat_titles_key_split_past_its_minimum_length_is_redacted_whole(
+        self, ct: ModuleType, function: str, char: str
+    ) -> None:
+        key = openai_project_key()
+        split = key.prefix + key.body[:40] + char + key.body[40:]
+        alone = getattr(ct, function)(split)
+        in_sentence = getattr(ct, function)(f"Rotate {split} today")
+        assert (alone, in_sentence) == (models._REDACTED, f"Rotate {models._REDACTED} today")
+        assert surviving_chunks(alone + in_sentence, key) == []
+
+
+# ===========================================================================
+# 5c. Long API keys in titles (GH-264)
+# ===========================================================================
+
+_LONG_KEYS = pytest.mark.parametrize(
+    "key",
+    [openai_project_key(), anthropic_api03_key()],
+    ids=["openai-project-164", "anthropic-api03-108"],
+)
+_TITLE_FUNCTIONS = pytest.mark.parametrize("function", ["sanitize_title", "fallback_title"])
+
+
+class TestLongKeys:
+    """A current key format is redacted in full in a model title and in a fallback title.
+
+    Before GH-264 the ``sk-proj-`` key wasn't matched at all and the
+    ``sk-ant-api03-`` key only up to its first ``_``: about half of a live key
+    showed in every chat list row.
+    """
+
+    @_LONG_KEYS
+    @_TITLE_FUNCTIONS
+    def test_chat_titles_long_key_alone_is_redacted_whole(
+        self, ct: ModuleType, function: str, key: ApiKey
+    ) -> None:
+        result = getattr(ct, function)(key.text)
+        assert result == models._REDACTED
+        assert surviving_chunks(result, key) == []
+
+    @_LONG_KEYS
+    @_TITLE_FUNCTIONS
+    def test_chat_titles_long_key_in_a_sentence_is_redacted_and_the_text_kept(
+        self, ct: ModuleType, function: str, key: ApiKey
+    ) -> None:
+        result = getattr(ct, function)(f"Rotate {key.text} today")
+        assert result == f"Rotate {models._REDACTED} today"
+        assert surviving_chunks(result, key) == []
 
 
 # ===========================================================================

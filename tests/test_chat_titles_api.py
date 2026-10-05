@@ -55,12 +55,32 @@ What is pinned (POST /api/chats/{id}/messages and the legacy POST
   makes no title call and gets the fallback, on both turn routes. A plain tool
   result (memory.recall), or a begin marker the user typed or the reply quotes
   (no tool result), still gets the model's title.
+- A first turn refused with ``rate_limit`` (GH-24's pending-confirmation limit,
+  GH-264 contract section 4): the caller holds the stored
+  ``max_pending_confirmations`` in other chats and the real agent's run asks to
+  confirm one more call (google_calendar.create, confirm by default). On both
+  turn routes: 200 ``status: "error"``, ``error_code: "rate_limit"``, NO title
+  call (the stored turn is an error, whatever the run's own status was) and the
+  fallback of the first message as the ``auto`` title.
+- Long API keys (GH-264 contract sections 1, 5, 6): a 164-character
+  ``sk-proj-`` key and a 108-character ``sk-ant-api03-`` key holding ``_``
+  (built at runtime, never a literal) are each replaced in full by one
+  ``[CREDENTIAL_REDACTED]``, the words around them kept, in a model title, in
+  the fallback title (after a failed title call, and after an ``error`` turn),
+  in the stored messages GET /api/chats/{id} shows and in the turn's own
+  response. No part of either key (the key, or any 8-character chunk of its
+  body) is in the chat list or detail, a turn's error response, the 422 bodies
+  of POST /api/chats, PATCH /api/chats/{id} and an over-long POST
+  /api/chats/{id}/messages, any log record (every logger at DEBUG) or any audit
+  row; a title call whose exception text holds both keys logs none of it.
 
 ``admino.chat_titles`` is imported inside the tests, so the file collects (and
 fails per test) before GH-179 is implemented.
 
 Security notes:
-- Every message, title and id here is a fixed fake value.
+- Every message, title and id here is a fixed fake value. The two API keys are
+  random bodies from a fixed seed, assembled at import time: no key literal is
+  in this file (push protection, gitleaks).
 - No network, no real PostgreSQL, no real LLM.
 """
 
@@ -69,12 +89,15 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import random
+import string
 import uuid
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 import pytest
+from pydantic import BaseModel, Field
 
 from admino import main as main_module
 from admino import scoped_settings, untrusted
@@ -90,6 +113,7 @@ from tests.tenancy_world import (
     build_world,
     make_client,
     make_config,
+    seed_pending_confirmation,
     use_fake_database,
     use_fast_passwords,
     use_roomy_rate_limits,
@@ -990,3 +1014,299 @@ def test_chat_titles_api_legacy_message_reading_external_content_gets_the_fallba
     assert _tool_results_wrapped(world.db, chat_id) == [True]
     assert llm.kinds() == [None, None]
     assert _title_of(client, editor, chat_id) == (_LONG_FALLBACK, "auto")
+
+
+# ---------------------------------------------------------------------------
+# 8. A first turn refused with rate_limit (GH-264 contract section 4)
+# ---------------------------------------------------------------------------
+
+# A confirm action (the org policy's default for google_calendar.create).
+_CALENDAR_CALL: Final = ToolCall(
+    tool="google_calendar",
+    action="create",
+    args={"title": "Team sync"},
+    tool_call_id="call-264-calendar",
+)
+
+
+class _EventArgs(BaseModel):
+    """The fake google_calendar.create's arguments."""
+
+    title: str = Field(min_length=1, max_length=100)
+
+
+@pytest.fixture()
+def calendar_tool(_one_tool: None) -> list[str]:
+    """google_calendar.create beside memory.recall; the titles it created (it must never
+    run here: its confirmation is refused)."""
+    created: list[str] = []
+
+    async def create(args: _EventArgs, **_: Any) -> str:
+        created.append(args.title)
+        return f"Created event: {args.title}"
+
+    register: Any = registry.register_tool
+    register("google_calendar", "create", "Create an event (GH-264)", _EventArgs, side_effect=True)(
+        create
+    )
+    return created
+
+
+@pytest.mark.parametrize(
+    "legacy", [pytest.param(False, id="chat-route"), pytest.param(True, id="legacy-route")]
+)
+def test_chat_titles_api_rate_limited_first_turn_stores_the_fallback_without_a_title_call(
+    world: World,
+    client: TestClient,
+    llm: _TitleLLM,
+    calendar_tool: list[str],
+    legacy: bool,
+) -> None:
+    """The Editor already holds the stored ``max_pending_confirmations`` (3) in other
+    chats; an untitled chat's first run asks to confirm one more call. The turn is the
+    200 ``rate_limit`` error, the title task makes NO model call (the run itself ended
+    ``awaiting_confirmation``, the stored turn is an ``error``) and the next refresh
+    shows the fallback of the first message as the ``auto`` title. Both turn routes."""
+    editor = world.a["editor"]
+    held = default_test_platform_settings().limits.max_pending_confirmations
+    for n in range(held):
+        seed_pending_confirmation(editor, world.db.add_chat(editor.user_id), f"confirm-264-h{n}")
+    llm.replies.append(LLMResponse(content="", tool_calls=[_CALENDAR_CALL]))
+
+    if legacy:
+        response = client.post(
+            "/api/message",
+            headers=editor.cookie,
+            json={"message": _LONG_MESSAGE, "session_id": _LEGACY_SESSION},
+        )
+    else:
+        response = client.post(
+            f"/api/chats/{_new_chat(client, editor)}/messages",
+            headers=editor.cookie,
+            json={"message": _LONG_MESSAGE},
+        )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["status"], body["error_code"], body["pending_confirmation"]) == (
+        "error",
+        "rate_limit",
+        None,
+    )
+    assert calendar_tool == []
+    assert llm.title_calls == []
+    assert _title_of(client, editor, uuid.UUID(body["chat_id"])) == (_LONG_FALLBACK, "auto")
+
+
+# ---------------------------------------------------------------------------
+# 9. Long API keys: redacted in full in titles and messages, nowhere else (GH-264)
+# ---------------------------------------------------------------------------
+
+_REDACTED: Final = "[CREDENTIAL_REDACTED]"
+# "In part" (contract section 5): any chunk of this many characters of a key's body.
+_KEY_CHUNK: Final = 8
+
+
+@dataclass(frozen=True)
+class _Key:
+    """A test API key: its fixed prefix plus a random body, assembled at runtime."""
+
+    value: str
+    body: str
+
+    def parts(self) -> list[str]:
+        """The full key and every ``_KEY_CHUNK``-character window of its body."""
+        windows = range(len(self.body) - _KEY_CHUNK + 1)
+        return [self.value, *(self.body[start : start + _KEY_CHUNK] for start in windows)]
+
+
+def _build_key(prefix: str, total: int, seed: int) -> _Key:
+    """``prefix`` plus a body of ``[A-Za-z0-9_-]`` from a fixed seed holding at least
+    one ``_`` and one ``-``: ``total`` characters in all (contract section 6)."""
+    rng = random.Random(seed)  # noqa: S311
+    chars = [
+        rng.choice(string.ascii_letters + string.digits + "_-") for _ in range(total - len(prefix))
+    ]
+    underscore, dash = rng.sample(range(4, len(chars) - 4), 2)
+    chars[underscore], chars[dash] = "_", "-"
+    body = "".join(chars)
+    assert len(prefix + body) == total
+    return _Key(value=prefix + body, body=body)
+
+
+# Never a literal (GitHub push protection, gitleaks): prefixes from pieces, bodies random.
+_OPENAI_KEY: Final = _build_key("sk-" + "proj-", 164, 26401)
+_ANTHROPIC_KEY: Final = _build_key("sk-" + "ant-" + "api03-", 108, 26402)
+_KEYS: Final = (_OPENAI_KEY, _ANTHROPIC_KEY)
+_BOTH: Final = f"{_OPENAI_KEY.value} and {_ANTHROPIC_KEY.value}"
+_BOTH_SHOWN: Final = f"{_REDACTED} and {_REDACTED}"
+
+# A first message holding both keys, and what is shown of it (75 characters: the
+# fallback title keeps all of it).
+_KEY_MESSAGE: Final = f"Please rotate {_BOTH} before Friday"
+_KEY_MESSAGE_SHOWN: Final = f"Please rotate {_BOTH_SHOWN} before Friday"
+# A model title holding both keys, and the stored title.
+_KEY_RAW_TITLE: Final = f'"Rotate {_BOTH} today."'
+_KEY_TITLE: Final = f"Rotate {_BOTH_SHOWN} today"
+# A reply echoing both keys, and what is shown of it.
+_KEY_REPLY: Final = f"Your keys {_BOTH} are exposed."
+_KEY_REPLY_SHOWN: Final = f"Your keys {_BOTH_SHOWN} are exposed."
+
+
+def _exposed(*texts: str) -> list[str]:
+    """Every part of either test key (the key, any 8-character chunk of its body) that
+    one of ``texts`` holds."""
+    return [part for key in _KEYS for part in key.parts() if any(part in t for t in texts)]
+
+
+def _debug_everywhere(caplog: pytest.LogCaptureFixture) -> None:
+    """Capture DEBUG records of the root and of every logger known now (all restored)."""
+    caplog.set_level(logging.DEBUG)
+    for name in list(logging.root.manager.loggerDict):
+        caplog.set_level(logging.DEBUG, logger=name)
+
+
+def _audit_dump(world: World) -> str:
+    """Every FakeDb audit row as text."""
+    return json.dumps(world.db.audit, default=str)
+
+
+def _views(client: TestClient, account: Account, chat_id: uuid.UUID) -> str:
+    """The raw bodies of GET /api/chats and GET /api/chats/{chat_id}."""
+    listed = client.get("/api/chats", headers=account.cookie)
+    detail = client.get(f"/api/chats/{chat_id}", headers=account.cookie)
+    assert (listed.status_code, detail.status_code) == (200, 200), detail.text
+    return f"{listed.text}\n{detail.text}"
+
+
+def _titles_lines(caplog: pytest.LogCaptureFixture, chat_id: uuid.UUID) -> list[str]:
+    """The title task's log lines naming the chat (non-vacuity of a log scan)."""
+    return [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "admino.chat_titles" and str(chat_id) in record.getMessage()
+    ]
+
+
+def test_chat_titles_api_model_title_redacts_long_keys_in_full(
+    world: World, client: TestClient, llm: _TitleLLM, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The title call answers a sentence holding both keys: the next list refresh and
+    the chat's detail show it with each key replaced by one marker and the words kept;
+    no part of either key is in the list, the detail, a log record or an audit row."""
+    _debug_everywhere(caplog)
+    editor = world.a["editor"]
+    chat_id = _new_chat(client, editor)
+    llm.titles.append(LLMResponse(content=_KEY_RAW_TITLE))
+
+    _turn(client, editor, chat_id)
+
+    assert len(llm.title_calls) == 1
+    assert _title_of(client, editor, chat_id) == (_KEY_TITLE, "auto")
+    assert _titles_lines(caplog, chat_id)
+    assert _exposed(_views(client, editor, chat_id), _log_dump(caplog), _audit_dump(world)) == []
+
+
+def test_chat_titles_api_fallback_after_a_failed_title_call_redacts_long_keys(
+    world: World, client: TestClient, llm: _TitleLLM, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first message holds both keys and the title call raises an exception whose
+    text holds them too: the fallback title shows the message with each key replaced
+    by one marker; the title task logs its outcome, and no log record (the exception's
+    text included), audit row, list or detail holds any part of either key."""
+    _debug_everywhere(caplog)
+    editor = world.a["editor"]
+    chat_id = _new_chat(client, editor)
+    llm.titles.append(RuntimeError(f"Provider echoed {_BOTH}"))
+
+    _turn(client, editor, chat_id, _KEY_MESSAGE)
+
+    assert len(llm.title_calls) == 1
+    assert _title_of(client, editor, chat_id) == (_KEY_MESSAGE_SHOWN, "auto")
+    assert _titles_lines(caplog, chat_id)
+    assert _exposed(_views(client, editor, chat_id), _log_dump(caplog), _audit_dump(world)) == []
+
+
+def test_chat_titles_api_error_turn_redacts_long_keys_in_its_response_and_fallback(
+    world: World, client: TestClient, llm: _TitleLLM, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first message holds both keys and the agent's call fails with a coded
+    LLMError whose text holds them too: the error response (status ``error``, the code)
+    holds no part of either key, no title call is made, and the fallback title shows the
+    message with each key replaced by one marker; nothing leaks to the list, the
+    detail, a log record or an audit row."""
+    _debug_everywhere(caplog)
+    editor = world.a["editor"]
+    chat_id = _new_chat(client, editor)
+    llm.replies.append(LLMError(f"The provider refused {_BOTH}.", 404, code="missing_model"))
+
+    response = client.post(
+        f"/api/chats/{chat_id}/messages", headers=editor.cookie, json={"message": _KEY_MESSAGE}
+    )
+
+    assert response.status_code == 200, response.text
+    assert (response.json()["status"], response.json()["error_code"]) == (
+        "error",
+        "missing_model",
+    )
+    assert llm.kinds() == [None]
+    assert _title_of(client, editor, chat_id) == (_KEY_MESSAGE_SHOWN, "auto")
+    texts = (response.text, _views(client, editor, chat_id), _log_dump(caplog), _audit_dump(world))
+    assert _exposed(*texts) == []
+
+
+def test_chat_titles_api_stored_messages_and_reply_show_long_keys_redacted_in_full(
+    world: World, client: TestClient, llm: _TitleLLM, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The first message holds both keys and the agent's reply echoes them: the turn's
+    response and the stored user message and reply GET /api/chats/{id} shows replace
+    each key by one marker and keep the words; no part of either key is in the
+    response, the list, the detail, a log record or an audit row."""
+    _debug_everywhere(caplog)
+    editor = world.a["editor"]
+    chat_id = _new_chat(client, editor)
+    llm.replies.append(LLMResponse(content=_KEY_REPLY))
+
+    body = _turn(client, editor, chat_id, _KEY_MESSAGE)
+
+    detail = client.get(f"/api/chats/{chat_id}", headers=editor.cookie)
+    assert detail.status_code == 200, detail.text
+    shown = [(message["role"], message["content"]) for message in detail.json()["messages"]]
+    assert (body["response"], shown) == (
+        _KEY_REPLY_SHOWN,
+        [("user", _KEY_MESSAGE_SHOWN), ("assistant", _KEY_REPLY_SHOWN)],
+    )
+    texts = (json.dumps(body), _views(client, editor, chat_id), _log_dump(caplog))
+    assert _exposed(*texts, _audit_dump(world)) == []
+
+
+def test_chat_titles_api_422_bodies_echo_no_part_of_a_key(
+    world: World, client: TestClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A title holding a key plus a control character (BEL) on POST /api/chats and
+    PATCH /api/chats/{id}, and a message one character over the stored
+    ``max_message_length`` holding both keys: every answer is a 422 holding no part of
+    either key, and no log record or audit row holds one either."""
+    _debug_everywhere(caplog)
+    editor = world.a["editor"]
+    chat_id = _new_chat(client, editor)
+    max_length = default_test_platform_settings().limits.max_message_length
+    over_long = f"{_KEY_MESSAGE} " + "x" * (max_length - len(_KEY_MESSAGE))
+    assert len(over_long) == max_length + 1
+
+    responses: list[httpx.Response] = []
+    for key in _KEYS:
+        title = f"Rotate {key.value} now{chr(7)}"
+        responses.append(client.post("/api/chats", headers=editor.cookie, json={"title": title}))
+        responses.append(
+            client.patch(f"/api/chats/{chat_id}", headers=editor.cookie, json={"title": title})
+        )
+    responses.append(
+        client.post(
+            f"/api/chats/{chat_id}/messages", headers=editor.cookie, json={"message": over_long}
+        )
+    )
+
+    assert [response.status_code for response in responses] == [422] * 5
+    texts = [response.text for response in responses]
+    assert _exposed(*texts, _log_dump(caplog), _audit_dump(world)) == []
