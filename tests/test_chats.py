@@ -75,6 +75,21 @@ What these tests pin down (contract §2):
   live chat of the org, of every member; none in another org's or a trashed
   chat; ``last_activity_at`` unchanged; returns the count) and
   ``count_org_chats`` (the org's live chats).
+- GH-24 (contract §2, the GH-66 notice never breaks a chat awaiting a
+  confirmation): ``append_org_notice(pool, tenant, content)`` skips every chat
+  whose latest message (highest seq) is ``awaiting_confirmation``, whether that
+  row is the assistant's ``tool_use`` or a ``tool`` row of a batch, and leaves
+  it exactly as stored; a chat whose awaiting message was followed by anything
+  (an approved call's result, a denial, a new turn), a chat without messages,
+  the caller's other chats and colleagues' chats get the notice after their
+  history; only the latest message's status decides (an earlier awaiting one
+  doesn't count). The count excludes skipped chats. It runs exactly two
+  statements on one connection acquired from the pool, inside one committed
+  transaction: first the lock ``SELECT id FROM chats WHERE org_id = $1 AND
+  deleted_at IS NULL ORDER BY id FOR UPDATE`` (binds the org only), then the
+  INSERT (binds the org and the text, never a chat or user id); a turn that
+  commits while the lock waits is seen by the INSERT (its chat is skipped); a
+  failing INSERT propagates, rolls the transaction back and stores nothing.
 - Deleting a users row removes that user's chats and messages (CASCADE); other
   users' chats stay.
 - Hygiene: a module docstring with security notes; nothing imported from
@@ -1966,8 +1981,151 @@ def _org_chats(db: FakeDb) -> dict[str, Any]:
     return {"alice": alice, "bob": bob, "live": live, "trashed": trashed, "foreign": foreign}
 
 
+# GH-24: the two ways a chat's latest message awaits a confirmation.
+_AWAITING_KINDS: Final = ("assistant-tool-use", "batch-tool-row")
+# S12a: the lock on the org's live chats, in id order, waiting (no SKIP LOCKED / NOWAIT).
+_NOTICE_LOCK_RE: Final = re.compile(
+    r"select (?:\w+\.)?id from chats(?: (?:as )?(?!where\b)\w+)? where (?P<where>.+)"
+    r" order by (?:\w+\.)?id for update"
+)
+
+
+@dataclass(frozen=True)
+class _NoticeWorld:
+    """Alice (the caller) and Bob in ORG_ID, Carol in OTHER_ORG_ID. ``skipped``: the
+    org's live chats whose latest message awaits a confirmation; ``receiving``: the
+    org's other live chats; ``never``: a trashed chat and another org's chat."""
+
+    alice: _Member
+    skipped: dict[str, uuid.UUID]
+    receiving: dict[str, uuid.UUID]
+    never: dict[str, uuid.UUID]
+
+    @property
+    def chats(self) -> dict[str, uuid.UUID]:
+        return {**self.skipped, **self.receiving, **self.never}
+
+
+def _ask(db: FakeDb, chat_id: uuid.UUID, call_id: str) -> None:
+    """A user request and the assistant's tool call, stored awaiting its confirmation."""
+    db.add_chat_message(chat_id, "user", "Send the summary to Muster AG")
+    db.add_chat_message(
+        chat_id,
+        "assistant",
+        "",
+        tool_use_blocks=[_tool_use(call_id, query="summary")],
+        status="awaiting_confirmation",
+    )
+
+
+def _chat(db: FakeDb, member: _Member, **fields: Any) -> uuid.UUID:
+    return db.add_chat(member.user_id, created_at=_PAST, **fields)
+
+
+def _notice_world(db: FakeDb) -> _NoticeWorld:
+    alice, bob = _member(db), _member(db)
+    carol = _member(db, org_id=OTHER_ORG_ID)
+    tool_use = _chat(db, alice)
+    _ask(db, tool_use, "call_w1")
+    # A batch: the first call ran, the second awaits; the first call's tool row is the
+    # latest message and carries the turn's final status.
+    batch = _chat(db, bob)
+    db.add_chat_message(batch, "user", "Search both mailboxes")
+    db.add_chat_message(
+        batch,
+        "assistant",
+        "",
+        tool_use_blocks=[_tool_use("call_w2", query="a"), _tool_use("call_w3", query="b")],
+    )
+    db.add_chat_message(
+        batch, "tool", "2 results", tool_call_id="call_w2", status="awaiting_confirmation"
+    )
+    approved = _chat(db, alice)
+    _ask(db, approved, "call_w4")
+    db.add_chat_message(approved, "tool", "Sent.", tool_call_id="call_w4")
+    denied = _chat(db, bob)
+    _ask(db, denied, "call_w5")
+    db.add_chat_message(denied, "tool", "Tool call denied by user.", tool_call_id="call_w5")
+    db.add_chat_message(denied, "assistant", "I did not send it.")
+    next_turn = _chat(db, alice)
+    _ask(db, next_turn, "call_w6")
+    db.add_chat_message(next_turn, "tool", "Tool call cancelled.", tool_call_id="call_w6")
+    db.add_chat_message(next_turn, "user", "Never mind")
+    db.add_chat_message(next_turn, "assistant", "Fine.")
+    empty = _chat(db, alice)
+    plain_chat = _chat(db, bob)
+    trashed = _chat(db, alice, deleted_at=_PAST)
+    foreign = _chat(db, carol)
+    for chat_id in (plain_chat, trashed, foreign):
+        db.add_chat_message(chat_id, "user", "Hello")
+        db.add_chat_message(chat_id, "assistant", "Hi there")
+    return _NoticeWorld(
+        alice=alice,
+        skipped={"assistant-tool-use": tool_use, "batch-tool-row": batch},
+        receiving={
+            "approved": approved,
+            "denied": denied,
+            "next-turn": next_turn,
+            "empty": empty,
+            "plain": plain_chat,
+        },
+        never={"trashed": trashed, "other-org": foreign},
+    )
+
+
+def _appended(before: list[dict[str, Any]], after: list[dict[str, Any]]) -> Any:
+    """The rows stored after ``before`` as (role, content, status, tool_use_blocks,
+    tool_call_id, tool_calls), or ``"history changed"`` when a row of ``before`` is
+    gone, moved or altered."""
+    if after[: len(before)] != before:
+        return "history changed"
+    return [
+        (
+            row["role"],
+            row["content"],
+            row["status"],
+            row["tool_use_blocks"],
+            row["tool_call_id"],
+            row["tool_calls"],
+        )
+        for row in after[len(before) :]
+    ]
+
+
+def _notice_statement(call: Call) -> tuple[str, tuple[Any, ...]]:
+    """A notice statement as ("lock" | "insert" | its SQL, its binds with UUIDs plain).
+
+    "lock": S12a with exactly the org and live-chat predicates; "insert": an INSERT
+    into chat_messages.
+    """
+    n = call.normalized
+    kind = n
+    if match := _NOTICE_LOCK_RE.fullmatch(n):
+        predicates = {
+            re.sub(r"^\w+\.", "", predicate.strip())
+            for predicate in match.group("where").split(" and ")
+        }
+        if predicates == {"org_id = $1", "deleted_at is null"}:
+            kind = "lock"
+    elif n.startswith("insert into chat_messages "):
+        kind = "insert"
+    return kind, tuple(_as_uuid(arg) or arg for arg in call.args)
+
+
+class _AcquireOnlyPool:
+    """A pool that only hands out connections (``acquire()``, as asyncpg.Pool): a
+    statement run on the pool itself, outside a transaction, fails."""
+
+    def __init__(self, db: FakeDb) -> None:
+        self._pool = db.pool
+
+    def acquire(self) -> Any:
+        return self._pool.acquire()
+
+
 class TestOrgNotice:
-    """GH-66's promotion notice: one user message in every live chat of the org."""
+    """GH-66's promotion notice: one user message in every live chat of the org, except
+    a chat whose latest message awaits a confirmation (GH-24)."""
 
     async def test_chats_org_notice_reaches_every_live_chat_of_the_org(
         self, chats: ModuleType, db: FakeDb
@@ -2020,6 +2178,171 @@ class TestOrgNotice:
 
         assert (count, none) == (4, 0)
         assert (type(count), type(none)) == (int, int)
+
+    # -- GH-24: never in a chat awaiting a confirmation, under a row lock ----------
+
+    async def test_chats_org_notice_skips_chats_whose_latest_message_awaits_confirmation(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """Alice's chat ending with the assistant's tool call and Bob's batch ending with a
+        tool row, both awaiting, get nothing; an approved, a denied and a moved-on chat, an
+        empty one and a plain colleague's chat each get one plain user message after their
+        history; the trashed and the other org's chat never."""
+        world = _notice_world(db)
+        before = {name: db.messages_of(chat_id) for name, chat_id in world.chats.items()}
+
+        await chats.append_org_notice(db.pool, world.alice.tenant, _MARK_NOTICE)
+
+        appended = {
+            name: _appended(before[name], db.messages_of(chat_id))
+            for name, chat_id in world.chats.items()
+        }
+        notice = ("user", _MARK_NOTICE, "complete", None, None, None)
+        assert appended == {
+            name: [notice] if name in world.receiving else [] for name in world.chats
+        }
+
+    async def test_chats_org_notice_decides_by_the_latest_messages_status_only(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """One chat per status of its latest message (an earlier message awaiting in each):
+        only a latest ``awaiting_confirmation`` is skipped."""
+        alice = _member(db)
+        by_status: dict[str, uuid.UUID] = {}
+        for status in _STATUSES:
+            chat_id = _chat(db, alice)
+            db.add_chat_message(chat_id, "assistant", "earlier", status="awaiting_confirmation")
+            db.add_chat_message(chat_id, "assistant", "latest", status=status)
+            by_status[status] = chat_id
+
+        await chats.append_org_notice(db.pool, alice.tenant, _MARK_NOTICE)
+
+        added = {
+            status: [row["content"] for row in db.messages_of(chat_id)[2:]]
+            for status, chat_id in by_status.items()
+        }
+        assert added == {
+            status: [] if status == "awaiting_confirmation" else [_MARK_NOTICE]
+            for status in _STATUSES
+        }
+
+    @pytest.mark.parametrize("kind", _AWAITING_KINDS)
+    async def test_chats_org_notice_leaves_an_awaiting_chat_exactly_as_stored(
+        self, chats: ModuleType, db: FakeDb, kind: str
+    ) -> None:
+        """Every stored row (ids, seq order, tool fields, statuses) and the chats row as they
+        were: the pending call's ``tool_use`` stays the chat's last turn."""
+        world = _notice_world(db)
+        chat_id = world.skipped[kind]
+        before = (db.chat_row(chat_id), db.messages_of(chat_id))
+
+        await chats.append_org_notice(db.pool, world.alice.tenant, _MARK_NOTICE)
+
+        assert (db.chat_row(chat_id), db.messages_of(chat_id)) == before
+
+    async def test_chats_org_notice_count_excludes_skipped_chats(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        world = _notice_world(db)
+
+        count = await chats.append_org_notice(db.pool, world.alice.tenant, _MARK_NOTICE)
+
+        assert (count, type(count)) == (len(world.receiving), int)
+
+    async def test_chats_org_notice_locks_the_orgs_live_chats_then_inserts_in_one_transaction(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """Exactly two statements: the lock (S12a: org and live filter only, id order, FOR
+        UPDATE without SKIP LOCKED / NOWAIT, binds the org), then the INSERT (binds the org
+        and the text); no chat or user id bound; both on one connection acquired from the
+        pool, inside one committed transaction."""
+        world = _notice_world(db)
+        db.calls.clear()
+
+        await chats.append_org_notice(db.pool, world.alice.tenant, _MARK_NOTICE)
+
+        assert [_notice_statement(call) for call in db.calls] == [
+            ("lock", (ORG_ID,)),
+            ("insert", (ORG_ID, _MARK_NOTICE)),
+        ]
+        sites = {(call.via, call.tx) for call in db.calls}
+        assert len(sites) == 1
+        ((via, tx),) = sites
+        assert via.startswith("conn-")
+        assert tx is not None
+        assert db.transactions == [(tx, "commit")]
+
+    async def test_chats_org_notice_skips_a_chat_whose_turn_committed_while_the_lock_waited(
+        self, chats: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#176 audit I-5: a turn storing ``tool_use`` + awaiting holds the chat's row, so
+        the lock waits until it commits; the INSERT then sees the awaiting message and
+        skips that chat (emulated: the turn's rows land while the lock statement runs)."""
+        world = _notice_world(db)
+        chat_id = world.receiving["plain"]
+        turns: list[str] = []
+        original = db.handle
+
+        def turn_commits_first(
+            method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None
+        ) -> Any:
+            if not turns and re.search(r"\bfor update\b", norm(sql)):
+                turns.append(sql)
+                _ask(db, chat_id, "call_w7")
+            return original(method, sql, args, via, tx)
+
+        monkeypatch.setattr(db, "handle", turn_commits_first)
+
+        count = await chats.append_org_notice(db.pool, world.alice.tenant, _MARK_NOTICE)
+
+        rows = db.messages_of(chat_id)
+        assert ([(row["role"], row["status"]) for row in rows], count) == (
+            [
+                ("user", "complete"),
+                ("assistant", "complete"),
+                ("user", "complete"),
+                ("assistant", "awaiting_confirmation"),
+            ],
+            len(world.receiving) - 1,
+        )
+
+    async def test_chats_org_notice_failed_insert_rolls_back_and_propagates(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """The INSERT fails after the lock: the driver error propagates, the one
+        transaction is rolled back, nothing is stored."""
+        world = _notice_world(db)
+        before = db.snapshot()
+        db.calls.clear()
+        db.fail_sql = r"^insert into chat_messages\b"
+
+        with pytest.raises(asyncpg.exceptions.DeadlockDetectedError):
+            await chats.append_org_notice(db.pool, world.alice.tenant, _MARK_NOTICE)
+
+        assert [_notice_statement(call)[0] for call in db.calls] == ["lock", "insert"]
+        sites = {(call.via, call.tx) for call in db.calls}
+        assert len(sites) == 1
+        ((_, tx),) = sites
+        assert tx is not None
+        assert (db.transactions, db.open_transactions) == (
+            [(tx, "rollback:DeadlockDetectedError")],
+            0,
+        )
+        assert db.snapshot() == before
+
+    async def test_chats_org_notice_runs_on_a_connection_it_acquires_from_the_pool(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """The first parameter is the pool: the function acquires its own connection and
+        runs nothing on the pool itself."""
+        world = _notice_world(db)
+
+        count = await chats.append_org_notice(
+            _AcquireOnlyPool(db), world.alice.tenant, _MARK_NOTICE
+        )
+
+        assert count == len(world.receiving)
+        assert all(call.via.startswith("conn-") for call in db.calls)
 
 
 class TestCountOrgChats:

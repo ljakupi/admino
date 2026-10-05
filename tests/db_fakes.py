@@ -198,6 +198,18 @@ Chats (GH-176, migration 0024):
   newest-first (PostgreSQL promises no order). Predicates the SQL doesn't
   state are not applied (a missing owner, org or ``deleted_at IS NULL``
   filter shows up), and anything else fails the test with an AssertionError.
+- GH-24's S12b (contract §2: the org notice in every live chat of the org
+  whose latest message isn't awaiting a confirmation) adds two reader
+  features. ``a IS [NOT] DISTINCT FROM b`` is NULL-safe: NULL is distinct
+  from any value and not from NULL. A scalar subquery ``(SELECT col FROM t a
+  WHERE ... [ORDER BY ...] [LIMIT n])`` goes wherever a value goes; a
+  correlated reference (``m.chat_id = c.id``) reads the enclosing row, a
+  column resolving in the subquery's own FROM first, then in each enclosing
+  query's, nearest first, as in PostgreSQL. It sees the tables as the
+  statement found them: an INSERT ... SELECT builds every row before storing
+  any (one new ``seq`` per row, in the chats' scan order). No row: NULL; more
+  than one row: CardinalityViolationError; more than one column:
+  PostgresSyntaxError.
 - Helpers: ``add_chat(owner_user_id, *, org_id=None, chat_id=None, title='',
   title_source='auto', legacy_session_id=None, external_content=False,
   created_at=None, last_activity_at=None, deleted_at=None)`` (org_id: the
@@ -3338,8 +3350,15 @@ def _binary_split(text: str) -> tuple[str, str, str] | None:
 
 
 def _clauses(text: str, keywords: tuple[str, ...]) -> dict[str, str]:
-    """Cut a statement into its top-level clauses, keyed by the keyword that opens each."""
-    masked = _masked(text)
+    """Cut a statement into its top-level clauses, keyed by the keyword that opens each.
+
+    The FROM of a predicate ``a IS [NOT] DISTINCT FROM b`` opens no clause (GH-24).
+    """
+    masked = re.sub(
+        r"(?<![\w.])is (?:not )?distinct from(?!\w)",
+        lambda match: " " * len(match.group(0)),
+        _masked(text),
+    )
     found: list[tuple[int, str]] = []
     for keyword in keywords:
         hits = list(re.finditer(rf"(?<![\w.]){re.escape(keyword)}(?!\w)", masked))
@@ -3838,6 +3857,9 @@ class _Statement:
         self.db = db
         self.args = args
         self.now = now
+        # GH-24: the row contexts of the queries enclosing the scalar subquery being
+        # evaluated (innermost last), for its correlated column references.
+        self.outer: list[_Context] = []
 
     # -- values and predicates ---------------------------------------------------
 
@@ -3848,7 +3870,10 @@ class _Statement:
 
     def value(self, expr: str, ctx: _Context) -> Any:
         """Evaluate a value expression in a row context."""
+        parenthesized = expr.strip().startswith("(")
         expr = _unwrap(expr)
+        if parenthesized and expr.startswith("select "):
+            return self.scalar(expr, ctx)
         if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?)?", expr):
             return self._arg(match.group(1))
         if match := re.fullmatch(r"case when (.+?) then (.+?) else (.+?) end", _masked(expr)):
@@ -3952,22 +3977,59 @@ class _Statement:
         raise AssertionError(msg)
 
     def column(self, qualifier: str | None, name: str, ctx: _Context) -> Any:
-        """A column's value in a row context, resolved like PostgreSQL."""
+        """A column's value in a row context, resolved like PostgreSQL.
+
+        The query's own FROM list first, then (in a correlated subquery, GH-24)
+        each enclosing query's, nearest first: a qualifier names the nearest
+        level's table of that alias, an unqualified column is the nearest level's
+        that has it (ambiguous only within one level).
+        """
+        for scope in (ctx, *reversed(self.outer)):
+            if qualifier is not None:
+                if qualifier not in scope:
+                    continue
+                owners = [qualifier] if name in _COLUMNS[scope[qualifier][0]] else []
+            else:
+                owners = [alias for alias, (table, _) in scope.items() if name in _COLUMNS[table]]
+                if not owners:
+                    continue
+            if len(owners) > 1:
+                msg = f'column reference "{name}" is ambiguous'
+                raise asyncpg.exceptions.AmbiguousColumnError(msg)
+            if not owners:
+                # The alias's table has no such column (no outer level is tried).
+                msg = f'column "{name}" does not exist'
+                raise asyncpg.exceptions.UndefinedColumnError(msg)
+            row = scope[owners[0]][1]
+            return None if row is None else row[name]
         if qualifier is not None:
-            if qualifier not in ctx:
-                msg = f'missing FROM-clause entry for table "{qualifier}"'
-                raise asyncpg.exceptions.UndefinedTableError(msg)
-            owners = [qualifier] if name in _COLUMNS[ctx[qualifier][0]] else []
-        else:
-            owners = [alias for alias, (table, _) in ctx.items() if name in _COLUMNS[table]]
-        if len(owners) > 1:
-            msg = f'column reference "{name}" is ambiguous'
-            raise asyncpg.exceptions.AmbiguousColumnError(msg)
-        if not owners:
-            msg = f'column "{name}" does not exist'
-            raise asyncpg.exceptions.UndefinedColumnError(msg)
-        row = ctx[owners[0]][1]
-        return None if row is None else row[name]
+            msg = f'missing FROM-clause entry for table "{qualifier}"'
+            raise asyncpg.exceptions.UndefinedTableError(msg)
+        msg = f'column "{name}" does not exist'
+        raise asyncpg.exceptions.UndefinedColumnError(msg)
+
+    def scalar(self, query: str, ctx: _Context) -> Any:
+        """A scalar subquery ``(SELECT <one column> FROM ...)`` (GH-24), as PostgreSQL runs it.
+
+        Evaluated for the enclosing row context ``ctx``, so a correlated
+        reference (``m.chat_id = c.id``) reads the enclosing row (see
+        ``column``); the tables are as the statement found them (the reader
+        stores an INSERT's rows only after every row is built). No row: NULL;
+        more than one row: CardinalityViolationError; more than one column:
+        PostgresSyntaxError.
+        """
+        if len(_top_split(_clauses(query, ("select", "from"))["select"], ",")) != 1:
+            msg = "subquery must return only one column"
+            raise asyncpg.exceptions.PostgresSyntaxError(msg)
+        self.outer.append(ctx)
+        try:
+            rows = self.select(query)
+        finally:
+            self.outer.pop()
+        if len(rows) > 1:
+            msg = "more than one row returned by a subquery used as an expression"
+            raise asyncpg.exceptions.CardinalityViolationError(msg)
+        return next(iter(rows[0].values())) if rows else None
 
     def holds(self, text: str, ctx: _Context) -> bool:
         """True when every AND-ed predicate of a WHERE / ON text holds."""
@@ -3985,6 +4047,16 @@ class _Statement:
         if " and " in _masked(atom):
             return self.holds(atom, ctx)
         masked = _masked(atom)
+        if match := re.fullmatch(r"(.+?) is (not )?distinct from (.+)", masked):
+            # GH-24: NULL-safe; two NULLs are not distinct, one NULL is distinct from
+            # anything else.
+            left = self.value(atom[: match.end(1)], ctx)
+            right = self.value(atom[match.start(3) :], ctx)
+            if left is None or right is None:
+                distinct = (left is None) != (right is None)
+            else:
+                distinct = not _compare("=", left, right)
+            return distinct != bool(match.group(2))
         if match := re.fullmatch(r"(.+?) is (not )?null", masked):
             value = self.value(atom[: match.end(1)], ctx)
             return (value is not None) if match.group(2) else (value is None)
