@@ -234,7 +234,10 @@ _LATEST_STATUS_SQL: Final = """
 """
 # S12a: GH-66's promotion notice first locks the org's live chats, in id order. A turn
 # storing its messages holds its chat's row (S7's UPDATE) until it commits, so the lock
-# waits for it and S12b then sees that turn's messages (GH-24).
+# waits for it and S12b then sees that turn's messages (GH-24). User deletions
+# (org_users, invitations) and the org purge lock the chats they cascade over in the
+# same id order before the users rows go, the purge also before the org row that
+# S12b's insert key-share locks, so none of them deadlocks with the notice (GH-265).
 _ORG_NOTICE_LOCK_SQL: Final = """
     SELECT id FROM chats
     WHERE org_id = $1 AND deleted_at IS NULL
@@ -829,7 +832,8 @@ async def append_org_notice(pool: asyncpg.Pool, tenant: TenantContext, content: 
     awaits a confirmation (GH-24); the chats' ``last_activity_at`` is left
     alone. One transaction on one acquired connection: the org's live chats
     are locked first (waiting for a turn that is storing its messages), then
-    the notice is inserted.
+    the notice is inserted. User deletions and the org purge lock the chats
+    in the same id order, so they don't deadlock with it (GH-265).
 
     Args:
         pool: The database pool.
