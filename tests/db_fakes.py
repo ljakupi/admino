@@ -122,7 +122,7 @@ The settings scopes (GH-159, migration 0013):
     (count: 0), as in PostgreSQL; FOR UPDATE with an aggregate fails with
     FeatureNotSupportedError.
 
-Chats (GH-176, migration 0024):
+Chats (GH-176, migration 0024; GH-266, migration 0025):
 - ``chats`` (``chats``, keyed by id): ``id`` (UUID primary key, default a new
   uuid4), ``org_id`` (UUID NOT NULL, references organizations ON DELETE
   CASCADE), ``owner_user_id`` (UUID NOT NULL, references users ON DELETE
@@ -179,6 +179,17 @@ Chats (GH-176, migration 0024):
   returned as a JSON str, re-serialized with JSONB's key order (shorter keys
   first), so it may differ from the text sent; a list or dict bound directly
   is a DataError.
+- Migration 0025 (GH-266): an UPDATE of chats may SET only title,
+  title_source, last_activity_at, external_content and deleted_at
+  (``CHAT_UPDATE_COLUMNS``); naming id, org_id, owner_user_id, created_at or
+  legacy_session_id is InsufficientPrivilegeError "permission denied for table
+  chats", raised before the statement runs (nothing changes). Its BEFORE
+  UPDATE row trigger refuses turning a row's external_content from true to
+  false: CheckViolationError ``CHAT_EXTERNAL_CONTENT_RESET`` ("chats.external_content
+  can't be reset", SQLSTATE 23514, no row data), raised before the row's other
+  checks; every target row is checked before any is written, so the statement
+  changes no row. false -> true, true -> true and other columns of a flagged
+  chat pass.
 - Deleting a users row deletes the user's chats and their messages;
   deleting an organizations row (the reader's DELETE and the
   ``purge_org_audit_events`` emulation) deletes the org's chats and
@@ -818,6 +829,14 @@ CHAT_MESSAGE_STATUSES: Final = frozenset(
 # newline doesn't match).
 LEGACY_SESSION_ID_RE: Final = re.compile(r"[a-zA-Z0-9_-]{1,64}")
 TOOL_CALL_ID_RE: Final = re.compile(r"[a-zA-Z0-9_-]{1,128}")
+# GH-266 (migration 0025): the only chats columns admino_app may UPDATE, and the
+# message of the trigger that keeps external_content true once it is.
+CHAT_UPDATE_COLUMNS: Final = frozenset(
+    {"title", "title_source", "last_activity_at", "external_content", "deleted_at"}
+)
+CHAT_EXTERNAL_CONTENT_RESET: Final = "chats.external_content can't be reset"
+# An UPDATE of chats (normalized SQL), whose SET 0025's column grant limits.
+_CHATS_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?chats\b")
 # What a ``$n::<type>`` cast tells about a bind parameter's type.
 _CAST_TYPES: Final[dict[str, str]] = {
     "uuid": "uuid",
@@ -2341,7 +2360,20 @@ class FakeDb:
         Each error carries the table, column or constraint name, and the
         CHECK / NOT NULL ones the "Failing row contains" detail (with content,
         as the driver's does).
+
+        Before all of these, on an UPDATE of chats, migration 0025's BEFORE
+        UPDATE row trigger (GH-266): turning external_content from true to false
+        is CheckViolationError ``CHAT_EXTERNAL_CONTENT_RESET`` (SQLSTATE 23514, no
+        row data, no table or constraint name, like a PL/pgSQL RAISE). A NULL
+        passes the trigger and fails NOT NULL, as in PostgreSQL.
         """
+        if (
+            table == "chats"
+            and original is not None
+            and original["external_content"] is True
+            and row.get("external_content") is False
+        ):
+            raise asyncpg.exceptions.CheckViolationError(CHAT_EXTERNAL_CONTENT_RESET)
         for column in _CHAT_TYPES[table]:
             if row.get(column) is None and column not in _CHAT_NULLABLE[table]:
                 raise _pg_error(
@@ -3814,7 +3846,11 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     asyncpg's encoder (DataError); every str argument through the server's text
     input (U+0000: CharacterNotInRepertoireError), used or not; then the
     grants of migration 0024: admino_app may not DELETE chats and may not
-    UPDATE or DELETE chat_messages (InsufficientPrivilegeError).
+    UPDATE or DELETE chat_messages (InsufficientPrivilegeError); and those of
+    migration 0025 (GH-266): an UPDATE of chats may SET only the
+    ``CHAT_UPDATE_COLUMNS`` (another existing column: InsufficientPrivilegeError;
+    a column chats doesn't have is left to the reader's UndefinedColumnError,
+    which PostgreSQL raises first).
     """
     masked = _masked_literals(n)
     numbers = {int(number) for number in re.findall(r"\$(\d+)", masked)}
@@ -3845,6 +3881,14 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     if denied is not None:
         msg = f"permission denied for table {denied.group(1) or denied.group(2)}"
         raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+    if _CHATS_UPDATE_RE.match(n) is not None:
+        clauses = _clauses(n, ("update", "set", "from", "where", "returning"))
+        for piece in _top_split(clauses["set"], ","):
+            target = re.match(r"(?:\w+\.)?(\w+) ?=", piece)
+            column = target.group(1) if target is not None else None
+            if column in _CHAT_TYPES["chats"] and column not in CHAT_UPDATE_COLUMNS:
+                msg = "permission denied for table chats"
+                raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
 
 
 _Context = dict[str, tuple[str, dict[str, Any] | None]]

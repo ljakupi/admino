@@ -8,14 +8,18 @@ text, the cascades from users). The fake applies only the predicates a
 statement states, so a query without its owner, org or ``deleted_at IS NULL``
 filter returns rows it must not.
 
-What these tests pin down (contract §2):
-- Surface: the fourteen coroutine functions with the contract's keyword-only
-  parameters; ``ChatNotFoundError`` is a ``LookupError``, ``InvalidCursorError``
-  a ``ValueError``; ``ChatRecord`` / ``MessageRecord`` carry exactly the
-  contract's fields and are frozen.
+What these tests pin down (contract §2; GH-266 contract §2):
+- Surface: the thirteen coroutine functions with the contract's keyword-only
+  parameters (``get_or_create_legacy_chat``'s ``chat_id`` required, no
+  default); ``list_messages`` and ``latest_message_status`` no longer exist
+  (GH-266: their only caller was the detail route); ``ChatNotFoundError`` is a
+  ``LookupError``, ``InvalidCursorError`` a ``ValueError``; ``ChatRecord`` /
+  ``MessageRecord`` / ``ChatDetail`` carry exactly the contract's fields and
+  are frozen; every ``json.dumps`` in the module passes ``allow_nan=False``
+  (GH-266's fail-closed backstop).
 - Tenant isolation (owner-private V1): for every function that takes a chat id
-  (get, rename, trash, append, load history, list messages, count, latest
-  status), another org's chat, another user's chat in the same org, a trashed
+  (get, rename, trash, append, load history, read the chat detail, count),
+  another org's chat, another user's chat in the same org, a trashed
   chat and an unknown id raise the same ``ChatNotFoundError`` (same type, same
   text, no id or title in it) and change nothing (no INSERT, the whole state
   unchanged). Every chat-table statement binds the caller's org id, every
@@ -30,7 +34,12 @@ What these tests pin down (contract §2):
   user (two users, same session id, two chats); a trashed one is replaced;
   ``find_legacy_chat`` never creates; a concurrent first insert
   (UniqueViolationError) is answered by selecting again; other insert errors
-  propagate.
+  propagate. GH-266: a chat created here gets exactly the given ``chat_id``
+  (the INSERT binds it with the caller's org, the caller as owner and the
+  session id; untitled, ``auto``); an existing live chat of the session is
+  returned with its own id and no INSERT runs; after a concurrent first
+  insert the winner's chat (not the given id) is returned and exactly one
+  chat exists; a trashed chat's session gets a new chat with the given id.
 - ``list_chats``: the caller's live chats by ``last_activity_at DESC, id DESC``
   (ties by id), at most ``limit``, ``next_cursor`` None on the last page
   (exactly ``limit`` left included), walking the cursors returns every live
@@ -59,22 +68,34 @@ What these tests pin down (contract §2):
   (U+D800 to U+DFFF, which model-produced tool inputs and tool-call arguments
   can carry and PostgreSQL's JSONB refuses) in any of those strings is stored
   as U+FFFD, so the turn is persisted (security audit L-2), while an emoji
-  (what an escaped surrogate pair decodes to) is kept; a ``system``
-  message is a ``ValueError`` with nothing written; an empty list runs no
-  statement; a failure midway rolls everything back.
+  (what an escaped surrogate pair decodes to) is kept. GH-266 (re-audit
+  L-4): a non-finite number (``NaN``, ``Infinity``, ``-Infinity``, an
+  overflowing literal such as ``1e400`` as ``json.loads`` parses it) in
+  ``tool_use_blocks`` or the tool calls, at the top level of the arguments or
+  nested at any depth, is stored as null and the turn is persisted; finite
+  numbers, ints, bools, null and look-alike strings ("NaN") are kept; the JSON
+  text the driver gets is strict JSON. A ``system`` message is a
+  ``ValueError`` with nothing written; an empty list runs no statement; a
+  failure midway rolls everything back.
 - ``load_recent_history``: the latest ``limit`` messages in chronological order
   as ``LLMMessage``s equal to what was appended (the tool turn's pairing kept),
   leading orphan ``tool`` messages of the tail dropped.
-- ``list_messages``: the latest page ascending, ``next_cursor`` to earlier
-  messages, None at the beginning; walking returns every message once in order;
-  bad and list cursors are ``InvalidCursorError``, and so is a crafted cursor
-  whose seq a BIGINT can't hold (2**63, 10**40) or that is negative, refused
-  before any statement binds it (security audit L-1).
-- ``count_messages``, ``latest_message_status`` (highest seq; None when empty),
-  ``append_org_notice`` (one user/complete message, the text verbatim, in every
-  live chat of the org, of every member; none in another org's or a trashed
-  chat; ``last_activity_at`` unchanged; returns the count) and
-  ``count_org_chats`` (the org's live chats).
+- ``read_chat_detail`` (GH-266, replaces ``list_messages`` and
+  ``latest_message_status``): the caller's chat, one page of its messages (the
+  latest page ascending, ``next_cursor`` to earlier messages, None at the
+  beginning; walking returns every message once in order; bad and list cursors
+  are ``InvalidCursorError``, and so is a crafted cursor whose seq a BIGINT
+  can't hold (2**63, 10**40) or that is negative, refused before any statement
+  binds it (security audit L-1)), the chat's message count and its latest
+  message's status (highest seq; None when empty), the same on every page.
+  The owner-checked lookup (S2) runs exactly once and first; a not-found chat
+  (with or without a bad cursor) and an invalid cursor run S2 only; the
+  status read selects only ``status`` (no statement but the page selects
+  ``content``).
+- ``count_messages``, ``append_org_notice`` (one user/complete message, the
+  text verbatim, in every live chat of the org, of every member; none in
+  another org's or a trashed chat; ``last_activity_at`` unchanged; returns the
+  count) and ``count_org_chats`` (the org's live chats).
 - GH-24 (contract §2, the GH-66 notice never breaks a chat awaiting a
   confirmation): ``append_org_notice(pool, tenant, content)`` skips every chat
   whose latest message (highest seq) is ``awaiting_confirmation``, whether that
@@ -117,8 +138,10 @@ import contextlib
 import dataclasses
 import inspect
 import json
+import math
 import re
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -161,9 +184,8 @@ _CHAT_ID_FUNCTIONS: Final = (
     "trash_chat",
     "append_messages",
     "load_recent_history",
-    "list_messages",
+    "read_chat_detail",
     "count_messages",
-    "latest_message_status",
 )
 _ALL_FUNCTIONS: Final = (
     *_CHAT_ID_FUNCTIONS,
@@ -178,16 +200,15 @@ _ALL_FUNCTIONS: Final = (
 _SIGNATURES: Final[dict[str, tuple[int, set[str]]]] = {
     "create_chat": (2, {"title"}),
     "get_chat": (3, set()),
-    "get_or_create_legacy_chat": (3, set()),
+    "get_or_create_legacy_chat": (3, {"chat_id"}),
     "find_legacy_chat": (3, set()),
     "list_chats": (2, {"limit", "cursor"}),
     "rename_chat": (4, set()),
     "trash_chat": (3, {"ip"}),
     "append_messages": (4, {"final_status", "tool_calls"}),
     "load_recent_history": (3, {"limit"}),
-    "list_messages": (3, {"limit", "cursor"}),
+    "read_chat_detail": (3, {"limit", "cursor"}),
     "count_messages": (3, set()),
-    "latest_message_status": (3, set()),
     "append_org_notice": (3, set()),
     "count_org_chats": (2, set()),
 }
@@ -201,6 +222,7 @@ _CHAT_RECORD_FIELDS: Final = {
     "created_at",
     "last_activity_at",
 }
+_CHAT_DETAIL_FIELDS: Final = {"chat", "page", "message_count", "latest_status"}
 _MESSAGE_RECORD_FIELDS: Final = {
     "id",
     "seq",
@@ -246,6 +268,40 @@ _MARK_RACE_SESSION: Final = "racemarker0815"
 _HIGH: Final = chr(0xD800)
 _LOW: Final = chr(0xDFFF)
 _REPLACEMENT: Final = chr(0xFFFD)
+
+# GH-266 (re-audit L-4): the non-finite numbers a model's tool arguments carry once
+# json.loads parsed them (an overflowing literal such as 1e400 parses as inf). JSON and
+# PostgreSQL's JSONB have none of them.
+_NON_FINITE: Final = {
+    "nan": float("nan"),
+    "infinity": float("inf"),
+    "minus-infinity": float("-inf"),
+    "1e400": json.loads("1e400"),
+}
+# A provider's tool arguments as JSON text with every non-finite form, at the top level and
+# nested, between finite numbers, ints, bools, null and strings that only look like them ...
+_PROVIDER_ARGS_TEXT: Final = (
+    '{"query": "NaN Infinity", "limit": 1e400, "score": NaN, "floor": -Infinity,'
+    ' "ceiling": Infinity, "ratio": 0.5, "big": 1e300, "max": 1.7976931348623157e308,'
+    ' "count": 7, "under": -1e400,'
+    ' "flags": [true, false, null, "Infinity", "-Infinity", "NaN", "1e400", 0, -3],'
+    ' "nested": {"a": [[NaN, 2.25], {"b": {"c": [Infinity, -0.5, 1e400, "x"]}}]}}'
+)
+# ... and what is stored: every non-finite number as null, everything else unchanged.
+_PROVIDER_ARGS_STORED: Final = {
+    "query": "NaN Infinity",
+    "limit": None,
+    "score": None,
+    "floor": None,
+    "ceiling": None,
+    "ratio": 0.5,
+    "big": 1e300,
+    "max": 1.7976931348623157e308,
+    "count": 7,
+    "under": None,
+    "flags": [True, False, None, "Infinity", "-Infinity", "NaN", "1e400", 0, -3],
+    "nested": {"a": [[None, 2.25], {"b": {"c": [None, -0.5, None, "x"]}}]},
+}
 
 
 # ---------------------------------------------------------------------------
@@ -335,12 +391,10 @@ async def _call_with_chat(
         )
     if name == "load_recent_history":
         return await chats.load_recent_history(pool, tenant, chat_id, limit=10)
-    if name == "list_messages":
-        return await chats.list_messages(pool, tenant, chat_id, limit=10, cursor=None)
-    if name == "count_messages":
-        return await chats.count_messages(pool, tenant, chat_id)
-    assert name == "latest_message_status"
-    return await chats.latest_message_status(pool, tenant, chat_id)
+    if name == "read_chat_detail":
+        return await chats.read_chat_detail(pool, tenant, chat_id, limit=10, cursor=None)
+    assert name == "count_messages"
+    return await chats.count_messages(pool, tenant, chat_id)
 
 
 def _as_uuid(value: Any) -> uuid.UUID | None:
@@ -412,6 +466,69 @@ def _record(**args: Any) -> ToolCallRecord:
 
 def _tool_use(call_id: str, **tool_input: Any) -> dict[str, Any]:
     return {"type": "tool_use", "id": call_id, "name": "gmail.search", "input": tool_input}
+
+
+def _non_finite_args(value: float | None) -> dict[str, Any]:
+    """Tool arguments holding ``value`` at the top level and nested (lists, objects,
+    several levels), next to finite values; ``None`` gives what must be stored."""
+    return {
+        "query": "invoice",
+        "max_results": value,
+        "filters": {"amount": [value, 12.5, {"min": value, "levels": [[3, value]]}]},
+        "pages": [value],
+    }
+
+
+def _non_finite_turn(value: float | None) -> list[LLMMessage]:
+    """A tool turn whose assistant tool call carries ``_non_finite_args(value)``."""
+    return [
+        LLMMessage(role="user", content="Find the large invoices"),
+        LLMMessage(
+            role="assistant",
+            content="",
+            tool_use_blocks=[_tool_use("call_f1", **_non_finite_args(value))],
+        ),
+        LLMMessage(role="tool", content="1 result", tool_call_id="call_f1"),
+        LLMMessage(role="assistant", content="I found one invoice."),
+    ]
+
+
+def _insert_binds(call: Call) -> dict[str, Any]:
+    """An ``INSERT INTO t (columns) VALUES (...)`` as column -> bound value (a literal in
+    VALUES maps to its SQL text)."""
+    match = re.fullmatch(
+        r"insert into \w+ \((?P<columns>[^)]*)\) values \((?P<values>[^)]*)\)"
+        r"(?: returning .*)?",
+        call.normalized,
+    )
+    assert match is not None, call.normalized
+    columns = [column.strip() for column in match.group("columns").split(",")]
+    values = [value.strip() for value in match.group("values").split(",")]
+    binds: dict[str, Any] = {}
+    for column, value in zip(columns, values, strict=True):
+        param = re.fullmatch(r"\$(\d+)(?:::\w+)?", value)
+        binds[column] = value if param is None else call.args[int(param.group(1)) - 1]
+    return binds
+
+
+def _strict_float(text: str) -> float:
+    """parse_float for strict JSON: an overflowing literal (1e400) is no JSON number."""
+    number = float(text)
+    if not math.isfinite(number):
+        msg = f"non-finite number {text}"
+        raise ValueError(msg)
+    return number
+
+
+def _refuse_constant(name: str) -> Any:
+    """parse_constant for strict JSON: NaN, Infinity and -Infinity aren't JSON."""
+    msg = f"not JSON: {name}"
+    raise ValueError(msg)
+
+
+def _strict_json(text: str) -> Any:
+    """The value of strict JSON text (ValueError for NaN / Infinity / 1e400)."""
+    return json.loads(text, parse_constant=_refuse_constant, parse_float=_strict_float)
 
 
 def _wrapped(text: str = "Invoice attached, CHF 1200") -> str:
@@ -491,32 +608,39 @@ async def _walk_chats(
     raise AssertionError(msg)
 
 
-async def _walk_messages(
+async def _walk_details(
     chats: ModuleType, db: FakeDb, tenant: TenantContext, chat_id: uuid.UUID, limit: int
-) -> tuple[list[list[int]], list[Any]]:
-    """Every page of list_messages (seqs, as returned) and every cursor seen on the way."""
-    pages: list[list[int]] = []
-    cursors: list[Any] = []
+) -> list[Any]:
+    """Every ChatDetail of read_chat_detail, following the page cursors to the beginning."""
+    details: list[Any] = []
     cursor: str | None = None
     for _ in range(50):
-        page = await chats.list_messages(db.pool, tenant, chat_id, limit=limit, cursor=cursor)
-        pages.append([record.seq for record in page.messages])
-        cursor = page.next_cursor
-        cursors.append(cursor)
+        detail = await chats.read_chat_detail(db.pool, tenant, chat_id, limit=limit, cursor=cursor)
+        details.append(detail)
+        cursor = detail.page.next_cursor
         if cursor is None:
-            return pages, cursors
+            return details
     msg = "the cursor walk never ended"
     raise AssertionError(msg)
 
 
+async def _walk_messages(
+    chats: ModuleType, db: FakeDb, tenant: TenantContext, chat_id: uuid.UUID, limit: int
+) -> tuple[list[list[int]], list[Any]]:
+    """Every message page of read_chat_detail (seqs, as returned) and every cursor seen."""
+    details = await _walk_details(chats, db, tenant, chat_id, limit)
+    pages = [[record.seq for record in detail.page.messages] for detail in details]
+    return pages, [detail.page.next_cursor for detail in details]
+
+
 async def _message_cursor(chats: ModuleType, db: FakeDb, member: _Member) -> str:
-    """A real cursor of list_messages (a chat with two messages, limit 1)."""
+    """A real message cursor of read_chat_detail (a chat with two messages, limit 1)."""
     chat_id = db.add_chat(member.user_id)
     db.add_chat_message(chat_id, "user", "one")
     db.add_chat_message(chat_id, "assistant", "two")
-    page = await chats.list_messages(db.pool, member.tenant, chat_id, limit=1, cursor=None)
-    assert isinstance(page.next_cursor, str)
-    return page.next_cursor
+    detail = await chats.read_chat_detail(db.pool, member.tenant, chat_id, limit=1, cursor=None)
+    assert isinstance(detail.page.next_cursor, str)
+    return detail.page.next_cursor
 
 
 async def _list_cursor(chats: ModuleType, db: FakeDb, member: _Member) -> str:
@@ -695,6 +819,49 @@ class TestSurface:
 
         assert sites == []
 
+    def test_chats_list_messages_and_latest_message_status_are_gone(
+        self, chats: ModuleType
+    ) -> None:
+        """GH-266: ``read_chat_detail`` replaced both (their only caller was the detail
+        route); keeping them would be dead code."""
+        assert callable(chats.read_chat_detail)
+        assert [
+            name for name in ("list_messages", "latest_message_status") if hasattr(chats, name)
+        ] == []
+
+    def test_chats_get_or_create_legacy_chat_id_is_required(self, chats: ModuleType) -> None:
+        """GH-266: the server always names the id of a chat created here (no default)."""
+        parameter = inspect.signature(chats.get_or_create_legacy_chat).parameters["chat_id"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is inspect.Parameter.empty
+
+    def test_chats_every_json_dumps_passes_allow_nan_false(self, chats: ModuleType) -> None:
+        """GH-266's fail-closed backstop: every ``json.dumps`` in the module refuses a
+        non-finite number (ValueError) instead of writing ``NaN`` / ``Infinity`` text."""
+        dumps = [
+            node
+            for node in ast.walk(_source_tree(chats))
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Attribute) and node.func.attr == "dumps")
+                or (isinstance(node.func, ast.Name) and node.func.id == "dumps")
+            )
+        ]
+        refusing = [
+            node.lineno
+            for node in dumps
+            if any(
+                keyword.arg == "allow_nan"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is False
+                for keyword in node.keywords
+            )
+        ]
+
+        assert dumps, "the JSONB values are serialized with json.dumps"
+        assert refusing == [node.lineno for node in dumps]
+
 
 # ---------------------------------------------------------------------------
 # 2. create_chat and get_chat
@@ -846,18 +1013,24 @@ class TestTenantIsolation:
         db.add_chat(alice.user_id, legacy_session_id=_SESSION, last_activity_at=_STAMP)
         db.calls.clear()
 
-        if name in _CHAT_ID_FUNCTIONS and name != "list_messages":
+        if name in _CHAT_ID_FUNCTIONS and name != "read_chat_detail":
             await _call_with_chat(chats, db, name, alice.tenant, world.chat)
-        elif name == "list_messages":
-            page = await chats.list_messages(pool, alice.tenant, world.chat, limit=1, cursor=None)
-            await chats.list_messages(
-                pool, alice.tenant, world.chat, limit=1, cursor=page.next_cursor
+        elif name == "read_chat_detail":
+            detail = await chats.read_chat_detail(
+                pool, alice.tenant, world.chat, limit=1, cursor=None
+            )
+            await chats.read_chat_detail(
+                pool, alice.tenant, world.chat, limit=1, cursor=detail.page.next_cursor
             )
         elif name == "create_chat":
             await chats.create_chat(pool, alice.tenant, title="New")
         elif name == "get_or_create_legacy_chat":
-            await chats.get_or_create_legacy_chat(pool, alice.tenant, "fresh-session")
-            await chats.get_or_create_legacy_chat(pool, alice.tenant, "fresh-session")
+            await chats.get_or_create_legacy_chat(
+                pool, alice.tenant, "fresh-session", chat_id=uuid.uuid4()
+            )
+            await chats.get_or_create_legacy_chat(
+                pool, alice.tenant, "fresh-session", chat_id=uuid.uuid4()
+            )
         elif name == "find_legacy_chat":
             await chats.find_legacy_chat(pool, alice.tenant, _SESSION)
         elif name == "list_chats":
@@ -917,7 +1090,9 @@ class TestTenantIsolation:
 
         with pytest.raises(chats.ChatNotFoundError):
             await chats.find_legacy_chat(db.pool, world.alice.tenant, _SESSION)
-        record = await chats.get_or_create_legacy_chat(db.pool, world.alice.tenant, _SESSION)
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, world.alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
 
         assert plain(record.id) != bobs
         assert plain(record.owner_user_id) == world.alice.user_id
@@ -939,8 +1114,12 @@ class TestLegacyChats:
         alice = _member(db)
         regular = db.add_chat(alice.user_id, title="Regular")
 
-        first = await chats.get_or_create_legacy_chat(db.pool, alice.tenant, _SESSION)
-        second = await chats.get_or_create_legacy_chat(db.pool, alice.tenant, _SESSION)
+        first = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
+        second = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
 
         assert plain(first.id) == plain(second.id) != regular
         row = db.chat_row(first.id)
@@ -960,8 +1139,12 @@ class TestLegacyChats:
         """Same session id, two users: two chats, each owned by its user."""
         alice, other = _member(db), _member(db, org_id=other_org)
 
-        mine = await chats.get_or_create_legacy_chat(db.pool, alice.tenant, _SESSION)
-        theirs = await chats.get_or_create_legacy_chat(db.pool, other.tenant, _SESSION)
+        mine = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
+        theirs = await chats.get_or_create_legacy_chat(
+            db.pool, other.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
 
         assert plain(mine.id) != plain(theirs.id)
         assert (plain(mine.owner_user_id), plain(theirs.owner_user_id)) == (
@@ -976,7 +1159,9 @@ class TestLegacyChats:
         alice = _member(db)
         trashed = db.add_chat(alice.user_id, legacy_session_id=_SESSION, deleted_at=_PAST)
 
-        record = await chats.get_or_create_legacy_chat(db.pool, alice.tenant, _SESSION)
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
 
         assert plain(record.id) != trashed
         row = db.chat_row(record.id)
@@ -1023,7 +1208,9 @@ class TestLegacyChats:
         alice = _member(db)
         raced = _race_legacy_insert(monkeypatch, db, alice.user_id, _SESSION)
 
-        record = await chats.get_or_create_legacy_chat(db.pool, alice.tenant, _SESSION)
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
 
         assert len(raced) == 1, "the INSERT must have been attempted"
         assert plain(record.id) == raced[0]
@@ -1037,9 +1224,110 @@ class TestLegacyChats:
         db.fail_sql = r"^insert into chats\b"
 
         with pytest.raises(asyncpg.exceptions.DeadlockDetectedError):
-            await chats.get_or_create_legacy_chat(db.pool, alice.tenant, _SESSION)
+            await chats.get_or_create_legacy_chat(
+                db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+            )
 
         assert db.chats_of(alice.user_id) == []
+
+    # -- GH-266: the server names the id of a chat created here ------------------
+
+    async def test_chats_get_or_create_legacy_new_chat_gets_the_given_id(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """One INSERT (S1L) binding the given id, the caller's org, the caller as owner and
+        the session id; the chat is untitled (``''``, ``auto``), unflagged and live, and the
+        record is the stored row."""
+        alice = _member(db)
+        chat_id = uuid.uuid4()
+        db.calls.clear()
+
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=chat_id
+        )
+
+        (insert,) = db.matching(r"^insert into chats\b")
+        binds = {
+            column: _as_uuid(value) or value for column, value in _insert_binds(insert).items()
+        }
+        assert {
+            column: binds.get(column)
+            for column in ("id", "org_id", "owner_user_id", "legacy_session_id")
+        } == {
+            "id": chat_id,
+            "org_id": ORG_ID,
+            "owner_user_id": alice.user_id,
+            "legacy_session_id": _SESSION,
+        }
+        row = db.chat_row(chat_id)
+        assert row is not None
+        assert (
+            row["title"],
+            row["title_source"],
+            row["external_content"],
+            row["deleted_at"],
+            row["legacy_session_id"],
+        ) == ("", "auto", False, None, _SESSION)
+        assert plain(record.id) == chat_id
+        _assert_record_is_row(record, row)
+
+    async def test_chats_get_or_create_legacy_existing_chat_keeps_its_id_and_inserts_nothing(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """The session's live chat is returned as is: its own id, the given id unused, no
+        INSERT, nothing changed."""
+        alice = _member(db)
+        existing = db.add_chat(alice.user_id, legacy_session_id=_SESSION, title="Kept")
+        unused = uuid.uuid4()
+        before = db.snapshot()
+        db.calls.clear()
+
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=unused
+        )
+
+        assert plain(record.id) == existing
+        assert db.matching(r"^insert into\b") == []
+        assert db.snapshot() == before
+        assert db.chat_row(unused) is None
+
+    async def test_chats_get_or_create_legacy_concurrent_winner_is_returned_not_the_given_id(
+        self, chats: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A concurrent first message of the session inserts first: its chat is returned
+        (an id other than the given one) and the session has exactly one chat."""
+        alice = _member(db)
+        chat_id = uuid.uuid4()
+        raced = _race_legacy_insert(monkeypatch, db, alice.user_id, _SESSION)
+
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=chat_id
+        )
+
+        assert len(raced) == 1, "the INSERT must have been attempted"
+        assert plain(record.id) == raced[0] != chat_id
+        assert [plain(row["id"]) for row in db.chats_of(alice.user_id)] == raced
+        assert db.chat_row(chat_id) is None
+
+    async def test_chats_get_or_create_legacy_trashed_session_gets_a_new_chat_with_the_given_id(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """The session's only chat is trashed: a new live chat with the given id, the
+        trashed one left as it was."""
+        alice = _member(db)
+        trashed = db.add_chat(alice.user_id, legacy_session_id=_SESSION, deleted_at=_PAST)
+        trashed_row = db.chat_row(trashed)
+        chat_id = uuid.uuid4()
+
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=chat_id
+        )
+
+        assert plain(record.id) == chat_id
+        row = db.chat_row(chat_id)
+        assert row is not None
+        assert (row["deleted_at"], row["legacy_session_id"]) == (None, _SESSION)
+        assert db.chat_row(trashed) == trashed_row
 
 
 # ---------------------------------------------------------------------------
@@ -1315,7 +1603,7 @@ class TestTrashChat:
 
         page = await chats.list_chats(db.pool, alice.tenant, limit=50, cursor=None)
         assert [plain(record.id) for record in page.chats] == [kept]
-        for name in ("get_chat", "list_messages", "load_recent_history", "count_messages"):
+        for name in ("get_chat", "read_chat_detail", "load_recent_history", "count_messages"):
             with pytest.raises(chats.ChatNotFoundError):
                 await _call_with_chat(chats, db, name, alice.tenant, chat_id)
 
@@ -1675,6 +1963,104 @@ class TestAppendMessages:
         ]
         assert row["tool_calls"] == [_record(query=f"party {emoji}").model_dump(mode="json")]
 
+    # -- GH-266 (re-audit L-4): non-finite numbers in tool arguments --------------
+
+    @pytest.mark.parametrize("value", list(_NON_FINITE.values()), ids=list(_NON_FINITE))
+    async def test_chats_append_non_finite_tool_arguments_are_stored_as_null(
+        self, chats: ModuleType, db: FakeDb, value: float
+    ) -> None:
+        """A model's tool input and the run's tool-call arguments holding NaN, Infinity,
+        -Infinity or an overflowing 1e400 (top level and nested): the whole turn is stored
+        (JSONB has no such number, so it failed after the tools had run) and each of them
+        reads back as null in ``tool_use_blocks`` and in ``tool_calls``."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id, created_at=_PAST)
+
+        await chats.append_messages(
+            db.pool,
+            alice.tenant,
+            chat_id,
+            _non_finite_turn(value),
+            final_status="awaiting_confirmation",
+            tool_calls=[_record(**_non_finite_args(value))],
+        )
+
+        rows = db.messages_of(chat_id)
+        assert [(row["role"], row["status"]) for row in rows] == [
+            ("user", "complete"),
+            ("assistant", "complete"),
+            ("tool", "complete"),
+            ("assistant", "awaiting_confirmation"),
+        ]
+        assert rows[1]["tool_use_blocks"] == [_tool_use("call_f1", **_non_finite_args(None))]
+        assert rows[3]["tool_calls"] == [_record(**_non_finite_args(None)).model_dump(mode="json")]
+        row = db.chat_row(chat_id)
+        assert row is not None
+        assert row["last_activity_at"] > _PAST
+
+    async def test_chats_append_non_finite_tool_arguments_keep_every_finite_value(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """Arguments as a provider's JSON text parses (``json.loads``): only the non-finite
+        numbers become null; finite floats (the largest included), ints, bools, null and
+        strings that read "NaN" / "Infinity" / "1e400" are stored unchanged."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        parsed = json.loads(_PROVIDER_ARGS_TEXT)
+
+        await chats.append_messages(
+            db.pool,
+            alice.tenant,
+            chat_id,
+            [
+                LLMMessage(role="user", content="Search"),
+                LLMMessage(
+                    role="assistant", content="", tool_use_blocks=[_tool_use("call_p1", **parsed)]
+                ),
+            ],
+            tool_calls=[_record(**json.loads(_PROVIDER_ARGS_TEXT))],
+        )
+
+        rows = db.messages_of(chat_id)
+        assert rows[1]["tool_use_blocks"] == [_tool_use("call_p1", **_PROVIDER_ARGS_STORED)]
+        assert rows[1]["tool_calls"] == [_record(**_PROVIDER_ARGS_STORED).model_dump(mode="json")]
+
+    async def test_chats_append_non_finite_json_text_sent_to_the_driver_is_strict(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """Every JSON text bound to the INSERTs' ``tool_use_blocks`` and ``tool_calls`` is
+        strict JSON: no NaN / Infinity token, no number that overflows a double."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        db.calls.clear()
+
+        await chats.append_messages(
+            db.pool,
+            alice.tenant,
+            chat_id,
+            [
+                LLMMessage(role="user", content="Search"),
+                LLMMessage(
+                    role="assistant",
+                    content="",
+                    tool_use_blocks=[_tool_use("call_j1", **json.loads(_PROVIDER_ARGS_TEXT))],
+                ),
+            ],
+            tool_calls=[_record(**json.loads(_PROVIDER_ARGS_TEXT))],
+        )
+
+        texts = [
+            binds[column]
+            for binds in map(_insert_binds, db.matching(r"^insert into chat_messages\b"))
+            for column in ("tool_use_blocks", "tool_calls")
+            if binds[column] is not None
+        ]
+        assert len(texts) == 2
+        assert [_strict_json(text) for text in texts] == [
+            [_tool_use("call_j1", **_PROVIDER_ARGS_STORED)],
+            [_record(**_PROVIDER_ARGS_STORED).model_dump(mode="json")],
+        ]
+
     async def test_chats_append_runs_in_one_transaction_update_first(
         self, chats: ModuleType, db: FakeDb
     ) -> None:
@@ -1765,12 +2151,95 @@ class TestLoadRecentHistory:
 
 
 # ---------------------------------------------------------------------------
-# 10. list_messages
+# 10. read_chat_detail (GH-266: replaces list_messages and latest_message_status)
 # ---------------------------------------------------------------------------
 
+# The detail statements (contract §2.3): S2's owner check, the page (S9 / S9b), S10, S15.
+_OWNER_CHECK_PREDICATES: Final = frozenset(
+    {"id = $n", "org_id = $n", "owner_user_id = $n", "deleted_at is null"}
+)
+_OWNER_CHECK_RE: Final = re.compile(r"select .+ from chats(?: (?:as )?(?!where\b)\w+)? where (.+)")
+_SELECT_MESSAGES_RE: Final = re.compile(r"select (?P<columns>.+?) from chat_messages\b.*")
+_STATUS_READ_RE: Final = re.compile(
+    r"select (?:\w+\.)?status from chat_messages(?: (?:as )?(?!where\b)\w+)? where .+"
+    r" order by (?:\w+\.)?seq desc limit (?:1|\$\d+)"
+)
+_COUNT_READ_RE: Final = re.compile(r"select count\(\*\) from chat_messages where .+")
 
-class TestListMessages:
-    """The latest page ascending; the cursor walks back to the beginning."""
+
+def _selects_content(call: Call) -> bool:
+    """A SELECT of chat_messages whose column list holds ``content`` or a ``*`` (not the
+    one of ``count(*)``)."""
+    match = _SELECT_MESSAGES_RE.fullmatch(call.normalized)
+    if match is None:
+        return False
+    columns = match.group("columns")
+    return re.search(r"\bcontent\b", columns) is not None or "*" in columns.replace("count(*)", "")
+
+
+def _detail_statement(call: Call) -> str:
+    """A read_chat_detail statement's kind: "owner" (a SELECT from chats filtered by
+    exactly id, org, owner and the live filter: S2), "status" (only ``status``, the highest
+    seq: S15), "count" (S10), "page" (a SELECT of chat_messages with ``content``: S9 /
+    S9b), else its SQL."""
+    n = call.normalized
+    if match := _OWNER_CHECK_RE.fullmatch(n):
+        predicates = {
+            re.sub(r"\$\d+", "$n", re.sub(r"^\w+\.", "", predicate.strip()))
+            for predicate in match.group(1).split(" and ")
+        }
+        if predicates == _OWNER_CHECK_PREDICATES:
+            return "owner"
+    if _STATUS_READ_RE.fullmatch(n):
+        return "status"
+    if _COUNT_READ_RE.fullmatch(n):
+        return "count"
+    if _selects_content(call):
+        return "page"
+    return n
+
+
+def _seed_statuses(db: FakeDb, chat_id: uuid.UUID, statuses: list[str]) -> list[int]:
+    """One assistant message per status, in order; returns their seqs."""
+    for index, status in enumerate(statuses):
+        db.add_chat_message(chat_id, "assistant", f"m{index}", status=status)
+    return [row["seq"] for row in db.messages_of(chat_id)]
+
+
+class TestChatDetail:
+    """The caller's chat with one page of its messages (the latest page ascending, the
+    cursor walking back), its message count and its latest message's status."""
+
+    async def test_chats_detail_returns_the_chat_latest_page_count_and_latest_status(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """The chat is the stored row; the page the latest three ascending with a cursor;
+        the count all seven messages; the status the highest seq's."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id, title="Plans", created_at=_PAST)
+        seqs = _seed_statuses(db, chat_id, [*["complete"] * 6, "limit_reached"])
+
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=3, cursor=None)
+
+        row = db.chat_row(chat_id)
+        assert row is not None
+        _assert_record_is_row(detail.chat, row)
+        assert [record.seq for record in detail.page.messages] == seqs[-3:]
+        assert isinstance(detail.page.next_cursor, str)
+        assert (detail.message_count, type(detail.message_count)) == (7, int)
+        assert detail.latest_status == "limit_reached"
+
+    async def test_chats_detail_has_exactly_the_contract_fields_and_is_frozen(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
+
+        assert _field_names(detail) == _CHAT_DETAIL_FIELDS
+        with pytest.raises((AttributeError, TypeError, ValueError)):
+            detail.message_count = 99
 
     async def test_chats_messages_latest_page_is_ascending(
         self, chats: ModuleType, db: FakeDb
@@ -1780,11 +2249,11 @@ class TestListMessages:
         _seed_history(db, chat_id, _seven_message_history())
         seqs = [row["seq"] for row in db.messages_of(chat_id)]
 
-        page = await chats.list_messages(db.pool, alice.tenant, chat_id, limit=3, cursor=None)
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=3, cursor=None)
 
-        assert [record.seq for record in page.messages] == seqs[-3:]
-        assert isinstance(page.next_cursor, str)
-        assert len(page.next_cursor) <= 200
+        assert [record.seq for record in detail.page.messages] == seqs[-3:]
+        assert isinstance(detail.page.next_cursor, str)
+        assert len(detail.page.next_cursor) <= 200
 
     async def test_chats_messages_records_carry_the_stored_fields(
         self, chats: ModuleType, db: FakeDb
@@ -1805,8 +2274,9 @@ class TestListMessages:
             status="limit_reached",
         )
 
-        page = await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
 
+        page = detail.page
         assert all(_field_names(record) == _MESSAGE_RECORD_FIELDS for record in page.messages)
         expected = [
             {name: row[name] for name in _MESSAGE_RECORD_FIELDS} for row in db.messages_of(chat_id)
@@ -1836,6 +2306,24 @@ class TestListMessages:
         assert all(len(page) == limit for page in pages[:-1])
         assert all(isinstance(cursor, str) and len(cursor) <= 200 for cursor in cursors[:-1])
 
+    async def test_chats_detail_count_and_latest_status_are_the_chats_on_every_page(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """Walking back with the cursor, every detail carries the chat's count and its
+        latest message's status, never the page's (each earlier page ends otherwise)."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        _seed_statuses(
+            db, chat_id, ["complete", "awaiting_confirmation", "error", "complete", "stopped"]
+        )
+
+        details = await _walk_details(chats, db, alice.tenant, chat_id, 2)
+
+        assert [len(detail.page.messages) for detail in details] == [2, 2, 1]
+        assert [(detail.message_count, detail.latest_status) for detail in details] == [
+            (5, "stopped")
+        ] * 3
+
     @pytest.mark.parametrize("total", [0, 3])
     async def test_chats_messages_beginning_has_no_cursor(
         self, chats: ModuleType, db: FakeDb, total: int
@@ -1846,10 +2334,10 @@ class TestListMessages:
         for index in range(total):
             db.add_chat_message(chat_id, "user", f"m{index}")
 
-        page = await chats.list_messages(db.pool, alice.tenant, chat_id, limit=3, cursor=None)
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=3, cursor=None)
 
-        assert len(page.messages) == total
-        assert page.next_cursor is None
+        assert len(detail.page.messages) == total
+        assert detail.page.next_cursor is None
 
     @pytest.mark.parametrize("cursor", _GARBAGE_CURSORS)
     async def test_chats_messages_bad_cursor_is_invalid(
@@ -1860,7 +2348,7 @@ class TestListMessages:
         db.add_chat_message(chat_id, "user", "Hello")
 
         with pytest.raises(chats.InvalidCursorError):
-            await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=cursor)
+            await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=cursor)
 
     async def test_chats_messages_truncated_cursor_is_invalid(
         self, chats: ModuleType, db: FakeDb
@@ -1870,7 +2358,9 @@ class TestListMessages:
         chat_id = db.add_chat(alice.user_id)
 
         with pytest.raises(chats.InvalidCursorError):
-            await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=cursor[:-4])
+            await chats.read_chat_detail(
+                db.pool, alice.tenant, chat_id, limit=10, cursor=cursor[:-4]
+            )
 
     async def test_chats_messages_refuse_a_list_cursor(self, chats: ModuleType, db: FakeDb) -> None:
         alice = _member(db)
@@ -1879,7 +2369,7 @@ class TestListMessages:
         db.add_chat_message(chat_id, "user", "Hello")
 
         with pytest.raises(chats.InvalidCursorError):
-            await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=cursor)
+            await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=cursor)
 
     @pytest.mark.parametrize(
         "seq",
@@ -1902,18 +2392,93 @@ class TestListMessages:
         db.calls.clear()
 
         with pytest.raises(chats.InvalidCursorError):
-            await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=crafted)
+            await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=crafted)
 
         assert not any(seq in call.args for call in db.calls)
 
+    # -- GH-266: the owner check once, the status without the row --------------
+
+    @pytest.mark.parametrize("with_cursor", [False, True], ids=["latest-page", "cursor-page"])
+    async def test_chats_detail_runs_the_owner_check_once_and_first(
+        self, chats: ModuleType, db: FakeDb, with_cursor: bool
+    ) -> None:
+        """S2 exactly once and before anything else, then the page, the count and the
+        status read, one statement each."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        _seed_history(db, chat_id, _seven_message_history())
+        cursor = None
+        if with_cursor:
+            first = await chats.read_chat_detail(
+                db.pool, alice.tenant, chat_id, limit=2, cursor=None
+            )
+            cursor = first.page.next_cursor
+        db.calls.clear()
+
+        await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=2, cursor=cursor)
+
+        kinds = [_detail_statement(call) for call in db.calls]
+        assert kinds[:1] == ["owner"]
+        assert Counter(kinds) == Counter({"owner": 1, "page": 1, "count": 1, "status": 1})
+
+    async def test_chats_detail_reads_the_latest_status_without_the_row(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """S15 selects only ``status`` of the chat's highest seq (bound to the chat and
+        the caller's org): the page is the one statement that fetches ``content``."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        _seed_statuses(db, chat_id, ["complete", "awaiting_confirmation"])
+        db.calls.clear()
+
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
+
+        (status_read,) = [call for call in db.calls if _detail_statement(call) == "status"]
+        assert _uuids(status_read.args) == {chat_id, ORG_ID}
+        assert [_detail_statement(call) for call in db.calls if _selects_content(call)] == ["page"]
+        assert detail.latest_status == "awaiting_confirmation"
+
+    @pytest.mark.parametrize("cursor", [None, "not-a-cursor"], ids=["no-cursor", "bad-cursor"])
+    @pytest.mark.parametrize("case", _NOT_FOUND_CASES)
+    async def test_chats_detail_not_found_runs_only_the_owner_check(
+        self, chats: ModuleType, db: FakeDb, case: str, cursor: str | None
+    ) -> None:
+        """Another org's, another user's, a trashed or an unknown chat: ChatNotFoundError
+        after S2 alone, also with a bad cursor (the owner check comes first)."""
+        world = _world(db)
+        db.calls.clear()
+
+        with pytest.raises(chats.ChatNotFoundError) as caught:
+            await chats.read_chat_detail(
+                db.pool, world.alice.tenant, _target(world, case), limit=10, cursor=cursor
+            )
+
+        assert type(caught.value) is chats.ChatNotFoundError
+        assert [_detail_statement(call) for call in db.calls] == ["owner"]
+
+    async def test_chats_detail_invalid_cursor_runs_only_the_owner_check(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """The caller's own chat with a bad cursor: InvalidCursorError after S2, nothing
+        else runs."""
+        world = _world(db)
+        db.calls.clear()
+
+        with pytest.raises(chats.InvalidCursorError):
+            await chats.read_chat_detail(
+                db.pool, world.alice.tenant, world.chat, limit=10, cursor="not-a-cursor"
+            )
+
+        assert [_detail_statement(call) for call in db.calls] == ["owner"]
+
 
 # ---------------------------------------------------------------------------
-# 11. count_messages and latest_message_status
+# 11. count_messages and the latest message status
 # ---------------------------------------------------------------------------
 
 
 class TestCounts:
-    """Per-chat counts and the latest status (by seq)."""
+    """Per-chat counts and the latest status (by seq, through read_chat_detail)."""
 
     async def test_chats_count_messages_counts_only_this_chat(
         self, chats: ModuleType, db: FakeDb
@@ -1946,9 +2511,9 @@ class TestCounts:
             chat_id, "assistant", "c", status="awaiting_confirmation", created_at=_PAST
         )
 
-        status = await chats.latest_message_status(db.pool, alice.tenant, chat_id)
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
 
-        assert status == "awaiting_confirmation"
+        assert detail.latest_status == "awaiting_confirmation"
 
     async def test_chats_latest_status_of_an_empty_chat_is_none(
         self, chats: ModuleType, db: FakeDb
@@ -1957,7 +2522,9 @@ class TestCounts:
         chat_id = db.add_chat(alice.user_id)
         db.add_chat_message(db.add_chat(alice.user_id), "assistant", "x", status="error")
 
-        assert await chats.latest_message_status(db.pool, alice.tenant, chat_id) is None
+        detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
+
+        assert (detail.latest_status, detail.message_count) == (None, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -2447,11 +3014,10 @@ class TestLogs:
         )
         await chats.list_chats(pool, tenant, limit=10, cursor=None)
         await chats.load_recent_history(pool, tenant, chat.id, limit=10)
-        await chats.list_messages(pool, tenant, chat.id, limit=1, cursor=None)
+        await chats.read_chat_detail(pool, tenant, chat.id, limit=1, cursor=None)
         await chats.count_messages(pool, tenant, chat.id)
-        await chats.latest_message_status(pool, tenant, chat.id)
         await chats.append_org_notice(pool, tenant, _MARK_NOTICE)
-        await chats.get_or_create_legacy_chat(pool, tenant, _MARK_SESSION)
+        await chats.get_or_create_legacy_chat(pool, tenant, _MARK_SESSION, chat_id=uuid.uuid4())
         await chats.find_legacy_chat(pool, tenant, _MARK_SESSION)
         await chats.count_org_chats(pool, ORG_ID)
         with contextlib.suppress(Exception):
@@ -2470,4 +3036,6 @@ class TestLogs:
         db.fail_audit = False
         await chats.trash_chat(pool, tenant, chat.id, ip=_IP)
         _race_legacy_insert(monkeypatch, db, alice.user_id, _MARK_RACE_SESSION)
-        await chats.get_or_create_legacy_chat(pool, tenant, _MARK_RACE_SESSION)
+        await chats.get_or_create_legacy_chat(
+            pool, tenant, _MARK_RACE_SESSION, chat_id=uuid.uuid4()
+        )

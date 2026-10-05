@@ -60,6 +60,13 @@ What is pinned:
   records each ``hold()`` call, so B is known to be queued before A goes on.
 - Lone surrogates (security audit L-2): a model-produced tool input holding
   one doesn't break the turn: 200, persisted with U+FFFD in its place.
+- Non-finite numbers (GH-266, re-audit L-4): a run whose tool_use input and
+  tool-call record arguments hold NaN, Infinity, -Infinity and 1e400 (as
+  ``json.loads`` parses them), at the top level and nested, answers 200 on the
+  chat route and on the legacy route (the response's ``tool_calls`` with null),
+  and the turn is stored with null in place of each in both ``tool_use_blocks``
+  and ``tool_calls`` (every finite value with its JSON type); GET
+  /api/chats/{id} reads it back.
 
 New names (``admino.chat_runtime``, the routes, ``server._chat_runtime``) are
 used lazily, so the file collects before GH-176 is implemented.
@@ -73,6 +80,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 import uuid
@@ -1840,3 +1848,112 @@ def test_chat_turns_lone_surrogate_in_a_tool_input_is_persisted_replaced(
             "input": {"key": f"pl{replaced}an", f"no{replaced}te": "x"},
         }
     ]
+
+
+# ---------------------------------------------------------------------------
+# 11. Non-finite numbers in a model's tool arguments (GH-266, re-audit L-4)
+# ---------------------------------------------------------------------------
+
+# A model's tool-call arguments as json.loads parses them: NaN, Infinity, -Infinity and
+# overflowing literals (1e400 is inf), at the top level and nested in objects and arrays.
+_NON_FINITE_ARGUMENTS: Final = """{
+    "nan": NaN, "inf": Infinity, "minus_inf": -Infinity, "huge": 1e400,
+    "ratio": 0.25, "count": 3, "exact": true, "key": "plan", "none": null,
+    "nested": {
+        "values": [NaN, 1.5, -1e400, {"deep": Infinity, "kept": -2.0}],
+        "minus_inf": -Infinity,
+        "zero": 0.0
+    }
+}"""
+# The same arguments as stored: null in place of each non-finite number, the rest as is.
+_NON_FINITE_STORED: Final[dict[str, Any]] = {
+    "nan": None,
+    "inf": None,
+    "minus_inf": None,
+    "huge": None,
+    "ratio": 0.25,
+    "count": 3,
+    "exact": True,
+    "key": "plan",
+    "none": None,
+    "nested": {
+        "values": [None, 1.5, None, {"deep": None, "kept": -2.0}],
+        "minus_inf": None,
+        "zero": 0.0,
+    },
+}
+_NON_FINITE_CALL_ID: Final = "call-nf266"
+
+
+def _json(value: Any) -> str:
+    """Canonical JSON text: equal only when every key, value and JSON type is (3 is not
+    3.0, true is not 1)."""
+    return json.dumps(value, sort_keys=True)
+
+
+def _non_finite_block(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "tool_use",
+        "id": _NON_FINITE_CALL_ID,
+        "name": "memory.recall",
+        "input": arguments,
+    }
+
+
+def _non_finite_record(arguments: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tool": "memory",
+        "action": "recall",
+        "args": arguments,
+        "permission": "allow",
+        "success": True,
+        "duration_ms": 7,
+    }
+
+
+@pytest.mark.parametrize("route", ["chat_route", "legacy_route"])
+def test_chat_turns_non_finite_numbers_in_tool_arguments_are_stored_as_null(
+    world: World, client: TestClient, script: _Script, route: str
+) -> None:
+    """The run's tool_use block input and its tool-call record's arguments hold NaN,
+    Infinity, -Infinity and 1e400, at the top level and nested. The turn answers 200
+    (never 500; the response's tool_calls carry null) and is stored: null in place of
+    each in both ``tool_use_blocks`` and ``tool_calls``, every finite value as it was.
+    GET /api/chats/{id} then reads the turn back."""
+    editor = world.a["editor"]
+    chat_id = world.db.add_chat(editor.user_id) if route == "chat_route" else None
+    record = ToolCallRecord.model_validate(_non_finite_record(json.loads(_NON_FINITE_ARGUMENTS)))
+    asked = LLMMessage(
+        role="assistant",
+        content="",
+        tool_use_blocks=[_non_finite_block(json.loads(_NON_FINITE_ARGUMENTS))],
+    )
+    result = LLMMessage(role="tool", content="No note.", tool_call_id=_NON_FINITE_CALL_ID)
+    script.queue(
+        _Reply(
+            new=(asked, result, _assistant("Not found.")),
+            response="Not found.",
+            tool_calls=(record,),
+        )
+    )
+
+    response = _legacy(client, editor) if chat_id is None else _send(client, editor, chat_id)
+
+    assert response.status_code == 200, response.text
+    expected_record = _non_finite_record(_NON_FINITE_STORED)
+    assert _json(response.json()["tool_calls"]) == _json([expected_record])
+    if chat_id is None:
+        (chat,) = world.db.chats_of(editor.user_id)
+        chat_id = plain(chat["id"])
+    stored = world.db.messages_of(chat_id)
+    assert [(m["role"], m["status"]) for m in stored] == [
+        ("user", "complete"),
+        ("assistant", "complete"),
+        ("tool", "complete"),
+        ("assistant", "complete"),
+    ]
+    assert _json(stored[1]["tool_use_blocks"]) == _json([_non_finite_block(_NON_FINITE_STORED)])
+    assert _json(stored[3]["tool_calls"]) == _json([expected_record])
+    detail = _detail(client, editor, chat_id)
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant", "tool", "assistant"]
+    assert _json(detail["messages"][3]["tool_calls"]) == _json([expected_record])
