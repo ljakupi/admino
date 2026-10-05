@@ -537,8 +537,8 @@ async def get_or_create_legacy_chat(
         asyncpg.UniqueViolationError: When the INSERT violates any unique key
             but ``chats_legacy_session_key`` (e.g. ``chats_pkey``: ``chat_id``
             is an existing chat's, of any owner or org); the driver's own
-            exception, unwrapped, and nothing is stored. It quotes the row, so
-            it must never be logged by text.
+            exception, unwrapped, and nothing is stored. It quotes the violated
+            key's values (its DETAIL), so it must never be logged by text.
     """
     with contextlib.suppress(ChatNotFoundError):
         return await find_legacy_chat(executor, tenant, session_id)

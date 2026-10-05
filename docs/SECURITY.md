@@ -127,7 +127,9 @@ How it's enforced:
   held external content keeps asking before actions that change something (see
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
   The database also ties a chat's owner to the chat's organization (a composite foreign
-  key), so no role can store a chat whose owner belongs to another organization.
+  key) and refuses any write of a chat whose owner belongs to another organization,
+  including the app's writes as `admino_app`. Only the `admino` owner role could remove
+  the key.
 - **New tables get explicit grants.** A migration that creates a table grants
   `admino_app` exactly what the app needs on it, in the same file; a unit test fails
   otherwise. New functions get no `EXECUTE` for anyone by default.
