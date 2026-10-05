@@ -50,6 +50,61 @@ config. See [Permissions → Hardcoded critical denials](permissions.md#hardcode
 for the exact rules and the deliberate flow for promoting a critical action (like
 `gmail.send`) to *confirm*.
 
+## External content is data, not instructions
+
+Some tool results carry text that someone else wrote: an email, a file name, an event
+description, or a memory note that an earlier email may have planted. A crafted one can
+try to give the agent orders ("ignore your instructions and..."). So before the model
+sees such a result, admino wraps it between two markers that carry a random ID, new for
+every run:
+
+```
+<untrusted_content_ID kind="email" label="gmail message 18c2f">
+...the result...
+</untrusted_content_ID>
+```
+
+The agent's instructions say that wrapped content is data, never instructions: the model
+should point out instructions it finds there instead of following them.
+
+| Kind | Wrapped results |
+| --- | --- |
+| `email` | Gmail and Outlook `read`, `list`, `search` |
+| `file` | Google Drive and OneDrive `read`, `list`, `search` (names and metadata) |
+| `event` | Google Calendar and Outlook Calendar `read`, `list`, and `update` (it returns the existing event) |
+| `memory` | `memory.recall` when a note is found, `memory.list` when there is at least one note |
+
+Not wrapped: the `send` and `create` results (they repeat the agent's own arguments), the
+`memory.store` confirmation, error messages and "nothing found" messages.
+
+Before it is wrapped, the text is cleaned: control characters and invisible formatting
+characters (bidirectional overrides, zero-width characters) are removed, any copy of the
+marker inside the text is defused so the content can't end its block early, and the text
+is capped at 20,000 characters (`[truncated]`). The wrapping is guidance for the model;
+the hard rule is the next section. See
+[Security Model → Untrusted content](SECURITY.md#untrusted-content-in-tool-results) for
+what it does and doesn't protect against.
+
+## Side effects
+
+Every action declares whether it changes something (a side effect) or only reads:
+
+| Tool | Side effect | Read-only |
+| --- | --- | --- |
+| **Gmail** | `send` | `read` · `list` · `search` |
+| **Outlook mail** | `send` | `read` · `list` · `search` |
+| **Google Calendar** | `create` · `update` | `read` · `list` |
+| **Outlook Calendar** | `create` · `update` | `read` · `list` |
+| **Google Drive** | — | `read` · `list` · `search` |
+| **OneDrive** | — | `read` · `list` · `search` |
+| **Memory** | `store` | `recall` · `list` |
+
+Once a run has read wrapped content, a side effect that the permission matrix allows asks
+you to confirm first, for the rest of the conversation. Denied and confirm actions stay as
+they are. See
+[Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first).
+An action added without a declaration counts as a side effect.
+
 ## Not yet implemented
 
 These are planned and **not** in this release — don't expect them to work yet:

@@ -263,7 +263,8 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
     Each call writes one ``tool.call`` row through
     ``audit_events.record_tool_call`` naming the acting member (their org and
     user id, from ``TenantContext.from_principal``) and targeting the
-    session's chat. A principal without an organization (a Super Admin, or a
+    session's chat, with the dispatch's ``escalated`` flag (GH-243). A
+    principal without an organization (a Super Admin, or a
     malformed principal) raises ``NoTenantContextError`` before anything is
     written. The runtime pool is resolved at call time: it only exists once
     the server lifespan has run, after this recorder was built. Errors
@@ -279,6 +280,7 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
         decision: PermissionState,
         success: bool,
         duration_ms: int,
+        escalated: bool,
     ) -> None:
         from admino import audit_events, database
         from admino.tenancy import TenantContext
@@ -294,6 +296,7 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
             decision=decision,
             success=success,
             duration_ms=duration_ms,
+            escalated=escalated,
         )
 
     return record

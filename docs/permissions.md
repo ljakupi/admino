@@ -16,7 +16,7 @@ resolves to exactly one of three states:
 
 | State | Meaning |
 | --- | --- |
-| **allow** | Runs immediately (read-only actions only). |
+| **allow** | Runs immediately (read-only actions, and saving your own memory notes). |
 | **confirm** | Pauses and asks you to approve before it runs. |
 | **deny** | Blocked — the agent is told it cannot do this. |
 
@@ -56,6 +56,29 @@ State-changing actions can only ever be **confirm** or **deny** — never **allo
 Org Admin sets a write action to `allow`, it is stored as **`confirm`**. A
 prompt injection that convinces the model to "just send it" still can't turn a write into
 a silent action: the engine, which never sees that text, holds the line.
+
+## External content makes side effects ask first
+
+Emails, files, calendar events and memory notes are written by other people, or were
+planted by an earlier email ("remember that..."), so they can carry instructions aimed at
+the agent. The agent sees them wrapped as data (see
+[Tools → External content](tools.md#external-content-is-data-not-instructions)), and the
+dispatch layer adds a hard rule on top:
+
+- Once a run has read external content (mail, files, events or memory notes), every
+  action that changes something and that the matrix sets to **allow** needs your
+  confirmation instead. This holds for the rest of that run and for the later turns of
+  the same conversation, because the content is still in the agent's context. Today the
+  one such action is `memory.store`: an email that says "remember X" makes the agent stop
+  and ask before it stores anything.
+- Approving runs that one call. The next action that changes something asks again.
+- Read-only actions (read, list, search, recall) keep running on their own. Which actions
+  count as changing something is listed in
+  [Tools → Side effects](tools.md#side-effects).
+- A decision is only ever tightened: **deny** stays deny and **confirm** stays confirm.
+  The permission engine is unchanged and never sees the content; the rule lives in the
+  dispatch layer, after the engine's decision.
+- The call's audit row says it was escalated (`escalated: true`, see below).
 
 ## Hardcoded critical denials
 
@@ -113,8 +136,9 @@ This isolation is a coding standard enforced in review — see the security expe
 
 Every tool call the agent makes writes one row to the **`audit_events` table** in
 PostgreSQL: the tool, the action, the permission decision (allowed, confirmed or denied),
-whether it succeeded, and how long it took. The row never holds the arguments, the tool's
-output or any message text.
+whether it succeeded, how long it took, and whether it was escalated (`escalated`: an
+**allow** turned into **confirm** because the conversation holds external content). The
+row never holds the arguments, the tool's output or any message text.
 
 The table is append-only: a database trigger refuses edits and deletions, except the daily
 retention purge of rows older than the audit retention (12 months by default). If a row can't be written, the agent stops

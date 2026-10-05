@@ -18,7 +18,9 @@ Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
 optional targets, the client IP and a small metadata dict.
 ``record_tool_call()`` takes an executor, the acting member's org and user
-IDs, the chat ID and one agent tool dispatch's outcome (GH-147, GH-149).
+IDs, the chat ID and one agent tool dispatch's outcome (GH-147, GH-149),
+including whether the dispatch was escalated to confirmation because the run
+holds external content (GH-243).
 ``purge_expired()`` takes the pool and a retention in months;
 ``run_retention_job()`` the pool and a zero-argument async callable that
 returns it, awaited before each purge (the server passes the stored platform
@@ -499,11 +501,13 @@ async def record_tool_call(
     decision: str,
     success: bool,
     duration_ms: int,
+    escalated: bool,
 ) -> None:
     """Record one agent tool dispatch as the acting member's ``tool.call`` event on its chat.
 
-    The metadata holds exactly ``tool``, ``action``, ``decision``, ``success``
-    and ``duration_ms`` — never argument values, tool output or error text.
+    The metadata holds exactly ``tool``, ``action``, ``decision``, ``success``,
+    ``duration_ms`` and ``escalated`` — never argument values, tool output,
+    error text or the external content that caused an escalation.
 
     Args:
         executor: The pool or a connection to write through.
@@ -516,15 +520,18 @@ async def record_tool_call(
         decision: The final permission decision: allow, confirm or deny.
         success: Whether the tool ran and returned a result.
         duration_ms: How long the dispatch took, in milliseconds.
+        escalated: Whether dispatch tightened an ``allow`` to ``confirm``
+            because the run holds external content (GH-243).
 
     Raises:
-        AuditRecordError: If ``decision`` is not a permission decision or the
-            event is otherwise invalid, e.g. a missing org or user id (nothing
-            is written), or the write fails.
+        AuditRecordError: If ``decision`` is not a permission decision,
+            ``escalated`` is not a bool, or the event is otherwise invalid,
+            e.g. a missing org or user id (nothing is written), or the write
+            fails.
     """
     # Explicit: the vocabulary also holds tool names and roles, which are no
-    # decision.
-    if type(decision) is not str or decision not in _DECISIONS:
+    # decision. ``type() is bool``: 1, 0 and "true" are no flag.
+    if type(decision) is not str or decision not in _DECISIONS or type(escalated) is not bool:
         raise AuditRecordError
     await record(
         executor,
@@ -540,6 +547,7 @@ async def record_tool_call(
             "decision": decision,
             "success": success,
             "duration_ms": duration_ms,
+            "escalated": escalated,
         },
     )
 

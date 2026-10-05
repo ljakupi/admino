@@ -6,8 +6,8 @@ calling user's own Google account (per-user connections, GH-162).
 Inputs: the validated args (``GmailReadArgs``, ``GmailListArgs``,
 ``GmailSearchArgs``, ``GmailSendArgs``) and the required keyword ``tenant``
 (the run's ``TenantContext``, passed by ``registry.dispatch_tool_call``).
-Outputs: the formatted message(s), a send summary, or a user-facing error
-string.
+Outputs: the formatted message(s), wrapped as untrusted email content
+(GH-243), a send summary, or a user-facing error string.
 
 Security notes:
 - Per-user tokens: every API request of a handler call carries the access
@@ -21,6 +21,11 @@ Security notes:
   gmail.delete remains a hardcoded immutable denial.
 - Email body content is truncated to 10000 characters to prevent LLM context
   overflow.
+- Untrusted content (GH-243): every read/list/search success result is
+  third-party text and reaches the model only through ``untrusted.wrap``
+  (kind ``email``), so the agent escalates the run's later side effects to
+  confirmation. Error and "nothing found" strings, and the send summary
+  (the LLM's own arguments), stay unwrapped.
 - RFC 2822 message construction uses stdlib email.message.EmailMessage to
   prevent header injection.
 - No eval, exec, shell=True, or importlib.
@@ -35,7 +40,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from admino import database
+from admino import database, untrusted
 from admino.models import GmailListArgs, GmailReadArgs, GmailSearchArgs, GmailSendArgs
 from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
@@ -245,6 +250,7 @@ def _format_message_list(messages: list[dict[str, str]]) -> str:
     action="read",
     description="Read a single email by message ID. Returns subject, from, date, and body text.",
     args_schema=GmailReadArgs,
+    side_effect=False,
 )
 async def gmail_read(args: GmailReadArgs, *, tenant: TenantContext, **_: object) -> str:
     """Read a single Gmail message by ID.
@@ -257,7 +263,7 @@ async def gmail_read(args: GmailReadArgs, *, tenant: TenantContext, **_: object)
         tenant: The caller's tool context (whose Google account is read).
 
     Returns:
-        Formatted message content string.
+        The formatted message content, wrapped as untrusted email content.
     """
     try:
         response = await _google_get(
@@ -293,8 +299,10 @@ async def gmail_read(args: GmailReadArgs, *, tenant: TenantContext, **_: object)
     if len(body) > _MAX_BODY_CHARS:
         body = body[:_MAX_BODY_CHARS] + f"\n\n[Truncated at {_MAX_BODY_CHARS} characters]"
 
-    return (
-        f"Subject: {subject}\nFrom: {from_addr}\nDate: {date}\nSnippet: {snippet}\n\nBody:\n{body}"
+    return untrusted.wrap(
+        "email",
+        f"gmail message {args.message_id}",
+        f"Subject: {subject}\nFrom: {from_addr}\nDate: {date}\nSnippet: {snippet}\n\nBody:\n{body}",
     )
 
 
@@ -303,6 +311,7 @@ async def gmail_read(args: GmailReadArgs, *, tenant: TenantContext, **_: object)
     action="list",
     description="List recent emails. Returns subject, from, and date for each message.",
     args_schema=GmailListArgs,
+    side_effect=False,
 )
 async def gmail_list(args: GmailListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List recent Gmail messages.
@@ -314,7 +323,8 @@ async def gmail_list(args: GmailListArgs, *, tenant: TenantContext, **_: object)
         tenant: The caller's tool context (whose Google account is read).
 
     Returns:
-        Formatted list of messages with headers.
+        The formatted list of messages with headers, wrapped as untrusted
+        email content ("No messages found." when none could be fetched).
     """
     try:
         response = await _google_get(
@@ -345,7 +355,10 @@ async def gmail_list(args: GmailListArgs, *, tenant: TenantContext, **_: object)
             except (OAuthError, httpx.HTTPError):
                 continue
 
-    return _format_message_list(messages)
+    if not messages:
+        # "Nothing found" carries no third-party text.
+        return _format_message_list(messages)
+    return untrusted.wrap("email", "gmail messages", _format_message_list(messages))
 
 
 @register_tool(
@@ -353,6 +366,7 @@ async def gmail_list(args: GmailListArgs, *, tenant: TenantContext, **_: object)
     action="search",
     description="Search emails by query. Returns subject, from, and date for matching messages.",
     args_schema=GmailSearchArgs,
+    side_effect=False,
 )
 async def gmail_search(args: GmailSearchArgs, *, tenant: TenantContext, **_: object) -> str:
     """Search Gmail messages by query.
@@ -365,7 +379,9 @@ async def gmail_search(args: GmailSearchArgs, *, tenant: TenantContext, **_: obj
         tenant: The caller's tool context (whose Google account is searched).
 
     Returns:
-        Formatted list of matching messages with headers.
+        The formatted list of matching messages with headers, wrapped as
+        untrusted email content ("No messages found." when none could be
+        fetched).
     """
     try:
         response = await _google_get(
@@ -396,7 +412,10 @@ async def gmail_search(args: GmailSearchArgs, *, tenant: TenantContext, **_: obj
             except (OAuthError, httpx.HTTPError):
                 continue
 
-    return _format_message_list(messages)
+    if not messages:
+        # "Nothing found" carries no third-party text.
+        return _format_message_list(messages)
+    return untrusted.wrap("email", "gmail search results", _format_message_list(messages))
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +477,7 @@ def _send_summary(args: GmailSendArgs) -> str:
         "via Critical Permissions. Returns a confirmation summary."
     ),
     args_schema=GmailSendArgs,
+    side_effect=True,
 )
 async def gmail_send(args: GmailSendArgs, *, tenant: TenantContext, **_: object) -> str:
     """Send an email via the Gmail API.
