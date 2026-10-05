@@ -1,25 +1,27 @@
 """Persisted, owner-private chats and their messages (GH-176, migration 0024).
 
 The repository behind the chat routes and the agent turns: a member creates,
-lists, renames and trashes their own chats; every turn appends the run's new
-messages (``append_messages``) and the next run loads the latest ones back
+lists, renames and trashes their own chats and reads one with a page of its
+messages (``read_chat_detail``); every turn appends the run's new messages
+(``append_messages``) and the next run loads the latest ones back
 (``load_recent_history``). The legacy ``session_id`` API keeps one chat per
 (user, session id) through ``chats.legacy_session_id`` until #177
-(``get_or_create_legacy_chat``, ``find_legacy_chat``). GH-66's promotion
+(``find_legacy_chat``, ``get_or_create_legacy_chat``). GH-66's promotion
 notice reaches every live chat of the org (``append_org_notice``), and the
 Super Admin's org metadata counts the org's chats (``count_org_chats``).
 GH-179's background task stores the automatic title (``set_auto_title``).
 
 Inputs: an executor (an asyncpg pool or connection) or, for the three
-transactional writes (``trash_chat``, ``append_messages``,
-``append_org_notice``), the pool; the
-caller's ``TenantContext``; a chat id; titles, ``LLMMessage``s and
-``ToolCallRecord``s; page sizes and opaque cursors.
-Outputs: ``ChatRecord``, ``ChatPage``, ``MessagePage``, ``LLMMessage`` lists,
-counts, message statuses and whether an automatic title was stored.
-Errors: ``ChatNotFoundError``,
-``InvalidCursorError``, ``ValueError`` (a ``system`` message to store),
-``audit_events.AuditRecordError`` and the driver's errors.
+transactional writes (``trash_chat``, ``append_messages`` and
+``append_org_notice``), the pool; the caller's ``TenantContext``; a chat id
+(the server-generated id of a legacy chat to create); titles,
+``LLMMessage``s and ``ToolCallRecord``s; page sizes and opaque cursors.
+Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
+``MessagePage``, its message count and latest message status),
+``LLMMessage`` lists, counts and whether an automatic title was stored.
+Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
+``system`` message to store), ``audit_events.AuditRecordError`` and the
+driver's errors.
 
 Behaviour:
 - Lists are keyset-paginated: chats by ``(last_activity_at, id)`` descending,
@@ -31,19 +33,27 @@ Behaviour:
   bound (a seq beyond BIGINT, a timestamp without a UTC equivalent). A cursor
   carries a position only, never a scope: the caller's tenant still filters
   every row.
+- ``read_chat_detail`` runs the owner check once, first; the page, the count
+  and the latest status (its ``status`` column only) follow it.
 - JSONB values travel as JSON text (``$n::jsonb``) and come back as text,
   decoded here. PostgreSQL's TEXT and JSONB refuse U+0000, so it is removed
   from message content and from every string (keys included) inside the JSON
   values before writing. JSONB also refuses a lone surrogate, which a
   model-produced tool input or tool-call argument can carry (the ``str``
   fields refuse one already), so each is replaced by U+FFFD in those strings.
+  JSON and JSONB have no NaN or infinity either, which a model's tool
+  arguments can carry once parsed (``1e400`` parses as infinity): each
+  non-finite number is stored as null, at any depth (GH-266), and the JSON
+  text is written with ``allow_nan=False``, so a non-finite number that
+  slipped through would raise instead of reaching the database.
 - ``append_messages`` and ``trash_chat`` each run in one transaction:
   ``append_messages`` touches the chat first (no row: nothing is written),
   then inserts the messages in order; ``trash_chat`` sets ``deleted_at`` and
   records ``chat.delete`` on the same connection, so a failed audit write
   rolls the trash back. ``get_or_create_legacy_chat`` uses no transaction of
   its own: a concurrent first message of the same session loses the INSERT
-  on the partial unique key and selects the winner's chat.
+  on the partial unique key and selects the winner's chat (whose id differs
+  from the one given).
 - ``append_org_notice`` (GH-66) skips every chat whose latest message (highest
   seq, any role) is ``awaiting_confirmation``: a user message after the
   pending call's ``tool_use`` would separate it from its result and break the
@@ -65,7 +75,11 @@ Security notes:
 - The sticky ``external_content`` flag (GH-243) is set only when an appended
   ``tool`` message holds wrapped external content
   (``untrusted.contains_wrapped``): a user or the model typing a marker can't
-  set it, and nothing here ever clears it.
+  set it, and nothing here ever clears it (migration 0025's trigger refuses
+  a reset in the database too).
+- The runtime role may update only ``title``, ``title_source``,
+  ``last_activity_at``, ``external_content`` and ``deleted_at`` of a chat
+  (migration 0025): every UPDATE here stays within them.
 - System prompts and instructions are never stored: a ``system`` message is
   refused before any statement.
 - No content in logs or errors: nothing is logged here, and no error carries
@@ -81,6 +95,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import math
 import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol
@@ -117,6 +132,14 @@ _CURSOR_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,200}")
 _CREATE_SQL: Final = """
     INSERT INTO chats (org_id, owner_user_id, title, title_source, legacy_session_id)
     VALUES ($1, $2, $3, $4, $5)
+    RETURNING id, org_id, owner_user_id, title, title_source, external_content,
+        created_at, last_activity_at
+"""
+# S1L: a legacy session's chat with the server-generated id (GH-266: the server holds the
+# chat's runtime entry before the chat exists); the title and its source are the defaults.
+_CREATE_LEGACY_SQL: Final = """
+    INSERT INTO chats (id, org_id, owner_user_id, legacy_session_id)
+    VALUES ($1, $2, $3, $4)
     RETURNING id, org_id, owner_user_id, title, title_source, external_content,
         created_at, last_activity_at
 """
@@ -202,6 +225,13 @@ _MESSAGES_BEFORE_SQL: Final = """
 """
 # S10
 _COUNT_MESSAGES_SQL: Final = "SELECT count(*) FROM chat_messages WHERE chat_id = $1 AND org_id = $2"
+# S15: the status of a chat's latest message, without the rest of its row.
+_LATEST_STATUS_SQL: Final = """
+    SELECT status FROM chat_messages
+    WHERE chat_id = $1 AND org_id = $2
+    ORDER BY seq DESC
+    LIMIT 1
+"""
 # S12a: GH-66's promotion notice first locks the org's live chats, in id order. A turn
 # storing its messages holds its chat's row (S7's UPDATE) until it commits, so the lock
 # waits for it and S12b then sees that turn's messages (GH-24).
@@ -312,6 +342,16 @@ class MessagePage(SealedModel):
     next_cursor: str | None
 
 
+class ChatDetail(SealedModel):
+    """A chat of the caller with one page of its messages, its count and latest status."""
+
+    chat: ChatRecord
+    page: MessagePage
+    message_count: int
+    # None for a chat without messages.
+    latest_status: MessageStatus | None
+
+
 def _utc_representable(value: datetime) -> datetime:
     """The stamp unchanged if it has a UTC equivalent, which asyncpg binds.
 
@@ -365,9 +405,12 @@ def _decode_cursor[C: (_ChatCursor, _MessageCursor)](cursor: str, kind: type[C])
 # Any: a JSON value of any shape (object, array, string, number, bool, null).
 def _jsonb_safe(value: Any) -> Any:
     """The JSON value with U+0000 removed and each lone surrogate replaced by U+FFFD in
-    every string, object keys included; a surrogate pair (an emoji) is kept."""
+    every string, object keys included (a surrogate pair, an emoji, is kept), and each
+    non-finite number (NaN, an infinity) replaced by None, at any depth."""
     if isinstance(value, str):
         return _LONE_SURROGATE_RE.sub(_REPLACEMENT_CHARACTER, value.replace(_NUL, ""))
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, list | tuple):
         return [_jsonb_safe(item) for item in value]
     if isinstance(value, dict):
@@ -376,8 +419,13 @@ def _jsonb_safe(value: Any) -> Any:
 
 
 def _json_text(value: list[dict[str, Any]] | None) -> str | None:
-    """The JSON text bound to a ``$n::jsonb`` parameter (``_jsonb_safe``), None for NULL."""
-    return None if value is None else json.dumps(_jsonb_safe(value))
+    """The JSON text bound to a ``$n::jsonb`` parameter (``_jsonb_safe``), None for NULL.
+
+    ``allow_nan=False`` is the fail-closed backstop: a non-finite number that
+    ``_jsonb_safe`` missed raises ``ValueError`` instead of becoming ``NaN`` /
+    ``Infinity`` text, which isn't JSON.
+    """
+    return None if value is None else json.dumps(_jsonb_safe(value), allow_nan=False)
 
 
 # Any: a decoded JSONB column (an array of objects here).
@@ -456,7 +504,7 @@ async def find_legacy_chat(
 
 
 async def get_or_create_legacy_chat(
-    executor: Executor, tenant: TenantContext, session_id: str
+    executor: Executor, tenant: TenantContext, session_id: str, *, chat_id: UUID
 ) -> ChatRecord:
     """Return the caller's live chat of a legacy session id, creating it if needed.
 
@@ -468,16 +516,20 @@ async def get_or_create_legacy_chat(
         executor: The pool.
         tenant: The caller's org scope.
         session_id: The validated legacy session id.
+        chat_id: The id a chat created here gets (server-generated); unused
+            when the session already has a live chat.
 
     Returns:
-        The chat (untitled, ``auto``, when created here).
+        The session's live chat with its own id, else the chat created here
+        (``chat_id``, untitled, ``auto``), else the chat a concurrent first
+        message of the session created meanwhile (another id).
     """
     with contextlib.suppress(ChatNotFoundError):
         return await find_legacy_chat(executor, tenant, session_id)
     # The driver's error quotes the session id: it is dropped, never logged.
     with contextlib.suppress(asyncpg.UniqueViolationError):
         row = await executor.fetchrow(
-            _CREATE_SQL, tenant.org_id, tenant.user_id, "", "auto", session_id
+            _CREATE_LEGACY_SQL, chat_id, tenant.org_id, tenant.user_id, session_id
         )
         return _chat_record(row)
     return await find_legacy_chat(executor, tenant, session_id)
@@ -611,9 +663,10 @@ async def append_messages(
     which gets ``final_status`` and the run's tool calls (NULL when there are
     none). The chat's ``last_activity_at`` is bumped, and ``external_content``
     is set (for good) when an appended ``tool`` message holds wrapped external
-    content. U+0000 is removed from the content and the JSON values, and each
-    lone surrogate in the JSON values (a model's tool input or the tool-call
-    arguments) is stored as U+FFFD.
+    content. U+0000 is removed from the content and the JSON values; in the
+    JSON values (a model's tool input or the tool-call arguments) each lone
+    surrogate is stored as U+FFFD and each non-finite number (NaN, an
+    infinity, an overflowing literal as parsed) as null, at any depth.
 
     Args:
         pool: The database pool.
@@ -707,10 +760,15 @@ async def load_recent_history(
     return history[start:]
 
 
-async def list_messages(
+async def read_chat_detail(
     executor: Executor, tenant: TenantContext, chat_id: UUID, *, limit: int, cursor: str | None
-) -> MessagePage:
-    """Return one page of the caller's chat's messages, latest page first.
+) -> ChatDetail:
+    """Return the caller's chat with one page of its messages, its count and latest status.
+
+    The owner check (S2) runs once and first: a chat the caller can't reach
+    runs nothing else, and the cursor is decoded only after it. The page,
+    the count and the latest status (its ``status`` column only) bind the
+    checked chat and the caller's org.
 
     Args:
         executor: The pool or a connection.
@@ -720,14 +778,16 @@ async def list_messages(
         cursor: The previous page's ``next_cursor``, or None for the latest page.
 
     Returns:
-        Up to ``limit`` messages before the cursor, in chronological order,
-        and the cursor of the earlier messages (None at the beginning).
+        The chat; up to ``limit`` messages before the cursor, in
+        chronological order, with the cursor of the earlier messages (None
+        at the beginning); the chat's message count; the status of its
+        latest message (highest seq; None without messages).
 
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed.
         InvalidCursorError: If the cursor isn't a message cursor.
     """
-    await get_chat(executor, tenant, chat_id)
+    chat = await get_chat(executor, tenant, chat_id)
     if cursor is None:
         rows = await executor.fetch(_LATEST_MESSAGES_SQL, chat_id, tenant.org_id, limit + 1)
     else:
@@ -739,7 +799,16 @@ async def list_messages(
     next_cursor = None
     if len(rows) > limit:
         next_cursor = _encode_cursor(_MessageCursor(seq=messages[0].seq))
-    return MessagePage(messages=messages, next_cursor=next_cursor)
+    message_count = int(await executor.fetchval(_COUNT_MESSAGES_SQL, chat_id, tenant.org_id))
+    latest_status: MessageStatus | None = await executor.fetchval(
+        _LATEST_STATUS_SQL, chat_id, tenant.org_id
+    )
+    return ChatDetail(
+        chat=chat,
+        page=MessagePage(messages=messages, next_cursor=next_cursor),
+        message_count=message_count,
+        latest_status=latest_status,
+    )
 
 
 async def count_messages(executor: Executor, tenant: TenantContext, chat_id: UUID) -> int:
@@ -750,25 +819,6 @@ async def count_messages(executor: Executor, tenant: TenantContext, chat_id: UUI
     """
     await get_chat(executor, tenant, chat_id)
     return int(await executor.fetchval(_COUNT_MESSAGES_SQL, chat_id, tenant.org_id))
-
-
-async def latest_message_status(
-    executor: Executor, tenant: TenantContext, chat_id: UUID
-) -> MessageStatus | None:
-    """Return the status of the caller's chat's latest message (highest seq).
-
-    Returns:
-        The status, or None for a chat without messages.
-
-    Raises:
-        ChatNotFoundError: Unless the chat is the caller's and not trashed.
-    """
-    await get_chat(executor, tenant, chat_id)
-    row = await executor.fetchrow(_LATEST_MESSAGES_SQL, chat_id, tenant.org_id, 1)
-    if row is None:
-        return None
-    status: MessageStatus = row["status"]
-    return status
 
 
 async def append_org_notice(pool: asyncpg.Pool, tenant: TenantContext, content: str) -> int:

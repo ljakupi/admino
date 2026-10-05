@@ -70,8 +70,9 @@ dispatch layer adds a hard rule on top:
   confirmation instead. This holds for the rest of that run and for the later turns of
   the same conversation, because the content is still in the agent's context. A turn
   loads only the chat's latest messages, so the chat remembers it: once a tool result
-  with external content is stored in a chat, the chat keeps that mark for good, and every
-  later turn there asks first, even when the email itself is long out of view. Today the
+  with external content is stored in a chat, the chat keeps that mark for good (the
+  database refuses to clear it, too), and every later turn there asks first, even when
+  the email itself is long out of view. Today the
   one such action is `memory.store`: an email that says "remember X" makes the agent stop
   and ask before it stores anything.
 - Approving runs that one call. The next action that changes something asks again.
