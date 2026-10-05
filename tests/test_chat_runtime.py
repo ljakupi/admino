@@ -553,7 +553,7 @@ class TestPending:
         )
 
     def test_chat_runtime_get_pending_returns_an_expired_confirmation(self) -> None:
-        """Expiry is the caller's decision (410 or reap_expired), not get_pending's."""
+        """Expiry is the caller's decision (its expiry check or reap_expired), not get_pending's."""
         runtime = _runtime(_Clock())
         expired = _pending(_chat(1), expires_at=datetime(2020, 1, 1, tzinfo=UTC))
         runtime.set_pending(_chat(1), _USER_A, expired)
