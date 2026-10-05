@@ -43,6 +43,15 @@ What is pinned:
   Guards: a lock-only chat is the same 404, a wrong confirmation id is the 404
   ``Confirmation not found`` with the pending one kept, another user's or org's chat is
   the 404 at the bound too; none of them runs, stores or changes the runtime.
+- GH-266 (server audit L-1 of #176): the first POST /api/message of a brand-new
+  ``session_id`` refused with the 429 ``rate_limit`` or the 503 ``chats_busy`` leaves no
+  chat: GET /api/chats unchanged, no chats row, no message, no run, the runtime
+  unchanged. Controls: the same refusal on an existing legacy chat keeps it unchanged;
+  once the refusal clears, the session runs in exactly one chat, created by that turn,
+  whose id is the response's ``chat_id``, the run's session id and a runtime entry's
+  key (``session_id`` echoed); a concurrent first message of the same session that
+  inserts first (a FakeDb hook before the INSERT) makes the turn run, be stored and
+  hold its runtime entry in that winner's chat, the session's only chat.
 
 ``admino.chat_runtime`` and the new server names are used lazily, so the file collects
 before GH-24 is implemented and each test fails on its own.
@@ -73,7 +82,7 @@ from admino.models import (
     ToolCall,
     ToolCallRecord,
 )
-from tests.db_fakes import FakeDb
+from tests.db_fakes import FakeDb, norm, plain
 from tests.tenancy_world import (
     CLIENT_IP,
     build_world,
@@ -1023,3 +1032,202 @@ def test_chat_runtime_bound_confirm_on_another_users_chat_at_bound_is_404(
     assert agent.run.await_count == runs
     assert _tables(world.db) == tables
     assert chat_runtime_state(world.db) == state
+
+
+# ---------------------------------------------------------------------------
+# 8. A refused first legacy message leaves no chat (GH-266, server audit L-1)
+# ---------------------------------------------------------------------------
+
+_NEW_SESSION: Final = "legacy-266-new-avocet"
+_RETRY_MESSAGE: Final = "Second try"
+_REFUSALS: Final = ("rate_limit", "chats_busy")
+
+
+@dataclass(frozen=True)
+class _Refusal:
+    """A runtime that refuses the Editor a new entry: the answer, and how it clears."""
+
+    answer: tuple[int, dict[str, str]]
+    clear: Callable[[], None]
+
+
+def _refusing_new_entries(
+    client: TestClient,
+    script: _Script,
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    refusal: str,
+) -> _Refusal:
+    """Org A's Editor (one listed chat without a runtime entry) gets no new runtime entry.
+
+    ``rate_limit``: bound 2, both of the Editor's other chats hold a pending
+    confirmation (429). ``chats_busy``: capacity 2, org B's Editor's and org A's Org
+    Admin's chats hold one each (503). Clearing denies one of those confirmations, so
+    its chat is then only a lock and gives way.
+    """
+    editor = world.a["editor"]
+    seed_chat(world.db, editor, title="Earlier plan", messages=[("user", "Earlier question")])
+    if refusal == "rate_limit":
+        _use_runtime(monkeypatch, max_entries=_ROOMY, max_entries_per_user=2)
+        owner, answer = editor, (429, _USER_CHATS_BUSY)
+        pending = [_new_chat(world.db, editor) for _ in range(2)]
+        for chat_id in pending:
+            _awaited(client, script, editor, chat_id)
+    else:
+        _use_runtime(monkeypatch, max_entries=2)
+        owner, answer = world.a["org_admin"], (503, _CHATS_BUSY)
+        other_org = world.b["editor"]
+        _awaited(client, script, other_org, _new_chat(world.db, other_org))
+        pending = [_new_chat(world.db, owner)]
+        _awaited(client, script, owner, pending[0])
+
+    def clear() -> None:
+        denied = _confirm(client, owner, pending[0], approved=False)
+        assert denied.status_code == 200, denied.text
+
+    return _Refusal(answer=answer, clear=clear)
+
+
+def _legacy_turn(
+    client: TestClient, account: Account, message: str = _MESSAGE, session_id: str = _NEW_SESSION
+) -> httpx.Response:
+    """POST /api/message under ``session_id`` as ``account``."""
+    return client.post(
+        "/api/message",
+        headers=account.cookie,
+        json={"message": message, "session_id": session_id},
+    )
+
+
+def _listed(client: TestClient, account: Account) -> Any:
+    """GET /api/chats as ``account`` (must succeed): the JSON body."""
+    response = client.get("/api/chats", headers=account.cookie)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _session_chats(world: World, account: Account, session_id: str) -> list[dict[str, Any]]:
+    """The account's chats rows of a legacy session id."""
+    return [
+        row for row in world.db.chats_of(account.user_id) if row["legacy_session_id"] == session_id
+    ]
+
+
+def _race_legacy_insert(
+    monkeypatch: pytest.MonkeyPatch, db: FakeDb, owner: uuid.UUID, session_id: str
+) -> list[uuid.UUID]:
+    """Store the owner's chat of ``session_id`` right before the first INSERT INTO chats
+    runs (a concurrent first message of the same session that inserted first); returns
+    the list that chat's id lands in (tests/test_chats.py's hook)."""
+    raced: list[uuid.UUID] = []
+    original = db.handle
+
+    def racing(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+        if not raced and norm(sql).startswith("insert into chats"):
+            raced.append(db.add_chat(owner, legacy_session_id=session_id))
+        return original(method, sql, args, via, tx)
+
+    monkeypatch.setattr(db, "handle", racing)
+    return raced
+
+
+@pytest.mark.parametrize("refusal", _REFUSALS)
+def test_chat_runtime_bound_refused_first_legacy_message_leaves_no_chat(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """The first POST /api/message of a brand-new session id, refused with the 429
+    ``rate_limit`` or the 503 ``chats_busy``, leaves GET /api/chats unchanged: no chats
+    row, no message, no run, the runtime unchanged."""
+    _, client = _client(agent)
+    editor = world.a["editor"]
+    refused = _refusing_new_entries(client, script, world, monkeypatch, refusal)
+    listed = _listed(client, editor)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _legacy_turn(client, editor, _REFUSED_MESSAGE)
+
+    assert (response.status_code, response.json()) == refused.answer
+    assert _listed(client, editor) == listed
+    assert _tables(world.db) == tables
+    assert (agent.run.await_count, chat_runtime_state(world.db)) == (runs, state)
+
+
+@pytest.mark.parametrize("refusal", _REFUSALS)
+def test_chat_runtime_bound_refused_message_on_existing_legacy_chat_keeps_it_unchanged(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """Control: the session's chat exists (with an exchange, no runtime entry). The same
+    refusal leaves it listed and unchanged; nothing runs or is stored."""
+    _, client = _client(agent)
+    editor = world.a["editor"]
+    refused = _refusing_new_entries(client, script, world, monkeypatch, refusal)
+    existing = seed_chat(
+        world.db,
+        editor,
+        messages=[("user", "Earlier legacy question"), ("assistant", "Earlier answer")],
+        legacy_session_id=_NEW_SESSION,
+    )
+    listed = _listed(client, editor)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _legacy_turn(client, editor, _REFUSED_MESSAGE)
+
+    assert (response.status_code, response.json()) == refused.answer
+    assert str(existing) in [chat["id"] for chat in listed["chats"]]
+    assert _listed(client, editor) == listed
+    assert _tables(world.db) == tables
+    assert (agent.run.await_count, chat_runtime_state(world.db)) == (runs, state)
+
+
+@pytest.mark.parametrize("refusal", _REFUSALS)
+def test_chat_runtime_bound_first_legacy_message_after_refusal_creates_one_chat_when_it_runs(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    """Once the refusal clears, the same new session id runs: exactly one chat of the
+    session, created by this turn (not by the refused message), whose id is the
+    response's ``chat_id``, the run's session id and a runtime entry's key; the session
+    id is echoed and the turn stored in it."""
+    _, client = _client(agent)
+    editor = world.a["editor"]
+    refused = _refusing_new_entries(client, script, world, monkeypatch, refusal)
+    assert _legacy_turn(client, editor, _REFUSED_MESSAGE).status_code == refused.answer[0]
+    refused.clear()
+    cleared = datetime.now(UTC)
+
+    response = _legacy_turn(client, editor, _RETRY_MESSAGE)
+
+    assert response.status_code == 200, response.text
+    (chat,) = _session_chats(world, editor, _NEW_SESSION)
+    chat_id = plain(chat["id"])
+    assert chat["created_at"] >= cleared
+    body = response.json()
+    assert (body["chat_id"], body["session_id"]) == (str(chat_id), _NEW_SESSION)
+    assert script.runs[-1].session_id == str(chat_id)
+    assert chat_id in server._chat_runtime
+    assert [m["content"] for m in world.db.messages_of(chat_id)] == [_RETRY_MESSAGE, _STUB_REPLY]
+
+
+def test_chat_runtime_bound_concurrent_first_legacy_message_runs_in_the_winners_chat(
+    world: World,
+    agent: MagicMock,
+    script: _Script,
+    monkeypatch: pytest.MonkeyPatch,
+    module_runtime: Any,
+) -> None:
+    """A concurrent first message of the same session id inserts its chat between this
+    turn's lookup and its INSERT: the turn runs and is stored in that chat, under that
+    chat's runtime entry, and it stays the session's only chat."""
+    _, client = _client(agent)
+    editor = world.a["editor"]
+    raced = _race_legacy_insert(monkeypatch, world.db, editor.user_id, _NEW_SESSION)
+
+    response = _legacy_turn(client, editor)
+
+    assert response.status_code == 200, response.text
+    (winner,) = raced
+    assert [plain(row["id"]) for row in world.db.chats_of(editor.user_id)] == [winner]
+    body = response.json()
+    assert (body["chat_id"], body["session_id"]) == (str(winner), _NEW_SESSION)
+    assert script.runs[-1].session_id == str(winner)
+    assert [m["content"] for m in world.db.messages_of(winner)] == [_MESSAGE, _STUB_REPLY]
+    assert winner in server._chat_runtime

@@ -120,6 +120,12 @@ How it's enforced:
   and it refuses a `PG_APP_PASSWORD` equal to `PG_PASSWORD`.
 - **No migrations at runtime.** The app and the admin CLI never run migrations. The app
   refuses to start while any are pending.
+- **A chat keeps its owner and its mark.** On `chats`, `admino_app` may update only the
+  title and its source, the last activity time, the external-content mark and the trash
+  time: it can't change a chat's ID, organization, owner, creation time or legacy session
+  ID. A database trigger refuses clearing the external-content mark, so a chat that once
+  held external content keeps asking before actions that change something (see
+  [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
 - **New tables get explicit grants.** A migration that creates a table grants
   `admino_app` exactly what the app needs on it, in the same file; a unit test fails
   otherwise. New functions get no `EXECUTE` for anyone by default.

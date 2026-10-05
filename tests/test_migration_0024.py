@@ -2,8 +2,10 @@
 
 There is no real PostgreSQL in the suite, so the shipped SQL file itself is the
 spec (the test_migration_0017.py / 0023 pattern): it must exist, be applied by
-run_migrations as version 24 (after 0023), and make exactly the schema change
-GH-176 needs. The SQL is read with ``--`` and ``/* */`` comments blanked;
+run_migrations as version 24 (after 0023), and create the tables, keys, CHECKs,
+indexes and grants GH-176 needs. Since GH-266 these tests pin that structure
+only, not the file's wording (no header, "nothing else" or statement-order text
+scans: a reviewer note on PR #261). The SQL is read with ``--`` and ``/* */`` comments blanked;
 statements are split outside parentheses and literals; keywords are compared
 case-insensitively with whitespace collapsed, while string literals are kept
 byte for byte (the two regexes and the IN lists are compared exactly). A CHECK
@@ -41,7 +43,9 @@ What these tests pin down (contract section 1):
   on (chat_id, seq DESC). No other index.
 - Grants: exactly ``SELECT, INSERT, UPDATE ON chats`` and ``SELECT, INSERT ON
   chat_messages`` to admino_app (no DELETE: trash is ``deleted_at``;
-  chat_messages is append-only), no grant option, no other grantee, no REVOKE.
+  chat_messages is append-only), no grant option, no other grantee. Migration
+  0025 (GH-266, tests/test_migration_0025.py) narrows the UPDATE on chats to
+  the five columns the application writes.
 - The SQL bounds equal the Python ones (contract section 6): the title bound
   is ``ChatSummary.title``'s, the content bound ``ChatMessageView.content``'s
   and ``LLMMessage.content``'s, the tool_calls bound ``ChatMessageView.tool_calls``'s,
@@ -50,13 +54,6 @@ What these tests pin down (contract section 1):
   ``ChatRequest.session_id`` does and the tool_call_id regex what
   ``LLMMessage.tool_call_id`` does; tests/db_fakes.py mirrors the shipped
   bounds.
-- A header comment: names both tables, says system prompts and instructions
-  are never stored, that chat_messages is append-only for the app, and that
-  legacy_session_id is a bridge #177 drops.
-- Nothing else: no row written, no DROP / ALTER (no audit catalog change:
-  ``chat.delete`` exists), no function, trigger, DO block, view, type,
-  extension, policy or dynamic SQL, no OWNER / ROLE / AUTHORIZATION statement,
-  no SET, parameter-free.
 
 Security notes:
 - Owner and org are NOT NULL without a default: every row names whose it is.
@@ -84,7 +81,6 @@ from pydantic import BaseModel, ValidationError
 
 import admino.database as db_mod
 import admino.models as models_module
-from admino import audit_events
 from tests import db_fakes
 
 if TYPE_CHECKING:
@@ -788,45 +784,6 @@ def _granted(table: str) -> frozenset[str]:
     return frozenset(privileges)
 
 
-def _kind(statement: str) -> str | None:
-    """Classify one statement against the contract; None for anything else."""
-    masked = _masked(statement)
-    for table in _TABLES:
-        if re.fullmatch(rf"create\s+table\s+{table}\s*\(.*\)", masked):
-            return f"create table {table}"
-    index = _parse_index(statement)
-    if index is not None and index.name in _INDEXES:
-        return f"create index {index.name}"
-    grant = _parse_grant(statement)
-    if grant is not None and len(grant.objects) == 1 and grant.objects[0] in _TABLES:
-        return f"grant {grant.objects[0]}"
-    return None
-
-
-def _kinds() -> list[str | None]:
-    return [_kind(statement) for statement in _statements()]
-
-
-def _header_lines() -> list[str]:
-    """The ``--`` comment lines before the first statement, without the dashes."""
-    lines: list[str] = []
-    for line in _raw_sql().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("--"):
-            lines.append(stripped[2:].strip())
-        elif stripped:
-            break
-    return lines
-
-
-def _header_comment() -> str:
-    return " ".join(_header_lines())
-
-
-def _header_sentences() -> list[str]:
-    return [s.lower() for s in re.split(r"(?<=[.!?])\s+", _header_comment()) if s]
-
-
 # ---------------------------------------------------------------------------
 # Helpers: the Python side
 # ---------------------------------------------------------------------------
@@ -965,97 +922,9 @@ class TestMigration0024File:
 
         assert not any(c.args and c.args[0] == shipped for c in conn.execute.call_args_list)
 
-    def test_migration_0024_is_parameter_free(self) -> None:
-        masked = _masked(_normalized())
-
-        assert re.search(r"\$\d", masked) is None
-        assert "%s" not in masked
-        assert "%(" not in masked
-
 
 # ---------------------------------------------------------------------------
-# 2. The header comment
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0024Header:
-    """A ``--`` header before the first statement tells the operator what is stored."""
-
-    def test_migration_0024_starts_with_a_header_comment(self) -> None:
-        """At least three comment lines (purpose, what is stored, grants) come first."""
-        assert len([line for line in _header_lines() if line]) >= 3, _header_lines()
-
-    @pytest.mark.parametrize("table", _TABLES)
-    def test_migration_0024_header_names_the_table(self, table: str) -> None:
-        assert re.search(rf"\b{table}\b", _header_comment().lower()), _header_comment()
-
-    def test_migration_0024_header_says_system_prompts_and_instructions_are_never_stored(
-        self,
-    ) -> None:
-        """One sentence says system prompts and instructions are never stored."""
-        hits = [
-            sentence
-            for sentence in _header_sentences()
-            if "never" in sentence and "system prompt" in sentence and "instruction" in sentence
-        ]
-
-        assert hits, _header_sentences()
-
-    def test_migration_0024_header_says_chat_messages_are_append_only(self) -> None:
-        hits = [s for s in _header_sentences() if re.search(r"append[- ]only", s)]
-
-        assert hits, _header_sentences()
-
-    def test_migration_0024_header_names_177_for_legacy_session_id(self) -> None:
-        """legacy_session_id is a bridge: the sentence naming it names #177, which drops it."""
-        hits = [s for s in _header_sentences() if "legacy_session_id" in s and "#177" in s]
-
-        assert hits, _header_sentences()
-
-
-# ---------------------------------------------------------------------------
-# 3. Exactly the contract's statements
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0024Statements:
-    """Two CREATE TABLEs, three CREATE INDEXes and the grants; nothing else."""
-
-    def test_migration_0024_every_statement_is_part_of_the_contract(self) -> None:
-        unexpected = [s for s in _statements() if _kind(s) is None]
-
-        assert unexpected == []
-
-    @pytest.mark.parametrize("table", _TABLES)
-    def test_migration_0024_creates_the_table_once(self, table: str) -> None:
-        assert _kinds().count(f"create table {table}") == 1
-
-    @pytest.mark.parametrize("name", sorted(_INDEXES))
-    def test_migration_0024_creates_the_index_once(self, name: str) -> None:
-        assert _kinds().count(f"create index {name}") == 1
-
-    def test_migration_0024_creates_chats_before_chat_messages(self) -> None:
-        """chat_messages references chats, so chats must exist first."""
-        kinds = _kinds()
-
-        assert kinds.index(f"create table {_CHATS}") < kinds.index(f"create table {_MESSAGES}")
-
-    def test_migration_0024_indexes_and_grants_follow_their_table(self) -> None:
-        statements = _statements()
-        created = {table: _kinds().index(f"create table {table}") for table in _TABLES}
-
-        for index, statement in enumerate(statements):
-            parsed_index = _parse_index(statement)
-            if parsed_index is not None:
-                assert created[parsed_index.table] < index, statement
-            grant = _parse_grant(statement)
-            if grant is not None:
-                for table in grant.objects:
-                    assert created[table] < index, statement
-
-
-# ---------------------------------------------------------------------------
-# 4. Columns
+# 2. Columns
 # ---------------------------------------------------------------------------
 
 
@@ -1109,7 +978,7 @@ class TestMigration0024Columns:
 
 
 # ---------------------------------------------------------------------------
-# 5. Keys and foreign keys
+# 3. Keys and foreign keys
 # ---------------------------------------------------------------------------
 
 
@@ -1163,7 +1032,7 @@ class TestMigration0024Keys:
 
 
 # ---------------------------------------------------------------------------
-# 6. CHECK constraints
+# 4. CHECK constraints
 # ---------------------------------------------------------------------------
 
 
@@ -1266,7 +1135,7 @@ class TestMigration0024Checks:
 
 
 # ---------------------------------------------------------------------------
-# 7. Indexes
+# 5. Indexes
 # ---------------------------------------------------------------------------
 
 
@@ -1309,7 +1178,7 @@ class TestMigration0024Indexes:
 
 
 # ---------------------------------------------------------------------------
-# 8. Grants
+# 6. Grants
 # ---------------------------------------------------------------------------
 
 
@@ -1349,12 +1218,9 @@ class TestMigration0024Grants:
 
         assert objects == set(_TABLES)
 
-    def test_migration_0024_revokes_nothing(self) -> None:
-        assert re.search(r"\brevoke\b", _masked(_normalized())) is None
-
 
 # ---------------------------------------------------------------------------
-# 9. SQL and Python stay in sync
+# 7. SQL and Python stay in sync
 # ---------------------------------------------------------------------------
 
 
@@ -1488,83 +1354,3 @@ class TestMigration0024MatchesPython:
         shipped = {table: [name for name, _ in _table(table).columns] for table in _TABLES}
 
         assert shipped == {table: list(db_fakes._CHAT_TYPES[table]) for table in _TABLES}
-
-
-# ---------------------------------------------------------------------------
-# 10. Nothing else
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0024NothingElse:
-    """No data, drop, alter, code, role or setting change."""
-
-    def test_migration_0024_writes_no_data(self) -> None:
-        masked = _masked(_normalized())
-
-        assert re.search(r"\binsert\s+into\b", masked) is None
-        assert re.search(r"\bupdate\s+(?:only\s+)?\w+\s+set\b", masked) is None
-        assert re.search(r"\bdelete\s+from\b", masked) is None
-        assert re.search(r"\btruncate\b", masked) is None
-        assert re.search(r"\bmerge\s+into\b", masked) is None
-        assert re.search(r"\bcopy\b", masked) is None
-
-    def test_migration_0024_drops_and_alters_nothing(self) -> None:
-        masked = _masked(_normalized())
-
-        assert re.search(r"\bdrop\b", masked) is None
-        assert re.search(r"\balter\b", masked) is None
-        assert re.search(r"\brename\b", masked) is None
-
-    def test_migration_0024_leaves_the_audit_catalog_alone(self) -> None:
-        """chat.delete is already in #146's catalog: no audit_events change."""
-        masked = _masked(_normalized())
-
-        assert audit_events.AuditAction.CHAT_DELETE.value == "chat.delete"
-        assert "audit_events" not in masked
-        assert "action_check" not in masked
-
-    def test_migration_0024_creates_only_the_two_tables_and_three_indexes(self) -> None:
-        masked = _masked(_normalized())
-        created = re.findall(r"\bcreate\s+((?:\w+\s+)*?)(table|index)\s+(\w+)", masked)
-
-        assert sorted(name for _, _, name in created) == sorted([*_TABLES, *_INDEXES])
-        assert len(re.findall(r"\bcreate\b", masked)) == len(_TABLES) + len(_INDEXES)
-
-    def test_migration_0024_runs_no_code(self) -> None:
-        """No DO block, dollar-quoted body, function, trigger, rule or dynamic SQL."""
-        masked = _masked(_normalized())
-
-        assert "$" not in masked
-        assert re.search(r"\bdo\b", masked) is None
-        assert re.search(r"\bexecute\b", masked) is None
-        assert re.search(r"\b(?:function|procedure|trigger|rule)\b", masked) is None
-
-    def test_migration_0024_defines_no_view_type_extension_policy_or_sequence(self) -> None:
-        """gen_random_uuid() is core since PostgreSQL 13: no CREATE EXTENSION."""
-        masked = _masked(_normalized())
-
-        assert (
-            re.search(r"\b(?:view|type|extension|policy|sequence|schema|domain)\b", masked) is None
-        )
-        assert re.search(r"\brow\s+level\s+security\b", masked) is None
-
-    def test_migration_0024_has_no_owner_or_role_statement(self) -> None:
-        masked = _masked(_normalized())
-
-        assert re.search(r"\bowner\b", masked) is None
-        assert re.search(r"\b(?:create|alter|drop|set)\s+(?:role|user|group)\b", masked) is None
-        assert re.search(r"\bauthorization\b", masked) is None
-        assert re.search(r"\bsecurity\s+(?:definer|invoker)\b", masked) is None
-
-    def test_migration_0024_sets_no_parameter(self) -> None:
-        masked = _masked(_normalized())
-
-        assert re.search(r"\b(?:set|reset)\b", masked) is None
-
-    def test_migration_0024_cascades_only_on_delete(self) -> None:
-        """CASCADE appears only as the four foreign keys' ON DELETE CASCADE."""
-        masked = _masked(_normalized())
-
-        assert len(re.findall(r"\bcascade\b", masked)) == 4
-        assert len(re.findall(r"\bon\s+delete\s+cascade\b", masked)) == 4
-        assert re.search(r"\bon\s+update\b", masked) is None

@@ -80,8 +80,9 @@ Routes:
   The first exchange of an untitled chat titles it after the response
   (GH-179).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
-  ``session_id`` (created on first use, until #177); returns ChatResponse.
-  Titles the chat like the route above.
+  ``session_id`` (created by its first run, until #177: a refused first
+  message creates none); returns ChatResponse. Titles the chat like the
+  route above.
 - GET  /api/events        — Legacy SSE stub for a chat session id.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
   (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
@@ -468,6 +469,9 @@ Legacy chat session ID note (until #177):
   caller's own persisted chat (``chats.legacy_session_id``, unique per live
   chat of an owner), so a user reusing another user's session id gets a chat
   of their own and can neither read, confirm nor cancel the other user's.
+- A new session id's chat is created only once its run can start (GH-266):
+  it gets a server-generated id whose runtime entry is held first, so a 429
+  ``rate_limit`` or 503 ``chats_busy`` leaves no chat behind.
 """
 
 from __future__ import annotations
@@ -3562,7 +3566,9 @@ async def get_chat_detail(
     confirmation that is gone (expired, or lost in a restart), else ``none``.
     ``context`` (interim until #190) counts every message of the chat against
     the stored platform ``max_context_messages`` (the latest messages a run
-    sends to the model). Reading changes nothing.
+    sends to the model). One ``chats.read_chat_detail`` read: the owner check
+    runs once, and the latest status is read without its message (GH-266).
+    Reading changes nothing.
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -3588,17 +3594,15 @@ async def get_chat_detail(
 
     from admino.database import get_pool
 
-    pool = get_pool()
     tenant = TenantContext.from_principal(principal)
-    chat = await chats.get_chat(pool, tenant, chat_id)
-    page = await chats.list_messages(pool, tenant, chat.id, limit=limit, cursor=cursor)
-    message_count = await chats.count_messages(pool, tenant, chat.id)
+    detail = await chats.read_chat_detail(get_pool(), tenant, chat_id, limit=limit, cursor=cursor)
+    chat, page, message_count = detail.chat, detail.page, detail.message_count
     max_context = (await _platform_run_settings()).limits.max_context_messages
     pending = _chat_runtime.get_pending(chat.id)
     confirmation_status: Literal["none", "pending", "expired"] = "none"
     if pending is not None:
         confirmation_status = "pending"
-    elif await chats.latest_message_status(pool, tenant, chat.id) == "awaiting_confirmation":
+    elif detail.latest_status == "awaiting_confirmation":
         confirmation_status = "expired"
     return ChatDetailResponse(
         id=chat.id,
@@ -3858,6 +3862,14 @@ async def _chat_turn(
     response language, timezone and personal instructions). A failing load
     escapes before the run: the generic 500, nothing of it echoed or logged.
 
+    A legacy session id is looked up first (``chats.find_legacy_chat``). A
+    session without a chat gets a server-generated id (uuid4) and its chat
+    is created only once that id's runtime entry is held
+    (``chats.get_or_create_legacy_chat``, GH-266): a 429 ``rate_limit`` or a
+    503 ``chats_busy`` writes nothing. When a concurrent first message of
+    the same session created the chat meanwhile, the turn runs in that chat,
+    under that chat's lock too, so the session keeps one chat.
+
     Under the chat's lock the chat is read again (a chat trashed meanwhile is
     the 404), a pending confirmation of the chat is cancelled (a message
     instead of a confirmation), the latest ``max_context_messages`` messages
@@ -3888,7 +3900,7 @@ async def _chat_turn(
         principal: The logged-in principal (``chat.send`` checked).
         message: The validated user message.
         chat_ref: The chat's id, or a legacy session id (the caller's chat of
-            it, created on its first message, until #177).
+            it, created by its first run, until #177).
         background_tasks: The request's background tasks (the title task).
 
     Returns:
@@ -3901,9 +3913,10 @@ async def _chat_turn(
             during the run (404 ``chat_not_found``, nothing stored).
         ChatRuntimeUserLimitError: The chat has no runtime entry and the
             caller's entries are all in use or hold a pending confirmation
-            (429 ``rate_limit``, GH-24; no run, nothing stored).
+            (429 ``rate_limit``, GH-24; no run, nothing stored, no chat
+            created).
         ChatRuntimeFullError: The runtime is full and no entry can be evicted
-            (503 ``chats_busy``, no run).
+            (503 ``chats_busy``, no run, no chat created).
     """
     if _agent is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -3927,19 +3940,36 @@ async def _chat_turn(
     prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
     session_id: str | None = None
-    # Resolves the chat (the 404, the legacy chat's creation); its flag may be stale by
-    # the time the lock is free.
+    # A legacy session id without a chat yet: its chat is created under the lock.
+    new_session: str | None = None
+    # Resolves the chat (the 404); its flag may be stale by the time the lock is free.
     if isinstance(chat_ref, UUID):
-        chat = await chats.get_chat(pool, tenant, chat_ref)
+        chat_id = (await chats.get_chat(pool, tenant, chat_ref)).id
     else:
-        chat = await chats.get_or_create_legacy_chat(pool, tenant, chat_ref)
         session_id = chat_ref
+        try:
+            chat_id = (await chats.find_legacy_chat(pool, tenant, chat_ref)).id
+        except chats.ChatNotFoundError:
+            # Nothing is written before the runtime entry is held: a refused hold (429
+            # rate_limit, 503 chats_busy) leaves no empty chat behind (GH-266).
+            chat_id, new_session = uuid4(), chat_ref
 
     # Runs of one chat are serialised, so each one loads what the previous stored.
-    async with _chat_runtime.hold(chat.id, tenant.user_id):
+    async with contextlib.AsyncExitStack() as held:
+        await held.enter_async_context(_chat_runtime.hold(chat_id, tenant.user_id))
+        if new_session is not None:
+            created = await chats.get_or_create_legacy_chat(
+                pool, tenant, new_session, chat_id=chat_id
+            )
+            if created.id != chat_id:
+                # A concurrent first message of the session created its chat meanwhile:
+                # run there under that chat's lock too. Only for another id: hold isn't
+                # reentrant, and the provisional entry stays an idle lock-only one.
+                chat_id = created.id
+                await held.enter_async_context(_chat_runtime.hold(chat_id, tenant.user_id))
         # Read again under the lock: a run queued ahead may have set external_content
         # (GH-243), and this run must be escalated by it (security audit M-1).
-        chat = await chats.get_chat(pool, tenant, chat.id)
+        chat = await chats.get_chat(pool, tenant, chat_id)
         if _chat_runtime.pop_pending(chat.id) is not None:
             logger.info(
                 "Chat %s got a new message while a confirmation was pending: cancelled",
@@ -4043,8 +4073,9 @@ async def post_message(
     """Handle POST /api/message — legacy: a turn in the caller's chat of a session id.
 
     The session id names the caller's own persisted chat
-    (``chats.legacy_session_id``), created on its first message: another
-    user's session id is a chat of the caller's own. The turn then runs like
+    (``chats.legacy_session_id``), created once its first message can run
+    (a refused one creates none, GH-266): another user's session id is a
+    chat of the caller's own. The turn then runs like
     POST /api/chats/{chat_id}/messages (``_chat_turn``), on the same per-user
     ``/api/message`` bucket, and titles the chat after its first exchange
     the same way (GH-179). Until #177.

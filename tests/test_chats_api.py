@@ -49,6 +49,11 @@ What these tests pin down:
   (never set, past its expiry: reaped, after a new ``create_app()``).
   ``context``: ``message_count`` (all messages, not the page), the STORED
   platform ``max_context_messages`` and ``truncated`` on both sides of it.
+  GH-266: a request runs the owner-checked chat lookup (``admino.chats``'s S2) exactly
+  once, the message page is the only statement selecting ``content`` and the latest
+  status is read by a status-only query, for a chat with a tool turn, an empty chat,
+  an earlier page (``confirmation_status`` still the latest message's), a live pending
+  and an expired confirmation; an invalid cursor runs the owner lookup only.
 - PATCH: renames (stripped), ``title_source`` "user", ``last_activity_at``
   untouched, idempotent; bad, missing or null titles and extra keys are 422
   without echo, nothing changed.
@@ -61,6 +66,8 @@ What these tests pin down:
   the same org (an Org Admin included) and a trashed chat answer GET detail,
   PATCH and DELETE with the same 404 ``{"detail": "Chat not found", "reason":
   "chat_not_found"}`` and change nothing; a non-UUID path id is 422.
+  GET detail's 404 runs the one owner lookup and no other chat-table statement
+  (GH-266).
 - No title and no message content in any app log record.
 - Every route declares its contract model (``route.response_model``) and
   status code.
@@ -78,6 +85,7 @@ import json
 import logging
 import re
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
@@ -130,6 +138,17 @@ _MESSAGE_KEYS: Final = frozenset(
 
 # A statement naming either chat table (the session lookup names neither).
 _CHAT_SQL: Final = re.compile(r"\b(?:chats|chat_messages)\b")
+# GH-266: admino.chats's owner-checked chat lookup (S2), normalized.
+_OWNER_LOOKUP: Final = re.compile(
+    r"select .+ from chats where id = \$1 and org_id = \$2 and owner_user_id = \$3"
+    r" and deleted_at is null"
+)
+# A SELECT's column list and its table (normalized SQL).
+_SELECT_FROM: Final = re.compile(r"select (.+?) from (chats|chat_messages)\b")
+# What a detail request of a chat it finds runs on the chat tables (GH-266): the owner
+# lookup once, the message page (the only statement selecting ``content``), the count
+# and the status-only read of the latest message.
+_DETAIL_READS: Final = Counter({"owner-lookup": 1, "page": 1, "count": 1, "status": 1})
 
 _FOREIGN_ORIGIN: Final = "https://evil.example"
 # TestClient sends ``Host: testserver``: an Origin with that host is same-origin.
@@ -308,6 +327,29 @@ def _chat_state(db: FakeDb) -> dict[str, Any]:
 
 def _chat_statements(db: FakeDb, since: int) -> list[str]:
     return [call.normalized for call in db.calls[since:] if _CHAT_SQL.search(call.normalized)]
+
+
+def _statement_kind(sql: str) -> str:
+    """A chat-table statement of a detail request (GH-266): ``owner-lookup`` (S2),
+    ``page`` (a chat_messages SELECT of ``content``), ``count`` (``count(*)`` only),
+    ``status`` (``status`` only), else the normalized SQL itself."""
+    if _OWNER_LOOKUP.fullmatch(sql):
+        return "owner-lookup"
+    match = _SELECT_FROM.match(sql)
+    if match is not None and match.group(2) == "chat_messages":
+        columns = [column.strip() for column in match.group(1).split(",")]
+        if "content" in columns:
+            return "page"
+        if columns == ["count(*)"]:
+            return "count"
+        if columns == ["status"]:
+            return "status"
+    return sql
+
+
+def _statement_kinds(db: FakeDb, since: int) -> Counter[str]:
+    """How often each kind of chat-table statement ran after the first ``since`` calls."""
+    return Counter(_statement_kind(sql) for sql in _chat_statements(db, since))
 
 
 def _no_echo(response: httpx.Response) -> None:
@@ -1177,6 +1219,62 @@ class TestChatsDetail:
         }
         assert body["context"]["truncated"] is truncated
 
+    @pytest.mark.parametrize(
+        ("case", "status"),
+        [
+            pytest.param("messages", "none", id="tool-turn"),
+            pytest.param("empty", "none", id="no-messages"),
+            pytest.param("cursor", "expired", id="earlier-page"),
+            pytest.param("pending", "pending", id="live-pending"),
+            pytest.param("expired", "expired", id="expired"),
+        ],
+    )
+    def test_chats_api_detail_runs_the_owner_lookup_once_and_reads_only_the_latest_status(
+        self, world: World, client: TestClient, case: str, status: str
+    ) -> None:
+        """GH-266: one owner-checked lookup (S2) per request, not one per read; the
+        page is the only statement selecting ``content``; the latest status is read by a
+        status-only query. ``confirmation_status`` is unchanged (on an earlier page too,
+        it is the latest message's)."""
+        caller = world.a["editor"]
+        params: dict[str, Any] = {}
+        if case == "messages":
+            chat, _ = _seed_tool_turn(world.db, caller)
+        elif case == "empty":
+            chat = world.db.add_chat(caller.user_id)
+        else:
+            chat = _awaiting_chat(world.db, caller)
+        if case == "pending":
+            _runtime().set_pending(chat, caller.user_id, _pending(chat))
+        if case == "cursor":
+            latest = _detail(client, caller, chat, limit=1)
+            assert latest.status_code == 200, latest.text
+            params = {"limit": 1, "cursor": latest.json()["next_cursor"]}
+        since = len(world.db.calls)
+
+        response = _detail(client, caller, chat, **params)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["confirmation_status"] == status
+        assert _statement_kinds(world.db, since) == _DETAIL_READS
+
+    def test_chats_api_detail_invalid_cursor_runs_only_the_owner_lookup(
+        self, world: World, client: TestClient
+    ) -> None:
+        """GH-266: the cursor is decoded after the one owner lookup; a bad one is the
+        422 ``invalid_cursor`` with no other chat statement."""
+        caller = world.a["editor"]
+        chat = world.db.add_chat(caller.user_id)
+        world.db.add_chat_message(chat, "user", "hello")
+        since = len(world.db.calls)
+
+        response = _detail(client, caller, chat, cursor="not-a-cursor")
+
+        assert _outcome(response) == (422, _INVALID_CURSOR)
+        assert [_statement_kind(sql) for sql in _chat_statements(world.db, since)] == [
+            "owner-lookup"
+        ]
+
 
 # ---------------------------------------------------------------------------
 # 5. PATCH /api/chats/{chat_id}
@@ -1389,6 +1487,31 @@ class TestChatsNotFound:
 
         assert [_outcome(response) for response in responses] == [(404, _CHAT_NOT_FOUND)] * 3
         assert _chat_state(world.db) == before
+
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param("unknown", id="unknown-id"),
+            pytest.param("other-org", id="other-org"),
+            pytest.param("other-member", id="same-org-other-member"),
+            pytest.param("org-admin-reads-member", id="org-admin-reads-an-editors-chat"),
+            pytest.param("trashed", id="own-trashed"),
+        ],
+    )
+    def test_chats_api_detail_not_found_runs_only_the_owner_lookup(
+        self, world: World, client: TestClient, case: str
+    ) -> None:
+        """GH-266: GET detail's 404 comes from its one owner-checked lookup; no other
+        statement on a chat table runs."""
+        caller, chat = _not_found_target(world, case)
+        since = len(world.db.calls)
+
+        response = _detail(client, caller, chat)
+
+        assert _outcome(response) == (404, _CHAT_NOT_FOUND)
+        assert [_statement_kind(sql) for sql in _chat_statements(world.db, since)] == [
+            "owner-lookup"
+        ]
 
     @pytest.mark.parametrize("op", _ID_OPS)
     def test_chats_api_non_uuid_chat_id_is_422_before_any_chat_statement(

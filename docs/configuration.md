@@ -703,8 +703,9 @@ Viewer's chats from before a role change stay stored, unused.
   are all running or waiting for a confirmation (see below), and `503` with `"reason":
   "chats_busy"` when the server is already running as many chats at once as it can hold.
   Only these two message routes answer this `429` or `503`. In either case your message
-  doesn't run and isn't stored; try again shortly. Two things still happen first: a new
-  `session_id` on `POST /api/message` creates its chat, and the notes of
+  doesn't run and isn't stored; try again shortly. A new `session_id` on
+  `POST /api/message` gets its chat only once its first message runs, so a refused
+  message leaves no empty chat behind. One thing still happens first: the notes of
   [promoted permissions](permissions.md#promoting-a-critical-permission) that just took
   effect are added to your organization's chats (see below).
 - **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages` and
