@@ -52,6 +52,15 @@ What is pinned:
   key (``session_id`` echoed); a concurrent first message of the same session that
   inserts first (a FakeDb hook before the INSERT) makes the turn run, be stored and
   hold its runtime entry in that winner's chat, the session's only chat.
+- GH-271: that race test's request is bounded inside the app's event loop
+  (``_Bounded``, 5 s), so a regression of the race-winner line (holding the provisional
+  chat's non-reentrant lock again) fails it within the bound instead of hanging the
+  suite. A primary-key collision of the legacy route's server-generated chat id with an
+  existing chat (the Editor's own, a colleague's, another org's; stored by a FakeDb hook
+  right before the INSERT) is the generic 500 ``Internal error``: no chat of the
+  session, no message, the colliding chat unchanged, no run; the only warning-or-worse
+  log record is ``Unhandled exception: UniqueViolationError`` and no log line names the
+  session id, the message, the colliding chat's title or its id.
 
 ``admino.chat_runtime`` and the new server names are used lazily, so the file collects
 before GH-24 is implemented and each test fails on its own.
@@ -63,8 +72,10 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import inspect
+import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -72,6 +83,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 
 from admino import server
 from admino.models import (
@@ -83,6 +95,7 @@ from admino.models import (
     ToolCallRecord,
 )
 from tests.db_fakes import FakeDb, norm, plain
+from tests.log_capture import configured_logging
 from tests.tenancy_world import (
     CLIENT_IP,
     build_world,
@@ -103,7 +116,7 @@ if TYPE_CHECKING:
     from unittest.mock import MagicMock
 
     from fastapi import FastAPI
-    from fastapi.testclient import TestClient
+    from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from tests.tenancy_world import Account, World
 
@@ -473,6 +486,63 @@ def _app_log_text(caplog: pytest.LogCaptureFixture) -> str:
         formatter.format(record)
         for record in caplog.records
         if not record.name.startswith(("httpx", "httpcore"))
+    )
+
+
+# GH-271: how long one request may run under ``_Bounded`` before it is answered for.
+_BOUND_S: Final = 5.0
+
+
+class _Bounded:
+    """The app with every request bounded in time, inside the app's own event loop (GH-271).
+
+    A request still running after ``seconds`` is cancelled where it runs (the app's
+    context managers unwind, a chat lock included) and, when no response has started,
+    answered 504 ``{"detail": "bounded_wait: ..."}``: a regression that waits forever
+    (re-entering a chat's non-reentrant lock) fails the test's own assertions within the
+    bound and the suite goes on. A timeout on the client's side wouldn't do: TestClient's
+    portal thread would stay blocked on the lock.
+    """
+
+    def __init__(self, app: ASGIApp, seconds: float = _BOUND_S) -> None:
+        self._app = app
+        self._seconds = seconds
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        started = False
+
+        async def tracked(message: Message) -> None:
+            nonlocal started
+            started = started or message["type"] == "http.response.start"
+            await send(message)
+
+        try:
+            async with asyncio.timeout(self._seconds):
+                await self._app(scope, receive, tracked)
+        except TimeoutError:
+            if started:
+                raise
+            detail = f"bounded_wait: no answer within {self._seconds} s"
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 504,
+                    "headers": [(b"content-type", b"application/json")],
+                }
+            )
+            await send(
+                {"type": "http.response.body", "body": json.dumps({"detail": detail}).encode()}
+            )
+
+
+def _bounded_client(agent: MagicMock) -> TestClient:
+    """The app around the stub agent behind ``_Bounded``, and its client (an escaping
+    exception is a 500), like ``_client``."""
+    return TestClient(
+        _Bounded(make_app(agent)),
+        client=(CLIENT_IP, 50000),
+        follow_redirects=False,
+        raise_server_exceptions=False,
     )
 
 
@@ -1216,8 +1286,10 @@ def test_chat_runtime_bound_concurrent_first_legacy_message_runs_in_the_winners_
 ) -> None:
     """A concurrent first message of the same session id inserts its chat between this
     turn's lookup and its INSERT: the turn runs and is stored in that chat, under that
-    chat's runtime entry, and it stays the session's only chat."""
-    _, client = _client(agent)
+    chat's runtime entry, and it stays the session's only chat. GH-271: the request is
+    bounded (``_Bounded``), so a regression of the race-winner line (holding the
+    provisional chat's lock again) fails within ``_BOUND_S`` instead of hanging."""
+    client = _bounded_client(agent)
     editor = world.a["editor"]
     raced = _race_legacy_insert(monkeypatch, world.db, editor.user_id, _NEW_SESSION)
 
@@ -1231,3 +1303,92 @@ def test_chat_runtime_bound_concurrent_first_legacy_message_runs_in_the_winners_
     assert script.runs[-1].session_id == str(winner)
     assert [m["content"] for m in world.db.messages_of(winner)] == [_MESSAGE, _STUB_REPLY]
     assert winner in server._chat_runtime
+
+
+# GH-271: a primary-key collision on the legacy route's server-generated chat id.
+_COLLISION_SESSION: Final = "legacy-271-collision-knot"
+_COLLISION_MESSAGE: Final = "COLLISION-CANARY-271-message-dunlin"
+_COLLIDING_TITLE: Final = "COLLISION-CANARY-271-title-plover"
+_COLLIDING_OWNERS: Final = ("own", "colleague", "other-org")
+
+
+def _colliding_owner(world: World, case: str) -> Account:
+    """Whose chat already has the id the legacy route generates."""
+    return {
+        "own": world.a["editor"],
+        "colleague": world.a["org_admin"],
+        "other-org": world.b["editor"],
+    }[case]
+
+
+def _collide_on_legacy_insert(
+    monkeypatch: pytest.MonkeyPatch, db: FakeDb, owner: uuid.UUID
+) -> list[dict[str, Any]]:
+    """Store ``owner``'s titled chat under the id the first INSERT INTO chats binds, right
+    before that INSERT runs (the server-generated id is already taken); returns the list
+    that chat's stored row lands in. ``server.uuid4`` stays real: it is also the request
+    id source."""
+    collided: list[dict[str, Any]] = []
+    original = db.handle
+
+    def colliding(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+        if not collided and norm(sql).startswith("insert into chats"):
+            chat_id = db.add_chat(
+                owner, chat_id=args[0], title=_COLLIDING_TITLE, title_source="user"
+            )
+            row = db.chat_row(chat_id)
+            assert row is not None
+            collided.append(row)
+        return original(method, sql, args, via, tx)
+
+    monkeypatch.setattr(db, "handle", colliding)
+    return collided
+
+
+@pytest.mark.parametrize("owner", _COLLIDING_OWNERS)
+def test_chat_runtime_bound_legacy_chat_id_collision_is_internal_error_and_stores_nothing(
+    world: World,
+    agent: MagicMock,
+    script: _Script,
+    monkeypatch: pytest.MonkeyPatch,
+    module_runtime: Any,
+    owner: str,
+) -> None:
+    """The first POST /api/message of a new session id whose server-generated chat id is
+    already a chat's (the Editor's own, a colleague's, another org's): the generic 500
+    ``Internal error``, no chat of the session, no message, the colliding chat unchanged,
+    no run; the only warning-or-worse record is ``Unhandled exception:
+    UniqueViolationError`` and no log line carries the session id, the message, the
+    colliding chat's title or its id."""
+    client = _bounded_client(agent)
+    editor = world.a["editor"]
+    collided = _collide_on_legacy_insert(
+        monkeypatch, world.db, _colliding_owner(world, owner).user_id
+    )
+    chats_before, messages_before = _tables(world.db)
+
+    with configured_logging("DEBUG", "json") as logs:
+        response = _legacy_turn(client, editor, _COLLISION_MESSAGE, _COLLISION_SESSION)
+
+    assert (response.status_code, response.json()) == (500, {"detail": "Internal error"})
+    (row,) = collided
+    colliding = plain(row["id"])
+    assert world.db.chat_row(colliding) == row
+    assert {key: value for key, value in world.db.chats.items() if plain(key) != colliding} == (
+        chats_before
+    )
+    assert world.db.chat_messages == messages_before
+    assert (agent.run.await_count, script.runs) == (0, [])
+    assert [
+        (record.levelname, record.getMessage())
+        for record in logs.records
+        if record.levelno >= logging.WARNING
+    ] == [("ERROR", "Unhandled exception: UniqueViolationError")]
+    forbidden = [
+        _COLLISION_SESSION,
+        _COLLISION_MESSAGE,
+        _COLLIDING_TITLE,
+        str(colliding),
+        colliding.hex,
+    ]
+    assert [value for value in forbidden if value in logs.text] == []

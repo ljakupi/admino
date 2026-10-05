@@ -40,6 +40,12 @@ What these tests pin down (contract §2; GH-266 contract §2):
   returned with its own id and no INSERT runs; after a concurrent first
   insert the winner's chat (not the given id) is returned and exactly one
   chat exists; a trashed chat's session gets a new chat with the given id.
+  GH-271: only a violation of ``chats_legacy_session_key`` is that race (one
+  more lookup, the winner's chat); a ``chats_pkey`` collision of the given id
+  with any existing chat (the caller's own, trashed, a colleague's, another
+  org's) and a unique violation naming another constraint or none propagate
+  as the driver raised them: nothing stored, the colliding chat unchanged and
+  never returned, no statement after the INSERT.
 - ``list_chats``: the caller's live chats by ``last_activity_at DESC, id DESC``
   (ties by id), at most ``limit``, ``next_cursor`` None on the last page
   (exactly ``limit`` left included), walking the cursors returns every live
@@ -178,6 +184,10 @@ _US: Final = timedelta(microseconds=1)
 
 _STATUSES: Final = ("complete", "stopped", "error", "awaiting_confirmation", "limit_reached")
 _NOT_FOUND_CASES: Final = ("other-org", "other-user", "trashed", "unknown")
+# GH-271: whose existing chat the id given to a legacy insert collides with.
+_COLLISIONS: Final = ("own-chat", "own-trashed", "colleague", "other-org")
+# GH-271: the only unique key whose violation means "a concurrent first message won".
+_LEGACY_SESSION_KEY: Final = "chats_legacy_session_key"
 _CHAT_ID_FUNCTIONS: Final = (
     "get_chat",
     "rename_chat",
@@ -371,6 +381,16 @@ def _target(world: _World, case: str) -> uuid.UUID:
         "other-user": world.bob_chat,
         "trashed": world.trashed,
         "unknown": _UNKNOWN_CHAT,
+    }[case]
+
+
+def _colliding(world: _World, case: str) -> uuid.UUID:
+    """The existing chat whose id Alice's legacy insert is given (GH-271)."""
+    return {
+        "own-chat": world.chat,
+        "own-trashed": world.trashed,
+        "colleague": world.bob_chat,
+        "other-org": world.carol_chat,
     }[case]
 
 
@@ -1328,6 +1348,111 @@ class TestLegacyChats:
         assert row is not None
         assert (row["deleted_at"], row["legacy_session_id"]) == (None, _SESSION)
         assert db.chat_row(trashed) == trashed_row
+
+    # -- GH-271: only the session-key violation is the concurrent first message --------
+
+    @pytest.mark.parametrize("case", _COLLISIONS)
+    async def test_chats_get_or_create_legacy_primary_key_collision_propagates_and_changes_nothing(
+        self, chats: ModuleType, db: FakeDb, case: str
+    ) -> None:
+        """The given id is an existing chat's (Alice's own, her trashed one, a colleague's,
+        another org's): the INSERT's ``chats_pkey`` violation propagates, the colliding
+        chat is never returned or changed, nothing is stored and no statement runs after
+        the INSERT."""
+        world = _world(db)
+        colliding = _colliding(world, case)
+        before = db.snapshot()
+        db.calls.clear()
+
+        with pytest.raises(asyncpg.exceptions.UniqueViolationError) as caught:
+            await chats.get_or_create_legacy_chat(
+                db.pool, world.alice.tenant, _SESSION, chat_id=colliding
+            )
+
+        assert (caught.value.constraint_name, caught.value.table_name) == ("chats_pkey", "chats")
+        assert db.snapshot() == before
+        assert len(db.matching(r"^insert into chats\b")) == 1
+        assert db.calls[-1].normalized.startswith("insert into chats"), db.calls[-1].normalized
+
+    @pytest.mark.parametrize(
+        "constraint",
+        [None, "chats_legacy_session_id_key"],
+        ids=["no-constraint-name", "another-constraint"],
+    )
+    async def test_chats_get_or_create_legacy_other_unique_violation_propagates(
+        self,
+        chats: ModuleType,
+        db: FakeDb,
+        monkeypatch: pytest.MonkeyPatch,
+        constraint: str | None,
+    ) -> None:
+        """A unique violation on the INSERT that doesn't name ``chats_legacy_session_key``
+        (no constraint name, or a look-alike one) is not a concurrent first message: that
+        very exception propagates, nothing is stored and no statement runs after it."""
+        alice = _member(db)
+        injected = asyncpg.exceptions.UniqueViolationError(
+            "duplicate key value violates unique constraint"
+        )
+        if constraint is not None:
+            injected.constraint_name = constraint
+        statements: list[str] = []
+        original = db.handle
+
+        def failing(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+            statements.append(norm(sql))
+            if norm(sql).startswith("insert into chats"):
+                raise injected
+            return original(method, sql, args, via, tx)
+
+        monkeypatch.setattr(db, "handle", failing)
+        before = db.snapshot()
+
+        with pytest.raises(asyncpg.exceptions.UniqueViolationError) as caught:
+            await chats.get_or_create_legacy_chat(
+                db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+            )
+
+        assert caught.value is injected
+        assert db.snapshot() == before
+        inserts = [statement.startswith("insert into chats") for statement in statements]
+        assert (inserts.count(True), inserts[-1]) == (1, True), statements
+
+    async def test_chats_get_or_create_legacy_race_answers_only_the_session_key_violation(
+        self, chats: ModuleType, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Guard: in the concurrent-first-message race the INSERT fails on exactly
+        ``chats_legacy_session_key``, and that is answered by one more lookup returning
+        the winner's chat (lookup, INSERT, lookup)."""
+        alice = _member(db)
+        raced = _race_legacy_insert(monkeypatch, db, alice.user_id, _SESSION)
+        racing = db.handle
+        raised: list[Exception] = []
+
+        def recording(
+            method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None
+        ) -> Any:
+            try:
+                return racing(method, sql, args, via, tx)
+            except Exception as exc:
+                raised.append(exc)
+                raise
+
+        monkeypatch.setattr(db, "handle", recording)
+        db.calls.clear()
+
+        record = await chats.get_or_create_legacy_chat(
+            db.pool, alice.tenant, _SESSION, chat_id=uuid.uuid4()
+        )
+
+        assert [(type(exc), getattr(exc, "constraint_name", None)) for exc in raised] == [
+            (asyncpg.exceptions.UniqueViolationError, _LEGACY_SESSION_KEY)
+        ]
+        assert plain(record.id) == raced[0]
+        assert [call.normalized.split(" ", 1)[0] for call in db.calls] == [
+            "select",
+            "insert",
+            "select",
+        ]
 
 
 # ---------------------------------------------------------------------------

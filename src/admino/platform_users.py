@@ -70,6 +70,10 @@ target's row, so two re-invites of one org run one after the other.
 - The invitee's own accept (``invitations.accept_invitation``) locks the
   invitation, then the users row, the reverse of a re-invite; PostgreSQL
   aborts one of the two, and both roll back whole.
+- A replacing re-invite locks the invited account's chats after the org row,
+  the reverse of the promotion notice (chats, then the org row's key share).
+  Invited users own no chats, so that lock matches no row and no cycle
+  forms; if they ever do, lock the chats before the org row, like the purge.
 
 Security notes:
 - Authorization through ``access.can`` before any query: the reads need
@@ -485,6 +489,16 @@ async def reinvite_org_admin(
     (``invitation.resend``). With an email, the invited account is revoked
     (``invitation.revoke``) and a new org_admin invitation is sent to that
     address (``invitation.create``), also when it is the same address.
+
+    Lock order: the org row first (``_LOCK_ORG_SQL``), and only then, in the
+    replacement, the revoke's lock on the invited account's chats
+    (``invitations.revoke_pending_invitation``). That is the reverse of the
+    promotion notice, which locks the org's chats and then key-shares the
+    org row, and still can't deadlock: invited users own no chats. An
+    account is created ``invited`` and never returns to that status, and a
+    pending invitee can't log in, so the chat lock matches no row and can't
+    form a cycle with the notice (GH-265). If invitees ever own chats, the
+    chat lock must move before the org lock, as the org purge does.
 
     Args:
         pool: The database pool.
