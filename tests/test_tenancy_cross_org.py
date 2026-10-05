@@ -8,8 +8,16 @@ Viewer, plus a Super Admin):
 - ``path_id`` routes (a resource id in the path, or the chat confirmation):
   another org's id answers 404 with exactly the body of an unknown id, never
   echoes the id, and changes nothing: no row, audit event, email, session,
-  in-memory chat, pending confirmation or OAuth state. A control shows the
-  caller reaches its own org's resource, and org B still reaches its own.
+  chat, chat message, pending confirmation in the chat runtime or OAuth state.
+  A control shows the caller reaches its own org's resource, and org B still
+  reaches its own.
+- The chat routes of GH-176 (GET/PATCH/DELETE /api/chats/{chat_id} and POST
+  /api/chats/{chat_id}/messages): org B's chat is ``404 {"detail": "Chat not
+  found", "reason": "chat_not_found"}`` like an unknown id; B's row, messages
+  and pending confirmation stay, no ``chat.delete`` row is written, the agent
+  never runs and B's title and content never appear. Chats are private to
+  their owner: a colleague's chat in the caller's own org (an Org Admin's, an
+  Editor's, a Viewer's) is the same 404, for an Org Admin too.
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
   promotions, the permission summary, invitations, the user list and its
@@ -26,7 +34,11 @@ Viewer, plus a Super Admin):
   and in-memory state.
 - ``own_user`` routes: only the caller's own data: sessions, settings, the
   account, logout, OAuth connections (and the data residency of the caller's
-  own org), the in-memory chat history and the SSE stream.
+  own org), the chat list and chat creation (GH-176: the caller's org and
+  ownership, a smuggled ``org_id`` / ``owner_user_id`` is a 422), and the
+  legacy chat routes: a legacy ``session_id`` names the caller's own persisted
+  chat (``chats.legacy_session_id``), so org B's session id creates or uses
+  the caller's chat, never B's, and B's pending confirmation stays.
 - The Super Admin's user routes of GH-167 (deactivate, reactivate, password
   reset and re-invite under ``/api/platform/orgs/{org_id}/users/{user_id}``):
   the org in the path scopes the user. Org B's account on org A's path is a
@@ -42,8 +54,9 @@ test asserts the covered set equals every ``ROUTES`` row whose isolation isn't
 Platform rows are isolation "none", so the GH-167 cases are tied to the
 registered ``/api/platform/orgs/{org_id}/users/{user_id}/...`` routes instead.
 
-Inputs: the FakeDb world, a stub agent (``agent.run`` is an AsyncMock), fake
-OAuth client credentials and a fresh Fernet key per test.
+Inputs: the FakeDb world (chats and chat messages in its tables), the server's
+chat runtime (pending confirmations), a stub agent (``agent.run`` is an
+AsyncMock), fake OAuth client credentials and a fresh Fernet key per test.
 Outputs: pass/fail only.
 
 Security notes: every id, email, password and token is a fixed fake value or
@@ -67,17 +80,20 @@ from cryptography.fernet import Fernet
 from fastapi.routing import APIRoute
 
 from admino import oauth, org_permissions, server
-from admino.models import LLMMessage, PendingConfirmation, ToolCall
 from admino.oauth import encrypt_refresh_token
 from tests.db_fakes import ORG_NAME, FakeDb
 from tests.tenancy_world import (
+    CHAT_NOT_FOUND,
     PASSWORD,
     ROUTES,
     Account,
     World,
     build_world,
+    chat_runtime_state,
     make_app,
     make_client,
+    seed_chat,
+    seed_pending_confirmation,
     stub_agent,
     use_fake_database,
     use_fast_passwords,
@@ -182,9 +198,10 @@ def _plain(value: Any) -> uuid.UUID:
 def _state(db: FakeDb) -> dict[str, Any]:
     """Everything a refused cross-org request must leave as it was.
 
-    Every table, the sessions as token hash -> (user, session id) (any request
-    may refresh the caller's ``last_seen_at``), plus the in-memory chats,
-    pending confirmations, OAuth states and pending critical promotions.
+    Every table (``chats`` and ``chat_messages`` included), the sessions as
+    token hash -> (user, session id) (any request may refresh the caller's
+    ``last_seen_at``), plus the chat runtime (its entries and every stored
+    chat's pending confirmation), OAuth states and pending critical promotions.
     """
     tables = db.snapshot()
     sessions = tables.pop("sessions")
@@ -192,8 +209,7 @@ def _state(db: FakeDb) -> dict[str, Any]:
         token_hash: (str(row["user_id"]), str(row["session_id"]))
         for token_hash, row in sessions.items()
     }
-    tables["chats"] = copy.deepcopy(dict(server._sessions))
-    tables["pending_confirmations"] = copy.deepcopy(dict(server._pending_confirmations))
+    tables["chat_runtime"] = chat_runtime_state(db)
     tables["oauth_states"] = dict(server._oauth_pending_states)
     tables["promotions"] = dict(org_permissions._pending)
     return tables
@@ -208,37 +224,44 @@ def _invite(client: TestClient, admin: Account, email: str) -> str:
     return str(response.json()["id"])
 
 
-def _seed_pending(account: Account, chat_id: str, confirmation_id: str) -> None:
-    """Store a live pending confirmation in one of the account's in-memory chats."""
-    now = datetime.now(UTC)
-    server._pending_confirmations[server._chat_key(account.user_id, chat_id)] = PendingConfirmation(
-        confirmation_id=confirmation_id,
-        session_id=chat_id,
-        tool_call=ToolCall(tool="google_calendar", action="create", args={}),
-        created_at=now,
-        expires_at=now + timedelta(minutes=5),
+def _seed_pending(
+    world: World, account: Account, session_id: str, confirmation_id: str
+) -> uuid.UUID:
+    """The account's legacy chat of ``session_id`` (persisted, GH-176) with a live pending
+    confirmation in the chat runtime; the chat's id."""
+    chat_id = seed_chat(world.db, account, legacy_session_id=session_id)
+    seed_pending_confirmation(account, chat_id, confirmation_id)
+    return chat_id
+
+
+def _seed_chat(world: World, account: Account, session_id: str, marker: str) -> uuid.UUID:
+    """The account's legacy chat of ``session_id`` (persisted, GH-176), holding a question
+    and an answer that carry ``marker``; the chat's id."""
+    return seed_chat(
+        world.db,
+        account,
+        title=f"{marker} title",
+        messages=(("user", f"{marker} question"), ("assistant", f"{marker} answer")),
+        legacy_session_id=session_id,
     )
-
-
-def _seed_chat(account: Account, chat_id: str, marker: str) -> tuple[uuid.UUID, str]:
-    """Store an in-memory chat history of the account; return its chat key."""
-    key: tuple[uuid.UUID, str] = server._chat_key(account.user_id, chat_id)
-    server._sessions[key] = [
-        LLMMessage(role="user", content=f"{marker} question"),
-        LLMMessage(role="assistant", content=f"{marker} answer"),
-    ]
-    return key
 
 
 def _confirm(
-    client: TestClient, caller: Account, confirmation_id: str, chat_id: str
+    client: TestClient, caller: Account, confirmation_id: str, session_id: str
 ) -> httpx.Response:
-    """Approve ``confirmation_id`` of the chat ``chat_id`` as ``caller``."""
+    """Approve ``confirmation_id`` of the legacy chat ``session_id`` as ``caller``."""
     return client.post(
         f"/api/confirm/{confirmation_id}",
-        json={"session_id": chat_id, "confirmation_id": confirmation_id, "approved": True},
+        json={"session_id": session_id, "confirmation_id": confirmation_id, "approved": True},
         headers=caller.cookie,
     )
+
+
+def _run_session_id(agent: MagicMock) -> str:
+    """The chat id (``session_id``, positional or keyword) the agent's one run got."""
+    call = agent.run.await_args
+    assert call is not None
+    return str(call.kwargs["session_id"] if "session_id" in call.kwargs else call.args[1])
 
 
 def _matrix(response: httpx.Response) -> dict[tuple[str, str], str]:
@@ -377,7 +400,9 @@ class _PathIdCase:
     """One path_id route: whom it serves, its 404 and how to seed and request it.
 
     ``seed_foreign`` stores org B's resource and returns its id; ``seed_own``
-    stores org A's. ``send`` requests the route for an id as a caller.
+    stores org A's. ``send`` requests the route for an id as a caller. The 404
+    body is ``{"detail": detail}``, plus ``"reason"`` when the route documents
+    one (GH-176's ``chat_not_found``).
     """
 
     caller: MemberRole
@@ -387,6 +412,15 @@ class _PathIdCase:
     seed_own: Callable[[World, TestClient], str]
     send: Callable[[TestClient, Account, str], httpx.Response]
     unknown_id: Callable[[], str]
+    reason: str | None = None
+
+    @property
+    def not_found(self) -> dict[str, str]:
+        """The route's documented 404 body."""
+        body = {"detail": self.detail}
+        if self.reason is not None:
+            body["reason"] = self.reason
+        return body
 
 
 def _uuid_id() -> str:
@@ -451,14 +485,79 @@ def _a_invitation(world: World, client: TestClient) -> str:
 
 
 def _b_pending(world: World, _client: TestClient) -> str:
-    """B's editor's pending confirmation; its chat id and confirmation id are the same."""
-    _seed_pending(world.b["editor"], "b-pending-163", "b-pending-163")
+    """B's editor's pending confirmation; its legacy session id and confirmation id are
+    the same."""
+    _seed_pending(world, world.b["editor"], "b-pending-163", "b-pending-163")
     return "b-pending-163"
 
 
 def _a_pending(world: World, _client: TestClient) -> str:
-    _seed_pending(world.a["editor"], "a-pending-163", "a-pending-163")
+    _seed_pending(world, world.a["editor"], "a-pending-163", "a-pending-163")
     return "a-pending-163"
+
+
+# GH-176: B's chat carries this marker in its title, messages and confirmation id.
+_B_MARKER: Final = "B-secret-176"
+_A_MARKER: Final = "A-own-176"
+
+
+def _marked_chat(world: World, owner: Account, marker: str) -> uuid.UUID:
+    """A titled chat of ``owner`` holding a question and an answer, with a live pending
+    confirmation (id ``conf-<marker>``) in the chat runtime; all carry ``marker``."""
+    chat_id = seed_chat(
+        world.db,
+        owner,
+        title=f"{marker} Vertragsentwurf",
+        messages=(("user", f"{marker} question"), ("assistant", f"{marker} answer")),
+    )
+    seed_pending_confirmation(owner, chat_id, f"conf-{marker}")
+    return chat_id
+
+
+def _b_chat(world: World, _client: TestClient) -> str:
+    return str(_marked_chat(world, world.b["editor"], _B_MARKER))
+
+
+def _a_chat(world: World, _client: TestClient) -> str:
+    return str(_marked_chat(world, world.a["editor"], _A_MARKER))
+
+
+def _get_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.get(f"/api/chats/{ident}", headers=caller.cookie)
+
+
+def _rename_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.patch(
+        f"/api/chats/{ident}", json={"title": "Umbenannt 176"}, headers=caller.cookie
+    )
+
+
+def _trash_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.delete(f"/api/chats/{ident}", headers=caller.cookie)
+
+
+def _send_chat_message(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.post(
+        f"/api/chats/{ident}/messages",
+        json={"message": "Hallo aus Org A 176"},
+        headers=caller.cookie,
+    )
+
+
+def _chat_case(
+    own_status: int, send: Callable[[TestClient, Account, str], httpx.Response]
+) -> _PathIdCase:
+    """A GH-176 chat route: org A's Editor, the chat_not_found 404, B's / A's marked chat."""
+    return _PathIdCase(
+        caller="editor",
+        detail="Chat not found",
+        own_status=own_status,
+        seed_foreign=_b_chat,
+        seed_own=_a_chat,
+        send=send,
+        unknown_id=_uuid_id,
+        reason="chat_not_found",
+    )
 
 
 def _delete_session(client: TestClient, caller: Account, ident: str) -> httpx.Response:
@@ -592,10 +691,33 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
         send=_confirm_same_ids,
         unknown_id=_chat_id,
     ),
+    # GH-176: persisted chats, private to their owner.
+    ("GET", "/api/chats/{chat_id}"): _chat_case(200, _get_chat),
+    ("PATCH", "/api/chats/{chat_id}"): _chat_case(200, _rename_chat),
+    ("DELETE", "/api/chats/{chat_id}"): _chat_case(204, _trash_chat),
+    ("POST", "/api/chats/{chat_id}/messages"): _chat_case(200, _send_chat_message),
 }
 
 _PATH_ID_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]} {route[1]}") for route in _PATH_ID_CASES
+]
+
+# The chat routes of GH-176 that name a chat in the path.
+_CHAT_ROUTES: Final[tuple[Route, ...]] = (
+    ("GET", "/api/chats/{chat_id}"),
+    ("PATCH", "/api/chats/{chat_id}"),
+    ("DELETE", "/api/chats/{chat_id}"),
+    ("POST", "/api/chats/{chat_id}/messages"),
+)
+# Space-free ids, so the RED record (gates.sh cuts node ids at a space) names each case.
+_CHAT_ROUTE_PARAMS: Final = [
+    pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _CHAT_ROUTES
+]
+# (caller, owner) in org A: chats are private, an Org Admin reads no member's chat.
+_COLLEAGUE_PAIRS: Final = [
+    pytest.param("editor", "org_admin", id="editor-on-org-admins-chat"),
+    pytest.param("org_admin", "editor", id="org-admin-on-editors-chat"),
+    pytest.param("org_admin", "viewer", id="org-admin-on-viewers-chat"),
 ]
 
 # The org user routes of GH-164 that name a user in the path.
@@ -645,7 +767,7 @@ class TestPathIdRoutes:
 
         response = case.send(client, world.a[case.caller], foreign)
 
-        assert (response.status_code, response.json()) == (404, {"detail": case.detail})
+        assert (response.status_code, response.json()) == (404, case.not_found)
 
     @covers(*_PATH_ID_CASES)
     @pytest.mark.parametrize("route", _PATH_ID_PARAMS)
@@ -663,7 +785,7 @@ class TestPathIdRoutes:
 
         assert (unknown_response.status_code, unknown_response.json()) == (
             404,
-            {"detail": case.detail},
+            case.not_found,
         )
         assert (foreign_response.status_code, foreign_response.json()) == (
             unknown_response.status_code,
@@ -678,14 +800,15 @@ class TestPathIdRoutes:
     def test_cross_org_path_id_foreign_id_changes_nothing(
         self, world: World, client: TestClient, agent: MagicMock, route: Route
     ) -> None:
-        """No row, audit event, email, session, chat, confirmation or state changes; no run."""
+        """No row, audit event, email, session, chat, chat message, runtime confirmation or
+        state changes; no run."""
         case = _PATH_ID_CASES[route]
         foreign = case.seed_foreign(world, client)
         before = _state(world.db)
 
         response = case.send(client, world.a[case.caller], foreign)
 
-        assert (response.status_code, response.json()) == (404, {"detail": case.detail})
+        assert (response.status_code, response.json()) == (404, case.not_found)
         assert _state(world.db) == before
         agent.run.assert_not_awaited()
 
@@ -700,7 +823,7 @@ class TestPathIdRoutes:
 
         response = case.send(client, world.a[case.caller], foreign)
 
-        assert (response.status_code, response.json()) == (404, {"detail": case.detail})
+        assert (response.status_code, response.json()) == (404, case.not_found)
         assert foreign not in response.text
         assert all(foreign not in value for value in response.headers.values())
 
@@ -825,8 +948,9 @@ class TestPathIdSideEffects:
     ) -> None:
         """B's Editor (a deactivated B user for reactivate) keeps its row (status, role,
         name, email), both sessions, OAuth connections, notes, settings, reset token,
-        in-memory chat, pending confirmation, OAuth state and cached access token; no
-        email is queued, no audit row written, nothing revoked at a provider."""
+        chat and its messages (GH-176: persisted), the chat's pending confirmation in
+        the chat runtime, OAuth state and cached access token; no email is queued, no
+        audit row written, nothing revoked at a provider."""
         reactivate = route[1].endswith("/reactivate")
         if reactivate:
             victim = uuid.UUID(_b_deactivated(world, client))
@@ -842,16 +966,14 @@ class TestPathIdSideEffects:
         world.db.add_memory(victim, "client", "B's private note 164")
         world.db.add_user_settings(victim, theme="dark")
         world.db.add_reset_token(victim)
-        chat_key = server._chat_key(victim, _SHARED_CHAT)
-        server._sessions[chat_key] = [LLMMessage(role="user", content="B-secret-164 question")]
-        now = datetime.now(UTC)
-        server._pending_confirmations[chat_key] = PendingConfirmation(
-            confirmation_id="conf-b-164",
-            session_id=_SHARED_CHAT,
-            tool_call=ToolCall(tool="google_calendar", action="create", args={}),
-            created_at=now,
-            expires_at=now + timedelta(minutes=5),
+        chat_id = seed_chat(
+            world.db,
+            victim,
+            messages=(("user", "B-secret-164 question"),),
+            legacy_session_id=_SHARED_CHAT,
         )
+        seed_pending_confirmation(victim, chat_id, "conf-b-164")
+        now = datetime.now(UTC)
         server._oauth_pending_states["b-state-164"] = server.OAuthPendingState(
             created_at=time.time(),
             provider="google",
@@ -869,7 +991,7 @@ class TestPathIdSideEffects:
         token_before = copy.deepcopy(world.db.tokens[victim])
         audit_before = copy.deepcopy(world.db.audit_rows())
         outbox_before = copy.deepcopy(world.db.outbox)
-        chat_before = copy.deepcopy(server._sessions[chat_key])
+        chat_before = (world.db.chat_row(chat_id), world.db.messages_of(chat_id))
 
         response = _PATH_ID_CASES[route].send(client, world.a["org_admin"], str(victim))
 
@@ -885,8 +1007,11 @@ class TestPathIdSideEffects:
         assert world.db.tokens.get(victim) == token_before
         assert world.db.outbox == outbox_before
         assert world.db.audit_rows() == audit_before
-        assert server._sessions.get(chat_key) == chat_before
-        assert server._pending_confirmations[chat_key].confirmation_id == "conf-b-164"
+        assert (world.db.chat_row(chat_id), world.db.messages_of(chat_id)) == chat_before
+        assert len(chat_before[1]) == 1
+        pending = server._chat_runtime.get_pending(chat_id)
+        assert pending is not None
+        assert pending.confirmation_id == "conf-b-164"
         assert server._oauth_pending_states["b-state-164"].user_id == victim
         assert (victim, "microsoft") in oauth.access_tokens._entries
         assert [mock.await_count for mock in revoke.values()] == [0, 0]
@@ -929,33 +1054,47 @@ class TestPathIdSideEffects:
         assert victim.email not in repr(new_rows).lower()
 
     @covers(("POST", "/api/confirm/{confirmation_id}"))
+    @pytest.mark.parametrize("reference", ["session_id", "chat_id"])
     def test_cross_org_confirm_with_the_other_orgs_chat_and_confirmation_ids_is_404(
-        self, world: World, client: TestClient, agent: MagicMock
+        self, world: World, client: TestClient, agent: MagicMock, reference: str
     ) -> None:
-        """B's pending confirmation can't be approved by A's editor: 404, still pending, no run."""
+        """B's pending confirmation can't be approved by A's editor, named by B's legacy
+        session id or (GH-176) by B's chat id: 404 like a chat without one, still pending,
+        no chat created for A, no run."""
         victim = world.b["editor"]
-        _seed_pending(victim, _SHARED_CHAT, "conf-b-163")
-        key = server._chat_key(victim.user_id, _SHARED_CHAT)
-        pending_before = server._pending_confirmations[key].model_copy(deep=True)
+        chat_id = _seed_pending(world, victim, _SHARED_CHAT, "conf-b-163")
+        pending = server._chat_runtime.get_pending(chat_id)
+        assert pending is not None
+        pending_before = pending.model_copy(deep=True)
+        before = _state(world.db)
+        named = (
+            {"session_id": _SHARED_CHAT} if reference == "session_id" else {"chat_id": str(chat_id)}
+        )
 
-        response = _confirm(client, world.a["editor"], "conf-b-163", _SHARED_CHAT)
+        response = client.post(
+            "/api/confirm/conf-b-163",
+            json={**named, "confirmation_id": "conf-b-163", "approved": True},
+            headers=world.a["editor"].cookie,
+        )
 
         assert (response.status_code, response.json()) == (
             404,
             {"detail": "No pending confirmation for this session"},
         )
-        assert server._pending_confirmations.get(key) == pending_before
+        assert server._chat_runtime.get_pending(chat_id) == pending_before
+        assert _state(world.db) == before
+        assert world.db.chats_of(world.a["editor"].user_id) == []
         agent.run.assert_not_awaited()
 
     @covers(("POST", "/api/confirm/{confirmation_id}"))
     def test_cross_org_confirm_in_a_shared_chat_id_never_matches_the_other_orgs_confirmation(
         self, world: World, client: TestClient, agent: MagicMock
     ) -> None:
-        """Both users have a pending in chat "shared-163": B's id is "Confirmation not found"
-        for A, like an unknown id, and both pendings stay."""
+        """Both users have a pending in their own legacy chat "shared-163": B's id is
+        "Confirmation not found" for A, like an unknown id, and both pendings stay."""
         caller = world.a["editor"]
-        _seed_pending(caller, _SHARED_CHAT, "conf-a-163")
-        _seed_pending(world.b["editor"], _SHARED_CHAT, "conf-b-163")
+        a_chat = _seed_pending(world, caller, _SHARED_CHAT, "conf-a-163")
+        b_chat = _seed_pending(world, world.b["editor"], _SHARED_CHAT, "conf-b-163")
         before = _state(world.db)
 
         foreign = _confirm(client, caller, "conf-b-163", _SHARED_CHAT)
@@ -964,6 +1103,71 @@ class TestPathIdSideEffects:
         assert (foreign.status_code, foreign.json()) == (404, {"detail": "Confirmation not found"})
         assert (unknown.status_code, unknown.json()) == (foreign.status_code, foreign.json())
         assert _state(world.db) == before
+        pendings = [server._chat_runtime.get_pending(chat) for chat in (a_chat, b_chat)]
+        assert [None if p is None else p.confirmation_id for p in pendings] == [
+            "conf-a-163",
+            "conf-b-163",
+        ]
+        agent.run.assert_not_awaited()
+
+
+class TestChatPathRoutes:
+    """GH-176: a chat is its owner's alone; any other caller gets chat_not_found."""
+
+    @covers(*_CHAT_ROUTES)
+    @pytest.mark.parametrize("route", _CHAT_ROUTE_PARAMS)
+    def test_cross_org_chat_route_keeps_the_other_orgs_chat_messages_and_pending(
+        self, world: World, client: TestClient, agent: MagicMock, route: Route
+    ) -> None:
+        """B's chat keeps its row (title, live, last activity), its messages and its
+        pending confirmation in the chat runtime; no chat.delete row, no run; B's title,
+        content and confirmation never appear in the 404."""
+        chat_id = _marked_chat(world, world.b["editor"], _B_MARKER)
+        row_before = world.db.chat_row(chat_id)
+        messages_before = world.db.messages_of(chat_id)
+
+        response = _PATH_ID_CASES[route].send(client, world.a["editor"], str(chat_id))
+
+        assert (response.status_code, response.json()) == (404, CHAT_NOT_FOUND)
+        assert world.db.chat_row(chat_id) == row_before
+        assert world.db.messages_of(chat_id) == messages_before
+        assert len(messages_before) == 2
+        pending = server._chat_runtime.get_pending(chat_id)
+        assert pending is not None
+        assert pending.confirmation_id == f"conf-{_B_MARKER}"
+        assert world.db.audit_rows("chat.delete") == []
+        assert _B_MARKER not in response.text
+        agent.run.assert_not_awaited()
+
+    @covers(*_CHAT_ROUTES)
+    @pytest.mark.parametrize(("caller_role", "owner_role"), _COLLEAGUE_PAIRS)
+    @pytest.mark.parametrize("route", _CHAT_ROUTE_PARAMS)
+    def test_cross_org_chat_route_on_a_colleagues_chat_is_404_like_an_unknown_id(
+        self,
+        world: World,
+        client: TestClient,
+        agent: MagicMock,
+        route: Route,
+        caller_role: MemberRole,
+        owner_role: MemberRole,
+    ) -> None:
+        """Another user's chat in the caller's own org (the issue's "another user's chat")
+        is the same 404 as an unknown id, for an Org Admin too (owner-private, V1); nothing
+        changes, no run, and the owner's title and content never appear."""
+        case = _PATH_ID_CASES[route]
+        chat_id = _marked_chat(world, world.a[owner_role], "A-colleague-176")
+        caller = world.a[caller_role]
+        before = _state(world.db)
+
+        colleague = case.send(client, caller, str(chat_id))
+        unknown = case.send(client, caller, _uuid_id())
+
+        assert (colleague.status_code, colleague.json()) == (404, CHAT_NOT_FOUND)
+        assert (unknown.status_code, unknown.json()) == (404, CHAT_NOT_FOUND)
+        assert colleague.headers.get("content-type") == unknown.headers.get("content-type")
+        assert _state(world.db) == before
+        assert "A-colleague-176" not in colleague.text
+        assert str(chat_id) not in colleague.text
         agent.run.assert_not_awaited()
 
 
@@ -1656,16 +1860,99 @@ class TestOwnUserOAuthRoutes:
 
 
 class TestOwnUserChatRoutes:
-    """The in-memory chats are keyed by (user, chat id): a shared chat id never crosses."""
+    """The caller's own chats: the list, creation, and the legacy chat routes, whose
+    session id names the caller's own persisted chat (GH-176), never another user's."""
+
+    @covers(("GET", "/api/chats"))
+    @pytest.mark.parametrize("role", ["org_admin", "editor"])
+    def test_cross_org_chat_list_shows_only_the_callers_own_chats(
+        self, world: World, client: TestClient, role: MemberRole
+    ) -> None:
+        """Every member of both orgs owns a chat and the caller two: the caller lists
+        exactly its own two; no id or title of a colleague's (the Org Admin reads no
+        member's chat) or of org B's appears; B's Editor lists its own (control)."""
+        caller = world.a[role]
+        own = {
+            str(seed_chat(world.db, caller, title=f"Own-176 chat {n}", messages=(("user", "hi"),)))
+            for n in (1, 2)
+        }
+        others: dict[str, str] = {}
+        for account in [*world.a.values(), *world.b.values()]:
+            if account != caller:
+                marker = f"Other-176-{account.email.split('@')[0]}"
+                others[str(seed_chat(world.db, account, title=marker))] = marker
+
+        response = client.get("/api/chats", headers=caller.cookie)
+        b_view = client.get("/api/chats", headers=world.b["editor"].cookie)
+
+        assert response.status_code == 200, response.text
+        assert {entry["id"] for entry in response.json()["chats"]} == own
+        assert [mark for pair in others.items() for mark in pair if mark in response.text] == []
+        b_own = {str(row["id"]) for row in world.db.chats_of(world.b["editor"].user_id)}
+        assert {entry["id"] for entry in b_view.json()["chats"]} == b_own
+        assert len(b_own) == 1
+
+    @covers(("POST", "/api/chats"))
+    def test_cross_org_chat_create_lands_in_the_callers_org_and_ownership(
+        self, world: World, client: TestClient
+    ) -> None:
+        """The new chat is the caller's, in the caller's org; no other user gets a chat,
+        and org B's Editor doesn't list it."""
+        caller = world.a["editor"]
+
+        response = client.post("/api/chats", json={"title": "Neu 176"}, headers=caller.cookie)
+
+        assert response.status_code == 201, response.text
+        chat_id = uuid.UUID(response.json()["id"])
+        row = world.db.chat_row(chat_id)
+        assert row is not None
+        assert (_plain(row["org_id"]), _plain(row["owner_user_id"])) == (
+            world.org_a,
+            caller.user_id,
+        )
+        assert [_plain(key) for key in world.db.chats] == [chat_id]
+        b_list = client.get("/api/chats", headers=world.b["editor"].cookie)
+        assert b_list.status_code == 200, b_list.text
+        assert b_list.json()["chats"] == []
+
+    @covers(("POST", "/api/chats"))
+    @pytest.mark.parametrize("field", ["org_id", "owner_user_id"])
+    def test_cross_org_chat_create_with_a_smuggled_org_or_owner_is_422_and_creates_nothing(
+        self, world: World, client: TestClient, field: str
+    ) -> None:
+        """Org B's id or B's Editor's id in the body: 422 (unknown field), nothing stored,
+        the value not echoed (whose chat it is comes from the session only)."""
+        smuggled = str(world.org_b if field == "org_id" else world.b["editor"].user_id)
+        before = _state(world.db)
+
+        response = client.post(
+            "/api/chats",
+            json={"title": "Neu 176", field: smuggled},
+            headers=world.a["editor"].cookie,
+        )
+
+        assert response.status_code == 422, response.text
+        assert smuggled not in response.text
+        assert _state(world.db) == before
+        assert world.db.chats == {}
 
     @covers(("POST", "/api/message"))
     def test_cross_org_message_with_the_other_orgs_chat_id_starts_an_empty_chat(
         self, world: World, client: TestClient, agent: MagicMock
     ) -> None:
-        """A's editor sends to B's chat id: the run gets no history and A's principal only;
-        B's stored history is unchanged."""
-        victim_key = _seed_chat(world.b["editor"], _SHARED_CHAT, "B-secret-163")
-        victim_before = copy.deepcopy(server._sessions[victim_key])
+        """A's editor sends to B's legacy session id: the run gets A's own new chat (in
+        org A, with that legacy session id), no history, A's principal and no external
+        content flag from B's chat; B's chat row and messages are unchanged."""
+        victim = world.b["editor"]
+        victim_chat = seed_chat(
+            world.db,
+            victim,
+            title="B-secret-163 title",
+            messages=(("user", "B-secret-163 question"), ("assistant", "B-secret-163 answer")),
+            legacy_session_id=_SHARED_CHAT,
+            external_content=True,
+        )
+        victim_before = (world.db.chat_row(victim_chat), world.db.messages_of(victim_chat))
         caller = world.a["editor"]
 
         response = client.post(
@@ -1682,18 +1969,29 @@ class TestOwnUserChatRoutes:
             caller.user_id,
             world.org_a,
         )
-        assert server._sessions[victim_key] == victim_before
+        assert kwargs.get("earlier_external_content") is False
+        own = world.db.chats_of(caller.user_id)
+        assert [(row["legacy_session_id"], _plain(row["org_id"])) for row in own] == [
+            (_SHARED_CHAT, world.org_a)
+        ]
+        assert _run_session_id(agent) == str(own[0]["id"])
+        assert (response.json()["chat_id"], response.json()["session_id"]) == (
+            str(own[0]["id"]),
+            _SHARED_CHAT,
+        )
+        assert (world.db.chat_row(victim_chat), world.db.messages_of(victim_chat)) == (
+            victim_before
+        )
         assert "B-secret-163" not in response.text
-        assert server._chat_key(caller.user_id, _SHARED_CHAT) in server._sessions
+        assert str(victim_chat) not in response.text
 
     @covers(("POST", "/api/message"))
     def test_cross_org_message_never_cancels_the_other_orgs_pending_confirmation(
         self, world: World, client: TestClient
     ) -> None:
-        """A new message in A's chat "shared-163" leaves B's pending in that chat id."""
-        victim = world.b["editor"]
-        _seed_pending(victim, _SHARED_CHAT, "conf-b-163")
-        key = server._chat_key(victim.user_id, _SHARED_CHAT)
+        """A new message in A's legacy chat "shared-163" leaves B's pending in B's chat of
+        that session id."""
+        victim_chat = _seed_pending(world, world.b["editor"], _SHARED_CHAT, "conf-b-163")
 
         response = client.post(
             "/api/message",
@@ -1702,15 +2000,17 @@ class TestOwnUserChatRoutes:
         )
 
         assert response.status_code == 200, response.text
-        assert key in server._pending_confirmations
-        assert server._pending_confirmations[key].confirmation_id == "conf-b-163"
+        pending = server._chat_runtime.get_pending(victim_chat)
+        assert pending is not None
+        assert pending.confirmation_id == "conf-b-163"
 
     @covers(("GET", "/api/events"))
     def test_cross_org_events_with_the_other_orgs_chat_id_streams_only_done(
         self, world: World, client: TestClient
     ) -> None:
-        """A's stream of B's chat id is the empty chat's stream (no "connected" status)."""
-        _seed_chat(world.b["editor"], _SHARED_CHAT, "B-secret-163")
+        """A's stream of B's legacy session id is the empty chat's stream (no "connected"
+        status) and creates no chat for A; B's own stream is live (control)."""
+        _seed_chat(world, world.b["editor"], _SHARED_CHAT, "B-secret-163")
         caller = world.a["editor"]
 
         a_stream = client.get(
@@ -1728,6 +2028,7 @@ class TestOwnUserChatRoutes:
         assert "event: done" in a_stream.text
         assert "connected" not in a_stream.text
         assert "B-secret-163" not in a_stream.text
+        assert world.db.chats_of(caller.user_id) == []
         assert "connected" in b_stream.text  # control: B's own chat is live
 
 
@@ -1986,6 +2287,7 @@ def test_cross_org_platform_user_cases_cover_every_registered_platform_user_rout
 _CASE_CLASSES: Final = (
     TestPathIdRoutes,
     TestPathIdSideEffects,
+    TestChatPathRoutes,
     TestOwnOrgRoutes,
     TestOwnUserAccountRoutes,
     TestOwnUserOAuthRoutes,

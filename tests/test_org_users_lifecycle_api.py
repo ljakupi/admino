@@ -12,16 +12,19 @@ What these tests pin down:
   (status "deactivated"). Every session of the user is deleted, so their cookie
   is refused on its very next request; one ``user.deactivate`` audit row
   (metadata ``{"sessions_revoked": n}``, the client IP) and one queued
-  ``account_deactivated`` email. Connections and memory are kept.
+  ``account_deactivated`` email. Connections, memory and the user's persisted
+  chats (GH-176) are kept.
 - ``POST /api/org/users/{user_id}/reactivate`` → 200 with the summary (status
   "active"); the user can log in again; one ``user.activate`` audit row and one
   queued ``account_activated`` email whose login link is ``<public_url>/login``.
   A full org (active + invited users >= seats) → 409 ``seat_limit``.
 - ``DELETE /api/org/users/{user_id}`` → 204 empty. The users row, the sessions,
-  the OAuth connections, the memory and the user settings are gone; one
+  the OAuth connections, the memory, the user settings and (GH-176) the user's
+  chats with their messages (the users row's ON DELETE CASCADE) are gone; one
   ``user.delete`` audit row. The server also forgets the user's in-memory state
-  (cached access tokens, chats, pending confirmations, chat locks, pending OAuth
-  states); other users' entries stay. A refused delete forgets nothing.
+  (cached access tokens, their entries in ``server._chat_runtime``: pending
+  confirmations and chat locks, via ``ChatRuntime.forget_user``; pending OAuth
+  states); other users' entries and chats stay. A refused delete forgets nothing.
 - Wrong status → 409 ``invalid_status``; the org's last active Org Admin → 409
   ``last_admin``; another org's user, an unknown id, an invited account, a
   deleted user or a Super Admin → 404 ``{"detail": "User not found"}`` with the
@@ -46,7 +49,6 @@ Security notes:
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import copy
 import json
@@ -64,7 +66,7 @@ from fastapi.testclient import TestClient
 from admino import invitations, server
 from admino import oauth as oauth_mod
 from admino.access import Capability
-from admino.models import LLMMessage, PendingConfirmation, ToolCall
+from admino.models import PendingConfirmation, ToolCall
 from admino.server import create_app
 from tests.db_fakes import ORG_ID, ORG_NAME, OTHER_ORG_ID, PUBLIC_URL, FakeDb, fake_hash
 
@@ -158,11 +160,12 @@ def configured_limits(monkeypatch: pytest.MonkeyPatch) -> dict[str, tuple[float,
 @pytest.fixture(autouse=True)
 def _clean_memory_state() -> Iterator[None]:
     """create_app clears the server's in-memory chat state; clear it after each test too
-    so the entries seeded here never reach another test."""
+    so the entries seeded here never reach another test. (GH-176: the chat runtime is
+    looked up when it is needed, so a server without it fails only the tests using it.)"""
     yield
-    server._sessions.clear()
-    server._pending_confirmations.clear()
-    server._session_locks.clear()
+    runtime = getattr(server, "_chat_runtime", None)
+    if runtime is not None:
+        runtime.clear()
     server._oauth_pending_states.clear()
 
 
@@ -340,21 +343,35 @@ def _assert_connected(db: FakeDb, user_id: uuid.UUID) -> None:
     assert user_id in db.user_settings
 
 
-def _seed_memory_state(target: uuid.UUID, other: uuid.UUID) -> None:
-    """In-memory chat state for two users: a chat, a pending confirmation, a chat lock and
-    a pending OAuth state each. Call after create_app (it clears these maps)."""
+def _seed_chat(db: FakeDb, user_id: uuid.UUID) -> uuid.UUID:
+    """A persisted chat of the user (GH-176) with one message; return its id."""
+    chat_id = db.add_chat(user_id)
+    db.add_chat_message(chat_id, "user", "hello")
+    return chat_id
+
+
+def _seed_memory_state(db: FakeDb, target: uuid.UUID, other: uuid.UUID) -> list[uuid.UUID]:
+    """Chat state for two users: a persisted chat with a message, a pending confirmation of
+    that chat in ``server._chat_runtime`` (which creates its runtime entry: the chat lock)
+    and a pending OAuth state each. Call after create_app (it clears the runtime). Returns
+    the chat ids (target's, other's)."""
+    runtime = server._chat_runtime
     now = datetime.now(UTC)
-    for user_id, chat in ((target, "chat-1"), (other, "chat-2")):
-        key = (user_id, chat)
-        server._sessions[key] = [LLMMessage(role="user", content="hello")]
-        server._pending_confirmations[key] = PendingConfirmation(
-            confirmation_id=f"conf-{chat}",
-            session_id=chat,
-            tool_call=ToolCall(tool="gmail", action="search", args={"query": "invoice"}),
-            created_at=now,
-            expires_at=now + timedelta(minutes=5),
+    chats = []
+    for user_id, label in ((target, "chat-1"), (other, "chat-2")):
+        chat_id = _seed_chat(db, user_id)
+        runtime.set_pending(
+            chat_id,
+            user_id,
+            PendingConfirmation(
+                confirmation_id=f"conf-{label}",
+                session_id=str(chat_id),
+                tool_call=ToolCall(tool="gmail", action="search", args={"query": "invoice"}),
+                created_at=now,
+                expires_at=now + timedelta(minutes=5),
+            ),
         )
-        server._session_locks[key] = asyncio.Lock()
+        chats.append(chat_id)
     for user_id, state in ((target, "state-of-the-target"), (other, "state-of-the-other")):
         server._oauth_pending_states[state] = server.OAuthPendingState(
             created_at=time.time(),
@@ -363,14 +380,23 @@ def _seed_memory_state(target: uuid.UUID, other: uuid.UUID) -> None:
             user_id=user_id,
             session_id=uuid.uuid4(),
         )
+    return chats
 
 
-def _memory_state() -> dict[str, Any]:
-    """The keys of the server's in-memory chat maps and the pending OAuth states' owners."""
+def _memory_state(db: FakeDb, chats: list[uuid.UUID]) -> dict[str, Any]:
+    """The seeded chats' stored rows and message counts, their pending confirmations in the
+    chat runtime (confirmation id, None when gone), the runtime's entry count and the
+    pending OAuth states' owners."""
+    runtime = server._chat_runtime
+    pending = {chat: runtime.get_pending(chat) for chat in chats}
     return {
-        "sessions": set(server._sessions),
-        "pending": set(server._pending_confirmations),
-        "locks": set(server._session_locks),
+        "chats": [chat for chat in chats if db.chat_row(chat) is not None],
+        "messages": {chat: len(db.messages_of(chat)) for chat in chats},
+        "pending": {
+            chat: None if entry is None else entry.confirmation_id
+            for chat, entry in pending.items()
+        },
+        "entries": len(runtime),
         "oauth": {state: entry.user_id for state, entry in server._oauth_pending_states.items()},
     }
 
@@ -638,15 +664,19 @@ class TestDeactivate:
     def test_org_users_lifecycle_api_deactivate_keeps_connections_and_memory(
         self, db: FakeDb
     ) -> None:
-        """Deactivation deletes sessions only: connections, notes and settings stay."""
+        """Deactivation deletes sessions only: connections, notes, settings and the user's
+        chats with their messages (GH-176) stay."""
         _, admin_token = _admin(db)
         target = _member(db)
         _connect(db, target)
+        chat = _seed_chat(db, target)
 
         response = _deactivate(_client(_app()), admin_token, target)
 
         assert response.status_code == 200
         _assert_connected(db, target)
+        assert [row["id"] for row in db.chats_of(target)] == [chat]
+        assert [row["content"] for row in db.messages_of(chat)] == ["hello"]
 
     def test_org_users_lifecycle_api_deactivate_already_deactivated_is_409(
         self, db: FakeDb
@@ -1101,22 +1131,25 @@ class TestDeleteForgetsMemoryState:
     def test_org_users_lifecycle_api_delete_forgets_the_users_memory_state(
         self, db: FakeDb, invalidate: AsyncMock
     ) -> None:
-        """After the delete, the target's entries are gone from every in-memory map, the
-        other user's entries stay, and the access-token cache forgot both providers of the
-        target (and nobody else)."""
+        """After the delete, the target's chat and its messages are gone (CASCADE), so are
+        the target's chat-runtime entry with its pending confirmation and the target's
+        pending OAuth state; the other user's chat, pending confirmation, runtime entry and
+        OAuth state stay, and the access-token cache forgot both providers of the target
+        (and nobody else)."""
         _, admin_token = _admin(db)
         target = _member(db)
         other = _member(db)
         app = _app()
-        _seed_memory_state(target, other)
+        target_chat, other_chat = _seed_memory_state(db, target, other)
 
         response = _delete(_client(app), admin_token, target)
 
         assert response.status_code == 204
-        assert _memory_state() == {
-            "sessions": {(other, "chat-2")},
-            "pending": {(other, "chat-2")},
-            "locks": {(other, "chat-2")},
+        assert _memory_state(db, [target_chat, other_chat]) == {
+            "chats": [other_chat],
+            "messages": {target_chat: 0, other_chat: 1},
+            "pending": {target_chat: None, other_chat: "conf-chat-2"},
+            "entries": 1,
             "oauth": {"state-of-the-other": other},
         }
         calls = _invalidated(invalidate)
@@ -1127,7 +1160,8 @@ class TestDeleteForgetsMemoryState:
     def test_org_users_lifecycle_api_refused_delete_forgets_nothing(
         self, db: FakeDb, invalidate: AsyncMock, refusal: str
     ) -> None:
-        """A 403, 404 or 409 delete leaves every in-memory entry and the token cache alone."""
+        """A 403, 404 or 409 delete leaves both users' chats, every chat-runtime entry,
+        the pending OAuth states and the token cache alone."""
         _route(_app(), "delete")
         admin, admin_token = _admin(db)
         if refusal == "forbidden":
@@ -1141,15 +1175,16 @@ class TestDeleteForgetsMemoryState:
             target = admin
         other = _member(db)
         app = _app()
-        _seed_memory_state(target, other)
-        before = _memory_state()
+        chats = _seed_memory_state(db, target, other)
+        before = _memory_state(db, chats)
 
         response = _delete(_client(app), token, target)
 
         assert (
             response.status_code == {"forbidden": 403, "not-found": 404, "last-admin": 409}[refusal]
         )
-        assert _memory_state() == before
+        assert _memory_state(db, chats) == before
+        assert before["entries"] == 2
         invalidate.assert_not_awaited()
         assert target in db.users
 
@@ -1315,21 +1350,22 @@ class TestAuditFailure:
     def test_org_users_lifecycle_api_delete_audit_failure_forgets_nothing(
         self, db: FakeDb, invalidate: AsyncMock
     ) -> None:
-        """A delete that fails on the audit write leaves the in-memory state and the token
-        cache alone."""
+        """A delete that fails on the audit write leaves the chats, the chat runtime's
+        entries, the pending OAuth states and the token cache alone."""
         _, admin_token = _admin(db)
         target = _member(db)
         other = _member(db)
         app = _app()
-        _seed_memory_state(target, other)
-        before = _memory_state()
+        chats = _seed_memory_state(db, target, other)
+        before = _memory_state(db, chats)
         db.fail_audit = True
 
         response = _delete(_client(app, raise_server_exceptions=False), admin_token, target)
 
         assert response.status_code == 500
         assert db.matching(r"^insert into audit_events\b") != []
-        assert _memory_state() == before
+        assert _memory_state(db, chats) == before
+        assert before["entries"] == 2
         invalidate.assert_not_awaited()
         assert target in db.users
 

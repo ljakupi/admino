@@ -14,8 +14,9 @@ What these tests pin down:
   invited account of the org, oldest first (created_at, then id), each with
   exactly id, name, email, role, status, created_at and last_login_at.
   ``GET .../metadata`` → 200 with exactly ``seats`` (``used``: active + invited,
-  ``limit``: the org's seats), ``storage_used_bytes``, ``chat_count`` and
-  ``file_count`` (integers, 0 for now). ``POST .../users/{user_id}/deactivate``
+  ``limit``: the org's seats), ``storage_used_bytes``, ``chat_count`` (GH-176:
+  the org's chats that aren't trashed, never a title) and ``file_count``
+  (integers; storage and files 0 for now). ``POST .../users/{user_id}/deactivate``
   and ``.../reactivate`` → 200 with the user's summary. ``.../password-reset``
   → 202 with an empty body and a queued reset email. ``.../invitation`` → 200
   with an ``InvitationSummary``: no body, ``{}`` or ``{"email": null}`` resends
@@ -206,6 +207,7 @@ _READY_STATUS = {"deactivate": "active", "reactivate": "deactivated", "password_
 
 _TARGET_EMAIL = "platform.marker.target@example.test"
 _TARGET_NAME = "Quillonmarker Person"
+_CHAT_TITLE = "Marker chat title Okapi"
 _INVITED_EMAIL = "platform.marker.invited@example.test"
 _NEW_EMAIL = "Grace.Marker.Replacement@Example.ch"
 _TAKEN_EMAIL = "platform.marker.taken@example.test"
@@ -853,11 +855,12 @@ class TestUsersList:
 
 
 class TestMetadata:
-    """Counts and sizes only: seats used and limit, storage, chats and files (0 for now)."""
+    """Counts and sizes only: seats used and limit, storage, chats (GH-176) and files."""
 
     def test_platform_users_api_metadata_counts_active_and_invited_seats(self, db: FakeDb) -> None:
         """used = active + invited (an expired invitation included); deactivated, deleted
-        and other orgs' users don't count; limit = the org's seats; the rest are 0."""
+        and other orgs' users don't count; limit = the org's seats; no chats are stored,
+        so the rest are 0."""
         _, token = _super_admin(db)
         _admin(db)
         _user(db)
@@ -881,6 +884,26 @@ class TestMetadata:
         }
         values = [*body["seats"].values(), *(body[key] for key in _METADATA_KEYS - {"seats"})]
         assert all(type(value) is int for value in values)
+
+    def test_platform_users_api_metadata_counts_the_orgs_live_chats(self, db: FakeDb) -> None:
+        """GH-176: chat_count = the org's chats that aren't trashed (every member's); another
+        org's chats count for that org only; no response carries a chat title."""
+        _, token = _super_admin(db)
+        admin, editor, other = _admin(db), _user(db), _admin(db, OTHER_ORG_ID)
+        for owner in (admin, admin, editor):
+            db.add_chat(owner, title=_CHAT_TITLE)
+        db.add_chat(editor, title=_CHAT_TITLE, deleted_at=datetime.now(UTC) - timedelta(days=1))
+        for _ in range(2):
+            db.add_chat(other, title=_CHAT_TITLE)
+        client = _client(_app())
+
+        response = _call(client, "metadata", token)
+        other_response = _call(client, "metadata", token, OTHER_ORG_ID)
+
+        assert (response.status_code, other_response.status_code) == (200, 200), response.text
+        assert (response.json()["chat_count"], other_response.json()["chat_count"]) == (3, 2)
+        assert set(response.json()) == _METADATA_KEYS
+        assert _CHAT_TITLE not in response.text + other_response.text
 
     def test_platform_users_api_metadata_used_may_exceed_the_limit(self, db: FakeDb) -> None:
         _, token = _super_admin(db)

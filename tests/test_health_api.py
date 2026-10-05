@@ -42,6 +42,8 @@ Security notes:
   reach a response or any log line.
 - No real database, LLM or network: ``check_health``, ``_check_llm_reachable``,
   ``resolve_session``, ``get_pool`` and ``organizations.list_orgs`` are patched.
+  The chat route (GH-176: it persists into a chat per user and session id) gets
+  the in-memory database of tests/db_fakes.py with the logged-in member stored.
 """
 
 from __future__ import annotations
@@ -63,6 +65,8 @@ from admino.access import Capability
 from admino.config import AppConfig
 from admino.server import create_app
 from tests.auth_helpers import (
+    TEST_MEMBER_ID,
+    TEST_ORG_ID,
     TEST_SUPER_ADMIN_ID,
     login,
     member_session,
@@ -70,6 +74,7 @@ from tests.auth_helpers import (
     session_cookie,
     super_admin_session,
 )
+from tests.db_fakes import FakeDb
 from tests.log_capture import CapturedLogs, configured_logging
 
 if TYPE_CHECKING:
@@ -738,9 +743,11 @@ class TestUnhandledExceptions:
         app = create_app(agent=agent, config=_config())
         login(app, member_session("editor"))
         # GH-160: the route reads the platform limits through the settings cache
-        # (primed by conftest). GH-161: the run's org policy is stubbed, so the
-        # MagicMock pool is never queried and the agent run is what fails.
-        # GH-170: the per-request prompt context load is stubbed the same way.
+        # (primed by conftest). GH-161: the run's org policy is stubbed. GH-170: the
+        # per-request prompt context load is stubbed the same way. GH-176: the legacy
+        # chat (one per user and session id) is persisted, so the pool is the shared
+        # in-memory database with the logged-in member stored; the agent run is what
+        # fails.
         from admino import models
         from admino.models import ToolPolicy
         from admino.permissions import PermissionsConfig
@@ -749,7 +756,9 @@ class TestUnhandledExceptions:
         prompt_context = (
             prompt_context_cls() if prompt_context_cls is not None else MagicMock(name="context")
         )
-        pool = patch("admino.database.get_pool", MagicMock(return_value=MagicMock(name="pool")))
+        db = FakeDb()
+        db.add_account(role="editor", org_id=TEST_ORG_ID, user_id=TEST_MEMBER_ID)
+        pool = patch("admino.database.get_pool", MagicMock(return_value=db.pool))
         policy = patch(
             "admino.org_permissions.load_tool_policy",
             AsyncMock(return_value=ToolPolicy(permissions=PermissionsConfig())),

@@ -34,6 +34,11 @@ What these tests pin down:
   shared tests/db_fakes.py database): the user's response language, timezone
   and personal instructions and the org's default language and instructions,
   so a change applies to the next message.
+- GH-176: the legacy chat routes run on persisted chats (one per user and
+  session id); their statements go to the shared tests/db_fakes.py database,
+  whose users table mirrors the accounts of this file's fake. A confirmation
+  pending in ``server._chat_runtime`` for the caller's legacy chat resumes with
+  the caller's principal and the chat's UUID as the run's ``session_id``.
 
 All database and LLM calls are faked. No network, no real PostgreSQL.
 
@@ -170,12 +175,18 @@ _PATH_VALUES: dict[str, str] = {
     "session_id": "0b1c2d3e-4f50-4a6b-8c7d-9e0f1a2b3c4d",
     "user_id": "1c2d3e4f-5061-4b7c-8d9e-0f1a2b3c4d5e",
     "invitation_id": "2d3e4f50-6172-4c8d-9e0f-1a2b3c4d5e6f",
+    "chat_id": "3e4f5061-7283-4d9e-8f0a-1b2c3d4e5f60",
 }
 
 
 def _norm(sql: str) -> str:
     """Collapse whitespace and lowercase, for formatting-tolerant SQL matching."""
     return re.sub(r"\s+", " ", sql).strip().lower()
+
+
+def _is_chat_sql(normalized: str) -> bool:
+    """True for a statement naming the chats or chat_messages table (GH-176)."""
+    return re.search(r"\bchat(?:s|_messages)\b", normalized) is not None
 
 
 def _is_throttle_sql(normalized: str) -> bool:
@@ -222,8 +233,12 @@ class _FakeDb:
       sessions ... token_hash deletes one (logout), and UPDATE sessions SET
       last_seen_at touches one by id. Every call is recorded.
     - GH-157: the login throttle's statements run on the login_throttle table of
-      the shared tests/db_fakes.py database (``throttle``), so several failures
+      the shared tests/db_fakes.py database (``shared``), so several failures
       sharing an email or an IP are counted, delayed and locked as in production.
+    - GH-176: so do the statements naming chats or chat_messages (the persisted
+      legacy chats of POST /api/message, POST /api/confirm and GET /api/events).
+      Every account added here is also stored, with the same id, in the shared
+      database's users table (the chats' owner foreign key).
     """
 
     def __init__(self) -> None:
@@ -231,7 +246,7 @@ class _FakeDb:
         self.sessions: dict[bytes, dict[str, Any]] = {}
         self.calls: list[tuple[str, str, tuple[Any, ...]]] = []
         self.session_inserts: list[tuple[str, tuple[Any, ...]]] = []
-        self.throttle = SharedFakeDb()
+        self.shared = SharedFakeDb()
         self.pool = _FakePool(self)
 
     # -- fixtures ------------------------------------------------------------
@@ -267,6 +282,13 @@ class _FakeDb:
             "response_language": response_language,
         }
         self.accounts[user_id] = row
+        self.shared.add_account(
+            kind=kind,
+            role=role if is_member else None,
+            org_id=_ORG_ID,
+            email=row["email"],
+            user_id=user_id,
+        )
         return row
 
     def open_session(
@@ -294,8 +316,8 @@ class _FakeDb:
     def handle(self, method: str, sql: str, args: tuple[Any, ...]) -> Any:
         self.calls.append((method, sql, args))
         normalized = _norm(sql)
-        if _is_throttle_sql(normalized):
-            return self.throttle.handle(method, sql, args, "pool", None)
+        if _is_throttle_sql(normalized) or _is_chat_sql(normalized):
+            return self.shared.handle(method, sql, args, "pool", None)
         if re.search(r"\brevoked_at\b", normalized):
             # Migration 0009 dropped the column: revoking deletes the row.
             raise asyncpg.exceptions.UndefinedColumnError('column "revoked_at" does not exist')
@@ -446,6 +468,7 @@ class _FakeAgent:
         agent_config: AgentConfig | None = None,
         tool_policy: Any = None,
         prompt_context: Any = None,
+        earlier_external_content: bool = False,
     ) -> AgentResult:
         self.run_calls.append(
             {
@@ -458,6 +481,8 @@ class _FakeAgent:
                 "tool_policy": tool_policy,
                 # GH-170: the caller's prompt context, loaded per request.
                 "prompt_context": prompt_context,
+                # GH-176: the persisted chat's sticky external-content flag (GH-243).
+                "earlier_external_content": earlier_external_content,
             }
         )
         return AgentResult(
@@ -1230,29 +1255,36 @@ class TestChatRoleGate:
         assert type(principal.org_id) is uuid.UUID
 
     def test_auth_api_confirm_passes_the_callers_principal_to_the_agent(self, db: _FakeDb) -> None:
-        """Resuming a confirmation runs the agent with the caller's principal too."""
+        """Resuming a confirmation runs the agent with the caller's principal too. GH-176:
+        the confirmation is pending in server._chat_runtime for the caller's persisted
+        legacy chat "chat-1", and the run's session_id is that chat's UUID string."""
         agent = _FakeAgent()
         account = db.add_account(role="org_admin")
         token = db.open_session(account)
         app = _app(agent)
+        user_id = _plain(account["id"])
+        chat_id = db.shared.add_chat(user_id, legacy_session_id="chat-1")
         now = datetime.now(UTC)
-        server._pending_confirmations[server._chat_key(_plain(account["id"]), "chat-1")] = (
+        server._chat_runtime.set_pending(
+            chat_id,
+            user_id,
             PendingConfirmation(
                 confirmation_id="c1",
-                session_id="chat-1",
+                session_id=str(chat_id),
                 tool_call=ToolCall(tool="google_calendar", action="create", args={}),
                 created_at=now,
                 expires_at=now + timedelta(minutes=5),
-            )
+            ),
         )
 
         response = _chat_request(_client(app), "confirm", token)
 
-        assert response.status_code == 200
+        assert response.status_code == 200, response.text
         assert agent.run_calls[0]["principal"] == Principal(
-            user_id=_plain(account["id"]), kind="member", org_id=_ORG_ID, role="org_admin"
+            user_id=user_id, kind="member", org_id=_ORG_ID, role="org_admin"
         )
         assert agent.run_calls[0]["pending_confirmation"] is not None
+        assert agent.run_calls[0]["session_id"] == str(chat_id)
 
     def test_auth_api_require_chat_sender_depends_on_require_principal(self) -> None:
         """The dependency chain: require_chat_sender → require_principal → require_session."""

@@ -12,11 +12,18 @@ Covers every model in models.py:
 - GH-160: AgentConfig's bounds widen so every stored platform limit fits
   (max_tool_calls 1-100, confirmation_timeout_s 1.0-3600.0; max_context_messages
   unchanged at 1-200)
+- GH-176: ChatResponse gains a required ``chat_id`` (UUID) and its ``session_id``
+  becomes optional (None; the pattern and the credential validator still apply
+  when set). ConfirmRequest takes ``chat_id`` (UUID) or the legacy
+  ``session_id``: exactly one of the two (both, or neither, is refused; a null
+  counts as absent), unknown keys still refused, errors never echo the input.
+  The new chat models are in tests/test_chat_models.py.
 """
 
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -47,6 +54,16 @@ _NOW: datetime = datetime.now(UTC)
 # Computed at import, so it must outlast the whole suite run: PendingConfirmation
 # requires expires_at > created_at, and created_at is set when a test runs.
 _EXPIRES: datetime = _NOW + timedelta(days=1)
+# GH-176: every ChatResponse names its persisted chat.
+_CHAT_ID = uuid.UUID("3d9f6a52-8c1e-4b7a-9e20-5f4c3b2a1d0e")
+
+
+def _error_types(exc: ValidationError) -> list[tuple[tuple[int | str, ...], str]]:
+    """(loc, type) of every error, without the input."""
+    return [
+        (tuple(error["loc"]), error["type"])
+        for error in exc.errors(include_url=False, include_input=False)
+    ]
 
 
 def _make_tool_call(**overrides: object) -> ToolCall:
@@ -188,50 +205,96 @@ class TestChatResponse:
     """Tests for the ChatResponse API model."""
 
     def test_valid_construction(self) -> None:
-        resp = ChatResponse(session_id="s1", response="ok")
+        resp = ChatResponse(chat_id=_CHAT_ID, session_id="s1", response="ok")
         assert resp.session_id == "s1"
         assert resp.response == "ok"
         assert resp.tool_calls == []
 
     def test_with_tool_calls(self) -> None:
         rec = ToolCallRecord(tool="gmail", action="read", permission="allow", success=True)
-        resp = ChatResponse(session_id="s1", response="done", tool_calls=[rec])
+        resp = ChatResponse(chat_id=_CHAT_ID, session_id="s1", response="done", tool_calls=[rec])
         assert len(resp.tool_calls) == 1
         assert resp.tool_calls[0].tool == "gmail"
 
     def test_response_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
-            ChatResponse(session_id="s1", response="x" * 65537)
+            ChatResponse(chat_id=_CHAT_ID, session_id="s1", response="x" * 65537)
 
     def test_session_id_empty_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            ChatResponse(session_id="", response="ok")
+            ChatResponse(chat_id=_CHAT_ID, session_id="", response="ok")
 
     def test_session_id_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
-            ChatResponse(session_id="s" * 65, response="ok")
+            ChatResponse(chat_id=_CHAT_ID, session_id="s" * 65, response="ok")
 
     def test_session_id_rejects_special_chars(self) -> None:
         """session_id with spaces is rejected by pattern constraint."""
         with pytest.raises(ValidationError):
-            ChatResponse(session_id="has space", response="ok")
+            ChatResponse(chat_id=_CHAT_ID, session_id="has space", response="ok")
 
     def test_session_id_rejects_newline(self) -> None:
         """session_id with embedded newline is rejected by pattern constraint."""
         with pytest.raises(ValidationError):
-            ChatResponse(session_id="inj\nected", response="ok")
+            ChatResponse(chat_id=_CHAT_ID, session_id="inj\nected", response="ok")
 
     def test_session_id_accepts_valid(self) -> None:
         """session_id with alphanumeric, hyphens, underscores is accepted."""
-        resp = ChatResponse(session_id="abc-123_def", response="ok")
+        resp = ChatResponse(chat_id=_CHAT_ID, session_id="abc-123_def", response="ok")
         assert resp.session_id == "abc-123_def"
 
     def test_session_id_credential_redacted(self) -> None:
         """session_id containing a GitHub token pattern should have it redacted."""
         token = "ghp_" + "A" * 36
-        resp = ChatResponse(session_id=token, response="ok")
+        resp = ChatResponse(chat_id=_CHAT_ID, session_id=token, response="ok")
         assert "ghp_" not in resp.session_id
         assert "[CREDENTIAL_REDACTED]" in resp.session_id
+
+    def test_chat_response_chat_id_is_required(self) -> None:
+        """GH-176: every reply names its persisted chat."""
+        with pytest.raises(ValidationError) as exc_info:
+            ChatResponse.model_validate({"session_id": "s1", "response": "ok"})
+
+        assert [loc for loc, _ in _error_types(exc_info.value)] == [("chat_id",)]
+
+    def test_chat_response_chat_id_is_a_uuid(self) -> None:
+        resp = ChatResponse.model_validate({"chat_id": str(_CHAT_ID), "response": "ok"})
+
+        assert isinstance(resp.chat_id, uuid.UUID)
+        assert resp.chat_id == _CHAT_ID
+        assert json.loads(resp.model_dump_json())["chat_id"] == str(_CHAT_ID)
+
+    @pytest.mark.parametrize("chat_id", ["chat-1", "", "3d9f6a52"])
+    def test_chat_response_chat_id_refuses_a_non_uuid(self, chat_id: str) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ChatResponse.model_validate({"chat_id": chat_id, "session_id": "s1", "response": "ok"})
+
+        assert [loc for loc, _ in _error_types(exc_info.value)] == [("chat_id",)]
+
+    def test_chat_response_session_id_is_optional(self) -> None:
+        """The chat route leaves session_id unset (None); only the legacy route echoes one."""
+        absent = ChatResponse.model_validate({"chat_id": str(_CHAT_ID), "response": "ok"})
+        explicit = ChatResponse.model_validate(
+            {"chat_id": str(_CHAT_ID), "session_id": None, "response": "ok"}
+        )
+
+        assert absent.session_id is None
+        assert explicit.session_id is None
+        assert json.loads(absent.model_dump_json())["session_id"] is None
+
+    def test_chat_response_json_keys(self) -> None:
+        """chat_id joins the reply; session_id stays in it (null on the chat route)."""
+        resp = ChatResponse.model_validate({"chat_id": str(_CHAT_ID), "response": "ok"})
+
+        assert set(json.loads(resp.model_dump_json())) == {
+            "chat_id",
+            "session_id",
+            "response",
+            "tool_calls",
+            "status",
+            "pending_confirmation",
+            "error_code",
+        }
 
 
 # ===========================================================================
@@ -277,6 +340,93 @@ class TestConfirmRequest:
     def test_confirmation_id_exceeds_max_length(self) -> None:
         with pytest.raises(ValidationError):
             ConfirmRequest(session_id="s", confirmation_id="c" * 65, approved=True)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{"chat_id": str(_CHAT_ID)}, {"chat_id": str(_CHAT_ID), "session_id": None}],
+        ids=["session-absent", "session-null"],
+    )
+    def test_confirm_request_accepts_chat_id_alone(self, payload: dict[str, object]) -> None:
+        """GH-176: the chat route confirms by chat_id."""
+        req = ConfirmRequest.model_validate({**payload, "confirmation_id": "c1", "approved": True})
+
+        assert req.chat_id == _CHAT_ID
+        assert req.session_id is None
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{"session_id": "sess-1"}, {"session_id": "sess-1", "chat_id": None}],
+        ids=["chat-absent", "chat-null"],
+    )
+    def test_confirm_request_accepts_legacy_session_id_alone(
+        self, payload: dict[str, object]
+    ) -> None:
+        """The legacy session_id keeps working until #177."""
+        req = ConfirmRequest.model_validate({**payload, "confirmation_id": "c1", "approved": False})
+
+        assert req.session_id == "sess-1"
+        assert req.chat_id is None
+
+    def test_confirm_request_refuses_both_chat_id_and_session_id(self) -> None:
+        """Exactly one of the two: a model-level error, never repeating the input."""
+        marker = "ZZ-SESS-176"
+        with pytest.raises(ValidationError) as exc_info:
+            ConfirmRequest.model_validate(
+                {
+                    "chat_id": str(_CHAT_ID),
+                    "session_id": marker,
+                    "confirmation_id": "c1",
+                    "approved": True,
+                }
+            )
+
+        errors = _error_types(exc_info.value)
+        assert len(errors) == 1, errors
+        assert errors[0][0] == ()
+        assert errors[0][1] != "extra_forbidden"
+        assert marker not in str(exc_info.value)
+        assert str(_CHAT_ID) not in str(exc_info.value)
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"chat_id": None, "session_id": None}],
+        ids=["absent", "null"],
+    )
+    def test_confirm_request_refuses_neither_chat_id_nor_session_id(
+        self, payload: dict[str, object]
+    ) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ConfirmRequest.model_validate({**payload, "confirmation_id": "c1", "approved": True})
+
+        errors = _error_types(exc_info.value)
+        assert len(errors) == 1, errors
+        assert errors[0][0] == ()
+
+    @pytest.mark.parametrize("chat_id", ["chat-1", "", "12345", "sess-1"])
+    def test_confirm_request_refuses_a_non_uuid_chat_id(self, chat_id: str) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            ConfirmRequest.model_validate(
+                {"chat_id": chat_id, "confirmation_id": "c1", "approved": True}
+            )
+
+        errors = _error_types(exc_info.value)
+        assert [loc for loc, _ in errors] == [("chat_id",)], errors
+        assert errors[0][1].startswith("uuid"), errors
+
+    def test_confirm_request_with_chat_id_still_refuses_unknown_keys(self) -> None:
+        """Whose confirmation it is comes from the session, never from an org_id in the body."""
+        with pytest.raises(ValidationError) as exc_info:
+            ConfirmRequest.model_validate(
+                {
+                    "chat_id": str(_CHAT_ID),
+                    "confirmation_id": "c1",
+                    "approved": True,
+                    "org_id": "ZZ-ORG-176",
+                }
+            )
+
+        assert _error_types(exc_info.value) == [(("org_id",), "extra_forbidden")]
+        assert "ZZ-ORG-176" not in str(exc_info.value)
 
 
 # ===========================================================================
@@ -582,7 +732,7 @@ class TestJsonRoundTrip:
 
     def test_chat_response(self) -> None:
         rec = ToolCallRecord(tool="t", action="a", permission="allow", success=True)
-        original = ChatResponse(session_id="s", response="ok", tool_calls=[rec])
+        original = ChatResponse(chat_id=_CHAT_ID, session_id="s", response="ok", tool_calls=[rec])
         raw = original.model_dump_json()
         restored = ChatResponse.model_validate_json(raw)
         assert restored == original
@@ -598,6 +748,16 @@ class TestJsonRoundTrip:
         raw = original.model_dump_json()
         restored = ConfirmRequest.model_validate_json(raw)
         assert restored == original
+
+    def test_confirm_request_with_chat_id(self) -> None:
+        """The dump carries session_id: null next to chat_id, and validates again."""
+        original = ConfirmRequest.model_validate(
+            {"chat_id": str(_CHAT_ID), "confirmation_id": "c", "approved": False}
+        )
+        raw = original.model_dump_json()
+        restored = ConfirmRequest.model_validate_json(raw)
+        assert restored == original
+        assert restored.chat_id == _CHAT_ID
 
     def test_sse_event(self) -> None:
         original = SSEEvent(event="message", data="payload")
@@ -697,7 +857,7 @@ _REDACTION_MARKER = "[CREDENTIAL_REDACTED]"
 
 def _chat_response(text: str) -> ChatResponse:
     """A ChatResponse carrying ``text`` as the assistant response."""
-    return ChatResponse(session_id="s1", response=text)
+    return ChatResponse(chat_id=_CHAT_ID, session_id="s1", response=text)
 
 
 def _record_args(args: dict[str, object]) -> dict[str, object]:

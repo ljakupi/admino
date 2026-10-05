@@ -29,10 +29,12 @@ What these tests pin down (the GH-167 contract):
   org status. Read-only: nothing written, audited or logged.
 - ``org_metadata``: ``seats.used`` = active + invited non-deleted users of the
   org (expired invitations included: #153's ``invitations._SEATS_TAKEN_SQL``),
-  ``seats.limit`` = the org's seats (``used`` may exceed it);
-  ``storage_used_bytes``, ``chat_count`` and ``file_count`` are 0; the JSON keys
-  are exactly ``seats`` (``used``, ``limit``), ``storage_used_bytes``,
-  ``chat_count`` and ``file_count``. Any org status; read-only.
+  ``seats.limit`` = the org's seats (``used`` may exceed it); ``chat_count``
+  (GH-176) = the org's chats that aren't trashed, of every member (never
+  another org's; a count, no statement reads a title); ``storage_used_bytes``
+  and ``file_count`` are 0; the JSON keys are exactly ``seats`` (``used``,
+  ``limit``), ``storage_used_bytes``, ``chat_count`` and ``file_count``. Any org
+  status; read-only.
 - ``deactivate_user``: the last-admin guard applies to the Super Admin too
   (``accounts.LastAdminError``); then status ``deactivated``, every session of
   the user deleted through ``sessions.revoke_user_sessions`` (nobody else's),
@@ -172,6 +174,7 @@ _SA_EMAIL: Final = "root.marker@example.test"
 _SA_NAME: Final = "Rita Rootmarker"
 _ADMIN_EMAIL: Final = "admin.marker@example.test"
 _ADMIN_NAME: Final = "Ada Adminmarker"
+_CHAT_TITLE: Final = "Marker chat title Okapi"
 
 
 # ---------------------------------------------------------------------------
@@ -972,7 +975,8 @@ class TestOrgMetadata:
         self, pu: ModuleType, db: FakeDb
     ) -> None:
         """{"seats": {"used", "limit"}, "storage_used_bytes", "chat_count", "file_count"}:
-        no name, title or any other field; the three counts are 0 until #176/#187."""
+        no name, title or any other field; storage and files are 0 until #187, and with no
+        chats stored chat_count is 0 too."""
         _mixed_org(db)
 
         result = await _metadata(pu, db)
@@ -1100,6 +1104,54 @@ class TestOrgMetadata:
         db.add_org(ORG_ID, seats=_SEATS, status=status)
 
         assert _seats(await _metadata(pu, db)) == (1, _SEATS)
+
+    async def test_platform_users_metadata_chat_count_is_the_orgs_live_chats(
+        self, pu: ModuleType, db: FakeDb
+    ) -> None:
+        """GH-176: every member's chat that isn't trashed counts (the Viewer's and the
+        deactivated member's included); a trashed chat and another org's chats don't. The
+        Super Admin gets a count only: the exact contract keys, no title in the result and
+        no statement that reads a title."""
+        ids = _mixed_org(db)
+        other_admin = next(
+            user_id
+            for user_id, row in db.users.items()
+            if row["org_id"] == OTHER_ORG_ID and row["role"] == "org_admin"
+        )
+        for owner in ("admin", "admin", "editor", "viewer", "deactivated"):
+            db.add_chat(ids[owner], title=_CHAT_TITLE)
+        db.add_chat(ids["editor"], title=_CHAT_TITLE, deleted_at=_CREATED)
+        for _ in range(2):
+            db.add_chat(other_admin, title=_CHAT_TITLE)
+        db.calls.clear()
+
+        result = await _metadata(pu, db)
+
+        assert result.model_dump(mode="json") == {
+            "seats": {"used": 5, "limit": _SEATS},
+            "storage_used_bytes": 0,
+            "chat_count": 5,
+            "file_count": 0,
+        }
+        assert _CHAT_TITLE not in json.dumps(result.model_dump(mode="json"))
+        assert [call.normalized for call in db.calls if "title" in call.normalized] == []
+
+    async def test_platform_users_metadata_chat_count_of_the_other_org_is_its_own(
+        self, pu: ModuleType, db: FakeDb
+    ) -> None:
+        """OTHER_ORG_ID counts its two chats, none of ORG_ID's."""
+        ids = _mixed_org(db)
+        other_admin = next(
+            user_id
+            for user_id, row in db.users.items()
+            if row["org_id"] == OTHER_ORG_ID and row["role"] == "org_admin"
+        )
+        for owner in (ids["admin"], ids["editor"], other_admin, other_admin):
+            db.add_chat(owner, title=_CHAT_TITLE)
+
+        result = await _metadata(pu, db, OTHER_ORG_ID)
+
+        assert (result.chat_count, type(result.chat_count)) == (2, int)
 
     async def test_platform_users_metadata_reads_are_bound_to_the_org(
         self, pu: ModuleType, db: FakeDb
