@@ -52,8 +52,10 @@ Behaviour:
   records ``chat.delete`` on the same connection, so a failed audit write
   rolls the trash back. ``get_or_create_legacy_chat`` uses no transaction of
   its own: a concurrent first message of the same session loses the INSERT
-  on the partial unique key and selects the winner's chat (whose id differs
-  from the one given).
+  on the partial unique key ``chats_legacy_session_key`` and selects the
+  winner's chat (whose id differs from the one given). Only that key's
+  violation is the race (GH-271): any other unique violation (the given id
+  already taken) propagates as the driver raised it.
 - ``append_org_notice`` (GH-66) skips every chat whose latest message (highest
   seq, any role) is ``awaiting_confirmation``: a user message after the
   pending call's ``tool_use`` would separate it from its result and break the
@@ -127,6 +129,8 @@ _REPLACEMENT_CHARACTER: Final = chr(0xFFFD)
 _MAX_SEQ: Final = 2**63 - 1
 # What a cursor may look like before it is decoded: base64url, at most 200 characters.
 _CURSOR_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,200}")
+# The partial unique key (migration 0024) a concurrent first legacy message loses on.
+_LEGACY_SESSION_KEY: Final = "chats_legacy_session_key"
 
 # S1: a new chat of the caller (a legacy session id only for the legacy route).
 _CREATE_SQL: Final = """
@@ -513,7 +517,9 @@ async def get_or_create_legacy_chat(
 
     Runs without a transaction of its own (pass the pool): when a concurrent
     first message of the same session inserts the chat first, the INSERT
-    fails on the partial unique key and the winner's chat is selected.
+    fails on the partial unique key ``chats_legacy_session_key`` and the
+    winner's chat is selected. That key's violation is the only one taken
+    for the race.
 
     Args:
         executor: The pool.
@@ -526,16 +532,28 @@ async def get_or_create_legacy_chat(
         The session's live chat with its own id, else the chat created here
         (``chat_id``, untitled, ``auto``), else the chat a concurrent first
         message of the session created meanwhile (another id).
+
+    Raises:
+        asyncpg.UniqueViolationError: When the INSERT violates any unique key
+            but ``chats_legacy_session_key`` (e.g. ``chats_pkey``: ``chat_id``
+            is an existing chat's, of any owner or org); the driver's own
+            exception, unwrapped, and nothing is stored. It quotes the row, so
+            it must never be logged by text.
     """
     with contextlib.suppress(ChatNotFoundError):
         return await find_legacy_chat(executor, tenant, session_id)
-    # The driver's error quotes the session id: it is dropped, never logged.
-    with contextlib.suppress(asyncpg.UniqueViolationError):
+    try:
         row = await executor.fetchrow(
             _CREATE_LEGACY_SQL, chat_id, tenant.org_id, tenant.user_id, session_id
         )
-        return _chat_record(row)
-    return await find_legacy_chat(executor, tenant, session_id)
+    except asyncpg.UniqueViolationError as exc:
+        # Only the session key means a concurrent first message won; any other key (the
+        # given id taken) is a fault and propagates. The race's error quotes the session
+        # id: it is dropped, never logged.
+        if exc.constraint_name != _LEGACY_SESSION_KEY:
+            raise
+        return await find_legacy_chat(executor, tenant, session_id)
+    return _chat_record(row)
 
 
 async def list_chats(

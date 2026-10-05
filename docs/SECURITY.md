@@ -126,6 +126,8 @@ How it's enforced:
   ID. A database trigger refuses clearing the external-content mark, so a chat that once
   held external content keeps asking before actions that change something (see
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
+  The database also ties a chat's owner to the chat's organization (a composite foreign
+  key), so no role can store a chat whose owner belongs to another organization.
 - **New tables get explicit grants.** A migration that creates a table grants
   `admino_app` exactly what the app needs on it, in the same file; a unit test fails
   otherwise. New functions get no `EXECUTE` for anyone by default.
