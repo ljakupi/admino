@@ -24,11 +24,13 @@ so this guard reads every shipped migration and pins the rule:
   ``organizations``, both ON DELETE CASCADE (deleting a user or purging the org
   removes their connections and notes).
 - GH-176: ``chats`` (migration 0024) has exactly two foreign keys, ``org_id`` ->
-  ``organizations`` and ``owner_user_id`` -> ``users``; ``chat_messages`` has
-  exactly two, ``org_id`` -> ``organizations`` and the composite ``(chat_id,
-  org_id)`` -> ``chats (id, org_id)``; all four ON DELETE CASCADE (deleting a
-  user or purging the org removes the chats and their messages, deleting a chat
-  row removes its messages, and a message can't name another org's chat).
+  ``organizations`` and (GH-271, migration 0026) the composite ``(owner_user_id,
+  org_id)`` -> ``users (id, org_id)``; ``chat_messages`` has exactly two,
+  ``org_id`` -> ``organizations`` and the composite ``(chat_id, org_id)`` ->
+  ``chats (id, org_id)``; all four ON DELETE CASCADE (deleting a user or purging
+  the org removes the chats and their messages, deleting a chat row removes its
+  messages, a chat's owner belongs to the chat's org and a message can't name
+  another org's chat).
 
 The parser reads the final schema across all migrations, in version order:
 inline column FKs, table-level ``FOREIGN KEY`` constraints (composite ones
@@ -414,17 +416,20 @@ class TestSchemaForeignKeyGuard:
 
     def test_schema_fk_chats_cascade_from_organizations_and_users(self) -> None:
         """GH-176: a chat belongs to its owner in one org. chats has exactly two foreign
-        keys, org_id -> organizations and owner_user_id -> users, both ON DELETE CASCADE,
-        so a user delete and the org purge remove the user's chats (migration 0024)."""
+        keys, org_id -> organizations and (GH-271, migration 0026) the composite
+        (owner_user_id, org_id) -> users (id, org_id), both ON DELETE CASCADE, so a user
+        delete and the org purge remove the user's chats (migration 0024) and the owner
+        is a member of the chat's org."""
         found = sorted(
-            (fk.columns, fk.referenced, fk.on_delete)
+            # Both referenced tables are keyed by id, so an omitted column list means (id).
+            (fk.columns, fk.referenced, fk.referenced_columns or ("id",), fk.on_delete)
             for fk in _shipped_schema().foreign_keys
             if fk.table == "chats"
         )
 
         assert found == [
-            (("org_id",), "organizations", "cascade"),
-            (("owner_user_id",), "users", "cascade"),
+            (("org_id",), "organizations", ("id",), "cascade"),
+            (("owner_user_id", "org_id"), "users", ("id", "org_id"), "cascade"),
         ]
 
     def test_schema_fk_chat_messages_cascade_from_organizations_and_their_chat(self) -> None:

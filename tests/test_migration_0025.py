@@ -27,7 +27,9 @@ What is pinned:
   NEW / OLD reference, no ``%`` placeholder).
 - tests/db_fakes.py mirrors 0025: an UPDATE of chats naming a column outside the five
   is InsufficientPrivilegeError ("permission denied for table chats") before anything
-  changes; a reset of external_content is CheckViolationError ("chats.external_content
+  changes, also (GH-271) in the row-constructor form ``SET (a, b) = (...)`` (a row,
+  ``ROW(...)``, a sub-select, ``WHERE false``, any case and spacing); a reset of
+  external_content is CheckViolationError ("chats.external_content
   can't be reset") and the statement changes no row; false -> true, true -> true and
   other columns of a flagged chat pass; the fake's columns and message equal the
   shipped ones.
@@ -584,6 +586,38 @@ _SET_ONE: dict[str, str] = {
 }
 
 
+# GH-271: the row-constructor SET form ``(a, b) = (...)`` (a row, ``ROW(...)`` or a
+# sub-select) naming each forbidden column, at different list positions; ``$1`` is the
+# forbidden column's new value, ``$2`` the chat. One literal statement per column.
+_ROW_SET_ONE: dict[str, str] = {
+    "id": "UPDATE chats SET (id, title) = ($1, 'Renamed') WHERE id = $2",
+    "org_id": "UPDATE chats SET (title, org_id) = ('Renamed', $1) WHERE id = $2",
+    "owner_user_id": (
+        "UPDATE chats SET (title, title_source, owner_user_id) = ('Renamed', 'user', $1)"
+        " WHERE id = $2"
+    ),
+    "created_at": "UPDATE chats SET (created_at) = ROW($1) WHERE id = $2",
+    "legacy_session_id": (
+        "UPDATE chats SET (title, legacy_session_id) = (SELECT 'Renamed', $1::text) WHERE id = $2"
+    ),
+}
+
+
+async def _refusal(db: FakeDb, sql: str, *args: Any) -> str:
+    """'permission denied' when the statement is refused with 0025's message and every
+    table is unchanged; otherwise what happened ('ok' or the error's repr, the fake's
+    "can't read" AssertionError included)."""
+    before = db.snapshot()
+    try:
+        await db.pool.execute(sql, *args)
+    except asyncpg.exceptions.InsufficientPrivilegeError as exc:
+        unchanged = db.snapshot() == before
+        return "permission denied" if str(exc) == _DENIED_MESSAGE and unchanged else repr(exc)
+    except (asyncpg.exceptions.PostgresError, AssertionError) as exc:
+        return repr(exc)
+    return "ok"
+
+
 async def _outcome(db: FakeDb, chat: uuid.UUID, sql: str, *args: Any) -> str:
     """'ok', 'permission denied' or 'reset refused' (each refusal changing nothing)."""
     before = db.chat_row(chat)
@@ -799,6 +833,70 @@ class TestMigration0025FakeDb:
         )
 
         assert outcome == "permission denied"
+
+    async def test_migration_0025_fake_refuses_each_forbidden_column_in_a_row_constructor_set(
+        self,
+    ) -> None:
+        """GH-271: ``SET (a, b) = (...)`` naming id, org_id, owner_user_id, created_at or
+        legacy_session_id (first, second or third in the list; a row, ``ROW(...)`` or a
+        sub-select) is 'permission denied for table chats' and changes nothing."""
+        db = FakeDb()
+        owner = db.add_account()
+        other = db.add_account(email="other@example.test")
+        outcomes: dict[str, str] = {}
+        for column, sql in _ROW_SET_ONE.items():
+            chat = db.add_chat(owner, title="Plan")
+            value = other if column == "owner_user_id" else _NEW_VALUES[column]
+            outcomes[column] = await _refusal(db, sql, value, chat)
+
+        assert outcomes == dict.fromkeys(_FIXED_COLUMNS, "permission denied")
+
+    async def test_migration_0025_fake_refuses_row_constructor_set_forms(self) -> None:
+        """GH-271, as PostgreSQL does for admino_app: a row constructor beside allowed
+        columns, a row piece after a plain ``col = ...`` piece, ``ROW(...)``, a sub-select
+        copying another chat's session id, ``WHERE false`` (no target row), mixed case and
+        whitespace; and (already refused) a forbidden plain piece after an allowed row
+        piece. Each is 'permission denied for table chats' and changes nothing."""
+        db = FakeDb()
+        owner = db.add_account()
+        other = db.add_account(email="other@example.test")
+        chat = db.add_chat(owner, title="Plan")
+        source = db.add_chat(other, legacy_session_id="sess-other")
+        stamp = _NEW_VALUES["created_at"]
+        cases: dict[str, tuple[str, tuple[Any, ...]]] = {
+            "row constructor": (
+                "UPDATE chats SET (title, owner_user_id) = ($1, $2) WHERE id = $3",
+                ("Renamed", other, chat),
+            ),
+            "row piece after a plain piece": (
+                "UPDATE chats SET title = $1, (created_at) = ROW($2) WHERE id = $3",
+                ("Renamed", stamp, chat),
+            ),
+            "ROW keyword": (
+                "UPDATE chats SET (title, org_id) = ROW($1, $2) WHERE id = $3",
+                ("Renamed", db_fakes.OTHER_ORG_ID, chat),
+            ),
+            "sub-select": (
+                "UPDATE chats SET (title, legacy_session_id) ="
+                " (SELECT title, legacy_session_id FROM chats WHERE id = $1) WHERE id = $2",
+                (source, chat),
+            ),
+            "where false": (
+                "UPDATE chats SET (title, org_id) = ($1, $2) WHERE false",
+                ("Renamed", db_fakes.OTHER_ORG_ID),
+            ),
+            "case and whitespace": (
+                "update Chats\n  SET (  Title ,OWNER_USER_ID\t)=( $1 ,\n $2 )  where ID = $3",
+                ("Renamed", other, chat),
+            ),
+            "plain piece after an allowed row piece": (
+                "UPDATE chats SET (title, title_source) = ($1, $2), org_id = $3 WHERE id = $4",
+                ("Renamed", "user", db_fakes.OTHER_ORG_ID, chat),
+            ),
+        }
+        outcomes = {name: await _refusal(db, sql, *args) for name, (sql, args) in cases.items()}
+
+        assert outcomes == dict.fromkeys(cases, "permission denied")
 
     async def test_migration_0025_fake_trigger_refuses_only_the_reset(self) -> None:
         """true -> false refused (the row unchanged); false -> true, true -> true,
