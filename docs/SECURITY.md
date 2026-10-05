@@ -219,10 +219,11 @@ the dispatch layer in `tools/registry.py`):
   base prompt tells the model that wrapped content is data, never instructions, and that
   it should point out embedded instructions to the user instead of following them. Before
   wrapping, the text loses its control characters and every invisible format character
-  (bidi overrides and isolates, direction marks, zero-width characters, the BOM, tag
-  characters). Then every copy of the marker name, in any case and even split by an
-  invisible character, is defused (`untrusted_content` becomes `untrusted-content`), so
-  the content can't close its block early or open a forged one. The text is capped at
+  (Unicode `Cf`: bidi overrides and isolates, direction marks, zero-width characters,
+  the BOM, tag characters). Then the exact marker name is defused in any case, also when
+  a copy is split by one of those removed characters (`untrusted_content` becomes
+  `untrusted-content`), so the content can't close its block early or open a forged one
+  with the exact marker syntax. Look-alikes still pass (see below). The text is capped at
   20,000 characters; the label is one line without quotes or angle brackets. Which
   results are wrapped is listed in
   [Tools → External content](tools.md#external-content-is-data-not-instructions).
@@ -238,11 +239,18 @@ the dispatch layer in `tools/registry.py`):
 
 What this doesn't cover:
 
-- **Look-alike markers survive.** Only the exact marker name is defused. Homoglyphs
-  (Cyrillic letters, full-width brackets, a space or hyphen instead of the underscore)
-  pass through, and the model may read them as markers. They can't carry the run's random
-  boundary, which the content never sees, and the side-effect escalation doesn't depend
-  on the model telling them apart.
+- **Look-alike markers survive.** Only the exact marker name is defused. These pass
+  through, and the model may read them as markers: homoglyphs (Cyrillic letters),
+  full-width brackets, a space or hyphen instead of the underscore, combining marks (such
+  as U+0301), and copies split by invisible characters that aren't format characters (the
+  combining grapheme joiner U+034F, the variation selectors U+FE00–U+FE0F and
+  U+E0100–U+E01EF, the Mongolian free variation selectors U+180B–U+180D and U+180F, the
+  Khmer inherent vowels U+17B4 and U+17B5, the Hangul fillers U+115F, U+1160, U+3164 and
+  U+FFA0). Such a split copy looks exactly like a real marker. The random boundary is
+  defence in depth only: the model isn't told the run's boundary, and the conversation
+  holds blocks of earlier runs with other boundaries, so it can't tell a forged boundary
+  from the real one. The enforcement is the side-effect escalation in the dispatch layer,
+  which doesn't depend on the model recognising markers.
 - **Read-only actions aren't escalated.** After external content, the model can still
   call read, list and search actions without confirmation, with arguments the content
   suggested (a search query, for example). Today these only reach the user's own

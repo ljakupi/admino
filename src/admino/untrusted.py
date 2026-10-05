@@ -28,21 +28,29 @@ Security notes:
   no clock or environment read. Content, labels and boundaries never reach a
   log line from here.
 - The text is sanitized before it is wrapped: line breaks become ``"\\n"``;
-  control characters but tab and newline, every format character (bidi
-  overrides and isolates, direction marks, zero-width characters, BOM, tag
-  characters) and lone surrogates are removed; then every case-insensitive
-  ``untrusted_content`` becomes ``untrusted-content``, so no begin or end
-  marker of any boundary survives inside the text (a copy split by an
-  invisible character is caught, as those go first). The text is capped at
-  ``MAX_CHARS`` characters, the label at ``MAX_LABEL_CHARS`` on one line
-  without quotes or angle brackets, so it can't leave its attribute.
-- Limits: look-alike markers (homoglyphs such as Cyrillic letters, a space
-  or hyphen for the underscore, full-width brackets) survive sanitization.
-  The model may read them as markers, but they can't carry the run's random
-  boundary, which the content never sees; and the wrapping is guidance to the
-  model only. The enforcement is the dispatch escalation: once a run has
-  received wrapped content, every side-effecting ``allow`` action needs the
-  user's confirmation.
+  control characters but tab and newline, every invisible format character
+  (Unicode ``Cf``: bidi overrides and isolates, direction marks, zero-width
+  characters, BOM, tag characters) and lone surrogates are removed; then
+  every case-insensitive ``untrusted_content`` becomes ``untrusted-content``.
+  So the exact marker name doesn't survive inside the text, also when a copy
+  is split by one of the removed characters, as those go first. The text is
+  capped at ``MAX_CHARS`` characters, the label at ``MAX_LABEL_CHARS`` on one
+  line without quotes or angle brackets, so it can't leave its attribute.
+- Limits: look-alike markers survive sanitization. These are homoglyphs
+  (such as Cyrillic letters), a space or hyphen for the underscore,
+  full-width brackets, combining marks (such as U+0301) and copies split by
+  invisible characters that aren't format characters: the combining grapheme
+  joiner U+034F, the variation selectors U+FE00-U+FE0F and U+E0100-U+E01EF,
+  the Mongolian free variation selectors U+180B-U+180D and U+180F, the Khmer
+  inherent vowels U+17B4 and U+17B5, and the Hangul fillers U+115F, U+1160,
+  U+3164 and U+FFA0. The model may read them as markers. The random boundary
+  is defence in depth only: the model isn't told the run's boundary, and the
+  history holds blocks of earlier runs with other boundaries, so it can't
+  tell a forged boundary from the real one. The wrapping is guidance to the
+  model only. The enforcement is the dispatch escalation, which doesn't
+  depend on the model recognising markers: once a run has received wrapped
+  content, every side-effecting ``allow`` action needs the user's
+  confirmation.
 """
 
 from __future__ import annotations

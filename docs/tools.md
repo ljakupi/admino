@@ -78,10 +78,13 @@ Not wrapped: the `send` and `create` results (they repeat the agent's own argume
 `memory.store` confirmation, error messages and "nothing found" messages.
 
 Before it is wrapped, the text is cleaned: control characters and invisible formatting
-characters (bidirectional overrides, zero-width characters) are removed, any copy of the
-marker inside the text is defused so the content can't end its block early, and the text
-is capped at 20,000 characters (`[truncated]`). The wrapping is guidance for the model;
-the hard rule is the next section. See
+characters (bidirectional overrides, zero-width characters) are removed, the exact marker
+name inside the text is defused (also when split by one of those removed characters) so
+the content can't end its block early with the exact marker, and the text is capped at
+20,000 characters (`[truncated]`). Look-alike markers still pass, and the random ID is
+only defence in depth: the model isn't told which ID is the current one. The wrapping is
+guidance for the model; the hard rule is the next section, and it doesn't depend on the
+model recognising markers. See
 [Security Model → Untrusted content](SECURITY.md#untrusted-content-in-tool-results) for
 what it does and doesn't protect against.
 
