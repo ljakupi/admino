@@ -53,8 +53,11 @@ org) is recorded as ``invitation.refuse`` after its transaction rolled back,
 so probing for existing emails shows in the org's audit log.
 
 Revoking deletes the invited users row; the foreign keys cascade to its
-invitation, its queued email, its sessions and its reset token, which frees
-the email and the seat. Resending rotates the token and resets ``sent_at`` and
+chats, its invitation, its queued email, its sessions and its reset token,
+which frees the email and the seat. Its chats in the org (trashed ones
+included) are locked in id order first, the order of the org-wide promotion
+notice (``chats``' S12a lock), so a revoke and a notice can't deadlock over
+them (GH-265). Resending rotates the token and resets ``sent_at`` and
 ``expires_at`` (also for an expired invitation, without a seat check),
 cancels the invitation email still queued with the old link
 (``email_outbox.cancel_pending``) and queues a new one. Accepting checks the
@@ -182,6 +185,19 @@ _LIST_SQL: Final = """
     JOIN users u ON u.id = i.user_id
     WHERE u.org_id = $1 AND i.accepted_at IS NULL
     ORDER BY i.sent_at DESC
+"""
+# The chats of the pending invitation's account in the org, trashed ones
+# included (the revoke's cascade removes them all), locked in id order before
+# the users row goes: the same order as the promotion notice's lock (chats
+# S12a), so a revoke and a notice can't lock the same chats in opposite orders
+# and deadlock (GH-265). Another org's, an unknown or an accepted invitation
+# matches no chat.
+_LOCK_CHATS_SQL: Final = """
+    SELECT id FROM chats
+    WHERE org_id = $2
+      AND owner_user_id = (SELECT user_id FROM invitations WHERE id = $1 AND accepted_at IS NULL)
+    ORDER BY id
+    FOR UPDATE
 """
 # Pending invitations of the actor's org only; the foreign keys cascade.
 _REVOKE_SQL: Final = """
@@ -679,10 +695,12 @@ async def revoke_pending_invitation(
 ) -> None:
     """Revoke a pending invitation of an org, inside the caller's transaction.
 
-    Deletes the invited users row (the foreign keys cascade to its invitation,
-    queued email, sessions and reset token, which frees the email and the seat)
-    and records ``invitation.revoke`` by ``actor`` in that org's log. The
-    caller decides the authorization.
+    Locks the invited account's chats in the org in id order (the promotion
+    notice's order, GH-265), then deletes the invited users row (the foreign
+    keys cascade to its chats, invitation, queued email, sessions and reset
+    token, which frees the email and the seat) and records
+    ``invitation.revoke`` by ``actor`` in that org's log. The caller decides
+    the authorization.
 
     Args:
         conn: A connection inside the caller's transaction.
@@ -696,6 +714,7 @@ async def revoke_pending_invitation(
             nothing is deleted or audited.
         AuditRecordError: If the audit event can't be recorded.
     """
+    await conn.fetch(_LOCK_CHATS_SQL, invitation_id, org_id)
     user_id = await conn.fetchval(_REVOKE_SQL, invitation_id, org_id)
     if user_id is None:
         raise InvitationNotFoundError
