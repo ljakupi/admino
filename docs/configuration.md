@@ -114,13 +114,14 @@ A chat reply that fails has `status: "error"`, and the `POST /api/chats/{id}/mes
 | `timeout` | The provider didn't answer within `llm.timeout_s`. |
 | `context_too_long` | The conversation is longer than the model accepts (400/413). Start a new chat. |
 | `residency_blocked` | The organization's data residency policy is on and the provider isn't Swiss (see [above](#data-residency-and-the-provider)). |
+| `rate_limit` | Not an LLM failure: you already have as many pending confirmations as allowed (`max_pending_confirmations`, a [platform default](#platform-defaults), 3 by default), so the action that needed one more wasn't run. The turn is stored (see [Chats](#chats)). Unlike `rate_limited`, it's admino's own limit, not the provider's. |
 
 Any other failure has `error_code: null`. The chat shows the code's translated text
 (English, German or French), or a generic "Something went wrong" text when there's no
-code. The response's `response` field holds an English fallback text. **Provider text is
-never shown or logged**: no provider message, response body or provider error code
-reaches a response or a log line. Errors are logged by their type, HTTP status and code
-only.
+code (and, in this release, for `rate_limit`). The response's `response` field holds an
+English fallback text. **Provider text is never shown or logged**: no provider message,
+response body or provider error code reaches a response or a log line. Errors are logged
+by their type, HTTP status and code only.
 
 **Retries.** A `timeout`, `provider_unavailable` or `rate_limited` failure is retried up to
 `llm.max_retries` times (a [platform default](#platform-defaults): 2, from 0 to 5, `0`
