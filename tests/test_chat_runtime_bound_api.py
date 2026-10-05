@@ -35,6 +35,14 @@ What is pinned:
   approval leaves that chat a lock only, the refused turn runs.
 - Logs (tracker section 5): the eviction and 429 paths log no message content, no tool
   argument of any pending confirmation, no user id and no id of another chat.
+- GH-24 audit fix (server audit L-1): POST /api/confirm on a chat of the caller's that
+  has no runtime entry (named by ``chat_id`` or the legacy ``session_id``, approve or
+  deny) is the 404 ``No pending confirmation for this session`` and creates no entry:
+  never the 429 at the caller's per-user bound, and at global capacity it evicts nothing
+  (the caller's own pending confirmation in another chat stays pending and approvable).
+  Guards: a lock-only chat is the same 404, a wrong confirmation id is the 404
+  ``Confirmation not found`` with the pending one kept, another user's or org's chat is
+  the 404 at the bound too; none of them runs, stores or changes the runtime.
 
 ``admino.chat_runtime`` and the new server names are used lazily, so the file collects
 before GH-24 is implemented and each test fails on its own.
@@ -103,8 +111,10 @@ _CHATS_BUSY: Final = {
     "reason": "chats_busy",
 }
 _NO_PENDING: Final = {"detail": "No pending confirmation for this session"}
+_CONFIRMATION_NOT_FOUND: Final = {"detail": "Confirmation not found"}
 
 _CONFIRMATION_ID: Final = "confirm-24-plover"
+_WRONG_CONFIRMATION_ID: Final = "confirm-24-wrong-tern"
 _LEGACY_SESSION: Final = "legacy-24-heron"
 _STUB_REPLY: Final = "Done."
 _MESSAGE: Final = "Hello there"
@@ -361,6 +371,28 @@ def _confirm(
         f"/api/confirm/{_CONFIRMATION_ID}",
         headers=account.cookie,
         json={"confirmation_id": _CONFIRMATION_ID, "approved": approved, "chat_id": str(chat_id)},
+    )
+
+
+def _confirm_by(
+    client: TestClient,
+    account: Account,
+    chat_id: uuid.UUID,
+    *,
+    reference: str = "chat_id",
+    approved: bool = True,
+    confirmation_id: str = _CONFIRMATION_ID,
+) -> httpx.Response:
+    """POST /api/confirm/{confirmation_id} naming the chat by ``chat_id`` or, with
+    ``reference="session_id"``, by the legacy ``_LEGACY_SESSION`` (``chat_id`` is then the
+    account's chat of that session id)."""
+    chat: dict[str, str] = (
+        {"session_id": _LEGACY_SESSION} if reference == "session_id" else {"chat_id": str(chat_id)}
+    )
+    return client.post(
+        f"/api/confirm/{confirmation_id}",
+        headers=account.cookie,
+        json={"confirmation_id": confirmation_id, "approved": approved, **chat},
     )
 
 
@@ -842,3 +874,152 @@ def test_chat_runtime_bound_eviction_and_429_logs_carry_no_content_ids_or_argume
     ]
     forbidden = [*messages, *arguments, *user_ids, *other_chats]
     assert [value for value in forbidden if value in text] == []
+
+
+# ---------------------------------------------------------------------------
+# 7. A confirm with nothing to confirm creates no entry (GH-24 audit fix, server L-1)
+# ---------------------------------------------------------------------------
+
+
+def _editor_at_bound(
+    client: TestClient, script: _Script, world: World, monkeypatch: pytest.MonkeyPatch
+) -> Account:
+    """Bound 2 (global roomy): org A's Editor, whose two entries hold pending confirmations."""
+    _use_runtime(monkeypatch, max_entries=_ROOMY, max_entries_per_user=2)
+    editor = world.a["editor"]
+    for _ in range(2):
+        _awaited(client, script, editor, _new_chat(world.db, editor))
+    return editor
+
+
+@pytest.mark.parametrize(
+    ("reference", "approved"),
+    [("chat_id", True), ("chat_id", False), ("session_id", True)],
+    ids=["approve", "deny", "legacy_session_id"],
+)
+def test_chat_runtime_bound_confirm_on_chat_without_entry_at_user_bound_is_404_not_429(
+    world: World,
+    agent: MagicMock,
+    script: _Script,
+    monkeypatch: pytest.MonkeyPatch,
+    reference: str,
+    approved: bool,
+) -> None:
+    """Bound 2, both of the Editor's entries pinned by pending confirmations: a confirm on a
+    third chat of theirs, which has no runtime entry, is the 404 ``No pending
+    confirmation`` (not the 429 ``rate_limit``), whether approving or denying and whether
+    the chat is named by ``chat_id`` or the legacy ``session_id``: no run, nothing stored,
+    the runtime unchanged (no entry created, both confirmations kept)."""
+    _, client = _client(agent)
+    editor = _editor_at_bound(client, script, world, monkeypatch)
+    legacy = _LEGACY_SESSION if reference == "session_id" else None
+    third = seed_chat(world.db, editor, legacy_session_id=legacy)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _confirm_by(client, editor, third, reference=reference, approved=approved)
+
+    assert (response.status_code, response.json()) == (404, _NO_PENDING)
+    assert agent.run.await_count == runs
+    assert _tables(world.db) == tables
+    assert chat_runtime_state(world.db) == state
+
+
+def test_chat_runtime_bound_confirm_on_chat_without_entry_at_capacity_keeps_own_confirmation(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Capacity 3, no per-user bound: the A Editor's chat ``kept``, org A's Org Admin's and
+    org B's Editor's chats each hold a pending confirmation, so the only entry that could
+    go is the Editor's own. A confirm on another chat of the Editor's, without an entry,
+    is the 404 ``No pending confirmation`` and evicts nothing: ``kept`` stays pending (GET
+    detail), the runtime is unchanged, nothing runs or is stored, and approving ``kept``
+    afterwards resumes its run (200)."""
+    _, client = _client(agent)
+    _use_runtime(monkeypatch, max_entries=3)
+    editor, colleague, other_org = world.a["editor"], world.a["org_admin"], world.b["editor"]
+    kept = _new_chat(world.db, editor)
+    _awaited(client, script, editor, kept)
+    _awaited(client, script, colleague, _new_chat(world.db, colleague))
+    _awaited(client, script, other_org, _new_chat(world.db, other_org))
+    stale = _new_chat(world.db, editor)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _confirm(client, editor, stale)
+
+    assert (response.status_code, response.json()) == (404, _NO_PENDING)
+    assert _confirmation_status(client, editor, kept) == "pending"
+    assert chat_runtime_state(world.db) == state
+    assert (agent.run.await_count, _tables(world.db)) == (runs, tables)
+    script.queue(_Reply(new=(_tool("Stored memory: plan", _PENDING_CALL),), response=_SAVED))
+    approved = _confirm(client, editor, kept)
+    assert approved.status_code == 200, approved.text
+    assert (approved.json()["status"], approved.json()["response"]) == ("final", _SAVED)
+
+
+def test_chat_runtime_bound_confirm_on_lock_only_chat_is_404_and_changes_nothing(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard. Bound 2: the Editor's chats are one with a pending confirmation and one whose
+    turn finished (its entry only a lock). A confirm on the lock-only chat is the 404 ``No
+    pending confirmation``: no run, nothing stored, the runtime unchanged."""
+    _, client = _client(agent)
+    _use_runtime(monkeypatch, max_entries=_ROOMY, max_entries_per_user=2)
+    editor = world.a["editor"]
+    _awaited(client, script, editor, _new_chat(world.db, editor))
+    lock_only = _new_chat(world.db, editor)
+    _finished(client, editor, lock_only)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _confirm(client, editor, lock_only)
+
+    assert (response.status_code, response.json()) == (404, _NO_PENDING)
+    assert agent.run.await_count == runs
+    assert _tables(world.db) == tables
+    assert chat_runtime_state(world.db) == state
+
+
+def test_chat_runtime_bound_confirm_with_wrong_id_is_404_and_keeps_the_pending_one(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Guard. A confirm naming a chat whose pending confirmation has another id is the 404
+    ``Confirmation not found``: no run, nothing stored, the pending one kept (runtime
+    unchanged)."""
+    _, client = _client(agent)
+    _use_runtime(monkeypatch, max_entries=_ROOMY, max_entries_per_user=2)
+    editor = world.a["editor"]
+    pending_chat = _new_chat(world.db, editor)
+    _awaited(client, script, editor, pending_chat)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _confirm_by(client, editor, pending_chat, confirmation_id=_WRONG_CONFIRMATION_ID)
+
+    assert (response.status_code, response.json()) == (404, _CONFIRMATION_NOT_FOUND)
+    assert agent.run.await_count == runs
+    assert _tables(world.db) == tables
+    assert chat_runtime_state(world.db) == state
+
+
+@pytest.mark.parametrize("owner", ["same_org", "other_org"])
+def test_chat_runtime_bound_confirm_on_another_users_chat_at_bound_is_404(
+    world: World,
+    agent: MagicMock,
+    script: _Script,
+    monkeypatch: pytest.MonkeyPatch,
+    owner: str,
+) -> None:
+    """Guard. Bound 2, both of the A Editor's entries pending: a confirm naming a chat of
+    org A's Org Admin or of org B's Editor, which holds a confirmation with the same id, is
+    the 404 ``No pending confirmation`` (never the 429): no run, nothing stored, the
+    owner's confirmation and the runtime unchanged."""
+    _, client = _client(agent)
+    editor = _editor_at_bound(client, script, world, monkeypatch)
+    account = world.a["org_admin"] if owner == "same_org" else world.b["editor"]
+    foreign = _new_chat(world.db, account)
+    _awaited(client, script, account, foreign)
+    runs, tables, state = agent.run.await_count, _tables(world.db), chat_runtime_state(world.db)
+
+    response = _confirm(client, editor, foreign)
+
+    assert (response.status_code, response.json()) == (404, _NO_PENDING)
+    assert agent.run.await_count == runs
+    assert _tables(world.db) == tables
+    assert chat_runtime_state(world.db) == state
