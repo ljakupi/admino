@@ -212,13 +212,17 @@ _CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"GOCSPX-[A-Za-z0-9_\-]{20,80}"),  # Google OAuth client secrets
     # Generic sk- API keys: OpenAI sk-proj-, sk-svcacct-, sk-admin- and plain sk-
     # (about 164 characters, with "_" and "-") and Anthropic sk-ant-<version>-
-    # (with "_"). "sk-" starts a key only at a token start (\b: risk-free-...
-    # isn't one), then at least 20 key characters. No upper bound on purpose: an
-    # upper bound would leave the rest of a longer run as a visible tail, so the
-    # whole run is redacted whatever its length (fail closed). No trailing \b, so a
-    # key's final "-" goes too. Still linear: one greedy class with nothing after
-    # it never backtracks, and a failed start reads at most 19 characters.
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}"),
+    # (with "_"). "sk-" starts a key only at a token start: not right after an
+    # ASCII letter, ASCII digit or "_" (risk-free-..., Ask-..., 2sk-... aren't
+    # keys), then at least 20 key characters. ASCII on purpose, not \b: Python's
+    # \b counts CJK, kana and accented letters as word characters, so a key glued
+    # to Chinese, Japanese or accented text would not be redacted at all. No upper
+    # bound on purpose: an upper bound would leave the rest of a longer run as a
+    # visible tail, so the whole run is redacted whatever its length (fail
+    # closed). No trailing \b, so a key's final "-" goes too. Still linear: the
+    # lookbehind is fixed-width, one greedy class with nothing after it never
+    # backtracks, and a failed start reads at most 19 characters.
+    re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"rk_live_[A-Za-z0-9]{20,200}"),  # Stripe restricted keys (live)
     re.compile(r"rk_test_[A-Za-z0-9]{20,200}"),  # Stripe restricted keys (test)
     re.compile(r"gh[ps]_[A-Za-z0-9]{36,255}"),  # GitHub PATs and server tokens
