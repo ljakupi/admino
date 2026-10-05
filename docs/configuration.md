@@ -677,11 +677,16 @@ Viewer's chats from before a role change stay stored, unused.
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":
   "chat_not_found"}`, so nobody learns that someone else's chat exists. A chat ID that
-  isn't a UUID answers `422`. A message answers `429` `{"detail": "Too many of your
-  chats are active. Try again shortly.", "reason": "rate_limit"}` when your 16 chats in
-  the server's memory are all running or waiting for a confirmation (see below), and
-  `503` with `"reason": "chats_busy"` when the server is already running as many chats
-  at once as it can hold. Nothing runs or is stored in either case; try again shortly.
+  isn't a UUID answers `422`. A message (`POST /api/chats/{id}/messages` or
+  `POST /api/message`) answers `429` `{"detail": "Too many of your chats are active. Try
+  again shortly.", "reason": "rate_limit"}` when your 16 chats in the server's memory
+  are all running or waiting for a confirmation (see below), and `503` with `"reason":
+  "chats_busy"` when the server is already running as many chats at once as it can hold.
+  Only these two message routes answer this `429` or `503`. In either case your message
+  doesn't run and isn't stored; try again shortly. Two things still happen first: a new
+  `session_id` on `POST /api/message` creates its chat, and the notes of
+  [promoted permissions](permissions.md#promoting-a-critical-permission) that just took
+  effect are added to your organization's chats (see below).
 - **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages` and
   `POST /api/message` share one limit, so switching between them doesn't double your
   rate.
@@ -690,7 +695,11 @@ Viewer's chats from before a role change stay stored, unused.
   `POST /api/confirm/{confirmation_id}` and
   `{"chat_id": "...", "confirmation_id": "...", "approved": true}` (or `false`). A denial
   is stored in the chat too, as "Tool call denied by the user." and "Action … was
-  denied." A new message in the chat cancels a pending confirmation.
+  denied." A new message in the chat cancels a pending confirmation. Confirming in a chat
+  with nothing pending (expired, already answered or never asked for) answers `404`
+  `{"detail": "No pending confirmation for this session"}` and nothing runs. Confirming
+  never adds a chat to the server's memory (see below), so it never answers `429` or
+  `503` and never drops another of your confirmations.
 - **At most 3 pending confirmations per user.** You can have up to
   `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
   confirmations waiting at once, across your chats. When you're at the limit, a message

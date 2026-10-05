@@ -362,12 +362,13 @@ We prefer to be transparent about what this does **not** guarantee:
   user asks again. A second process or replica wouldn't see the first one's confirmations
   or locks, so the agent isn't scaled out. The memory is bounded per user too, so one
   user or organization can't push everyone else's state out: a user holds at most 16
-  chats in it (more answers `429` `rate_limit` while all of them are running or waiting
-  for a confirmation) and at most `max_pending_confirmations` (3 by default) pending
-  confirmations (one more is refused with `rate_limit`, and the action doesn't run). When
-  the server is full, a new chat never drops another user's pending confirmation: only
-  the requester's own, as a last resort. Expired confirmations are dropped at every chat
-  request and every 30 seconds, and are never run.
+  chats in it (a message in one more answers `429` `rate_limit` while all of them are
+  running or waiting for a confirmation; a confirm never adds one, so confirming in a
+  chat that isn't there is the `404`) and at most `max_pending_confirmations` (3 by
+  default) pending confirmations (one more is refused with `rate_limit`, and the action
+  doesn't run). When the server is full, a new chat never drops another user's pending
+  confirmation: only the requester's own, as a last resort. Expired confirmations are
+  dropped at every chat request and every 30 seconds, and are never run.
 - **The owner password lives in `.env`.** The database roles protect the audit log from
   a compromised app, not from someone who can read `.env` on the server: `PG_PASSWORD`
   is the database superuser's password.

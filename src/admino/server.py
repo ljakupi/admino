@@ -430,7 +430,9 @@ Deployment note:
   ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run locks
   and pending confirmations, at most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries
   and ``_MAX_CHAT_RUNTIME_ENTRIES_PER_USER`` per user, idle ones evicted
-  after ``_CHAT_IDLE_EVICT_S``; GH-24: a user at their bound loses their own
+  after ``_CHAT_IDLE_EVICT_S``; GH-24: only the two message routes create
+  entries (a confirm on a chat without one is the 404 "No pending
+  confirmation for this session"); a user at their bound loses their own
   least recently used entry that only holds a lock, else gets the 429
   ``rate_limit`` before any run; at capacity the requester's own lock-only
   entry goes first, then anyone's, then the requester's own pending
@@ -4046,6 +4048,8 @@ async def post_confirm(
     The body names the chat by ``chat_id`` or by the legacy ``session_id``
     (looked up, never created); a chat the caller can't reach, or one
     without a pending confirmation in ``_chat_runtime``, is the same 404.
+    A confirm never creates a runtime entry: a chat without one is that 404
+    before its lock is taken, so nothing is evicted, run or stored (GH-24).
     Expired confirmations are reaped first. Under the chat's lock the
     confirmation id and the expiry are checked (``_utc_now``) and the
     confirmation is consumed: one that expired meanwhile (while the request
@@ -4087,10 +4091,7 @@ async def post_confirm(
         HTTPException: 404 if no confirmation is pending for the chat, it has
             expired or the id doesn't match, 400 if the IDs mismatch, 500
             when the agent fails. A chat trashed meanwhile is the 404
-            ``chat_not_found``. A chat without a runtime entry gets one, so
-            the caller at their chat-runtime bound is the 429 ``rate_limit``
-            and a full chat runtime with nothing to evict the 503
-            ``chats_busy``.
+            ``chat_not_found``.
     """
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -4114,6 +4115,15 @@ async def post_confirm(
             chat = await chats.find_legacy_chat(pool, tenant, cast("str", body.session_id))
     except chats.ChatNotFoundError:
         raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL) from None
+
+    # A chat without a runtime entry has nothing pending, and a confirm never creates
+    # one: otherwise a stale confirm could hit the per-user 429 or, at capacity, evict
+    # the caller's own pending confirmation elsewhere (GH-24, audit L-1). Only "no
+    # entry" answers here: an approval queued behind a running turn of the chat must
+    # still wait for the lock (the turn may store the confirmation it approves). No
+    # await before hold(), so the entry checked is the one hold() finds.
+    if chat.id not in _chat_runtime:
+        raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
 
     # Per-chat lock serialises with concurrent turns of the chat.
     async with _chat_runtime.hold(chat.id, tenant.user_id):

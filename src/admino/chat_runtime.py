@@ -14,7 +14,8 @@ must not be stored there lives here, one entry per chat:
 
 Inputs: chat and user ids (server-generated UUIDs), ``PendingConfirmation``
 models, the current time for ``reap_expired``.
-Outputs: ``hold()`` context managers, stored confirmations, counts.
+Outputs: ``hold()`` context managers, stored confirmations, counts, and
+whether a chat has an entry (``chat_id in runtime``, which never creates one).
 Errors: ``ChatRuntimeFullError``, ``ChatRuntimeUserLimitError`` and
 ``PendingConfirmationLimitError`` (see below).
 
@@ -139,6 +140,14 @@ class ChatRuntime:
     def __len__(self) -> int:
         """The number of entries."""
         return len(self._entries)
+
+    def __contains__(self, chat_id: UUID) -> bool:
+        """Whether the chat has an entry (``chat_id in runtime``); never creates one.
+
+        Synchronous, so a caller that checks it and then enters ``hold`` with no
+        ``await`` in between finds the same entry there and creates none.
+        """
+        return chat_id in self._entries
 
     @contextlib.asynccontextmanager
     async def hold(self, chat_id: UUID, owner_user_id: UUID) -> AsyncIterator[None]:
