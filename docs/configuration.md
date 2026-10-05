@@ -652,7 +652,7 @@ Viewer's chats from before a role change stay stored, unused.
 
 | Route | What it does |
 | --- | --- |
-| `POST /api/chats` | Starts a chat. The body is `{}` or `{"title": "..."}`. Answers `201` with the chat: `id`, `title`, `title_source`, `created_at` and `last_activity_at`. Without a title, `title` is `""` and `title_source` is `"auto"`; with one, `"user"`. |
+| `POST /api/chats` | Starts a chat. The body is `{}` or `{"title": "..."}`. Answers `201` with the chat: `id`, `title`, `title_source`, `created_at` and `last_activity_at`. Without a title, `title` is `""` and `title_source` is `"auto"` until the first exchange titles it (see below); with one, `"user"`. |
 | `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
 | `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. It also carries `pending_confirmation`, `confirmation_status` and `context`, see below. |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
@@ -662,6 +662,23 @@ Viewer's chats from before a role change stay stored, unused.
 - **Titles** have 1 to 200 characters, spaces at either end removed. Control and
   formatting characters are refused with `422`. Creating, renaming and sending messages
   aren't recorded in the audit log, and titles and messages are never logged.
+- **Automatic titles.** After an untitled chat's first exchange, the server asks the
+  active model for a short title in the background. It sends only your first message and
+  the reply as written, each cut to 1,000 characters, with no tools and no account
+  identifiers (no user, organization or chat IDs, no account name or email address).
+  Names or addresses that the message or the reply contain are sent as they are.
+  The answer is capped at 40 tokens, and reasoning is off on Infomaniak. The call goes
+  through the same [retries](#llm-errors-and-retries). The title is cleaned up (quotes, a
+  "Title:" label, a final period and control characters removed, credentials redacted)
+  and is at most 80 characters. When the call fails, when the organization's
+  [data residency](#data-residency-and-the-provider) blocks the provider (no call is
+  made), when the answer has nothing usable, or when the turn ended with an error, the
+  title is your first message instead, cut at a word boundary. The same goes when the
+  first reply was built from an email, a file or other outside content: no call is made,
+  so outside content can't choose the title. A rename always wins, also
+  while the title is being made. The title shows on the next `GET /api/chats` or
+  `GET /api/chats/{id}`, with `title_source: "auto"`. The reply doesn't wait for it, and
+  titles are never logged.
 - **Pages and cursors.** Pass a response's `next_cursor` as `cursor` to get the next
   page; `null` means there's nothing more. Cursors are opaque: use them as they come, and
   don't build or change them. A cursor that doesn't decode, or one from the other list,

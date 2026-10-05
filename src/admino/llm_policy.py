@@ -17,10 +17,16 @@ two rules (GH-242):
   jitter) when there is none; a Retry-After above 10 s means no retry at all.
   The last error is raised unchanged; any other error propagates at once.
   ``chat_stream`` retries only while nothing has reached the caller yet.
+- Per-call output cap (GH-179): ``chat``'s keyword-only ``max_tokens`` is
+  passed to ``client.chat`` on every attempt when it is an int (the chat-title
+  call); when it is None the keyword is not passed at all, so clients without
+  it keep working. The client validates it and applies
+  ``min(max_tokens, configured cap)``.
 
-Inputs: the client, the call's messages and tools, the org's residency flag
-and the platform's retry limit. Outputs: the client's ``LLMResponse`` (or its
-stream items), or the client's / the guard's ``LLMError``.
+Inputs: the client, the call's messages and tools, an optional per-call output
+cap, the org's residency flag and the platform's retry limit. Outputs: the
+client's ``LLMResponse`` (or its stream items), or the client's / the guard's
+``LLMError``.
 
 Security notes:
 - Pure policy: imports only the standard library, ``admino.llm`` and
@@ -148,6 +154,7 @@ async def chat(
     *,
     data_residency: bool,
     max_retries: int,
+    max_tokens: int | None = None,
 ) -> LLMResponse:
     """Send one chat request through the residency guard and the retry policy.
 
@@ -157,6 +164,9 @@ async def chat(
         tools: The call's tool definitions (the same object on every retry).
         data_residency: The requesting org's residency policy.
         max_retries: Retries of a retryable error (0..5).
+        max_tokens: Per-call output cap (GH-179) passed to ``client.chat`` on
+            every attempt; None calls ``client.chat(messages, tools=tools)``
+            without the keyword, exactly as before.
 
     Returns:
         The client's response.
@@ -171,7 +181,10 @@ async def chat(
     attempt = 0
     while True:
         try:
-            return await client.chat(messages, tools=tools)
+            if max_tokens is None:
+                # No keyword at all: clients (and test fakes) without it keep working.
+                return await client.chat(messages, tools=tools)
+            return await client.chat(messages, tools=tools, max_tokens=max_tokens)
         except LLMError as exc:
             if not await _wait_before_retry(exc, attempt, max_retries):
                 raise
