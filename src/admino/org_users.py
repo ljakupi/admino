@@ -43,9 +43,10 @@ and its audit event commit or roll back together.
 - Reactivating locks the org row and counts its seats (active and invited
   users, ``invitations.ensure_free_seat``), then sets the status and queues
   ``account_activated``.
-- Deleting runs the last-admin guard first, ends the sessions, then deletes
-  the users row; the foreign keys cascade to its OAuth connections, memory,
-  settings, reset token and queued emails. The audit event survives it.
+- Deleting runs the last-admin guard first, ends the sessions, locks the
+  user's chats, then deletes the users row; the foreign keys cascade to its
+  chats (with their messages), OAuth connections, memory, settings, reset
+  token and queued emails. The audit event survives it.
 - A reset reuses GH-151's link (``password_reset.queue_reset_link``) for an
   active user, with the admin as the event's actor.
 
@@ -53,7 +54,10 @@ Concurrency: the guard locks the target's row and the org's active Org Admin
 rows in id order before anything else locks the target, so concurrent
 demotions, deactivations and deletions serialize without deadlocking. The
 other actions lock the target's row (``FOR UPDATE``) while they check its
-status; a reactivation locks the org row after it.
+status; a reactivation locks the org row after it. A deletion then locks the
+user's chats in the org (trashed ones included) in id order before the users
+row goes: the order of the org-wide promotion notice (``chats``' S12a lock),
+so a deletion and a notice can't deadlock over them (GH-265).
 
 Security notes:
 - Authorization through ``access.can`` before any query: listing and the seat
@@ -140,8 +144,18 @@ _REACTIVATE_SQL: Final = """
     WHERE id = $1 AND org_id = $2
     RETURNING id, name, email, role, status, created_at, last_login_at
 """
-# The foreign keys cascade to the user's connections, memory, settings, reset
-# token and queued emails.
+# Every chat of the user in the org, trashed ones included (the cascade removes
+# them all), locked in id order before the users row goes: the same order as
+# the promotion notice's lock (chats S12a), so a deletion and a notice can't
+# lock the same chats in opposite orders and deadlock (GH-265).
+_LOCK_CHATS_SQL: Final = """
+    SELECT id FROM chats
+    WHERE org_id = $1 AND owner_user_id = $2
+    ORDER BY id
+    FOR UPDATE
+"""
+# The foreign keys cascade to the user's chats (with their messages),
+# connections, memory, settings, reset token and queued emails.
 _DELETE_SQL: Final = "DELETE FROM users WHERE id = $1 AND org_id = $2"
 # A reset link already sent to the old address stops working.
 _CANCEL_RESET_SQL: Final = "DELETE FROM password_reset_tokens WHERE user_id = $1"
@@ -452,9 +466,11 @@ async def delete_org_user(
 ) -> None:
     """Delete a user's account with everything of it, and record ``user.delete``.
 
-    The sessions are ended first (their count is the event's metadata); the
-    users row's foreign keys cascade to the OAuth connections, memory,
-    settings, reset token and queued emails. The email is free again.
+    The sessions are ended first (their count is the event's metadata), then
+    the user's chats in the org are locked in id order (the promotion notice's
+    order, GH-265); the users row's foreign keys cascade to the chats with
+    their messages, the OAuth connections, memory, settings, reset token and
+    queued emails. The email is free again.
 
     Args:
         pool: The database pool.
@@ -474,6 +490,7 @@ async def delete_org_user(
         await accounts.ensure_not_last_active_admin(conn, org_id=org_id, user_id=user_id)
         await _locked_target(conn, org_id=org_id, user_id=user_id)
         revoked = await sessions.revoke_user_sessions(conn, user_id)
+        await conn.fetch(_LOCK_CHATS_SQL, org_id, user_id)
         await conn.execute(_DELETE_SQL, user_id, org_id)
         await _record(
             conn,
