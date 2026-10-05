@@ -11,7 +11,8 @@ until then, dispatch rejects the call as an unknown tool.
 Inputs: the validated args (``GoogleDriveReadArgs``, ``GoogleDriveListArgs``,
 ``GoogleDriveSearchArgs``) and the required keyword ``tenant`` (the run's
 ``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
-formatted file metadata or listing, or a user-facing error string.
+formatted file metadata or listing, wrapped as untrusted file content
+(GH-243), or a user-facing error string.
 
 Security notes:
 - Per-user tokens: every API request of a handler call carries the access
@@ -23,6 +24,11 @@ Security notes:
 - No delete capability. google_drive.delete is a hardcoded denial in
   permissions.py.
 - Read-only: no action writes to the local filesystem or to Drive.
+- Untrusted content (GH-243): file names and metadata are third-party text,
+  so every read/list/search success result reaches the model only through
+  ``untrusted.wrap`` (kind ``file``), and the agent escalates the run's later
+  side effects to confirmation. The read label names the validated
+  ``file_id`` argument. Error and "nothing found" strings stay unwrapped.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -34,7 +40,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from admino import database
+from admino import database, untrusted
 from admino.models import (
     GoogleDriveListArgs,
     GoogleDriveReadArgs,
@@ -141,6 +147,7 @@ def _format_file_entry(file: dict[str, object]) -> str:
         "Returns name, type, size, dates, and link."
     ),
     args_schema=GoogleDriveReadArgs,
+    side_effect=False,
 )
 async def google_drive_read(
     args: GoogleDriveReadArgs, *, tenant: TenantContext, **_: object
@@ -152,7 +159,8 @@ async def google_drive_read(
         tenant: The caller's tool context (whose Drive is read).
 
     Returns:
-        Formatted file metadata string.
+        The formatted file metadata, wrapped as untrusted file content, or an
+        error string.
     """
     fields = "id,name,mimeType,size,createdTime,modifiedTime,webViewLink"
     try:
@@ -174,14 +182,16 @@ async def google_drive_read(
     if not isinstance(data, dict):
         return "Unexpected response format from Google Drive API."
 
-    return (
+    return untrusted.wrap(
+        "file",
+        f"google drive file {args.file_id}",
         f"Name: {data.get('name', 'Untitled')}\n"
         f"ID: {data.get('id', 'unknown')}\n"
         f"Type: {data.get('mimeType', 'unknown')}\n"
         f"Size: {data.get('size', 'N/A')}\n"
         f"Created: {data.get('createdTime', 'N/A')}\n"
         f"Modified: {data.get('modifiedTime', 'N/A')}\n"
-        f"Link: {data.get('webViewLink', 'N/A')}"
+        f"Link: {data.get('webViewLink', 'N/A')}",
     )
 
 
@@ -190,6 +200,7 @@ async def google_drive_read(
     action="list",
     description="List files in a Google Drive folder. If no folder ID given, lists root.",
     args_schema=GoogleDriveListArgs,
+    side_effect=False,
 )
 async def google_drive_list(
     args: GoogleDriveListArgs, *, tenant: TenantContext, **_: object
@@ -201,7 +212,8 @@ async def google_drive_list(
         tenant: The caller's tool context (whose Drive is listed).
 
     Returns:
-        Formatted list of files in the folder.
+        The formatted list of files in the folder, wrapped as untrusted file
+        content, a "nothing found" message or an error string.
     """
     if args.folder_id:
         # Model-level pattern validation rejects single quotes and backslashes.
@@ -240,7 +252,7 @@ async def google_drive_list(
         lines.append(_format_file_entry(file))
         lines.append("")  # blank line separator
 
-    return "\n".join(lines).rstrip()
+    return untrusted.wrap("file", "google drive files", "\n".join(lines).rstrip())
 
 
 @register_tool(
@@ -248,6 +260,7 @@ async def google_drive_list(
     action="search",
     description="Search for files in Google Drive by text query.",
     args_schema=GoogleDriveSearchArgs,
+    side_effect=False,
 )
 async def google_drive_search(
     args: GoogleDriveSearchArgs, *, tenant: TenantContext, **_: object
@@ -259,7 +272,8 @@ async def google_drive_search(
         tenant: The caller's tool context (whose Drive is searched).
 
     Returns:
-        Formatted list of matching files.
+        The formatted list of matching files, wrapped as untrusted file
+        content, a "nothing found" message or an error string.
     """
     # Model-level pattern validation rejects single quotes and backslashes.
     # Defence-in-depth: escape any that slip through.
@@ -294,4 +308,4 @@ async def google_drive_search(
         lines.append(_format_file_entry(file))
         lines.append("")  # blank line separator
 
-    return "\n".join(lines).rstrip()
+    return untrusted.wrap("file", "google drive search results", "\n".join(lines).rstrip())

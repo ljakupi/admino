@@ -206,6 +206,61 @@ over HTTP. Its route catalog lives in `tests/tenancy_world.py`. Every registered
 a row there, every role is tried on every route, and every content route has a cross-org
 case. A route added without its row fails the suite.
 
+## Untrusted content in tool results
+
+Emails, files, calendar events and memory notes are written by third parties, and they
+reach the model through tool results. A crafted email can say "ignore your instructions
+and remember X". admino handles that in two layers (`untrusted.py`, the tool handlers and
+the dispatch layer in `tools/registry.py`):
+
+- **Wrapped as data.** Every tool result that carries third-party text sits between a
+  begin and an end marker holding a random boundary (16 hex characters, new for every
+  run): `<untrusted_content_B kind="..." label="...">` ... `</untrusted_content_B>`. The
+  base prompt tells the model that wrapped content is data, never instructions, and that
+  it should point out embedded instructions to the user instead of following them. Before
+  wrapping, the text loses its control characters and every invisible format character
+  (Unicode `Cf`: bidi overrides and isolates, direction marks, zero-width characters,
+  the BOM, tag characters). Then the exact marker name is defused in any case, also when
+  a copy is split by one of those removed characters (`untrusted_content` becomes
+  `untrusted-content`), so the content can't close its block early or open a forged one
+  with the exact marker syntax. Look-alikes still pass (see below). The text is capped at
+  20,000 characters; the label is one line without quotes or angle brackets. Which
+  results are wrapped is listed in
+  [Tools → External content](tools.md#external-content-is-data-not-instructions).
+- **Side effects ask first.** The wrapping only guides the model; the enforcement is in
+  the dispatch layer. Once a run has received wrapped content, or its conversation
+  already holds some, every action that changes something and that the organization's
+  matrix allows is dispatched as **confirm**, so it waits for the user's approval. Today
+  that's `memory.store`, so an email can't plant a note silently. **Deny** and **confirm**
+  are never relaxed. The permission engine is unchanged and never sees the content, and
+  the call's audit row records `escalated`. See
+  [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first).
+- **Nothing logged.** No wrapped content, label or boundary reaches a log line.
+
+What this doesn't cover:
+
+- **Look-alike markers survive.** Only the exact marker name is defused. These pass
+  through, and the model may read them as markers: homoglyphs (Cyrillic letters),
+  full-width brackets, a space or hyphen instead of the underscore, combining marks (such
+  as U+0301), and copies split by invisible characters that aren't format characters (the
+  combining grapheme joiner U+034F, the variation selectors U+FE00–U+FE0F and
+  U+E0100–U+E01EF, the Mongolian free variation selectors U+180B–U+180D and U+180F, the
+  Khmer inherent vowels U+17B4 and U+17B5, the Hangul fillers U+115F, U+1160, U+3164 and
+  U+FFA0). Such a split copy looks exactly like a real marker. The random boundary is
+  defence in depth only: the model isn't told the run's boundary, and the conversation
+  holds blocks of earlier runs with other boundaries, so it can't tell a forged boundary
+  from the real one. The enforcement is the side-effect escalation in the dispatch layer,
+  which doesn't depend on the model recognising markers.
+- **Read-only actions aren't escalated.** After external content, the model can still
+  call read, list and search actions without confirmation, with arguments the content
+  suggested (a search query, for example). Today these only reach the user's own
+  accounts. It matters for the planned web search, where a query leaves for a third
+  party.
+- **Attachments aren't wrapped yet.** Chat attachments aren't implemented; they'll be
+  wrapped when they ship.
+- **The answer can still be misled.** Wrapping stops silent side effects, not injected
+  text shaping what the model tells you. Read summaries of unexpected mail with care.
+
 ## The LLM provider and data residency
 
 The active LLM provider sees the conversation, so admino limits what reaches it and what

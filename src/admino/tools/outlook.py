@@ -7,8 +7,9 @@ calling user's own Microsoft account (per-user connections, GH-162).
 Inputs: the validated args (``OutlookReadArgs``, ``OutlookListArgs``,
 ``OutlookSearchArgs``, ``OutlookSendArgs``) and the required keyword
 ``tenant`` (the run's ``TenantContext``, passed by
-``registry.dispatch_tool_call``). Outputs: the formatted message(s), a send
-summary, or a user-facing error string.
+``registry.dispatch_tool_call``). Outputs: the formatted message(s), wrapped
+as untrusted email content (GH-243), a send summary, or a user-facing error
+string.
 
 Security notes:
 - Per-user tokens: every API request of a handler call carries the access
@@ -21,6 +22,12 @@ Security notes:
   by default and requires explicit user promotion + cooldown before use.
   outlook.delete remains a hardcoded immutable denial.
 - Message body content is truncated to 10 000 characters before returning.
+- Untrusted content (GH-243): every read/list/search success result is
+  third-party text and reaches the model only through ``untrusted.wrap``
+  (kind ``email``), so the agent escalates the run's later side effects to
+  confirmation. The read label names the validated ``message_id`` argument,
+  never its URL-encoded form. Error and "nothing found" strings, and the
+  send summary (the LLM's own arguments), stay unwrapped.
 - JSON payload structure of Microsoft Graph prevents header injection by design.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
@@ -34,7 +41,7 @@ from urllib.parse import quote
 
 import httpx
 
-from admino import database
+from admino import database, untrusted
 from admino.models import OutlookListArgs, OutlookReadArgs, OutlookSearchArgs, OutlookSendArgs
 from admino.oauth import OAuthError, access_tokens
 from admino.tools.registry import register_tool
@@ -141,6 +148,7 @@ def _format_message_summary(msg: dict[str, object]) -> str:
         "Read a single Outlook email message by ID. Returns subject, sender, date, and body."
     ),
     args_schema=OutlookReadArgs,
+    side_effect=False,
 )
 async def outlook_read(args: OutlookReadArgs, *, tenant: TenantContext, **_: object) -> str:
     """Read a single Outlook message by ID.
@@ -150,7 +158,8 @@ async def outlook_read(args: OutlookReadArgs, *, tenant: TenantContext, **_: obj
         tenant: The caller's tool context (whose mailbox is read).
 
     Returns:
-        Formatted message content, or an error string.
+        The formatted message content, wrapped as untrusted email content, or
+        an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -199,7 +208,11 @@ async def outlook_read(args: OutlookReadArgs, *, tenant: TenantContext, **_: obj
     if len(body_content) > _MAX_BODY_CHARS:
         body_content = body_content[:_MAX_BODY_CHARS] + "\n\n[Truncated]"
 
-    return f"Subject: {subject}\nFrom: {from_email}\nDate: {received}\nBody:\n{body_content}"
+    return untrusted.wrap(
+        "email",
+        f"outlook message {args.message_id}",
+        f"Subject: {subject}\nFrom: {from_email}\nDate: {received}\nBody:\n{body_content}",
+    )
 
 
 @register_tool(
@@ -207,6 +220,7 @@ async def outlook_read(args: OutlookReadArgs, *, tenant: TenantContext, **_: obj
     action="list",
     description="List recent Outlook email messages, ordered by date descending.",
     args_schema=OutlookListArgs,
+    side_effect=False,
 )
 async def outlook_list(args: OutlookListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List recent Outlook messages.
@@ -216,7 +230,8 @@ async def outlook_list(args: OutlookListArgs, *, tenant: TenantContext, **_: obj
         tenant: The caller's tool context (whose mailbox is read).
 
     Returns:
-        Formatted list of messages, or an error string.
+        The formatted list of messages, wrapped as untrusted email content,
+        "No messages found." or an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -259,7 +274,7 @@ async def outlook_list(args: OutlookListArgs, *, tenant: TenantContext, **_: obj
             parts.append(_format_message_summary(msg))
     if not parts:
         return "No messages found."
-    return "\n---\n".join(parts)
+    return untrusted.wrap("email", "outlook messages", "\n---\n".join(parts))
 
 
 @register_tool(
@@ -267,6 +282,7 @@ async def outlook_list(args: OutlookListArgs, *, tenant: TenantContext, **_: obj
     action="search",
     description="Search Outlook email messages using KQL query syntax.",
     args_schema=OutlookSearchArgs,
+    side_effect=False,
 )
 async def outlook_search(args: OutlookSearchArgs, *, tenant: TenantContext, **_: object) -> str:
     """Search Outlook messages using KQL.
@@ -276,7 +292,8 @@ async def outlook_search(args: OutlookSearchArgs, *, tenant: TenantContext, **_:
         tenant: The caller's tool context (whose mailbox is searched).
 
     Returns:
-        Formatted list of matching messages, or an error string.
+        The formatted list of matching messages, wrapped as untrusted email
+        content, a "nothing found" message or an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -324,7 +341,7 @@ async def outlook_search(args: OutlookSearchArgs, *, tenant: TenantContext, **_:
             parts.append(_format_message_summary(msg))
     if not parts:
         return "No messages found matching the search query."
-    return "\n---\n".join(parts)
+    return untrusted.wrap("email", "outlook search results", "\n---\n".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +405,7 @@ def _outlook_send_summary(args: OutlookSendArgs) -> str:
         "deny to confirm via Critical Permissions. Returns a confirmation summary."
     ),
     args_schema=OutlookSendArgs,
+    side_effect=True,
 )
 async def outlook_send(args: OutlookSendArgs, *, tenant: TenantContext, **_: object) -> str:
     """Send an email via the Microsoft Graph ``sendMail`` endpoint.

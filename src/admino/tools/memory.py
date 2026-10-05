@@ -8,8 +8,9 @@ each naming the user's org.
 Inputs: the validated args (``MemoryStoreArgs``, ``MemoryRecallArgs``,
 ``MemoryListArgs``) and the required keyword ``tenant`` (the run's
 ``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: a
-confirmation ("Stored memory: <key>"), the stored value or "No memory found
-for key: <key>", the newline-joined sorted keys or "No memories stored.".
+confirmation ("Stored memory: <key>"), the stored value wrapped as untrusted
+memory content or "No memory found for key: <key>", the newline-joined sorted
+keys wrapped as untrusted memory content or "No memories stored.".
 
 Security notes:
 - Tenant isolation: every statement binds the tenant's user_id AND org_id,
@@ -18,6 +19,12 @@ Security notes:
 - All SQL uses parameterized queries ($1, $2, ...). No string interpolation.
 - No DELETE capability. memory.delete is a hardcoded deny in permissions.py.
 - No content in logs: keys and values are never logged.
+- Untrusted content (GH-243): a note may have been planted by an earlier
+  email ("remember ..."), so a recalled value and the key list reach the
+  model only through ``untrusted.wrap`` (kind ``memory``), and the agent
+  escalates the run's later side effects to confirmation. The store
+  confirmation and the not-found messages carry no stored text and stay
+  unwrapped.
 - Does not import from agent.py, llm.py, or server.py.
 """
 
@@ -25,6 +32,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Final
 
+from admino import untrusted
 from admino.database import get_pool
 from admino.models import MemoryListArgs, MemoryRecallArgs, MemoryStoreArgs
 from admino.tools.registry import register_tool
@@ -50,6 +58,7 @@ _LIST_SQL: Final = "SELECT key FROM memory WHERE user_id = $1 AND org_id = $2 OR
     action="store",
     description="Store a key-value note in persistent memory. Updates existing key if present.",
     args_schema=MemoryStoreArgs,
+    side_effect=True,
 )
 async def memory_store(args: MemoryStoreArgs, *, tenant: TenantContext, **_: object) -> str:
     """Upsert one of the caller's notes.
@@ -73,6 +82,7 @@ async def memory_store(args: MemoryStoreArgs, *, tenant: TenantContext, **_: obj
     action="recall",
     description="Recall a value from persistent memory by key.",
     args_schema=MemoryRecallArgs,
+    side_effect=False,
 )
 async def memory_recall(args: MemoryRecallArgs, *, tenant: TenantContext, **_: object) -> str:
     """Retrieve one of the caller's notes by key.
@@ -82,12 +92,13 @@ async def memory_recall(args: MemoryRecallArgs, *, tenant: TenantContext, **_: o
         tenant: The caller's tool context.
 
     Returns:
-        The stored value, or a not-found message.
+        The stored value, wrapped as untrusted memory content, or a not-found
+        message.
     """
     row = await get_pool().fetchrow(_RECALL_SQL, tenant.user_id, tenant.org_id, args.key)
     if row is None:
         return f"No memory found for key: {args.key}"
-    return str(row["value"])
+    return untrusted.wrap("memory", f"memory note {args.key}", str(row["value"]))
 
 
 @register_tool(
@@ -95,6 +106,7 @@ async def memory_recall(args: MemoryRecallArgs, *, tenant: TenantContext, **_: o
     action="list",
     description="List all keys stored in persistent memory.",
     args_schema=MemoryListArgs,
+    side_effect=False,
 )
 async def memory_list(args: MemoryListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List the keys of the caller's notes.
@@ -104,10 +116,10 @@ async def memory_list(args: MemoryListArgs, *, tenant: TenantContext, **_: objec
         tenant: The caller's tool context.
 
     Returns:
-        A newline-separated, sorted list of keys, or a message if the caller
-        has no notes.
+        A newline-separated, sorted list of keys, wrapped as untrusted memory
+        content, or a message if the caller has no notes.
     """
     rows = await get_pool().fetch(_LIST_SQL, tenant.user_id, tenant.org_id)
     if not rows:
         return "No memories stored."
-    return "\n".join(str(row["key"]) for row in rows)
+    return untrusted.wrap("memory", "memory keys", "\n".join(str(row["key"]) for row in rows))

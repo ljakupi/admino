@@ -12,7 +12,8 @@ until then, dispatch rejects the call as an unknown tool.
 Inputs: the validated args (``OneDriveReadArgs``, ``OneDriveListArgs``,
 ``OneDriveSearchArgs``) and the required keyword ``tenant`` (the run's
 ``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
-formatted item metadata or listing, or a user-facing error string.
+formatted item metadata or listing, wrapped as untrusted file content
+(GH-243), or a user-facing error string.
 
 Security notes:
 - Per-user tokens: every API request of a handler call carries the access
@@ -23,6 +24,12 @@ Security notes:
   never leave oauth.py, and no token is logged.
 - No delete capability. onedrive.delete is a hardcoded denial in permissions.py.
 - Read-only: no action writes to the local filesystem or to OneDrive.
+- Untrusted content (GH-243): item names and metadata are third-party text,
+  so every read/list/search success result reaches the model only through
+  ``untrusted.wrap`` (kind ``file``), and the agent escalates the run's later
+  side effects to confirmation. The read label names the validated
+  ``item_id`` argument, never its URL-encoded form. Error, rejected-path and
+  "nothing found" strings stay unwrapped.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -35,7 +42,7 @@ from urllib.parse import quote
 
 import httpx
 
-from admino import database
+from admino import database, untrusted
 from admino.models import (
     OneDriveListArgs,
     OneDriveReadArgs,
@@ -153,6 +160,7 @@ def _human_readable_size(size_bytes: int) -> str:
     action="read",
     description="Read OneDrive file or folder metadata by item ID.",
     args_schema=OneDriveReadArgs,
+    side_effect=False,
 )
 async def onedrive_read(args: OneDriveReadArgs, *, tenant: TenantContext, **_: object) -> str:
     """Read metadata for a OneDrive item by ID.
@@ -162,7 +170,8 @@ async def onedrive_read(args: OneDriveReadArgs, *, tenant: TenantContext, **_: o
         tenant: The caller's tool context (whose OneDrive is read).
 
     Returns:
-        Formatted item metadata, or an error string.
+        The formatted item metadata, wrapped as untrusted file content, or an
+        error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -199,13 +208,15 @@ async def onedrive_read(args: OneDriveReadArgs, *, tenant: TenantContext, **_: o
     size = item.get("size", 0)
     size_str = _human_readable_size(int(size)) if isinstance(size, int | float) else "unknown"
 
-    return (
+    return untrusted.wrap(
+        "file",
+        f"onedrive item {args.item_id}",
         f"Name: {item.get('name', '(unnamed)')}\n"
         f"Type: {item_type}\n"
         f"Size: {size_str}\n"
         f"Created: {item.get('createdDateTime', 'unknown')}\n"
         f"Modified: {item.get('lastModifiedDateTime', 'unknown')}\n"
-        f"Web URL: {item.get('webUrl', '')}"
+        f"Web URL: {item.get('webUrl', '')}",
     )
 
 
@@ -214,6 +225,7 @@ async def onedrive_read(args: OneDriveReadArgs, *, tenant: TenantContext, **_: o
     action="list",
     description="List items in a OneDrive folder. Lists root if no folder path is given.",
     args_schema=OneDriveListArgs,
+    side_effect=False,
 )
 async def onedrive_list(args: OneDriveListArgs, *, tenant: TenantContext, **_: object) -> str:
     """List items in a OneDrive folder.
@@ -223,7 +235,8 @@ async def onedrive_list(args: OneDriveListArgs, *, tenant: TenantContext, **_: o
         tenant: The caller's tool context (whose OneDrive is listed).
 
     Returns:
-        Formatted list of items, or an error string.
+        The formatted list of items, wrapped as untrusted file content, a
+        "nothing found" message or an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -275,7 +288,7 @@ async def onedrive_list(args: OneDriveListArgs, *, tenant: TenantContext, **_: o
             parts.append(_format_item_summary(item))
     if not parts:
         return "No items found in this folder."
-    return "\n---\n".join(parts)
+    return untrusted.wrap("file", "onedrive items", "\n---\n".join(parts))
 
 
 @register_tool(
@@ -283,6 +296,7 @@ async def onedrive_list(args: OneDriveListArgs, *, tenant: TenantContext, **_: o
     action="search",
     description="Search for files in OneDrive by query string.",
     args_schema=OneDriveSearchArgs,
+    side_effect=False,
 )
 async def onedrive_search(args: OneDriveSearchArgs, *, tenant: TenantContext, **_: object) -> str:
     """Search for files in OneDrive.
@@ -292,7 +306,8 @@ async def onedrive_search(args: OneDriveSearchArgs, *, tenant: TenantContext, **
         tenant: The caller's tool context (whose OneDrive is searched).
 
     Returns:
-        Formatted list of matching items, or an error string.
+        The formatted list of matching items, wrapped as untrusted file
+        content, a "nothing found" message or an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -337,4 +352,4 @@ async def onedrive_search(args: OneDriveSearchArgs, *, tenant: TenantContext, **
             parts.append(_format_item_summary(item))
     if not parts:
         return "No files found matching the search query."
-    return "\n---\n".join(parts)
+    return untrusted.wrap("file", "onedrive search results", "\n---\n".join(parts))

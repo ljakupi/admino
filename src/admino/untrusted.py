@@ -1,0 +1,168 @@
+"""Untrusted-content boundary: third-party text in tool results is wrapped as data (GH-243).
+
+Tool results carry third-party content (emails, files, calendar events,
+recalled memory notes). Before such text reaches the model it is wrapped
+between a begin and an end marker that carry a random boundary::
+
+    <untrusted_content_{B} kind="{kind}" label="{label}">
+    {text}
+    </untrusted_content_{B}>
+
+The base prompt (``prompt_assembly``) tells the model that wrapped content is
+data, never instructions; the agent uses ``contains_wrapped`` to notice that a
+run has received such content and then escalates its side-effecting actions to
+confirmation (``tools.registry.dispatch_tool_call``).
+
+Inputs: a kind (one of ``UNTRUSTED_KINDS``), a short label (e.g. ``gmail
+message 18c2f``) and the formatted tool output.
+Outputs: the wrapped string (``wrap``), whether a text holds a begin marker
+(``contains_wrapped``), and the run's boundary (``run_boundary``).
+
+The boundary ``B`` is 16 lowercase hex characters from ``secrets``. Inside a
+``run_boundary()`` block every ``wrap`` uses the block's boundary (one per
+agent run, kept in a ``ContextVar`` so concurrent runs never share one);
+outside any block each ``wrap`` draws a fresh one.
+
+Security notes:
+- Pure: standard library only, nothing from ``admino``, no logging, no I/O,
+  no clock or environment read. Content, labels and boundaries never reach a
+  log line from here.
+- The text is sanitized before it is wrapped: line breaks become ``"\\n"``;
+  control characters but tab and newline, every invisible format character
+  (Unicode ``Cf``: bidi overrides and isolates, direction marks, zero-width
+  characters, BOM, tag characters) and lone surrogates are removed; then
+  every case-insensitive ``untrusted_content`` becomes ``untrusted-content``.
+  So the exact marker name doesn't survive inside the text, also when a copy
+  is split by one of the removed characters, as those go first. The text is
+  capped at ``MAX_CHARS`` characters, the label at ``MAX_LABEL_CHARS`` on one
+  line without quotes or angle brackets, so it can't leave its attribute.
+- Limits: look-alike markers survive sanitization. These are homoglyphs
+  (such as Cyrillic letters), a space or hyphen for the underscore,
+  full-width brackets, combining marks (such as U+0301) and copies split by
+  invisible characters that aren't format characters: the combining grapheme
+  joiner U+034F, the variation selectors U+FE00-U+FE0F and U+E0100-U+E01EF,
+  the Mongolian free variation selectors U+180B-U+180D and U+180F, the Khmer
+  inherent vowels U+17B4 and U+17B5, and the Hangul fillers U+115F, U+1160,
+  U+3164 and U+FFA0. The model may read them as markers. The random boundary
+  is defence in depth only: the model isn't told the run's boundary, and the
+  history holds blocks of earlier runs with other boundaries, so it can't
+  tell a forged boundary from the real one. The wrapping is guidance to the
+  model only. The enforcement is the dispatch escalation, which doesn't
+  depend on the model recognising markers: once a run has received wrapped
+  content, every side-effecting ``allow`` action needs the user's
+  confirmation.
+"""
+
+from __future__ import annotations
+
+import re
+import secrets
+import unicodedata
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING, Final, Literal, get_args
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+UntrustedKind = Literal["email", "file", "event", "memory", "attachment", "web"]
+UNTRUSTED_KINDS: Final[frozenset[str]] = frozenset(get_args(UntrustedKind))
+MAX_CHARS: Final[int] = 20_000
+MAX_LABEL_CHARS: Final[int] = 100
+TRUNCATION_MARKER: Final[str] = "[truncated]"
+
+# None: no run is open, so each wrap draws a fresh boundary.
+_RUN_BOUNDARY: Final[ContextVar[str | None]] = ContextVar("untrusted_run_boundary", default=None)
+
+_LINE_BREAK_RE: Final = re.compile("\r\n?|[\u2028\u2029]")
+_KEPT_CONTROLS: Final = frozenset("\n\t")
+_REMOVED_CATEGORIES: Final = frozenset({"Cf", "Cs"})
+# One pass is enough: the replacement can't combine with its neighbours into a
+# new occurrence, as no suffix of the token is a prefix of the replacement or
+# the other way round.
+_MARKER_NAME_RE: Final = re.compile("untrusted_content", re.IGNORECASE)
+_DEFANGED_MARKER_NAME: Final = "untrusted-content"
+_WHITESPACE_RE: Final = re.compile(r"\s+")
+_LABEL_REMOVED_RE: Final = re.compile('["<>]')
+_BEGIN_MARKER_RE: Final = re.compile(r'<untrusted_content_[0-9a-f]{16} kind="')
+
+
+@contextmanager
+def run_boundary() -> Iterator[str]:
+    """Open a run: every ``wrap`` inside the block uses one fresh boundary.
+
+    The previous boundary (or none) comes back when the block ends, also on
+    an exception and for nested blocks.
+
+    Yields:
+        The run's boundary, 16 lowercase hex characters.
+    """
+    boundary = secrets.token_hex(8)
+    token = _RUN_BOUNDARY.set(boundary)
+    try:
+        yield boundary
+    finally:
+        _RUN_BOUNDARY.reset(token)
+
+
+def _sanitize(text: str) -> str:
+    """Normalise line breaks, drop unsafe characters and neutralize the marker token."""
+    text = _LINE_BREAK_RE.sub("\n", text)
+    text = "".join(
+        char
+        for char in text
+        if (category := unicodedata.category(char)) not in _REMOVED_CATEGORIES
+        and (category != "Cc" or char in _KEPT_CONTROLS)
+    )
+    return _MARKER_NAME_RE.sub(_DEFANGED_MARKER_NAME, text)
+
+
+def _sanitize_label(label: str) -> str:
+    """One stripped line without quotes or angle brackets, capped; ``-`` when empty."""
+    label = _WHITESPACE_RE.sub(" ", _sanitize(label))
+    label = _LABEL_REMOVED_RE.sub("", label).strip()[:MAX_LABEL_CHARS]
+    return label or "-"
+
+
+def wrap(kind: UntrustedKind, label: str, text: str) -> str:
+    """Return ``text`` sanitized and wrapped between the run's begin and end markers.
+
+    Args:
+        kind: What the content is (one of ``UNTRUSTED_KINDS``).
+        label: A short description such as ``gmail message 18c2f``; sanitized
+            to one line of at most ``MAX_LABEL_CHARS`` characters.
+        text: The third-party content; sanitized and capped at ``MAX_CHARS``
+            characters (then ``"\\n[truncated]"`` follows).
+
+    Returns:
+        The begin marker, a newline, the sanitized text, a newline and the
+        end marker.
+
+    Raises:
+        ValueError: ``kind`` is not a known kind (the value is not echoed).
+    """
+    if kind not in UNTRUSTED_KINDS:
+        msg = "Unknown untrusted content kind."
+        raise ValueError(msg)
+    boundary = _RUN_BOUNDARY.get() or secrets.token_hex(8)
+    body = _sanitize(text)
+    if len(body) > MAX_CHARS:
+        body = f"{body[:MAX_CHARS]}\n{TRUNCATION_MARKER}"
+    return (
+        f'<untrusted_content_{boundary} kind="{kind}" label="{_sanitize_label(label)}">\n'
+        f"{body}\n</untrusted_content_{boundary}>"
+    )
+
+
+def contains_wrapped(text: str) -> bool:
+    """Return whether ``text`` holds a begin marker of any boundary.
+
+    The end marker is not required, so a cut-off wrap still counts.
+
+    Args:
+        text: A tool result or a history message's content.
+
+    Returns:
+        True when a begin marker is present.
+    """
+    return _BEGIN_MARKER_RE.search(text) is not None

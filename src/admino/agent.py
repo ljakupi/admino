@@ -46,8 +46,20 @@ Security notes:
 - The recorder is the tool-call audit sink. It receives only the run's
   principal (the logged-in user, which the agent passes through unread), the
   session id, the tool/action names the LLM asked for, the final permission
-  decision, the success flag and the dispatch duration — never argument
-  values, tool output or error text. Conversation content is not audited.
+  decision, the success flag, the dispatch duration and whether the dispatch
+  was escalated — never argument values, tool output or error text.
+  Conversation content is not audited.
+- Untrusted content (GH-243): the whole run executes inside
+  ``untrusted.run_boundary()``, so the tool handlers wrap third-party content
+  (emails, files, events, memory notes) with the run's random boundary. The
+  run counts as having received external content once its history (the
+  whole of it, not just the LLM's context window; this covers a resumed
+  confirmation and later turns) holds a wrapped ``tool`` message, or a
+  dispatch returns a wrapped result. From then on every dispatch, the resume
+  pre-dispatch included, passes ``escalate_side_effects=True`` and the
+  registry turns an allowed side effect into ``confirm``. The flag only
+  tightens a decision and never reaches the permission engine. No content,
+  label or boundary is logged.
 - A run is never anonymous: ``run`` takes the caller's ``principal`` as a
   required keyword (GH-149); the agent makes no access decision with it.
 - Tool context (GH-162): each run derives its ``TenantContext`` once from
@@ -111,7 +123,7 @@ from functools import partial
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
-from admino import llm_policy, prompt_assembly
+from admino import llm_policy, prompt_assembly, untrusted
 from admino.llm import LLMError
 from admino.models import (
     AgentConfig,
@@ -185,6 +197,7 @@ class ToolCallRecorder(Protocol):
         decision: PermissionState,
         success: bool,
         duration_ms: int,
+        escalated: bool,
     ) -> None:
         """Record one dispatch outcome.
 
@@ -196,6 +209,8 @@ class ToolCallRecorder(Protocol):
             decision: The dispatch's final permission decision.
             success: Whether the tool ran and returned a result.
             duration_ms: Wall-clock duration of the dispatch, milliseconds.
+            escalated: Whether dispatch tightened an ``allow`` to ``confirm``
+                because the run holds external content (GH-243).
         """
 
 
@@ -309,6 +324,37 @@ class Agent:
             message), a summary of tool calls made during the run and, for a
             coded LLM failure, its ``error_code``.
         """
+        # GH-243: one random boundary for the whole run, so every tool result
+        # this run wraps carries the same markers and no content can guess them.
+        with untrusted.run_boundary():
+            return await self._run_in_boundary(
+                user_message,
+                session_id,
+                history=history,
+                principal=principal,
+                tool_policy=tool_policy,
+                pending_confirmation=pending_confirmation,
+                agent_config=agent_config,
+                prompt_context=prompt_context,
+            )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _run_in_boundary(
+        self,
+        user_message: str,
+        session_id: str,
+        *,
+        history: list[LLMMessage],
+        principal: Principal,
+        tool_policy: ToolPolicy,
+        pending_confirmation: PendingConfirmation | None,
+        agent_config: AgentConfig | None,
+        prompt_context: PromptContext | None,
+    ) -> AgentResult:
+        """Run the agent loop inside the run's untrusted-content boundary (see ``run``)."""
         config = self._config if agent_config is None else agent_config
         # GH-162: the run's tool context, derived once from the principal (never
         # from LLM output or history). A principal without an org (a Super
@@ -323,6 +369,11 @@ class Agent:
         # call, so the returned history never carries it and it cannot pile
         # up when the caller feeds the history back (GH-140).
         working_history: list[LLMMessage] = _drop_system_messages(history)
+        # GH-243: once the run holds external content (a wrapped tool result,
+        # here or in an earlier turn of the conversation, e.g. the run that
+        # asked for the confirmation being resumed), every side effect the
+        # policy allows needs the user's confirmation for the rest of the run.
+        received_untrusted = _holds_untrusted_content(working_history)
         # Index of this turn's user message, pinned into every context window.
         # On resume there is no new user message, so the request being resumed
         # (the most recent user message) is pinned instead. None only when the
@@ -412,12 +463,15 @@ class Agent:
                 session_id=session_id,
                 working_history=working_history,
                 tool_records=tool_records,
+                escalate_side_effects=received_untrusted,
             )
             if pre_result is not None:
                 # H-1: the resumed dispatch could not be recorded —
                 # ``_resume_pending_dispatch`` has already logged and built the
                 # terminal error. Return it before any LLM call.
                 return pre_result
+            # The resumed call's result is now the last history message.
+            received_untrusted = _holds_untrusted_content(working_history)
             tool_calls_used += 1
             carry_confirmation = None  # consumed on pre-dispatch
 
@@ -528,6 +582,7 @@ class Agent:
                     tool_policy=tool_policy,
                     session_id=session_id,
                     pending_confirmation=carry_confirmation,
+                    escalate_side_effects=received_untrusted,
                 )
                 if dispatched is None:
                     # H-1: the dispatch could not be recorded — abort before
@@ -535,6 +590,9 @@ class Agent:
                     return _audit_unavailable(working_history, tool_records)
                 result, dispatch_duration_ms = dispatched
                 carry_confirmation = None  # consumed on the first dispatch
+                # GH-243: from here on, later calls (this batch's included)
+                # are escalated once a result carried external content.
+                received_untrusted = received_untrusted or untrusted.contains_wrapped(result.result)
                 # M-4 design note: EVERY dispatch (including denied and
                 # validation-failed calls) counts against the cap.  This is
                 # intentional — it prevents the LLM from cheaply probing
@@ -609,10 +667,6 @@ class Agent:
             tool_records=tool_records,
         )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     async def _dispatch_one(
         self,
         *,
@@ -622,18 +676,21 @@ class Agent:
         tool_policy: ToolPolicy,
         session_id: str,
         pending_confirmation: PendingConfirmation | None,
+        escalate_side_effects: bool,
     ) -> tuple[ToolCallResult, int] | None:
         """Dispatch a single tool call via the registry, then record it.
 
         The dispatch is decided by the run's ``tool_policy`` (permissions,
-        promoted pairs, enabled services), and the handler gets the run's
+        promoted pairs, enabled services) and ``escalate_side_effects`` (the
+        run holds external content, GH-243: the registry then turns an
+        allowed side effect into ``confirm``), and the handler gets the run's
         ``tenant`` (GH-162). Without a tool context nothing is dispatched: the
         outcome is a fixed "No organization context." deny. The one place
         that times a dispatch and awaits the recorder, so no call site can
         dispatch without recording. The recorder gets the run's
         principal, the raw tool/action names the LLM asked for, the final
-        decision, the success flag and the duration — never arguments, output
-        or error text.
+        decision, the success flag, the duration and the escalated flag —
+        never arguments, output or error text.
 
         Returns:
             ``(result, duration_ms)`` once the outcome is recorded, or
@@ -657,6 +714,7 @@ class Agent:
                 pending_confirmation=pending_confirmation,
                 promoted=tool_policy.promoted,
                 enabled_tools=tool_policy.enabled_tools or None,
+                escalate_side_effects=escalate_side_effects,
             )
         duration_ms = int((time.monotonic() - start) * 1000)
         try:
@@ -668,6 +726,7 @@ class Agent:
                 decision=result.permission.allowed,
                 success=result.success,
                 duration_ms=duration_ms,
+                escalated=result.escalated,
             )
         except (MemoryError, RecursionError):
             raise
@@ -686,14 +745,17 @@ class Agent:
         session_id: str,
         working_history: list[LLMMessage],
         tool_records: list[ToolCallRecord],
+        escalate_side_effects: bool,
     ) -> AgentResult | None:
         """Resume an approved pending confirmation by dispatching the tool call.
 
         Called once at the top of ``run()`` when resuming. Dispatches the
         tool call stored inside ``pending_confirmation`` through the registry
         (which verifies tool/action/args identity and expiry one more time),
-        appends the resulting ``tool_result`` to ``working_history``, and
-        records the call in ``tool_records``.
+        with the run's ``escalate_side_effects`` (GH-243: an escalated call
+        stays an escalated ``confirm``), appends the resulting
+        ``tool_result`` to ``working_history``, and records the call in
+        ``tool_records``.
 
         Returns ``None`` on success, or a terminal ``AgentResult`` if the
         dispatch could not be recorded (H-1) — in which case the caller must
@@ -710,6 +772,7 @@ class Agent:
             tool_policy=tool_policy,
             session_id=session_id,
             pending_confirmation=pending_confirmation,
+            escalate_side_effects=escalate_side_effects,
         )
         if dispatched is None:
             return _audit_unavailable(working_history, tool_records)
@@ -798,6 +861,18 @@ def _drop_system_messages(history: list[LLMMessage]) -> list[LLMMessage]:
     if dropped:
         logger.warning("Dropped %d system-role message(s) from caller-supplied history", dropped)
     return kept
+
+
+def _holds_untrusted_content(history: list[LLMMessage]) -> bool:
+    """Return whether a ``tool``-role message of ``history`` holds wrapped external content.
+
+    The whole history counts, not only the window the LLM is sent: content
+    that has scrolled out of the context may still have shaped the turn.
+    """
+    return any(
+        message.role == "tool" and untrusted.contains_wrapped(message.content)
+        for message in history
+    )
 
 
 def _context_window(

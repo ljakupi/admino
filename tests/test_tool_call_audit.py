@@ -8,15 +8,16 @@ mocked. What these tests pin down:
   through one parameterized INSERT: action ``tool.call``, actor kind ``member``
   with the member's ``actor_user_id``, the member's ``org_id``, the session's
   chat as target, and metadata with exactly ``tool, action, decision, success,
-  duration_ms``. The tool's argument values and its output appear in no bind
-  parameter.
+  duration_ms, escalated`` (GH-243 added ``escalated``). The tool's argument values
+  and its output appear in no bind parameter.
 - GH-149 retires #147's default-org bridge: the default org's id
   (``00000000-0000-4000-8000-000000000001``; GH-154 removed the constant) appears
   in no bind parameter, and a principal without an organization (a Super Admin)
   can't write a tool.call row, so the run aborts (H-1) and nothing is written.
 - ``Agent.run`` takes the caller's ``principal`` as a required keyword and the
-  agent passes it to the recorder with the six content-free fields. GH-161: every
-  run also passes its org's ``tool_policy`` (the agent holds no permissions).
+  agent passes it to the recorder with the seven content-free fields (GH-243 added
+  ``escalated``). GH-161: every run also passes its org's ``tool_policy`` (the
+  agent holds no permissions).
 - A turn without a tool call writes nothing (conversation entries are gone).
 - GH-162: the member's run reaches the tool handler with the member's own
   ``TenantContext`` (``tenant=``); a Super Admin's run (no organization, so no
@@ -232,13 +233,20 @@ class TestToolCallWritesOneRow:
             assert str(_DEFAULT_ORG_ID) not in " ".join(str(value) for value in call.args)
 
     @pytest.mark.asyncio
-    async def test_metadata_holds_exactly_the_five_decision_fields(self, pool: MagicMock) -> None:
+    async def test_metadata_holds_exactly_the_six_decision_fields(self, pool: MagicMock) -> None:
         await _agent(_tool_then_text()).run(
             "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
 
         metadata = json.loads(pool.execute.await_args.args[-1])
-        assert set(metadata) == {"tool", "action", "decision", "success", "duration_ms"}
+        assert set(metadata) == {
+            "tool",
+            "action",
+            "decision",
+            "success",
+            "duration_ms",
+            "escalated",
+        }
         assert metadata["tool"] == "memory"
         assert metadata["action"] == "read"
         assert metadata["decision"] == "allow"
@@ -298,9 +306,9 @@ class TestPrincipalReachesTheRecorder:
         assert parameter.default is inspect.Parameter.empty
 
     @pytest.mark.asyncio
-    async def test_recorder_gets_the_principal_and_six_content_free_fields(self) -> None:
-        """The agent awaits the recorder with exactly seven keywords: the principal plus
-        session_id, tool, action, decision, success and duration_ms."""
+    async def test_recorder_gets_the_principal_and_seven_content_free_fields(self) -> None:
+        """The agent awaits the recorder with exactly eight keywords: the principal plus
+        session_id, tool, action, decision, success, duration_ms and escalated (GH-243)."""
         recorder = AsyncMock()
 
         await _agent(_tool_then_text(), recorder).run(
@@ -318,6 +326,7 @@ class TestPrincipalReachesTheRecorder:
             "decision",
             "success",
             "duration_ms",
+            "escalated",
         }
         assert kwargs["principal"] is _MEMBER
         assert (kwargs["session_id"], kwargs["tool"], kwargs["action"]) == (

@@ -8,7 +8,8 @@ Inputs: the validated args (``GoogleCalendarReadArgs``,
 ``GoogleCalendarListArgs``, ``GoogleCalendarCreateArgs``,
 ``GoogleCalendarUpdateArgs``) and the required keyword ``tenant`` (the run's
 ``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
-formatted event(s), a confirmation, or a user-facing error string.
+formatted event(s) and the update confirmation, wrapped as untrusted event
+content (GH-243), the create confirmation, or a user-facing error string.
 
 Security notes:
 - Per-user tokens: every API request of a handler call carries the access
@@ -23,6 +24,14 @@ Security notes:
   via the Critical Permissions UI. event_id and attendee addresses are validated
   in models.py to prevent path traversal and injection.
 - google_calendar.create requires user confirmation via the permission engine.
+- Untrusted content (GH-243): event titles, locations and descriptions are
+  third-party text, so every read/list success result and the update result
+  (it returns the existing event's title) reach the model only through
+  ``untrusted.wrap`` (kind ``event``), and the agent escalates the run's
+  later side effects to confirmation. Labels name the validated ``event_id``
+  argument, never the ID of the API's response. The create confirmation
+  (the LLM's own arguments), error, parse-failure and "nothing found" strings
+  stay unwrapped.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -34,7 +43,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from admino import database
+from admino import database, untrusted
 from admino.models import (
     GoogleCalendarCreateArgs,
     GoogleCalendarListArgs,
@@ -187,6 +196,7 @@ def _format_event(event: dict[str, object]) -> str:
         "Returns summary, times, description, location, and attendees."
     ),
     args_schema=GoogleCalendarReadArgs,
+    side_effect=False,
 )
 async def google_calendar_read(
     args: GoogleCalendarReadArgs, *, tenant: TenantContext, **_: object
@@ -198,7 +208,8 @@ async def google_calendar_read(
         tenant: The caller's tool context (whose calendar is read).
 
     Returns:
-        Formatted event details string.
+        The formatted event details, wrapped as untrusted event content, or an
+        error string.
     """
     try:
         token = await _get_google_token(tenant)
@@ -237,7 +248,7 @@ async def google_calendar_read(
     if html_link:
         result += f"\nLink: {html_link}"
 
-    return result
+    return untrusted.wrap("event", f"google calendar event {args.event_id}", result)
 
 
 @register_tool(
@@ -247,6 +258,7 @@ async def google_calendar_read(
         "List calendar events in a time range. Returns summary, start, and end for each event."
     ),
     args_schema=GoogleCalendarListArgs,
+    side_effect=False,
 )
 async def google_calendar_list(
     args: GoogleCalendarListArgs, *, tenant: TenantContext, **_: object
@@ -258,7 +270,8 @@ async def google_calendar_list(
         tenant: The caller's tool context (whose calendar is read).
 
     Returns:
-        Formatted list of events.
+        The formatted list of events, wrapped as untrusted event content, a
+        "nothing found" message or an error string.
     """
     params = {
         "timeMin": args.time_min.isoformat(),
@@ -297,7 +310,7 @@ async def google_calendar_list(
         lines.append(_format_event(event))
         lines.append("")  # blank line separator
 
-    return "\n".join(lines).rstrip()
+    return untrusted.wrap("event", "google calendar events", "\n".join(lines).rstrip())
 
 
 @register_tool(
@@ -305,6 +318,7 @@ async def google_calendar_list(
     action="create",
     description="Create a new calendar event. Returns the event ID and link on success.",
     args_schema=GoogleCalendarCreateArgs,
+    side_effect=True,
 )
 async def google_calendar_create(
     args: GoogleCalendarCreateArgs, *, tenant: TenantContext, **_: object
@@ -368,6 +382,7 @@ async def google_calendar_create(
         "changed (partial update). Requires user confirmation."
     ),
     args_schema=GoogleCalendarUpdateArgs,
+    side_effect=True,
 )
 async def google_calendar_update(
     args: GoogleCalendarUpdateArgs, *, tenant: TenantContext, **_: object
@@ -379,7 +394,9 @@ async def google_calendar_update(
         tenant: The caller's tool context (whose calendar is updated).
 
     Returns:
-        Confirmation message with the updated event summary, or an error string.
+        Confirmation message with the updated event summary, wrapped as
+        untrusted event content (the summary is the event's existing title
+        unless the update set it), or an error string.
     """
     event_body: dict[str, object] = {}
     if args.summary is not None:
@@ -428,4 +445,4 @@ async def google_calendar_update(
     if html_link:
         result += f"\nLink: {html_link}"
 
-    return result
+    return untrusted.wrap("event", f"google calendar event {args.event_id}", result)

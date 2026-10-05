@@ -8,7 +8,8 @@ Inputs: the validated args (``OutlookCalendarReadArgs``,
 ``OutlookCalendarListArgs``, ``OutlookCalendarCreateArgs``,
 ``OutlookCalendarUpdateArgs``) and the required keyword ``tenant`` (the run's
 ``TenantContext``, passed by ``registry.dispatch_tool_call``). Outputs: the
-formatted event(s), a confirmation, or a user-facing error string.
+formatted event(s) and the update confirmation, wrapped as untrusted event
+content (GH-243), the create confirmation, or a user-facing error string.
 
 Security notes:
 - Per-user tokens: every API request of a handler call carries the access
@@ -23,6 +24,14 @@ Security notes:
   Critical Permissions UI. event_id and attendee addresses are validated in
   models.py to prevent path traversal and injection.
 - Event body content is truncated to 10 000 characters before returning.
+- Untrusted content (GH-243): event subjects, locations and bodies are
+  third-party text, so every read/list success result and the update result
+  (it returns the existing event's subject) reach the model only through
+  ``untrusted.wrap`` (kind ``event``), and the agent escalates the run's
+  later side effects to confirmation. Labels name the validated ``event_id``
+  argument, never its URL-encoded form or the ID of the API's response. The
+  create confirmation (the LLM's own arguments), error, parse-failure and
+  "nothing found" strings stay unwrapped.
 - No eval, exec, shell=True, or importlib.
 - Does not import from agent.py, llm.py, or server.py.
 """
@@ -35,7 +44,7 @@ from urllib.parse import quote
 
 import httpx
 
-from admino import database
+from admino import database, untrusted
 from admino.models import (
     OutlookCalendarCreateArgs,
     OutlookCalendarListArgs,
@@ -159,6 +168,7 @@ def _format_event_summary(event: dict[str, object]) -> str:
         "Returns subject, times, body, location, and attendees."
     ),
     args_schema=OutlookCalendarReadArgs,
+    side_effect=False,
 )
 async def outlook_calendar_read(
     args: OutlookCalendarReadArgs, *, tenant: TenantContext, **_: object
@@ -170,7 +180,8 @@ async def outlook_calendar_read(
         tenant: The caller's tool context (whose calendar is read).
 
     Returns:
-        Formatted event details, or an error string.
+        The formatted event details, wrapped as untrusted event content, or
+        an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -243,14 +254,16 @@ async def outlook_calendar_read(
 
     attendees_str = ", ".join(attendee_list) if attendee_list else "none"
 
-    return (
+    return untrusted.wrap(
+        "event",
+        f"outlook calendar event {args.event_id}",
         f"Subject: {subject}\n"
         f"Start: {start_str}\n"
         f"End: {end_str}\n"
         f"Location: {location_str}\n"
         f"Attendees: {attendees_str}\n"
         f"Web link: {web_link}\n"
-        f"Body:\n{body_content}"
+        f"Body:\n{body_content}",
     )
 
 
@@ -259,6 +272,7 @@ async def outlook_calendar_read(
     action="list",
     description="List Outlook Calendar events in a time range, ordered by start time.",
     args_schema=OutlookCalendarListArgs,
+    side_effect=False,
 )
 async def outlook_calendar_list(
     args: OutlookCalendarListArgs, *, tenant: TenantContext, **_: object
@@ -270,7 +284,8 @@ async def outlook_calendar_list(
         tenant: The caller's tool context (whose calendar is read).
 
     Returns:
-        Formatted list of events, or an error string.
+        The formatted list of events, wrapped as untrusted event content, a
+        "nothing found" message or an error string.
     """
     try:
         token = await _get_microsoft_token(tenant)
@@ -321,7 +336,7 @@ async def outlook_calendar_list(
             parts.append(_format_event_summary(event))
     if not parts:
         return "No events found in the specified time range."
-    return "\n---\n".join(parts)
+    return untrusted.wrap("event", "outlook calendar events", "\n---\n".join(parts))
 
 
 @register_tool(
@@ -329,6 +344,7 @@ async def outlook_calendar_list(
     action="create",
     description="Create a new Outlook Calendar event. Requires user confirmation.",
     args_schema=OutlookCalendarCreateArgs,
+    side_effect=True,
 )
 async def outlook_calendar_create(
     args: OutlookCalendarCreateArgs, *, tenant: TenantContext, **_: object
@@ -410,6 +426,7 @@ async def outlook_calendar_create(
         "fields are changed (partial update). Requires user confirmation."
     ),
     args_schema=OutlookCalendarUpdateArgs,
+    side_effect=True,
 )
 async def outlook_calendar_update(
     args: OutlookCalendarUpdateArgs, *, tenant: TenantContext, **_: object
@@ -421,7 +438,9 @@ async def outlook_calendar_update(
         tenant: The caller's tool context (whose calendar is updated).
 
     Returns:
-        Confirmation message with the updated event summary, or an error string.
+        Confirmation message with the updated event summary, wrapped as
+        untrusted event content (the subject is the event's existing one
+        unless the update set it), or an error string.
     """
     event_payload: dict[str, object] = {}
     if args.subject is not None:
@@ -488,4 +507,4 @@ async def outlook_calendar_update(
     if web_link:
         result += f"\nWeb link: {web_link}"
 
-    return result
+    return untrusted.wrap("event", f"outlook calendar event {args.event_id}", result)

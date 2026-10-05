@@ -27,6 +27,13 @@ Security notes:
   pattern used by the permission engine.
 - Argument validation errors never leak raw input values; only field-level
   constraint descriptions are surfaced.
+- Side-effect escalation (GH-243): every registration declares
+  ``side_effect`` (default True, fail-closed). Once the agent's run has
+  received external content it dispatches with ``escalate_side_effects``,
+  and a side-effect action the engine allows becomes ``confirm``
+  (``ToolCallResult.escalated``). This happens after ``check_permission``,
+  which is called exactly as without it and never sees the flag; ``deny`` and
+  ``confirm`` are kept, so a decision is never relaxed.
 - Tool context (GH-162): ``dispatch_tool_call`` requires the run's
   ``TenantContext`` and hands it to the handler as ``tenant=``; handlers
   scope every content query by its user_id and org_id. The context only
@@ -117,6 +124,12 @@ class ToolDescription(BaseModel):
     parameters_schema: dict[str, object] = Field(
         description="JSON Schema derived from the tool's Pydantic args model.",
     )
+    side_effect: bool = Field(
+        default=True,
+        description=(
+            "Whether the action changes something (registry metadata; never sent to the LLM)."
+        ),
+    )
 
 
 class ToolCallResult(BaseModel):
@@ -144,6 +157,13 @@ class ToolCallResult(BaseModel):
             "Set when the permission decision is 'confirm' and the call is pending user approval."
         ),
     )
+    escalated: bool = Field(
+        default=False,
+        description=(
+            "Whether dispatch tightened an 'allow' to 'confirm' because the run holds "
+            "external content (GH-243)."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +184,7 @@ class _ToolEntry(BaseModel):
     args_schema: type[BaseModel] = Field(
         description="Pydantic model class used to validate tool arguments.",
     )
+    side_effect: bool = Field(description="Whether the action changes something.")
     # Stored separately because Pydantic cannot serialise bare callables
     # and we do not need to serialise entries.
     handler: ToolHandler = Field(
@@ -196,6 +217,8 @@ def register_tool(
     action: str,
     description: str,
     args_schema: type[BaseModel],
+    *,
+    side_effect: bool = True,
 ) -> Callable[[ToolHandler], ToolHandler]:
     """Decorator that registers an async tool handler in the global registry.
 
@@ -204,6 +227,10 @@ def register_tool(
         action: Action name — must match ``[a-z][a-z0-9_]{0,62}``.
         description: Human-readable description (1-1024 chars).
         args_schema: Pydantic BaseModel subclass for argument validation.
+        side_effect: Whether the action changes something (sends, creates,
+            updates, stores). Fail-closed default: an undeclared action counts
+            as a side effect, so it is escalated once a run holds external
+            content. Production registrations declare it explicitly.
 
     Returns:
         A decorator that registers the wrapped function and returns it unchanged.
@@ -232,6 +259,7 @@ def register_tool(
             action=action,
             description=description,
             args_schema=args_schema,
+            side_effect=side_effect,
             handler=func,
         )
         _REGISTRY[key] = entry
@@ -255,6 +283,7 @@ async def dispatch_tool_call(
     pending_confirmation: PendingConfirmation | None = None,
     promoted: frozenset[tuple[str, str]] = frozenset(),
     enabled_tools: dict[str, bool] | None = None,
+    escalate_side_effects: bool = False,
 ) -> ToolCallResult:
     """Dispatch a tool call: check enabled state, registry, permissions, validate, execute.
 
@@ -266,7 +295,8 @@ async def dispatch_tool_call(
        with a ``deny`` decision.  The permission engine never evaluates it
        and no confirmation is ever requested for it.
     3. Check permission via the isolated permission engine; if denied, return
-       immediately with the denial reason.
+       immediately with the denial reason.  With ``escalate_side_effects``, a
+       side-effect action the engine allows becomes ``confirm`` (escalated).
     4. If ``confirm`` and no pending_confirmation supplied, return a result
        indicating that user confirmation is required.  If pending_confirmation
        IS supplied, verify its tool/action identity and expiry.
@@ -297,6 +327,11 @@ async def dispatch_tool_call(
             tools whose name maps to ``False`` are rejected before the
             registry lookup and permission check.  Missing keys default to
             enabled.
+        escalate_side_effects: The run has received external content
+            (GH-243): a ``side_effect`` action the engine allows needs the
+            user's confirmation instead, and every result of that dispatch
+            has ``escalated=True``.  ``deny`` and ``confirm`` are kept as they
+            are, so a decision is only ever tightened.
 
     Returns:
         A ``ToolCallResult`` with the outcome of the dispatch.
@@ -348,7 +383,20 @@ async def dispatch_tool_call(
     #    It must never see LLM-supplied args, session state, or conversation.
     permission = check_permission(raw_tool, raw_action, permissions_config, promoted=promoted)
 
-    # 3a. Denied — return immediately.
+    # 3a. Escalation (GH-243) — after the engine, never inside it: external
+    #     content in the run may have planted the call, so an allowed side
+    #     effect waits for the user.  Only ``allow`` is rewritten.
+    escalated = escalate_side_effects and entry.side_effect and permission.allowed == "allow"
+    if escalated:
+        permission = PermissionResult(
+            allowed="confirm",
+            reason=(
+                f"Action {raw_tool}.{raw_action} needs confirmation: "
+                "this conversation contains external content."
+            ),
+        )
+
+    # 3b. Denied — return immediately (never escalated).
     if permission.allowed == "deny":
         return ToolCallResult(
             success=False,
@@ -360,13 +408,15 @@ async def dispatch_tool_call(
     if permission.allowed == "confirm":
         # 4a. No confirmation supplied — ask the user.
         if pending_confirmation is None:
+            # defence-in-depth truncation on [:63] slices
+            required = f"Action {raw_tool[:63]}.{raw_action[:63]} requires user confirmation"
+            if escalated:
+                required += ": this conversation contains external content"
             return ToolCallResult(
                 success=False,
-                result=(
-                    # defence-in-depth truncation on [:63] slices
-                    f"Action {raw_tool[:63]}.{raw_action[:63]} requires user confirmation."
-                ),
+                result=f"{required}.",
                 permission=permission,
+                escalated=escalated,
             )
 
         # 4b. Confirmation supplied — enforce identity match.  The caller MUST
@@ -392,6 +442,7 @@ async def dispatch_tool_call(
                 success=False,
                 result="Pending confirmation does not match this tool call.",
                 permission=mismatched,
+                escalated=escalated,
             )
 
         # 4c. Confirmation supplied — enforce expiry.
@@ -409,6 +460,7 @@ async def dispatch_tool_call(
                 success=False,
                 result="Pending confirmation has expired.",
                 permission=expired,
+                escalated=escalated,
             )
 
     # 5a. Reject args containing fields not declared on the schema.  Pydantic's
@@ -421,6 +473,7 @@ async def dispatch_tool_call(
             success=False,
             result="Argument validation failed: unexpected fields are not permitted.",
             permission=permission,
+            escalated=escalated,
         )
 
     # 5b. Validate arguments against the tool's Pydantic schema.
@@ -436,6 +489,7 @@ async def dispatch_tool_call(
             success=False,
             result=f"Argument validation failed: {error_summary[:512]}",
             permission=permission,
+            escalated=escalated,
         )
 
     # 6. Execute the async handler.
@@ -459,6 +513,7 @@ async def dispatch_tool_call(
             success=False,
             result=f"Tool execution failed: {error_type}",
             permission=permission,
+            escalated=escalated,
         )
 
     # Guard against handlers that return a non-string type (e.g. None, dict).
@@ -473,6 +528,7 @@ async def dispatch_tool_call(
             success=False,
             result="Tool execution failed: handler returned non-string result.",
             permission=permission,
+            escalated=escalated,
         )
 
     # Sanitize handler output: strip control characters that could spoof
@@ -488,6 +544,7 @@ async def dispatch_tool_call(
         success=True,
         result=sanitized_result,
         permission=permission,
+        escalated=escalated,
     )
 
 
@@ -546,6 +603,7 @@ def get_registered_tools(
                 action=entry.action,
                 description=entry.description,
                 parameters_schema=schema,
+                side_effect=entry.side_effect,
             )
         )
     return descriptions
@@ -572,6 +630,7 @@ def get_tool_entry(tool: str, action: str) -> ToolDescription | None:
         action=entry.action,
         description=entry.description,
         parameters_schema=entry.args_schema.model_json_schema(),
+        side_effect=entry.side_effect,
     )
 
 

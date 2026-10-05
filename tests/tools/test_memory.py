@@ -15,8 +15,10 @@ Covers:
   separate, and a row under the user's id but another org is invisible.
 - Store is an upsert on ``(user_id, key)``: the second value replaces the
   first, still one row.
-- Outputs are unchanged: "Stored memory: <key>", the value or "No memory found
-  for key: <key>", newline-joined sorted keys or "No memories stored.".
+- Outputs: "Stored memory: <key>"; a found note as one wrapped untrusted block
+  (GH-243: kind "memory", label "memory note <key>", the value inside) or "No
+  memory found for key: <key>"; the newline-joined sorted keys as one wrapped
+  block (label "memory keys") or "No memories stored.".
 - Every memory statement is parameterized and carries both the tenant's
   user_id and org_id as bind args; no key, value or id is interpolated.
 - Registration is unchanged (store / recall / list, no delete handler) and
@@ -36,7 +38,7 @@ import importlib
 import inspect
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import patch
 
 import pytest
@@ -119,6 +121,31 @@ def _rows_of(db: FakeDb, tenant: TenantContext) -> list[dict[str, Any]]:
     return [row for (owner, _), row in db.memory.items() if owner == tenant.user_id]
 
 
+# GH-243: a found note and a non-empty key list come back as ONE wrapped untrusted block,
+# <untrusted_content_B kind="memory" label="...">\n<text>\n</untrusted_content_B>.
+_WRAPPED: Final = re.compile(
+    r'<untrusted_content_(?P<b>[0-9a-f]{16}) kind="(?P<kind>[^"]*)" label="(?P<label>[^"<>]*)">\n'
+    r"(?P<text>.*)\n</untrusted_content_(?P=b)>",
+    re.DOTALL,
+)
+
+
+def _fed(result: str) -> str | tuple[str, str, str]:
+    """What the LLM is fed: a wrapped result as (kind, label, text), a plain one as is."""
+    match = _WRAPPED.fullmatch(result)
+    return (match["kind"], match["label"], match["text"]) if match else result
+
+
+def _note(key: str, value: str) -> tuple[str, str, str]:
+    """A found note as wrapped by memory.recall (GH-243)."""
+    return ("memory", f"memory note {key}", value)
+
+
+def _keys(*keys: str) -> tuple[str, str, str]:
+    """A non-empty key list as wrapped by memory.list (GH-243)."""
+    return ("memory", "memory keys", "\n".join(keys))
+
+
 _HANDLER_ARGS: list[Any] = [
     pytest.param("memory_store", MemoryStoreArgs(key="greeting", value="hello"), id="store"),
     pytest.param("memory_recall", MemoryRecallArgs(key="greeting"), id="recall"),
@@ -177,7 +204,7 @@ class TestMemoryStoreAndRecall:
         recalled = await _recall("greeting", alice)
 
         assert stored == "Stored memory: greeting"
-        assert recalled == "hello world"
+        assert _fed(recalled) == _note("greeting", "hello world")
 
     async def test_memory_store_writes_the_tenants_user_and_org(
         self, db: FakeDb, alice: TenantContext
@@ -208,8 +235,8 @@ class TestMemoryStoreAndRecall:
         await _store("project", "alice-value", alice)
         await _store("project", "bob-value", bob)
 
-        assert await _recall("project", alice) == "alice-value"
-        assert await _recall("project", bob) == "bob-value"
+        assert _fed(await _recall("project", alice)) == _note("project", "alice-value")
+        assert _fed(await _recall("project", bob)) == _note("project", "bob-value")
         assert db.memories_of(alice.user_id) == {"project": "alice-value"}
         assert db.memories_of(bob.user_id) == {"project": "bob-value"}
 
@@ -222,7 +249,7 @@ class TestMemoryStoreAndRecall:
         await _store("project", "bob-value", bob)
 
         assert db.memories_of(alice.user_id) == {"project": "alice-value"}
-        assert await _recall("project", alice) == "alice-value"
+        assert _fed(await _recall("project", alice)) == _note("project", "alice-value")
 
     async def test_memory_user_of_another_org_is_isolated(
         self, db: FakeDb, alice: TenantContext, carol: TenantContext
@@ -232,8 +259,8 @@ class TestMemoryStoreAndRecall:
         await _store("project", "carol-value", carol)
         await _store("carol-only", "carol-secret", carol)
 
-        assert await _recall("project", alice) == "alice-value"
-        assert await _recall("project", carol) == "carol-value"
+        assert _fed(await _recall("project", alice)) == _note("project", "alice-value")
+        assert _fed(await _recall("project", carol)) == _note("project", "carol-value")
         assert await _recall("carol-only", alice) == "No memory found for key: carol-only"
         assert _rows_of(db, carol)[0]["org_id"] == OTHER_ORG_ID
 
@@ -269,7 +296,7 @@ class TestMemoryStoreAndRecall:
         second = await _store("mood", "second value", alice)
 
         assert (first, second) == ("Stored memory: mood", "Stored memory: mood")
-        assert await _recall("mood", alice) == "second value"
+        assert _fed(await _recall("mood", alice)) == _note("mood", "second value")
         assert db.memories_of(alice.user_id) == {"mood": "second value"}
         assert len(_rows_of(db, alice)) == 1
 
@@ -291,7 +318,7 @@ class TestMemoryList:
         db.add_memory(bob.user_id, "beta", "bob-value")
         db.add_memory(carol.user_id, "aardvark", "carol-value")
 
-        assert await _list(alice) == "alpha\nmiddle\nzebra"
+        assert _fed(await _list(alice)) == _keys("alpha", "middle", "zebra")
 
     async def test_memory_list_of_each_user_is_their_own(
         self, db: FakeDb, alice: TenantContext, bob: TenantContext
@@ -302,8 +329,8 @@ class TestMemoryList:
         db.add_memory(bob.user_id, "shared", "b")
         db.add_memory(bob.user_id, "bob-only", "b")
 
-        assert await _list(alice) == "alice-only\nshared"
-        assert await _list(bob) == "bob-only\nshared"
+        assert _fed(await _list(alice)) == _keys("alice-only", "shared")
+        assert _fed(await _list(bob)) == _keys("bob-only", "shared")
 
     async def test_memory_list_without_notes_says_none_stored(
         self, db: FakeDb, alice: TenantContext, bob: TenantContext
@@ -353,7 +380,7 @@ class TestMemorySqlIsScoped:
         await _store(key, value, alice)
         recalled = await _recall(key, alice)
 
-        assert recalled == value
+        assert _fed(recalled) == _note(key, value)
         store_calls = [call for call in _memory_calls(db) if value in call.args]
         assert len(store_calls) == 1
         assert key in store_calls[0].args
@@ -369,7 +396,7 @@ class TestMemorySqlIsScoped:
 
         await _store("long-val", long_value, alice)
 
-        assert await _recall("long-val", alice) == long_value
+        assert _fed(await _recall("long-val", alice)) == _note("long-val", long_value)
 
     async def test_memory_logs_no_keys_or_values(
         self, db: FakeDb, alice: TenantContext, caplog: pytest.LogCaptureFixture
