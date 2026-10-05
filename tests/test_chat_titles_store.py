@@ -40,6 +40,12 @@ What these tests pin down (contract §2 and the ``title_chat`` part of §3):
     and ``RecursionError`` propagate.
   - Logs: one line per outcome carrying the chat id; never the title, the
     messages, the model's reply, an exception's text, the org or user id.
+  - ``external_content=True`` (contract section 7, security audit L-2: the
+    first run read wrapped third-party content): the fallback, exactly as for a
+    failed run (no client resolved, no request; a whitespace-only message
+    stores nothing; a rename before it stays); its log line says
+    ``fallback`` and holds no content. ``external_content=False`` keeps the
+    model path.
 
 No real PostgreSQL, no network, no sleeps: every statement goes to
 ``FakeDb`` (or a stub executor that raises), the LLM clients are fakes and
@@ -350,9 +356,15 @@ async def _title_chat(
     user_message: str = _USER,
     assistant_message: str = _ASSISTANT,
     run_failed: bool = False,
+    external_content: bool | None = None,
     data_residency: bool = False,
     max_retries: int = 2,
 ) -> Any:
+    # external_content (contract section 7) is passed only when a test gives it, so the
+    # other tests call title_chat exactly as before (its default).
+    flag: dict[str, bool] = (
+        {} if external_content is None else {"external_content": external_content}
+    )
     return await chat_titles.title_chat(
         pool,
         tenant,
@@ -363,6 +375,7 @@ async def _title_chat(
         run_failed=run_failed,
         data_residency=data_residency,
         max_retries=max_retries,
+        **flag,
     )
 
 
@@ -938,3 +951,152 @@ class TestTitleChatLogs:
             if not any(str(chat_id) in line for line in admino_lines)
         ]
         assert unlogged == []
+
+
+# ---------------------------------------------------------------------------
+# 7. chat_titles.title_chat: third-party content never chooses the title
+#    (contract section 7, security audit L-2)
+# ---------------------------------------------------------------------------
+
+
+class TestTitleChatExternalContent:
+    """external_content=True: the first run read wrapped third-party content, so the
+    fallback from the user's own message is stored; no client is resolved, no request."""
+
+    @pytest.mark.parametrize("run_failed", [False, True], ids=["finished-run", "failed-run"])
+    async def test_chat_titles_title_chat_external_content_stores_fallback_without_a_client(
+        self, chat_titles: ModuleType, db: FakeDb, run_failed: bool
+    ) -> None:
+        """get_client is never called and the client gets no request, although it would
+        answer a usable title; the first message cut at a word boundary is stored as an
+        auto title, the chat's activity untouched (also when the run failed)."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id, created_at=_PAST)
+        client = _TitleClient(_REPLY)
+        resolver = _Resolver(client)
+
+        result = await _title_chat(
+            chat_titles,
+            db.pool,
+            alice.tenant,
+            chat_id,
+            get_client=resolver,
+            run_failed=run_failed,
+            external_content=True,
+        )
+
+        row = _row(db, chat_id)
+        assert result is None
+        assert (resolver.calls, client.calls) == (0, [])
+        assert (row["title"], row["title_source"], row["last_activity_at"]) == (
+            _FALLBACK,
+            "auto",
+            _PAST,
+        )
+
+    async def test_chat_titles_title_chat_external_content_blank_message_stores_nothing(
+        self, chat_titles: ModuleType, db: FakeDb
+    ) -> None:
+        """A whitespace-only first message has no fallback: no UPDATE, the chat stays
+        untitled, and the model (which would answer a title) is not asked."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        client = _TitleClient(_REPLY)
+        resolver = _Resolver(client)
+        before = db.snapshot()
+        db.calls.clear()
+
+        result = await _title_chat(
+            chat_titles,
+            db.pool,
+            alice.tenant,
+            chat_id,
+            get_client=resolver,
+            user_message=_BLANK,
+            external_content=True,
+        )
+
+        assert result is None
+        assert (resolver.calls, client.calls) == (0, [])
+        assert db.matching(r"^update chats\b") == []
+        assert db.snapshot() == before
+
+    async def test_chat_titles_title_chat_external_content_keeps_a_title_renamed_before_it_runs(
+        self, chats: ModuleType, chat_titles: ModuleType, db: FakeDb
+    ) -> None:
+        """The compare-and-set still guards the fallback: a rename before the task stays."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        await chats.rename_chat(db.pool, alice.tenant, chat_id, _RENAME)
+        before = db.snapshot()
+
+        await _title_chat(
+            chat_titles,
+            db.pool,
+            alice.tenant,
+            chat_id,
+            get_client=_Resolver(_TitleClient(_REPLY)),
+            external_content=True,
+        )
+
+        assert db.snapshot() == before
+        assert _title_of(db, chat_id) == (_RENAME, "user")
+
+    async def test_chat_titles_title_chat_external_content_false_keeps_the_model_path(
+        self, chat_titles: ModuleType, db: FakeDb
+    ) -> None:
+        """external_content=False given explicitly: the client is resolved and asked once,
+        the model's title is stored."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        client = _TitleClient(_REPLY)
+        resolver = _Resolver(client)
+
+        await _title_chat(
+            chat_titles,
+            db.pool,
+            alice.tenant,
+            chat_id,
+            get_client=resolver,
+            external_content=False,
+        )
+
+        assert (resolver.calls, len(client.calls)) == (1, 1)
+        assert _title_of(db, chat_id) == (_MODEL_TITLE, "auto")
+
+    async def test_chat_titles_title_chat_external_content_logs_the_fallback_without_content(
+        self, chat_titles: ModuleType, db: FakeDb, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """At DEBUG: an admino record names the chat and says ``fallback``; no record
+        (message, args, exception info) holds the message, the reply, the would-be model
+        title, the org id or the user id."""
+        caplog.set_level(logging.DEBUG)
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+
+        await _title_chat(
+            chat_titles,
+            db.pool,
+            alice.tenant,
+            chat_id,
+            get_client=_Resolver(_TitleClient(_LOG_REPLY)),
+            user_message=_LOG_USER,
+            assistant_message=_LOG_ASSISTANT,
+            external_content=True,
+        )
+
+        # The fallback path was reached (the scan below isn't vacuous).
+        assert _title_of(db, chat_id) == (_LOG_USER, "auto")
+        dump = _log_dump(caplog).casefold()
+        leaked = [
+            marker
+            for marker in (*_LOG_CANARIES, str(ORG_ID), str(alice.user_id))
+            if marker.casefold() in dump
+        ]
+        assert leaked == []
+        outcome = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name.startswith("admino") and str(chat_id) in record.getMessage()
+        ]
+        assert any("fallback" in line.casefold() for line in outcome), outcome
