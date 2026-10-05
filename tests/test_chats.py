@@ -36,7 +36,11 @@ What these tests pin down (contract §2):
   (exactly ``limit`` left included), walking the cursors returns every live
   chat exactly once in order (microsecond-apart stamps and ties across a page
   boundary); cursors are strings of at most 200 characters; garbage, a
-  truncated cursor and a message cursor are ``InvalidCursorError``.
+  truncated cursor and a message cursor are ``InvalidCursorError``. So is a
+  crafted cursor that decodes but can't be bound (security audit L-1): a
+  ``last_activity_at`` whose offset puts it outside the datetime range in
+  UTC (year 1 at +23:00, year 9999 at -23:00); it is refused before any
+  statement binds it.
 - ``rename_chat``: title + ``'user'``, ``last_activity_at`` unchanged,
   idempotent.
 - ``trash_chat``: ``deleted_at`` set and exactly one ``chat.delete`` audit row
@@ -51,7 +55,11 @@ What these tests pin down (contract §2):
   ``last_activity_at`` bumped; ``external_content`` set (sticky) only by a
   ``tool`` message holding ``untrusted.wrap(...)`` output, never by a user or
   assistant message with a marker-looking text; U+0000 removed from content and
-  from every string (keys included) inside the JSON values; a ``system``
+  from every string (keys included) inside the JSON values; a lone surrogate
+  (U+D800 to U+DFFF, which model-produced tool inputs and tool-call arguments
+  can carry and PostgreSQL's JSONB refuses) in any of those strings is stored
+  as U+FFFD, so the turn is persisted (security audit L-2), while an emoji
+  (what an escaped surrogate pair decodes to) is kept; a ``system``
   message is a ``ValueError`` with nothing written; an empty list runs no
   statement; a failure midway rolls everything back.
 - ``load_recent_history``: the latest ``limit`` messages in chronological order
@@ -59,7 +67,9 @@ What these tests pin down (contract §2):
   leading orphan ``tool`` messages of the tail dropped.
 - ``list_messages``: the latest page ascending, ``next_cursor`` to earlier
   messages, None at the beginning; walking returns every message once in order;
-  bad and list cursors are ``InvalidCursorError``.
+  bad and list cursors are ``InvalidCursorError``, and so is a crafted cursor
+  whose seq a BIGINT can't hold (2**63, 10**40) or that is negative, refused
+  before any statement binds it (security audit L-1).
 - ``count_messages``, ``latest_message_status`` (highest seq; None when empty),
   ``append_org_notice`` (one user/complete message, the text verbatim, in every
   live chat of the org, of every member; none in another org's or a trashed
@@ -87,6 +97,7 @@ Security notes:
 from __future__ import annotations
 
 import ast
+import base64
 import contextlib
 import dataclasses
 import inspect
@@ -111,6 +122,7 @@ from tests.db_fakes import ORG_ID, ORG_ID_PARAM_RE, OTHER_ORG_ID, Call, FakeDb, 
 from tests.log_capture import configured_logging
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from types import ModuleType
 
 # ---------------------------------------------------------------------------
@@ -214,6 +226,11 @@ _MARK_CONTENT: Final = "Quokka-salary-figures"
 _MARK_NOTICE: Final = "Narwhal promotion notice"
 _MARK_SESSION: Final = "sessmarker4711"
 _MARK_RACE_SESSION: Final = "racemarker0815"
+
+# Security audit L-2: lone surrogates (PostgreSQL's JSONB refuses them) and their stand-in.
+_HIGH: Final = chr(0xD800)
+_LOW: Final = chr(0xDFFF)
+_REPLACEMENT: Final = chr(0xFFFD)
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +511,37 @@ async def _list_cursor(chats: ModuleType, db: FakeDb, member: _Member) -> str:
     page = await chats.list_chats(db.pool, member.tenant, limit=1, cursor=None)
     assert isinstance(page.next_cursor, str)
     return page.next_cursor
+
+
+def _cursor_payload(cursor: str) -> dict[str, Any]:
+    """The JSON object a real cursor carries (admino.chats: unpadded base64url of JSON)."""
+    payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+    assert isinstance(payload, dict), payload
+    return payload
+
+
+def _is_seq(value: Any) -> bool:
+    return type(value) is int
+
+
+def _is_stamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _crafted(cursor: str, is_field: Callable[[Any], bool], value: Any) -> str:
+    """A real cursor with its one field ``is_field`` picks set to ``value``, encoded like
+    admino.chats encodes it (a cursor that decodes, security audit L-1)."""
+    payload = _cursor_payload(cursor)
+    (name,) = [key for key, item in payload.items() if is_field(item)]
+    payload[name] = value
+    text = json.dumps(payload, separators=(",", ":"))
+    return base64.urlsafe_b64encode(text.encode()).rstrip(b"=").decode()
 
 
 def _race_legacy_insert(
@@ -1079,6 +1127,28 @@ class TestListChats:
         with pytest.raises(chats.InvalidCursorError):
             await chats.list_chats(db.pool, alice.tenant, limit=10, cursor=cursor)
 
+    @pytest.mark.parametrize(
+        "stamp",
+        [
+            pytest.param("0001-01-01T00:00:00+23:00", id="year-1-at-plus-23h"),
+            pytest.param("9999-12-31T23:59:59-23:00", id="year-9999-at-minus-23h"),
+        ],
+    )
+    async def test_chats_list_cursor_stamp_outside_the_utc_range_is_invalid(
+        self, chats: ModuleType, db: FakeDb, stamp: str
+    ) -> None:
+        """Security audit L-1: a crafted cursor whose ``last_activity_at`` decodes but
+        overflows on the conversion to UTC (asyncpg's DataError, a 500) is
+        ``InvalidCursorError``, refused before a statement binds it."""
+        alice = _member(db)
+        crafted = _crafted(await _list_cursor(chats, db, alice), _is_stamp, stamp)
+        db.calls.clear()
+
+        with pytest.raises(chats.InvalidCursorError):
+            await chats.list_chats(db.pool, alice.tenant, limit=10, cursor=crafted)
+
+        assert not any(isinstance(arg, datetime) for call in db.calls for arg in call.args)
+
 
 # ---------------------------------------------------------------------------
 # 6. rename_chat
@@ -1520,6 +1590,76 @@ class TestAppendMessages:
         (row,) = db.messages_of(chat_id)
         assert row["tool_use_blocks"][0]["input"] == {"query": "invoice"}
 
+    async def test_chats_append_replaces_lone_surrogates_in_json_strings(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """Security audit L-2: a model's tool input and the run's tool-call arguments are
+        free-form JSON, so a lone surrogate gets through Pydantic; JSONB refuses it, which
+        failed the whole append after the tools had run. Every lone surrogate (values,
+        nested lists and objects, keys at any depth) is stored as one U+FFFD, the rest
+        kept, and the turn is persisted. (Pydantic's JSON-mode dump of a record turns a
+        surrogate in a key into three U+FFFD, or raises for a nested key.)"""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        blocks = [_tool_use("call_s1", query=f"in{_HIGH}voice", tags=[f"a{_LOW}", {"k": _HIGH}])]
+        blocks[0]["input"][f"fil{_LOW}ter"] = "from:muster"
+        blocks[0]["input"]["nested"] = {f"k{_HIGH}": [{f"j{_LOW}": "v"}]}
+        blocks[0][f"no{_HIGH}te"] = "x"
+        record = _record(
+            query=f"in{_LOW}voice", filters={"from": [f"mu{_HIGH}ster"], f"t{_LOW}o": ["me"]}
+        )
+        record.args[f"li{_HIGH}mit"] = 5
+
+        await chats.append_messages(
+            db.pool,
+            alice.tenant,
+            chat_id,
+            [
+                LLMMessage(role="user", content="Search"),
+                LLMMessage(role="assistant", content="", tool_use_blocks=blocks),
+            ],
+            tool_calls=[record],
+        )
+
+        rows = db.messages_of(chat_id)
+        assert [row["role"] for row in rows] == ["user", "assistant"]
+        r = _REPLACEMENT
+        stored_block = _tool_use("call_s1", query=f"in{r}voice", tags=[f"a{r}", {"k": r}])
+        stored_block["input"][f"fil{r}ter"] = "from:muster"
+        stored_block["input"]["nested"] = {f"k{r}": [{f"j{r}": "v"}]}
+        stored_block[f"no{r}te"] = "x"
+        assert rows[1]["tool_use_blocks"] == [stored_block]
+        stored_record = _record(
+            query=f"in{r}voice", filters={"from": [f"mu{r}ster"], f"t{r}o": ["me"]}
+        )
+        stored_record.args[f"li{r}mit"] = 5
+        assert rows[1]["tool_calls"] == [stored_record.model_dump(mode="json")]
+
+    async def test_chats_append_keeps_emoji_in_json_strings(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """A valid surrogate pair (a provider's escaped emoji decodes to one code point) is
+        not a lone surrogate: stored unchanged, keys included."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+        emoji = json.loads('"' + chr(92) + "ud83d" + chr(92) + 'ude00"')
+        assert emoji == chr(0x1F600)
+        blocks = [_tool_use("call_e1", query=f"party {emoji}", tags=[{emoji: emoji}])]
+
+        await chats.append_messages(
+            db.pool,
+            alice.tenant,
+            chat_id,
+            [LLMMessage(role="assistant", content="", tool_use_blocks=blocks)],
+            tool_calls=[_record(query=f"party {emoji}")],
+        )
+
+        (row,) = db.messages_of(chat_id)
+        assert row["tool_use_blocks"] == [
+            _tool_use("call_e1", query=f"party {emoji}", tags=[{emoji: emoji}])
+        ]
+        assert row["tool_calls"] == [_record(query=f"party {emoji}").model_dump(mode="json")]
+
     async def test_chats_append_runs_in_one_transaction_update_first(
         self, chats: ModuleType, db: FakeDb
     ) -> None:
@@ -1725,6 +1865,31 @@ class TestListMessages:
 
         with pytest.raises(chats.InvalidCursorError):
             await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=cursor)
+
+    @pytest.mark.parametrize(
+        "seq",
+        [
+            pytest.param(2**63, id="bigint-max-plus-1"),
+            pytest.param(10**40, id="10-to-the-40"),
+            pytest.param(-1, id="negative"),
+        ],
+    )
+    async def test_chats_messages_cursor_seq_outside_bigint_is_invalid(
+        self, chats: ModuleType, db: FakeDb, seq: int
+    ) -> None:
+        """Security audit L-1: a crafted cursor whose seq decodes but no BIGINT holds
+        (asyncpg's DataError, a 500) is ``InvalidCursorError``, refused before a
+        statement binds it; a negative seq too."""
+        alice = _member(db)
+        crafted = _crafted(await _message_cursor(chats, db, alice), _is_seq, seq)
+        chat_id = db.add_chat(alice.user_id)
+        db.add_chat_message(chat_id, "user", "Hello")
+        db.calls.clear()
+
+        with pytest.raises(chats.InvalidCursorError):
+            await chats.list_messages(db.pool, alice.tenant, chat_id, limit=10, cursor=crafted)
+
+        assert not any(seq in call.args for call in db.calls)
 
 
 # ---------------------------------------------------------------------------

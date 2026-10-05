@@ -49,6 +49,17 @@ What is pinned:
   the LLM is fed; the ``tool.call`` audit row targets the chat's real UUID;
   GH-243's sticky ``external_content`` flag escalates a side-effecting allow
   action after a restart even when the wrapped message is outside the tail.
+- Queued turns (security audit M-1): the flag a run gets is the chat's flag as
+  read under the chat's lock, after the turn ahead of it stored its messages.
+  Turn B, sent while turn A (which reads an email: a wrapped tool result) still
+  holds the lock, runs with ``earlier_external_content=True`` on the chat
+  route, the legacy route and the approve path of POST /api/confirm; with the
+  real agent, B's allowed side effect (memory.store) waits for confirmation
+  although B's loaded tail holds no wrapped content. Both requests run in the
+  test's event loop (``httpx.ASGITransport``); a ``ChatRuntime`` subclass
+  records each ``hold()`` call, so B is known to be queued before A goes on.
+- Lone surrogates (security audit L-2): a model-produced tool input holding
+  one doesn't break the turn: 200, persisted with U+FFFD in its place.
 
 New names (``admino.chat_runtime``, the routes, ``server._chat_runtime``) are
 used lazily, so the file collects before GH-176 is implemented.
@@ -60,6 +71,7 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
@@ -1387,7 +1399,7 @@ def llm() -> _ScriptLLM:
     return _ScriptLLM()
 
 
-def _real_client(llm: _ScriptLLM) -> TestClient:
+def _real_app(llm: _ScriptLLM) -> FastAPI:
     """A new app (a restart) around a new REAL Agent with the real tool-call recorder."""
     agent = Agent(
         llm_client=llm,
@@ -1397,7 +1409,12 @@ def _real_client(llm: _ScriptLLM) -> TestClient:
         ),
     )
     app: FastAPI = create_app(agent=agent, config=make_config())
-    return make_client(app, raise_server_exceptions=False)
+    return app
+
+
+def _real_client(llm: _ScriptLLM) -> TestClient:
+    """A client of ``_real_app(llm)``."""
+    return make_client(_real_app(llm), raise_server_exceptions=False)
 
 
 def test_chat_turns_restart_round_trip_keeps_the_tool_use_pairing(
@@ -1513,3 +1530,313 @@ def test_chat_turns_chat_without_external_content_runs_an_allowed_side_effect(
     chat = world.db.chat_row(chat_id)
     assert chat is not None
     assert chat["external_content"] is False
+
+
+# ---------------------------------------------------------------------------
+# 9. A queued turn runs with the flag the turn ahead of it stored (audit M-1)
+# ---------------------------------------------------------------------------
+
+_WAIT_S: Final = 5.0
+
+
+def _watched_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Swap in a real ``ChatRuntime`` that records every ``hold()`` call (its chat id) when
+    it is made, i.e. before the caller waits for the chat's lock."""
+    from admino.chat_runtime import ChatRuntime
+
+    class _Watched(ChatRuntime):
+        def __init__(self) -> None:
+            super().__init__(max_entries=64, idle_s=900.0)
+            self.holds: list[uuid.UUID] = []
+
+        def hold(self, chat_id: uuid.UUID, owner_user_id: uuid.UUID) -> Any:
+            self.holds.append(chat_id)
+            return super().hold(chat_id, owner_user_id)
+
+    runtime = _Watched()
+    monkeypatch.setattr(server, "_chat_runtime", runtime)
+    return runtime
+
+
+def _async_client(app: FastAPI) -> httpx.AsyncClient:
+    """A client running the app in the caller's event loop (concurrent requests)."""
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False, client=(CLIENT_IP, 50002))
+    return httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    """Yield to the event loop until ``condition()`` holds (at most ``_WAIT_S`` seconds)."""
+
+    async def poll() -> None:
+        while not condition():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(poll(), _WAIT_S)
+
+
+async def _queued_behind(
+    app: FastAPI,
+    runtime: Any,
+    gate: tuple[asyncio.Event, asyncio.Event],
+    ahead: Callable[[httpx.AsyncClient], Awaitable[httpx.Response]],
+    queued: Callable[[httpx.AsyncClient], Awaitable[httpx.Response]],
+) -> tuple[httpx.Response, httpx.Response]:
+    """Send ``ahead``; once its run is parked inside the chat's lock (``gate``'s first
+    event set), send ``queued`` and wait until it has called ``hold()``; then release the
+    first run (``gate``'s second event). Returns both responses."""
+    parked, release = gate
+    async with _async_client(app) as http:
+        first = asyncio.create_task(ahead(http))
+        try:
+            await asyncio.wait_for(parked.wait(), _WAIT_S)
+            holds = len(runtime.holds)
+            second = asyncio.create_task(queued(http))
+            await _until(lambda: len(runtime.holds) > holds)
+        finally:
+            release.set()
+        responses = await asyncio.wait_for(asyncio.gather(first, second), _WAIT_S)
+    return responses[0], responses[1]
+
+
+def _park_next_run(script: _Script) -> tuple[asyncio.Event, asyncio.Event]:
+    """The next stub run sets the first event, then waits for the second (bounded)."""
+    parked, release = asyncio.Event(), asyncio.Event()
+
+    async def park() -> None:
+        parked.set()
+        await asyncio.wait_for(release.wait(), _WAIT_S)
+
+    script.during = park
+    return parked, release
+
+
+def _mail_turn() -> tuple[LLMMessage, ...]:
+    """A turn's new messages after reading an email: the call, its wrapped result, a reply."""
+    wrapped = untrusted.wrap("email", "message m176", _MAIL_BODY)
+    return (_tool_use(_READ_MAIL), _tool(wrapped, _READ_MAIL), _assistant("One new email."))
+
+
+async def _post_turn(
+    http: httpx.AsyncClient, account: Account, chat_id: uuid.UUID, message: str
+) -> httpx.Response:
+    return await http.post(
+        f"/api/chats/{chat_id}/messages", headers=account.cookie, json={"message": message}
+    )
+
+
+async def _post_legacy(http: httpx.AsyncClient, account: Account, message: str) -> httpx.Response:
+    return await http.post(
+        "/api/message",
+        headers=account.cookie,
+        json={"message": message, "session_id": _LEGACY_SESSION},
+    )
+
+
+async def _post_approval(
+    http: httpx.AsyncClient, account: Account, chat_id: uuid.UUID
+) -> httpx.Response:
+    body = {"confirmation_id": _CONFIRMATION_ID, "approved": True, "chat_id": str(chat_id)}
+    return await http.post(f"/api/confirm/{_CONFIRMATION_ID}", headers=account.cookie, json=body)
+
+
+def _flag_of(db: FakeDb, chat_id: uuid.UUID) -> object:
+    chat = db.chat_row(chat_id)
+    assert chat is not None
+    return chat["external_content"]
+
+
+async def test_chat_turns_queued_turn_runs_with_the_flag_the_turn_ahead_stored(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turn B waits on the chat's lock while turn A reads an email (A stores the wrapped
+    result: ``external_content`` true). B runs with ``earlier_external_content=True``,
+    the flag read under the lock, not the false it saw before waiting."""
+    editor = world.a["editor"]
+    chat_id = world.db.add_chat(editor.user_id)
+    app = make_app(agent)
+    runtime = _watched_runtime(monkeypatch)
+    gate = _park_next_run(script)
+    script.queue(_Reply(new=_mail_turn(), response="One new email."))
+
+    first, second = await _queued_behind(
+        app,
+        runtime,
+        gate,
+        lambda http: _post_turn(http, editor, chat_id, "read my mail"),
+        lambda http: _post_turn(http, editor, chat_id, "store a note"),
+    )
+
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert _flag_of(world.db, chat_id) is True
+    assert [run.user_message for run in script.runs] == ["read my mail", "store a note"]
+    assert [run.flag for run in script.runs] == [False, True]
+
+
+async def test_chat_turns_queued_legacy_turn_runs_with_the_flag_the_turn_ahead_stored(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same on POST /api/message: two turns of one legacy session id, the second
+    queued behind the first, which reads an email."""
+    editor = world.a["editor"]
+    chat_id = world.db.add_chat(editor.user_id, legacy_session_id=_LEGACY_SESSION)
+    app = make_app(agent)
+    runtime = _watched_runtime(monkeypatch)
+    gate = _park_next_run(script)
+    script.queue(_Reply(new=_mail_turn(), response="One new email."))
+
+    first, second = await _queued_behind(
+        app,
+        runtime,
+        gate,
+        lambda http: _post_legacy(http, editor, "read my mail"),
+        lambda http: _post_legacy(http, editor, "store a note"),
+    )
+
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert [response.json()["chat_id"] for response in (first, second)] == [str(chat_id)] * 2
+    assert _flag_of(world.db, chat_id) is True
+    assert [run.user_message for run in script.runs] == ["read my mail", "store a note"]
+    assert [run.flag for run in script.runs] == [False, True]
+
+
+async def test_chat_turns_queued_approval_runs_with_the_flag_the_turn_ahead_stored(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The approve path of POST /api/confirm: the chat awaits a confirmation; turn A (a
+    new message, so that one is cancelled) reads an email and asks to confirm again under
+    the same confirmation id (the stub reuses it). The approval B, sent while A runs,
+    waits on the lock, resumes A's confirmation and runs with
+    ``earlier_external_content=True``."""
+    editor = world.a["editor"]
+    chat_id = world.db.add_chat(editor.user_id)
+    app = make_app(agent)
+    runtime = _watched_runtime(monkeypatch)
+    script.queue(_awaiting(_OTHER_CALL))
+    async with _async_client(app) as http:
+        earlier = await _post_turn(http, editor, chat_id, "plan it")
+    assert earlier.json()["status"] == "awaiting_confirmation", earlier.text
+    gate = _park_next_run(script)
+    asks = _awaiting(_PENDING_CALL)
+    script.queue(_Reply(**{**asks.__dict__, "new": (*_mail_turn()[:2], *asks.new)}))
+
+    first, second = await _queued_behind(
+        app,
+        runtime,
+        gate,
+        lambda http: _post_turn(http, editor, chat_id, "read my mail"),
+        lambda http: _post_approval(http, editor, chat_id),
+    )
+
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert first.json()["status"] == "awaiting_confirmation"
+    assert _flag_of(world.db, chat_id) is True
+    resumed = script.runs[2]
+    pending = resumed.arguments["pending_confirmation"]
+    assert pending is not None
+    assert (pending.tool_call, resumed.user_message) == (_PENDING_CALL, "")
+    assert [run.flag for run in script.runs] == [False, False, True]
+
+
+class _ParkingLLM(_ScriptLLM):
+    """A ``_ScriptLLM`` whose first call of the ``park_on`` turn sets ``parked`` and then
+    waits for ``release`` (bounded) before answering."""
+
+    def __init__(self, park_on: str) -> None:
+        super().__init__()
+        self._park_on = park_on
+        self.parked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def chat(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        stream: bool = False,
+    ) -> LLMResponse:
+        users = [message for message in messages if message.role == "user"]
+        if not self.parked.is_set() and str(users[-1].content) == self._park_on:
+            self.parked.set()
+            await asyncio.wait_for(self.release.wait(), _WAIT_S)
+        return await super().chat(messages, tools, stream=stream)
+
+
+async def test_chat_turns_queued_turn_escalates_an_allowed_side_effect_with_the_real_agent(
+    world: World, tools: _Tools, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end with the real agent: turn A reads an email; turn B, queued behind it,
+    asks for memory.store (allowed, a side effect) with a stored ``max_context_messages``
+    of 2, so B's loaded tail holds no wrapped content. The chat's flag, read under the
+    lock, still makes B wait for confirmation: nothing is stored, the audit row says
+    escalated."""
+    editor = world.a["editor"]
+    chat_id = world.db.add_chat(editor.user_id)
+    llm = _ParkingLLM("read my mail")
+    llm.script("read my mail", _READ_MAIL)
+    llm.script("store a note", _STORE)
+    app = _real_app(llm)
+    runtime = _watched_runtime(monkeypatch)
+
+    async def store_a_note(http: httpx.AsyncClient) -> httpx.Response:
+        # A read its platform limits before parking; only B gets the small window.
+        _stored_limits(monkeypatch, max_context_messages=2)
+        return await _post_turn(http, editor, chat_id, "store a note")
+
+    first, second = await _queued_behind(
+        app,
+        runtime,
+        (llm.parked, llm.release),
+        lambda http: _post_turn(http, editor, chat_id, "read my mail"),
+        store_a_note,
+    )
+
+    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert first.json()["status"] == "final"
+    assert _flag_of(world.db, chat_id) is True
+    fed = [message for call in llm.fed("store a note") for message in call]
+    assert fed, "B's turn never reached the LLM"
+    assert not any(untrusted.contains_wrapped(message["content"]) for message in fed)
+    body = second.json()
+    assert body["status"] == "awaiting_confirmation"
+    pending = body["pending_confirmation"]
+    assert (pending["tool"], pending["action"]) == ("memory", "store")
+    assert tools.stored == []
+    assert world.db.audit_rows("tool.call")[-1]["metadata"]["escalated"] is True
+
+
+# ---------------------------------------------------------------------------
+# 10. A lone surrogate in a model's tool input (audit L-2)
+# ---------------------------------------------------------------------------
+
+
+def test_chat_turns_lone_surrogate_in_a_tool_input_is_persisted_replaced(
+    world: World, client: TestClient, script: _Script
+) -> None:
+    """The model's tool input carries lone surrogates (free-form JSON gets them past
+    Pydantic; PostgreSQL's JSONB refuses them). The turn still answers 200 and is
+    persisted, each lone surrogate stored as U+FFFD."""
+    editor = world.a["editor"]
+    chat_id = world.db.add_chat(editor.user_id)
+    high, low, replaced = chr(0xD800), chr(0xDFFF), chr(0xFFFD)
+    asked = ToolCall(
+        tool="memory",
+        action="recall",
+        args={"key": f"pl{high}an", f"no{low}te": "x"},
+        tool_call_id="call-s176",
+    )
+    new = (_tool_use(asked), _tool("No note under that key.", asked), _assistant("Not found."))
+    script.queue(_Reply(new=new, response="Not found."))
+
+    response = _send(client, editor, chat_id)
+
+    assert response.status_code == 200, response.text
+    stored = world.db.messages_of(chat_id)
+    assert [m["role"] for m in stored] == ["user", "assistant", "tool", "assistant"]
+    assert stored[1]["tool_use_blocks"] == [
+        {
+            "type": "tool_use",
+            "id": "call-s176",
+            "name": "memory.recall",
+            "input": {"key": f"pl{replaced}an", f"no{replaced}te": "x"},
+        }
+    ]

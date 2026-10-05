@@ -33,10 +33,13 @@ What these tests pin down:
   ``next_cursor`` walk returns every chat once (ties on the timestamp
   included) and ends with null; a bad cursor (garbage, a message cursor) is
   422 ``{"detail": "Invalid cursor", "reason": "invalid_cursor"}``, never
-  echoed.
+  echoed. So is a crafted cursor that decodes but can't be bound (security
+  audit L-1: a ``last_activity_at`` that overflows in UTC), never a 500.
 - GET detail: the summary plus ``messages`` (chronological, the latest page,
   ``limit`` default 100, 1 to 100), ``next_cursor`` to earlier messages and
-  the walk back to the first one; tool messages with their ``tool_call_id``;
+  the walk back to the first one (a crafted message cursor whose seq no
+  BIGINT holds is the same 422 ``invalid_cursor``, security audit L-1); tool
+  messages with their ``tool_call_id``;
   ``tool_calls`` as sanitized ``ToolCallRecord`` dicts; content sanitized like
   ``ChatResponse.response``; no ``tool_use_blocks`` key anywhere and nothing of
   their raw input. ``confirmation_status``: "none" (the latest message isn't
@@ -70,6 +73,8 @@ markers and the "Bearer" value are fake content.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import re
 import uuid
@@ -95,6 +100,8 @@ from tests.tenancy_world import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     import httpx
     from fastapi.testclient import TestClient
 
@@ -435,6 +442,32 @@ def _walk_messages(
             return pages
         params = {"limit": limit, "cursor": body["next_cursor"]}
     raise AssertionError("the message cursor walk never ended")
+
+
+def _is_seq(value: Any) -> bool:
+    return type(value) is int
+
+
+def _is_stamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _crafted(cursor: Any, is_field: Callable[[Any], bool], value: Any) -> str:
+    """A real cursor (unpadded base64url of JSON, as admino.chats encodes it) with its one
+    field ``is_field`` picks set to ``value``: it still decodes (security audit L-1)."""
+    assert isinstance(cursor, str), cursor
+    payload = json.loads(base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4)))
+    assert isinstance(payload, dict), payload
+    (name,) = [key for key, item in payload.items() if is_field(item)]
+    payload[name] = value
+    text = json.dumps(payload, separators=(",", ":"))
+    return base64.urlsafe_b64encode(text.encode()).rstrip(b"=").decode()
 
 
 def _app_log_text(caplog: pytest.LogCaptureFixture) -> str:
@@ -797,6 +830,30 @@ class TestChatsList:
         assert _outcome(on_messages) == (422, _INVALID_CURSOR)
         assert _outcome(on_list) == (422, _INVALID_CURSOR)
 
+    @pytest.mark.parametrize(
+        "stamp",
+        [
+            pytest.param("0001-01-01T00:00:00+23:00", id="year-1-at-plus-23h"),
+            pytest.param("9999-12-31T23:59:59-23:00", id="year-9999-at-minus-23h"),
+        ],
+    )
+    def test_chats_api_list_cursor_stamp_outside_the_utc_range_is_422_invalid_cursor(
+        self, world: World, client: TestClient, stamp: str
+    ) -> None:
+        """Security audit L-1: a crafted cursor that decodes but whose ``last_activity_at``
+        overflows on the conversion to UTC (asyncpg can't bind it: a 500) is the
+        documented 422 ``invalid_cursor``."""
+        caller = world.a["editor"]
+        world.db.add_chat(caller.user_id, last_activity_at=_at(1))
+        world.db.add_chat(caller.user_id, last_activity_at=_at(2))
+        first = _list(client, caller, limit=1)
+        assert first.status_code == 200, first.text
+        crafted = _crafted(first.json()["next_cursor"], _is_stamp, stamp)
+
+        response = _list(client, caller, cursor=crafted)
+
+        assert _outcome(response) == (422, _INVALID_CURSOR)
+
     @pytest.mark.parametrize("path", ["list", "detail"])
     def test_chats_api_overlong_cursor_is_422_without_echo(
         self, world: World, client: TestClient, path: str
@@ -967,6 +1024,28 @@ class TestChatsDetail:
         world.db.add_chat_message(chat, "user", "hello")
 
         response = _detail(client, world.a["editor"], chat, cursor=cursor)
+
+        assert _outcome(response) == (422, _INVALID_CURSOR)
+
+    @pytest.mark.parametrize(
+        "seq",
+        [pytest.param(2**63, id="bigint-max-plus-1"), pytest.param(10**40, id="10-to-the-40")],
+    )
+    def test_chats_api_detail_cursor_seq_outside_bigint_is_422_invalid_cursor(
+        self, world: World, client: TestClient, seq: int
+    ) -> None:
+        """Security audit L-1: a crafted message cursor that decodes but whose seq no
+        BIGINT holds (asyncpg can't bind it: a 500) is the documented 422
+        ``invalid_cursor``."""
+        caller = world.a["editor"]
+        chat = world.db.add_chat(caller.user_id)
+        world.db.add_chat_message(chat, "user", "first")
+        world.db.add_chat_message(chat, "assistant", "second")
+        latest = _detail(client, caller, chat, limit=1)
+        assert latest.status_code == 200, latest.text
+        crafted = _crafted(latest.json()["next_cursor"], _is_seq, seq)
+
+        response = _detail(client, caller, chat, cursor=crafted)
 
         assert _outcome(response) == (422, _INVALID_CURSOR)
 
