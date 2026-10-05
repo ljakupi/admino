@@ -75,8 +75,10 @@ Routes:
 - PATCH /api/chats/{chat_id} — Renames the chat.
 - DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
 - POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
-  ChatResponse (with the run's LLM error code, GH-242). The first exchange
-  of an untitled chat titles it after the response (GH-179).
+  ChatResponse (with the run's LLM error code, GH-242, or ``rate_limit`` when
+  the caller's pending-confirmation limit refused its confirmation, GH-24).
+  The first exchange of an untitled chat titles it after the response
+  (GH-179).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created on first use, until #177); returns ChatResponse.
   Titles the chat like the route above.
@@ -163,6 +165,20 @@ Security notes:
   session id is a chat of the caller's own, and a confirmation never creates
   one. Log lines name chat ids only: never a title, message text or legacy
   session id.
+- Pending confirmations (GH-24): one expires ``confirmation_timeout_s`` (the
+  stored platform limit) after its creation, by ``_utc_now``. Expired ones
+  are reaped at the start of every chat request and every
+  ``_CONFIRMATION_REAP_INTERVAL_S`` by a background task (memory only: no
+  query, no chat lock), and are never dispatched: confirming one, including
+  one that expires while the request waits for the chat's lock, is the 404
+  "No pending confirmation for this session" with nothing run or stored. A
+  user holds at most the stored ``max_pending_confirmations`` (read per
+  request) in their other chats: a run (a turn or an approved resume) asking
+  for one more keeps nothing, is stored with that call's "too many
+  confirmations are pending" result (any other dangling call cancelled) and
+  a reply, and answers 200 ``status: "error"``, ``error_code: "rate_limit"``
+  (not a 429: the turn already ran and is stored). Other users and orgs never
+  count.
 - Automatic titles (GH-179, ``admino.chat_titles``): after the first
   exchange of an untitled ``auto`` chat, a background task (after the
   response, no chat lock) sends the first message and the reply only (as
@@ -170,7 +186,8 @@ Security notes:
   through ``llm_policy.chat`` (the org's residency guard, the stored retry
   limit) to the client running at that moment, and stores the sanitized
   title by compare-and-set (``chats.set_auto_title``), so a rename always
-  wins. A failed call, a blocked provider or an ``error`` run stores the
+  wins. A failed call, a blocked provider or an ``error`` run (a
+  confirmation refused with ``rate_limit`` included, GH-24) stores the
   fallback (the first message, sanitized). So does a first run whose tool
   results hold wrapped external content (GH-243; the same rule as the chat's
   sticky ``external_content`` flag), with no model call: an email, file or
@@ -314,8 +331,9 @@ Security notes:
   password. Pending promotions live in process memory (a restart cancels
   them); an org's due ones are completed by that org's next chat run, summary
   or critical-permissions request, and a user-role notice (GH-66) is stored
-  in every chat of that org that isn't in the trash
-  (``chats.append_org_notice``), never in another org's.
+  in every chat of that org that isn't in the trash and whose latest message
+  doesn't await a confirmation (``chats.append_org_notice``, GH-24: it would
+  split a ``tool_use`` from its result), never in another org's.
 - OAuth connections are per user (GH-162): every OAuth route but the callback
   spends a per-user bucket, then needs ``Capability.OAUTH_CONNECT`` through
   ``access.can`` (Org Admin and Editor: 403 for a Viewer or a Super Admin)
@@ -352,8 +370,9 @@ Security notes:
   never logged; a failing load is the generic 500 with no run started.
 - Platform defaults apply without a restart (GH-160): the chat routes read
   the stored limits through the settings cache on every request (the message
-  length, and each agent run's tool-call, context and confirmation limits
-  and, GH-242, its LLM retry limit),
+  length, each agent run's tool-call, context and confirmation timeout
+  limits, GH-242, its LLM retry limit and, GH-24, the pending-confirmation
+  limit),
   logins the Super Admin session policy, the login throttle its lockout
   thresholds, an org deletion its grace period and the audit retention job
   its months.
@@ -426,10 +445,17 @@ Security notes:
 Deployment note:
 - Chats and their messages live in PostgreSQL. In-memory state: the bounded
   ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run locks
-  and pending confirmations, at most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries,
-  idle ones evicted after ``_CHAT_IDLE_EVICT_S``; 503 ``chats_busy`` when
-  every entry is in use; cleared by ``create_app``, so a restart turns a
-  pending confirmation into ``expired``), ``_rate_buckets`` and
+  and pending confirmations, at most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries
+  and ``_MAX_CHAT_RUNTIME_ENTRIES_PER_USER`` per user, idle ones evicted
+  after ``_CHAT_IDLE_EVICT_S``; GH-24: only the two message routes create
+  entries (a confirm on a chat without one is the 404 "No pending
+  confirmation for this session"); a user at their bound loses their own
+  least recently used entry that only holds a lock, else gets the 429
+  ``rate_limit`` before any run; at capacity the requester's own lock-only
+  entry goes first, then anyone's, then the requester's own pending
+  confirmation, never another user's; 503 ``chats_busy`` when nothing can
+  go; cleared by ``create_app``, so a restart turns a pending confirmation
+  into ``expired``), ``_rate_buckets`` and
   ``_oauth_pending_states``; ``admino.org_permissions`` keeps the pending
   promotions in memory (as ``admino.oauth`` does the access-token cache).
   This requires a **single-worker** ASGI deployment. Running multiple
@@ -504,7 +530,12 @@ from admino import (
     untrusted,
 )
 from admino.access import Capability, Principal, can
-from admino.chat_runtime import ChatRuntime, ChatRuntimeFullError
+from admino.chat_runtime import (
+    ChatRuntime,
+    ChatRuntimeFullError,
+    ChatRuntimeUserLimitError,
+    PendingConfirmationLimitError,
+)
 from admino.logs import request_id_var, safe_log
 from admino.models import (
     PROVIDER_TOOLS,
@@ -597,7 +628,7 @@ if TYPE_CHECKING:
     from admino.agent import Agent
     from admino.config import AppConfig
     from admino.llm import LLMClient
-    from admino.models import AgentStatus, MessageStatus, SettingsPatchLLM
+    from admino.models import AgentStatus, LLMErrorCode, MessageStatus, SettingsPatchLLM
 
 logger = logging.getLogger(__name__)
 
@@ -1081,10 +1112,20 @@ def _client_ip(request: Request) -> str:
 # pending confirmation (one at a time; lost on a restart, then shown as
 # expired). Routes read this module global at request time (tests swap it).
 _MAX_CHAT_RUNTIME_ENTRIES: Final = 1024
+# One user holds at most this many entries (GH-24), so one user or org can't fill
+# the runtime and push everyone else's locks and confirmations out.
+_MAX_CHAT_RUNTIME_ENTRIES_PER_USER: Final = 16
 # An entry unused this long, not in use and without a pending confirmation,
 # is evicted when another one is created.
 _CHAT_IDLE_EVICT_S: Final = 900.0
-_chat_runtime = ChatRuntime(max_entries=_MAX_CHAT_RUNTIME_ENTRIES, idle_s=_CHAT_IDLE_EVICT_S)
+_chat_runtime = ChatRuntime(
+    max_entries=_MAX_CHAT_RUNTIME_ENTRIES,
+    idle_s=_CHAT_IDLE_EVICT_S,
+    max_entries_per_user=_MAX_CHAT_RUNTIME_ENTRIES_PER_USER,
+)
+# The background reaper's pause between two passes (GH-24): an expired confirmation
+# is gone within this long even when no chat request comes in.
+_CONFIRMATION_REAP_INTERVAL_S: Final = 30.0
 
 # OAuth state binding (GH-162): the authorize route stores the state with the
 # initiating user and session, and sets this short-lived cookie (HttpOnly,
@@ -1128,27 +1169,62 @@ _config: AppConfig | None = None
 # ---------------------------------------------------------------------------
 
 
+def _utc_now() -> datetime:
+    """The current aware UTC time: the only clock of the confirmation expiry (GH-24).
+
+    Read by ``_reap_expired_confirmations`` and by ``post_confirm``'s expiry
+    check, so both agree on when a confirmation expired (tests move it).
+    """
+    return datetime.now(UTC)
+
+
 def _reap_expired_confirmations() -> None:
     """Drop every expired pending confirmation from ``_chat_runtime``.
 
     Called unconditionally at the top of the chat turns, ``post_confirm`` and
-    the chat detail (before taking a chat's lock), so stale confirmations
-    never accumulate and a chat shows an expired one as ``expired``. This is
-    the enforcement point for the stored ``confirmation_timeout_s``.
+    the chat detail (before taking a chat's lock), and every
+    ``_CONFIRMATION_REAP_INTERVAL_S`` by ``_run_confirmation_reaper``, so
+    stale confirmations never accumulate, an expired one frees its slot of
+    the per-user pending limit and a chat shows it as ``expired``. This is
+    the enforcement point for the stored ``confirmation_timeout_s``
+    (``now >= expires_at`` by ``_utc_now``).
 
     IMPORTANT: This function must remain synchronous (no ``await`` calls).
     Callers invoke it outside per-chat locks, so it must complete
     atomically within a single event-loop tick to avoid cross-chat
-    race conditions on the runtime's pending confirmations.
+    race conditions on the runtime's pending confirmations. It never
+    waits for a chat's lock and never touches the database.
     """
-    reaped = _chat_runtime.reap_expired(datetime.now(UTC))
+    reaped = _chat_runtime.reap_expired(_utc_now())
     if reaped:
         logger.info("Reaped %d expired confirmation(s)", reaped)
+
+
+async def _run_confirmation_reaper() -> None:
+    """Reap expired confirmations every ``_CONFIRMATION_REAP_INTERVAL_S``, until cancelled.
+
+    The background half of the expiry (GH-24): a confirmation expires even
+    when no chat request comes in. Each pass is ``_reap_expired_confirmations``
+    (memory only: no chat lock, no query), so it never blocks a request. A
+    failing pass is logged by its exception class only (never its message)
+    and the loop goes on. The interval and ``asyncio.sleep`` are looked up on
+    every pass.
+    """
+    while True:
+        await asyncio.sleep(_CONFIRMATION_REAP_INTERVAL_S)
+        try:
+            _reap_expired_confirmations()
+        except Exception as exc:
+            # A broken pass must not end the expiry for the life of the process.
+            logger.warning("Confirmation reaper pass failed: %s", type(exc).__name__)
 
 
 _CANCELLED_TOOL_RESULT_MSG = "Tool call cancelled — user sent a new message instead of confirming."
 # The stored tool result answering a denied call (GH-176), so the history stays well-formed.
 _DENIED_TOOL_RESULT_MSG: Final = "Tool call denied by the user."
+# The stored tool result answering a call whose confirmation the per-user pending limit
+# refused (GH-24).
+_PENDING_LIMIT_TOOL_RESULT_MSG: Final = "Tool call denied: too many confirmations are pending."
 _NO_PENDING_DETAIL: Final = "No pending confirmation for this session"
 
 # The documented error bodies of the chat routes (GH-176).
@@ -1157,6 +1233,11 @@ _INVALID_CURSOR_BODY: Final = {"detail": "Invalid cursor", "reason": "invalid_cu
 _CHATS_BUSY_BODY: Final = {
     "detail": "Too many active chats. Try again shortly.",
     "reason": "chats_busy",
+}
+# GH-24: the caller is at their per-user chat-runtime bound.
+_USER_CHATS_BUSY_BODY: Final = {
+    "detail": "Too many of your chats are active. Try again shortly.",
+    "reason": "rate_limit",
 }
 
 # The stored status of a run's last message: a run's ``final`` is ``complete``.
@@ -3604,19 +3685,20 @@ async def delete_chat(request: Request, principal: _ChatSenderDep, chat_id: UUID
 
 
 def _denied_tool_results(
-    loaded: list[LLMMessage], pending: PendingConfirmation
+    history: list[LLMMessage], pending: PendingConfirmation, denied: str
 ) -> list[LLMMessage]:
-    """The ``tool`` results a denial stores for the last assistant turn's dangling calls.
+    """The ``tool`` results closing the last assistant turn's dangling calls of ``history``.
 
     One per dangling ``tool_use`` block, in block order (those of
-    ``_close_dangling_tool_use``): the denied call's says so, any other
-    (a later call of the same batch) is cancelled.
+    ``_close_dangling_tool_use``): the pending call's is ``denied`` (a user's
+    denial, or the per-user pending limit), any other (a later call of the
+    same batch) is cancelled.
     """
     return [
-        LLMMessage(role="tool", content=_DENIED_TOOL_RESULT_MSG, tool_call_id=message.tool_call_id)
+        LLMMessage(role="tool", content=denied, tool_call_id=message.tool_call_id)
         if message.tool_call_id == pending.tool_call.tool_call_id
         else message
-        for message in _close_dangling_tool_use(loaded)[len(loaded) :]
+        for message in _close_dangling_tool_use(history)[len(history) :]
     ]
 
 
@@ -3627,6 +3709,8 @@ async def _finish_run(
     loaded: list[LLMMessage],
     result: AgentResult,
     session_id: str | None,
+    *,
+    max_pending: int,
 ) -> ChatResponse:
     """Store a run's new messages, keep its pending confirmation and build the response.
 
@@ -3634,8 +3718,16 @@ async def _finish_run(
     followed by the run's messages, so the new ones are
     ``result.history[len(loaded):]`` (synthetic cancelled results included).
     The last one is stored with the run's status (``final`` as ``complete``)
-    and its tool calls. An ``awaiting_confirmation`` run's confirmation goes
-    to ``_chat_runtime``.
+    and its tool calls, in one append.
+
+    An ``awaiting_confirmation`` run's confirmation goes to ``_chat_runtime``
+    before the append, checked against the caller's pending limit in the same
+    step (GH-24), and is dropped again when the append fails. At the limit
+    nothing is kept: the turn is stored with the closing ``tool`` results of
+    the dangling calls (the pending call's ``_PENDING_LIMIT_TOOL_RESULT_MSG``,
+    any other the cancelled result) and a reply naming the call, the last
+    one with status ``error``, and the answer is a 200 with ``error_code:
+    "rate_limit"``.
 
     Args:
         pool: The database pool.
@@ -3644,40 +3736,78 @@ async def _finish_run(
         loaded: The stored messages the run's history was built from.
         result: The run's result.
         session_id: The legacy session id to echo, or None.
+        max_pending: The stored platform ``max_pending_confirmations`` read
+            for this request: the most pending confirmations the caller may
+            hold in their other chats.
 
     Returns:
-        The ChatResponse naming the chat (with the run's LLM error code).
+        The ChatResponse naming the chat (with the run's LLM error code, or
+        ``rate_limit`` when its confirmation was refused).
 
     Raises:
         chats.ChatNotFoundError: The chat was trashed during the run; nothing
-            is stored.
+            is stored and no confirmation kept.
     """
-    await chats.append_messages(
-        pool,
-        tenant,
-        chat.id,
-        result.history[len(loaded) :],
-        final_status=_STORED_STATUS[result.status],
-        tool_calls=result.tool_calls,
-    )
+    new_messages = result.history[len(loaded) :]
+    status: AgentStatus = result.status
+    response = result.response
+    error_code: Literal[LLMErrorCode, "rate_limit"] | None = result.error_code
+    pending = result.pending_confirmation
     pending_summary: PendingConfirmationSummary | None = None
-    if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
-        _chat_runtime.set_pending(chat.id, tenant.user_id, result.pending_confirmation)
-        pending_summary = _summarise_pending(result.pending_confirmation)
+    if status == "awaiting_confirmation" and pending is not None:
+        try:
+            # Checks the limit and stores without an await in between, so two concurrent
+            # turns of the caller can't both take the last slot.
+            _chat_runtime.set_pending(
+                chat.id, tenant.user_id, pending, max_pending_per_user=max_pending
+            )
+        except PendingConfirmationLimitError:
+            # A 200, not a 429: the turn already ran and is stored, and a client
+            # retrying a 429 would run it twice. Safe f-string: tool and action are
+            # Pydantic-validated identifiers (pattern ^[a-z][a-z0-9_]{0,62}$);
+            # ChatResponse.sanitize_response is defence-in-depth.
+            response = (
+                f"Action {pending.tool_call.tool}.{pending.tool_call.action} was not run:"
+                " too many confirmations are pending. Approve or deny one of them first."
+            )
+            new_messages = [
+                *new_messages,
+                *_denied_tool_results(result.history, pending, _PENDING_LIMIT_TOOL_RESULT_MSG),
+                LLMMessage(role="assistant", content=response),
+            ]
+            status, error_code = "error", "rate_limit"
+            logger.info("Chat %s: confirmation refused, too many pending", safe_log(chat.id))
+        else:
+            pending_summary = _summarise_pending(pending)
+    try:
+        await chats.append_messages(
+            pool,
+            tenant,
+            chat.id,
+            new_messages,
+            final_status=_STORED_STATUS[status],
+            tool_calls=result.tool_calls,
+        )
+    except BaseException:
+        # Whatever stopped the store (a chat trashed meanwhile, a database error, a
+        # cancelled request), no confirmation may outlive the messages it belongs to.
+        if pending_summary is not None:
+            _chat_runtime.pop_pending(chat.id)
+        raise
     logger.info(
         "Completed message for chat %s: status=%s, tool_calls=%d",
         safe_log(chat.id),
-        result.status,
+        status,
         len(result.tool_calls),
     )
     return ChatResponse(
         chat_id=chat.id,
         session_id=session_id,
-        response=result.response,
+        response=response,
         tool_calls=result.tool_calls,
-        status=result.status,
+        status=status,
         pending_confirmation=pending_summary,
-        error_code=result.error_code,
+        error_code=error_code,
     )
 
 
@@ -3735,14 +3865,17 @@ async def _chat_turn(
     and the agent runs with ``str(chat.id)`` as its session id and the chat's
     sticky ``external_content`` flag (GH-243) as read under the lock, so a
     turn queued behind one that stored wrapped content is escalated by it.
-    Then the turn is stored (``_finish_run``).
+    Then the turn is stored (``_finish_run``: a confirmation it asks for is
+    kept within the caller's stored ``max_pending_confirmations``, else
+    refused with ``rate_limit``, GH-24).
 
     Once it is stored, the chat's first exchange (the chat as read under the
     lock is untitled with ``title_source`` "auto", and the loaded history
     holds no ``assistant`` message; a GH-66 notice is a user message) gets
     its title after the response is sent (GH-179,
     ``chat_titles.title_chat``): the model's from the message and the reply,
-    or the fallback from the message. An ``error`` run makes no model call,
+    or the fallback from the message. A turn stored as ``error`` (a
+    confirmation refused with ``rate_limit`` included) makes no model call,
     nor does a run whose new ``tool`` results hold wrapped external content
     (``_read_external_content``): the reply may quote an email or a file,
     which must not choose the title. The task gets the agent's client when it
@@ -3766,8 +3899,11 @@ async def _chat_turn(
             fails (nothing stored).
         chats.ChatNotFoundError: The chat isn't the caller's, or was trashed
             during the run (404 ``chat_not_found``, nothing stored).
-        ChatRuntimeFullError: Every chat-runtime entry is in use (503
-            ``chats_busy``, no run).
+        ChatRuntimeUserLimitError: The chat has no runtime entry and the
+            caller's entries are all in use or hold a pending confirmation
+            (429 ``rate_limit``, GH-24; no run, nothing stored).
+        ChatRuntimeFullError: The runtime is full and no entry can be evicted
+            (503 ``chats_busy``, no run).
     """
     if _agent is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -3829,7 +3965,15 @@ async def _chat_turn(
         except Exception:
             logger.error("Agent run failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
-        response = await _finish_run(pool, tenant, chat, loaded, result, session_id)
+        response = await _finish_run(
+            pool,
+            tenant,
+            chat,
+            loaded,
+            result,
+            session_id,
+            max_pending=platform.limits.max_pending_confirmations,
+        )
     # Only an untitled chat's first exchange: a stored reply means it had one (a GH-66
     # notice is a user message and doesn't count). The task runs after the response.
     if (
@@ -3845,7 +3989,9 @@ async def _chat_turn(
             get_client=_running_llm_client,
             user_message=message,
             assistant_message=result.response,
-            run_failed=result.status == "error",
+            # The stored status: a confirmation refused by the pending limit (GH-24)
+            # stored an error turn, which gets the fallback like any other.
+            run_failed=response.status == "error",
             external_content=_read_external_content(loaded, result),
             data_residency=policy.data_residency,
             max_retries=platform.llm.max_retries,
@@ -3873,14 +4019,17 @@ async def post_chat_message(
 
     Returns:
         ChatResponse with the chat's id (``session_id`` None), the agent's
-        reply, the tool call summary, the pending confirmation and the run's
-        LLM error code (None unless a coded LLM error ended it).
+        reply, the tool call summary, the pending confirmation and the error
+        code: the run's LLM error code, or ``rate_limit`` (``status:
+        "error"``, GH-24) when the caller already holds the stored
+        ``max_pending_confirmations`` in other chats; None otherwise.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
             length, 500 when the agent fails. A chat the caller can't reach is
-            the 404 ``chat_not_found``; a full chat runtime the 503
-            ``chats_busy``.
+            the 404 ``chat_not_found``; the caller at their chat-runtime
+            bound the 429 ``rate_limit`` (GH-24); a full chat runtime with
+            nothing to evict the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
     return await _chat_turn(principal, body.message, chat_id, background_tasks)
@@ -3907,13 +4056,16 @@ async def post_message(
 
     Returns:
         ChatResponse with the chat's id, the echoed session id, the agent's
-        reply, the tool call summary and the run's LLM error code (None
-        unless a coded LLM error ended it).
+        reply, the tool call summary, the pending confirmation and the error
+        code: the run's LLM error code, or ``rate_limit`` (``status:
+        "error"``, GH-24) when the caller already holds the stored
+        ``max_pending_confirmations`` in other chats; None otherwise.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
-            length, 500 when the agent fails. A full chat runtime is the 503
-            ``chats_busy``.
+            length, 500 when the agent fails. The caller at their
+            chat-runtime bound is the 429 ``rate_limit`` (GH-24); a full chat
+            runtime with nothing to evict the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
     return await _chat_turn(principal, body.message, body.session_id, background_tasks)
@@ -4005,8 +4157,13 @@ async def post_confirm(
     The body names the chat by ``chat_id`` or by the legacy ``session_id``
     (looked up, never created); a chat the caller can't reach, or one
     without a pending confirmation in ``_chat_runtime``, is the same 404.
-    Under the chat's lock the confirmation id and the expiry are checked and
-    the confirmation is consumed. A denial stores the closing ``tool``
+    A confirm never creates a runtime entry: a chat without one is that 404
+    before its lock is taken, so nothing is evicted, run or stored (GH-24).
+    Expired confirmations are reaped first. Under the chat's lock the
+    confirmation id and the expiry are checked (``_utc_now``) and the
+    confirmation is consumed: one that expired meanwhile (while the request
+    waited for the lock) is popped and answers the same 404 as one already
+    reaped, with nothing run or stored (GH-24). A denial stores the closing ``tool``
     results (the denied call's "Tool call denied by the user.", any other
     dangling call's cancelled result) and the assistant's denial, so the
     history stays well-formed. An approval resumes the agent on the latest
@@ -4016,7 +4173,9 @@ async def post_confirm(
     that ran in front of the approval counts), the stored platform limits
     and LLM retry limit (read on every request, GH-160, GH-242) and their org's tool
     policy as it is now (loaded again, after completing the org's due
-    promotions; GH-161), then stores the run like a turn. An approved resume
+    promotions; GH-161), then stores the run like a turn (a confirmation it
+    asks for counts against the caller's stored ``max_pending_confirmations``
+    in their other chats, the consumed one not included; GH-24). An approved resume
     also loads the caller's prompt context again (GH-170), so a change made
     while the confirmation was pending applies; a failing load is the
     generic 500 with nothing resumed, echoed or logged. Under the org's data
@@ -4033,15 +4192,15 @@ async def post_confirm(
 
     Returns:
         ChatResponse naming the chat (``session_id`` echoed when given) with
-        the result of the resumed agent run (its LLM error code included;
-        None for a denial).
+        the result of the resumed agent run (its LLM error code, or
+        ``rate_limit`` when the confirmation it asked for was refused; None
+        for a denial).
 
     Raises:
-        HTTPException: 404 if no confirmation is pending for the chat or the
-            id doesn't match, 400 if the IDs mismatch, 410 if the
-            confirmation has expired, 500 when the agent fails. A chat
-            trashed meanwhile is the 404 ``chat_not_found``; a full chat
-            runtime the 503 ``chats_busy``.
+        HTTPException: 404 if no confirmation is pending for the chat, it has
+            expired or the id doesn't match, 400 if the IDs mismatch, 500
+            when the agent fails. A chat trashed meanwhile is the 404
+            ``chat_not_found``.
     """
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -4066,6 +4225,15 @@ async def post_confirm(
     except chats.ChatNotFoundError:
         raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL) from None
 
+    # A chat without a runtime entry has nothing pending, and a confirm never creates
+    # one: otherwise a stale confirm could hit the per-user 429 or, at capacity, evict
+    # the caller's own pending confirmation elsewhere (GH-24, audit L-1). Only "no
+    # entry" answers here: an approval queued behind a running turn of the chat must
+    # still wait for the lock (the turn may store the confirmation it approves). No
+    # await before hold(), so the entry checked is the one hold() finds.
+    if chat.id not in _chat_runtime:
+        raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
+
     # Per-chat lock serialises with concurrent turns of the chat.
     async with _chat_runtime.hold(chat.id, tenant.user_id):
         pending = _chat_runtime.get_pending(chat.id)
@@ -4080,11 +4248,11 @@ async def post_confirm(
         if body.confirmation_id != confirmation_id:
             raise HTTPException(status_code=400, detail="Confirmation ID mismatch")
 
-        # Check expiry at server layer — avoids a full agent round trip for
-        # expired confirmations that the registry would also reject.
-        if datetime.now(UTC) >= pending.expires_at:
+        # It may have expired while this request waited for the lock (after its reap
+        # kept it): the same 404 as one already reaped, nothing run or stored (GH-24).
+        if _utc_now() >= pending.expires_at:
             _chat_runtime.pop_pending(chat.id)
-            raise HTTPException(status_code=410, detail="Confirmation has expired")
+            raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
 
         # Consume the pending confirmation regardless of approval/denial.
         _chat_runtime.pop_pending(chat.id)
@@ -4103,7 +4271,7 @@ async def post_confirm(
                 tenant,
                 chat.id,
                 [
-                    *_denied_tool_results(loaded, pending),
+                    *_denied_tool_results(loaded, pending, _DENIED_TOOL_RESULT_MSG),
                     LLMMessage(role="assistant", content=denial),
                 ],
             )
@@ -4143,7 +4311,15 @@ async def post_confirm(
             logger.error("Agent resume failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
 
-        return await _finish_run(pool, tenant, chat, loaded, result, body.session_id)
+        return await _finish_run(
+            pool,
+            tenant,
+            chat,
+            loaded,
+            result,
+            body.session_id,
+            max_pending=platform.limits.max_pending_confirmations,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -5374,8 +5550,17 @@ async def _invalid_cursor_handler(request: Request, exc: Exception) -> JSONRespo
 
 
 async def _chats_busy_handler(request: Request, exc: Exception) -> JSONResponse:
-    """``ChatRuntimeFullError``: the 503 ``chats_busy`` (every runtime entry is in use)."""
+    """``ChatRuntimeFullError``: the 503 ``chats_busy`` (no runtime entry can be evicted)."""
     return JSONResponse(status_code=503, content=_CHATS_BUSY_BODY)
+
+
+async def _user_chats_busy_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``ChatRuntimeUserLimitError``: the 429 ``rate_limit`` (GH-24).
+
+    The caller's runtime entries are all in use or hold a pending
+    confirmation; raised before any agent run, with nothing stored.
+    """
+    return JSONResponse(status_code=429, content=_USER_CHATS_BUSY_BODY)
 
 
 # ---------------------------------------------------------------------------
@@ -5387,8 +5572,9 @@ async def _chats_busy_handler(request: Request, exc: Exception) -> JSONResponse:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
     expired-session purge, the organization purge, the expired login-throttle
-    purge and, when SMTP is configured, the email outbox sender on startup;
-    stop the background tasks, then close the pool, on shutdown.
+    purge, the expired-confirmation reaper and, when SMTP is configured, the
+    email outbox sender on startup; stop the background tasks, then close the
+    pool, on shutdown.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -5448,10 +5634,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         else None
     )
 
+    # GH-24: expired pending confirmations are reaped every 30 seconds while the app
+    # is up, even without a chat request (memory only: no query, no chat lock).
+    # Looked up at call time, like the session purge; cancelled before the pool
+    # closes.
+    confirmation_reaper_task = asyncio.create_task(_run_confirmation_reaper())
+
     # GH-161: no tools gate or promoted permissions are loaded into the agent:
     # every chat run loads its own org's tool policy.
 
     yield
+    confirmation_reaper_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await confirmation_reaper_task
     retention_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await retention_task
@@ -5559,6 +5754,8 @@ def create_app(
     app.add_exception_handler(chats.ChatNotFoundError, _chat_not_found_handler)
     app.add_exception_handler(chats.InvalidCursorError, _invalid_cursor_handler)
     app.add_exception_handler(ChatRuntimeFullError, _chats_busy_handler)
+    # GH-24: the caller's per-user chat-runtime bound.
+    app.add_exception_handler(ChatRuntimeUserLimitError, _user_chats_busy_handler)
 
     # --- Routes ---
     # Public: health check, login, password reset, the invitation link routes

@@ -14,15 +14,40 @@ must not be stored there lives here, one entry per chat:
 
 Inputs: chat and user ids (server-generated UUIDs), ``PendingConfirmation``
 models, the current time for ``reap_expired``.
-Outputs: ``hold()`` context managers, stored confirmations, counts.
+Outputs: ``hold()`` context managers, stored confirmations, counts, and
+whether a chat has an entry (``chat_id in runtime``, which never creates one).
+Errors: ``ChatRuntimeFullError``, ``ChatRuntimeUserLimitError`` and
+``PendingConfirmationLimitError`` (see below).
 
-Bound: at most ``max_entries`` entries. Creating one (``hold`` or
-``set_pending`` on an unknown chat) first evicts the idle entries (not in
-use, no pending confirmation, last used at least ``idle_s`` ago), then, at
-capacity, the least recently used entry not in use (its pending confirmation
-goes with it). An entry in use is never evicted; when every entry is in use,
-``ChatRuntimeFullError`` is raised and nothing changes (the server answers
-503 ``chats_busy``).
+Bound: at most ``max_entries`` entries, and (when ``max_entries_per_user``
+is set) at most that many per owner, so one user can't push everyone else's
+state out (GH-24). A chat that already has an entry is always served; creating
+one (``hold`` or ``set_pending`` on an unknown chat) runs, in order:
+
+1. Idle eviction: every entry not in use, without a pending confirmation and
+   last used at least ``idle_s`` ago goes, whoever owns it.
+2. Per-user bound: an owner at the bound loses their least recently used
+   entry not in use and without a pending confirmation; when none of theirs
+   can go, ``ChatRuntimeUserLimitError`` is raised, nothing is created and
+   nothing beyond the idle entries is evicted (the server answers 429
+   ``rate_limit``).
+3. Global bound: at capacity, one victim goes, the first that exists of the
+   owner's least recently used entry not in use without a pending
+   confirmation, anyone's such entry, then the owner's least recently used
+   entry not in use with a pending confirmation (that confirmation is lost).
+   Another user's pending confirmation is never evicted, so a user filling
+   the runtime can't cancel someone else's confirmation. Without a victim,
+   ``ChatRuntimeFullError`` is raised and nothing changes (the server answers
+   503 ``chats_busy``).
+
+"Least recently used" is the order of the last ``hold`` entry or exit or
+``set_pending``. An entry in use is never evicted.
+
+Pending-confirmation limit: ``set_pending(..., max_pending_per_user=N)``
+raises ``PendingConfirmationLimitError`` and changes nothing when the owner
+already holds ``N`` stored confirmations (expired ones included: reaping is
+the caller's job) in their other chats. Replacing a chat's own confirmation
+never counts against it, nor do other users' confirmations.
 
 Single process: the state belongs to one event loop in one process (admino
 runs a single uvicorn worker). Several workers would each hold their own
@@ -34,8 +59,8 @@ Security notes:
 - Nothing here checks ownership: the server resolves the chat through the
   tenant-scoped repository (owner-private, cross-org 404) before calling in,
   so a caller only ever names a chat of its own.
-- Log lines carry counts only, never a confirmation's tool arguments, a chat
-  title or message content.
+- Log lines carry counts only, never a chat, user or confirmation id, a
+  confirmation's tool arguments, a chat title or message content.
 """
 
 from __future__ import annotations
@@ -59,7 +84,15 @@ logger = logging.getLogger(__name__)
 
 
 class ChatRuntimeFullError(RuntimeError):
-    """Every entry is in use, so no entry can be created for another chat."""
+    """At capacity and no entry can be evicted, so no entry can be created for another chat."""
+
+
+class ChatRuntimeUserLimitError(RuntimeError):
+    """The owner is at their per-user bound and none of their entries can be evicted."""
+
+
+class PendingConfirmationLimitError(RuntimeError):
+    """The owner already holds the allowed number of pending confirmations in other chats."""
 
 
 @dataclass(slots=True)
@@ -76,13 +109,14 @@ class _Entry:
 
 
 class ChatRuntime:
-    """Per-chat run locks and pending confirmations, bounded to ``max_entries`` entries."""
+    """Per-chat run locks and pending confirmations, bounded globally and per owner."""
 
     def __init__(
         self,
         *,
         max_entries: int,
         idle_s: float,
+        max_entries_per_user: int | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         """Create an empty runtime.
@@ -92,10 +126,13 @@ class ChatRuntime:
             idle_s: Seconds after its last use from which an entry not in use
                 and without a pending confirmation is idle (evicted on the next
                 creation).
+            max_entries_per_user: The most entries one owner holds at once;
+                None for no per-user bound (only ``max_entries`` applies).
             clock: Monotonic seconds; injected so tests control time.
         """
         self._max_entries = max_entries
         self._idle_s = idle_s
+        self._max_entries_per_user = max_entries_per_user
         self._clock = clock
         # Least recently used first: every use moves the entry to the end.
         self._entries: OrderedDict[UUID, _Entry] = OrderedDict()
@@ -103,6 +140,14 @@ class ChatRuntime:
     def __len__(self) -> int:
         """The number of entries."""
         return len(self._entries)
+
+    def __contains__(self, chat_id: UUID) -> bool:
+        """Whether the chat has an entry (``chat_id in runtime``); never creates one.
+
+        Synchronous, so a caller that checks it and then enters ``hold`` with no
+        ``await`` in between finds the same entry there and creates none.
+        """
+        return chat_id in self._entries
 
     @contextlib.asynccontextmanager
     async def hold(self, chat_id: UUID, owner_user_id: UUID) -> AsyncIterator[None]:
@@ -113,7 +158,10 @@ class ChatRuntime:
         body exits, an exception included.
 
         Raises:
-            ChatRuntimeFullError: The chat has no entry and every entry is in use.
+            ChatRuntimeUserLimitError: The chat has no entry and none of the
+                owner's entries can make room under the per-user bound.
+            ChatRuntimeFullError: The chat has no entry and none can be evicted
+                at capacity.
         """
         entry = self._entries.get(chat_id)
         if entry is None:
@@ -127,12 +175,42 @@ class ChatRuntime:
             entry.in_use -= 1
             self._touch(chat_id, entry)
 
-    def set_pending(self, chat_id: UUID, owner_user_id: UUID, pending: PendingConfirmation) -> None:
+    def set_pending(
+        self,
+        chat_id: UUID,
+        owner_user_id: UUID,
+        pending: PendingConfirmation,
+        *,
+        max_pending_per_user: int | None = None,
+    ) -> None:
         """Store the chat's pending confirmation, replacing any earlier one.
 
+        Args:
+            chat_id: The chat.
+            owner_user_id: The chat's owner.
+            pending: The confirmation to store.
+            max_pending_per_user: When given, the most pending confirmations
+                the owner may hold in their other chats before this one is
+                refused; None for no limit.
+
         Raises:
-            ChatRuntimeFullError: The chat has no entry and every entry is in use.
+            PendingConfirmationLimitError: The owner's other chats already hold
+                ``max_pending_per_user`` stored confirmations (expired or not).
+            ChatRuntimeUserLimitError: The chat has no entry and none of the
+                owner's entries can make room under the per-user bound.
+            ChatRuntimeFullError: The chat has no entry and none can be evicted
+                at capacity.
         """
+        if max_pending_per_user is not None:
+            held = sum(
+                1
+                for known_id, known in self._entries.items()
+                if known_id != chat_id
+                and known.owner_user_id == owner_user_id
+                and known.pending is not None
+            )
+            if held >= max_pending_per_user:
+                raise PendingConfirmationLimitError
         entry = self._entries.get(chat_id)
         if entry is None:
             entry = self._create(chat_id, owner_user_id)
@@ -185,7 +263,7 @@ class ChatRuntime:
             self._entries.move_to_end(chat_id)
 
     def _create(self, chat_id: UUID, owner_user_id: UUID) -> _Entry:
-        """Make room under the bound, then add an entry for the chat."""
+        """Make room under the bounds (see the module docstring), then add an entry for the chat."""
         now = self._clock()
         idle: list[UUID] = []
         for known_id, known in self._entries.items():
@@ -196,22 +274,66 @@ class ChatRuntime:
                 idle.append(known_id)
         for known_id in idle:
             del self._entries[known_id]
+        if self._max_entries_per_user is not None:
+            owned = [
+                (known_id, known)
+                for known_id, known in self._entries.items()
+                if known.owner_user_id == owner_user_id
+            ]
+            if len(owned) >= self._max_entries_per_user:
+                victim = next(
+                    (
+                        known_id
+                        for known_id, known in owned
+                        if known.in_use == 0 and known.pending is None
+                    ),
+                    None,
+                )
+                if victim is None:
+                    logger.info(
+                        "Chat runtime: a user's %d entries are all in use or pending", len(owned)
+                    )
+                    raise ChatRuntimeUserLimitError
+                del self._entries[victim]
         if len(self._entries) >= self._max_entries:
-            self._evict_least_recently_used()
+            self._evict_one(owner_user_id)
         entry = _Entry(owner_user_id=owner_user_id, last_used=now)
         self._entries[chat_id] = entry
         return entry
 
-    def _evict_least_recently_used(self) -> None:
-        """Evict the least recently used entry not in use, with its pending confirmation.
+    def _evict_one(self, owner_user_id: UUID) -> None:
+        """Evict one entry not in use, in the module's victim order, for a new entry of the owner.
 
         Raises:
-            ChatRuntimeFullError: Every entry is in use (nothing is evicted).
+            ChatRuntimeFullError: No entry can go (nothing is evicted).
         """
-        victim = next((key for key, entry in self._entries.items() if entry.in_use == 0), None)
+        free = [(key, entry) for key, entry in self._entries.items() if entry.in_use == 0]
+        own_without_pending = next(
+            (
+                key
+                for key, entry in free
+                if entry.owner_user_id == owner_user_id and entry.pending is None
+            ),
+            None,
+        )
+        any_without_pending = next((key for key, entry in free if entry.pending is None), None)
+        # Chosen only when neither of the above exists: the owner's free entries then all
+        # hold a confirmation.
+        own_with_pending = next(
+            (key for key, entry in free if entry.owner_user_id == owner_user_id), None
+        )
+        victim = next(
+            (
+                key
+                for key in (own_without_pending, any_without_pending, own_with_pending)
+                if key is not None
+            ),
+            None,
+        )
         if victim is None:
-            logger.warning("Chat runtime full: all %d entries are in use", len(self._entries))
+            logger.warning(
+                "Chat runtime full: none of its %d entries can be evicted", len(self._entries)
+            )
             raise ChatRuntimeFullError
-        dropped = self._entries.pop(victim).pending is not None
-        if dropped:
+        if self._entries.pop(victim).pending is not None:
             logger.info("Chat runtime evicted a chat with a pending confirmation")

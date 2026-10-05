@@ -114,13 +114,14 @@ A chat reply that fails has `status: "error"`, and the `POST /api/chats/{id}/mes
 | `timeout` | The provider didn't answer within `llm.timeout_s`. |
 | `context_too_long` | The conversation is longer than the model accepts (400/413). Start a new chat. |
 | `residency_blocked` | The organization's data residency policy is on and the provider isn't Swiss (see [above](#data-residency-and-the-provider)). |
+| `rate_limit` | Not an LLM failure: you already have as many pending confirmations as allowed (`max_pending_confirmations`, a [platform default](#platform-defaults), 3 by default), so the action that needed one more wasn't run. The turn is stored (see [Chats](#chats)). Unlike `rate_limited`, it's admino's own limit, not the provider's. |
 
 Any other failure has `error_code: null`. The chat shows the code's translated text
 (English, German or French), or a generic "Something went wrong" text when there's no
-code. The response's `response` field holds an English fallback text. **Provider text is
-never shown or logged**: no provider message, response body or provider error code
-reaches a response or a log line. Errors are logged by their type, HTTP status and code
-only.
+code (and, in this release, for `rate_limit`). The response's `response` field holds an
+English fallback text. **Provider text is never shown or logged**: no provider message,
+response body or provider error code reaches a response or a log line. Errors are logged
+by their type, HTTP status and code only.
 
 **Retries.** A `timeout`, `provider_unavailable` or `rate_limited` failure is retried up to
 `llm.max_retries` times (a [platform default](#platform-defaults): 2, from 0 to 5, `0`
@@ -342,7 +343,7 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `llm` | `image_input` | from `config.yaml` (`true`) | `true` / `false` | image attachments (later release) |
 | `llm` | `max_retries` | 2 | 0–5 | every message ([retries](#llm-errors-and-retries)) |
 | `limits` | `max_tool_calls_per_message` | from `config.yaml` (10) | 1–100 | every message |
-| `limits` | `max_pending_confirmations` | from `config.yaml` (3) | 1–50 | — |
+| `limits` | `max_pending_confirmations` | from `config.yaml` (3) | 1–50 | every message |
 | `limits` | `confirmation_timeout_s` | from `config.yaml` (300) | 10–3600 | every message |
 | `limits` | `max_message_length` | from `config.yaml` (4000) | 1–100,000 | every message |
 | `limits` | `max_context_messages` | from `config.yaml` (20) | 1–200 | every message |
@@ -694,8 +695,16 @@ Viewer's chats from before a role change stay stored, unused.
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":
   "chat_not_found"}`, so nobody learns that someone else's chat exists. A chat ID that
-  isn't a UUID answers `422`. `503` with `"reason": "chats_busy"` means the server is
-  already running as many chats at once as it can hold; try again shortly.
+  isn't a UUID answers `422`. A message (`POST /api/chats/{id}/messages` or
+  `POST /api/message`) answers `429` `{"detail": "Too many of your chats are active. Try
+  again shortly.", "reason": "rate_limit"}` when your 16 chats in the server's memory
+  are all running or waiting for a confirmation (see below), and `503` with `"reason":
+  "chats_busy"` when the server is already running as many chats at once as it can hold.
+  Only these two message routes answer this `429` or `503`. In either case your message
+  doesn't run and isn't stored; try again shortly. Two things still happen first: a new
+  `session_id` on `POST /api/message` creates its chat, and the notes of
+  [promoted permissions](permissions.md#promoting-a-critical-permission) that just took
+  effect are added to your organization's chats (see below).
 - **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages` and
   `POST /api/message` share one limit, so switching between them doesn't double your
   rate.
@@ -704,16 +713,50 @@ Viewer's chats from before a role change stay stored, unused.
   `POST /api/confirm/{confirmation_id}` and
   `{"chat_id": "...", "confirmation_id": "...", "approved": true}` (or `false`). A denial
   is stored in the chat too, as "Tool call denied by the user." and "Action … was
-  denied." A new message in the chat cancels a pending confirmation.
+  denied." A new message in the chat cancels a pending confirmation. Confirming in a chat
+  with nothing pending (expired, already answered or never asked for) answers `404`
+  `{"detail": "No pending confirmation for this session"}` and nothing runs. Confirming
+  never adds a chat to the server's memory (see below), so it never answers the
+  `rate_limit` `429` or the `chats_busy` `503` described above and never drops another of
+  your confirmations. Its own per-user rate limit can still answer `429`
+  `{"detail": "Rate limit exceeded"}`.
+- **At most 3 pending confirmations per user.** You can have up to
+  `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
+  confirmations waiting at once, across your chats. When you're at the limit, a message
+  (or an approval) whose action needs one more answers `200` with `status: "error"`,
+  `error_code: "rate_limit"` and no `pending_confirmation`: the action doesn't run. The
+  chat stores the turn with "Tool call denied: too many confirmations are pending." as
+  that action's result and the reply "Action … was not run: too many confirmations are
+  pending. Approve or deny one of them first." Approving, denying or cancelling one of
+  your confirmations frees its slot, and so does one that expires. Other users'
+  confirmations never count against yours.
 - **Pending confirmations live in memory only.** The chat and its messages are stored,
   but the pending confirmations and the lock that runs one message at a time per chat are
-  kept in the server's memory, for a limited number of chats; idle ones are dropped. So
-  after a restart, or once a confirmation timed out (`confirmation_timeout_s`, a
-  [platform default](#platform-defaults), 300 seconds by default), `GET /api/chats/{id}`
-  shows `confirmation_status: "expired"` and no `pending_confirmation`, and confirming it
-  answers `404`. When the server holds too many chats at once, the least recently used one
-  loses its pending confirmation the same way. Ask again in a new message.
-  `confirmation_status` is `"pending"` while a confirmation waits, and `"none"` otherwise.
+  kept in the server's memory, for a limited number of chats; idle ones are dropped. A
+  confirmation expires `confirmation_timeout_s` (a [platform default](#platform-defaults),
+  300 seconds by default) after it was asked for. The server checks for expired ones at
+  the start of every chat request and every 30 seconds, and an expired one never runs. So
+  after a restart, or once a confirmation expired, `GET /api/chats/{id}` shows
+  `confirmation_status: "expired"` and no `pending_confirmation`, and confirming it
+  answers `404` `{"detail": "No pending confirmation for this session"}` (never `410`),
+  with nothing run or stored. Ask again in a new message: it closes the expired action
+  as cancelled. `confirmation_status` is `"pending"` while a confirmation waits, and
+  `"none"` otherwise.
+- **The server's memory is shared fairly.** Each user holds at most 16 chats in it at
+  once. A new chat first replaces your least recently used one that is neither running
+  nor waiting for a confirmation (nothing is lost: only its lock goes); when all 16 are
+  running or waiting, the message answers `429` with `"reason": "rate_limit"` (see
+  Errors above). When the server as a whole is full, a new chat replaces your own least
+  recently used chat without a pending confirmation, else anyone's without one, else
+  your own least recently used one with a pending confirmation, which then shows as
+  `expired`. Another user's pending confirmation is never dropped this way, and
+  `503 chats_busy` comes only when nothing can go.
+- **Permission notes and pending confirmations.** When a
+  [promoted permission](permissions.md#promoting-a-critical-permission) takes effect,
+  every chat of the organization gets a short note, except a chat waiting for a
+  confirmation: the note would split the action from its result. That chat skips the
+  note; once its confirmation is approved or denied, or a new message follows it, later
+  notes reach it again.
 - **What the model sees.** Each message sends the model only the chat's latest messages,
   up to `max_context_messages` (a [platform default](#platform-defaults), 20 by default).
   The assistant's instructions and your new message are always sent. Older messages stay

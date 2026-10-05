@@ -2521,8 +2521,8 @@ class TestConfirmationExpiry:
 
         The unconditional reap (``_chat_runtime.reap_expired``) at the top of
         post_confirm removes expired entries before the per-chat lookup.
-        The 410 code path remains as defence-in-depth for confirmations that
-        expire in the narrow window between reap and the expiry check.
+        Since GH-24 a confirmation that expires in the narrow window between
+        the reap and the expiry check under the chat's lock answers the same 404.
         """
         agent = FakeAgent([_make_agent_result()])
         app = _make_app(agent)
@@ -2543,7 +2543,7 @@ class TestConfirmationExpiry:
                     "approved": True,
                 },
             )
-        # Expired entry is reaped before lookup, so 404 (not 410).
+        # Expired entry is reaped before lookup, so 404 (there is no 410 since GH-24).
         assert (resp.status_code, resp.json()) == (
             404,
             {"detail": "No pending confirmation for this session"},

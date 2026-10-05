@@ -10,8 +10,9 @@ notice reaches every live chat of the org (``append_org_notice``), and the
 Super Admin's org metadata counts the org's chats (``count_org_chats``).
 GH-179's background task stores the automatic title (``set_auto_title``).
 
-Inputs: an executor (an asyncpg pool or connection) or, for the two
-transactional writes (``trash_chat``, ``append_messages``), the pool; the
+Inputs: an executor (an asyncpg pool or connection) or, for the three
+transactional writes (``trash_chat``, ``append_messages``,
+``append_org_notice``), the pool; the
 caller's ``TenantContext``; a chat id; titles, ``LLMMessage``s and
 ``ToolCallRecord``s; page sizes and opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``MessagePage``, ``LLMMessage`` lists,
@@ -43,6 +44,13 @@ Behaviour:
   rolls the trash back. ``get_or_create_legacy_chat`` uses no transaction of
   its own: a concurrent first message of the same session loses the INSERT
   on the partial unique key and selects the winner's chat.
+- ``append_org_notice`` (GH-66) skips every chat whose latest message (highest
+  seq, any role) is ``awaiting_confirmation``: a user message after the
+  pending call's ``tool_use`` would separate it from its result and break the
+  history the next run gets (GH-24). It runs in one transaction that first
+  locks the org's live chats (``FOR UPDATE``, id order): a turn storing its
+  messages holds its chat's row until it commits, so the notice waits and
+  then sees that turn's awaiting message.
 
 Security notes:
 - Owner-private chats (V1): every statement on a chat binds the caller's
@@ -194,10 +202,25 @@ _MESSAGES_BEFORE_SQL: Final = """
 """
 # S10
 _COUNT_MESSAGES_SQL: Final = "SELECT count(*) FROM chat_messages WHERE chat_id = $1 AND org_id = $2"
-# S12: GH-66's promotion notice in every live chat of the org, one statement.
+# S12a: GH-66's promotion notice first locks the org's live chats, in id order. A turn
+# storing its messages holds its chat's row (S7's UPDATE) until it commits, so the lock
+# waits for it and S12b then sees that turn's messages (GH-24).
+_ORG_NOTICE_LOCK_SQL: Final = """
+    SELECT id FROM chats
+    WHERE org_id = $1 AND deleted_at IS NULL
+    ORDER BY id
+    FOR UPDATE
+"""
+# S12b: the notice in every live chat of the org whose latest message isn't awaiting a
+# confirmation: a user message there would split the pending call's tool_use from its
+# result and malform the history the next run gets (GH-24).
 _ORG_NOTICE_SQL: Final = """
     INSERT INTO chat_messages (chat_id, org_id, role, content, status)
-    SELECT id, org_id, 'user', $2, 'complete' FROM chats WHERE org_id = $1 AND deleted_at IS NULL
+    SELECT c.id, c.org_id, 'user', $2, 'complete' FROM chats c
+    WHERE c.org_id = $1 AND c.deleted_at IS NULL
+        AND (SELECT m.status FROM chat_messages m
+             WHERE m.chat_id = c.id AND m.org_id = c.org_id
+             ORDER BY m.seq DESC LIMIT 1) IS DISTINCT FROM 'awaiting_confirmation'
 """
 # S13
 _COUNT_ORG_CHATS_SQL: Final = "SELECT count(*) FROM chats WHERE org_id = $1 AND deleted_at IS NULL"
@@ -748,17 +771,27 @@ async def latest_message_status(
     return status
 
 
-async def append_org_notice(executor: Executor, tenant: TenantContext, content: str) -> int:
+async def append_org_notice(pool: asyncpg.Pool, tenant: TenantContext, content: str) -> int:
     """Append GH-66's promotion notice to every live chat of the caller's org.
 
     One ``user`` message, status ``complete``, in every member's live chat of
-    ``tenant.org_id`` (never another org's), in one statement; the chats'
-    ``last_activity_at`` is left alone.
+    ``tenant.org_id`` (never another org's) except a chat whose latest message
+    awaits a confirmation (GH-24); the chats' ``last_activity_at`` is left
+    alone. One transaction on one acquired connection: the org's live chats
+    are locked first (waiting for a turn that is storing its messages), then
+    the notice is inserted.
+
+    Args:
+        pool: The database pool.
+        tenant: The caller's org scope.
+        content: The notice text.
 
     Returns:
         The number of chats the notice was appended to.
     """
-    status = await executor.execute(_ORG_NOTICE_SQL, tenant.org_id, content)
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.fetch(_ORG_NOTICE_LOCK_SQL, tenant.org_id)
+        status: str = await conn.execute(_ORG_NOTICE_SQL, tenant.org_id, content)
     # The command tag is "INSERT 0 <rows>".
     return int(status.rsplit(" ", 1)[1])
 
