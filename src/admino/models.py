@@ -58,6 +58,16 @@ Security notes:
   org's response language, the timezone), never an account identifier; it
   is frozen, refuses unknown keys, bounds every text by its column's limit
   and hides its input from validation errors.
+- Persisted chats (GH-176): ``ChatCreateRequest``, ``ChatUpdateRequest`` and
+  ``ChatMessageCreate`` refuse unknown keys (the org, the owner, the chat and
+  the title source come from the session, the path and the server) and hide
+  their input from validation errors. A title is stripped, 1 to 200
+  characters, and refuses control, format (bidi overrides included),
+  surrogate and line/paragraph separator characters. ``ChatMessageView``
+  sanitizes stored content like ``ChatResponse.response`` and exposes the
+  sanitized ``ToolCallRecord``s only, never the raw tool inputs.
+  ``ConfirmRequest`` names exactly one of ``chat_id`` and the legacy
+  ``session_id``.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -119,7 +129,9 @@ from typing import Annotated, Any, Final, Literal, get_args
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     SecretStr,
@@ -232,6 +244,16 @@ def _strip_credentials(value: str) -> str:
             continue
         value = pattern.sub(_REDACTED, value)
     return value
+
+
+def _sanitize_display_text(value: str) -> str:
+    """Strip control characters and credential patterns from text shown to users.
+
+    The live chat reply (``ChatResponse.response``) and a stored message
+    (``ChatMessageView.content``) go through this same function, so a chat
+    reads the same live and reloaded.
+    """
+    return _strip_credentials(value.translate(_CONTROL_CHAR_TABLE))
 
 
 # ---------------------------------------------------------------------------
@@ -389,20 +411,27 @@ class PendingConfirmationSummary(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Response body from POST /chat."""
+    """Response body of a chat turn and of a confirmation (GH-176: names its chat).
 
-    session_id: str = Field(
+    ``chat_id`` is the persisted chat the turn ran in. ``session_id`` is the
+    legacy session id, echoed by the legacy routes only (None on the chat
+    route) until #177.
+    """
+
+    chat_id: UUID = Field(description="The persisted chat this turn ran in.")
+    session_id: str | None = Field(
+        default=None,
         min_length=1,
         max_length=64,
         pattern=r"^[a-zA-Z0-9_-]+$",
-        description="The session identifier for this conversation.",
+        description="The legacy session identifier, echoed by the legacy routes (until #177).",
     )
 
     @field_validator("session_id")
     @classmethod
-    def redact_credentials_in_session_id(cls, v: str) -> str:
+    def redact_credentials_in_session_id(cls, v: str | None) -> str | None:
         """Defence-in-depth: strip credentials from session_id."""
-        return _strip_credentials(v)
+        return None if v is None else _strip_credentials(v)
 
     response: str = Field(
         max_length=65536,
@@ -418,8 +447,7 @@ class ChatResponse(BaseModel):
         direction-override characters. This is defence-in-depth — the PWA
         must also use textContent (not innerHTML) when rendering responses.
         """
-        v = v.translate(_CONTROL_CHAR_TABLE)
-        return _strip_credentials(v)
+        return _sanitize_display_text(v)
 
     tool_calls: list[ToolCallRecord] = Field(
         default_factory=list,
@@ -459,18 +487,22 @@ class ChatResponse(BaseModel):
 class ConfirmRequest(BaseModel):
     """Incoming POST /confirm request body.
 
-    Used when the user approves or denies a pending confirmation. Unknown
-    fields (e.g. a smuggled ``org_id`` or ``user_id``) are refused with a 422:
-    whose confirmation it is comes from the session only (GH-163).
+    Used when the user approves or denies a pending confirmation. The chat is
+    named by ``chat_id`` (GH-176) or by the legacy ``session_id`` (until
+    #177): exactly one of the two. Unknown fields (e.g. a smuggled ``org_id``
+    or ``user_id``) are refused with a 422: whose confirmation it is comes
+    from the session only (GH-163).
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    session_id: str = Field(
+    chat_id: UUID | None = Field(default=None, description="The persisted chat (GH-176).")
+    session_id: str | None = Field(
+        default=None,
         min_length=1,
         max_length=64,
         pattern=r"^[a-zA-Z0-9_-]+$",
-        description="Session identifier.",
+        description="Legacy session identifier (until #177).",
     )
     confirmation_id: str = Field(
         min_length=1,
@@ -481,6 +513,14 @@ class ConfirmRequest(BaseModel):
     approved: bool = Field(
         description="Whether the user approved (True) or denied (False) the action.",
     )
+
+    @model_validator(mode="after")
+    def _check_one_chat_reference(self) -> ConfirmRequest:
+        """Refuse a body naming both a chat_id and a session_id, or neither."""
+        if (self.chat_id is None) == (self.session_id is None):
+            msg = "Give exactly one of chat_id and session_id."
+            raise ValueError(msg)
+        return self
 
 
 class SSEEvent(BaseModel):
@@ -2438,9 +2478,10 @@ class PlatformUserListResponse(BaseModel):
 class OrgMetadata(BaseModel):
     """GET /api/platform/orgs/{org_id}/metadata response: counts and sizes only.
 
-    ``seats`` follows the invitation seat rule (``OrgSeats``). The storage,
-    chat and file counts are 0 until chats and attachments exist (#176,
-    #187). Never a title, a name or any other org content.
+    ``seats`` follows the invitation seat rule (``OrgSeats``).
+    ``chat_count`` is the org's chats that aren't trashed (GH-176); the
+    storage and file counts are 0 until attachments exist (#187). Never a
+    title, a name or any other org content.
     """
 
     seats: OrgSeats
@@ -2836,3 +2877,140 @@ class PlatformDiagnosticsResponse(BaseModel):
     provider: Literal["infomaniak", "anthropic", "openai", "vllm"]
     model: str | None = Field(max_length=200)
     llm_reachable: bool
+
+
+# ---------------------------------------------------------------------------
+# Persisted chats (GH-176): the /api/chats request and response models
+# ---------------------------------------------------------------------------
+
+
+MessageStatus = Literal["complete", "stopped", "error", "awaiting_confirmation", "limit_reached"]
+"""Status of a stored chat message (migration 0024's CHECK); the run's ``final`` is ``complete``."""
+
+TitleSource = Literal["auto", "user"]
+"""Who set a chat's title: ``auto`` (untitled until #179 fills it) or the ``user``."""
+
+_CHAT_TITLE_MAX_LENGTH: Final = 200
+# A title is stored and shown in every chat list: the display-name rule plus
+# surrogates (Cs), which can't be stored as UTF-8.
+_CHAT_TITLE_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
+_CURSOR_MAX_LENGTH: Final = 200
+
+
+def _check_chat_title(value: str) -> str:
+    """Refuse a title with a control, format, surrogate or line/paragraph separator.
+
+    The message never includes the title.
+    """
+    if any(unicodedata.category(char) in _CHAT_TITLE_BANNED_CATEGORIES for char in value):
+        msg = "The title must not contain control or formatting characters."
+        raise ValueError(msg)
+    return value
+
+
+ChatTitle = Annotated[
+    str,
+    BeforeValidator(_strip_if_str),
+    Field(min_length=1, max_length=_CHAT_TITLE_MAX_LENGTH),
+    AfterValidator(_check_chat_title),
+]
+"""A chat title from a request: stripped, 1 to 200 characters, no control or format character."""
+
+
+class ChatCreateRequest(BaseModel):
+    """POST /api/chats request body: an optional title (absent or null: untitled).
+
+    The org, the owner and the title source come from the session and the
+    server, never from the body; validation errors never repeat the input.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    title: ChatTitle | None = None
+
+
+class ChatUpdateRequest(BaseModel):
+    """PATCH /api/chats/{chat_id} request body: the new title (required)."""
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    title: ChatTitle
+
+
+class ChatMessageCreate(BaseModel):
+    """POST /api/chats/{chat_id}/messages request body: one user message.
+
+    The chat comes from the path, the org and the owner from the session.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    message: str = Field(min_length=1, max_length=32768)
+
+
+class ChatSummary(BaseModel):
+    """One chat as the API lists it: metadata only, never a message."""
+
+    id: UUID
+    title: str = Field(max_length=_CHAT_TITLE_MAX_LENGTH)
+    title_source: TitleSource
+    created_at: datetime
+    last_activity_at: datetime
+
+
+class ChatListResponse(BaseModel):
+    """GET /api/chats response: one page of the caller's chats, latest activity first."""
+
+    chats: list[ChatSummary] = Field(max_length=100)
+    next_cursor: str | None = Field(default=None, max_length=_CURSOR_MAX_LENGTH)
+
+
+class ChatMessageView(BaseModel):
+    """One stored message as the API shows it.
+
+    ``content`` is sanitized like ``ChatResponse.response`` and ``tool_calls``
+    holds the sanitized ``ToolCallRecord``s; the raw tool inputs the model sent
+    stay in the database and are never exposed.
+    """
+
+    id: UUID
+    role: Literal["user", "assistant", "tool"]
+    content: str = Field(max_length=65536)
+    tool_call_id: str | None = Field(default=None, max_length=128)
+    tool_calls: list[ToolCallRecord] | None = Field(default=None, max_length=50)
+    status: MessageStatus
+    created_at: datetime
+
+    @field_validator("content")
+    @classmethod
+    def _sanitize_content(cls, value: str) -> str:
+        """Strip control characters and credential patterns, as in the live reply."""
+        return _sanitize_display_text(value)
+
+
+class ChatContext(BaseModel):
+    """How much of the chat the model sees (interim until #190 removes it).
+
+    ``truncated`` is true when the chat holds more messages than the stored
+    platform limit ``max_context_messages`` sends to the model.
+    """
+
+    message_count: int = Field(ge=0)
+    max_context_messages: int = Field(ge=1, le=200)
+    truncated: bool
+
+
+class ChatDetailResponse(ChatSummary):
+    """GET /api/chats/{chat_id} response: the summary, a page of messages and the state.
+
+    ``messages`` is chronological (the latest page without a cursor) and
+    ``next_cursor`` points to earlier messages. ``confirmation_status`` is
+    ``pending`` with a live pending confirmation, ``expired`` when the latest
+    message awaits a confirmation that is gone (expired or lost in a restart).
+    """
+
+    messages: list[ChatMessageView] = Field(max_length=100)
+    next_cursor: str | None = Field(default=None, max_length=_CURSOR_MAX_LENGTH)
+    pending_confirmation: PendingConfirmationSummary | None = None
+    confirmation_status: Literal["none", "pending", "expired"]
+    context: ChatContext

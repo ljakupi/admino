@@ -25,8 +25,9 @@ Outputs: a list of ``PlatformUserSummary`` (listing), an ``OrgMetadata``, one
 The reads work in any org status and write nothing, so they aren't audited.
 ``seats.used`` is the invitation seat rule (``invitations._SEATS_TAKEN_SQL``,
 #153): the org's active and invited users, expired invitations included; it
-may exceed ``seats.limit``. The storage, chat and file counts are 0 until
-chats and attachments exist (#176, #187).
+may exceed ``seats.limit``. ``chat_count`` is the org's chats that aren't
+trashed, of every member (``chats.count_org_chats``, GH-176). The storage
+and file counts are 0 until attachments exist (#187).
 
 A target is a users row of the org that isn't deleted, whatever its status.
 Each action runs in one transaction on one connection: the checks, the
@@ -104,6 +105,7 @@ from typing import TYPE_CHECKING, Final
 from admino import (
     accounts,
     audit_events,
+    chats,
     email_outbox,
     invitations,
     org_users,
@@ -263,8 +265,9 @@ async def org_metadata(pool: asyncpg.Pool, *, actor: Principal, org_id: UUID) ->
 
     Returns:
         The org's seats (``limit``) and its active and invited users that
-        aren't deleted (``used``, which may exceed ``limit``); the storage,
-        chat and file counts, 0 until #176 and #187.
+        aren't deleted (``used``, which may exceed ``limit``); the number of
+        the org's chats that aren't trashed (``chat_count``, a count only);
+        the storage and file counts, 0 until #187.
 
     Raises:
         PermissionError: Without ``Capability.PLATFORM_ORG_METADATA_VIEW``; no
@@ -277,7 +280,7 @@ async def org_metadata(pool: asyncpg.Pool, *, actor: Principal, org_id: UUID) ->
     return OrgMetadata(
         seats=OrgSeats(used=used, limit=org["seats"]),
         storage_used_bytes=0,
-        chat_count=0,
+        chat_count=await chats.count_org_chats(pool, org_id),
         file_count=0,
     )
 

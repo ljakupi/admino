@@ -193,9 +193,20 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   body as an unknown ID, so its existence isn't revealed.
 - **No smuggled IDs.** Request bodies reject unknown fields, so an `org_id` or `user_id`
   can't be slipped into one. The agent's tools refuse the same fields in their arguments.
+- **Chats are private to their owner.** The data layer (`chats.py`) reads and changes a
+  chat only within the caller's organization and as its owner, so the check doesn't rest
+  on the route alone. Two functions work on a whole organization, and on one only: the
+  note a finished permission promotion adds to each of its chats, and the Super Admin's
+  chat count. Another user's chat, another organization's chat, a chat in the trash and
+  an unknown ID all answer the same `404`
+  `{"detail": "Chat not found", "reason": "chat_not_found"}`. In this release nobody else
+  reads a chat, not even an Org Admin; Viewers and the Super Admin get `403` on every chat
+  route. A tool call's `tool.call` audit row names the chat's ID as its target, never its
+  title or a message.
 - **Operator blindness.** The Super Admin reaches only the platform routes and their own
   account. Platform responses carry metadata and counts, never content, titles or file
-  names.
+  names. Of an organization's chats, the Super Admin sees only how many aren't in the
+  trash.
 - **No impersonation.** The Super Admin can deactivate or reactivate an organization's
   user, send them a password reset link and re-invite an organization's first Org Admin,
   each recorded in that organization's audit log. They can't set a password, see a reset
@@ -343,6 +354,13 @@ We prefer to be transparent about what this does **not** guarantee:
   bypassing TLS. They get no more than any other client: the login is still
   required, and their forwarded headers are ignored because they don't come from
   Caddy's address. Anyone with that access to the server can already read `.env`.
+- **Pending confirmations don't survive a restart.** admino runs as one uvicorn process,
+  in one replica. That process keeps the pending confirmations and the per-chat run locks
+  (one message at a time per chat) in memory, bounded and dropped when idle. Chats and
+  their messages are stored in PostgreSQL, but a restart drops every pending
+  confirmation: its chat then shows it as `expired`, confirming it answers `404`, and the
+  user asks again. A second process or replica wouldn't see the first one's confirmations
+  or locks, so the agent isn't scaled out.
 - **The owner password lives in `.env`.** The database roles protect the audit log from
   a compromised app, not from someone who can read `.env` on the server: `PG_PASSWORD`
   is the database superuser's password.

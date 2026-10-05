@@ -40,8 +40,9 @@ Security notes:
 - Tool calls are audited as content-free ``tool.call`` rows in
   ``audit_events`` (tool, action, decision, success, duration — never
   arguments or output) through the recorder injected into the Agent, in the
-  acting member's organization. A principal without one (a Super Admin) or a
-  failed write raises, so the agent aborts the run (H-1).
+  acting member's organization, targeting the run's persisted chat id
+  (GH-176). A principal without one (a Super Admin), a run id that isn't a
+  chat UUID or a failed write raises, so the agent aborts the run (H-1).
 - Registry is frozen after tool imports to block dynamic registration.
 - Single-worker uvicorn prevents split-brain session state.
 - HSTS is not set here: the Caddy proxy of the production profile
@@ -90,11 +91,6 @@ if TYPE_CHECKING:
     from admino.permissions import PermissionState
 
 logger = logging.getLogger(__name__)
-
-# Namespace of the per-session chat id that tool.call audit events target until
-# #176 gives chats server-generated UUIDs. Fixed, so a session maps to the same
-# chat id across restarts.
-_SESSION_CHAT_NAMESPACE: Final[uuid.UUID] = uuid.UUID("3b8f6e2a-9c4d-4e71-8a5f-0d2c7b9e1f43")
 
 # Config directory: CONFIG_DIR env var (set in .env / docker-compose), or
 # fall back to ./config (local dev from project root).
@@ -247,28 +243,20 @@ def _import_tool_modules() -> None:
             raise
 
 
-def _session_chat_id(session_id: str) -> uuid.UUID:
-    """Return the chat id a session's ``tool.call`` audit events target.
-
-    ``uuid5(_SESSION_CHAT_NAMESPACE, session_id)``: deterministic per session,
-    and a UUID, so no session text reaches the audit store. The bridge until
-    persisted chats (#176) carry server-generated UUIDs.
-    """
-    return uuid.uuid5(_SESSION_CHAT_NAMESPACE, session_id)
-
-
 def _build_tool_call_recorder() -> ToolCallRecorder:
     """Build the recorder the Agent awaits after every tool dispatch.
 
     Each call writes one ``tool.call`` row through
     ``audit_events.record_tool_call`` naming the acting member (their org and
-    user id, from ``TenantContext.from_principal``) and targeting the
-    session's chat, with the dispatch's ``escalated`` flag (GH-243). A
-    principal without an organization (a Super Admin, or a
-    malformed principal) raises ``NoTenantContextError`` before anything is
-    written. The runtime pool is resolved at call time: it only exists once
-    the server lifespan has run, after this recorder was built. Errors
-    propagate so the agent aborts the run (H-1).
+    user id, from ``TenantContext.from_principal``) and targeting the run's
+    chat, with the dispatch's ``escalated`` flag (GH-243). The run's
+    ``session_id`` is the persisted chat's id (GH-176: ``str(chat.id)``), so
+    the row targets that UUID itself. A principal without an organization (a
+    Super Admin, or a malformed principal) raises ``NoTenantContextError`` and
+    a ``session_id`` that isn't a UUID raises ``ValueError``, both before
+    anything is written. The runtime pool is resolved at call time: it only
+    exists once the server lifespan has run, after this recorder was built.
+    Errors propagate so the agent aborts the run (H-1).
     """
 
     async def record(
@@ -290,7 +278,7 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
             database.get_pool(),
             org_id=tenant.org_id,
             actor_user_id=tenant.user_id,
-            chat_id=_session_chat_id(session_id),
+            chat_id=uuid.UUID(session_id),
             tool=tool,
             action=action,
             decision=decision,
