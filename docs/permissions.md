@@ -118,7 +118,9 @@ promotion applies to their own organization only:
 After promotion the action reaches **confirm** — so it *still* asks before every send. You
 can never turn one of these into a silent `allow`. When the cooldown ends, every chat of
 your organization that isn't in the trash gets a short note, stored as a message, that the
-action is now available. Other organizations' chats never do.
+action is now available. Other organizations' chats never do, and neither does a chat
+waiting for a confirmation: the note would split the waiting action from its result (see
+[Chats](configuration.md#chats)).
 
 Turning a promoted permission off again takes effect at once and needs no password.
 Promotions, cancellations and demotions are each recorded in the organization's audit log

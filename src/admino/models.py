@@ -29,7 +29,8 @@ Security notes:
 - LLM error codes (GH-242): ``LLMErrorCode`` is the closed set of stable
   codes a failed run carries (``AgentResult.error_code``,
   ``ChatResponse.error_code``); the UI translates them, so no provider text
-  is ever shown.
+  is ever shown. ``ChatResponse.error_code`` also admits ``rate_limit``
+  (GH-24: too many pending confirmations), which no agent run carries.
 - Super Admin user administration (GH-167): ``PlatformUserSummary`` carries
   account metadata only (no hash, token, org id or kind); ``OrgMetadata``
   counts and sizes only, never org content. ``PlatformReinviteRequest`` has
@@ -475,11 +476,16 @@ class ChatResponse(BaseModel):
         ),
     )
 
-    error_code: LLMErrorCode | None = Field(
+    # One flattened Literal (the same type as ``LLMErrorCode | Literal["rate_limit"]``):
+    # a union of two Literals would report one validation error per member.
+    error_code: Literal[LLMErrorCode, "rate_limit"] | None = Field(
         default=None,
         description=(
-            "The run's LLM error code (GH-242) when ``status='error'``: the PWA"
-            " shows its translation. None on success and for uncoded errors."
+            "The error code when ``status='error'``: the PWA shows its"
+            " translation. One of the run's LLM error codes (GH-242), or"
+            " ``rate_limit`` (GH-24) when too many confirmations are pending,"
+            " so the confirmation this run asked for was denied. None on"
+            " success and for uncoded errors."
         ),
     )
 

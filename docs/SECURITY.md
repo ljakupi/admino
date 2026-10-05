@@ -196,9 +196,9 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
 - **Chats are private to their owner.** The data layer (`chats.py`) reads and changes a
   chat only within the caller's organization and as its owner, so the check doesn't rest
   on the route alone. Two functions work on a whole organization, and on one only: the
-  note a finished permission promotion adds to each of its chats, and the Super Admin's
-  chat count. Another user's chat, another organization's chat, a chat in the trash and
-  an unknown ID all answer the same `404`
+  note a finished permission promotion adds to its chats (not to one waiting for a
+  confirmation), and the Super Admin's chat count. Another user's chat, another
+  organization's chat, a chat in the trash and an unknown ID all answer the same `404`
   `{"detail": "Chat not found", "reason": "chat_not_found"}`. In this release nobody else
   reads a chat, not even an Org Admin; Viewers and the Super Admin get `403` on every chat
   route. A tool call's `tool.call` audit row names the chat's ID as its target, never its
@@ -360,7 +360,14 @@ We prefer to be transparent about what this does **not** guarantee:
   their messages are stored in PostgreSQL, but a restart drops every pending
   confirmation: its chat then shows it as `expired`, confirming it answers `404`, and the
   user asks again. A second process or replica wouldn't see the first one's confirmations
-  or locks, so the agent isn't scaled out.
+  or locks, so the agent isn't scaled out. The memory is bounded per user too, so one
+  user or organization can't push everyone else's state out: a user holds at most 16
+  chats in it (more answers `429` `rate_limit` while all of them are running or waiting
+  for a confirmation) and at most `max_pending_confirmations` (3 by default) pending
+  confirmations (one more is refused with `rate_limit`, and the action doesn't run). When
+  the server is full, a new chat never drops another user's pending confirmation: only
+  the requester's own, as a last resort. Expired confirmations are dropped at every chat
+  request and every 30 seconds, and are never run.
 - **The owner password lives in `.env`.** The database roles protect the audit log from
   a compromised app, not from someone who can read `.env` on the server: `PG_PASSWORD`
   is the database superuser's password.
