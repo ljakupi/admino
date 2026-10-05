@@ -7,7 +7,7 @@ at all and Anthropic ``sk-ant-api03-`` keys were cut at their first ``_``, so
 the rest survived. What this file pins:
 
 - A key is ``sk-`` at the start of the text or right after a character that is
-  not a word character (letter, digit, ``_``), followed by a run of at least 20
+  not an ASCII letter, an ASCII digit or ``_``, followed by a run of at least 20
   key characters (``A-Z``, ``a-z``, ``0-9``, ``_``, ``-``). The whole run
   becomes one ``[CREDENTIAL_REDACTED]`` (``models._REDACTED``); the text before
   and after it (spaces, ``.``, ``,``, ``)``, words) is kept as it is.
@@ -17,9 +17,11 @@ the rest survived. What this file pins:
   run (300 characters) fails closed: redacted whole, no tail left. No
   8-character chunk of a key's body survives anywhere.
 - A key starts after a space, a newline, ``-``, ``(``, ``"``, ``'``, ``=`` or
-  ``:``. Not a key: ``sk-`` inside a word (``risk-free-investment-strategy-2026``,
-  a long ``ask-...`` word, ``_sk-...``, ``2sk-...``) and ``sk-`` followed by 19
-  key characters (20 is redacted). Two keys in one text are two markers.
+  ``:``, and after a non-ASCII letter (Chinese, Japanese, accented Latin:
+  security audit L-1). Not a key: ``sk-`` inside a word
+  (``risk-free-investment-strategy-2026``, a long ``ask-...`` or ``Ask-...``
+  word, ``_sk-...``, ``2sk-...``) and ``sk-`` followed by 19 key characters (20
+  is redacted). Two keys in one text are two markers.
 - ``models.sanitize_display_text`` is the public display-text sanitizer
   (``_sanitize_display_text`` before GH-264). The ``sanitize`` fixture looks it
   up when a test runs, so this file collects before the rename and every test
@@ -177,7 +179,7 @@ class TestKeyInText:
 
 
 class TestKeyStart:
-    """``sk-`` starts a key only at the start of a token (as today's ``\\b``)."""
+    """``sk-`` starts a key only at a token start: not after an ASCII letter, digit or ``_``."""
 
     @pytest.mark.parametrize(
         "before",
@@ -199,6 +201,33 @@ class TestKeyStart:
     ) -> None:
         key = _plain_key(40, seed=40)
         assert sanitize(f"{before}{key.text} end") == f"{before}{REDACTED} end"
+
+    @pytest.mark.parametrize(
+        "before",
+        ["我的密钥是", "かぎは", "Clé"],
+        ids=["cjk", "kana", "accented-latin"],
+    )
+    def test_models_sk_after_a_non_ascii_letter_starts_a_key(
+        self, sanitize: Callable[[str], str], before: str
+    ) -> None:
+        """Security audit L-1: a key glued to Chinese, Japanese or accented text is redacted.
+
+        Python's Unicode ``\\b`` counts these letters as word characters, so a
+        key right after one was not redacted at all. Only an ASCII letter, an
+        ASCII digit or ``_`` before ``sk-`` keeps it from starting a key.
+        """
+        key = openai_project_key()
+        assert (before[-1].isalpha(), before[-1].isascii()) == (True, False)
+        result = sanitize(before + key.text)
+        assert result == before + REDACTED
+        assert surviving_chunks(result, key) == []
+
+    def test_models_sk_after_an_uppercase_ascii_letter_is_not_a_key(
+        self, sanitize: Callable[[str], str]
+    ) -> None:
+        """Every ASCII letter keeps ``sk-`` inside a word, a capital at a sentence start too."""
+        text = "Ask-me-anything-about-the-quarterly-budget-review starts at 10"
+        assert sanitize(text) == text
 
     @pytest.mark.parametrize(
         "text",

@@ -23,15 +23,16 @@ routes have their own files.
 - ``sanitize_title(raw)``: the model reply, in order: reasoning blocks removed,
   the first non-empty line, a leading heading marker / ``title:`` label
   dropped, surrounding quote and emphasis characters stripped (these two steps
-  repeat until stable, so ``**Title:** X`` is ``X``), credentials redacted and
-  control characters stripped as for a stored message (NFKC included), banned
-  title characters (Cc, Cf, Cs, Zl, Zp) removed, whitespace collapsed,
-  credentials redacted once more (a key split by a removed invisible character),
-  trailing dots removed, then truncated. ``""`` when nothing usable remains,
-  else always a valid ``models.ChatTitle`` of at most 80 characters.
-- ``fallback_title(user_message)``: the first user message, redacted, cleaned,
-  single-spaced, redacted once more and truncated (no markdown, label or quote
-  stripping).
+  repeat until stable, so ``**Title:** X`` is ``X``), banned title characters
+  (Cc, Cf, Cs, Zl, Zp; whitespace still separates words) removed before the
+  redaction, so a key split by one is joined first (GH-264 security audit L-2),
+  credentials redacted and control characters stripped as for a stored message
+  (NFKC included), banned characters removed, whitespace collapsed, trailing
+  dots removed, then truncated. ``""`` when nothing usable remains, else always
+  a valid ``models.ChatTitle`` of at most 80 characters.
+- ``fallback_title(user_message)``: the first user message, cleaned the same
+  way (banned characters removed before the redaction), single-spaced and
+  truncated (no markdown, label or quote stripping).
 - Long keys (GH-264): a 164-character ``sk-proj-`` key and a 108-character
   ``sk-ant-api03-`` key with ``_`` become exactly one ``[CREDENTIAL_REDACTED]``
   in a model title and in a fallback title, alone or in a sentence whose text
@@ -1112,15 +1113,15 @@ class TestFallbackTitle:
 
 
 # ===========================================================================
-# 5b. The second redaction (sanitize_title and fallback_title)
+# 5b. Credentials split by an invisible character (sanitize_title and fallback_title)
 # ===========================================================================
 
 
 def _split_credential(kind: str, char: str) -> tuple[str, str, str]:
     """(text with a credential split by ``char``, the same text joined, the expected title).
 
-    ``models.sanitize_display_text`` keeps ``char``, so the first redaction
-    misses the split credential; removing ``char`` in step 6 joins it again.
+    ``models.sanitize_display_text`` keeps ``char``, so redacting the raw text
+    misses the split credential; removing ``char`` joins it again.
     """
     if kind == "key":
         joined = "Key sk-" + "a" * 24
@@ -1130,11 +1131,11 @@ def _split_credential(kind: str, char: str) -> tuple[str, str, str]:
 
 
 class TestSecondRedaction:
-    """Step 6 (amended): credentials are redacted once more after banned characters go.
+    """Step 6 (amended): a credential split by a banned character is redacted.
 
-    A soft hyphen, a word joiner or DEL inside a credential hides it from the
-    first redaction (``models._CONTROL_CHAR_TABLE`` keeps them); step 6 removes
-    them and would hand a clean, unredacted credential to the title.
+    A soft hyphen, a word joiner or DEL inside a credential hides it from
+    ``models.sanitize_display_text`` (``models._CONTROL_CHAR_TABLE`` keeps
+    them); removing them would hand a clean, unredacted credential to the title.
     """
 
     @pytest.mark.parametrize(
@@ -1160,6 +1161,32 @@ class TestSecondRedaction:
         result = getattr(ct, function)(raw)
         assert result == f"Use {models._REDACTED} " + " ".join(["word"] * 10) + ELLIPSIS
         assert _invariant_violation(result) is None
+
+
+class TestKeySplitPastTheMinimum:
+    """Security audit L-2: a key split after its 20th key character is redacted whole.
+
+    Split 40 characters into the body of the 164-character ``sk-proj-`` key, the
+    part before the invisible character is already a key on its own. Redacting
+    before the character goes would redact only that head; removing the
+    character afterwards joins the tail (which doesn't start with ``sk-``) onto
+    the marker, and no later pass can match it. The banned characters go before
+    the redaction, so the key is joined first and becomes one marker.
+    """
+
+    @pytest.mark.parametrize(
+        "char", [SHY, WORD_JOINER, DEL], ids=["soft-hyphen", "word-joiner", "del"]
+    )
+    @pytest.mark.parametrize("function", ["sanitize_title", "fallback_title"])
+    def test_chat_titles_key_split_past_its_minimum_length_is_redacted_whole(
+        self, ct: ModuleType, function: str, char: str
+    ) -> None:
+        key = openai_project_key()
+        split = key.prefix + key.body[:40] + char + key.body[40:]
+        alone = getattr(ct, function)(split)
+        in_sentence = getattr(ct, function)(f"Rotate {split} today")
+        assert (alone, in_sentence) == (models._REDACTED, f"Rotate {models._REDACTED} today")
+        assert surviving_chunks(alone + in_sentence, key) == []
 
 
 # ===========================================================================
