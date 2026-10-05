@@ -24,12 +24,16 @@ Behaviour:
   one row more than asked to know whether ``next_cursor`` is needed.
 - Cursors are base64url JSON tagged with their kind, at most 200 characters:
   a chat-list cursor never decodes as a message cursor, and anything that
-  doesn't decode is ``InvalidCursorError``. A cursor carries a position only,
-  never a scope: the caller's tenant still filters every row.
+  doesn't decode is ``InvalidCursorError``, so is one whose position can't be
+  bound (a seq beyond BIGINT, a timestamp without a UTC equivalent). A cursor
+  carries a position only, never a scope: the caller's tenant still filters
+  every row.
 - JSONB values travel as JSON text (``$n::jsonb``) and come back as text,
   decoded here. PostgreSQL's TEXT and JSONB refuse U+0000, so it is removed
   from message content and from every string (keys included) inside the JSON
-  values before writing.
+  values before writing. JSONB also refuses a lone surrogate, which a
+  model-produced tool input or tool-call argument can carry (the ``str``
+  fields refuse one already), so each is replaced by U+FFFD in those strings.
 - ``append_messages`` and ``trash_chat`` each run in one transaction:
   ``append_messages`` touches the chat first (no row: nothing is written),
   then inserts the messages in order; ``trash_chat`` sets ``deleted_at`` and
@@ -64,12 +68,12 @@ import base64
 import contextlib
 import json
 import re
-from datetime import datetime  # noqa: TC003 — Pydantic resolves field annotations at runtime
-from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
 import asyncpg
-from pydantic import AwareDatetime, Field, StrictInt
+from pydantic import AfterValidator, AwareDatetime, Field, StrictInt
 
 from admino import audit_events, untrusted
 from admino.access import PlainUUID, SealedModel
@@ -85,6 +89,13 @@ if TYPE_CHECKING:
     from admino.tenancy import TenantContext
 
 _NUL: Final = "\x00"
+# A surrogate code point not paired with its other half: PostgreSQL's JSONB refuses it.
+_LONE_SURROGATE_RE: Final = re.compile(
+    "[\\ud800-\\udbff](?![\\udc00-\\udfff])|(?<![\\ud800-\\udbff])[\\udc00-\\udfff]"
+)
+_REPLACEMENT_CHARACTER: Final = chr(0xFFFD)
+# The largest seq a BIGINT column (and its bind parameter) holds.
+_MAX_SEQ: Final = 2**63 - 1
 # What a cursor may look like before it is decoded: base64url, at most 200 characters.
 _CURSOR_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,200}")
 
@@ -263,11 +274,26 @@ class MessagePage(SealedModel):
     next_cursor: str | None
 
 
+def _utc_representable(value: datetime) -> datetime:
+    """The stamp unchanged if it has a UTC equivalent, which asyncpg binds.
+
+    Raises:
+        ValueError: If the conversion to UTC leaves the datetime range (year 1
+            at +23:00, year 9999 at -23:00).
+    """
+    try:
+        value.astimezone(UTC)
+    except OverflowError:
+        msg = "Timestamp outside the UTC range."
+        raise ValueError(msg) from None
+    return value
+
+
 class _ChatCursor(SealedModel):
     """The position after the last chat of a list page."""
 
     kind: Literal["chats"] = "chats"
-    last_activity_at: AwareDatetime
+    last_activity_at: Annotated[AwareDatetime, AfterValidator(_utc_representable)]
     id: UUID
 
 
@@ -275,7 +301,7 @@ class _MessageCursor(SealedModel):
     """The seq of the earliest message of a message page."""
 
     kind: Literal["messages"] = "messages"
-    seq: StrictInt = Field(ge=1)
+    seq: StrictInt = Field(ge=1, le=_MAX_SEQ)
 
 
 def _encode_cursor(cursor: _ChatCursor | _MessageCursor) -> str:
@@ -299,20 +325,21 @@ def _decode_cursor[C: (_ChatCursor, _MessageCursor)](cursor: str, kind: type[C])
 
 
 # Any: a JSON value of any shape (object, array, string, number, bool, null).
-def _without_nul(value: Any) -> Any:
-    """The JSON value with U+0000 removed from every string, object keys included."""
+def _jsonb_safe(value: Any) -> Any:
+    """The JSON value with U+0000 removed and each lone surrogate replaced by U+FFFD in
+    every string, object keys included; a surrogate pair (an emoji) is kept."""
     if isinstance(value, str):
-        return value.replace(_NUL, "")
+        return _LONE_SURROGATE_RE.sub(_REPLACEMENT_CHARACTER, value.replace(_NUL, ""))
     if isinstance(value, list | tuple):
-        return [_without_nul(item) for item in value]
+        return [_jsonb_safe(item) for item in value]
     if isinstance(value, dict):
-        return {_without_nul(key): _without_nul(item) for key, item in value.items()}
+        return {_jsonb_safe(key): _jsonb_safe(item) for key, item in value.items()}
     return value
 
 
 def _json_text(value: list[dict[str, Any]] | None) -> str | None:
-    """The JSON text bound to a ``$n::jsonb`` parameter (U+0000 removed), None for NULL."""
-    return None if value is None else json.dumps(_without_nul(value))
+    """The JSON text bound to a ``$n::jsonb`` parameter (``_jsonb_safe``), None for NULL."""
+    return None if value is None else json.dumps(_jsonb_safe(value))
 
 
 # Any: a decoded JSONB column (an array of objects here).
@@ -519,7 +546,9 @@ async def append_messages(
     which gets ``final_status`` and the run's tool calls (NULL when there are
     none). The chat's ``last_activity_at`` is bumped, and ``external_content``
     is set (for good) when an appended ``tool`` message holds wrapped external
-    content. U+0000 is removed from the content and the JSON values.
+    content. U+0000 is removed from the content and the JSON values, and each
+    lone surrogate in the JSON values (a model's tool input or the tool-call
+    arguments) is stored as U+FFFD.
 
     Args:
         pool: The database pool.
@@ -541,7 +570,9 @@ async def append_messages(
         msg = "System messages are never stored."
         raise ValueError(msg)
     last = len(messages) - 1
-    calls = [record.model_dump(mode="json") for record in tool_calls or ()]
+    # Python mode: the JSON mode mangles a lone surrogate in a key (or raises for a nested
+    # one) before _json_text could replace it. Every ToolCallRecord field is JSON-native.
+    calls = [record.model_dump() for record in tool_calls or ()]
     rows = [
         (
             message.role,

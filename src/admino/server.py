@@ -148,9 +148,11 @@ Security notes:
   that doesn't decode is a 422 ``invalid_cursor``; no error repeats a title,
   message or cursor. A turn runs on the latest ``max_context_messages``
   messages (``chats.load_recent_history``) and passes the chat's sticky
-  ``external_content`` flag as ``earlier_external_content`` (GH-243 covers
-  the whole conversation); its new messages are stored after the run (an
-  agent failure stores nothing; a chat trashed meanwhile is the 404). A
+  ``external_content`` flag, read under the chat's lock (a turn queued behind
+  one that stored wrapped content gets it), as ``earlier_external_content``
+  (GH-243 covers the whole conversation); its new messages are stored after
+  the run (an agent failure stores nothing; a chat trashed meanwhile is the
+  404). A
   denial is stored too (the closing ``tool`` results and the assistant's
   denial), so the history stays well-formed. The agent's ``session_id`` is
   ``str(chat.id)``, so ``tool.call`` rows target the chat. Trashing records
@@ -3666,12 +3668,14 @@ async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -
     response language, timezone and personal instructions). A failing load
     escapes before the run: the generic 500, nothing of it echoed or logged.
 
-    Under the chat's lock a pending confirmation of the chat is cancelled (a
-    message instead of a confirmation), the latest ``max_context_messages``
-    messages are loaded, a dangling ``tool_use`` gets its synthetic cancelled
-    result, and the agent runs with ``str(chat.id)`` as its session id and
-    the chat's sticky ``external_content`` flag (GH-243). Then the turn is
-    stored (``_finish_run``).
+    Under the chat's lock the chat is read again (a chat trashed meanwhile is
+    the 404), a pending confirmation of the chat is cancelled (a message
+    instead of a confirmation), the latest ``max_context_messages`` messages
+    are loaded, a dangling ``tool_use`` gets its synthetic cancelled result,
+    and the agent runs with ``str(chat.id)`` as its session id and the chat's
+    sticky ``external_content`` flag (GH-243) as read under the lock, so a
+    turn queued behind one that stored wrapped content is escalated by it.
+    Then the turn is stored (``_finish_run``).
 
     Args:
         principal: The logged-in principal (``chat.send`` checked).
@@ -3712,6 +3716,8 @@ async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -
     prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
     session_id: str | None = None
+    # Resolves the chat (the 404, the legacy chat's creation); its flag may be stale by
+    # the time the lock is free.
     if isinstance(chat_ref, UUID):
         chat = await chats.get_chat(pool, tenant, chat_ref)
     else:
@@ -3720,6 +3726,9 @@ async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -
 
     # Runs of one chat are serialised, so each one loads what the previous stored.
     async with _chat_runtime.hold(chat.id, tenant.user_id):
+        # Read again under the lock: a run queued ahead may have set external_content
+        # (GH-243), and this run must be escalated by it (security audit M-1).
+        chat = await chats.get_chat(pool, tenant, chat.id)
         if _chat_runtime.pop_pending(chat.id) is not None:
             logger.info(
                 "Chat %s got a new message while a confirmation was pending: cancelled",
@@ -3899,8 +3908,9 @@ async def post_confirm(
     history stays well-formed. An approval resumes the agent on the latest
     ``max_context_messages`` stored messages (the dangling ``tool_use`` left
     as it is: the resume dispatches it), with the caller's principal, the
-    chat's ``external_content`` flag, the stored platform limits and LLM
-    retry limit (read on every request, GH-160, GH-242) and their org's tool
+    chat's ``external_content`` flag (read again under the lock, so a turn
+    that ran in front of the approval counts), the stored platform limits
+    and LLM retry limit (read on every request, GH-160, GH-242) and their org's tool
     policy as it is now (loaded again, after completing the org's due
     promotions; GH-161), then stores the run like a turn. An approved resume
     also loads the caller's prompt context again (GH-170), so a change made
@@ -4002,9 +4012,11 @@ async def post_confirm(
                 pending_confirmation=None,
             )
 
-        # Approved — resume the agent with the pending confirmation and the
-        # prompt context as it is now (GH-170: a change made while the
-        # confirmation was pending applies to the resumed run).
+        # Approved — resume the agent with the pending confirmation, the chat's
+        # external_content flag as read under the lock (a turn queued ahead may have
+        # set it; security audit M-1) and the prompt context as it is now (GH-170: a
+        # change made while the confirmation was pending applies to the resumed run).
+        chat = await chats.get_chat(pool, tenant, chat.id)
         prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
         logger.info("Resuming agent for chat %s after a confirmation", safe_log(chat.id))
