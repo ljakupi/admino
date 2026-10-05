@@ -25,8 +25,15 @@ reply. The helpers below build the shared catalogue:
 - ``sdk_status_error`` maps an SDK HTTP status error: Retry-After read with
   ``parse_retry_after``, a 400/413 classified with ``is_context_too_long``.
 
+Per-call output cap (GH-179): ``LLMClient.chat`` takes a keyword-only
+``max_tokens`` (default None = the configured ``max_response_tokens``). Every
+client resolves it with ``output_token_cap``: the cap is
+``min(max_tokens, configured)``, so a caller can lower it but never raise it;
+a value below 1, a bool or a non-int is a ``ValueError`` before any request.
+
 Inputs: provider statuses, response headers, and (for classification only)
-the provider's error code and message. Outputs: ``LLMError`` instances.
+the provider's error code and message, a per-call output cap. Outputs:
+``LLMError`` instances, the cap a request sends.
 
 Security notes:
 - No credentials are stored or logged by this module.
@@ -577,6 +584,32 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
     return parsed
 
 
+def output_token_cap(configured: int, max_tokens: int | None) -> int:
+    """Return a request's output cap: ``configured``, or the lower per-call cap (GH-179).
+
+    A per-call cap only ever lowers the configured ``max_response_tokens``, so
+    a caller (the chat-title call) can't make a reply longer than the operator
+    allows. Clients call this before any setup check or request.
+
+    Args:
+        configured: The client's configured cap (``LLMConfig.max_response_tokens``).
+        max_tokens: The per-call cap, or None for the configured cap.
+
+    Returns:
+        ``configured`` when ``max_tokens`` is None, else ``min(max_tokens, configured)``.
+
+    Raises:
+        ValueError: ``max_tokens`` is not an int (a bool counts as not one) or is below 1.
+    """
+    if max_tokens is None:
+        return configured
+    # type() rather than isinstance(): a bool is an int subclass but never a cap.
+    if type(max_tokens) is not int or max_tokens < 1:
+        msg = "max_tokens must be an int of at least 1"
+        raise ValueError(msg)
+    return min(max_tokens, configured)
+
+
 def validate_tools_payload(tools: list[dict[str, Any]]) -> None:
     """Validate tool definitions against size limits.
 
@@ -620,6 +653,7 @@ class LLMClient(Protocol):
         tools: list[dict[str, Any]] | None = None,
         *,
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Send a chat request and return the parsed response.
 
@@ -627,9 +661,15 @@ class LLMClient(Protocol):
             messages: Conversation messages.
             tools: Optional tool definitions (JSON Schema format).
             stream: Must be False (streaming not yet unified across providers).
+            max_tokens: Per-call output cap (GH-179). None sends the configured
+                ``max_response_tokens``; an int sends ``output_token_cap()``'s
+                ``min(max_tokens, configured)``. Nothing else in the request changes.
 
         Returns:
             Parsed LLMResponse with content, tool_calls, model, and done flag.
+
+        Raises:
+            ValueError: ``max_tokens`` below 1, a bool or not an int (before any request).
         """
         ...
 

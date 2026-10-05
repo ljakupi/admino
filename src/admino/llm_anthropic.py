@@ -22,6 +22,11 @@ shared catalogue in ``llm.py``: a timeout is ``timeout``, a connection error
 (code None, ``user_facing=False``, "Claude API returned HTTP <n>"). The SDK
 never retries (``max_retries=0``): retries belong to ``admino.llm_policy``.
 
+Output cap: ``chat()``'s keyword-only ``max_tokens`` (GH-179) lowers the
+request's ``max_tokens`` to ``min(max_tokens, config.max_response_tokens)``;
+None keeps the configured cap, an invalid value is a ``ValueError`` before any
+request.
+
 Security notes:
 - API key is read from ANTHROPIC_API_KEY env var, never from config files.
 - No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
@@ -47,6 +52,7 @@ from admino.llm import (
     check_args_depth,
     missing_model_error,
     not_configured_error,
+    output_token_cap,
     provider_status_error,
     sanitize_content,
     sdk_status_error,
@@ -334,6 +340,7 @@ class AnthropicClient:
         tools: list[dict[str, Any]] | None = None,
         *,
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Send a chat request to Anthropic's Messages API.
 
@@ -341,6 +348,8 @@ class AnthropicClient:
             messages: Conversation messages.
             tools: Optional tool definitions (admino tool format).
             stream: Must be False for this method.
+            max_tokens: Per-call output cap (GH-179), sent as ``max_tokens``:
+                ``min(max_tokens, configured cap)``; None sends the configured cap.
 
         Returns:
             Parsed LLMResponse.
@@ -350,11 +359,13 @@ class AnthropicClient:
                 key is rejected, the model is unknown, the rate limit is hit,
                 Claude is unavailable (5xx, connection), the request timed out or
                 the prompt is too long; internal otherwise.
-            ValueError: If stream=True is passed.
+            ValueError: If stream=True is passed, or ``max_tokens`` is below 1,
+                a bool or not an int (before any request).
         """
         if stream:
             msg = "Streaming not yet supported for Anthropic provider"
             raise ValueError(msg)
+        cap = output_token_cap(self._max_tokens, max_tokens)
         if not self._api_key_configured:
             raise not_configured_error(_LABEL, _API_KEY_ENV)
         if not self._model:
@@ -371,7 +382,7 @@ class AnthropicClient:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": api_messages,
-            "max_tokens": self._max_tokens,
+            "max_tokens": cap,
         }
         if system_prompt:
             kwargs["system"] = system_prompt

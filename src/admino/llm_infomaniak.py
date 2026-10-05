@@ -36,8 +36,13 @@ response's Retry-After), a chat 400/413 whose input exceeds the context
 Request shape follows Infomaniak's documented schema for
 ``POST /2/ai/{product_id}/openai/v1/chat/completions``: the output cap is sent as
 ``max_completion_tokens`` and ``chat()`` sends an explicit ``stream: false``
-(``stream`` defaults to true there). Tool-call turns are replayed with
-``tool_calls`` so every ``tool`` result answers its call.
+(``stream`` defaults to true there). ``chat()``'s keyword-only ``max_tokens``
+(GH-179, the chat-title call) lowers that cap to
+``min(max_tokens, config.max_response_tokens)`` and changes nothing else; None
+keeps the configured cap, an invalid value is a ``ValueError`` before any
+request or product discovery. ``chat_stream()`` always sends the configured cap.
+Tool-call turns are replayed with ``tool_calls`` so every ``tool`` result
+answers its call.
 
 Reasoning: requests send ``reasoning_effort: "none"`` (thinking is on by
 default for most models). Reasoning never reaches the answer: the
@@ -83,6 +88,7 @@ from admino.llm import (
     LLMUsage,
     missing_model_error,
     not_configured_error,
+    output_token_cap,
     parse_retry_after,
     provider_status_error,
     sdk_status_error,
@@ -479,7 +485,10 @@ class InfomaniakClient:
         return self._client
 
     async def _prepare(
-        self, messages: list[LLMMessage], tools: list[dict[str, Any]] | None
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None,
+        max_completion_tokens: int,
     ) -> tuple[AsyncOpenAI, dict[str, Any]]:
         """Check the setup, build the request kwargs and return them with the SDK client."""
         self._require_token()
@@ -489,7 +498,7 @@ class InfomaniakClient:
             "model": self._model,
             "messages": _convert_messages_to_openai(messages),
             # Infomaniak documents max_completion_tokens (not the legacy max_tokens).
-            "max_completion_tokens": self._max_tokens,
+            "max_completion_tokens": max_completion_tokens,
             "reasoning_effort": "none",
         }
         if tools:
@@ -506,6 +515,7 @@ class InfomaniakClient:
         tools: list[dict[str, Any]] | None = None,
         *,
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Send a non-streaming chat request to Infomaniak.
 
@@ -513,21 +523,26 @@ class InfomaniakClient:
             messages: Conversation messages.
             tools: Optional tool definitions (admino tool format).
             stream: Must be False; use ``chat_stream()`` to stream.
+            max_tokens: Per-call output cap (GH-179), sent as
+                ``max_completion_tokens``: ``min(max_tokens, configured cap)``;
+                None sends the configured cap.
 
         Returns:
             Parsed LLMResponse with reasoning removed.
 
         Raises:
             LLMError: Catalogue errors (user-facing or internal, never a body).
-            ValueError: If stream=True is passed.
+            ValueError: If stream=True is passed, or ``max_tokens`` is below 1,
+                a bool or not an int (before any request or discovery).
         """
         if stream:
             msg = "InfomaniakClient.chat() does not stream; use chat_stream()"
             raise ValueError(msg)
+        cap = output_token_cap(self._max_tokens, max_tokens)
 
         import openai
 
-        client, kwargs = await self._prepare(messages, tools)
+        client, kwargs = await self._prepare(messages, tools, cap)
         try:
             # Infomaniak documents ``stream`` as defaulting to true and the SDK omits
             # the key unless it is passed, so ask for a single JSON reply explicitly.
@@ -572,7 +587,7 @@ class InfomaniakClient:
         """
         import openai
 
-        client, kwargs = await self._prepare(messages, tools)
+        client, kwargs = await self._prepare(messages, tools, self._max_tokens)
         try:
             stream = await client.chat.completions.create(
                 **kwargs, stream=True, stream_options={"include_usage": True}

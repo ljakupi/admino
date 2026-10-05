@@ -300,6 +300,11 @@ comes back from it. The full behavior is in
 - **Bounded retries.** Only timeouts, connection errors, 429 and 5xx answers are retried,
   at most `llm.max_retries` times (0–5), on the same provider and model; a `Retry-After`
   above 10 seconds isn't retried. The provider SDKs' own retries are off.
+- **Chat titles.** After an untitled chat's first exchange, the title call sends only the
+  first message and the reply (each cut to 1,000 characters), with no tools and no
+  identifiers, through the same residency guard and retries. A blocked or failed call,
+  or a turn that ended with an error, gets a title from the first message instead. The
+  title is sanitized like a stored message and never logged.
 
 ## Logs and error tracking
 

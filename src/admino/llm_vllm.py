@@ -9,7 +9,10 @@ request/response shape is identical to the OpenAI backend.
 
 Inputs/outputs:
 - ``VLLMClient.chat()`` sends messages/tools to the local endpoint and returns a
-  sanitized ``LLMResponse`` (content, tool_calls, model, done).
+  sanitized ``LLMResponse`` (content, tool_calls, model, done). Its keyword-only
+  ``max_tokens`` (GH-179) lowers the request's ``max_tokens`` to
+  ``min(max_tokens, config.max_response_tokens)``; None keeps the configured cap,
+  an invalid value is a ``ValueError`` before any request.
 - ``VLLMClient.close()`` releases the underlying HTTP client.
 
 Errors (provider label "vLLM", GH-242 codes): a missing/empty ``vllm_model``
@@ -44,6 +47,7 @@ from admino.llm import (
     LLMError,
     LLMResponse,
     missing_model_error,
+    output_token_cap,
     sanitize_content,
     sdk_status_error,
     strip_control_chars,
@@ -133,6 +137,7 @@ class VLLMClient:
         tools: list[dict[str, Any]] | None = None,
         *,
         stream: bool = False,
+        max_tokens: int | None = None,
     ) -> LLMResponse:
         """Send a chat request to the local vLLM (OpenAI-compatible) endpoint.
 
@@ -140,6 +145,8 @@ class VLLMClient:
             messages: Conversation messages.
             tools: Optional tool definitions (admino tool format).
             stream: Must be False for this method.
+            max_tokens: Per-call output cap (GH-179), sent as ``max_tokens``:
+                ``min(max_tokens, configured cap)``; None sends the configured cap.
 
         Returns:
             Parsed LLMResponse.
@@ -149,11 +156,13 @@ class VLLMClient:
                 is starting/unreachable or timed out, the model is unknown (404),
                 the rate limit is hit, the endpoint fails (5xx) or the input is
                 too long; internal otherwise.
-            ValueError: If stream=True is passed.
+            ValueError: If stream=True is passed, or ``max_tokens`` is below 1,
+                a bool or not an int (before any request).
         """
         if stream:
             msg = "Streaming not yet supported for vLLM provider"
             raise ValueError(msg)
+        cap = output_token_cap(self._max_tokens, max_tokens)
         if not self._model:
             raise missing_model_error(_LABEL)
 
@@ -164,7 +173,7 @@ class VLLMClient:
         kwargs: dict[str, Any] = {
             "model": self._model,
             "messages": api_messages,
-            "max_tokens": self._max_tokens,
+            "max_tokens": cap,
         }
         if tools:
             try:
