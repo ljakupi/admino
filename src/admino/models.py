@@ -210,7 +210,19 @@ _CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     # loggable string; keep it exclusively in memory from the env var.
     re.compile(r"Bearer\s+\S{1,2048}"),  # Bearer token header values (bounded)
     re.compile(r"GOCSPX-[A-Za-z0-9_\-]{20,80}"),  # Google OAuth client secrets
-    re.compile(r"\bsk-[A-Za-z0-9\-]{20,100}\b"),  # Generic API keys (OpenAI sk-proj-*, Stripe)
+    # Generic sk- API keys: OpenAI sk-proj-, sk-svcacct-, sk-admin- and plain sk-
+    # (about 164 characters, with "_" and "-") and Anthropic sk-ant-<version>-
+    # (with "_"). "sk-" starts a key only at a token start: not right after an
+    # ASCII letter, ASCII digit or "_" (risk-free-..., Ask-..., 2sk-... aren't
+    # keys), then at least 20 key characters. ASCII on purpose, not \b: Python's
+    # \b counts CJK, kana and accented letters as word characters, so a key glued
+    # to Chinese, Japanese or accented text would not be redacted at all. No upper
+    # bound on purpose: an upper bound would leave the rest of a longer run as a
+    # visible tail, so the whole run is redacted whatever its length (fail
+    # closed). No trailing \b, so a key's final "-" goes too. Still linear: the
+    # lookbehind is fixed-width, one greedy class with nothing after it never
+    # backtracks, and a failed start reads at most 19 characters.
+    re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"rk_live_[A-Za-z0-9]{20,200}"),  # Stripe restricted keys (live)
     re.compile(r"rk_test_[A-Za-z0-9]{20,200}"),  # Stripe restricted keys (test)
     re.compile(r"gh[ps]_[A-Za-z0-9]{36,255}"),  # GitHub PATs and server tokens
@@ -247,12 +259,13 @@ def _strip_credentials(value: str) -> str:
     return value
 
 
-def _sanitize_display_text(value: str) -> str:
+def sanitize_display_text(value: str) -> str:
     """Strip control characters and credential patterns from text shown to users.
 
     The live chat reply (``ChatResponse.response``) and a stored message
     (``ChatMessageView.content``) go through this same function, so a chat
-    reads the same live and reloaded.
+    reads the same live and reloaded. Public because chat titles
+    (``chat_titles``) are redacted and cleaned exactly like a stored message.
     """
     return _strip_credentials(value.translate(_CONTROL_CHAR_TABLE))
 
@@ -448,7 +461,7 @@ class ChatResponse(BaseModel):
         direction-override characters. This is defence-in-depth — the PWA
         must also use textContent (not innerHTML) when rendering responses.
         """
-        return _sanitize_display_text(v)
+        return sanitize_display_text(v)
 
     tool_calls: list[ToolCallRecord] = Field(
         default_factory=list,
@@ -2898,8 +2911,9 @@ TitleSource = Literal["auto", "user"]
 
 _CHAT_TITLE_MAX_LENGTH: Final = 200
 # A title is stored and shown in every chat list: the display-name rule plus
-# surrogates (Cs), which can't be stored as UTF-8.
-_CHAT_TITLE_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
+# surrogates (Cs), which can't be stored as UTF-8. Public because an automatic
+# title (chat_titles) drops exactly the characters a ChatTitle refuses.
+CHAT_TITLE_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
 _CURSOR_MAX_LENGTH: Final = 200
 
 
@@ -2908,7 +2922,7 @@ def _check_chat_title(value: str) -> str:
 
     The message never includes the title.
     """
-    if any(unicodedata.category(char) in _CHAT_TITLE_BANNED_CATEGORIES for char in value):
+    if any(unicodedata.category(char) in CHAT_TITLE_BANNED_CATEGORIES for char in value):
         msg = "The title must not contain control or formatting characters."
         raise ValueError(msg)
     return value
@@ -2991,7 +3005,7 @@ class ChatMessageView(BaseModel):
     @classmethod
     def _sanitize_content(cls, value: str) -> str:
         """Strip control characters and credential patterns, as in the live reply."""
-        return _sanitize_display_text(value)
+        return sanitize_display_text(value)
 
 
 class ChatContext(BaseModel):

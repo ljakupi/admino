@@ -37,15 +37,20 @@ Security notes:
   time), so a residency org on a non-Swiss provider makes no request at all
   (``residency_blocked``) and gets the fallback.
 - The reply is untrusted: reasoning blocks, extra lines, markdown headings,
-  ``title:`` labels and surrounding quotes are dropped; credentials are
-  redacted and control characters stripped exactly as for a stored message
-  (NFKC included), then the control, format, surrogate and line/paragraph
-  separator characters (categories Cc, Cf, Cs, Zl, Zp) are removed and
-  credentials are redacted once more, a best-effort net: a key split by a
-  removed control or format character (soft hyphen, word joiner, DEL) is
-  joined by that removal and caught, one split by another invisible character
-  is not; the length is capped last, so a credential is never cut before it
-  is redacted. The fallback gets the same redaction and cleanup.
+  ``title:`` labels and surrounding quotes are dropped; the control, format,
+  surrogate and line/paragraph separator characters a ``ChatTitle`` refuses
+  (``models.CHAT_TITLE_BANNED_CATEGORIES``: Cc, Cf, Cs, Zl, Zp; whitespace
+  kept) are removed before the redaction, so a key split anywhere by one
+  (soft hyphen, word joiner, DEL) is joined first and redacted whole
+  (security audit L-2); then credentials are redacted and control characters
+  stripped exactly as for a stored message (``models.sanitize_display_text``,
+  NFKC included; API keys of the current formats, ``sk-proj-`` and ``sk-ant-``
+  among them, are redacted in full whatever their length), the banned
+  characters are removed once more and whitespace is collapsed. Residual
+  limit: a key split by an invisible character a title keeps (a combining
+  grapheme joiner, a variation selector, a Hangul filler) is not joined, so
+  it isn't redacted whole. The length is capped last, so a credential is never
+  cut before it is redacted. The fallback gets the same redaction and cleanup.
 - A user rename always wins: the store is ``chats.set_auto_title``'s
   compare-and-set on the caller's live, untitled, automatic chat, so a rename
   that lands while the title is being generated is never overwritten.
@@ -72,9 +77,10 @@ from typing import TYPE_CHECKING, Final, Literal
 from admino import chats, llm_policy
 from admino.logs import safe_log
 
-# Private names on purpose: a title is redacted and cleaned exactly like a stored
-# message, and refuses exactly the characters a ChatTitle refuses (contract).
-from admino.models import _CHAT_TITLE_BANNED_CATEGORIES, LLMMessage, _sanitize_display_text
+# A title is redacted and cleaned exactly like a stored message
+# (sanitize_display_text) and drops exactly the characters a ChatTitle refuses
+# (CHAT_TITLE_BANNED_CATEGORIES): the same objects, so the two can't drift apart.
+from admino.models import CHAT_TITLE_BANNED_CATEGORIES, LLMMessage, sanitize_display_text
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -160,23 +166,29 @@ def truncate_title(text: str) -> str:
     return text[: TITLE_MAX_LENGTH - 1] + _ELLIPSIS
 
 
-def _redact_and_clean(text: str) -> str:
-    """Redact as for a stored message, drop the banned characters, single-space and strip.
+def _drop_banned(text: str) -> str:
+    """Remove the characters a ``ChatTitle`` refuses, keeping whitespace."""
+    return "".join(
+        char
+        for char in text
+        # Whitespace is collapsed later, not removed: a tab or a newline (Cc)
+        # still separates two words.
+        if char.isspace() or unicodedata.category(char) not in CHAT_TITLE_BANNED_CATEGORIES
+    )
 
-    Twice: removing an invisible character that the stored-message cleanup keeps
-    (a soft hyphen, a word joiner, DEL) can join a credential the first
-    redaction couldn't match.
+
+def _redact_and_clean(text: str) -> str:
+    """Drop the banned characters, redact as for a stored message, single-space and strip.
+
+    The banned characters go before the redaction: an invisible character that
+    the stored-message cleanup keeps (a soft hyphen, a word joiner, DEL) can
+    split a key anywhere, and removing it only after the redaction would join
+    the key's unredacted tail onto the marker (security audit L-2). They are
+    dropped once more after it, because a title must hold none and NFKC isn't
+    trusted to add none. Linear: three single passes.
     """
-    for _ in range(2):
-        kept = "".join(
-            char
-            for char in _sanitize_display_text(text)
-            # Whitespace is collapsed below, not removed: a tab or a newline (Cc)
-            # still separates two words.
-            if char.isspace() or unicodedata.category(char) not in _CHAT_TITLE_BANNED_CATEGORIES
-        )
-        text = _WHITESPACE_RE.sub(" ", kept).strip()
-    return text
+    kept = _drop_banned(sanitize_display_text(_drop_banned(text)))
+    return _WHITESPACE_RE.sub(" ", kept).strip()
 
 
 def sanitize_title(raw: str) -> str:
@@ -186,7 +198,7 @@ def sanitize_title(raw: str) -> str:
     rest, an orphan ``</think>`` everything before it); the first line with
     text kept; a leading heading marker or ``title:`` label (EN/DE/FR) and
     the surrounding quote and emphasis characters stripped until neither
-    changes the text; credentials redacted and banned characters removed
+    changes the text; banned characters removed and credentials redacted
     (``_redact_and_clean``); trailing dots removed; truncated.
 
     Args:
@@ -289,7 +301,7 @@ async def title_chat(
     user_message: str,
     assistant_message: str,
     run_failed: bool,
-    external_content: bool = False,
+    external_content: bool,
     data_residency: bool,
     max_retries: int,
 ) -> None:
@@ -312,7 +324,8 @@ async def title_chat(
         run_failed: Whether the first run ended in an error.
         external_content: Whether the first run's tool results held wrapped
             external content (GH-243): the reply may quote it, so the model
-            isn't asked and the fallback is stored.
+            isn't asked and the fallback is stored. Required (no default), so
+            no caller can leave it out and fail open.
         data_residency: The org's residency policy.
         max_retries: The platform's retry limit (0..5).
 

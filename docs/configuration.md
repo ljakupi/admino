@@ -689,8 +689,10 @@ Viewer's chats from before a role change stay stored, unused.
   message of a turn carries the turn's outcome (`complete`, `error`,
   `awaiting_confirmation` or `limit_reached`) and its tool calls; the others are
   `complete`. Control characters and credential-like text are stripped from the content,
-  like in a live reply. `tool_calls` is the same summary as in the live reply; the raw
-  arguments the model sent to a tool are never shown.
+  like in a live reply and in automatic titles: API keys such as `sk-…`, `sk-proj-…` and
+  `sk-ant-…` become `[CREDENTIAL_REDACTED]` in full, whatever their length. `tool_calls`
+  is the same summary as in the live reply; the raw arguments the model sent to a tool
+  are never shown.
 - **Errors** use the usual `{"detail", "reason"}` body and never repeat what you sent. A
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":

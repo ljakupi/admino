@@ -19,7 +19,8 @@ What these tests pin down (contract §2 and the ``title_chat`` part of §3):
   ``deleted_at IS NULL``, ``title_source = 'auto'`` and ``title = ''``; the
   title travels as a bind parameter; no audit row, no log line.
 - ``title_chat(pool, tenant, chat_id, *, get_client, user_message,
-  assistant_message, run_failed, data_residency, max_retries) -> None``:
+  assistant_message, run_failed, external_content, data_residency,
+  max_retries) -> None`` (every keyword required since GH-264):
   - Model path: the client from ``get_client()`` (resolved once) gets ONE
     request (``build_title_messages`` of the two messages, no tools,
     ``max_tokens=TITLE_MAX_TOKENS``, no chat, org or user id), through
@@ -356,15 +357,12 @@ async def _title_chat(
     user_message: str = _USER,
     assistant_message: str = _ASSISTANT,
     run_failed: bool = False,
-    external_content: bool | None = None,
+    external_content: bool = False,
     data_residency: bool = False,
     max_retries: int = 2,
 ) -> Any:
-    # external_content (contract section 7) is passed only when a test gives it, so the
-    # other tests call title_chat exactly as before (its default).
-    flag: dict[str, bool] = (
-        {} if external_content is None else {"external_content": external_content}
-    )
+    # external_content (contract section 7) has no default in title_chat (GH-264), so
+    # it is always passed: False unless a test gives it.
     return await chat_titles.title_chat(
         pool,
         tenant,
@@ -373,9 +371,9 @@ async def _title_chat(
         user_message=user_message,
         assistant_message=assistant_message,
         run_failed=run_failed,
+        external_content=external_content,
         data_residency=data_residency,
         max_retries=max_retries,
-        **flag,
     )
 
 
