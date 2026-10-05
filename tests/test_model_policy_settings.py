@@ -128,6 +128,8 @@ _INT_FIELDS: dict[str, tuple[int, int, int]] = {
 _INT_IDS = list(_INT_FIELDS)
 _BOUND_ERRORS = frozenset({"greater_than_equal", "less_than_equal"})
 _RESIDENCY_CONFIRM_MAX = 1_000_000
+# GH-176: a ChatResponse names its persisted chat (a required chat_id).
+_CHAT_ID = uuid.UUID("5b2e9d14-7a3c-4f68-b1e0-2c9d8f7a6e51")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SHIPPED_CONFIG_PATH = _REPO_ROOT / "config" / "config.yaml"
@@ -808,7 +810,7 @@ class TestErrorCodes:
         assert [loc[:1] for loc, _ in _errors(exc)] == [("error_code",)]
 
     def test_chat_response_error_code_defaults_to_none_and_is_serialized(self) -> None:
-        response = ChatResponse(session_id="sess-1", response="Hello.")
+        response = ChatResponse(chat_id=_CHAT_ID, session_id="sess-1", response="Hello.")
 
         assert response.error_code is None
         assert json.loads(response.model_dump_json())["error_code"] is None
@@ -816,7 +818,13 @@ class TestErrorCodes:
     @pytest.mark.parametrize("code", sorted(_ERROR_CODES))
     def test_chat_response_error_code_accepts_each_code(self, code: str) -> None:
         response = ChatResponse.model_validate(
-            {"session_id": "sess-1", "response": "x", "status": "error", "error_code": code}
+            {
+                "chat_id": str(_CHAT_ID),
+                "session_id": "sess-1",
+                "response": "x",
+                "status": "error",
+                "error_code": code,
+            }
         )
 
         assert response.error_code == code
@@ -826,7 +834,13 @@ class TestErrorCodes:
     def test_chat_response_error_code_refuses_an_unknown_code(self, code: str) -> None:
         exc = _rejects(
             ChatResponse,
-            {"session_id": "sess-1", "response": "x", "status": "error", "error_code": code},
+            {
+                "chat_id": str(_CHAT_ID),
+                "session_id": "sess-1",
+                "response": "x",
+                "status": "error",
+                "error_code": code,
+            },
         )
 
         assert [loc[:1] for loc, _ in _errors(exc)] == [("error_code",)]

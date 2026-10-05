@@ -17,6 +17,7 @@ admino is configured by two things:
 - [`config.yaml` reference](#configyaml-reference)
 - [Settings: mine, organization, platform](#settings-mine-organization-platform)
 - [Accounts and sessions](#accounts-and-sessions)
+- [Chats](#chats)
 - [Email (SMTP)](#email-smtp)
 - [Production deployment (TLS reverse proxy)](#production-deployment-tls-reverse-proxy)
 - [Data & storage](#data--storage)
@@ -34,10 +35,10 @@ Switzerland. A local vLLM container and two cloud providers are opt-in.
 | **Claude (Anthropic)** | opt-in cloud | `ANTHROPIC_API_KEY` in the environment. |
 | **OpenAI** | opt-in cloud | `OPENAI_API_KEY` in the environment, and `api.openai.com` in the egress whitelist. |
 
-The active provider processes your messages and tool results. Everything else (audit
-log, memory, documents) stays on the server that runs admino. API keys and tokens live in
-environment variables on the server only: they're never written to `config.yaml`, never
-logged, and never sent to the browser.
+The active provider processes your messages and tool results. Everything else (chats,
+audit log, memory, documents) stays on the server that runs admino. API keys and tokens
+live in environment variables on the server only: they're never written to `config.yaml`,
+never logged, and never sent to the browser.
 
 **When something is missing, admino still boots.** A missing API key or model, a rejected
 key, a rate limit or an unreachable provider never stops startup or a provider switch.
@@ -101,8 +102,8 @@ aren't.
 
 ### LLM errors and retries
 
-A chat reply that fails has `status: "error"`, and the `POST /api/message` and
-`POST /api/confirm/{id}` responses carry its `error_code`:
+A chat reply that fails has `status: "error"`, and the `POST /api/chats/{id}/messages`,
+`POST /api/message` and `POST /api/confirm/{id}` responses carry its `error_code`:
 
 | `error_code` | What happened |
 | --- | --- |
@@ -224,7 +225,7 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | `server` | Bind `host` / `port` for the ASGI server, the session cookie's `cookie_secure` flag, the `public_url` users open admino at, and the `trusted_proxies` whose `X-Forwarded-*` headers are believed (see [Production deployment](#production-deployment-tls-reverse-proxy)). |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
 | `llm` | `provider`, request `timeout_s`, the cloud `*_model` IDs, and the active model's capabilities: `max_input_tokens` (the most input tokens it accepts, default 200000, from 1000 to 2000000) and `image_input` (whether it accepts images, default `true`). The provider, the model IDs and the capabilities are also [platform settings](#platform-defaults); this section is applied again at every start. The retry limit isn't in `config.yaml`: it's a platform setting only. |
-| `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (the system prompt and your latest message are always sent). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. Change them with `PATCH /api/platform/settings` instead. |
+| `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (how many of a chat's latest messages are sent to the model; the system prompt and your latest message are always sent, see [Chats](#chats)). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. Change them with `PATCH /api/platform/settings` instead. |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 | `log_level` | Top-level key: `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. The `LOG_LEVEL` env var overrides it. |
 | `log_format` | Top-level key: `text` (default) or `json`, one JSON object per line (`ts`, `level`, `logger`, `message`, `request_id`) for a log collector. The `LOG_FORMAT` env var overrides it (`text` or `json`, any case; another value is ignored with a warning). Logs never hold content, see [Logs and error tracking](SECURITY.md#logs-and-error-tracking). |
@@ -394,7 +395,8 @@ from the settings as they are at that moment, in this order:
 3. **Your personal instructions** (**My account**).
 4. **The current date, time and timezone**: your timezone, or Europe/Zurich when you
    haven't set one.
-5. **The chat**: the earlier messages, then your new one.
+5. **The chat**: its latest earlier messages (up to `max_context_messages`, see
+   [Chats](#chats)), then your new one.
 
 - The organization's and your personal instructions each go in their own marked section,
   introduced as preferences the assistant follows unless they conflict with the
@@ -570,13 +572,14 @@ routes. Editors, Viewers and the Super Admin get `403`.
   can't belong to any account on the platform yet, in any capitalization. When the address
   changes, admino emails the old address a short notice (without either address), and a
   password reset link the user already got stops working. A new role applies from the
-  user's next request. A Viewer keeps their connections and notes, unused.
+  user's next request. A Viewer keeps their chats, connections and notes, unused.
 - `POST /api/org/users/{id}/deactivate` ends every session of the user at once and emails
-  them that their account was deactivated. Their connections, notes and settings are kept.
+  them that their account was deactivated. Their chats, connections, notes and settings
+  are kept.
 - `POST /api/org/users/{id}/reactivate` needs a free seat (active and invited users take
   one), and emails the user a link to log in.
-- `DELETE /api/org/users/{id}` deletes the account with its sessions, connections, notes
-  and settings. The email address is free again.
+- `DELETE /api/org/users/{id}` deletes the account with its sessions, chats, connections,
+  notes and settings. The email address is free again.
 - `POST /api/org/users/{id}/password-reset` sends the user the same email as **Forgot your
   password?** above. The admin never sees the link. A deactivated user can't get one.
 
@@ -640,6 +643,78 @@ what the agent may do in their organization. The Platform page is the Super Admi
 [Organizations](#organizations-super-admin)). The server checks every request on its own, so a hidden page's API still
 refuses a role that isn't allowed to use it.
 
+## Chats
+
+Chats are stored in PostgreSQL, in their organization, and they're private to the member
+who started them. Nobody else can read them in this release, not even an Org Admin. Org
+Admins and Editors chat. Viewers and the Super Admin get `403` on every chat route. A
+Viewer's chats from before a role change stay stored, unused.
+
+| Route | What it does |
+| --- | --- |
+| `POST /api/chats` | Starts a chat. The body is `{}` or `{"title": "..."}`. Answers `201` with the chat: `id`, `title`, `title_source`, `created_at` and `last_activity_at`. Without a title, `title` is `""` and `title_source` is `"auto"`; with one, `"user"`. |
+| `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
+| `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. It also carries `pending_confirmation`, `confirmation_status` and `context`, see below. |
+| `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
+| `DELETE /api/chats/{id}` | Moves the chat to the trash and answers `204`. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete`, with the chat's ID only. |
+| `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`. Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, and the `chat_id`. |
+
+- **Titles** have 1 to 200 characters, spaces at either end removed. Control and
+  formatting characters are refused with `422`. Creating, renaming and sending messages
+  aren't recorded in the audit log, and titles and messages are never logged.
+- **Pages and cursors.** Pass a response's `next_cursor` as `cursor` to get the next
+  page; `null` means there's nothing more. Cursors are opaque: use them as they come, and
+  don't build or change them. A cursor that doesn't decode, or one from the other list,
+  answers `422` `{"detail": "Invalid cursor", "reason": "invalid_cursor"}`.
+- **Messages** have an `id`, a `role` (`user`, `assistant` or `tool`), the `content`, a
+  `tool_call_id` (tool results), `tool_calls`, a `status` and `created_at`. The last
+  message of a turn carries the turn's outcome (`complete`, `error`,
+  `awaiting_confirmation` or `limit_reached`) and its tool calls; the others are
+  `complete`. Control characters and credential-like text are stripped from the content,
+  like in a live reply. `tool_calls` is the same summary as in the live reply; the raw
+  arguments the model sent to a tool are never shown.
+- **Errors** use the usual `{"detail", "reason"}` body and never repeat what you sent. A
+  chat that doesn't exist, is in the trash, or belongs to another user or another
+  organization answers the same `404` `{"detail": "Chat not found", "reason":
+  "chat_not_found"}`, so nobody learns that someone else's chat exists. A chat ID that
+  isn't a UUID answers `422`. `503` with `"reason": "chats_busy"` means the server is
+  already running as many chats at once as it can hold; try again shortly.
+- **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages` and
+  `POST /api/message` share one limit, so switching between them doesn't double your
+  rate.
+- **Confirmations.** When an action needs your approval, the reply has
+  `status: "awaiting_confirmation"` and a `pending_confirmation`. Approve or deny it with
+  `POST /api/confirm/{confirmation_id}` and
+  `{"chat_id": "...", "confirmation_id": "...", "approved": true}` (or `false`). A denial
+  is stored in the chat too, as "Tool call denied by the user." and "Action … was
+  denied." A new message in the chat cancels a pending confirmation.
+- **Pending confirmations live in memory only.** The chat and its messages are stored,
+  but the pending confirmations and the lock that runs one message at a time per chat are
+  kept in the server's memory, for a limited number of chats; idle ones are dropped. So
+  after a restart, or once a confirmation timed out (`confirmation_timeout_s`, a
+  [platform default](#platform-defaults), 300 seconds by default), `GET /api/chats/{id}`
+  shows `confirmation_status: "expired"` and no `pending_confirmation`, and confirming it
+  answers `404`. When the server holds too many chats at once, the least recently used one
+  loses its pending confirmation the same way. Ask again in a new message.
+  `confirmation_status` is `"pending"` while a confirmation waits, and `"none"` otherwise.
+- **What the model sees.** Each message sends the model only the chat's latest messages,
+  up to `max_context_messages` (a [platform default](#platform-defaults), 20 by default).
+  The assistant's instructions and your new message are always sent. Older messages stay
+  stored and readable, but the model doesn't see them. Until
+  [#190](https://github.com/ljakupi/admino/issues/190) changes how long chats are
+  handled, `GET /api/chats/{id}` carries `context: {"message_count",
+  "max_context_messages", "truncated"}`, with `truncated: true` when the chat holds more
+  messages than the model sees. When an earlier message of the chat held external
+  content, actions that change something still ask first, even after the model no longer
+  sees that message (see
+  [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
+- **The older routes.** `POST /api/message` and `POST /api/confirm/{id}` with a
+  `session_id`, and `GET /api/events?session_id=`, still work until
+  [#177](https://github.com/ljakupi/admino/issues/177) removes them. Each of your session
+  IDs maps to a stored chat of yours, created with its first message and listed with
+  your other chats, so these conversations survive a restart too. Their responses carry
+  that chat's `chat_id` and echo the `session_id`.
+
 ## Organizations (Super Admin)
 
 The Super Admin creates organizations, sets their plan limits, deactivates and deletes
@@ -691,8 +766,8 @@ a new one to replace it).
 
   A background job checks every hour (and at startup) for organizations past their date
   and **irreversibly** deletes everything they hold: their users with their sessions,
-  invitations and queued email, their audit log, the organization itself, and its files on
-  disk. What stays is the platform's record of the deletion: an `org.purge` audit event
+  chats, invitations and queued email, their audit log, the organization itself, and its
+  files on disk. What stays is the platform's record of the deletion: an `org.purge` audit event
   with the organization's ID and counts, no names.
 
   The database enforces the grace period too: a deletion is always open for at least
@@ -722,10 +797,11 @@ log, without names or email addresses.
   details only, never what the users store.
 - `GET /api/platform/orgs/{id}/metadata` returns the seat usage, `seats: {"used",
   "limit"}` (counted like an invitation: active users and pending invitations), the storage
-  used in bytes, and the number of chats and files. The last three are `0` until chats and
-  attachments arrive in a later release.
+  used in bytes, the number of the organization's chats that aren't in the trash (a count,
+  never a title), and the number of files. The storage used and the number of files are
+  `0` until attachments arrive in a later release.
 - `POST /api/platform/orgs/{id}/users/{user_id}/deactivate` ends every session of the user
-  at once and emails them; their connections, notes and settings are kept.
+  at once and emails them; their chats, connections, notes and settings are kept.
   `.../reactivate` needs a free seat and emails the user a link to log in; it's refused
   while the organization's deletion is pending. An organization always keeps at least one
   active Org Admin, for the Super Admin too: deactivating the last one answers `409` with
@@ -835,8 +911,9 @@ What the profile sets up:
   print a request's path or query string are turned off: invitation and reset tokens are
   part of some URLs.
 - **No local model, one process.** The profile never starts the `vllm` container, and the
-  agent runs as a single uvicorn process in a single container. Pending confirmations and
-  rate-limit counters live in that process's memory, so don't scale it out.
+  agent runs as a single uvicorn process in a single container. Pending confirmations, the
+  per-chat run locks and the rate-limit counters live in that process's memory, so don't
+  scale it out (see [Chats](#chats)).
 
 **Trying it on a laptop.** With `ADMINO_DOMAIN=localhost`, Caddy uses its own local
 certificate authority instead of Let's Encrypt. Check it with curl, e.g.
@@ -850,7 +927,8 @@ certificate authority instead of Let's Encrypt. Check it with curl, e.g.
 
 PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, each organization's `permissions`,
 each user's `memory` notes and `oauth_tokens` (one row per user and provider), the
-`audit_events` audit trail, and the `email_outbox` of queued transactional email.
+`chats` and their `chat_messages`, the `audit_events` audit trail, and the `email_outbox`
+of queued transactional email.
 
 - **Two database roles.** The app connects as `admino_app`, a non-superuser with
   per-table rights (`PG_APP_PASSWORD`). The owner `admino` (`PG_PASSWORD`) applies the
@@ -863,11 +941,19 @@ each user's `memory` notes and `oauth_tokens` (one row per user and provider), t
   the database. Lose the key and stored tokens are unrecoverable; after rotating it, every
   user reconnects their accounts on the Tools page (see
   [Connect your accounts](getting-started.md#connect-your-accounts)).
+- **Chats** live in the `chats` and `chat_messages` tables, each chat in its organization
+  and with its owner (see [Chats](#chats)). They hold your messages, the assistant's
+  replies and the tool results. The assistant's instructions (the platform's rules, the
+  organization's and your personal instructions) are never stored. The app can add
+  messages but can't edit or delete a single one. Deleting a user deletes their chats, and
+  purging an organization deletes all of its chats. A chat in the trash stays stored, only
+  marked with `deleted_at`; restoring and purging the trash come with
+  [#194](https://github.com/ljakupi/admino/issues/194).
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
-  row with the tool, the action, the permission decision, success and duration. Arguments,
-  tool output and message text are never stored. Rows are kept for 12 months by default
-  (6 to 84, a [platform default](#platform-defaults)), and a daily
-  job purges older ones. See [Permissions](permissions.md#append-only-audit-log).
+  row with the chat's ID, the tool, the action, the permission decision, success and
+  duration. Arguments, tool output and message text are never stored. Rows are kept for 12
+  months by default (6 to 84, a [platform default](#platform-defaults)), and a daily job
+  purges older ones. See [Permissions](permissions.md#append-only-audit-log).
 
 ## Egress whitelist
 

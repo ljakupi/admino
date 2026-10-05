@@ -8,12 +8,15 @@ What is pinned here:
   boolean (``true``/``false``, never ``1``/``0`` or text). A non-bool (``1``, ``0``,
   ``"true"``, ``None``, ``1.0``) raises ``AuditRecordError`` and nothing is executed.
 - ``main._build_tool_call_recorder()``'s recorder takes ``escalated`` as a required
-  keyword-only argument and forwards it to ``record_tool_call(..., escalated=)``.
+  keyword-only argument and forwards it to ``record_tool_call(..., escalated=)``,
+  targeting the chat whose id the run's ``session_id`` carries (GH-176:
+  ``chat_id=uuid.UUID(session_id)``).
 - End to end, a real ``Agent`` with that recorder and a mocked pool: a run that reads
   wrapped content and then calls an allowed side-effect action writes ``escalated``
   false for the read and true for the escalated ``confirm``; the approved resume
-  writes true again; a run without wrapped content writes false. No body, label,
-  boundary or argument value reaches any bind parameter.
+  writes true again; a run without wrapped content writes false. Every row targets
+  the run's chat (GH-176). No body, label, boundary or argument value reaches any
+  bind parameter.
 
 ``admino.untrusted`` and ``register_tool(..., side_effect=)`` are used lazily, so this
 file collects before GH-243 and every test fails on its own.
@@ -59,7 +62,8 @@ _ORG: Final = uuid.UUID("2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e")
 _USER: Final = uuid.UUID("3c4d5e6f-7a8b-4c9d-8e0f-2a3b4c5d6e7f")
 _CHAT: Final = uuid.UUID("4d5e6f7a-8b9c-4d0e-9f1a-3b4c5d6e7f8a")
 _MEMBER: Final = Principal(user_id=_USER, kind="member", org_id=_ORG, role="editor")
-_SESSION: Final = "s-audit-escalated-243"
+# GH-176: the run's session_id is the chat's id (str(chat.id)), the tool.call target.
+_SESSION: Final = str(_CHAT)
 
 _SIX_FIELDS: Final = frozenset(
     {"tool", "action", "decision", "success", "duration_ms", "escalated"}
@@ -262,7 +266,7 @@ class TestMainRecorderForwardsEscalated:
             pool,
             org_id=_ORG,
             actor_user_id=_USER,
-            chat_id=main_module._session_chat_id(_SESSION),
+            chat_id=uuid.UUID(_SESSION),
             tool="memory",
             action="store",
             decision="confirm",
@@ -447,6 +451,21 @@ class TestEscalatedRowEndToEnd:
         ]
         assert [item["escalated"] for item in metadata] == [False, True]
         assert all(set(item) == _SIX_FIELDS for item in metadata)
+
+    async def test_tool_call_audit_escalated_rows_target_the_runs_chat(
+        self, pool: MagicMock, stored: list[tuple[str, str]]
+    ) -> None:
+        """GH-176: the read and the escalated confirm both name the run's chat id."""
+        await _run(
+            LLMResponse(content="", tool_calls=[_READ]),
+            LLMResponse(content="", tool_calls=[_STORE]),
+        )
+
+        rows = [_row(call) for call in pool.execute.await_args_list]
+        assert [(row["target_type"], json.loads(row["target_ids"])) for row in rows] == [
+            ("chat", [str(_CHAT)]),
+            ("chat", [str(_CHAT)]),
+        ]
 
     async def test_tool_call_audit_approved_escalated_resume_writes_true(
         self, pool: MagicMock, stored: list[tuple[str, str]]

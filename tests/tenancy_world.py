@@ -12,6 +12,9 @@ Inputs: a ``FakeDb``. Outputs:
   ``PASSWORD``. Both orgs have data residency off, the default tool
   permission matrix and an org_settings row; the platform settings row exists.
 - ``make_app(agent)`` / ``make_client(app)``: the app and a TestClient.
+- ``seed_chat`` / ``seed_pending_confirmation`` / ``chat_runtime_state``: a
+  persisted chat of an account, a pending confirmation of it in the server's
+  chat runtime, and what that runtime holds (GH-176).
 - The catalog: ``ROUTES`` (every registered API route, classified),
   ``ROLE_MATRIX`` (#139 §2.1, written from the tracker, never from
   ``access.py``), ``PENDING_CAPABILITIES`` (capabilities without a route yet,
@@ -33,6 +36,18 @@ GH-167's two capabilities (``platform.org_metadata.view``,
 ``platform.users.manage``) are named by value through ``_capability`` so the
 catalog imports before access.py defines them (see its docstring).
 
+GH-176 (persisted, owner-private chats): the six chat routes (POST and GET
+/api/chats, GET/PATCH/DELETE /api/chats/{chat_id}, POST
+/api/chats/{chat_id}/messages) are member rows gated by ``chat.send`` (Org
+Admin, Editor; a Viewer and the Super Admin get 403). Not found, another
+org's and another user's chat all answer ``CHAT_NOT_FOUND``. Chats live in the
+FakeDb's ``chats`` / ``chat_messages`` tables (so ``db.snapshot()`` holds
+them); the only in-memory chat state is ``server._chat_runtime`` (per-chat
+locks and pending confirmations). Helpers: ``seed_chat`` (a live chat of an
+account, with messages), ``seed_pending_confirmation`` (a live pending
+confirmation of a chat in the runtime) and ``chat_runtime_state`` (what the
+runtime holds for the stored chats, for "nothing changed" snapshots).
+
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
 - The expected role matrix is spelled out here on purpose: deriving it from
@@ -41,9 +56,11 @@ Security notes:
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
@@ -51,12 +68,12 @@ from fastapi.testclient import TestClient
 from admino import server
 from admino.access import Capability
 from admino.config import AppConfig
-from admino.models import AgentResult, LLMMessage
+from admino.models import AgentResult, LLMMessage, PendingConfirmation, ToolCall
 from admino.server import create_app
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, PUBLIC_URL, FakeDb, fake_hash
 
 if TYPE_CHECKING:
-    import uuid
+    from collections.abc import Sequence
 
     import pytest
     from fastapi import FastAPI
@@ -78,6 +95,8 @@ NEW_PASSWORD: Final = "tenancy-Changed-166-meadow"
 CLIENT_IP: Final = "203.0.113.163"
 FORBIDDEN: Final = {"detail": "Forbidden"}
 UNAUTHORIZED: Final = {"detail": "Unauthorized"}
+# GH-176: unknown, another org's, another user's (and a trashed) chat: one answer.
+CHAT_NOT_FOUND: Final = {"detail": "Chat not found", "reason": "chat_not_found"}
 
 
 @dataclass(frozen=True)
@@ -154,6 +173,82 @@ def build_world(db: FakeDb) -> World:
         a=MappingProxyType(a),
         b=MappingProxyType(b),
     )
+
+
+# ---------------------------------------------------------------------------
+# Chats (GH-176): persisted rows, and the in-memory runtime's pending confirmations
+# ---------------------------------------------------------------------------
+
+
+def _user_id(owner: Account | uuid.UUID) -> uuid.UUID:
+    """An account's user id (or the id itself)."""
+    return owner.user_id if isinstance(owner, Account) else owner
+
+
+def seed_chat(
+    db: FakeDb,
+    owner: Account | uuid.UUID,
+    *,
+    title: str = "",
+    messages: Sequence[tuple[str, str]] = (),
+    legacy_session_id: str | None = None,
+    external_content: bool = False,
+) -> uuid.UUID:
+    """Store a live chat of ``owner`` (an account or a user id) in the owner's org, with
+    ``messages``; its id.
+
+    ``messages`` are (role, content) pairs stored in order (``complete``). A
+    title makes ``title_source`` "user"; none leaves "" and "auto". A
+    ``legacy_session_id`` makes it the owner's chat of that legacy session id.
+    """
+    chat_id = db.add_chat(
+        _user_id(owner),
+        title=title,
+        title_source="user" if title else "auto",
+        legacy_session_id=legacy_session_id,
+        external_content=external_content,
+    )
+    for role, content in messages:
+        db.add_chat_message(chat_id, role, content)
+    return chat_id
+
+
+def seed_pending_confirmation(
+    owner: Account | uuid.UUID, chat_id: uuid.UUID, confirmation_id: str
+) -> PendingConfirmation:
+    """Store a live (5 minutes) google_calendar.create confirmation of the chat in
+    ``server._chat_runtime`` (read at call time: it exists from GH-176); return it.
+
+    Call it after ``make_app``: ``create_app()`` clears the runtime (a restart).
+    """
+    now = datetime.now(UTC)
+    pending = PendingConfirmation(
+        confirmation_id=confirmation_id,
+        session_id=str(chat_id),
+        tool_call=ToolCall(tool="google_calendar", action="create", args={}),
+        created_at=now,
+        expires_at=now + timedelta(minutes=5),
+    )
+    server._chat_runtime.set_pending(chat_id, _user_id(owner), pending)
+    return pending
+
+
+def chat_runtime_state(db: FakeDb) -> dict[str, Any] | None:
+    """What ``server._chat_runtime`` holds: its entry count and, for every stored chat,
+    its pending confirmation (as JSON values) or None.
+
+    None while the server has no runtime (before GH-176), so the "nothing changed"
+    snapshots of unrelated routes stay meaningful; tests/test_tenancy_roles.py pins
+    that the runtime exists and is the only in-memory chat state.
+    """
+    runtime = getattr(server, "_chat_runtime", None)
+    if runtime is None:
+        return None
+    pending: dict[str, Any] = {}
+    for chat_id in db.chats:
+        found = runtime.get_pending(uuid.UUID(str(chat_id)))
+        pending[str(chat_id)] = None if found is None else found.model_dump(mode="json")
+    return {"entries": len(runtime), "pending": pending}
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +621,13 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     RouteSpec("POST", "/api/message", "member", Capability.CHAT_SEND, "own_user"),
     RouteSpec("GET", "/api/events", "member", Capability.CHAT_SEND, "own_user"),
     RouteSpec("POST", "/api/confirm/{confirmation_id}", "member", Capability.CHAT_SEND, "path_id"),
+    # GH-176: persisted chats, private to their owner (not even an Org Admin reads them).
+    RouteSpec("POST", "/api/chats", "member", Capability.CHAT_SEND, "own_user"),
+    RouteSpec("GET", "/api/chats", "member", Capability.CHAT_SEND, "own_user"),
+    RouteSpec("GET", "/api/chats/{chat_id}", "member", Capability.CHAT_SEND, "path_id"),
+    RouteSpec("PATCH", "/api/chats/{chat_id}", "member", Capability.CHAT_SEND, "path_id"),
+    RouteSpec("DELETE", "/api/chats/{chat_id}", "member", Capability.CHAT_SEND, "path_id"),
+    RouteSpec("POST", "/api/chats/{chat_id}/messages", "member", Capability.CHAT_SEND, "path_id"),
     # --- own Google/Microsoft connections ---
     RouteSpec("GET", "/api/oauth/google/authorize", "member", Capability.OAUTH_CONNECT, "own_user"),
     RouteSpec(

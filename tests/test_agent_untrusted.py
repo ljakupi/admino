@@ -44,6 +44,17 @@ What is pinned here:
   leaves ``gmail.send`` denied by default and confirm-gated (unescalated) when
   promoted, and the send handler never runs.
 
+GH-176 (contract section 4): ``Agent.run(..., earlier_external_content=True)`` (a
+persisted chat's sticky ``external_content`` flag: the conversation held wrapped
+content before the loaded tail) starts the run escalated exactly like a history
+holding a wrapped tool result: from the first dispatch (the dispatch layer gets
+``escalate_side_effects=True``, the recorder ``escalated=True``), on a confirmation
+resume and for the resumed run's further side effects. Read-only, ``deny`` and
+configured ``confirm`` outcomes are unchanged. ``False`` (the default) keeps today's
+behaviour and never masks a wrapped history, and the flag belongs to its run only
+(the next run and a concurrent run on the same Agent aren't escalated). The keyword
+is passed through ``**kwargs`` so this file collects before GH-176.
+
 ``admino.untrusted`` and the new ``register_tool(..., side_effect=)`` keyword are
 used lazily (inside fixtures and helpers), so this file collects before GH-243 and
 each test fails on its own.
@@ -56,6 +67,7 @@ well-known Swiss example number, never real data.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import re
@@ -1138,3 +1150,280 @@ class TestForwardEmailScenario:
             ("gmail", "read", "allow", True, False),
             ("gmail", "send", "confirm", False, False),
         ]
+
+
+# ===========================================================================
+# 9. GH-176: earlier_external_content (a persisted chat's sticky flag)
+# ===========================================================================
+
+# earlier_external_content=True on a clean history, one call per probe action:
+# (status, handler runs, recorder outcomes). Only the allowed side effect changes.
+_EARLIER_OUTCOMES: Final[dict[str, tuple[str, list[tuple[str, str]], list[tuple[Any, ...]]]]] = {
+    "look": ("final", [("look", "x")], [("probe", "look", "allow", True, False)]),
+    "act": ("awaiting_confirmation", [], [("probe", "act", "confirm", False, True)]),
+    "danger": ("final", [], [("probe", "danger", "deny", False, False)]),
+    "ask": ("awaiting_confirmation", [], [("probe", "ask", "confirm", False, False)]),
+}
+
+
+def _clean_history() -> list[LLMMessage]:
+    """A finished earlier turn whose tool result holds no wrapped content."""
+    return _wrapped_history(content="look:m0 plain text, nothing external")
+
+
+async def _run_flagged(
+    agent: Agent,
+    message: str = "ok, do it",
+    *,
+    earlier: bool | None,
+    history: list[LLMMessage] | None = None,
+    pending: PendingConfirmation | None = None,
+) -> AgentResult:
+    """Run with ``earlier_external_content=earlier`` (omitted when ``None``).
+
+    The keyword travels through ``**flag`` so this file collects before GH-176.
+    """
+    flag: dict[str, bool] = {} if earlier is None else {"earlier_external_content": earlier}
+    run: Any = agent.run
+    result: AgentResult = await run(
+        message,
+        session_id=_SESSION,
+        history=_clean_history() if history is None else history,
+        principal=_MEMBER,
+        tool_policy=_probe_policy(),
+        pending_confirmation=pending,
+        **flag,
+    )
+    return result
+
+
+async def _flagged_pending_run() -> AgentResult:
+    """A flagged run on a clean history whose ``probe.act`` awaits confirmation."""
+    first = await _run_flagged(
+        _agent(_ScriptedLLM(_tools(_call("act", "1", "c-1"))), _Recorder()), earlier=True
+    )
+    assert first.pending_confirmation is not None
+    return first
+
+
+class _BarrierLLM:
+    """Each run's first LLM call waits until every run has made its first call.
+
+    Runs are told apart by their user message; each gets its own script.
+    """
+
+    provider = "infomaniak"
+
+    def __init__(self, scripts: dict[str, list[LLMResponse]]) -> None:
+        self._scripts = {message: list(script) for message, script in scripts.items()}
+        self._started: set[str] = set()
+        self._all_started = asyncio.Event()
+
+    async def chat(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        stream: bool = False,
+    ) -> LLMResponse:
+        user = next(m.content for m in reversed(messages) if m.role == "user")
+        if user not in self._started:
+            self._started.add(user)
+            if len(self._started) == len(self._scripts):
+                self._all_started.set()
+            await asyncio.wait_for(self._all_started.wait(), 5.0)
+        return self._scripts[user].pop(0)
+
+
+class TestEarlierExternalContent:
+    """earlier_external_content=True starts the run escalated, like a wrapped history."""
+
+    def test_agent_untrusted_run_takes_an_optional_earlier_external_content_keyword(
+        self,
+    ) -> None:
+        params = inspect.signature(Agent.run).parameters
+
+        assert "earlier_external_content" in params
+        flag = params["earlier_external_content"]
+        assert flag.kind is inspect.Parameter.KEYWORD_ONLY
+        assert flag.default is False
+        assert flag.annotation in (bool, "bool")
+
+    async def test_agent_untrusted_earlier_external_content_escalates_the_first_side_effect(
+        self, probe: _Probe, recorder: _Recorder
+    ) -> None:
+        """A clean history, no wrapped result in this run: the first call still awaits."""
+        act = _call("act", "x", "c-1")
+        llm = _ScriptedLLM(_tools(act))
+
+        result = await _run_flagged(_agent(llm, recorder), earlier=True)
+
+        assert (result.status, result.response) == ("awaiting_confirmation", _ESCALATED_CONFIRM)
+        assert result.pending_confirmation is not None
+        assert result.pending_confirmation.tool_call == act
+        assert probe.ran == []
+        assert recorder.outcomes() == [("probe", "act", "confirm", False, True)]
+        assert recorder.calls[0]["escalated"] is True
+
+    async def test_agent_untrusted_earlier_external_content_matches_a_wrapped_history(
+        self, probe: _Probe
+    ) -> None:
+        """The flag on a clean history and a wrapped history without it end the same way."""
+        outcomes: dict[str, tuple[Any, ...]] = {}
+        cases: list[tuple[str, list[LLMMessage], bool | None]] = [
+            ("wrapped-history", _wrapped_history(), None),
+            ("flag", _clean_history(), True),
+        ]
+        for case, history, earlier in cases:
+            recorder = _Recorder()
+            llm = _ScriptedLLM(_tools(_call("act", "x", "c-1")))
+            result = await _run_flagged(_agent(llm, recorder), history=history, earlier=earlier)
+            pending = result.pending_confirmation
+            outcomes[case] = (
+                result.status,
+                result.response,
+                None if pending is None else pending.tool_call,
+                recorder.outcomes(),
+            )
+
+        assert outcomes["flag"] == outcomes["wrapped-history"]
+        assert probe.ran == []
+
+    @pytest.mark.parametrize("action", sorted(_EARLIER_OUTCOMES))
+    async def test_agent_untrusted_earlier_external_content_outcome_per_action(
+        self, probe: _Probe, recorder: _Recorder, action: str
+    ) -> None:
+        """Read-only runs, the allowed side effect escalates, deny stays deny and a
+        configured confirm stays an unescalated confirm."""
+        llm = _ScriptedLLM(_tools(_call(action, "x", "c-1")), _text("Done."))
+
+        result = await _run_flagged(_agent(llm, recorder), earlier=True)
+
+        assert (result.status, probe.ran, recorder.outcomes()) == _EARLIER_OUTCOMES[action]
+
+    async def test_agent_untrusted_earlier_external_content_reaches_the_first_dispatch(
+        self, probe: _Probe, recorder: _Recorder, dispatch_spy: _DispatchSpy
+    ) -> None:
+        """The dispatch layer gets escalate_side_effects=True from the run's first call."""
+        llm = _ScriptedLLM(_tools(_call("look", "a", "c-1")), _tools(_call("act", "x", "c-2")))
+
+        result = await _run_flagged(_agent(llm, recorder), earlier=True)
+
+        assert dispatch_spy.flags() == [True, True]
+        assert (result.status, probe.ran) == ("awaiting_confirmation", [("look", "a")])
+
+    async def test_agent_untrusted_earlier_external_content_false_or_omitted_is_unchanged(
+        self, probe: _Probe
+    ) -> None:
+        """False and the default keep today's behaviour: the allowed side effect runs."""
+        outcomes: dict[str, tuple[Any, ...]] = {}
+        for case, earlier in (("false", False), ("omitted", None)):
+            recorder = _Recorder()
+            llm = _ScriptedLLM(_tools(_call("act", case, "c-1")), _text("Done."))
+            result = await _run_flagged(_agent(llm, recorder), earlier=earlier)
+            outcomes[case] = (result.status, recorder.outcomes())
+
+        unchanged = ("final", [("probe", "act", "allow", True, False)])
+        assert outcomes == {"false": unchanged, "omitted": unchanged}
+        assert probe.ran == [("act", "false"), ("act", "omitted")]
+
+    async def test_agent_untrusted_earlier_external_content_false_keeps_history_escalation(
+        self, probe: _Probe, recorder: _Recorder
+    ) -> None:
+        """False never masks a wrapped tool result in the history passed in."""
+        llm = _ScriptedLLM(_tools(_call("act", "x", "c-1")))
+
+        result = await _run_flagged(
+            _agent(llm, recorder), history=_wrapped_history(), earlier=False
+        )
+
+        assert result.status == "awaiting_confirmation"
+        assert probe.ran == []
+        assert recorder.outcomes() == [("probe", "act", "confirm", False, True)]
+
+    async def test_agent_untrusted_earlier_external_content_resume_is_an_escalated_confirm(
+        self, probe: _Probe
+    ) -> None:
+        first = await _flagged_pending_run()
+        second_recorder = _Recorder()
+
+        second = await _run_flagged(
+            _agent(_ScriptedLLM(_text("Done.")), second_recorder),
+            "",
+            history=first.history,
+            pending=first.pending_confirmation,
+            earlier=True,
+        )
+
+        assert second.status == "final"
+        assert probe.ran == [("act", "1")]
+        assert second_recorder.outcomes() == [("probe", "act", "confirm", True, True)]
+
+    async def test_agent_untrusted_earlier_external_content_resumed_run_keeps_escalating(
+        self, probe: _Probe, dispatch_spy: _DispatchSpy
+    ) -> None:
+        """After the approved call, a further side effect of the resumed run awaits again."""
+        first = await _flagged_pending_run()
+        before = len(dispatch_spy.calls)
+        second_recorder = _Recorder()
+        again = _call("act", "2", "c-2")
+
+        second = await _run_flagged(
+            _agent(_ScriptedLLM(_tools(again)), second_recorder),
+            "",
+            history=first.history,
+            pending=first.pending_confirmation,
+            earlier=True,
+        )
+
+        assert second.status == "awaiting_confirmation"
+        assert second.pending_confirmation is not None
+        assert second.pending_confirmation.tool_call == again
+        assert probe.ran == [("act", "1")]
+        assert second_recorder.outcomes() == [
+            ("probe", "act", "confirm", True, True),
+            ("probe", "act", "confirm", False, True),
+        ]
+        assert dispatch_spy.flags()[before:] == [True, True]
+
+    async def test_agent_untrusted_earlier_external_content_applies_to_its_run_only(
+        self, probe: _Probe, recorder: _Recorder
+    ) -> None:
+        """The next run on the same Agent without the flag isn't escalated."""
+        llm = _ScriptedLLM(
+            _tools(_call("act", "1", "c-1")), _tools(_call("act", "2", "c-2")), _text("Done.")
+        )
+        agent = _agent(llm, recorder)
+
+        first = await _run_flagged(agent, earlier=True)
+        second = await _run_flagged(agent, earlier=None)
+
+        assert (first.status, second.status) == ("awaiting_confirmation", "final")
+        assert probe.ran == [("act", "2")]
+        assert recorder.outcomes() == [
+            ("probe", "act", "confirm", False, True),
+            ("probe", "act", "allow", True, False),
+        ]
+
+    async def test_agent_untrusted_earlier_external_content_concurrent_runs_keep_their_own(
+        self, probe: _Probe, recorder: _Recorder
+    ) -> None:
+        """Two interleaved runs on one Agent, one flagged: only the flagged one escalates."""
+        llm: Any = _BarrierLLM(
+            {
+                "flagged": [_tools(_call("act", "flagged", "c-1"))],
+                "plain": [_tools(_call("act", "plain", "c-2")), _text("Done.")],
+            }
+        )
+        agent = _agent(llm, recorder)
+
+        flagged, plain = await asyncio.wait_for(
+            asyncio.gather(
+                _run_flagged(agent, "flagged", earlier=True),
+                _run_flagged(agent, "plain", earlier=False),
+            ),
+            10.0,
+        )
+
+        assert (flagged.status, plain.status) == ("awaiting_confirmation", "final")
+        assert probe.ran == [("act", "plain")]

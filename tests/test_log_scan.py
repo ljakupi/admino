@@ -75,6 +75,10 @@ What these tests pin down:
   RuntimeError" together with that request ID. Neither its message text nor a
   traceback is logged.
 - A chat request's log lines carry that request's X-Request-ID.
+- GH-176: the chat lines name the persisted chat by its id ("Processing
+  message for chat <id>", "Completed message for chat <id>: ..."), the id of
+  the FakeDb chat the legacy session id maps to. The client's legacy
+  ``session_id`` is content like the rest: it never reaches the sink.
 - Non-vacuity: the sink is not empty and holds the content-free lines each
   step must produce (a DEBUG record, both chat turns, the outbox failure by
   class name, the unhandled exception). The scenario also checks every
@@ -163,6 +167,9 @@ _OAUTH_STATE: Final = "logscan-state-2718"
 _LLM_ERROR_TEXT: Final = f"Provider rejected the prompt about {_TITLE} for {_MEMBER_EMAIL}"
 _CRASH_TEXT: Final = f"row leaked by driver: {_TITLE} {_FILE_NAME} {_MEMBER_EMAIL}"
 
+# The client's legacy session id of the chat turns (POST /api/message).
+_CHAT_SESSION_ID: Final = "logscan-chat-1"
+
 _CHAT_MESSAGE: Final = (
     f"{_MESSAGE_TEXT}. Find the mail '{_TITLE}' from {_GOOGLE_EMAIL} with "
     f"{_FILE_NAME} attached. {_INSTRUCTIONS}."
@@ -213,6 +220,8 @@ _CONTENT: Final = (
     _Content("oauth state", _OAUTH_STATE),
     _Content("llm error text", _LLM_ERROR_TEXT, ("Provider rejected the prompt",)),
     _Content("exception text", _CRASH_TEXT, ("row leaked by driver",)),
+    # GH-176: logs name chat ids only, never the client's legacy session id.
+    _Content("legacy session id", _CHAT_SESSION_ID),
 )
 
 # ---------------------------------------------------------------------------
@@ -223,7 +232,9 @@ _FORMATS: Final = ["text", "json"]
 _IP: Final = "203.0.113.77"
 _COOKIE: Final = "admino_session"
 _OAUTH_STATE_COOKIE: Final = "admino_oauth_state"
-_CHAT_SESSION: Final = "logscan-chat-1"
+_CHAT_SESSION: Final = _CHAT_SESSION_ID
+# Stands for the run's chat id in _MARKERS (only known once the legacy chat exists).
+_THE_CHAT_ID: Final = "<the chat id>"
 _GMAIL_MESSAGE_ID: Final = "msgLogscan0001"
 _GMAIL_SCOPE: Final = "https://www.googleapis.com/auth/gmail.readonly"
 _GMAIL_MESSAGES_PATH: Final = "/gmail/v1/users/me/messages"
@@ -237,14 +248,16 @@ _UNHANDLED: Final = "Unhandled exception: RuntimeError"
 # Content-free lines the scenario must leave in the sink (each tuple: all on one line).
 _MARKERS: Final[dict[str, tuple[str, ...]]] = {
     "a DEBUG record (the tool registration)": ("Registered tool gmail.search",),
-    "the first chat turn": ("Processing message for session", _CHAT_SESSION),
+    "the first chat turn": ("Processing message for chat", _THE_CHAT_ID),
     "the turn with the tool call": (
-        "Completed message for session",
+        "Completed message for chat",
+        _THE_CHAT_ID,
         "status=final",
         "tool_calls=1",
     ),
     "the turn whose LLM call failed": (
-        "Completed message for session",
+        "Completed message for chat",
+        _THE_CHAT_ID,
         "status=error",
         "tool_calls=0",
     ),
@@ -525,6 +538,8 @@ class _Run:
 
     output: str
     chat_turns: tuple[httpx.Response, httpx.Response]
+    # The persisted chat both turns ran in (the FakeDb row of the legacy session id).
+    chat_id: str
     crashed: httpx.Response
     # Secrets the flows minted (session, invitation and reset tokens): value -> label.
     secrets: dict[str, str]
@@ -785,6 +800,14 @@ def _chat(
     return first, second
 
 
+def _legacy_chat_id(db: FakeDb, turns: tuple[httpx.Response, httpx.Response]) -> str:
+    """GH-176: the id of the FakeDb chat of the legacy session id, which both turns name."""
+    (chat,) = [row for row in db.chats.values() if row["legacy_session_id"] == _CHAT_SESSION]
+    chat_id = str(plain(chat["id"]))
+    assert [turn.json()["chat_id"] for turn in turns] == [chat_id, chat_id]
+    return chat_id
+
+
 def _connect_google(db: FakeDb, client: TestClient, admin_session: str) -> None:
     """Step 7: the Google OAuth callback stores a token for the fixture account.
 
@@ -866,6 +889,7 @@ def _run_scenario(
         _deliver_outbox(db, monkeypatch)
         _store_prompt_settings(db, org_id)
         chat_turns = _chat(db, client, member_session, llm, gmail_requests)
+        chat_id = _legacy_chat_id(db, chat_turns)
         _connect_google(db, client, member_session)
         crashed = _crash(app, member_session)
         _health(client)
@@ -873,6 +897,7 @@ def _run_scenario(
     return _Run(
         output=output,
         chat_turns=chat_turns,
+        chat_id=chat_id,
         crashed=crashed,
         secrets=secrets,
         login_delays=tuple(login_delays),
@@ -961,7 +986,10 @@ def _assert_captured(run: _Run) -> None:
     missing = [
         what
         for what, parts in _MARKERS.items()
-        if not any(all(part in line for part in parts) for line in run.lines)
+        if not any(
+            all((run.chat_id if part == _THE_CHAT_ID else part) in line for part in parts)
+            for line in run.lines
+        )
     ]
     assert not missing, f"expected log lines are missing: {missing}"
 
@@ -1096,12 +1124,15 @@ def test_log_scan_unhandled_exception_is_logged_by_type_and_request_id(
 def test_log_scan_chat_lines_carry_their_requests_id(
     scan: Callable[[str], _Run], log_format: str
 ) -> None:
-    """Each chat turn's "Processing message" line carries that turn's X-Request-ID."""
+    """Each chat turn's "Processing message" line (naming the chat) carries that turn's
+    X-Request-ID."""
     run = scan(log_format)
 
     expected = [_request_id(turn) for turn in run.chat_turns]
     assert len(set(expected)) == 2, "two requests got the same request ID"
-    lines = [line for line in run.lines if "Processing message for session" in line]
+    lines = [
+        line for line in run.lines if "Processing message for chat" in line and run.chat_id in line
+    ]
     assert len(lines) == 2, lines
     if log_format == "json":
         assert [json.loads(line)["request_id"] for line in lines] == expected

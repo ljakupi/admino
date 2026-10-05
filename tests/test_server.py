@@ -17,7 +17,22 @@ Tests the FastAPI application created by ``create_app()``, covering:
 - POST /api/message (happy path, agent status variants, input validation)
 - SSE streaming via GET /api/events
 - Confirmation flow via POST /api/confirm/{confirmation_id}
-- Session management and isolation
+- GH-176: the legacy ``session_id`` routes are backed by persisted chats (one
+  ``chats`` row per (user, session id) through ``legacy_session_id``, here a
+  ``tests.db_fakes.FakeDb`` behind ``admino.database.get_pool``). A run's
+  history is the chat's stored messages (never an in-memory ``_sessions``
+  map, which is gone with ``_pending_confirmations``, ``_session_locks``,
+  ``_MAX_SESSIONS``, ``_chat_key``, ``_get_session_lock`` and
+  ``_touch_session``); the agent's ``session_id`` is ``str(chat.id)``; the
+  turn's new messages are appended to the chat; ``ChatResponse`` carries the
+  ``chat_id`` and echoes the legacy ``session_id``. Per-chat run locks and
+  pending confirmations live in the bounded ``server._chat_runtime``
+  (``ChatRuntime(max_entries=1024, idle_s=900.0)``), keyed by the chat id and
+  cleared by ``create_app()`` (a restart). Each user has their own chat per
+  session id: another user's turn never reads or changes it, and nobody else
+  can confirm, deny or cancel its pending confirmation. A denial persists the
+  closing ``tool`` result(s) and the denial message, so the stored history
+  stays well-formed.
 - CORS middleware (``Authorization`` is no longer an allowed header)
 - Per-caller rate limits (GH-149): ``_check_rate_limit(route, caller)`` keeps
   one token bucket per (route, caller) in ``_rate_buckets``; one user (or IP)
@@ -53,9 +68,11 @@ Security notes:
 from __future__ import annotations
 
 import ast
+import asyncio
 import importlib.util
 import json
 import logging
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -84,6 +101,7 @@ from admino.tenancy import TenantContext
 from admino.tools.registry import ToolDescription, clear_registry, register_tool
 from tests.auth_helpers import (
     TEST_MEMBER_ID,
+    TEST_ORG_ID,
     TEST_SESSION_TOKEN,
     login,
     member_session,
@@ -92,9 +110,10 @@ from tests.auth_helpers import (
     super_admin_session,
 )
 from tests.conftest import default_test_platform_settings
+from tests.db_fakes import FakeDb
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Generator, Iterator
 
     from admino.access import MemberRole, Principal
     from admino.models import PromptContext, ToolPolicy
@@ -159,7 +178,12 @@ def _make_agent_result(
 
 
 class FakeAgent:
-    """A fake Agent that returns scripted AgentResult values in sequence."""
+    """A fake Agent that returns scripted AgentResult values in sequence.
+
+    Like the real Agent, the history a run returns is the history it received
+    followed by the turn's messages: a scripted result's ``history`` holds only
+    what that turn adds (GH-176: the route persists ``result.history[len(loaded):]``).
+    """
 
     def __init__(self, results: list[AgentResult]) -> None:
         self._results = list(results)
@@ -177,28 +201,33 @@ class FakeAgent:
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
         prompt_context: PromptContext | None = None,
+        earlier_external_content: bool = False,
     ) -> AgentResult:
         """Record the call (GH-149: ``principal`` is a required keyword; GH-160: the
         run's ``agent_config`` from the stored platform limits; GH-161: the requesting
         org's ``tool_policy`` is a required keyword too; GH-170: the caller's
-        ``prompt_context``, loaded per request) and reply."""
+        ``prompt_context``, loaded per request; GH-176: ``session_id`` is the chat's
+        id and ``earlier_external_content`` the chat's sticky external-content flag)
+        and reply."""
         self.run_calls.append(
             {
                 "user_message": user_message,
                 "session_id": session_id,
-                "history": history,
+                "history": list(history),
                 "principal": principal,
                 "tool_policy": tool_policy,
                 "pending_confirmation": pending_confirmation,
                 "agent_config": agent_config,
                 "prompt_context": prompt_context,
+                "earlier_external_content": earlier_external_content,
             }
         )
         if self._call_index >= len(self._results):
-            return _make_agent_result()
-        result = self._results[self._call_index]
-        self._call_index += 1
-        return result
+            result = _make_agent_result()
+        else:
+            result = self._results[self._call_index]
+            self._call_index += 1
+        return result.model_copy(update={"history": [*history, *result.history]})
 
 
 # The org policy the stubbed per-run load returns (GH-161): echo.write needs a
@@ -264,14 +293,81 @@ def _loaded_tenant(call: Any) -> Any:
 
 
 @pytest.fixture(autouse=True)
-def _settings_pool(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A stand-in pool for the chat routes' platform limits (GH-160).
+def db(monkeypatch: pytest.MonkeyPatch) -> FakeDb:
+    """The chat routes' database (GH-176): a FakeDb behind ``admino.database.get_pool``.
 
-    POST /api/message and POST /api/confirm read the stored limits through
-    ``scoped_settings.current_platform_settings(get_pool())``. The conftest
-    primes the settings cache, so this pool is never queried.
+    The legacy chat routes persist one chat per (user, session id) and its
+    messages, so the pool is a ``tests.db_fakes.FakeDb`` holding the org and
+    the two members this suite logs in with (``TEST_MEMBER_ID`` and
+    ``_OTHER_USER_ID``, both of ``TEST_ORG_ID``). The platform limits still come
+    from the settings cache the conftest primes (GH-160), the org policy and the
+    prompt context from the stubbed loads above.
     """
-    monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock(name="pool")))
+    fake = FakeDb()
+    fake.add_org(TEST_ORG_ID)
+    for user_id in (TEST_MEMBER_ID, _OTHER_USER_ID):
+        fake.add_account(user_id=user_id, org_id=TEST_ORG_ID, role="editor")
+    monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=fake.pool))
+    return fake
+
+
+@contextmanager
+def _resolved_on_db(session: AuthenticatedSession | None, db: FakeDb) -> Iterator[AsyncMock]:
+    """``auth_helpers.resolved_session`` with the suite's FakeDb pool kept (GH-176).
+
+    ``resolved_session`` patches ``get_pool`` with a MagicMock; the legacy chat
+    routes now store the chat on the pool, so it is pointed back at ``db``.
+    """
+    with (
+        resolved_session(session) as resolve,
+        patch("admino.database.get_pool", MagicMock(return_value=db.pool)),
+    ):
+        yield resolve
+
+
+def _runtime() -> Any:
+    """``server._chat_runtime`` (GH-176): the bounded per-chat locks and pending confirmations."""
+    from admino import server
+
+    return server._chat_runtime
+
+
+def _legacy_chat(db: FakeDb, session_id: str, user_id: UUID = TEST_MEMBER_ID) -> dict[str, Any]:
+    """The one live chat of ``user_id`` behind the legacy ``session_id`` (GH-176)."""
+    rows = [
+        row
+        for row in db.chats_of(user_id)
+        if row["legacy_session_id"] == session_id and row["deleted_at"] is None
+    ]
+    assert len(rows) == 1, f"expected one live legacy chat of {user_id}, found {len(rows)}"
+    return rows[0]
+
+
+def _legacy_chat_id(db: FakeDb, session_id: str, user_id: UUID = TEST_MEMBER_ID) -> UUID:
+    """The id of ``_legacy_chat`` as a plain UUID."""
+    return UUID(str(_legacy_chat(db, session_id, user_id)["id"]))
+
+
+def _rows(db: FakeDb, chat_id: UUID) -> list[tuple[str, str]]:
+    """``(role, content)`` of every stored message of a chat, in order."""
+    return [(row["role"], row["content"]) for row in db.messages_of(chat_id)]
+
+
+def _pairs(messages: list[LLMMessage]) -> list[tuple[str, str]]:
+    """``(role, content)`` of every message."""
+    return [(message.role, message.content) for message in messages]
+
+
+def _turn(message: str, reply: str, **fields: Any) -> AgentResult:
+    """An AgentResult whose turn adds the user ``message`` and the assistant ``reply``."""
+    return _make_agent_result(
+        response=reply,
+        history=[
+            LLMMessage(role="user", content=message),
+            LLMMessage(role="assistant", content=reply),
+        ],
+        **fields,
+    )
 
 
 def _make_app(
@@ -301,6 +397,7 @@ def _make_pending_confirmation(
     tool: str = "calendar",
     action: str = "create",
     expired: bool = False,
+    tool_call_id: str | None = None,
 ) -> PendingConfirmation:
     """Build a PendingConfirmation for testing."""
     now = datetime.now(UTC)
@@ -313,7 +410,7 @@ def _make_pending_confirmation(
     return PendingConfirmation(
         confirmation_id=confirmation_id,
         session_id=session_id,
-        tool_call=ToolCall(tool=tool, action=action, args={}),
+        tool_call=ToolCall(tool=tool, action=action, args={}, tool_call_id=tool_call_id),
         created_at=created_at,
         expires_at=expires_at,
     )
@@ -444,10 +541,10 @@ class TestAuth:
         assert resp.json()["detail"] == "Unauthorized"
         assert agent.run_calls == []
 
-    async def test_server_post_message_valid_session_cookie_succeeds(self) -> None:
+    async def test_server_post_message_valid_session_cookie_succeeds(self, db: FakeDb) -> None:
         """A cookie that resolves to an Editor's session is let through."""
         app = _make_app(anonymous=True)
-        with resolved_session(member_session("editor")):
+        with _resolved_on_db(member_session("editor"), db):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 resp = await c.post(
                     "/api/message",
@@ -456,10 +553,10 @@ class TestAuth:
                 )
         assert resp.status_code == 200
 
-    async def test_server_session_cookie_value_is_what_gets_resolved(self) -> None:
+    async def test_server_session_cookie_value_is_what_gets_resolved(self, db: FakeDb) -> None:
         """require_session looks up exactly the admino_session cookie's token."""
         app = _make_app(anonymous=True)
-        with resolved_session(member_session("editor")) as resolve:
+        with _resolved_on_db(member_session("editor"), db) as resolve:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 await c.post(
                     "/api/message",
@@ -471,12 +568,12 @@ class TestAuth:
         assert call is not None
         assert TEST_SESSION_TOKEN in (*call.args, *call.kwargs.values())
 
-    async def test_server_session_cookie_principal_reaches_agent(self) -> None:
+    async def test_server_session_cookie_principal_reaches_agent(self, db: FakeDb) -> None:
         """The principal comes from the resolved session, never from the request."""
         agent = FakeAgent([_make_agent_result()])
         app = _make_app(agent, anonymous=True)
         session = member_session("org_admin", user_id=_OTHER_USER_ID)
-        with resolved_session(session):
+        with _resolved_on_db(session, db):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 await c.post(
                     "/api/message",
@@ -880,7 +977,8 @@ class TestPostMessage:
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_message_final_status_returns_200(self) -> None:
+    async def test_server_message_final_status_returns_200(self, db: FakeDb) -> None:
+        """GH-176: the response carries the legacy chat's id and echoes the session id."""
         app = _make_app()
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
@@ -890,6 +988,7 @@ class TestPostMessage:
         assert resp.status_code == 200
         data = resp.json()
         assert data["session_id"] == "sess1"
+        assert data["chat_id"] == str(_legacy_chat_id(db, "sess1"))
         assert data["response"] == "Hello from the agent."
         assert isinstance(data["tool_calls"], list)
 
@@ -1182,17 +1281,24 @@ class TestConfirmation:
             )
         assert resp.status_code == 404
 
-    async def test_server_confirm_approved_resumes_agent(self) -> None:
-        """Approve a pending confirmation -> agent resumes -> final response."""
+    async def test_server_confirm_approved_resumes_agent(self, db: FakeDb) -> None:
+        """Approve a pending confirmation -> agent resumes -> final response.
+
+        GH-176: the resumed run is on the legacy chat (its id as ``session_id``, its
+        stored messages as history) and the response carries the chat id and echoes
+        the session id.
+        """
         pending = _make_pending_confirmation(session_id="sess1")
-        awaiting_result = _make_agent_result(
+        awaiting_result = _turn(
+            "create event",
+            "Calendar event requires confirmation.",
             status="awaiting_confirmation",
-            response="Calendar event requires confirmation.",
             pending_confirmation=pending,
         )
         resumed_result = _make_agent_result(
             status="final",
             response="Event created successfully.",
+            history=[LLMMessage(role="assistant", content="Event created successfully.")],
         )
         agent = FakeAgent([awaiting_result, resumed_result])
         app = _make_app(agent)
@@ -1217,6 +1323,19 @@ class TestConfirmation:
         assert resp2.status_code == 200
         data = resp2.json()
         assert data["response"] == "Event created successfully."
+        chat_id = _legacy_chat_id(db, "sess1")
+        assert (data["chat_id"], data["session_id"]) == (str(chat_id), "sess1")
+        resumed = agent.run_calls[1]
+        assert resumed["session_id"] == str(chat_id)
+        assert _pairs(resumed["history"]) == [
+            ("user", "create event"),
+            ("assistant", "Calendar event requires confirmation."),
+        ]
+        assert _rows(db, chat_id) == [
+            ("user", "create event"),
+            ("assistant", "Calendar event requires confirmation."),
+            ("assistant", "Event created successfully."),
+        ]
 
     async def test_server_confirm_denied_returns_denial_message(self) -> None:
         """Deny a pending confirmation -> pending removed, denial message."""
@@ -1396,13 +1515,21 @@ class TestConfirmation:
 
 
 class TestSessionManagement:
-    """Session creation, reuse, and isolation."""
+    """Legacy session ids are backed by persisted chats (GH-176).
+
+    The first message on a session id creates the caller's chat (``chats`` row
+    with that ``legacy_session_id``, in the caller's org); the agent runs with
+    ``str(chat.id)`` as its ``session_id`` and the chat's stored messages as its
+    history; the turn's new messages are appended to the chat. Another session
+    id is another chat.
+    """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_session_created_on_first_message(self) -> None:
-        """First message creates a session; agent receives empty history."""
-        agent = FakeAgent([_make_agent_result()])
+    async def test_server_session_created_on_first_message(self, db: FakeDb) -> None:
+        """First message creates the caller's chat; the agent runs on it with an empty
+        history, and the turn's messages are stored."""
+        agent = FakeAgent([_turn("hello", "Hi there.")])
         app = _make_app(agent)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
@@ -1410,18 +1537,22 @@ class TestSessionManagement:
                 json={"message": "hello", "session_id": "new-sess"},
             )
         assert resp.status_code == 200
-        # Agent was called with empty history (new session)
+        chat = _legacy_chat(db, "new-sess")
+        assert (chat["org_id"], chat["owner_user_id"]) == (TEST_ORG_ID, TEST_MEMBER_ID)
         assert len(agent.run_calls) == 1
         assert agent.run_calls[0]["history"] == []
+        assert agent.run_calls[0]["session_id"] == str(chat["id"])
+        assert agent.run_calls[0]["earlier_external_content"] is False
+        assert _rows(db, chat["id"]) == [("user", "hello"), ("assistant", "Hi there.")]
 
-    async def test_server_session_reuses_history(self) -> None:
-        """Second message to same session_id builds on returned history."""
+    async def test_server_session_reuses_history(self, db: FakeDb) -> None:
+        """Second message to same session_id runs on the same chat with the stored turn."""
         history1 = [
             LLMMessage(role="user", content="hello"),
             LLMMessage(role="assistant", content="hi"),
         ]
         result1 = _make_agent_result(response="hi", history=history1)
-        result2 = _make_agent_result(response="how can I help?")
+        result2 = _turn("help me", "how can I help?")
         agent = FakeAgent([result1, result2])
         app = _make_app(agent)
 
@@ -1434,15 +1565,58 @@ class TestSessionManagement:
                 "/api/message",
                 json={"message": "help me", "session_id": "sess1"},
             )
-        # Second call should receive the history from the first result
+        # Second call should receive the history stored by the first turn
         assert len(agent.run_calls) == 2
         assert agent.run_calls[1]["history"] == history1
+        chat_id = _legacy_chat_id(db, "sess1")
+        assert len(db.chats_of(TEST_MEMBER_ID)) == 1
+        assert [call["session_id"] for call in agent.run_calls] == [str(chat_id)] * 2
+        assert _rows(db, chat_id) == [
+            ("user", "hello"),
+            ("assistant", "hi"),
+            ("user", "help me"),
+            ("assistant", "how can I help?"),
+        ]
 
-    async def test_server_sessions_are_isolated(self) -> None:
+    async def test_server_session_history_is_loaded_from_the_stored_chat(self, db: FakeDb) -> None:
+        """A chat stored before this process started (a restart) is the run's history."""
+        chat_id = db.add_chat(TEST_MEMBER_ID, legacy_session_id="sess1")
+        db.add_chat_message(chat_id, "user", "stored question")
+        db.add_chat_message(chat_id, "assistant", "stored answer")
+        agent = FakeAgent([_turn("next", "next answer")])
+        app = _make_app(agent)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/message", json={"message": "next", "session_id": "sess1"})
+
+        assert resp.status_code == 200
+        assert agent.run_calls[0]["session_id"] == str(chat_id)
+        assert _pairs(agent.run_calls[0]["history"]) == [
+            ("user", "stored question"),
+            ("assistant", "stored answer"),
+        ]
+        assert len(db.chats_of(TEST_MEMBER_ID)) == 1
+
+    async def test_server_session_external_content_flag_reaches_every_run(self, db: FakeDb) -> None:
+        """GH-243 via GH-176: a chat stored with external content runs (message and
+        approved resume) with ``earlier_external_content=True``."""
+        db.add_chat(TEST_MEMBER_ID, legacy_session_id="sess1", external_content=True)
+        pending, awaiting = _awaiting_confirmation()
+        agent = FakeAgent([awaiting, _make_agent_result(response="Done.")])
+        app = _make_app(agent)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "create", "session_id": "sess1"})
+            resp = await _approve(c, pending)
+
+        assert resp.status_code == 200
+        assert [call["earlier_external_content"] for call in agent.run_calls] == [True, True]
+
+    async def test_server_sessions_are_isolated(self, db: FakeDb) -> None:
         """Messages to session A do not appear in session B."""
         history_a = [LLMMessage(role="user", content="session-a-msg")]
         result_a = _make_agent_result(response="a-reply", history=history_a)
-        result_b = _make_agent_result(response="b-reply")
+        result_b = _turn("msg-b", "b-reply")
         agent = FakeAgent([result_a, result_b])
         app = _make_app(agent)
 
@@ -1455,11 +1629,15 @@ class TestSessionManagement:
                 "/api/message",
                 json={"message": "msg-b", "session_id": "sessB"},
             )
-        # Session B should receive empty history (new session)
+        # Session B should receive empty history (new chat)
         assert agent.run_calls[1]["history"] == []
+        chat_a, chat_b = _legacy_chat_id(db, "sessA"), _legacy_chat_id(db, "sessB")
+        assert [call["session_id"] for call in agent.run_calls] == [str(chat_a), str(chat_b)]
+        assert _rows(db, chat_a) == [("user", "session-a-msg")]
+        assert _rows(db, chat_b) == [("user", "msg-b"), ("assistant", "b-reply")]
 
-    async def test_server_new_session_creates_new_history(self) -> None:
-        """A different session_id creates a new, empty session."""
+    async def test_server_new_session_creates_new_history(self, db: FakeDb) -> None:
+        """A different session_id creates a new, empty chat."""
         agent = FakeAgent([_make_agent_result(), _make_agent_result()])
         app = _make_app(agent)
 
@@ -1474,24 +1652,44 @@ class TestSessionManagement:
             )
         assert agent.run_calls[0]["history"] == []
         assert agent.run_calls[1]["history"] == []
+        chats = db.chats_of(TEST_MEMBER_ID)
+        assert sorted(chat["legacy_session_id"] for chat in chats) == ["sess1", "sess2"]
+        assert {call["session_id"] for call in agent.run_calls} == {
+            str(chat["id"]) for chat in chats
+        }
 
 
 class TestChatSessionsArePerUser:
-    """In-memory chat state is keyed per user, so a session_id never crosses users (GH-149).
+    """Each user has their own persisted chat per session id (GH-149, GH-176).
 
-    Chat session ids are client-generated until #176. With several users logged
-    in, user B reusing user A's session_id must neither read A's history nor
-    confirm A's pending tool call.
+    Chat session ids are client-generated until #177. With several users logged
+    in, user B reusing user A's session_id gets B's own chat: B neither reads
+    nor changes A's stored messages, and B can't confirm, deny or cancel A's
+    pending tool call (held in ``server._chat_runtime`` under A's chat id).
     """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_chat_key_pairs_user_and_session(self) -> None:
-        """The key is the (user_id, session_id) pair."""
-        import admino.server as srv
+    async def test_server_same_session_id_gives_each_user_their_own_chat(self, db: FakeDb) -> None:
+        """The legacy chat is keyed by (owner, session id): two users, two chats."""
+        agent = FakeAgent([_turn("a", "a-reply"), _turn("b", "b-reply")])
+        app = _make_app(agent, session=member_session("editor"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "a", "session_id": "shared"})
+            login(app, member_session("editor", user_id=_OTHER_USER_ID))
+            await c.post("/api/message", json={"message": "b", "session_id": "shared"})
 
-        assert srv._chat_key(TEST_MEMBER_ID, "sess1") == (TEST_MEMBER_ID, "sess1")
-        assert srv._chat_key(TEST_MEMBER_ID, "sess1") != srv._chat_key(_OTHER_USER_ID, "sess1")
+        chat_a = _legacy_chat(db, "shared", TEST_MEMBER_ID)
+        chat_b = _legacy_chat(db, "shared", _OTHER_USER_ID)
+        assert chat_a["id"] != chat_b["id"]
+        assert (chat_a["owner_user_id"], chat_b["owner_user_id"]) == (
+            TEST_MEMBER_ID,
+            _OTHER_USER_ID,
+        )
+        assert [call["session_id"] for call in agent.run_calls] == [
+            str(chat_a["id"]),
+            str(chat_b["id"]),
+        ]
 
     async def test_server_other_user_with_same_session_id_gets_empty_history(self) -> None:
         """User B posting with A's session_id starts from an empty history."""
@@ -1513,10 +1711,8 @@ class TestChatSessionsArePerUser:
 
         assert agent.run_calls[1]["history"] == []
 
-    async def test_server_other_user_does_not_overwrite_history(self) -> None:
-        """B's turn on the same session_id leaves A's stored history intact."""
-        import admino.server as srv
-
+    async def test_server_other_user_does_not_overwrite_history(self, db: FakeDb) -> None:
+        """B's turn on the same session_id leaves A's stored chat and messages intact."""
         history_a = [LLMMessage(role="user", content="a-secret")]
         history_b = [LLMMessage(role="user", content="b-msg")]
         agent = FakeAgent(
@@ -1529,18 +1725,25 @@ class TestChatSessionsArePerUser:
         app = _make_app(agent, session=member_session("editor"))
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             await c.post("/api/message", json={"message": "a", "session_id": "shared"})
+            chat_a = _legacy_chat_id(db, "shared", TEST_MEMBER_ID)
+            a_before = (db.chat_row(chat_a), db.messages_of(chat_a))
             login(app, member_session("editor", user_id=_OTHER_USER_ID))
             await c.post("/api/message", json={"message": "b", "session_id": "shared"})
+            a_after_b = (db.chat_row(chat_a), db.messages_of(chat_a))
             login(app, member_session("editor"))
             await c.post("/api/message", json={"message": "a2", "session_id": "shared"})
 
+        assert a_after_b == a_before
         assert agent.run_calls[2]["history"] == history_a
-        assert srv._sessions[srv._chat_key(_OTHER_USER_ID, "shared")] == history_b
+        assert _rows(db, _legacy_chat_id(db, "shared", _OTHER_USER_ID)) == [("user", "b-msg")]
 
-    async def test_server_other_user_cannot_confirm_a_pending_call(self) -> None:
-        """B can't resolve A's pending confirmation: 404, and A's stays pending."""
-        import admino.server as srv
-
+    @pytest.mark.parametrize("approved", [True, False], ids=["approve", "deny"])
+    async def test_server_other_user_cannot_confirm_a_pending_call(
+        self, db: FakeDb, approved: bool
+    ) -> None:
+        """B can't resolve (approve or deny) A's pending confirmation: the same 404 as
+        for no pending one, A's stays pending with A's chat untouched, B gets no chat
+        (the confirm route never creates one), and A can still approve it."""
         pending = _make_pending_confirmation(session_id="shared")
         awaiting = _make_agent_result(
             status="awaiting_confirmation",
@@ -1556,11 +1759,21 @@ class TestChatSessionsArePerUser:
         }
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             await c.post("/api/message", json={"message": "create", "session_id": "shared"})
+            chat_a = _legacy_chat_id(db, "shared", TEST_MEMBER_ID)
+            a_before = db.messages_of(chat_a)
             login(app, member_session("editor", user_id=_OTHER_USER_ID))
-            stolen = await c.post(f"/api/confirm/{pending.confirmation_id}", json=confirm_body)
-            assert stolen.status_code == 404
+            stolen = await c.post(
+                f"/api/confirm/{pending.confirmation_id}",
+                json={**confirm_body, "approved": approved},
+            )
+            assert (stolen.status_code, stolen.json()) == (
+                404,
+                {"detail": "No pending confirmation for this session"},
+            )
             assert len(agent.run_calls) == 1
-            assert srv._chat_key(TEST_MEMBER_ID, "shared") in srv._pending_confirmations
+            assert _runtime().get_pending(chat_a) == pending
+            assert db.messages_of(chat_a) == a_before
+            assert db.chats_of(_OTHER_USER_ID) == []
 
             login(app, member_session("editor"))
             own = await c.post(f"/api/confirm/{pending.confirmation_id}", json=confirm_body)
@@ -1568,10 +1781,10 @@ class TestChatSessionsArePerUser:
         assert own.status_code == 200
         assert agent.run_calls[1]["pending_confirmation"] is not None
 
-    async def test_server_other_users_message_does_not_cancel_a_pending_call(self) -> None:
+    async def test_server_other_users_message_does_not_cancel_a_pending_call(
+        self, db: FakeDb
+    ) -> None:
         """B's message on the same session_id doesn't drop A's pending confirmation."""
-        import admino.server as srv
-
         pending = _make_pending_confirmation(session_id="shared")
         awaiting = _make_agent_result(
             status="awaiting_confirmation",
@@ -1583,9 +1796,10 @@ class TestChatSessionsArePerUser:
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             await c.post("/api/message", json={"message": "create", "session_id": "shared"})
             login(app, member_session("editor", user_id=_OTHER_USER_ID))
-            await c.post("/api/message", json={"message": "hi", "session_id": "shared"})
+            resp = await c.post("/api/message", json={"message": "hi", "session_id": "shared"})
 
-        assert srv._chat_key(TEST_MEMBER_ID, "shared") in srv._pending_confirmations
+        assert resp.status_code == 200
+        assert _runtime().get_pending(_legacy_chat_id(db, "shared", TEST_MEMBER_ID)) == pending
 
 
 class TestCORS:
@@ -1738,6 +1952,26 @@ class TestSecurityInvariants:
 
         assert not hasattr(server_module, removed)
 
+    @pytest.mark.parametrize(
+        "removed",
+        [
+            "_sessions",
+            "_pending_confirmations",
+            "_session_locks",
+            "_MAX_SESSIONS",
+            "_chat_key",
+            "_get_session_lock",
+            "_touch_session",
+        ],
+    )
+    def test_server_in_memory_chat_state_removed(self, removed: str) -> None:
+        """GH-176: no in-memory chat histories; locks and pending confirmations moved
+        into the bounded ``_chat_runtime``."""
+        import admino.server as server_module
+
+        assert not hasattr(server_module, removed)
+        assert hasattr(server_module, "_chat_runtime")
+
     @pytest.mark.parametrize("dependency", ["require_session", "require_principal"])
     def test_server_exposes_session_dependencies(self, dependency: str) -> None:
         """GH-149: routes depend on require_session / require_principal."""
@@ -1881,26 +2115,32 @@ class TestAppFactory:
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_create_app_clears_sessions(self) -> None:
-        """create_app clears session state for test isolation."""
-        import admino.server as srv
-
-        agent = FakeAgent([_make_agent_result(), _make_agent_result()])
+    async def test_server_create_app_clears_the_chat_runtime_and_keeps_persisted_chats(
+        self, db: FakeDb
+    ) -> None:
+        """create_app is a restart (GH-176): the chat runtime (run locks, pending
+        confirmations) starts empty, the persisted chat and its messages stay."""
+        pending, awaiting = _awaiting_confirmation()
+        agent = FakeAgent([awaiting, _make_agent_result()])
         config = _make_config()
         app1 = _make_app(agent, config=config)
 
-        # Post a message to populate session state
+        # Post a message that leaves a pending confirmation on the chat
         async with AsyncClient(transport=ASGITransport(app=app1), base_url="http://test") as c:
             await c.post(
                 "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
+                json={"message": "create", "session_id": "sess1"},
             )
-        assert srv._chat_key(TEST_MEMBER_ID, "sess1") in srv._sessions
+        chat_id = _legacy_chat_id(db, "sess1")
+        assert _runtime().get_pending(chat_id) == pending
+        stored = db.messages_of(chat_id)
 
-        # Create a new app — sessions should be cleared
+        # Create a new app — the runtime is cleared, the chat isn't
         create_app(agent=agent, config=config)
-        # The module-level _sessions should now be empty
-        assert len(srv._sessions) == 0
+        assert len(_runtime()) == 0
+        assert _runtime().get_pending(chat_id) is None
+        assert db.messages_of(chat_id) == stored
+        assert _legacy_chat_id(db, "sess1") == chat_id
 
     async def test_server_create_app_returns_fastapi_instance(self) -> None:
         from fastapi import FastAPI
@@ -1920,10 +2160,8 @@ class TestConfirmationEdgeCases:
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_confirm_denied_removes_pending(self) -> None:
-        """After denial, the pending confirmation is removed entirely."""
-        import admino.server as srv
-
+    async def test_server_confirm_denied_removes_pending(self, db: FakeDb) -> None:
+        """After denial, the chat's pending confirmation is removed from the runtime."""
         pending = _make_pending_confirmation(session_id="sess1")
         awaiting_result = _make_agent_result(
             status="awaiting_confirmation",
@@ -1938,7 +2176,9 @@ class TestConfirmationEdgeCases:
                 "/api/message",
                 json={"message": "create event", "session_id": "sess1"},
             )
-            await c.post(
+            chat_id = _legacy_chat_id(db, "sess1")
+            assert _runtime().get_pending(chat_id) == pending
+            resp = await c.post(
                 f"/api/confirm/{pending.confirmation_id}",
                 json={
                     "session_id": "sess1",
@@ -1947,7 +2187,70 @@ class TestConfirmationEdgeCases:
                 },
             )
         # Pending should be cleared
-        assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._pending_confirmations
+        assert resp.status_code == 200
+        assert _runtime().get_pending(chat_id) is None
+
+    async def test_server_confirm_denied_persists_the_closing_tool_results_and_the_denial(
+        self, db: FakeDb
+    ) -> None:
+        """GH-176: a denial appends, after the awaiting turn, one ``tool`` result per
+        dangling ``tool_use`` block ("Tool call denied by the user." for the pending
+        call, the cancelled text for any other) and then the assistant's denial, all
+        ``complete`` without tool calls, so the stored history stays well-formed."""
+        from admino.server import _CANCELLED_TOOL_RESULT_MSG
+
+        pending = _make_pending_confirmation(session_id="sess1", tool_call_id="call_pending_2")
+        awaiting_history = [
+            LLMMessage(role="user", content="book it"),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_use_blocks=[
+                    {
+                        "type": "tool_use",
+                        "id": "call_other_1",
+                        "name": "calendar.list",
+                        "input": {},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "call_pending_2",
+                        "name": "calendar.create",
+                        "input": {},
+                    },
+                ],
+            ),
+        ]
+        awaiting_result = _make_agent_result(
+            status="awaiting_confirmation",
+            response="Requires confirmation.",
+            history=awaiting_history,
+            pending_confirmation=pending,
+        )
+        agent = FakeAgent([awaiting_result])
+        app = _make_app(agent)
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            await c.post("/api/message", json={"message": "book it", "session_id": "sess1"})
+            resp = await c.post(
+                f"/api/confirm/{pending.confirmation_id}",
+                json={
+                    "session_id": "sess1",
+                    "confirmation_id": pending.confirmation_id,
+                    "approved": False,
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "final"
+        rows = db.messages_of(_legacy_chat_id(db, "sess1"))
+        assert [row["role"] for row in rows] == ["user", "assistant", "tool", "tool", "assistant"]
+        assert {row["tool_call_id"]: row["content"] for row in rows[2:4]} == {
+            "call_pending_2": "Tool call denied by the user.",
+            "call_other_1": _CANCELLED_TOOL_RESULT_MSG,
+        }
+        assert rows[4]["content"] == "Action calendar.create was denied."
+        assert [(row["status"], row["tool_calls"]) for row in rows[2:]] == [("complete", None)] * 3
 
     async def test_server_confirm_passes_pending_to_agent(self) -> None:
         """On approval, agent.run is called with pending_confirmation."""
@@ -1983,12 +2286,13 @@ class TestConfirmationEdgeCases:
         assert agent.run_calls[1]["pending_confirmation"].confirmation_id == pending.confirmation_id
 
     async def test_server_awaiting_confirmation_response_exposes_pending_summary(
-        self,
+        self, db: FakeDb
     ) -> None:
         """When the agent is awaiting confirmation, POST /api/message must
         return ``status='awaiting_confirmation'`` plus a ``pending_confirmation``
         summary carrying the confirmation_id, tool, and action. Without these
-        fields the PWA has no way to render its Approve/Deny card.
+        fields the PWA has no way to render its Approve/Deny card. GH-176: the
+        response names the chat, whose runtime entry holds the pending call.
         """
         pending = _make_pending_confirmation(
             session_id="sess1",
@@ -2024,6 +2328,9 @@ class TestConfirmationEdgeCases:
         # Internal fields must not leak.
         assert "tool_call" not in pc
         assert "input" not in pc
+        chat_id = _legacy_chat_id(db, "sess1")
+        assert (data["chat_id"], data["session_id"]) == (str(chat_id), "sess1")
+        assert _runtime().get_pending(chat_id) == pending
 
     async def test_server_final_response_omits_pending_confirmation(self) -> None:
         """A plain final response has status='final' and pending_confirmation=None."""
@@ -2041,15 +2348,16 @@ class TestConfirmationEdgeCases:
         assert data["status"] == "final"
         assert data["pending_confirmation"] is None
 
-    async def test_server_new_message_during_pending_closes_tool_use(self) -> None:
+    async def test_server_new_message_during_pending_closes_tool_use(self, db: FakeDb) -> None:
         """Regression: sending a freeform /api/message while a confirmation is
         pending must (a) cancel the pending confirmation and (b) append a
         synthetic cancelled tool_result so the history handed to the next
         agent.run() does not leave a ``tool_use`` dangling — which would
         otherwise make Anthropic reject the next LLM call with HTTP 400.
+        GH-176: the pending confirmation lives in the chat's runtime entry, and the
+        synthetic result is stored with the turn, so the persisted history stays
+        well-formed for every later load.
         """
-        import admino.server as srv
-
         pending = _make_pending_confirmation(session_id="sess1")
         # First turn: agent returns awaiting_confirmation with a history that
         # ends in an assistant message carrying a tool_use block — the exact
@@ -2088,7 +2396,8 @@ class TestConfirmationEdgeCases:
                 "/api/message",
                 json={"message": "book the dentist", "session_id": "sess1"},
             )
-            assert srv._chat_key(TEST_MEMBER_ID, "sess1") in srv._pending_confirmations
+            chat_id = _legacy_chat_id(db, "sess1")
+            assert _runtime().get_pending(chat_id) == pending
 
             # Turn 2: user sends a new chat message instead of calling
             # /api/confirm/{id}. Must succeed (no 500) and the pending
@@ -2099,7 +2408,7 @@ class TestConfirmationEdgeCases:
             )
 
         assert resp.status_code == 200
-        assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._pending_confirmations
+        assert _runtime().get_pending(chat_id) is None
 
         # Inspect the history passed to agent.run() on the second call: the
         # dangling tool_use must have been closed with a synthetic tool
@@ -2111,6 +2420,13 @@ class TestConfirmationEdgeCases:
             m.tool_call_id == "toolu_abc123" and "cancelled" in m.content.lower()
             for m in trailing_tool
         ), "dangling tool_use must be closed by a synthetic cancelled tool_result"
+        stored = db.messages_of(chat_id)
+        assert [(row["role"], row["tool_call_id"]) for row in stored[:3]] == [
+            ("user", None),
+            ("assistant", None),
+            ("tool", "toolu_abc123"),
+        ]
+        assert "cancelled" in stored[2]["content"].lower()
 
     async def test_server_close_dangling_tool_use_noop_on_clean_history(self) -> None:
         """_close_dangling_tool_use is a no-op on well-formed history."""
@@ -2140,99 +2456,83 @@ class TestConfirmationEdgeCases:
         assert _close_dangling_tool_use(history) == history
 
 
-class TestSessionCap:
-    """H-1: Session count is capped with LRU eviction."""
+class TestChatRuntimeBound:
+    """GH-176: chat histories are persisted, not capped in memory (``_MAX_SESSIONS`` is gone).
+
+    What stays in memory is ``server._chat_runtime``: one bounded ``ChatRuntime``
+    (run locks and pending confirmations per chat, at most
+    ``_MAX_CHAT_RUNTIME_ENTRIES`` entries, idle ones evicted after
+    ``_CHAT_IDLE_EVICT_S``). Its own eviction rules are unit-tested in
+    tests/test_chat_runtime.py.
+    """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_session_cap_evicts_oldest(self) -> None:
-        """Sessions beyond _MAX_SESSIONS evict the least-recently-used."""
+    async def test_server_chat_runtime_bound_constants(self) -> None:
         import admino.server as srv
 
-        original_max = srv._MAX_SESSIONS
-        try:
-            srv._MAX_SESSIONS = 3
-            results = [_make_agent_result() for _ in range(5)]
-            agent = FakeAgent(results)
-            app = _make_app(agent)
+        assert (srv._MAX_CHAT_RUNTIME_ENTRIES, srv._CHAT_IDLE_EVICT_S) == (1024, 900.0)
 
+    async def test_server_chat_runtime_is_one_chat_runtime(self) -> None:
+        from admino.chat_runtime import ChatRuntime
+
+        assert isinstance(_runtime(), ChatRuntime)
+
+    async def test_server_evicted_runtime_entry_never_loses_history(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """With a runtime of two entries, five chats later the first chat's run still
+        gets its whole stored history (eviction drops only locks and pending calls)."""
+        import admino.server as srv
+        from admino.chat_runtime import ChatRuntime
+
+        results = [_turn("hi", f"reply-{i}") for i in range(5)] + [_turn("again", "back")]
+        agent = FakeAgent(results)
+        app = _make_app(agent)
+        monkeypatch.setattr(srv, "_chat_runtime", ChatRuntime(max_entries=2, idle_s=900.0))
+
+        # The rate limiter (burst 5) is not under test here.
+        with patch("admino.server._check_rate_limit"):
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
                 for i in range(5):
                     await c.post(
                         "/api/message",
                         json={"message": "hi", "session_id": f"sess{i}"},
                     )
-            # Only the 3 most recent sessions should remain.
-            assert len(srv._sessions) == 3
-            assert srv._chat_key(TEST_MEMBER_ID, "sess0") not in srv._sessions
-            assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._sessions
-            assert srv._chat_key(TEST_MEMBER_ID, "sess4") in srv._sessions
-        finally:
-            srv._MAX_SESSIONS = original_max
-
-    async def test_server_session_lru_reuse_prevents_eviction(self) -> None:
-        """Accessing a session moves it to the end, preventing eviction."""
-        import admino.server as srv
-
-        original_max = srv._MAX_SESSIONS
-        try:
-            srv._MAX_SESSIONS = 3
-            results = [_make_agent_result() for _ in range(5)]
-            agent = FakeAgent(results)
-            app = _make_app(agent)
-
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-                # Create 3 sessions
-                for i in range(3):
-                    await c.post(
-                        "/api/message",
-                        json={"message": "hi", "session_id": f"sess{i}"},
-                    )
-                # Reuse sess0 (moves to end)
-                await c.post(
+                resp = await c.post(
                     "/api/message",
-                    json={"message": "hi again", "session_id": "sess0"},
+                    json={"message": "again", "session_id": "sess0"},
                 )
-                # Add sess3 — should evict sess1 (oldest unreused)
-                await c.post(
-                    "/api/message",
-                    json={"message": "hi", "session_id": "sess3"},
-                )
-            assert srv._chat_key(TEST_MEMBER_ID, "sess0") in srv._sessions  # reused, not evicted
-            assert srv._chat_key(TEST_MEMBER_ID, "sess1") not in srv._sessions  # oldest, evicted
-        finally:
-            srv._MAX_SESSIONS = original_max
+
+        assert resp.status_code == 200
+        assert len(srv._chat_runtime) <= 2
+        assert agent.run_calls[5]["session_id"] == str(_legacy_chat_id(db, "sess0"))
+        assert _pairs(agent.run_calls[5]["history"]) == [("user", "hi"), ("assistant", "reply-0")]
+        assert len(db.chats_of(TEST_MEMBER_ID)) == 5
 
 
 class TestConfirmationExpiry:
-    """H-2/M-3: Expired confirmations are reaped and rejected."""
+    """H-2/M-3: Expired confirmations are reaped and rejected (GH-176: in the chat runtime)."""
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_expired_confirmation_reaped_returns_404(self) -> None:
+    async def test_server_expired_confirmation_reaped_returns_404(self, db: FakeDb) -> None:
         """Expired confirmations are reaped unconditionally at entry, returning 404.
 
-        The unconditional _reap_expired_confirmations() call at the top of
-        post_confirm removes expired entries before the per-session lookup.
+        The unconditional reap (``_chat_runtime.reap_expired``) at the top of
+        post_confirm removes expired entries before the per-chat lookup.
         The 410 code path remains as defence-in-depth for confirmations that
         expire in the narrow window between reap and the expiry check.
         """
-        pending = _make_pending_confirmation(session_id="sess1", expired=True)
-        awaiting_result = _make_agent_result(
-            status="awaiting_confirmation",
-            response="Requires confirmation.",
-            pending_confirmation=pending,
-        )
-        agent = FakeAgent([awaiting_result])
+        agent = FakeAgent([_make_agent_result()])
         app = _make_app(agent)
 
-        # Manually inject the expired pending (bypassing normal flow)
-        import admino.server as srv
-
-        srv._pending_confirmations[srv._chat_key(TEST_MEMBER_ID, "sess1")] = pending
-        srv._sessions[srv._chat_key(TEST_MEMBER_ID, "sess1")] = [
-            LLMMessage(role="user", content="hi")
-        ]
+        # Manually store the expired pending on the caller's legacy chat
+        # (bypassing normal flow)
+        chat_id = db.add_chat(TEST_MEMBER_ID, legacy_session_id="sess1")
+        db.add_chat_message(chat_id, "user", "hi")
+        pending = _make_pending_confirmation(session_id=str(chat_id), expired=True)
+        _runtime().set_pending(chat_id, TEST_MEMBER_ID, pending)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post(
@@ -2244,17 +2544,21 @@ class TestConfirmationExpiry:
                 },
             )
         # Expired entry is reaped before lookup, so 404 (not 410).
-        assert resp.status_code == 404
+        assert (resp.status_code, resp.json()) == (
+            404,
+            {"detail": "No pending confirmation for this session"},
+        )
+        assert _runtime().get_pending(chat_id) is None
+        assert agent.run_calls == []
 
-    async def test_server_reap_removes_expired_before_lookup(self) -> None:
+    async def test_server_reap_removes_expired_before_lookup(self, db: FakeDb) -> None:
         """Expired confirmations are reaped before any lookup."""
-        import admino.server as srv
-
-        expired_pending = _make_pending_confirmation(session_id="sess-expired", expired=True)
         agent = FakeAgent([_make_agent_result()])
         app = _make_app(agent)
 
-        srv._pending_confirmations[srv._chat_key(TEST_MEMBER_ID, "sess-expired")] = expired_pending
+        expired_chat = db.add_chat(TEST_MEMBER_ID, legacy_session_id="sess-expired")
+        expired_pending = _make_pending_confirmation(session_id=str(expired_chat), expired=True)
+        _runtime().set_pending(expired_chat, TEST_MEMBER_ID, expired_pending)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             # Query for a different session — the expired one should be reaped
@@ -2267,7 +2571,7 @@ class TestConfirmationExpiry:
                 },
             )
         assert resp.status_code == 404
-        assert srv._chat_key(TEST_MEMBER_ID, "sess-expired") not in srv._pending_confirmations
+        assert _runtime().get_pending(expired_chat) is None
 
 
 def _stored_max_message_length(monkeypatch: pytest.MonkeyPatch, max_length: int) -> None:
@@ -2486,6 +2790,10 @@ class TestConfirmationPathInjection:
 # ---------------------------------------------------------------------------
 
 
+# GH-176: ChatResponse requires the chat's id.
+_SANITISATION_CHAT_ID = UUID("7c1d2e3f-4a5b-4c6d-8e7f-90a1b2c3d4e5")
+
+
 class TestChatResponseSanitisation:
     """Verify ChatResponse.response strips XSS and credentials."""
 
@@ -2502,6 +2810,7 @@ class TestChatResponseSanitisation:
         from admino.models import ChatResponse
 
         resp = ChatResponse(
+            chat_id=_SANITISATION_CHAT_ID,
             session_id="test",
             response="Hello <script>alert(1)</script>",
             tool_calls=[],
@@ -2515,6 +2824,7 @@ class TestChatResponseSanitisation:
         from admino.models import ChatResponse
 
         resp = ChatResponse(
+            chat_id=_SANITISATION_CHAT_ID,
             session_id="test",
             response="The token is Bearer sk-proj-abcdefghijklmnopqrstuvwxyz123",
             tool_calls=[],
@@ -2527,6 +2837,7 @@ class TestChatResponseSanitisation:
         from admino.models import ChatResponse
 
         resp = ChatResponse(
+            chat_id=_SANITISATION_CHAT_ID,
             session_id="test",
             response="Hello \u202e dlrow",
             tool_calls=[],
@@ -2849,31 +3160,138 @@ class TestPerCallerRateLimit:
 
 
 # ---------------------------------------------------------------------------
-# F-10: Session lock test
+# F-10: Per-chat run locks (GH-176: in the chat runtime)
 # ---------------------------------------------------------------------------
 
 
-class TestSessionLocks:
-    """Verify per-session locks are created and cleared."""
+def _recording_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """Swap ``server._chat_runtime`` for a ChatRuntime that records each ``hold`` (GH-176).
+
+    Same bound as the server's; ``held`` lists ``(chat_id, owner_user_id)`` per
+    ``hold()`` call. Call it after ``_make_app`` (``create_app`` clears the runtime).
+    """
+    import admino.server as srv
+    from admino.chat_runtime import ChatRuntime
+
+    class _RecordingRuntime(ChatRuntime):
+        def __init__(self) -> None:
+            super().__init__(
+                max_entries=srv._MAX_CHAT_RUNTIME_ENTRIES, idle_s=srv._CHAT_IDLE_EVICT_S
+            )
+            self.held: list[tuple[UUID, UUID]] = []
+
+        def hold(self, chat_id: UUID, owner_user_id: UUID) -> Any:
+            self.held.append((UUID(str(chat_id)), UUID(str(owner_user_id))))
+            return super().hold(chat_id, owner_user_id)
+
+    runtime = _RecordingRuntime()
+    monkeypatch.setattr(srv, "_chat_runtime", runtime)
+    return runtime
+
+
+class _ParkingAgent(FakeAgent):
+    """A FakeAgent whose FIRST run parks until ``release`` is set; counts overlapping runs."""
+
+    def __init__(self, results: list[AgentResult]) -> None:
+        super().__init__(results)
+        self.release = asyncio.Event()
+        self.first_entered = asyncio.Event()
+        self.started: list[str] = []
+        self.active = 0
+        self.max_active = 0
+
+    async def run(self, user_message: str, session_id: str, **kwargs: Any) -> AgentResult:
+        self.started.append(user_message)
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            if len(self.started) == 1:
+                self.first_entered.set()
+                await asyncio.wait_for(self.release.wait(), timeout=5)
+            return await super().run(user_message, session_id, **kwargs)
+        finally:
+            self.active -= 1
+
+
+class _BarrierAgent(FakeAgent):
+    """A FakeAgent whose runs wait (at most 5 s) until ``parties`` runs have started."""
+
+    def __init__(self, results: list[AgentResult], *, parties: int) -> None:
+        super().__init__(results)
+        self._parties = parties
+        self._arrived = 0
+        self._all_in = asyncio.Event()
+        self.timed_out = False
+
+    async def run(self, user_message: str, session_id: str, **kwargs: Any) -> AgentResult:
+        self._arrived += 1
+        if self._arrived >= self._parties:
+            self._all_in.set()
+        try:
+            await asyncio.wait_for(self._all_in.wait(), timeout=5)
+        except TimeoutError:
+            self.timed_out = True
+        return await super().run(user_message, session_id, **kwargs)
+
+
+class TestChatRunLocks:
+    """GH-176: runs of one chat are serialised through ``server._chat_runtime.hold``.
+
+    Two messages to the same legacy chat never run at once (the second one
+    loads the history the first one stored); messages to different chats
+    run concurrently. The run locks moved from ``_session_locks`` into the
+    bounded chat runtime (``create_app`` clearing it is pinned in TestAppFactory).
+    """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_session_locks_cleared_on_app_creation(self) -> None:
-        """create_app clears session locks."""
-        import admino.server as srv
-
-        agent = FakeAgent([_make_agent_result()])
+    async def test_server_concurrent_messages_to_one_chat_are_serialised(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent = _ParkingAgent([_turn("m1", "first"), _turn("m2", "second")])
         app = _make_app(agent)
+        runtime = _recording_runtime(monkeypatch)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            await c.post(
-                "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
+            first = asyncio.create_task(
+                c.post("/api/message", json={"message": "m1", "session_id": "sess1"})
             )
-        assert srv._chat_key(TEST_MEMBER_ID, "sess1") in srv._session_locks
+            await asyncio.wait_for(agent.first_entered.wait(), timeout=5)
+            second = asyncio.create_task(
+                c.post("/api/message", json={"message": "m2", "session_id": "sess1"})
+            )
+            await asyncio.sleep(0.05)
+            started_while_first_ran = list(agent.started)
+            agent.release.set()
+            responses = await asyncio.gather(first, second)
 
-        # Creating a new app clears locks
-        _make_app()
-        assert len(srv._session_locks) == 0
+        assert [resp.status_code for resp in responses] == [200, 200]
+        assert started_while_first_ran == ["m1"]
+        assert agent.max_active == 1
+        assert _pairs(agent.run_calls[1]["history"]) == [("user", "m1"), ("assistant", "first")]
+        chat_id = _legacy_chat_id(db, "sess1")
+        assert runtime.held == [(chat_id, TEST_MEMBER_ID)] * 2
+
+    async def test_server_messages_to_different_chats_run_concurrently(
+        self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A serialising implementation would make the first run wait out the 5 s barrier."""
+        agent = _BarrierAgent([_turn("a", "a-reply"), _turn("b", "b-reply")], parties=2)
+        app = _make_app(agent)
+        runtime = _recording_runtime(monkeypatch)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            responses = await asyncio.gather(
+                c.post("/api/message", json={"message": "a", "session_id": "sess-a"}),
+                c.post("/api/message", json={"message": "b", "session_id": "sess-b"}),
+            )
+
+        assert [resp.status_code for resp in responses] == [200, 200]
+        assert agent.timed_out is False
+        assert sorted(runtime.held) == sorted(
+            [
+                (_legacy_chat_id(db, "sess-a"), TEST_MEMBER_ID),
+                (_legacy_chat_id(db, "sess-b"), TEST_MEMBER_ID),
+            ]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2957,8 +3375,9 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
     """GH-140: the server round-trips history without duplicating the system prompt.
 
     Uses a REAL ``admino.agent.Agent`` (only the LLM is faked) so the
-    server's store-and-replay of ``result.history`` through ``_sessions`` is
-    exercised end to end. Before the fix, every turn stored the agent's system
+    server's store-and-replay of ``result.history`` is exercised end to end
+    (GH-176: through the persisted chat, a FakeDb here, instead of
+    ``_sessions``). Before the fix, every turn stored the agent's system
     prompt in the session and the next turn prepended it again. GH-170: the
     system message is the assembled one (``_gh140_system``) built from the
     prompt context the route loaded for that request, with a fixed clock.
@@ -3063,22 +3482,26 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
             assert (call[-1].role, call[-1].content) == ("user", f"turn-{i}"), f"turn {i}"
 
     async def test_server_message_25_turns_session_history_has_no_system_messages(
-        self, tool_call_recorder: AsyncMock
+        self, tool_call_recorder: AsyncMock, db: FakeDb
     ) -> None:
-        from admino import server
-
+        """GH-176: the chat stores the 50 user/assistant messages, never a system one."""
         await self._post_turns(tool_call_recorder)
 
-        stored = server._sessions[server._chat_key(TEST_MEMBER_ID, _GH140_SESSION)]
-        assert _system_pairs(stored) == []
+        stored = _rows(db, _legacy_chat_id(db, _GH140_SESSION))
+        assert [role for role, _ in stored if role == "system"] == []
         assert len(stored) == 50
+        assert stored[:2] == [("user", "turn-0"), ("assistant", "reply-0")]
+        assert stored[-2:] == [("user", "turn-24"), ("assistant", "reply-24")]
 
     async def test_server_confirm_resume_llm_call_has_one_system_prompt(
-        self, tool_call_recorder: AsyncMock
+        self, tool_call_recorder: AsyncMock, db: FakeDb
     ) -> None:
-        """POST /api/message -> awaiting confirmation -> POST /api/confirm (approve)."""
-        from admino import server
+        """POST /api/message -> awaiting confirmation -> POST /api/confirm (approve).
 
+        GH-176: the resume runs on the persisted chat (the real agent's pending
+        confirmation names ``str(chat.id)``, which the resumed run must match), and
+        the chat stores the paired turns without a system message.
+        """
         register_tool("echo", "write", "Write echo", _EchoArgs)(_echo_handler)
         llm = _RecordingLLM(
             [
@@ -3127,9 +3550,11 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
         assert _system_pairs(first_call) == [("system", expected)]
         assert _system_pairs(resume_call) == [("system", expected)]
         assert resume_call[0].role == "system"
-        assert (
-            _system_pairs(server._sessions[server._chat_key(TEST_MEMBER_ID, _GH140_SESSION)]) == []
-        )
+        stored = db.messages_of(_legacy_chat_id(db, _GH140_SESSION))
+        assert [row["role"] for row in stored] == ["user", "assistant", "tool", "assistant"]
+        assert stored[1]["tool_use_blocks"][0]["id"] == "call_write_1"
+        assert stored[2]["tool_call_id"] == "call_write_1"
+        assert stored[3]["content"] == "Written."
 
     async def test_server_tool_call_recorder_receives_logged_in_principal(
         self, tool_call_recorder: AsyncMock
@@ -3174,3 +3599,51 @@ class TestSystemPromptNotDuplicatedAcrossTurns:
 
         principals = [call.kwargs["principal"] for call in tool_call_recorder.await_args_list]
         assert principals == [session.principal, session.principal]
+
+    async def test_server_tool_call_recorder_receives_the_chat_id(
+        self, tool_call_recorder: AsyncMock, db: FakeDb
+    ) -> None:
+        """GH-176 end to end: every tool-call record of the message and of the approved
+        resume names the legacy chat's id (``tool.call`` rows target the real chat)."""
+        register_tool("echo", "write", "Write echo", _EchoArgs)(_echo_handler)
+        llm = _RecordingLLM(
+            [
+                LLMResponse(
+                    content="",
+                    tool_calls=[
+                        ToolCall(
+                            tool="echo",
+                            action="write",
+                            args={"text": "x"},
+                            tool_call_id="call_write_1",
+                        )
+                    ],
+                    model="m",
+                    done=True,
+                ),
+                LLMResponse(content="Written.", tool_calls=[], model="m", done=True),
+            ]
+        )
+        app = _make_app(self._make_real_agent(llm, tool_call_recorder))
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp1 = await c.post(
+                "/api/message",
+                json={"message": "please write x", "session_id": _GH140_SESSION},
+            )
+            confirmation_id = resp1.json()["pending_confirmation"]["confirmation_id"]
+            resp2 = await c.post(
+                f"/api/confirm/{confirmation_id}",
+                json={
+                    "session_id": _GH140_SESSION,
+                    "confirmation_id": confirmation_id,
+                    "approved": True,
+                },
+            )
+
+        assert resp2.status_code == 200
+        chat_id = _legacy_chat_id(db, _GH140_SESSION)
+        assert [call.kwargs["session_id"] for call in tool_call_recorder.await_args_list] == [
+            str(chat_id),
+            str(chat_id),
+        ]

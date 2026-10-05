@@ -32,6 +32,11 @@ of tests/ and is made of five files:
 - ``tests/test_tenancy_memory.py``: the memory row, through the chat (memory
   has no HTTP route), including LLM-supplied foreign ids in tool arguments.
 
+GH-176 adds the six persisted chat routes (requests on a chat of the
+caller's own, seeded in the FakeDb; the Super Admin's name org A's Editor's)
+and backs the legacy confirm with a persisted legacy chat and a pending
+confirmation in ``server._chat_runtime``.
+
 Adding a route (each later issue): give it a ``RouteSpec`` row in
 ``ROUTES`` (tests/tenancy_world.py), a well-formed request in ``_REQUESTS``
 below (and in ``_BODY_ROUTES`` when it takes a JSON body), its role cases in
@@ -56,7 +61,6 @@ import typing
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock
 
@@ -68,7 +72,6 @@ from starlette.routing import Route
 
 from admino import server
 from admino.access import Capability, Principal, can
-from admino.models import PendingConfirmation, ToolCall
 from tests.db_fakes import FakeDb
 from tests.tenancy_world import (
     CLIENT_IP,
@@ -89,9 +92,12 @@ from tests.tenancy_world import (
     World,
     allowed_roles,
     build_world,
+    chat_runtime_state,
     make_app,
     make_client,
     route_id,
+    seed_chat,
+    seed_pending_confirmation,
     stub_agent,
     use_fake_database,
     use_fast_passwords,
@@ -280,21 +286,42 @@ def _cancel_pending_promotion(world: World, _caller: Account, client: TestClient
     return _Request("DELETE", "/api/org/critical-permissions/gmail/send/pending")
 
 
-def _confirm(_world: World, caller: Account, _client: TestClient) -> _Request:
-    """Approve a pending confirmation seeded in the caller's own chat."""
-    now = datetime.now(UTC)
-    server._pending_confirmations[server._chat_key(caller.user_id, _CHAT_ID)] = PendingConfirmation(
-        confirmation_id=_CONFIRMATION_ID,
-        session_id=_CHAT_ID,
-        tool_call=ToolCall(tool="google_calendar", action="create", args={}),
-        created_at=now,
-        expires_at=now + timedelta(minutes=5),
-    )
+def _chat_owner(world: World, caller: Account) -> Account:
+    """The caller, or org A's Editor for the Super Admin (who can own no chat)."""
+    return caller if caller.org_id is not None else world.a["editor"]
+
+
+def _confirm(world: World, caller: Account, _client: TestClient) -> _Request:
+    """Approve a pending confirmation seeded in the caller's own legacy chat (GH-176: a
+    persisted chat with that legacy session id, the pending in the chat runtime)."""
+    owner = _chat_owner(world, caller)
+    chat_id = seed_chat(world.db, owner, legacy_session_id=_CHAT_ID)
+    seed_pending_confirmation(owner, chat_id, _CONFIRMATION_ID)
     return _Request(
         "POST",
         f"/api/confirm/{_CONFIRMATION_ID}",
         json={"session_id": _CHAT_ID, "confirmation_id": _CONFIRMATION_ID, "approved": True},
     )
+
+
+def _own_chat(
+    method: str, suffix: str = "", json: dict[str, Any] | None = None, *, history: bool = True
+) -> _Builder:
+    """A request on a chat of the caller's own (GH-176), titled and, with ``history``,
+    holding a question and its answer (an empty chat for a new turn)."""
+
+    def build(world: World, caller: Account, _client: TestClient) -> _Request:
+        chat_id = seed_chat(
+            world.db,
+            _chat_owner(world, caller),
+            title="Tenancy chat 176",
+            messages=(("user", "Tenancy question 176"), ("assistant", "Tenancy answer 176"))
+            if history
+            else (),
+        )
+        return _Request(method, f"/api/chats/{chat_id}{suffix}", json)
+
+    return build
 
 
 def _platform_org(method: str, suffix: str, json: dict[str, Any] | None = None) -> _Builder:
@@ -427,6 +454,15 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ),
     ("GET", "/api/events"): _plain("GET", "/api/events", params={"session_id": _CHAT_ID}),
     ("POST", "/api/confirm/{confirmation_id}"): _confirm,
+    # GH-176: persisted chats ({} is a valid create body: no title, "auto").
+    ("POST", "/api/chats"): _plain("POST", "/api/chats", {}),
+    ("GET", "/api/chats"): _plain("GET", "/api/chats"),
+    ("GET", "/api/chats/{chat_id}"): _own_chat("GET"),
+    ("PATCH", "/api/chats/{chat_id}"): _own_chat("PATCH", json={"title": "Renamed chat 176"}),
+    ("DELETE", "/api/chats/{chat_id}"): _own_chat("DELETE"),
+    ("POST", "/api/chats/{chat_id}/messages"): _own_chat(
+        "POST", "/messages", {"message": "Hello from the tenancy suite"}, history=False
+    ),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _plain("GET", "/api/oauth/google/authorize"),
     ("GET", "/api/oauth/microsoft/authorize"): _plain("GET", "/api/oauth/microsoft/authorize"),
@@ -491,6 +527,10 @@ _BODY_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("PATCH", "/api/org/critical-permissions/{tool}/{action}"),
         ("POST", "/api/message"),
         ("POST", "/api/confirm/{confirmation_id}"),
+        # GH-176: create (a JSON body is required, {} is valid), rename, send.
+        ("POST", "/api/chats"),
+        ("PATCH", "/api/chats/{chat_id}"),
+        ("POST", "/api/chats/{chat_id}/messages"),
         ("POST", "/api/platform/orgs"),
         ("PATCH", "/api/platform/orgs/{org_id}/limits"),
         ("PATCH", "/api/platform/orgs/{org_id}/residency"),
@@ -1055,8 +1095,8 @@ class TestRequestBodies:
         agent: MagicMock,
     ) -> None:
         """Another org's id (or another org's user id) in the body: 422 extra_forbidden,
-        no agent run, no write besides the session refresh, the pending confirmation
-        kept, and the smuggled value not echoed."""
+        no agent run, no write besides the session refresh, the chat runtime (pending
+        confirmations) unchanged, and the smuggled value not echoed."""
         caller = _allowed_caller(world, spec)
         request = _build(world, spec, caller, client)
         smuggled = str(world.org_b if field == "org_id" else world.b["editor"].user_id)
@@ -1064,7 +1104,7 @@ class TestRequestBodies:
         tampered = _Request(
             request.method, request.url, {**request.json, field: smuggled}, request.params
         )
-        pending_before = dict(server._pending_confirmations)
+        runtime_before = chat_runtime_state(world.db)
         mark = len(world.db.calls)
 
         response = _send(client, tampered, caller.cookie)
@@ -1077,7 +1117,7 @@ class TestRequestBodies:
         assert smuggled not in response.text
         agent.run.assert_not_awaited()
         assert _writes_since(world.db, mark) == []
-        assert server._pending_confirmations == pending_before
+        assert chat_runtime_state(world.db) == runtime_before
 
 
 # ---------------------------------------------------------------------------

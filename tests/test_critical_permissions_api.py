@@ -50,9 +50,13 @@ reauthenticate" and "server.py routes"):
 - Cancel: drops the org's own pending entry, ``org.permission_promote_cancel``
   audit row; without a pending entry (or another org's) -> 404 ``{"detail":
   "No pending promotion for this permission"}``.
-- GH-66 notice: a completed promotion appends ONE user-role message with the
-  contract's exact text to every in-memory chat of the promoting org's users,
-  none to other orgs' chats, never twice; it survives ``_trim_context``.
+- GH-66 notice (GH-176: persisted, ``chats.append_org_notice``): a completed
+  promotion appends ONE ``user``-role, ``complete`` chat_messages row with the
+  contract's exact text to every live chat of the promoting org (all its
+  members' chats), none to another org's chats nor to trashed ones, once per
+  completed resolution, without touching the chats' ``last_activity_at``; the
+  history the next run loads (``chats.load_recent_history``) keeps it through
+  ``_trim_context``.
 - The agent run of an org's member gets ``tool_policy`` (a ``ToolPolicy``)
   whose ``promoted`` holds that org's completed promotions only.
 - GH-162: the fixture orgs have no data residency. In a residency org a
@@ -78,6 +82,7 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
 from dataclasses import dataclass
@@ -156,6 +161,9 @@ _NOTICE_GMAIL_OUTLOOK: Final = (
     "PERMISSION UPDATE: The following actions are now available with user confirmation: "
     "gmail.send, outlook.send. Earlier denials for these actions no longer apply."
 )
+# GH-176: the notice as a stored chat_messages row (role, content, status).
+_NOTICE_ROW_GMAIL: Final = ("user", _NOTICE_GMAIL, "complete")
+_NOTICE_ROW_GMAIL_OUTLOOK: Final = ("user", _NOTICE_GMAIL_OUTLOOK, "complete")
 
 _GET_KEY: Final = "/api/org/critical-permissions/get"
 _PROMOTE_KEY: Final = "/api/org/critical-permissions/promote"
@@ -498,19 +506,33 @@ def _lockout_after() -> int:
     return int(cache.security.lockout_after_failures)
 
 
-def _seed_chat(user: _User, chat_id: str) -> tuple[uuid.UUID, str]:
-    """Store an in-memory chat of the user (after create_app, which clears them)."""
-    key = server._chat_key(user.id, chat_id)
-    server._sessions[key] = [
-        LLMMessage(role="user", content="send an email to the auditor"),
-        LLMMessage(role="assistant", content="I can't send email."),
-    ]
-    return key
+def _seed_chat(
+    db: FakeDb,
+    user: _User,
+    *,
+    trashed: bool = False,
+    last_activity_at: datetime | None = None,
+) -> uuid.UUID:
+    """Store a persisted chat of the user (GH-176) with two messages; return its id."""
+    chat_id = db.add_chat(
+        user.id,
+        created_at=last_activity_at,
+        last_activity_at=last_activity_at,
+        deleted_at=datetime.now(UTC) - timedelta(minutes=1) if trashed else None,
+    )
+    db.add_chat_message(chat_id, "user", "send an email to the auditor")
+    db.add_chat_message(chat_id, "assistant", "I can't send email.")
+    return chat_id
 
 
-def _added(key: tuple[uuid.UUID, str]) -> list[tuple[str, str]]:
-    """(role, content) of every message appended after the two seeded ones."""
-    return [(message.role, message.content) for message in server._sessions[key][2:]]
+def _added(db: FakeDb, chat_id: uuid.UUID) -> list[tuple[str, str, str]]:
+    """(role, content, status) of every message stored after the two seeded ones."""
+    return [(row["role"], row["content"], row["status"]) for row in db.messages_of(chat_id)[2:]]
+
+
+def _notice_rows(db: FakeDb, content: str) -> int:
+    """How many chat_messages rows, in any chat, hold exactly this content."""
+    return sum(1 for row in db.chat_messages.values() if row["content"] == content)
 
 
 def _post_message(client: TestClient, user: _User, chat_id: str = "chat-161") -> httpx.Response:
@@ -1480,33 +1502,77 @@ class TestCancel:
 
 
 class TestPromotionNotice:
-    """One user-role notice per completed resolution, in the promoting org's chats only."""
+    """One user-role, complete notice per completed resolution, persisted into every live
+    chat of the promoting org only (GH-66, GH-176 ``chats.append_org_notice``)."""
 
     def test_critical_permissions_notice_reaches_only_the_promoting_orgs_chats(
         self, db: FakeDb, app: FastAPI, clock: _Clock
     ) -> None:
+        """Every live chat of every member of the org (two chats of one member included)
+        gets the notice; the other org's chat gets none."""
         admin_a = _account(db, "org_admin")
         editor_a = _account(db, "editor")
         editor_b = _account(db, "editor", OTHER_ORG_ID)
-        chat_admin_a = _seed_chat(admin_a, "chat-admin-a")
-        chat_editor_a = _seed_chat(editor_a, "chat-editor-a")
-        chat_editor_b = _seed_chat(editor_b, "chat-editor-b")
+        chat_admin_a = _seed_chat(db, admin_a)
+        chats_editor_a = (_seed_chat(db, editor_a), _seed_chat(db, editor_a))
+        chat_editor_b = _seed_chat(db, editor_b)
         client = _client(app)
         _complete(client, clock, admin_a)
 
         response = _get(client, admin_a)
 
         assert response.status_code == 200, response.text
-        assert _added(chat_admin_a) == [("user", _NOTICE_GMAIL)]
-        assert _added(chat_editor_a) == [("user", _NOTICE_GMAIL)]
-        assert _added(chat_editor_b) == []
+        assert {
+            chat: _added(db, chat) for chat in (chat_admin_a, *chats_editor_a, chat_editor_b)
+        } == {
+            chat_admin_a: [_NOTICE_ROW_GMAIL],
+            chats_editor_a[0]: [_NOTICE_ROW_GMAIL],
+            chats_editor_a[1]: [_NOTICE_ROW_GMAIL],
+            chat_editor_b: [],
+        }
+
+    def test_critical_permissions_notice_skips_trashed_chats(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """A trashed chat (deleted_at set) of the promoting org gets no notice; the same
+        member's live chat does."""
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        live = _seed_chat(db, editor_a)
+        trashed = _seed_chat(db, editor_a, trashed=True)
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        assert _get(client, admin_a).status_code == 200
+
+        assert (_added(db, live), _added(db, trashed)) == ([_NOTICE_ROW_GMAIL], [])
+
+    def test_critical_permissions_notice_leaves_last_activity_unchanged(
+        self, db: FakeDb, app: FastAPI, clock: _Clock
+    ) -> None:
+        """The notice isn't the member's activity: the chat's last_activity_at (the chat
+        list order) keeps its stored value."""
+        earlier = datetime.now(UTC).replace(microsecond=0) - timedelta(days=2)
+        admin_a = _account(db, "org_admin")
+        editor_a = _account(db, "editor")
+        chat = _seed_chat(db, editor_a, last_activity_at=earlier)
+        client = _client(app)
+        _complete(client, clock, admin_a)
+
+        assert _get(client, admin_a).status_code == 200
+
+        row = db.chat_row(chat)
+        assert row is not None
+        assert (_added(db, chat), row["last_activity_at"]) == ([_NOTICE_ROW_GMAIL], earlier)
 
     def test_critical_permissions_notice_is_not_repeated(
         self, db: FakeDb, app: FastAPI, clock: _Clock
     ) -> None:
+        """Later requests (the admin's GET, the member's next message in a new chat) store
+        no second notice anywhere."""
         admin_a = _account(db, "org_admin")
         editor_a = _account(db, "editor")
-        chat = _seed_chat(editor_a, "chat-editor-a")
+        chat = _seed_chat(db, editor_a)
         client = _client(app)
         _complete(client, clock, admin_a)
         assert _get(client, admin_a).status_code == 200
@@ -1515,35 +1581,41 @@ class TestPromotionNotice:
         assert _get(client, admin_a).status_code == 200
         assert _post_message(client, editor_a, "another-chat").status_code == 200
 
-        assert _added(chat) == [("user", _NOTICE_GMAIL)]
+        assert _added(db, chat) == [_NOTICE_ROW_GMAIL]
+        assert _notice_rows(db, _NOTICE_GMAIL) == 1
 
     def test_critical_permissions_notice_names_every_completed_pair_once(
         self, db: FakeDb, app: FastAPI, clock: _Clock
     ) -> None:
         admin_a = _account(db, "org_admin")
         editor_a = _account(db, "editor")
-        chat = _seed_chat(editor_a, "chat-editor-a")
+        chat = _seed_chat(db, editor_a)
         client = _client(app)
         _complete(client, clock, admin_a, _OUTLOOK_SEND, _GMAIL_SEND)
 
         assert _get(client, admin_a).status_code == 200
 
-        assert _added(chat) == [("user", _NOTICE_GMAIL_OUTLOOK)]
+        assert _added(db, chat) == [_NOTICE_ROW_GMAIL_OUTLOOK]
 
     def test_critical_permissions_no_notice_before_the_cooldown(
         self, db: FakeDb, app: FastAPI, clock: _Clock
     ) -> None:
+        """At 4:59 the chat has no notice; the same chat gets it once the cooldown is over
+        (so the empty list isn't a chat the notice could never reach)."""
         admin_a = _account(db, "org_admin")
         editor_a = _account(db, "editor")
-        chat = _seed_chat(editor_a, "chat-editor-a")
+        chat = _seed_chat(db, editor_a)
         client = _client(app)
         clock.at()
         assert _promote(client, admin_a).status_code == 200
         clock.at(_JUST_BEFORE)
 
         assert _get(client, admin_a).status_code == 200
+        before_the_cooldown = _added(db, chat)
+        clock.at(_COOLDOWN)
+        assert _get(client, admin_a).status_code == 200
 
-        assert _added(chat) == []
+        assert (before_the_cooldown, _added(db, chat)) == ([], [_NOTICE_ROW_GMAIL])
 
     def test_critical_permissions_another_orgs_request_delivers_no_notice(
         self, db: FakeDb, app: FastAPI, clock: _Clock
@@ -1551,32 +1623,42 @@ class TestPromotionNotice:
         admin_a = _account(db, "org_admin")
         admin_b = _account(db, "org_admin", OTHER_ORG_ID)
         editor_a = _account(db, "editor")
-        chat = _seed_chat(editor_a, "chat-editor-a")
+        chat = _seed_chat(db, editor_a)
         client = _client(app)
         _complete(client, clock, admin_a)
 
         assert _get(client, admin_b).status_code == 200
-        before_own_request = _added(chat)
+        before_own_request = _added(db, chat)
         assert _get(client, admin_a).status_code == 200
 
         assert before_own_request == []
-        assert _added(chat) == [("user", _NOTICE_GMAIL)]
+        assert _added(db, chat) == [_NOTICE_ROW_GMAIL]
 
     def test_critical_permissions_notice_survives_the_agents_context_trim(
         self, db: FakeDb, app: FastAPI, clock: _Clock
     ) -> None:
-        """GH-66: a user-role notice survives _filter_mid_system (a system one would not)."""
+        """GH-66: the notice is stored user-role (a system one would be dropped by the
+        agent's _filter_mid_system), so the history the next run loads
+        (chats.load_recent_history) keeps it through _trim_context."""
+        from admino import chats
         from admino.agent import _trim_context
+        from admino.tenancy import TenantContext
 
         admin_a = _account(db, "org_admin")
-        chat = _seed_chat(admin_a, "chat-admin-a")
+        chat = _seed_chat(db, admin_a)
         client = _client(app)
         _complete(client, clock, admin_a)
         assert _get(client, admin_a).status_code == 200
+        tenant = TenantContext(org_id=ORG_ID, user_id=admin_a.id, role="org_admin")
 
-        trimmed = _trim_context(server._sessions[chat], max_messages=40)
+        loaded = asyncio.run(chats.load_recent_history(db.pool, tenant, chat, limit=40))
+        trimmed = _trim_context(loaded, max_messages=40)
 
-        assert [message.content for message in trimmed].count(_NOTICE_GMAIL) == 1
+        assert [
+            (message.role, message.content)
+            for message in trimmed
+            if message.content == _NOTICE_GMAIL
+        ] == [("user", _NOTICE_GMAIL)]
 
 
 # ---------------------------------------------------------------------------

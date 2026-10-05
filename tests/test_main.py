@@ -14,8 +14,12 @@ covering:
 - GH-147: the NDJSON audit logger is gone. main() never reads ``config.paths``
   and wires ``Agent(tool_call_recorder=main._build_tool_call_recorder())``; the
   recorder resolves the pool at call time and awaits
-  ``audit_events.record_tool_call`` with the session's chat id
-  (``uuid5(_SESSION_CHAT_NAMESPACE, session_id)``); errors propagate.
+  ``audit_events.record_tool_call``; errors propagate.
+- GH-176: tool.call rows target the chat's real UUID. The agent's ``session_id``
+  carries ``str(chat.id)`` and the recorder passes ``chat_id=uuid.UUID(session_id)``;
+  a ``session_id`` that isn't a UUID raises ValueError before anything is written
+  (the agent aborts the run). #147's stopgap ``_session_chat_id`` /
+  ``_SESSION_CHAT_NAMESPACE`` (uuid5 of the session id) no longer exists.
 - GH-149: the default-org bridge is retired. The recorder takes the caller's
   principal and records its org and user (``TenantContext.from_principal``: a
   Super Admin raises, so the agent aborts the run). Startup no longer calls
@@ -2055,32 +2059,19 @@ class TestStartupLoadsCommonPasswords:
         mock_deps["uvicorn_run"].assert_not_called()
 
 
-class TestSessionChatId:
-    """GH-147: the audit target for a session until #176 adds chat UUIDs."""
+class TestSessionChatIdStopgapRemoved:
+    """GH-176: #147's uuid5 stopgap is gone; tool.call rows target the real chat id."""
 
-    def test_is_uuid5_of_the_session_in_the_fixed_namespace(self) -> None:
-        import uuid
-
-        chat_id = main_module._session_chat_id("s-lz3k-a1b2c3d4")
-
-        assert isinstance(chat_id, uuid.UUID)
-        assert chat_id.version == 5
-        assert chat_id == uuid.uuid5(main_module._SESSION_CHAT_NAMESPACE, "s-lz3k-a1b2c3d4")
-
-    def test_is_deterministic(self) -> None:
-        assert main_module._session_chat_id("s-1") == main_module._session_chat_id("s-1")
-
-    def test_differs_per_session(self) -> None:
-        assert main_module._session_chat_id("s-1") != main_module._session_chat_id("s-2")
-
-    def test_namespace_is_a_fixed_uuid(self) -> None:
-        import uuid
-
-        assert isinstance(main_module._SESSION_CHAT_NAMESPACE, uuid.UUID)
+    @pytest.mark.parametrize("name", ["_session_chat_id", "_SESSION_CHAT_NAMESPACE"])
+    def test_stopgap_name_no_longer_exists(self, name: str) -> None:
+        assert not hasattr(main_module, name)
 
 
 _RECORDER_USER = uuid.UUID("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d")
 _RECORDER_ORG = uuid.UUID("1f2e3d4c-5b6a-4978-9a8b-7c6d5e4f3a2b")
+# GH-176: the run's session_id is the chat's id (str(chat.id)).
+_RECORDER_CHAT = uuid.UUID("2c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f")
+_RECORDER_OTHER_CHAT = uuid.UUID("3d4e5f6a-7b8c-4d9e-8f0a-2b3c4d5e6f7a")
 # #147's default organization (GH-154 removed accounts.DEFAULT_ORG_ID).
 _DEFAULT_ORG_ID = uuid.UUID("00000000-0000-4000-8000-000000000001")
 
@@ -2096,7 +2087,7 @@ def _recorder_kwargs(**overrides: Any) -> dict[str, Any]:
     """The eight keywords the agent passes to the recorder (GH-243 added escalated)."""
     kwargs: dict[str, Any] = {
         "principal": _member_principal(),
-        "session_id": "s-abc",
+        "session_id": str(_RECORDER_CHAT),
         "tool": "memory",
         "action": "read",
         "decision": "allow",
@@ -2116,7 +2107,7 @@ class TestBuildToolCallRecorder:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """One call → one record_tool_call on the runtime pool, with the member's org and
-        user id and the session's chat."""
+        user id and the run's chat: exactly the UUID its session_id carries (GH-176)."""
         pool = MagicMock(name="runtime-pool")
         record = AsyncMock()
         monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=pool))
@@ -2129,7 +2120,7 @@ class TestBuildToolCallRecorder:
             pool,
             org_id=_RECORDER_ORG,
             actor_user_id=_RECORDER_USER,
-            chat_id=main_module._session_chat_id("s-abc"),
+            chat_id=_RECORDER_CHAT,
             tool="memory",
             action="read",
             decision="allow",
@@ -2137,6 +2128,44 @@ class TestBuildToolCallRecorder:
             duration_ms=12,
             escalated=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_each_call_targets_the_chat_uuid_it_is_given(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GH-176: two chats, two targets, each a uuid.UUID equal to the session's id."""
+        record = AsyncMock()
+        monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
+
+        recorder = main_module._build_tool_call_recorder()
+        await recorder(**_recorder_kwargs(session_id=str(_RECORDER_CHAT)))
+        await recorder(**_recorder_kwargs(session_id=str(_RECORDER_OTHER_CHAT)))
+
+        targets = [call.kwargs["chat_id"] for call in record.await_args_list]
+        assert targets == [_RECORDER_CHAT, _RECORDER_OTHER_CHAT]
+        assert [type(target) for target in targets] == [uuid.UUID, uuid.UUID]
+
+    @pytest.mark.parametrize(
+        "session_id",
+        ["s-lz3k-a1b2c3d4", "", f"{_RECORDER_CHAT}0"],
+        ids=["legacy-session-id", "empty", "uuid-with-a-trailing-character"],
+    )
+    @pytest.mark.asyncio
+    async def test_non_uuid_session_id_raises_before_anything_is_written(
+        self, monkeypatch: pytest.MonkeyPatch, session_id: str
+    ) -> None:
+        """GH-176: no derived id any more: the recorder raises ValueError, so the agent
+        aborts the run (H-1), and record_tool_call is never awaited."""
+        record = AsyncMock()
+        monkeypatch.setattr("admino.database.get_pool", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr("admino.audit_events.record_tool_call", record, raising=False)
+
+        recorder = main_module._build_tool_call_recorder()
+        with pytest.raises(ValueError):
+            await recorder(**_recorder_kwargs(session_id=session_id))
+
+        record.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_super_admin_principal_raises_and_records_nothing(

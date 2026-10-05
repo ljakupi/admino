@@ -6,8 +6,9 @@ mocked. What these tests pin down:
 
 - A tool call by a logged-in member writes exactly one ``audit_events`` row
   through one parameterized INSERT: action ``tool.call``, actor kind ``member``
-  with the member's ``actor_user_id``, the member's ``org_id``, the session's
-  chat as target, and metadata with exactly ``tool, action, decision, success,
+  with the member's ``actor_user_id``, the member's ``org_id``, the run's chat as
+  target (GH-176: the chat's real UUID, carried by the run's ``session_id``; #147's
+  uuid5 stopgap is gone), and metadata with exactly ``tool, action, decision, success,
   duration_ms, escalated`` (GH-243 added ``escalated``). The tool's argument values
   and its output appear in no bind parameter.
 - GH-149 retires #147's default-org bridge: the default org's id
@@ -19,6 +20,9 @@ mocked. What these tests pin down:
   ``escalated``). GH-161: every run also passes its org's ``tool_policy`` (the
   agent holds no permissions).
 - A turn without a tool call writes nothing (conversation entries are gone).
+- GH-176: two runs on two chats write rows targeting each run's own chat, and a run
+  whose ``session_id`` isn't a UUID can't write a tool.call row: the run aborts (H-1)
+  and nothing is written.
 - GH-162: the member's run reaches the tool handler with the member's own
   ``TenantContext`` (``tenant=``); a Super Admin's run (no organization, so no
   tool context) never reaches the handler at all, and still ends with the
@@ -65,7 +69,10 @@ if TYPE_CHECKING:
     from admino.models import LLMMessage
 
 _SRC_DIR = Path(__file__).resolve().parent.parent / "src" / "admino"
-_SESSION = "s-e2e-4b1c"
+# GH-176: the run's session_id is the chat's id (str(chat.id)), the tool.call target.
+_CHAT_ID = uuid.UUID("5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b")
+_OTHER_CHAT_ID = uuid.UUID("6f7a8b9c-0d1e-4f2a-9b3c-4d5e6f7a8b9c")
+_SESSION = str(_CHAT_ID)
 _ARG_MARKER = "SECRET-ARG-7f3a"
 _OUTPUT_MARKER = "SECRET-OUTPUT-91bc"
 _USER_ID = uuid.UUID("4d5e6f70-8192-4a3b-9c4d-5e6f7a8b9c0d")
@@ -170,7 +177,7 @@ class TestToolCallWritesOneRow:
     async def test_row_is_a_member_tool_call_in_the_members_org_on_the_chat(
         self, pool: MagicMock
     ) -> None:
-        """actor_kind member, the member's user id and org, the session's chat."""
+        """actor_kind member, the member's user id and org, the run's chat id."""
         await _agent(_tool_then_text()).run(
             "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
@@ -182,7 +189,7 @@ class TestToolCallWritesOneRow:
         assert actor_kind == "member"
         assert action == "tool.call"
         assert target_type == "chat"
-        assert json.loads(target_ids) == [str(main_module._session_chat_id(_SESSION))]
+        assert json.loads(target_ids) == [str(_CHAT_ID)]
 
     @pytest.mark.asyncio
     async def test_row_follows_the_principal_of_each_run(self, pool: MagicMock) -> None:
@@ -196,11 +203,32 @@ class TestToolCallWritesOneRow:
             "go", session_id=_SESSION, history=[], principal=_MEMBER, tool_policy=_tool_policy()
         )
         await agent.run(
-            "go", session_id="s-other", history=[], principal=other, tool_policy=_tool_policy()
+            "go",
+            session_id=str(_OTHER_CHAT_ID),
+            history=[],
+            principal=other,
+            tool_policy=_tool_policy(),
         )
 
         rows = [call.args[1:3] for call in pool.execute.await_args_list]
         assert rows == [(_ORG_ID, _USER_ID), (other.org_id, other.user_id)]
+
+    @pytest.mark.asyncio
+    async def test_row_targets_each_runs_own_chat(self, pool: MagicMock) -> None:
+        """GH-176: two runs on two chats, two rows, each naming its own chat id."""
+        agent = _agent([*_tool_then_text(), *_tool_then_text()])
+
+        for chat_id in (_CHAT_ID, _OTHER_CHAT_ID):
+            await agent.run(
+                "go",
+                session_id=str(chat_id),
+                history=[],
+                principal=_MEMBER,
+                tool_policy=_tool_policy(),
+            )
+
+        targets = [json.loads(call.args[6]) for call in pool.execute.await_args_list]
+        assert targets == [[str(_CHAT_ID)], [str(_OTHER_CHAT_ID)]]
 
     @pytest.mark.asyncio
     async def test_member_built_from_asyncpg_uuids_is_recorded(self, pool: MagicMock) -> None:
@@ -293,6 +321,27 @@ class TestAuditFailureAbortsTheRun:
         assert result.status == "error"
         assert result.response == "Internal error: audit unavailable."
         assert result.pending_confirmation is None
+
+    @pytest.mark.asyncio
+    async def test_non_uuid_session_aborts_with_audit_unavailable_and_writes_nothing(
+        self, pool: MagicMock
+    ) -> None:
+        """GH-176: no target can be derived from a legacy session id any more: the
+        recorder raises, the run aborts (H-1) and no row is written."""
+        result = await _agent(_tool_then_text()).run(
+            "go",
+            session_id="s-e2e-4b1c",
+            history=[],
+            principal=_MEMBER,
+            tool_policy=_tool_policy(),
+        )
+
+        assert (result.status, result.response, result.pending_confirmation) == (
+            "error",
+            "Internal error: audit unavailable.",
+            None,
+        )
+        pool.execute.assert_not_awaited()
 
 
 class TestPrincipalReachesTheRecorder:

@@ -68,7 +68,10 @@ dispatch layer adds a hard rule on top:
 - Once a run has read external content (mail, files, events or memory notes), every
   action that changes something and that the matrix sets to **allow** needs your
   confirmation instead. This holds for the rest of that run and for the later turns of
-  the same conversation, because the content is still in the agent's context. Today the
+  the same conversation, because the content is still in the agent's context. A turn
+  loads only the chat's latest messages, so the chat remembers it: once a tool result
+  with external content is stored in a chat, the chat keeps that mark for good, and every
+  later turn there asks first, even when the email itself is long out of view. Today the
   one such action is `memory.store`: an email that says "remember X" makes the agent stop
   and ask before it stores anything.
 - Approving runs that one call. The next action that changes something asks again.
@@ -113,8 +116,9 @@ promotion applies to their own organization only:
    cancel the promotion while it's pending.
 
 After promotion the action reaches **confirm** — so it *still* asks before every send. You
-can never turn one of these into a silent `allow`. When the cooldown ends, the open chats of
-your organization get a short note that the action is now available.
+can never turn one of these into a silent `allow`. When the cooldown ends, every chat of
+your organization that isn't in the trash gets a short note, stored as a message, that the
+action is now available. Other organizations' chats never do.
 
 Turning a promoted permission off again takes effect at once and needs no password.
 Promotions, cancellations and demotions are each recorded in the organization's audit log

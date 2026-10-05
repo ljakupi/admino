@@ -66,11 +66,22 @@ Routes:
   active one (Super Admin); audited in the org's own log.
 - GET  /api/platform/diagnostics — The database status, the active LLM provider
   and model, and whether the LLM looks reachable (Super Admin).
-- POST /api/message       — Send a user message; returns ChatResponse (with the
-  run's LLM error code, GH-242).
-- GET  /api/events        — SSE stream for a chat session.
-- POST /api/confirm/{cid} — Approve or deny a pending confirmation; returns
-  ChatResponse (with the resumed run's LLM error code).
+- POST /api/chats         — Creates a chat of the caller (201 ChatSummary).
+- GET  /api/chats         — One page of the caller's chats, latest activity
+  first (``limit``, ``cursor``).
+- GET  /api/chats/{chat_id} — The chat's summary, one page of its messages
+  (the latest first, ``cursor`` to earlier ones), its confirmation state and
+  context.
+- PATCH /api/chats/{chat_id} — Renames the chat.
+- DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
+- POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
+  ChatResponse (with the run's LLM error code, GH-242).
+- POST /api/message       — Legacy: a turn in the caller's chat of a client
+  ``session_id`` (created on first use, until #177); returns ChatResponse.
+- GET  /api/events        — Legacy SSE stub for a chat session id.
+- POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
+  (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
+  resumed run's LLM error code).
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -124,7 +135,32 @@ Security notes:
   There is no bearer-token or VPN mode, and ``Authorization`` headers
   authenticate nothing.
 - The chat routes also need ``Capability.CHAT_SEND`` (403 for a Viewer or a
-  Super Admin); the principal is passed to ``agent.run``.
+  Super Admin, before any database work); the principal is passed to
+  ``agent.run``.
+- Persisted chats (GH-176, ``admino.chats``): chats are private to their
+  owner. Every statement binds the caller's org and user id (from the
+  session, never a request value), so an unknown id, another org's chat, a
+  colleague's chat (an Org Admin's request included) and a trashed chat
+  answer the same 404 ``{"detail": "Chat not found", "reason":
+  "chat_not_found"}`` with nothing changed. Each route spends a per-user
+  bucket; a chat turn spends the ``/api/message`` bucket shared with the
+  legacy route, so alternating routes doesn't double the LLM rate. A cursor
+  that doesn't decode is a 422 ``invalid_cursor``; no error repeats a title,
+  message or cursor. A turn runs on the latest ``max_context_messages``
+  messages (``chats.load_recent_history``) and passes the chat's sticky
+  ``external_content`` flag, read under the chat's lock (a turn queued behind
+  one that stored wrapped content gets it), as ``earlier_external_content``
+  (GH-243 covers the whole conversation); its new messages are stored after
+  the run (an agent failure stores nothing; a chat trashed meanwhile is the
+  404). A
+  denial is stored too (the closing ``tool`` results and the assistant's
+  denial), so the history stays well-formed. The agent's ``session_id`` is
+  ``str(chat.id)``, so ``tool.call`` rows target the chat. Trashing records
+  ``chat.delete`` in the same transaction. The legacy ``session_id`` names
+  the caller's own chat (``chats.legacy_session_id``): another user's
+  session id is a chat of the caller's own, and a confirmation never creates
+  one. Log lines name chat ids only: never a title, message text or legacy
+  session id.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -173,7 +209,8 @@ Security notes:
   it's spent, before any database work. Reset and login links are built from
   ``server.public_url`` only; the reset token never reaches the admin.
   Deactivating or deleting oneself clears the cookie. After a delete the
-  server forgets the user's chats, pending confirmations, chat locks, pending
+  server forgets the user's pending confirmations and chat locks
+  (``ChatRuntime.forget_user``; the chats go with the users row), pending
   OAuth states and cached access tokens; a refused one forgets nothing. No
   name, email, token or link is logged.
 - Platform organizations (GH-154): only a Super Admin reaches them, through
@@ -261,8 +298,9 @@ Security notes:
   failed audit write is a 500 with nothing changed; a 422 never echoes the
   password. Pending promotions live in process memory (a restart cancels
   them); an org's due ones are completed by that org's next chat run, summary
-  or critical-permissions request, and a user-role notice (GH-66) is appended
-  to that org's in-memory chats only.
+  or critical-permissions request, and a user-role notice (GH-66) is stored
+  in every chat of that org that isn't in the trash
+  (``chats.append_org_notice``), never in another org's.
 - OAuth connections are per user (GH-162): every OAuth route but the callback
   spends a per-user bucket, then needs ``Capability.OAUTH_CONNECT`` through
   ``access.can`` (Org Admin and Editor: 403 for a Viewer or a Super Admin)
@@ -371,20 +409,24 @@ Security notes:
 - Imports only the ``PROMOTABLE_DENIALS`` constant from permissions.py.
 
 Deployment note:
-- This module uses module-level dicts (_sessions, _pending_confirmations,
-  _rate_buckets, _oauth_pending_states) for in-memory state, and
-  ``admino.org_permissions`` keeps the pending promotions in memory (as
-  ``admino.oauth`` does the access-token cache). This requires a
-  **single-worker** ASGI deployment. Running multiple workers (e.g. uvicorn
-  --workers 2) will silently split state across processes. Use
-  ``--workers 1`` (the default).
+- Chats and their messages live in PostgreSQL. In-memory state: the bounded
+  ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run locks
+  and pending confirmations, at most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries,
+  idle ones evicted after ``_CHAT_IDLE_EVICT_S``; 503 ``chats_busy`` when
+  every entry is in use; cleared by ``create_app``, so a restart turns a
+  pending confirmation into ``expired``), ``_rate_buckets`` and
+  ``_oauth_pending_states``; ``admino.org_permissions`` keeps the pending
+  promotions in memory (as ``admino.oauth`` does the access-token cache).
+  This requires a **single-worker** ASGI deployment. Running multiple
+  workers (e.g. uvicorn --workers 2) will silently split state across
+  processes. Use ``--workers 1`` (the default).
 
-Chat session ID note:
-- Chat session IDs are client-provided until #176 and validated by Pydantic
-  (alphanumeric, hyphens, underscores, max 64 chars).
-  In-memory chat state is keyed by ``_chat_key(user_id, session_id)``, so a
-  user reusing another user's session_id sees an empty history and can neither
-  confirm nor cancel the other user's pending tool call.
+Legacy chat session ID note (until #177):
+- The legacy routes take a client-provided session id, validated by
+  Pydantic (alphanumeric, hyphens, underscores, max 64 chars). It names the
+  caller's own persisted chat (``chats.legacy_session_id``, unique per live
+  chat of an owner), so a user reusing another user's session id gets a chat
+  of their own and can neither read, confirm nor cancel the other user's.
 """
 
 from __future__ import annotations
@@ -400,7 +442,7 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
-from typing import TYPE_CHECKING, Annotated, Final, NamedTuple
+from typing import TYPE_CHECKING, Annotated, Final, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
 
@@ -419,6 +461,7 @@ from starlette.staticfiles import StaticFiles
 from admino import (
     accounts,
     auth,
+    chats,
     invitations,
     llm_policy,
     login_throttle,
@@ -434,13 +477,22 @@ from admino import (
     sessions,
 )
 from admino.access import Capability, Principal, can
-from admino.logs import request_id_var
+from admino.chat_runtime import ChatRuntime, ChatRuntimeFullError
+from admino.logs import request_id_var, safe_log
 from admino.models import (
     PROVIDER_TOOLS,
     AgentConfig,
     AgentResult,
+    ChatContext,
+    ChatCreateRequest,
+    ChatDetailResponse,
+    ChatListResponse,
+    ChatMessageCreate,
+    ChatMessageView,
     ChatRequest,
     ChatResponse,
+    ChatSummary,
+    ChatUpdateRequest,
     ConfirmRequest,
     CriticalPermissionPromote,
     CriticalPermissionsResponse,
@@ -518,7 +570,7 @@ if TYPE_CHECKING:
     from admino.agent import Agent
     from admino.config import AppConfig
     from admino.llm import LLMClient
-    from admino.models import SettingsPatchLLM
+    from admino.models import AgentStatus, MessageStatus, SettingsPatchLLM
 
 logger = logging.getLogger(__name__)
 
@@ -756,7 +808,7 @@ class _TokenBucket:
 
     Limits requests per second to prevent resource exhaustion (LLM inference,
     memory, Argon2 CPU). Not shared across workers — requires single-worker
-    deployment (already required by the in-memory chat state).
+    deployment (already required by the in-memory chat runtime).
 
     Args:
         rate: Tokens added per second.
@@ -798,6 +850,13 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
     "/api/events": (0.17, 3),
+    # GH-176: persisted chats, per user. A chat turn spends "/api/message"
+    # (one LLM bucket per user, shared with the legacy route).
+    "/api/chats/create": (0.5, 5),
+    "/api/chats/list": (1.0, 10),
+    "/api/chats/get": (1.0, 10),
+    "/api/chats/patch": (0.5, 5),
+    "/api/chats/delete": (0.5, 5),
     # GH-159: the settings scopes, per user.
     "/api/me/settings/get": (1.0, 10),
     "/api/me/settings/patch": (0.5, 5),
@@ -989,29 +1048,16 @@ def _client_ip(request: Request) -> str:
 # Module-level state — set during create_app()
 # ---------------------------------------------------------------------------
 
-# Maximum number of concurrent chat sessions before LRU eviction kicks in.
-_MAX_SESSIONS: int = 256
-
-# In-memory chat state is keyed by _chat_key(user_id, session_id): the chat
-# session id is client-provided (until #176), so keying by it alone would let
-# one user read, confirm or cancel another user's chat.
-
-# Conversation history per chat. No persistence across restarts.
-# OrderedDict enables O(1) LRU eviction when _MAX_SESSIONS is exceeded.
-_sessions: OrderedDict[tuple[UUID, str], list[LLMMessage]] = OrderedDict()
-
-# Pending confirmation per chat — only one at a time. A new confirmation for
-# the same chat overwrites the previous one. This prevents confirmation queue
-# buildup and simplifies the confirmation UX.
-_pending_confirmations: dict[tuple[UUID, str], PendingConfirmation] = {}
-
-# Per-chat asyncio locks to serialise concurrent requests for the same chat.
-# Prevents race conditions where two concurrent POST /api/message requests
-# read the same history snapshot, both run the agent, and the second write
-# silently overwrites the first's result. Also protects the confirmation flow
-# from interleaving with new messages. Entries are lazily created and cleaned
-# up on LRU eviction in _touch_session, keeping them bounded by _MAX_SESSIONS.
-_session_locks: dict[tuple[UUID, str], asyncio.Lock] = {}
+# Chats and their messages are persisted (GH-176, admino.chats). What stays in
+# memory is one bounded ChatRuntime: per-chat run locks (two runs of one chat
+# never overlap, so the second loads what the first stored) and the chat's
+# pending confirmation (one at a time; lost on a restart, then shown as
+# expired). Routes read this module global at request time (tests swap it).
+_MAX_CHAT_RUNTIME_ENTRIES: Final = 1024
+# An entry unused this long, not in use and without a pending confirmation,
+# is evicted when another one is created.
+_CHAT_IDLE_EVICT_S: Final = 900.0
+_chat_runtime = ChatRuntime(max_entries=_MAX_CHAT_RUNTIME_ENTRIES, idle_s=_CHAT_IDLE_EVICT_S)
 
 # OAuth state binding (GH-162): the authorize route stores the state with the
 # initiating user and session, and sets this short-lived cookie (HttpOnly,
@@ -1051,87 +1097,48 @@ _config: AppConfig | None = None
 
 
 # ---------------------------------------------------------------------------
-# Session helpers
+# Chat helpers
 # ---------------------------------------------------------------------------
 
 
-def _chat_key(user_id: UUID, session_id: str) -> tuple[UUID, str]:
-    """The key of one user's chat in the in-memory chat state.
-
-    Args:
-        user_id: The logged-in principal's user id (from the session).
-        session_id: The client-provided chat session id.
-
-    Returns:
-        The ``(user_id, session_id)`` pair.
-    """
-    return (user_id, session_id)
-
-
-def _get_session_lock(key: tuple[UUID, str]) -> asyncio.Lock:
-    """Get or create the asyncio lock of one chat.
-
-    Lazily creates locks on first access. Cleaned up when chats are
-    LRU-evicted in ``_touch_session``, keeping the dict bounded by
-    ``_MAX_SESSIONS``.
-
-    Args:
-        key: The chat key from ``_chat_key``.
-
-    Returns:
-        The asyncio.Lock for the given chat.
-    """
-    if key not in _session_locks:
-        _session_locks[key] = asyncio.Lock()
-    return _session_locks[key]
-
-
-def _touch_session(key: tuple[UUID, str], history: list[LLMMessage]) -> None:
-    """Insert or update a chat's history, maintaining LRU order.
-
-    If the chat store exceeds _MAX_SESSIONS, the least-recently-used chat is
-    evicted. This bounds memory usage and prevents DoS via unbounded session
-    creation.
-
-    Args:
-        key: The chat key from ``_chat_key``.
-        history: The conversation history to store.
-    """
-    # Move to end if exists (mark as recently used), then update.
-    if key in _sessions:
-        _sessions.move_to_end(key)
-    _sessions[key] = history
-
-    # Evict oldest chats if over capacity.
-    while len(_sessions) > _MAX_SESSIONS:
-        evicted_key, _ = _sessions.popitem(last=False)
-        # Also clean up any pending confirmation and lock for the evicted chat.
-        _pending_confirmations.pop(evicted_key, None)
-        _session_locks.pop(evicted_key, None)
-        logger.info("Evicted session %s (session cap %d reached)", evicted_key[1], _MAX_SESSIONS)
-
-
 def _reap_expired_confirmations() -> None:
-    """Remove all expired pending confirmations.
+    """Drop every expired pending confirmation from ``_chat_runtime``.
 
-    Called unconditionally at the top of ``post_message`` and
-    ``post_confirm`` (before acquiring per-chat locks) to prevent
-    stale confirmations from accumulating. This is the enforcement point
-    for confirmation_timeout_s configured in LimitsConfig.
+    Called unconditionally at the top of the chat turns, ``post_confirm`` and
+    the chat detail (before taking a chat's lock), so stale confirmations
+    never accumulate and a chat shows an expired one as ``expired``. This is
+    the enforcement point for the stored ``confirmation_timeout_s``.
 
     IMPORTANT: This function must remain synchronous (no ``await`` calls).
     Callers invoke it outside per-chat locks, so it must complete
     atomically within a single event-loop tick to avoid cross-chat
-    race conditions on ``_pending_confirmations``.
+    race conditions on the runtime's pending confirmations.
     """
-    now = datetime.now(UTC)
-    expired = [key for key, pc in _pending_confirmations.items() if now >= pc.expires_at]
-    for key in expired:
-        logger.info("Reaped expired confirmation for session %s", key[1])
-        del _pending_confirmations[key]
+    reaped = _chat_runtime.reap_expired(datetime.now(UTC))
+    if reaped:
+        logger.info("Reaped %d expired confirmation(s)", reaped)
 
 
 _CANCELLED_TOOL_RESULT_MSG = "Tool call cancelled — user sent a new message instead of confirming."
+# The stored tool result answering a denied call (GH-176), so the history stays well-formed.
+_DENIED_TOOL_RESULT_MSG: Final = "Tool call denied by the user."
+_NO_PENDING_DETAIL: Final = "No pending confirmation for this session"
+
+# The documented error bodies of the chat routes (GH-176).
+_CHAT_NOT_FOUND_BODY: Final = {"detail": "Chat not found", "reason": "chat_not_found"}
+_INVALID_CURSOR_BODY: Final = {"detail": "Invalid cursor", "reason": "invalid_cursor"}
+_CHATS_BUSY_BODY: Final = {
+    "detail": "Too many active chats. Try again shortly.",
+    "reason": "chats_busy",
+}
+
+# The stored status of a run's last message: a run's ``final`` is ``complete``.
+_STORED_STATUS: Final[dict[AgentStatus, MessageStatus]] = {
+    "final": "complete",
+    "awaiting_confirmation": "awaiting_confirmation",
+    "limit_reached": "limit_reached",
+    "error": "error",
+}
 
 
 def _summarise_pending(pending: PendingConfirmation) -> PendingConfirmationSummary:
@@ -1161,11 +1168,14 @@ def _close_dangling_tool_use(history: list[LLMMessage]) -> list[LLMMessage]:
     appending the assistant turn): the stored history now ends with a
     trailing ``tool_use`` that has no companion result.
 
-    If the user then posts a new ``/api/message`` (instead of using
+    If the user then sends a new message (instead of using
     ``/api/confirm/{id}``), the next LLM call would fail with HTTP 400. This
     helper rewrites the history so the contract holds: for each tool_use_block
     in the last assistant message without a matching ``tool`` message after
     it, append a synthetic ``tool`` message stating the call was cancelled.
+    GH-176: the turn stores these synthetic results with its messages, and a
+    denial reuses them (the denied call's result reworded), so the persisted
+    history stays well-formed for every later load.
 
     Returns a new list; the input is not mutated.
     """
@@ -2391,16 +2401,12 @@ async def _org_user_change[T](change: Awaitable[T]) -> T | JSONResponse:
 async def _forget_user(user_id: UUID) -> None:
     """Drop a deleted user's in-memory state; other users' entries stay.
 
-    Their chats, pending confirmations and chat locks (keyed by
-    ``(user_id, session_id)``), their pending OAuth states and their cached
-    access tokens of both providers.
+    Their pending confirmations and chat locks in ``_chat_runtime``
+    (``ChatRuntime.forget_user``; their persisted chats go with the users row
+    by CASCADE), their pending OAuth states and their cached access tokens of
+    both providers.
     """
-    for key in [key for key in _sessions if key[0] == user_id]:
-        del _sessions[key]
-    for key in [key for key in _pending_confirmations if key[0] == user_id]:
-        del _pending_confirmations[key]
-    for key in [key for key in _session_locks if key[0] == user_id]:
-        del _session_locks[key]
+    _chat_runtime.forget_user(user_id)
     states = [state for state, entry in _oauth_pending_states.items() if entry.user_id == user_id]
     for state in states:
         del _oauth_pending_states[state]
@@ -2591,10 +2597,10 @@ async def delete_org_user(
 ) -> Response:
     """Handle DELETE /api/org/users/{user_id} — delete a user's account.
 
-    The account goes with its sessions, OAuth connections, notes and settings;
-    then the server forgets the user's in-memory state (chats, pending
-    confirmations and OAuth states, cached access tokens). Deleting oneself
-    also clears the cookie. A refused delete forgets nothing.
+    The account goes with its sessions, OAuth connections, notes, settings and
+    chats; then the server forgets the user's in-memory state (pending
+    confirmations and chat locks, OAuth states, cached access tokens).
+    Deleting oneself also clears the cookie. A refused delete forgets nothing.
 
     Args:
         request: The incoming request (the client IP for the audit event).
@@ -3363,38 +3369,333 @@ def _run_config(platform: scoped_settings.StoredPlatformSettings) -> AgentConfig
     )
 
 
-async def post_message(
-    body: ChatRequest,
-    principal: _ChatSenderDep,
-) -> ChatResponse:
-    """Handle POST /api/message — send a user message to the agent.
+# ---------------------------------------------------------------------------
+# Persisted chats (GH-176): the chat routes, the turn and the confirmation
+# ---------------------------------------------------------------------------
 
-    Validates the request, retrieves or creates the caller's chat, runs the
-    agent with the caller's principal and their org's tool policy, updates
-    chat state, and returns the response. The message length and the run's
-    limits are the stored platform limits, and its LLM retry limit the stored
-    ``llm.max_retries`` (GH-242), read on every request (GH-160: a change
-    applies without a restart). The org's due critical permission promotions
-    are completed first, and the policy (the org's data residency included)
-    is loaded on every request (GH-161), so a change applies to the next run.
-    So is the caller's prompt context (GH-170,
-    ``scoped_settings.load_prompt_context``: the org's instructions and default
-    response language, the user's response language, timezone and personal
-    instructions), passed to the run as ``prompt_context``. A failing load
-    escapes before the run: the generic 500, nothing of it echoed or logged.
+
+def _chat_summary(chat: chats.ChatRecord) -> ChatSummary:
+    """The API summary of a stored chat: metadata only, never a message."""
+    return ChatSummary(
+        id=chat.id,
+        title=chat.title,
+        title_source=chat.title_source,
+        created_at=chat.created_at,
+        last_activity_at=chat.last_activity_at,
+    )
+
+
+async def post_chat(principal: _ChatSenderDep, body: ChatCreateRequest) -> ChatSummary:
+    """Handle POST /api/chats — create a chat of the caller.
 
     Args:
-        body: Validated ChatRequest with message and session_id.
         principal: The logged-in principal (needs ``chat.send``).
+        body: Validated ChatCreateRequest. A JSON body is required (``{}`` is
+            valid): no title is an untitled ``auto`` chat, a title (stripped)
+            a ``user`` one. The org and the owner come from the session.
 
     Returns:
-        ChatResponse with the agent's reply, tool call summary and the run's
-        LLM error code (None unless a coded LLM error ended it).
-    """
-    if _agent is None or _config is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
+        201 with the new chat's ChatSummary.
 
-    _check_rate_limit("/api/message", _user_caller(principal))
+    Raises:
+        HTTPException: 429 when rate-limited.
+    """
+    _check_rate_limit("/api/chats/create", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    tenant = TenantContext.from_principal(principal)
+    return _chat_summary(await chats.create_chat(get_pool(), tenant, title=body.title))
+
+
+async def get_chats(
+    principal: _ChatSenderDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    cursor: Annotated[str | None, Query(max_length=200)] = None,
+) -> ChatListResponse:
+    """Handle GET /api/chats — one page of the caller's chats, latest activity first.
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        limit: The page size, 1 to 100 (default 50).
+        cursor: The previous page's ``next_cursor``; none for the first page.
+
+    Returns:
+        ChatListResponse: the caller's own chats that aren't in the trash
+        (never a colleague's or another org's) by last activity then id, and
+        the next page's cursor (None on the last page).
+
+    Raises:
+        HTTPException: 429 when rate-limited. A cursor that doesn't decode is
+            a 422 ``invalid_cursor`` (``chats.InvalidCursorError``).
+    """
+    _check_rate_limit("/api/chats/list", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    tenant = TenantContext.from_principal(principal)
+    page = await chats.list_chats(get_pool(), tenant, limit=limit, cursor=cursor)
+    return ChatListResponse(
+        chats=[_chat_summary(chat) for chat in page.chats], next_cursor=page.next_cursor
+    )
+
+
+async def get_chat_detail(
+    principal: _ChatSenderDep,
+    chat_id: UUID,
+    limit: Annotated[int, Query(ge=1, le=100)] = 100,
+    cursor: Annotated[str | None, Query(max_length=200)] = None,
+) -> ChatDetailResponse:
+    """Handle GET /api/chats/{chat_id} — a chat of the caller with one page of messages.
+
+    Expired confirmations are reaped first, so ``confirmation_status`` is
+    ``pending`` (with ``pending_confirmation``) only for a live one in
+    ``_chat_runtime``, ``expired`` when the latest message awaits a
+    confirmation that is gone (expired, or lost in a restart), else ``none``.
+    ``context`` (interim until #190) counts every message of the chat against
+    the stored platform ``max_context_messages`` (the latest messages a run
+    sends to the model). Reading changes nothing.
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+        limit: The page size, 1 to 100 (default 100).
+        cursor: The previous page's ``next_cursor`` (earlier messages); none
+            for the latest page.
+
+    Returns:
+        ChatDetailResponse: the summary, the page's messages in chronological
+        order (sanitized content and tool-call summaries, never the raw tool
+        inputs), the cursor of earlier messages, the confirmation state and
+        the context.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Another org's, a colleague's,
+            a trashed and an unknown chat are the 404 ``chat_not_found``
+            (``chats.ChatNotFoundError``); a cursor that doesn't decode is a
+            422 ``invalid_cursor``.
+    """
+    _check_rate_limit("/api/chats/get", _user_caller(principal))
+    _reap_expired_confirmations()
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    tenant = TenantContext.from_principal(principal)
+    chat = await chats.get_chat(pool, tenant, chat_id)
+    page = await chats.list_messages(pool, tenant, chat.id, limit=limit, cursor=cursor)
+    message_count = await chats.count_messages(pool, tenant, chat.id)
+    max_context = (await _platform_run_settings()).limits.max_context_messages
+    pending = _chat_runtime.get_pending(chat.id)
+    confirmation_status: Literal["none", "pending", "expired"] = "none"
+    if pending is not None:
+        confirmation_status = "pending"
+    elif await chats.latest_message_status(pool, tenant, chat.id) == "awaiting_confirmation":
+        confirmation_status = "expired"
+    return ChatDetailResponse(
+        id=chat.id,
+        title=chat.title,
+        title_source=chat.title_source,
+        created_at=chat.created_at,
+        last_activity_at=chat.last_activity_at,
+        messages=[
+            ChatMessageView.model_validate(message, from_attributes=True)
+            for message in page.messages
+        ],
+        next_cursor=page.next_cursor,
+        pending_confirmation=None if pending is None else _summarise_pending(pending),
+        confirmation_status=confirmation_status,
+        context=ChatContext(
+            message_count=message_count,
+            max_context_messages=max_context,
+            truncated=message_count > max_context,
+        ),
+    )
+
+
+async def patch_chat(
+    principal: _ChatSenderDep, chat_id: UUID, body: ChatUpdateRequest
+) -> ChatSummary:
+    """Handle PATCH /api/chats/{chat_id} — rename a chat of the caller.
+
+    The title becomes a ``user`` title; the last activity is unchanged, and
+    the same title again changes nothing (idempotent).
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+        body: Validated ChatUpdateRequest (the stripped title).
+
+    Returns:
+        The renamed chat's ChatSummary.
+
+    Raises:
+        HTTPException: 429 when rate-limited. A chat the caller can't reach is
+            the 404 ``chat_not_found``.
+    """
+    _check_rate_limit("/api/chats/patch", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    tenant = TenantContext.from_principal(principal)
+    return _chat_summary(await chats.rename_chat(get_pool(), tenant, chat_id, body.title))
+
+
+async def delete_chat(request: Request, principal: _ChatSenderDep, chat_id: UUID) -> Response:
+    """Handle DELETE /api/chats/{chat_id} — move a chat of the caller to the trash.
+
+    Sets ``deleted_at`` (the messages stay until the purge, #194) and records
+    ``chat.delete`` in the same transaction (a failed audit write is a 500
+    with nothing changed). The chat's pending confirmation is dropped.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 429 when rate-limited. A chat the caller can't reach is
+            the 404 ``chat_not_found``, with nothing changed (another user's
+            pending confirmation included).
+    """
+    _check_rate_limit("/api/chats/delete", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    tenant = TenantContext.from_principal(principal)
+    await chats.trash_chat(
+        get_pool(),
+        tenant,
+        chat_id,
+        ip=request.client.host if request.client is not None else None,
+    )
+    _chat_runtime.pop_pending(chat_id)
+    return Response(status_code=204)
+
+
+def _denied_tool_results(
+    loaded: list[LLMMessage], pending: PendingConfirmation
+) -> list[LLMMessage]:
+    """The ``tool`` results a denial stores for the last assistant turn's dangling calls.
+
+    One per dangling ``tool_use`` block, in block order (those of
+    ``_close_dangling_tool_use``): the denied call's says so, any other
+    (a later call of the same batch) is cancelled.
+    """
+    return [
+        LLMMessage(role="tool", content=_DENIED_TOOL_RESULT_MSG, tool_call_id=message.tool_call_id)
+        if message.tool_call_id == pending.tool_call.tool_call_id
+        else message
+        for message in _close_dangling_tool_use(loaded)[len(loaded) :]
+    ]
+
+
+async def _finish_run(
+    pool: asyncpg.Pool,
+    tenant: TenantContext,
+    chat: chats.ChatRecord,
+    loaded: list[LLMMessage],
+    result: AgentResult,
+    session_id: str | None,
+) -> ChatResponse:
+    """Store a run's new messages, keep its pending confirmation and build the response.
+
+    Called under the chat's lock. The agent returns the history it got
+    followed by the run's messages, so the new ones are
+    ``result.history[len(loaded):]`` (synthetic cancelled results included).
+    The last one is stored with the run's status (``final`` as ``complete``)
+    and its tool calls. An ``awaiting_confirmation`` run's confirmation goes
+    to ``_chat_runtime``.
+
+    Args:
+        pool: The database pool.
+        tenant: The caller's org scope.
+        chat: The chat the run ran in.
+        loaded: The stored messages the run's history was built from.
+        result: The run's result.
+        session_id: The legacy session id to echo, or None.
+
+    Returns:
+        The ChatResponse naming the chat (with the run's LLM error code).
+
+    Raises:
+        chats.ChatNotFoundError: The chat was trashed during the run; nothing
+            is stored.
+    """
+    await chats.append_messages(
+        pool,
+        tenant,
+        chat.id,
+        result.history[len(loaded) :],
+        final_status=_STORED_STATUS[result.status],
+        tool_calls=result.tool_calls,
+    )
+    pending_summary: PendingConfirmationSummary | None = None
+    if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
+        _chat_runtime.set_pending(chat.id, tenant.user_id, result.pending_confirmation)
+        pending_summary = _summarise_pending(result.pending_confirmation)
+    logger.info(
+        "Completed message for chat %s: status=%s, tool_calls=%d",
+        safe_log(chat.id),
+        result.status,
+        len(result.tool_calls),
+    )
+    return ChatResponse(
+        chat_id=chat.id,
+        session_id=session_id,
+        response=result.response,
+        tool_calls=result.tool_calls,
+        status=result.status,
+        pending_confirmation=pending_summary,
+        error_code=result.error_code,
+    )
+
+
+async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -> ChatResponse:
+    """Run one user message in a chat and store the turn (the two turn routes).
+
+    The caller spent the ``/api/message`` bucket. Expired confirmations are
+    reaped and the org's due critical permission promotions completed first.
+    The message length and the run's limits are the stored platform limits,
+    and its LLM retry limit the stored ``llm.max_retries`` (GH-242), read on
+    every request (GH-160: a change applies without a restart); so are the
+    org's tool policy (GH-161, the org's data residency included) and the
+    caller's prompt context (GH-170, ``scoped_settings.load_prompt_context``:
+    the org's instructions and default response language, the user's
+    response language, timezone and personal instructions). A failing load
+    escapes before the run: the generic 500, nothing of it echoed or logged.
+
+    Under the chat's lock the chat is read again (a chat trashed meanwhile is
+    the 404), a pending confirmation of the chat is cancelled (a message
+    instead of a confirmation), the latest ``max_context_messages`` messages
+    are loaded, a dangling ``tool_use`` gets its synthetic cancelled result,
+    and the agent runs with ``str(chat.id)`` as its session id and the chat's
+    sticky ``external_content`` flag (GH-243) as read under the lock, so a
+    turn queued behind one that stored wrapped content is escalated by it.
+    Then the turn is stored (``_finish_run``).
+
+    Args:
+        principal: The logged-in principal (``chat.send`` checked).
+        message: The validated user message.
+        chat_ref: The chat's id, or a legacy session id (the caller's chat of
+            it, created on its first message, until #177).
+
+    Returns:
+        The turn's ChatResponse (``session_id`` echoes a legacy session id).
+
+    Raises:
+        HTTPException: 422 over the stored message length; 500 when the agent
+            fails (nothing stored).
+        chats.ChatNotFoundError: The chat isn't the caller's, or was trashed
+            during the run (404 ``chat_not_found``, nothing stored).
+        ChatRuntimeFullError: Every chat-runtime entry is in use (503
+            ``chats_busy``, no run).
+    """
+    if _agent is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
     _reap_expired_confirmations()
 
     from admino.database import get_pool
@@ -3405,7 +3706,7 @@ async def post_message(
     # Enforce the stored max_message_length (tighter than Pydantic's 32768).
     platform = await _platform_run_settings()
     max_len = platform.limits.max_message_length
-    if len(body.message) > max_len:
+    if len(message) > max_len:
         raise HTTPException(
             status_code=422,
             detail=f"Message exceeds maximum length of {max_len} characters",
@@ -3414,71 +3715,104 @@ async def post_message(
     policy = await org_permissions.load_tool_policy(pool, tenant)
     prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
-    session_id = body.session_id
-    key = _chat_key(principal.user_id, session_id)
+    session_id: str | None = None
+    # Resolves the chat (the 404, the legacy chat's creation); its flag may be stale by
+    # the time the lock is free.
+    if isinstance(chat_ref, UUID):
+        chat = await chats.get_chat(pool, tenant, chat_ref)
+    else:
+        chat = await chats.get_or_create_legacy_chat(pool, tenant, chat_ref)
+        session_id = chat_ref
 
-    # Per-chat lock serialises concurrent requests for the same chat,
-    # preventing lost conversation turns from interleaved read-modify-write.
-    async with _get_session_lock(key):
-        history = _sessions.get(key, [])
-
-        # If a confirmation was pending for this chat, the user has
-        # implicitly cancelled it by sending a new chat message. Drop the
-        # pending record and close any dangling ``tool_use`` in the stored
-        # history so the next LLM call is well-formed. We also call the
-        # cleanup unconditionally as a defence-in-depth step — it is a
-        # no-op on a well-formed history.
-        if key in _pending_confirmations:
+    # Runs of one chat are serialised, so each one loads what the previous stored.
+    async with _chat_runtime.hold(chat.id, tenant.user_id):
+        # Read again under the lock: a run queued ahead may have set external_content
+        # (GH-243), and this run must be escalated by it (security audit M-1).
+        chat = await chats.get_chat(pool, tenant, chat.id)
+        if _chat_runtime.pop_pending(chat.id) is not None:
             logger.info(
-                "Session %s sent a new message while confirmation was pending — "
-                "cancelling the pending tool call",
-                session_id,
+                "Chat %s got a new message while a confirmation was pending: cancelled",
+                safe_log(chat.id),
             )
-            del _pending_confirmations[key]
-        history = _close_dangling_tool_use(history)
-
-        logger.info("Processing message for session %s", session_id)
-
+        loaded = await chats.load_recent_history(
+            pool, tenant, chat.id, limit=platform.limits.max_context_messages
+        )
+        logger.info("Processing message for chat %s", safe_log(chat.id))
         try:
             result = await _agent.run(
-                user_message=body.message,
-                session_id=session_id,
-                history=history,
+                user_message=message,
+                session_id=str(chat.id),
+                history=_close_dangling_tool_use(loaded),
                 principal=principal,
                 tool_policy=policy,
                 agent_config=_run_config(platform),
                 prompt_context=prompt_context,
+                earlier_external_content=chat.external_content,
             )
         except (MemoryError, RecursionError):
             raise
         except Exception:
-            logger.error("Agent run failed for session %s", session_id)
+            logger.error("Agent run failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
+        return await _finish_run(pool, tenant, chat, loaded, result, session_id)
 
-        # Update chat history from the agent's returned history (LRU-tracked).
-        _touch_session(key, result.history)
 
-        # Store pending confirmation if the agent is awaiting one.
-        pending_summary: PendingConfirmationSummary | None = None
-        if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
-            _pending_confirmations[key] = result.pending_confirmation
-            pending_summary = _summarise_pending(result.pending_confirmation)
+async def post_chat_message(
+    principal: _ChatSenderDep, chat_id: UUID, body: ChatMessageCreate
+) -> ChatResponse:
+    """Handle POST /api/chats/{chat_id}/messages — run a turn in a chat of the caller.
 
-        logger.info(
-            "Completed message for session %s: status=%s, tool_calls=%d",
-            session_id,
-            result.status,
-            len(result.tool_calls),
-        )
+    Spends the per-user ``/api/message`` bucket (shared with the legacy
+    route), then runs and stores the turn (``_chat_turn``).
 
-        return ChatResponse(
-            session_id=session_id,
-            response=result.response,
-            tool_calls=result.tool_calls,
-            status=result.status,
-            pending_confirmation=pending_summary,
-            error_code=result.error_code,
-        )
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+        body: Validated ChatMessageCreate (the message).
+
+    Returns:
+        ChatResponse with the chat's id (``session_id`` None), the agent's
+        reply, the tool call summary, the pending confirmation and the run's
+        LLM error code (None unless a coded LLM error ended it).
+
+    Raises:
+        HTTPException: 429 when rate-limited, 422 over the stored message
+            length, 500 when the agent fails. A chat the caller can't reach is
+            the 404 ``chat_not_found``; a full chat runtime the 503
+            ``chats_busy``.
+    """
+    _check_rate_limit("/api/message", _user_caller(principal))
+    return await _chat_turn(principal, body.message, chat_id)
+
+
+async def post_message(
+    body: ChatRequest,
+    principal: _ChatSenderDep,
+) -> ChatResponse:
+    """Handle POST /api/message — legacy: a turn in the caller's chat of a session id.
+
+    The session id names the caller's own persisted chat
+    (``chats.legacy_session_id``), created on its first message: another
+    user's session id is a chat of the caller's own. The turn then runs like
+    POST /api/chats/{chat_id}/messages (``_chat_turn``), on the same per-user
+    ``/api/message`` bucket. Until #177.
+
+    Args:
+        body: Validated ChatRequest with message and session_id.
+        principal: The logged-in principal (needs ``chat.send``).
+
+    Returns:
+        ChatResponse with the chat's id, the echoed session id, the agent's
+        reply, the tool call summary and the run's LLM error code (None
+        unless a coded LLM error ended it).
+
+    Raises:
+        HTTPException: 429 when rate-limited, 422 over the stored message
+            length, 500 when the agent fails. A full chat runtime is the 503
+            ``chats_busy``.
+    """
+    _check_rate_limit("/api/message", _user_caller(principal))
+    return await _chat_turn(principal, body.message, body.session_id)
 
 
 async def get_events(
@@ -3490,11 +3824,13 @@ async def get_events(
         description="Session identifier. Alphanumeric, hyphens, underscores only.",
     ),
 ) -> StreamingResponse:
-    """Handle GET /api/events — SSE stream for one of the caller's chats.
+    """Handle GET /api/events — legacy SSE stub for one of the caller's chats.
 
     For v1, this is a stub that returns session status. ``_stream_agent_result``
     is implemented and tested but not yet wired into this endpoint — it will
-    be connected in v2 when full SSE streaming is completed.
+    be connected in v2 when full SSE streaming is completed. The chat "has
+    history" when the caller's chat of the session id exists and holds a
+    message; the stream only looks it up, never creates it.
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -3508,8 +3844,16 @@ async def get_events(
 
     _check_rate_limit("/api/events", _user_caller(principal))
 
-    history = _sessions.get(_chat_key(principal.user_id, session_id), [])
-    if not history:
+    from admino.database import get_pool
+
+    pool = get_pool()
+    tenant = TenantContext.from_principal(principal)
+    try:
+        chat = await chats.find_legacy_chat(pool, tenant, session_id)
+        has_history = await chats.count_messages(pool, tenant, chat.id) > 0
+    except chats.ChatNotFoundError:
+        has_history = False
+    if not has_history:
         # No messages in session yet — stream an empty done.
         async def _empty_stream() -> AsyncIterator[str]:
             yield _make_sse_event("done", {})
@@ -3554,31 +3898,46 @@ async def post_confirm(
 ) -> ChatResponse:
     """Handle POST /api/confirm/{confirmation_id} — approve or deny a pending action.
 
-    Looks up the caller's pending confirmation by session_id, verifies the
-    confirmation_id matches, checks expiry, and if approved, resumes the agent
-    run with the caller's principal, the stored platform limits and LLM retry
-    limit (read on every request, GH-160, GH-242) and their org's tool policy
-    as it is now (loaded again, after completing the org's due promotions;
-    GH-161). An approved resume also loads the caller's prompt context again
-    (GH-170), so a change made while the confirmation was pending applies; a
-    failing load is the generic 500 with nothing resumed, echoed or logged.
-    Under the org's data residency a resumed run whose LLM provider
-    has meanwhile become non-Swiss ends with ``residency_blocked`` before the
-    approved tool is dispatched (the agent's guard). Another user's pending
-    confirmation is never found (404).
+    The body names the chat by ``chat_id`` or by the legacy ``session_id``
+    (looked up, never created); a chat the caller can't reach, or one
+    without a pending confirmation in ``_chat_runtime``, is the same 404.
+    Under the chat's lock the confirmation id and the expiry are checked and
+    the confirmation is consumed. A denial stores the closing ``tool``
+    results (the denied call's "Tool call denied by the user.", any other
+    dangling call's cancelled result) and the assistant's denial, so the
+    history stays well-formed. An approval resumes the agent on the latest
+    ``max_context_messages`` stored messages (the dangling ``tool_use`` left
+    as it is: the resume dispatches it), with the caller's principal, the
+    chat's ``external_content`` flag (read again under the lock, so a turn
+    that ran in front of the approval counts), the stored platform limits
+    and LLM retry limit (read on every request, GH-160, GH-242) and their org's tool
+    policy as it is now (loaded again, after completing the org's due
+    promotions; GH-161), then stores the run like a turn. An approved resume
+    also loads the caller's prompt context again (GH-170), so a change made
+    while the confirmation was pending applies; a failing load is the
+    generic 500 with nothing resumed, echoed or logged. Under the org's data
+    residency a resumed run whose LLM provider has meanwhile become
+    non-Swiss ends with ``residency_blocked`` before the approved tool is
+    dispatched (the agent's guard). Another user's pending confirmation is
+    never found (404).
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
         confirmation_id: The confirmation ID from the URL path (Pydantic-validated).
-        body: Validated ConfirmRequest with session_id and approved flag.
+        body: Validated ConfirmRequest with ``chat_id`` or ``session_id``, the
+            confirmation id and the approved flag.
 
     Returns:
-        ChatResponse with the result of the resumed agent run (its LLM error
-        code included; None for a denial).
+        ChatResponse naming the chat (``session_id`` echoed when given) with
+        the result of the resumed agent run (its LLM error code included;
+        None for a denial).
 
     Raises:
-        HTTPException: 404 if confirmation not found, 400 if IDs mismatch,
-                       410 if confirmation has expired.
+        HTTPException: 404 if no confirmation is pending for the chat or the
+            id doesn't match, 400 if the IDs mismatch, 410 if the
+            confirmation has expired, 500 when the agent fails. A chat
+            trashed meanwhile is the 404 ``chat_not_found``; a full chat
+            runtime the 503 ``chats_busy``.
     """
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -3594,15 +3953,21 @@ async def post_confirm(
     tenant = TenantContext.from_principal(principal)
     policy = await org_permissions.load_tool_policy(pool, tenant)
 
-    session_id = body.session_id
-    key = _chat_key(principal.user_id, session_id)
+    try:
+        if body.chat_id is not None:
+            chat = await chats.get_chat(pool, tenant, body.chat_id)
+        else:
+            # ConfirmRequest names exactly one of chat_id and session_id.
+            chat = await chats.find_legacy_chat(pool, tenant, cast("str", body.session_id))
+    except chats.ChatNotFoundError:
+        raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL) from None
 
-    # Per-chat lock serialises with concurrent POST /api/message requests.
-    async with _get_session_lock(key):
-        pending = _pending_confirmations.get(key)
+    # Per-chat lock serialises with concurrent turns of the chat.
+    async with _chat_runtime.hold(chat.id, tenant.user_id):
+        pending = _chat_runtime.get_pending(chat.id)
 
         if pending is None:
-            raise HTTPException(status_code=404, detail="No pending confirmation for this session")
+            raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
 
         if pending.confirmation_id != confirmation_id:
             raise HTTPException(status_code=404, detail="Confirmation not found")
@@ -3614,73 +3979,67 @@ async def post_confirm(
         # Check expiry at server layer — avoids a full agent round trip for
         # expired confirmations that the registry would also reject.
         if datetime.now(UTC) >= pending.expires_at:
-            del _pending_confirmations[key]
+            _chat_runtime.pop_pending(chat.id)
             raise HTTPException(status_code=410, detail="Confirmation has expired")
 
-        # Remove the pending confirmation regardless of approval/denial.
-        del _pending_confirmations[key]
+        # Consume the pending confirmation regardless of approval/denial.
+        _chat_runtime.pop_pending(chat.id)
+        loaded = await chats.load_recent_history(
+            pool, tenant, chat.id, limit=platform.limits.max_context_messages
+        )
 
         if not body.approved:
-            logger.info("Confirmation %s denied for session %s", confirmation_id, session_id)
-            # The dangling tool_use in session history will be closed the next
-            # time the user sends a chat message (see _close_dangling_tool_use
-            # in post_message). We could also close it eagerly here, but the
-            # lazy approach keeps the denial path minimal.
+            logger.info("Confirmation denied for chat %s", safe_log(chat.id))
             # Safe f-string: tool and action are Pydantic-validated with
             # pattern=r"^[a-z][a-z0-9_]{0,62}$", restricting to alphanumeric/
             # underscore. ChatResponse.sanitize_response provides defence-in-depth.
+            denial = f"Action {pending.tool_call.tool}.{pending.tool_call.action} was denied."
+            await chats.append_messages(
+                pool,
+                tenant,
+                chat.id,
+                [
+                    *_denied_tool_results(loaded, pending),
+                    LLMMessage(role="assistant", content=denial),
+                ],
+            )
             return ChatResponse(
-                session_id=session_id,
-                response=f"Action {pending.tool_call.tool}.{pending.tool_call.action} was denied.",
+                chat_id=chat.id,
+                session_id=body.session_id,
+                response=denial,
                 tool_calls=[],
                 status="final",
                 pending_confirmation=None,
             )
 
-        # Approved — resume the agent with the pending confirmation and the
-        # prompt context as it is now (GH-170: a change made while the
-        # confirmation was pending applies to the resumed run).
-        history = _sessions.get(key, [])
+        # Approved — resume the agent with the pending confirmation, the chat's
+        # external_content flag as read under the lock (a turn queued ahead may have
+        # set it; security audit M-1) and the prompt context as it is now (GH-170: a
+        # change made while the confirmation was pending applies to the resumed run).
+        chat = await chats.get_chat(pool, tenant, chat.id)
         prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
-        logger.info(
-            "Resuming agent for session %s after confirmation %s",
-            session_id,
-            confirmation_id,
-        )
+        logger.info("Resuming agent for chat %s after a confirmation", safe_log(chat.id))
 
         try:
             result = await _agent.run(
                 user_message="",
-                session_id=session_id,
-                history=history,
+                session_id=str(chat.id),
+                history=loaded,
                 principal=principal,
                 tool_policy=policy,
                 pending_confirmation=pending,
                 agent_config=_run_config(platform),
                 prompt_context=prompt_context,
+                earlier_external_content=chat.external_content,
             )
         except (MemoryError, RecursionError):
             raise
         except Exception:
-            logger.error("Agent resume failed for session %s", session_id)
+            logger.error("Agent resume failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
 
-        _touch_session(key, result.history)
-
-        pending_summary: PendingConfirmationSummary | None = None
-        if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
-            _pending_confirmations[key] = result.pending_confirmation
-            pending_summary = _summarise_pending(result.pending_confirmation)
-
-        return ChatResponse(
-            session_id=session_id,
-            response=result.response,
-            tool_calls=result.tool_calls,
-            status=result.status,
-            pending_confirmation=pending_summary,
-            error_code=result.error_code,
-        )
+        return await _finish_run(pool, tenant, chat, loaded, result, body.session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -4124,9 +4483,9 @@ async def _resolve_due_promotions(pool: asyncpg.Pool, principal: Principal) -> N
 
     ``org_permissions.resolve_due_promotions`` stores each pair whose cooldown
     has passed as 'confirm'. Then ONE ``user``-role notice naming the pairs is
-    appended to every in-memory chat of the org's users (their ids read from
-    the database), and to no other org's chat, so the LLM doesn't refuse based
-    on earlier denials in the conversation.
+    stored in every chat of the org that isn't in the trash (all its members'
+    chats, GH-176 ``chats.append_org_notice``), and in no other org's chat, so
+    the LLM doesn't refuse based on earlier denials in the conversation.
 
     GH-66: the notice MUST NOT be ``system``-role: the agent drops every
     ``system`` message in caller-supplied history (prompt-injection defence,
@@ -4143,17 +4502,12 @@ async def _resolve_due_promotions(pool: asyncpg.Pool, principal: Principal) -> N
     if not completed:
         return
     names = ", ".join(f"{tool}.{action}" for tool, action in completed)
-    notice = LLMMessage(
-        role="user",
-        content=(
-            f"PERMISSION UPDATE: The following actions are now available with user "
-            f"confirmation: {names}. Earlier denials for these actions no longer apply."
-        ),
+    await chats.append_org_notice(
+        pool,
+        tenant,
+        f"PERMISSION UPDATE: The following actions are now available with user "
+        f"confirmation: {names}. Earlier denials for these actions no longer apply.",
     )
-    members = await accounts.org_user_ids(pool, tenant.org_id)
-    for (user_id, _session_id), history in _sessions.items():
-        if UUID(str(user_id)) in members:
-            history.append(notice)
 
 
 def _require_promotable(tool: str, action: str) -> None:
@@ -4897,6 +5251,29 @@ async def _request_validation_error_handler(
     return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
+# The chat routes' documented errors (GH-176), one body each wherever they are
+# raised (the repository, the chat runtime), so no route answers them otherwise.
+
+
+async def _chat_not_found_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``chats.ChatNotFoundError``: the 404 ``chat_not_found``.
+
+    One body for an unknown id, another org's or another user's chat and a
+    trashed one, so a 404 never tells whether a chat exists.
+    """
+    return JSONResponse(status_code=404, content=_CHAT_NOT_FOUND_BODY)
+
+
+async def _invalid_cursor_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``chats.InvalidCursorError``: the 422 ``invalid_cursor`` (the cursor isn't echoed)."""
+    return JSONResponse(status_code=422, content=_INVALID_CURSOR_BODY)
+
+
+async def _chats_busy_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``ChatRuntimeFullError``: the 503 ``chats_busy`` (every runtime entry is in use)."""
+    return JSONResponse(status_code=503, content=_CHATS_BUSY_BODY)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -5011,10 +5388,10 @@ def create_app(
     _agent = agent
     _config = config
 
-    # Clear session state on app creation (supports test isolation).
-    _sessions.clear()
-    _pending_confirmations.clear()
-    _session_locks.clear()
+    # A fresh process state (a restart; test isolation): the chat runtime's
+    # locks and pending confirmations start empty (a chat awaiting one then
+    # shows it as expired), and so do the OAuth states.
+    _chat_runtime.clear()
     _oauth_pending_states.clear()
     # Pending critical permission promotions start empty, like a restart (GH-161).
     org_permissions.clear_pending()
@@ -5074,6 +5451,10 @@ def create_app(
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)  # type: ignore[arg-type]
     # ValidationError: raised by Pydantic inside route handlers (e.g. response model construction).
     app.add_exception_handler(ValidationError, _validation_error_handler)  # type: ignore[arg-type]
+    # GH-176: the chat routes' documented errors.
+    app.add_exception_handler(chats.ChatNotFoundError, _chat_not_found_handler)
+    app.add_exception_handler(chats.InvalidCursorError, _invalid_cursor_handler)
+    app.add_exception_handler(ChatRuntimeFullError, _chats_busy_handler)
 
     # --- Routes ---
     # Public: health check, login, password reset, the invitation link routes
@@ -5175,6 +5556,12 @@ def create_app(
     app.get("/api/platform/diagnostics", response_model=PlatformDiagnosticsResponse)(
         get_platform_diagnostics
     )
+    app.post("/api/chats", status_code=201, response_model=ChatSummary)(post_chat)
+    app.get("/api/chats", response_model=ChatListResponse)(get_chats)
+    app.get("/api/chats/{chat_id}", response_model=ChatDetailResponse)(get_chat_detail)
+    app.patch("/api/chats/{chat_id}", response_model=ChatSummary)(patch_chat)
+    app.delete("/api/chats/{chat_id}", status_code=204, response_model=None)(delete_chat)
+    app.post("/api/chats/{chat_id}/messages", response_model=ChatResponse)(post_chat_message)
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.get("/api/events")(get_events)
     app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)

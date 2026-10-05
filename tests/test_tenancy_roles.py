@@ -13,14 +13,20 @@ a second member, a fresh active or deactivated member to manage (GH-164), a
 second session, a pending confirmation or promotion, an OAuth connection, a
 target org for the platform routes, a fresh active or deactivated user of org
 B for the Super Admin's user actions and an org whose first Org Admin is still
-invited for the re-invite (GH-167)).
+invited for the re-invite (GH-167)). GH-176: the chat routes act on a persisted
+chat of the caller's own (a Viewer's too: chats from before a demotion stay
+stored, so its 403 is the role's, not a missing chat's) with a live pending
+confirmation in ``server._chat_runtime``; the Super Admin, who can own no chat,
+is pointed at org A's Org Admin's. The legacy confirm acts on the caller's
+legacy chat (``chats.legacy_session_id``) and its pending confirmation.
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
   gets exactly ``403 {"detail": "Forbidden"}`` and nothing happens: no table
-  changes, no write statement (a session's ``last_seen_at`` refresh aside),
-  no audit row, no in-memory chat, confirmation, OAuth state or promotion
-  change, and the agent never runs;
+  changes (chats and chat messages included), no write statement (a
+  session's ``last_seen_at`` refresh aside), no audit row, no change in the
+  chat runtime (entries, pending confirmations), OAuth states or promotions,
+  and the agent never runs;
 - a role inside it gets the route's documented success status
   (``_SETUPS[...].status``) for the same request.
 
@@ -42,7 +48,7 @@ from __future__ import annotations
 import copy
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock
 
@@ -51,7 +57,6 @@ from cryptography.fernet import Fernet
 
 from admino import org_permissions, server
 from admino.access import Capability
-from admino.models import PendingConfirmation, ToolCall
 from admino.oauth import encrypt_refresh_token
 from tests.db_fakes import FakeDb
 from tests.tenancy_world import (
@@ -69,9 +74,12 @@ from tests.tenancy_world import (
     World,
     allowed_roles,
     build_world,
+    chat_runtime_state,
     make_app,
     make_client,
     route_id,
+    seed_chat,
+    seed_pending_confirmation,
     stub_agent,
     use_fake_database,
     use_fast_passwords,
@@ -99,10 +107,12 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
 
 @pytest.fixture(autouse=True)
 def _no_leftover_server_state() -> Iterator[None]:
-    """Leave no seeded chat, confirmation, OAuth state or promotion to later test files."""
+    """Leave no chat runtime entry, confirmation, OAuth state or promotion to later
+    test files (chats themselves live in each test's own FakeDb)."""
     yield
-    server._sessions.clear()
-    server._pending_confirmations.clear()
+    runtime = getattr(server, "_chat_runtime", None)
+    if runtime is not None:
+        runtime.clear()
     server._oauth_pending_states.clear()
     org_permissions.clear_pending()
 
@@ -262,21 +272,48 @@ def _cancel_pending_promotion(world: World, caller: Account) -> _Request:
     return _Request("DELETE", "/api/org/critical-permissions/gmail/send/pending")
 
 
+def _chat_owner(world: World, caller: Account) -> Account:
+    """The caller, or org A's Org Admin for the Super Admin (who can own no chat)."""
+    return caller if caller.org_id is not None else world.a["org_admin"]
+
+
 def _confirm(world: World, caller: Account) -> _Request:
-    """A pending confirmation in the caller's own chat; the request denies it."""
-    now = datetime.now(UTC)
-    server._pending_confirmations[server._chat_key(caller.user_id, _CHAT_ID)] = PendingConfirmation(
-        confirmation_id=_CONFIRMATION_ID,
-        session_id=_CHAT_ID,
-        tool_call=ToolCall(tool="google_calendar", action="create", args={}),
-        created_at=now,
-        expires_at=now + timedelta(minutes=5),
-    )
+    """A pending confirmation in the caller's own legacy chat (GH-176: a persisted chat
+    with that legacy session id, the pending in the chat runtime); the request denies it."""
+    owner = _chat_owner(world, caller)
+    chat_id = seed_chat(world.db, owner, legacy_session_id=_CHAT_ID)
+    seed_pending_confirmation(owner, chat_id, _CONFIRMATION_ID)
     return _Request(
         "POST",
         f"/api/confirm/{_CONFIRMATION_ID}",
         json={"session_id": _CHAT_ID, "confirmation_id": _CONFIRMATION_ID, "approved": False},
     )
+
+
+def _own_chat(
+    method: str, suffix: str = "", *, json: dict[str, Any] | None = None, history: bool = True
+) -> Callable[[World, Account], _Request]:
+    """A request on a chat of the caller's own (GH-176), with a live pending confirmation.
+
+    The chat has a title and, with ``history``, a question and its answer. A Viewer
+    owns one too (from before a demotion); the Super Admin's request names org A's
+    Org Admin's chat.
+    """
+
+    def prepare(world: World, caller: Account) -> _Request:
+        owner = _chat_owner(world, caller)
+        chat_id = seed_chat(
+            world.db,
+            owner,
+            title="Rollen Chat 176",
+            messages=(("user", "Rollen Frage 176"), ("assistant", "Rollen Antwort 176"))
+            if history
+            else (),
+        )
+        seed_pending_confirmation(owner, chat_id, _CONFIRMATION_ID)
+        return _Request(method, f"/api/chats/{chat_id}{suffix}", json=json)
+
+    return prepare
 
 
 def _oauth_disconnect(provider: str) -> Callable[[World, Account], _Request]:
@@ -423,6 +460,22 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
         _plain("GET", "/api/events", params={"session_id": _CHAT_ID}), 200
     ),
     ("POST", "/api/confirm/{confirmation_id}"): _Setup(_confirm, 200),
+    # GH-176: persisted chats (a title on create: "user"; the turn runs the stub agent).
+    ("POST", "/api/chats"): _Setup(
+        _plain("POST", "/api/chats", json={"title": "Neuer Rollen Chat 176"}), 201
+    ),
+    ("GET", "/api/chats"): _Setup(_plain("GET", "/api/chats"), 200),
+    ("GET", "/api/chats/{chat_id}"): _Setup(_own_chat("GET"), 200),
+    ("PATCH", "/api/chats/{chat_id}"): _Setup(
+        _own_chat("PATCH", json={"title": "Umbenannter Rollen Chat 176"}), 200
+    ),
+    ("DELETE", "/api/chats/{chat_id}"): _Setup(_own_chat("DELETE"), 204),
+    ("POST", "/api/chats/{chat_id}/messages"): _Setup(
+        _own_chat(
+            "POST", "/messages", json={"message": "Hello from the role suite."}, history=False
+        ),
+        200,
+    ),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _Setup(
         _plain("GET", "/api/oauth/google/authorize"), 200
@@ -531,12 +584,12 @@ def _tables(db: FakeDb) -> dict[str, Any]:
     return state
 
 
-def _memory_state() -> dict[str, Any]:
-    """The server's in-memory chats, confirmations, OAuth states and pending promotions."""
+def _memory_state(db: FakeDb) -> dict[str, Any]:
+    """The server's in-memory state: the chat runtime (its entries and the pending
+    confirmation of every stored chat), OAuth states and pending promotions."""
     return copy.deepcopy(
         {
-            "chats": {key: list(history) for key, history in server._sessions.items()},
-            "confirmations": dict(server._pending_confirmations),
+            "chat_runtime": chat_runtime_state(db),
             "oauth_states": dict(server._oauth_pending_states),
             "promotions": dict(org_permissions._pending),
         }
@@ -590,7 +643,7 @@ class TestForbiddenRoles:
         request = _SETUPS[(spec.method, spec.path)].prepare(world, caller)
         tables = _tables(world.db)
         audit = copy.deepcopy(world.db.audit_rows())
-        memory = _memory_state()
+        memory = _memory_state(world.db)
         start = len(world.db.calls)
 
         response = make_client(app).request(
@@ -605,7 +658,7 @@ class TestForbiddenRoles:
         assert world.db.audit_rows() == audit
         assert _writes_since(world.db, start) == []
         assert _tables(world.db) == tables
-        assert _memory_state() == memory
+        assert _memory_state(world.db) == memory
         agent.run.assert_not_awaited()
 
 
@@ -691,6 +744,24 @@ class TestRoleCaseCoverage:
             "uncovered": sorted(set(Capability) - exercised - set(PENDING_CAPABILITIES)),
             "routed_but_pending": sorted(exercised & set(PENDING_CAPABILITIES)),
         } == {"uncovered": [], "routed_but_pending": []}
+
+    def test_tenancy_roles_chat_state_in_memory_is_only_the_chat_runtime(self) -> None:
+        """GH-176: ``server._chat_runtime`` exists (locks and pending confirmations) and the
+        removed in-memory chat dicts are gone, so ``_memory_state`` sees every in-memory
+        chat change a refused request could make."""
+        runtime = getattr(server, "_chat_runtime", None)
+        leftovers = [
+            name
+            for name in ("_sessions", "_pending_confirmations", "_session_locks")
+            if hasattr(server, name)
+        ]
+
+        assert runtime is not None
+        assert all(
+            callable(getattr(runtime, name, None))
+            for name in ("get_pending", "set_pending", "clear", "__len__")
+        )
+        assert leftovers == []
 
     def test_tenancy_roles_matrix_covers_every_capability(self) -> None:
         """The spelled-out §2.1 matrix names every capability, each with at least one role."""

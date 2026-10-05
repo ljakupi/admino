@@ -1,9 +1,9 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-169).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-176).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
-platform_settings, org_settings, user_settings, permissions, oauth_tokens and
-memory tables behind a pool-shaped
+platform_settings, org_settings, user_settings, permissions, oauth_tokens,
+memory, chats and chat_messages tables behind a pool-shaped
 object (``FakeDb.pool``). The real ``admino.auth``, ``admino.sessions``,
 ``admino.session_management``, ``admino.password_reset``,
 ``admino.invitations``, ``admino.organizations``, ``admino.email_outbox``,
@@ -121,6 +121,94 @@ The settings scopes (GH-159, migration 0013):
     ``coalesce(bool_and(col), true)``). An aggregate over no rows is NULL
     (count: 0), as in PostgreSQL; FOR UPDATE with an aggregate fails with
     FeatureNotSupportedError.
+
+Chats (GH-176, migration 0024):
+- ``chats`` (``chats``, keyed by id): ``id`` (UUID primary key, default a new
+  uuid4), ``org_id`` (UUID NOT NULL, references organizations ON DELETE
+  CASCADE), ``owner_user_id`` (UUID NOT NULL, references users ON DELETE
+  CASCADE), ``title`` (TEXT NOT NULL, default '', CHECK ``char_length(title)
+  <= 200``), ``title_source`` (TEXT NOT NULL, default 'auto', auto / user),
+  ``legacy_session_id`` (NULL or fully matching ``[a-zA-Z0-9_-]{1,64}``: no
+  trailing newline), ``external_content`` (BOOLEAN NOT NULL, default false),
+  ``created_at`` and ``last_activity_at`` (NOT NULL, default now()) and
+  ``deleted_at`` (NULL: live; set: trashed); UNIQUE (id, org_id); the partial
+  unique index ``chats_legacy_session_key`` on (owner_user_id,
+  legacy_session_id) WHERE legacy_session_id IS NOT NULL AND deleted_at IS
+  NULL (a trashed chat's session id can be used again).
+- ``chat_messages`` (``chat_messages``, keyed by id, insertion order): ``id``
+  (UUID primary key, default a new uuid4), ``seq`` (BIGINT GENERATED ALWAYS AS
+  IDENTITY, UNIQUE: ``chat_seq`` is the fake-global sequence, strictly
+  increasing and never reused; a failed or rolled-back insert leaves a gap, as
+  the sequence is not part of a transaction's snapshot; an INSERT naming
+  ``seq`` raises GeneratedAlwaysError), ``chat_id`` (UUID NOT NULL),
+  ``org_id`` (UUID NOT NULL, references organizations ON DELETE CASCADE),
+  ``role`` (TEXT NOT NULL: user / assistant / tool), ``content`` (TEXT NOT
+  NULL, at most 65536 characters), ``tool_use_blocks`` (JSONB: NULL or a JSON
+  array), ``tool_call_id`` (NULL or fully matching ``[a-zA-Z0-9_-]{1,128}``),
+  ``tool_calls`` (JSONB: NULL or a JSON array of at most 50 items), ``status``
+  (TEXT NOT NULL, default 'complete': complete / stopped / error /
+  awaiting_confirmation / limit_reached) and ``created_at`` (NOT NULL, default
+  now()); the composite foreign key (chat_id, org_id) references chats (id,
+  org_id) ON DELETE CASCADE, so a message whose org differs from its chat's is
+  refused.
+- Checked like PostgreSQL, in its order, with asyncpg's exception classes:
+  bind values through asyncpg's encoders (DataError: a non-bool
+  external_content, a non-int, a non-str text or JSONB value, a naive
+  datetime, a str that isn't a UUID, a lone surrogate; the text repeats the
+  value's repr like asyncpg's), the server's input (a TEXT value holding
+  U+0000: CharacterNotInRepertoireError "null character not permitted";
+  invalid JSON: InvalidTextRepresentationError; the JSON escape ``\\u0000``:
+  UntranslatableCharacterError "unsupported Unicode escape sequence"), NOT
+  NULL (NotNullViolationError), the CHECKs by constraint name
+  (CheckViolationError), the unique keys (UniqueViolationError) and the
+  foreign keys (ForeignKeyViolationError). Errors carry ``table_name``,
+  ``column_name`` / ``constraint_name`` and, like the driver's, a DETAIL in
+  ``str(error)``: "Failing row contains (...)" for NOT NULL and CHECK (the
+  row's content, each value cut to 64 bytes) and the key for the legacy
+  session index (the session id): a log line that prints the error leaks
+  what the real driver's would.
+- Every statement naming either table runs on the SQL reader, after what
+  asyncpg and PostgreSQL check first: the argument count (InterfaceError) and
+  no gap in the ``$n`` numbering (IndeterminateDatatypeError); each parameter
+  whose type the SQL implies (a cast, ``col <op> $n``, a row comparison, an
+  INSERT position, ``LIMIT $n``) through its encoder; every str argument's
+  U+0000 (used or not); and migration 0024's grants: admino_app may not
+  DELETE chats nor UPDATE or DELETE chat_messages (InsufficientPrivilegeError;
+  the cascades still run). JSONB values travel as JSON text (``$n::jsonb``,
+  no codec, like ``oauth_tokens.scopes``): parsed on write, stored and
+  returned as a JSON str, re-serialized with JSONB's key order (shorter keys
+  first), so it may differ from the text sent; a list or dict bound directly
+  is a DataError.
+- Deleting a users row deletes the user's chats and their messages;
+  deleting an organizations row (the reader's DELETE and the
+  ``purge_org_audit_events`` emulation) deletes the org's chats and
+  messages; deleting a chats row deletes its messages. ``conn.transaction()``
+  snapshots and restores both tables.
+- The SQL forms of contract §2 (S1 to S13) and the general reader features
+  they need: ``INSERT INTO t (cols) VALUES (exprs) [RETURNING cols]`` (one
+  row; ``$n`` optionally cast, literals, ``DEFAULT``, ``now()``); ``INSERT
+  INTO t (cols) SELECT <columns, literals, $n> FROM ... [WHERE ...]`` (one
+  row per selected row, all or nothing); ``SELECT cols | count(*) FROM t
+  WHERE ... [ORDER BY a DESC, b DESC] [LIMIT $n]``; ``UPDATE t SET col =
+  <$n | literal | now() | true>, ... WHERE ... [RETURNING cols]``. WHERE
+  takes the reader's AND-ed predicates plus the row comparison ``(a, b) <
+  ($n, $m)`` (lexicographic, NULL-aware, as PostgreSQL). LIMIT must bind an
+  int (DataError otherwise; negative: InvalidRowCountInLimitClauseError;
+  NULL: no limit). A SELECT on a chat table without ORDER BY answers its rows
+  newest-first (PostgreSQL promises no order). Predicates the SQL doesn't
+  state are not applied (a missing owner, org or ``deleted_at IS NULL``
+  filter shows up), and anything else fails the test with an AssertionError.
+- Helpers: ``add_chat(owner_user_id, *, org_id=None, chat_id=None, title='',
+  title_source='auto', legacy_session_id=None, external_content=False,
+  created_at=None, last_activity_at=None, deleted_at=None)`` (org_id: the
+  owner's; last_activity_at: created_at, itself now) and
+  ``add_chat_message(chat_id, role, content, *, tool_use_blocks=None,
+  tool_call_id=None, tool_calls=None, status='complete', created_at=None)``
+  (org_id: the chat's; the next seq; the JSONB values as Python lists) seed
+  rows checked like an INSERT and return their ids; ``chat_row(chat_id)``,
+  ``chats_of(user_id)`` (any deletion state, by created_at then id) and
+  ``messages_of(chat_id)`` (by seq, the JSONB columns as Python values) read
+  copies back. ``add_account(user_id=...)`` gives an account a fixed id.
 
 The login throttle (GH-157):
 - ``throttle`` holds the login_throttle rows of migration 0012 (scope,
@@ -670,6 +758,74 @@ _OLD_SETTINGS_RE: Final = re.compile(
 )
 _AGGREGATE_RE: Final = re.compile(r"(?<![\w.])(?:count|bool_and|bool_or|every|min|max|sum) ?\(")
 
+# GH-176: persisted, tenant-scoped chats (migration 0024). Column -> type, in the
+# migration's column order (NOT NULL checks and "Failing row contains" follow it).
+_CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
+    "chats": {
+        "id": "uuid",
+        "org_id": "uuid",
+        "owner_user_id": "uuid",
+        "title": "text",
+        "title_source": "text",
+        "legacy_session_id": "text",
+        "external_content": "bool",
+        "created_at": "timestamptz",
+        "last_activity_at": "timestamptz",
+        "deleted_at": "timestamptz",
+    },
+    "chat_messages": {
+        "id": "uuid",
+        "seq": "int",
+        "chat_id": "uuid",
+        "org_id": "uuid",
+        "role": "text",
+        "content": "text",
+        "tool_use_blocks": "jsonb",
+        "tool_call_id": "text",
+        "tool_calls": "jsonb",
+        "status": "text",
+        "created_at": "timestamptz",
+    },
+}
+_CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
+    "chats": frozenset({"legacy_session_id", "deleted_at"}),
+    "chat_messages": frozenset({"tool_use_blocks", "tool_call_id", "tool_calls"}),
+}
+_CHAT_TABLES: Final = frozenset(_CHAT_TYPES)
+# A statement that names either chat table (on the SQL with its literals blanked).
+_CHAT_TABLE_RE: Final = re.compile(r"\b(?:chats|chat_messages)\b")
+CHAT_TITLE_MAX: Final = 200
+CHAT_CONTENT_MAX: Final = 65536
+CHAT_TOOL_CALLS_MAX: Final = 50
+CHAT_TITLE_SOURCES: Final = frozenset({"auto", "user"})
+CHAT_ROLES: Final = frozenset({"user", "assistant", "tool"})
+CHAT_MESSAGE_STATUSES: Final = frozenset(
+    {"complete", "stopped", "error", "awaiting_confirmation", "limit_reached"}
+)
+# The two regex CHECKs, read the way PostgreSQL reads '^...$' (fullmatch: a trailing
+# newline doesn't match).
+LEGACY_SESSION_ID_RE: Final = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+TOOL_CALL_ID_RE: Final = re.compile(r"[a-zA-Z0-9_-]{1,128}")
+# What a ``$n::<type>`` cast tells about a bind parameter's type.
+_CAST_TYPES: Final[dict[str, str]] = {
+    "uuid": "uuid",
+    "text": "text",
+    "varchar": "text",
+    "bool": "bool",
+    "boolean": "bool",
+    "int": "int",
+    "int4": "int",
+    "int8": "int",
+    "integer": "int",
+    "bigint": "int",
+    "timestamptz": "timestamptz",
+    "jsonb": "jsonb",
+    "json": "jsonb",
+}
+_COMPARISON: Final = r"(?:<>|!=|<=|>=|=|<|>)"
+# PostgreSQL truncates each value of a "Failing row contains (...)" detail to 64 bytes.
+_FAILING_ROW_FIELD_MAX: Final = 64
+
 _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "users": _USER_COLUMNS,
     "organizations": _ORG_COLUMNS,
@@ -682,10 +838,12 @@ _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "permissions": _PERMISSIONS_COLUMNS,
     "oauth_tokens": _OAUTH_TOKEN_COLUMNS,
     "memory": _MEMORY_COLUMNS,
+    "chats": frozenset(_CHAT_TYPES["chats"]),
+    "chat_messages": frozenset(_CHAT_TYPES["chat_messages"]),
 }
 # The tables the SQL reader writes (INSERT, UPDATE, DELETE).
 _WRITABLE: Final = frozenset(
-    {"users", "invitations", "organizations", "login_throttle", *_SETTINGS_TABLES}
+    {"users", "invitations", "organizations", "login_throttle", *_SETTINGS_TABLES, *_CHAT_TABLES}
 )
 _INTERVAL_UNITS: Final = {
     "sec": "seconds",
@@ -864,6 +1022,13 @@ class FakeDb:
         # GH-162: per-user connections keyed by (user_id, provider), notes by (user_id, key).
         self.oauth_tokens: dict[tuple[uuid.UUID, str], dict[str, Any]] = {}
         self.memory: dict[tuple[uuid.UUID, str], dict[str, Any]] = {}
+        # GH-176: persisted chats and their messages, each keyed by id (insertion
+        # order), and the identity sequence behind chat_messages.seq. The sequence
+        # is not part of a transaction's snapshot: like PostgreSQL's, a rolled-back
+        # or failed insert leaves a gap.
+        self.chats: dict[uuid.UUID, dict[str, Any]] = {}
+        self.chat_messages: dict[uuid.UUID, dict[str, Any]] = {}
+        self.chat_seq = 0
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
         self.open_transactions = 0
@@ -951,6 +1116,7 @@ class FakeDb:
         response_language: str | None = None,
         timezone: str | None = None,
         personal_instructions: str = "",
+        user_id: uuid.UUID | None = None,
     ) -> uuid.UUID:
         """Add an account and return its id (a plain uuid.UUID).
 
@@ -961,9 +1127,12 @@ class FakeDb:
         ``last_login_at`` to None (GH-164: the Org Admin user list shows both).
         ``response_language`` (None: the org default), ``timezone`` (None:
         not preset yet) and ``personal_instructions`` ('' : none) are the
-        account self-service columns (GH-166, migration 0021).
+        account self-service columns (GH-166, migration 0021). ``user_id``
+        (GH-176) gives the account a fixed id (e.g. ``auth_helpers.TEST_MEMBER_ID``)
+        instead of a random one; it must not exist yet.
         """
-        user_id = uuid.uuid4()
+        user_id = uuid.uuid4() if user_id is None else uuid.UUID(int=user_id.int)
+        assert user_id not in self.users, f"an account with id {user_id} exists already"
         is_member = kind == "member"
         if is_member and org_id not in self.orgs:
             self.add_org(org_id)
@@ -1342,6 +1511,140 @@ class FakeDb:
             if owner == _canonical(user_id)
         }
 
+    def add_chat(
+        self,
+        owner_user_id: uuid.UUID,
+        *,
+        org_id: uuid.UUID | None = None,
+        chat_id: uuid.UUID | None = None,
+        title: str = "",
+        title_source: str = "auto",
+        legacy_session_id: str | None = None,
+        external_content: bool = False,
+        created_at: datetime | None = None,
+        last_activity_at: datetime | None = None,
+        deleted_at: datetime | None = None,
+    ) -> uuid.UUID:
+        """Store a chats row (GH-176) as migration 0024 allows it; return its id.
+
+        ``org_id`` defaults to the owner's org (an owner that doesn't exist is a
+        ForeignKeyViolationError); ``chat_id`` to a new uuid4; ``created_at`` to
+        now and ``last_activity_at`` to ``created_at``. Every value is checked
+        like an INSERT (DataError, CharacterNotInRepertoireError, NotNull, the
+        CHECKs, the partial unique legacy session key, the foreign keys).
+        Returns a plain uuid.UUID.
+        """
+        if org_id is None:
+            owner = (
+                self.users.get(uuid.UUID(int=owner_user_id.int))
+                if isinstance(owner_user_id, uuid.UUID)
+                else None
+            )
+            if owner is None:
+                raise _pg_error(
+                    asyncpg.exceptions.ForeignKeyViolationError,
+                    'insert or update on table "chats" violates foreign key constraint'
+                    ' "chats_owner_user_id_fkey"',
+                    table="chats",
+                    constraint="chats_owner_user_id_fkey",
+                )
+            org_id = owner["org_id"]
+        now = datetime.now(UTC)
+        created = created_at if created_at is not None else now
+        given: dict[str, Any] = {
+            "org_id": org_id,
+            "owner_user_id": owner_user_id,
+            "title": title,
+            "title_source": title_source,
+            "legacy_session_id": legacy_session_id,
+            "external_content": external_content,
+            "created_at": created,
+            "last_activity_at": last_activity_at if last_activity_at is not None else created,
+            "deleted_at": deleted_at,
+        }
+        if chat_id is not None:
+            given["id"] = chat_id
+        row = self.build_chat_row("chats", given, now)
+        self.store_chat_row("chats", row)
+        return uuid.UUID(int=row["id"].int)
+
+    def add_chat_message(
+        self,
+        chat_id: uuid.UUID,
+        role: str,
+        content: str,
+        *,
+        tool_use_blocks: list[Any] | None = None,
+        tool_call_id: str | None = None,
+        tool_calls: list[Any] | None = None,
+        status: str = "complete",
+        created_at: datetime | None = None,
+    ) -> uuid.UUID:
+        """Store a chat_messages row (GH-176) as migration 0024 allows it; return its id.
+
+        ``org_id`` is the chat's (a chat that doesn't exist is a
+        ForeignKeyViolationError), ``seq`` the next identity value,
+        ``created_at`` defaults to now. ``tool_use_blocks`` / ``tool_calls`` are
+        Python values, sent as their JSON text like the app's ``$n::jsonb``
+        (so a str holding U+0000 fails like the escape ``\\u0000``). Checked like
+        an INSERT. The chat's ``last_activity_at`` is not touched (a seed).
+        """
+        chat = (
+            self.chats.get(uuid.UUID(int=chat_id.int)) if isinstance(chat_id, uuid.UUID) else None
+        )
+        if chat is None:
+            raise _pg_error(
+                asyncpg.exceptions.ForeignKeyViolationError,
+                'insert or update on table "chat_messages" violates foreign key constraint'
+                ' "chat_messages_chat_fkey"',
+                table="chat_messages",
+                constraint="chat_messages_chat_fkey",
+            )
+        now = datetime.now(UTC)
+        given: dict[str, Any] = {
+            "chat_id": chat_id,
+            "org_id": chat["org_id"],
+            "role": role,
+            "content": content,
+            "tool_use_blocks": None if tool_use_blocks is None else json.dumps(tool_use_blocks),
+            "tool_call_id": tool_call_id,
+            "tool_calls": None if tool_calls is None else json.dumps(tool_calls),
+            "status": status,
+            "created_at": created_at if created_at is not None else now,
+        }
+        row = self.build_chat_row("chat_messages", given, now)
+        self.store_chat_row("chat_messages", row)
+        return uuid.UUID(int=row["id"].int)
+
+    def chat_row(self, chat_id: uuid.UUID) -> dict[str, Any] | None:
+        """A copy of a stored chats row (GH-176), None when there is none."""
+        row = self.chats.get(uuid.UUID(int=chat_id.int))
+        return dict(row) if row is not None else None
+
+    def chats_of(self, user_id: uuid.UUID) -> list[dict[str, Any]]:
+        """Copies of every chats row a user owns, trashed ones included, by created_at then id."""
+        owner = uuid.UUID(int=user_id.int)
+        rows = [dict(row) for row in self.chats.values() if row["owner_user_id"] == owner]
+        return sorted(rows, key=lambda row: (row["created_at"], row["id"]))
+
+    def messages_of(self, chat_id: uuid.UUID) -> list[dict[str, Any]]:
+        """Copies of a chat's chat_messages rows by seq; the JSONB columns as Python values."""
+        wanted = uuid.UUID(int=chat_id.int)
+        rows = sorted(
+            (row for row in self.chat_messages.values() if row["chat_id"] == wanted),
+            key=lambda row: row["seq"],
+        )
+        return [
+            {
+                **row,
+                **{
+                    column: None if row[column] is None else json.loads(row[column])
+                    for column in ("tool_use_blocks", "tool_calls")
+                },
+            }
+            for row in rows
+        ]
+
     def platform_row(self) -> dict[str, Any] | None:
         """The platform_settings row, if there is one."""
         return self.platform_settings[0] if self.platform_settings else None
@@ -1472,6 +1775,8 @@ class FakeDb:
                 "permissions": self.permissions,
                 "oauth_tokens": self.oauth_tokens,
                 "memory": self.memory,
+                "chats": self.chats,
+                "chat_messages": self.chat_messages,
             }
         )
 
@@ -1491,6 +1796,8 @@ class FakeDb:
         self.permissions = state["permissions"]
         self.oauth_tokens = state["oauth_tokens"]
         self.memory = state["memory"]
+        self.chats = state["chats"]
+        self.chat_messages = state["chat_messages"]
 
     def new_connection(self) -> FakeConnection:
         """A new connection on this database."""
@@ -1518,6 +1825,11 @@ class FakeDb:
         assert not n.startswith("truncate"), f"the fake doesn't truncate: {n}"
         if purge := _PURGE_ORG_AUDIT_RE.fullmatch(n):
             return self._purge_org_audit_events(method, purge, args)
+        if _CHAT_TABLE_RE.search(_masked_literals(n)):
+            # GH-176: every statement naming chats or chat_messages runs on the reader,
+            # after the checks asyncpg and PostgreSQL make before it runs.
+            _check_chat_binds(n, args)
+            return self._run_statement(method, n, args)
         if method == "fetch" and _LAST_ADMIN_GUARD_RE.fullmatch(n):
             return self._last_admin_guard_rows(args)
         if _runs_on_reader(method, n, args):
@@ -1635,6 +1947,10 @@ class FakeDb:
             return list(self.oauth_tokens.values())
         if table == "memory":
             return list(self.memory.values())
+        if table == "chats":
+            return list(self.chats.values())
+        if table == "chat_messages":
+            return list(self.chat_messages.values())
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
 
@@ -1814,6 +2130,9 @@ class FakeDb:
 
     def normalized(self, table: str, values: dict[str, Any]) -> dict[str, Any]:
         """The values as the column types store them (asyncpg's encoders, NUMERIC(12,2))."""
+        if table in _CHAT_TABLES:
+            # GH-176: encoders, then TEXT's U+0000 refusal and JSONB's input.
+            return _chat_stored(table, values)
         if table == "login_throttle":
             subject = values.get("subject")
             if isinstance(subject, bytearray | memoryview):
@@ -1937,9 +2256,213 @@ class FakeDb:
             self._check_throttle(row, original)
         elif table in _SETTINGS_TABLES:
             self.check_settings(table, row, original=original)
+        elif table in _CHAT_TABLES:
+            self.check_chat_row(table, row, original=original)
         else:
             msg = f"the fake's SQL reader never writes {table}"
             raise AssertionError(msg)
+
+    # -- the chat tables of migration 0024 (GH-176) ----------------------------------
+
+    def build_chat_row(
+        self,
+        table: str,
+        given: dict[str, Any],
+        now: datetime,
+        *,
+        pending: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """A new, checked chats / chat_messages row (an INSERT), not stored yet.
+
+        The given values go through asyncpg's encoders and the server's input
+        functions first; then the column defaults fill the rest (chat_messages
+        takes the next ``seq``, consumed even when a later check fails, as an
+        identity column's is); then every constraint runs. ``pending`` are the
+        rows the same statement adds before this one (their keys count).
+        """
+        if "seq" in given:
+            raise _pg_error(
+                asyncpg.exceptions.GeneratedAlwaysError,
+                'cannot insert a non-DEFAULT value into column "seq"',
+                table=table,
+                column="seq",
+            )
+        stored = self.normalized(table, given)
+        row: dict[str, Any] = dict.fromkeys(_CHAT_TYPES[table])
+        if table == "chats":
+            row.update(
+                id=uuid.uuid4(),
+                title="",
+                title_source="auto",
+                external_content=False,
+                created_at=now,
+                last_activity_at=now,
+            )
+        else:
+            self.chat_seq += 1
+            row.update(id=uuid.uuid4(), seq=self.chat_seq, status="complete", created_at=now)
+        row.update(stored)
+        self.check_chat_row(table, row, original=None, pending=pending or [])
+        return row
+
+    def store_chat_row(self, table: str, row: dict[str, Any]) -> None:
+        """Store a new row built by ``build_chat_row``."""
+        target = self.chats if table == "chats" else self.chat_messages
+        target[row["id"]] = row
+
+    def check_chat_row(
+        self,
+        table: str,
+        row: dict[str, Any],
+        *,
+        original: dict[str, Any] | None,
+        pending: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Migration 0024's constraints on a written row, in PostgreSQL's order.
+
+        NOT NULL (column order), the CHECKs (by constraint name), the unique keys
+        (the primary key, chat_messages.seq, the partial unique
+        ``chats_legacy_session_key`` over live chats only), then the foreign
+        keys (chats -> organizations and users; chat_messages -> organizations
+        and the composite (chat_id, org_id) -> chats(id, org_id); a chat whose
+        (id, org_id) changes while messages reference it is refused, NO ACTION).
+        Each error carries the table, column or constraint name, and the
+        CHECK / NOT NULL ones the "Failing row contains" detail (with content,
+        as the driver's does).
+        """
+        for column in _CHAT_TYPES[table]:
+            if row.get(column) is None and column not in _CHAT_NULLABLE[table]:
+                raise _pg_error(
+                    asyncpg.exceptions.NotNullViolationError,
+                    f'null value in column "{column}" of relation "{table}" violates'
+                    " not-null constraint",
+                    table=table,
+                    column=column,
+                    detail=_failing_row(table, row),
+                )
+        rules: list[tuple[str, bool]]
+        if table == "chats":
+            legacy = row["legacy_session_id"]
+            rules = [
+                (
+                    "chats_legacy_session_id_check",
+                    legacy is None or LEGACY_SESSION_ID_RE.fullmatch(legacy) is not None,
+                ),
+                ("chats_title_check", len(row["title"]) <= CHAT_TITLE_MAX),
+                ("chats_title_source_check", row["title_source"] in CHAT_TITLE_SOURCES),
+            ]
+        else:
+            blocks = row["tool_use_blocks"]
+            calls = None if row["tool_calls"] is None else json.loads(row["tool_calls"])
+            call_id = row["tool_call_id"]
+            rules = [
+                ("chat_messages_content_check", len(row["content"]) <= CHAT_CONTENT_MAX),
+                ("chat_messages_role_check", row["role"] in CHAT_ROLES),
+                ("chat_messages_status_check", row["status"] in CHAT_MESSAGE_STATUSES),
+                (
+                    "chat_messages_tool_call_id_check",
+                    call_id is None or TOOL_CALL_ID_RE.fullmatch(call_id) is not None,
+                ),
+                (
+                    "chat_messages_tool_calls_check",
+                    calls is None
+                    or (isinstance(calls, list) and len(calls) <= CHAT_TOOL_CALLS_MAX),
+                ),
+                (
+                    "chat_messages_tool_use_blocks_check",
+                    blocks is None or isinstance(json.loads(blocks), list),
+                ),
+            ]
+        for constraint, valid in rules:
+            if not valid:
+                raise _pg_error(
+                    asyncpg.exceptions.CheckViolationError,
+                    f'new row for relation "{table}" violates check constraint "{constraint}"',
+                    table=table,
+                    constraint=constraint,
+                    detail=_failing_row(table, row),
+                )
+        others = [other for other in self.table_rows(table) if other is not original]
+        others += pending or []
+        if any(other["id"] == row["id"] for other in others):
+            raise _pg_error(
+                asyncpg.exceptions.UniqueViolationError,
+                f'duplicate key value violates unique constraint "{table}_pkey"',
+                table=table,
+                constraint=f"{table}_pkey",
+                detail=f"Key (id)=({row['id']}) already exists.",
+            )
+        if table == "chat_messages" and any(other["seq"] == row["seq"] for other in others):
+            raise _pg_error(
+                asyncpg.exceptions.UniqueViolationError,
+                'duplicate key value violates unique constraint "chat_messages_seq_key"',
+                table=table,
+                constraint="chat_messages_seq_key",
+            )
+        if (
+            table == "chats"
+            and row["legacy_session_id"] is not None
+            and row["deleted_at"] is None
+            and any(
+                other["owner_user_id"] == row["owner_user_id"]
+                and other["legacy_session_id"] == row["legacy_session_id"]
+                and other["deleted_at"] is None
+                for other in others
+            )
+        ):
+            # The driver's DETAIL repeats the key, legacy session id included.
+            raise _pg_error(
+                asyncpg.exceptions.UniqueViolationError,
+                'duplicate key value violates unique constraint "chats_legacy_session_key"',
+                table=table,
+                constraint="chats_legacy_session_key",
+                detail=(
+                    f"Key (owner_user_id, legacy_session_id)=({row['owner_user_id']},"
+                    f" {row['legacy_session_id']}) already exists."
+                ),
+            )
+        foreign = [("org_id", "organizations", row["org_id"] in self.orgs)]
+        if table == "chats":
+            foreign.append(("owner_user_id", "users", row["owner_user_id"] in self.users))
+        else:
+            parent = self.chats.get(row["chat_id"])
+            foreign.append(
+                ("chat", "chats", parent is not None and parent["org_id"] == row["org_id"])
+            )
+        for name, parent_table, valid in foreign:
+            if not valid:
+                constraint = f"{table}_{name}_fkey"
+                raise _pg_error(
+                    asyncpg.exceptions.ForeignKeyViolationError,
+                    f'insert or update on table "{table}" violates foreign key constraint'
+                    f' "{constraint}"',
+                    table=table,
+                    constraint=constraint,
+                    detail=f'Key is not present in table "{parent_table}".',
+                )
+        if (
+            table == "chats"
+            and original is not None
+            and (original["id"], original["org_id"]) != (row["id"], row["org_id"])
+            and any(
+                (message["chat_id"], message["org_id"]) == (original["id"], original["org_id"])
+                for message in self.chat_messages.values()
+            )
+        ):
+            raise _pg_error(
+                asyncpg.exceptions.ForeignKeyViolationError,
+                'update or delete on table "chats" violates foreign key constraint'
+                ' "chat_messages_chat_fkey" on table "chat_messages"',
+                table="chat_messages",
+                constraint="chat_messages_chat_fkey",
+            )
+
+    def drop_chats(self, doomed: set[uuid.UUID]) -> None:
+        """Delete chats rows and, ON DELETE CASCADE, their messages."""
+        self.chats = {key: row for key, row in self.chats.items() if key not in doomed}
+        self.chat_messages = {
+            key: row for key, row in self.chat_messages.items() if row["chat_id"] not in doomed
+        }
 
     def _check_throttle(
         self, row: dict[str, Any], original: dict[str, Any] | None, *, check_key: bool = True
@@ -2145,9 +2668,9 @@ class FakeDb:
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
 
     def delete_row(self, table: str, row: dict[str, Any]) -> None:
-        """Delete one users, invitations, organizations, login_throttle or settings row; a
-        user's rows and an org's org_settings row cascade (ON DELETE CASCADE). Call
-        ``check_delete`` first."""
+        """Delete one users, invitations, organizations, login_throttle, settings or chat
+        row; a user's rows (chats and their messages included) and an org's rows
+        cascade (ON DELETE CASCADE). Call ``check_delete`` first."""
         if table == "login_throttle":
             self.throttle = [other for other in self.throttle if other is not row]
             return
@@ -2171,6 +2694,21 @@ class FakeDb:
             self.memory = {
                 key: value for key, value in self.memory.items() if value["org_id"] != row["id"]
             }
+            # GH-176: chats.org_id and chat_messages.org_id cascade too.
+            self.drop_chats(
+                {key for key, chat in self.chats.items() if chat["org_id"] == row["id"]}
+            )
+            self.chat_messages = {
+                key: value
+                for key, value in self.chat_messages.items()
+                if value["org_id"] != row["id"]
+            }
+            return
+        if table == "chats":
+            self.drop_chats({row["id"]})
+            return
+        if table == "chat_messages":
+            del self.chat_messages[row["id"]]
             return
         if table == "platform_settings":
             self.platform_settings = [other for other in self.platform_settings if other is not row]
@@ -2200,6 +2738,10 @@ class FakeDb:
             key: value for key, value in self.oauth_tokens.items() if key[0] != user_id
         }
         self.memory = {key: value for key, value in self.memory.items() if key[0] != user_id}
+        # GH-176: chats.owner_user_id cascades, and each chat's messages with it.
+        self.drop_chats(
+            {key for key, chat in self.chats.items() if chat["owner_user_id"] == user_id}
+        )
         self.invitations = {
             key: value for key, value in self.invitations.items() if value["user_id"] != user_id
         }
@@ -2970,6 +3512,322 @@ def _compare(operator: str, left: Any, right: Any) -> bool:
     return bool(left >= right)
 
 
+# ---------------------------------------------------------------------------
+# GH-176: the chats and chat_messages tables (migration 0024): driver-shaped
+# errors, asyncpg's encoders, PostgreSQL's JSONB input and row comparison.
+# ---------------------------------------------------------------------------
+
+
+def _pg_error(
+    cls: type[asyncpg.PostgresError],
+    message: str,
+    *,
+    table: str | None = None,
+    column: str | None = None,
+    constraint: str | None = None,
+    detail: str | None = None,
+) -> asyncpg.PostgresError:
+    """A driver error carrying the fields asyncpg fills from the server's report.
+
+    ``detail`` shows up in ``str(error)`` (``"<message>\\nDETAIL:  <detail>"``),
+    as it does for a real asyncpg error.
+    """
+    error = cls(message)
+    fields = {
+        "schema_name": "public" if table else None,
+        "table_name": table,
+        "column_name": column,
+        "constraint_name": constraint,
+        "detail": detail,
+    }
+    for name, value in fields.items():
+        if value is not None:
+            setattr(error, name, value)
+    return error
+
+
+def _pg_text(value: Any) -> str:
+    """A value as PostgreSQL's text output roughly shows it (for error details)."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "t" if value else "f"
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    return str(value)
+
+
+def _failing_row(table: str, row: dict[str, Any]) -> str:
+    """PostgreSQL's "Failing row contains (...)" detail: every column, each value
+    cut to 64 bytes. Like the real driver's, it carries the row's content."""
+    fields = []
+    for column in _CHAT_TYPES[table]:
+        text = _pg_text(row.get(column))
+        encoded = text.encode("utf-8", "replace")
+        if len(encoded) > _FAILING_ROW_FIELD_MAX:
+            text = encoded[:_FAILING_ROW_FIELD_MAX].decode("utf-8", "ignore") + "..."
+        fields.append(text)
+    return f"Failing row contains ({', '.join(fields)})."
+
+
+def _encode_chat_value(kind: str, position: str, value: Any) -> Any:
+    """asyncpg's encoder for one value of a chat column or bind parameter.
+
+    Returns the value as the table stores it (a plain uuid.UUID for a uuid). A
+    value the encoder refuses (a non-bool for a boolean, a non-int for a bigint,
+    a non-str for a text or jsonb, a naive datetime, a str that isn't a UUID, a
+    str that can't be UTF-8 encoded: a lone surrogate) is a DataError whose text
+    repeats the value's repr (at most 40 characters), as asyncpg's does.
+    """
+    if value is None:
+        return None
+    valid = True
+    reason = f"{kind} expected"
+    stored = value
+    if kind == "uuid":
+        if isinstance(value, uuid.UUID):
+            stored = _canonical(value)
+        elif isinstance(value, str):
+            try:
+                stored = uuid.UUID(value)
+            except ValueError:
+                valid, reason = False, "invalid UUID"
+        else:
+            valid = False
+    elif kind in {"text", "jsonb"}:
+        valid = isinstance(value, str)
+        if valid:
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                valid, reason = False, "surrogates not allowed"
+    elif kind == "bool":
+        valid = type(value) is bool
+    elif kind == "int":
+        valid = type(value) is int
+    else:
+        assert kind == "timestamptz", kind
+        valid = isinstance(value, datetime) and value.tzinfo is not None
+        if isinstance(value, datetime) and value.tzinfo is None:
+            reason = "an aware datetime expected"
+    if not valid:
+        shown = repr(value)
+        if len(shown) > 40:
+            shown = shown[:40] + "..."
+        msg = f"invalid input for query argument {position}: {shown} ({reason})"
+        raise asyncpg.exceptions.DataError(msg)
+    return stored
+
+
+def _refuse_nul(value: str) -> None:
+    """PostgreSQL's TEXT input refuses U+0000 (verified on postgres:16 for GH-176)."""
+    if "\x00" in value:
+        msg = "null character not permitted"
+        raise asyncpg.exceptions.CharacterNotInRepertoireError(msg)
+
+
+def _reject_json_constant(name: str) -> Any:
+    """PostgreSQL's JSON has no NaN / Infinity (Python's json module accepts them)."""
+    msg = f"invalid JSON constant {name}"
+    raise ValueError(msg)
+
+
+def _jsonb_order(value: Any) -> Any:
+    """A JSON value with every object's keys in JSONB's storage order: shorter keys
+    first, equal lengths by their bytes (what jsonb_out prints back)."""
+    if isinstance(value, dict):
+        keys = sorted(value, key=lambda key: (len(key.encode("utf-8")), key.encode("utf-8")))
+        return {key: _jsonb_order(value[key]) for key in keys}
+    if isinstance(value, list):
+        return [_jsonb_order(item) for item in value]
+    return value
+
+
+def _json_strings(value: Any) -> list[str]:
+    """Every string of a parsed JSON value, object keys included."""
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for key, item in value.items() for text in [key, *_json_strings(item)]]
+    if isinstance(value, list):
+        return [text for item in value for text in _json_strings(item)]
+    return []
+
+
+def _jsonb_text(text: str) -> str:
+    """PostgreSQL's JSONB input for JSON text bound as a str; returns what a read gives back.
+
+    A raw U+0000 is refused like any text (CharacterNotInRepertoireError); text
+    that isn't JSON (NaN and Infinity included) and an escaped lone surrogate
+    are InvalidTextRepresentationError; the escape ``\\u0000`` is
+    UntranslatableCharacterError ("unsupported Unicode escape sequence"). The
+    result is re-serialized with JSONB's key order (duplicate keys: the last
+    wins), so it may differ from the text that was sent.
+    """
+    _refuse_nul(text)
+    try:
+        parsed = json.loads(text, parse_constant=_reject_json_constant)
+    except ValueError:
+        msg = "invalid input syntax for type json"
+        raise asyncpg.exceptions.InvalidTextRepresentationError(msg) from None
+    strings = _json_strings(parsed)
+    if any("\x00" in string for string in strings):
+        # json.loads strict mode refuses a raw NUL, so this came from the escape.
+        msg = "unsupported Unicode escape sequence"
+        raise asyncpg.exceptions.UntranslatableCharacterError(msg)
+    if any(0xD800 <= ord(char) <= 0xDFFF for string in strings for char in string):
+        msg = "invalid input syntax for type json"
+        raise asyncpg.exceptions.InvalidTextRepresentationError(msg)
+    return json.dumps(_jsonb_order(parsed), ensure_ascii=False)
+
+
+def _chat_stored(table: str, values: dict[str, Any]) -> dict[str, Any]:
+    """The written values of a chats / chat_messages row as the table stores them.
+
+    First asyncpg's encoders for every value (DataError), then the server's
+    input functions: TEXT refuses U+0000, JSONB parses (see ``_jsonb_text``).
+    """
+    types = _CHAT_TYPES[table]
+    stored: dict[str, Any] = {}
+    for column, value in values.items():
+        if column not in types:
+            msg = f'column "{column}" of relation "{table}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
+        stored[column] = _encode_chat_value(types[column], f"({column})", value)
+    for column, value in stored.items():
+        if value is None:
+            continue
+        if types[column] == "text":
+            _refuse_nul(value)
+        elif types[column] == "jsonb":
+            stored[column] = _jsonb_text(value)
+    return stored
+
+
+def _row_compare(operator: str, lefts: list[Any], rights: list[Any]) -> bool:
+    """PostgreSQL's row-wise comparison ``(a, b) < (c, d)``.
+
+    Ordering operators compare pairs left to right and stop at the first pair
+    that is unequal or has a NULL: a NULL there makes the result NULL (not
+    true), otherwise that pair decides. ``=`` holds when every pair is equal;
+    ``<>`` when some pair is unequal; NULLs otherwise make either NULL.
+    """
+    pairs = list(zip(lefts, rights, strict=True))
+    if operator in {"=", "<>", "!="}:
+        unequal = any(
+            left is not None and right is not None and not _compare("=", left, right)
+            for left, right in pairs
+        )
+        if unequal:
+            return operator != "="
+        if any(left is None or right is None for left, right in pairs):
+            return False
+        return operator == "="
+    for left, right in pairs:
+        if left is None or right is None:
+            return False
+        if _compare("=", left, right):
+            continue
+        return _compare(operator[0], left, right)
+    return operator in {"<=", ">="}
+
+
+def _chat_param_types(n: str) -> dict[int, str]:
+    """The type PostgreSQL infers for each bind parameter of a chat-table statement.
+
+    From an explicit ``$n::<type>`` cast, a comparison or SET with a column
+    (``col = $n``, ``$n < col``), a row comparison ``(a, b) < ($n, $m)``, an
+    INSERT's VALUES or SELECT list position, and ``LIMIT $n`` (bigint). A
+    parameter none of these types is left out (only its U+0000 is checked).
+    """
+    masked = _masked_literals(n)
+    columns: dict[str, str] = {}
+    for table, types in _CHAT_TYPES.items():
+        if re.search(rf"\b{table}\b", masked):
+            columns.update(types)
+    found: dict[int, str] = {}
+
+    def note(number: str, column: str | None, cast: str | None = None) -> None:
+        kind = _CAST_TYPES.get(cast) if cast else None
+        if kind is None and column is not None:
+            kind = columns.get(column)
+        if kind is not None:
+            found.setdefault(int(number), kind)
+
+    for match in re.finditer(r"\$(\d+) ?:: ?(\w+)", masked):
+        note(match.group(1), None, match.group(2))
+    for match in re.finditer(rf"(?<![\w.$])(?:\w+\.)?(\w+) ?{_COMPARISON} ?\$(\d+)", masked):
+        note(match.group(2), match.group(1))
+    for match in re.finditer(rf"\$(\d+)(?: ?:: ?\w+)? ?{_COMPARISON} ?(?:\w+\.)?(\w+)", masked):
+        note(match.group(1), match.group(2))
+    for match in re.finditer(rf"\(([^()]*)\) ?{_COMPARISON} ?\(([^()]*)\)", masked):
+        lefts = [item.strip() for item in match.group(1).split(",")]
+        rights = [item.strip() for item in match.group(2).split(",")]
+        for left, right in zip(lefts, rights, strict=False):
+            for column_text, param_text in ((left, right), (right, left)):
+                param = re.fullmatch(r"\$(\d+)(?: ?:: ?\w+)?", param_text)
+                column = re.fullmatch(r"(?:\w+\.)?(\w+)", column_text)
+                if param is not None and column is not None:
+                    note(param.group(1), column.group(1))
+    if limit := re.search(r"\blimit \$(\d+)", masked):
+        found.setdefault(int(limit.group(1)), "int")
+    if head := re.match(r"insert into (\w+) ?\(([^)]*)\)", masked):
+        table_types = _CHAT_TYPES.get(head.group(1), {})
+        targets = [column.strip().strip('"') for column in head.group(2).split(",")]
+        clauses = _clauses(n, ("insert into", "values", "select", "on conflict", "returning"))
+        exprs: list[str] = []
+        if "values" in clauses and _unwrap(clauses["values"]) != clauses["values"]:
+            exprs = _top_split(clauses["values"][1:-1], ",")
+        elif "select" in clauses:
+            exprs = _top_split(_top_split(clauses["select"], r" from ")[0], ",")
+        for column, expr in zip(targets, exprs, strict=False):
+            param = re.fullmatch(r"\$(\d+)(?: ?:: ?\w+)?", expr)
+            if param is not None and column in table_types:
+                found.setdefault(int(param.group(1)), table_types[column])
+    return found
+
+
+def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
+    """What asyncpg and PostgreSQL check before a chat-table statement runs.
+
+    The argument count (InterfaceError, asyncpg's text) and no gap in the
+    ``$n`` numbering (IndeterminateDatatypeError); each typed parameter through
+    asyncpg's encoder (DataError); every str argument through the server's text
+    input (U+0000: CharacterNotInRepertoireError), used or not; then the
+    grants of migration 0024: admino_app may not DELETE chats and may not
+    UPDATE or DELETE chat_messages (InsufficientPrivilegeError).
+    """
+    masked = _masked_literals(n)
+    numbers = {int(number) for number in re.findall(r"\$(\d+)", masked)}
+    expected = max(numbers, default=0)
+    if expected != len(args):
+        plural = "s" if expected != 1 else ""
+        verb = "was" if len(args) == 1 else "were"
+        msg = (
+            f"the server expects {expected} argument{plural} for this query,"
+            f" {len(args)} {verb} passed"
+        )
+        raise asyncpg.exceptions.InterfaceError(msg)
+    for number in range(1, expected + 1):
+        if number not in numbers:
+            msg = f"could not determine data type of parameter ${number}"
+            raise asyncpg.exceptions.IndeterminateDatatypeError(msg)
+    for number, kind in sorted(_chat_param_types(n).items()):
+        _encode_chat_value(kind, f"${number}", args[number - 1])
+    for index, arg in enumerate(args):
+        if isinstance(arg, str):
+            _encode_chat_value("text", f"${index + 1}", arg)
+            _refuse_nul(arg)
+    denied = re.match(
+        r"(?:delete from (?:only )?(?:public\.)?(chats|chat_messages)"
+        r"|update (?:only )?(?:public\.)?(chat_messages))\b",
+        n,
+    )
+    if denied is not None:
+        msg = f"permission denied for table {denied.group(1) or denied.group(2)}"
+        raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+
+
 _Context = dict[str, tuple[str, dict[str, Any] | None]]
 
 
@@ -3151,6 +4009,18 @@ class _Statement:
             found = any(_compare("=", left, value) for value in values)
             return left is not None and (found != bool(match.group(2)))
         assert not re.match(r"not ", masked), f"the fake doesn't evaluate NOT: {atom}"
+        if match := re.fullmatch(r"(\( *\)) ?(<>|!=|<=|>=|=|<|>) ?(\( *\))", masked):
+            # GH-176: a row comparison, e.g. the keyset "(last_activity_at, id) < ($3, $4)".
+            lefts = _top_split(atom[1 : match.end(1) - 1], ",")
+            rights = _top_split(atom[match.start(3) + 1 : -1], ",")
+            if len(lefts) != len(rights):
+                msg = "unequal number of entries in row expressions"
+                raise asyncpg.exceptions.PostgresSyntaxError(msg)
+            return _row_compare(
+                match.group(2),
+                [self.value(item, ctx) for item in lefts],
+                [self.value(item, ctx) for item in rights],
+            )
         if match := re.fullmatch(r"(.+?) ?(<>|!=|<=|>=|=|<|>) ?(.+)", masked):
             left = self.value(atom[: match.end(1)], ctx)
             right = self.value(atom[match.start(3) :], ctx)
@@ -3305,12 +4175,32 @@ class _Statement:
         contexts = self.filtered(self.contexts(_sources(clauses["from"])), clauses.get("where"))
         if "order by" in clauses:
             contexts = self.ordered(contexts, clauses["order by"])
+        elif _primary_table(n) in _CHAT_TABLES:
+            # GH-176: PostgreSQL promises no order without ORDER BY; the chat tables
+            # answer newest-first, so code that relies on insertion order shows up.
+            contexts = contexts[::-1]
         rows = self.project(clauses["select"], contexts)
         if "limit" in clauses:
-            rows = rows[: int(self.value(clauses["limit"], {}))]
+            rows = rows[: self.limit(clauses["limit"])]
         return rows
 
+    def limit(self, text: str) -> int | None:
+        """A LIMIT value: a bigint (DataError otherwise), never negative; NULL: no limit."""
+        value = self.value(text, {})
+        if value is None:
+            return None
+        if type(value) is not int:
+            msg = f"invalid input for LIMIT: {type(value).__name__} (an integer expected)"
+            raise asyncpg.exceptions.DataError(msg)
+        if value < 0:
+            msg = "LIMIT must not be negative"
+            raise asyncpg.exceptions.InvalidRowCountInLimitClauseError(msg)
+        return value
+
     def insert(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        target = re.match(r"insert into (?:only )?(\w+)", n)
+        if target is not None and target.group(1) in _CHAT_TABLES:
+            return self.insert_chat(n)
         if re.search(
             r"\b(?:(?:platform|org|user)_settings|permissions|oauth_tokens|memory)\b",
             n.split("(", 1)[0],
@@ -3347,6 +4237,85 @@ class _Statement:
         ctx: _Context = {table: (table, row)}
         returned = self.project(clauses["returning"], [ctx]) if "returning" in clauses else []
         return returned, 1
+
+    def insert_chat(self, n: str) -> tuple[list[dict[str, Any]], int]:
+        """An INSERT into chats or chat_messages (GH-176, see the module docstring).
+
+        ``INSERT INTO t (cols) VALUES (exprs) [RETURNING ...]`` (one row) or
+        ``INSERT INTO t (cols) SELECT exprs FROM ... [WHERE ...]`` (one row per
+        selected row; a select item may be a column, a literal or ``$n``). All
+        rows are built and checked before any is stored (one statement: all or
+        nothing). No ON CONFLICT.
+        """
+        clauses = _clauses(n, ("insert into", "values", "select", "on conflict", "returning"))
+        assert "on conflict" not in clauses, f"the fake does no ON CONFLICT on chat tables: {n}"
+        head = re.fullmatch(r"(\w+) ?\((.*)\)", clauses["insert into"])
+        assert head is not None, f"name the columns of an INSERT: {n}"
+        table = head.group(1)
+        columns = [column.strip().strip('"') for column in head.group(2).split(",")]
+        if len(set(columns)) != len(columns):
+            msg = "a column is specified more than once"
+            raise asyncpg.exceptions.DuplicateColumnError(msg)
+        unknown = set(columns) - _COLUMNS[table]
+        if unknown:
+            msg = f'column "{sorted(unknown)[0]}" of relation "{table}" does not exist'
+            raise asyncpg.exceptions.UndefinedColumnError(msg)
+        candidates: list[dict[str, Any]] = []
+        if "values" in clauses:
+            values = clauses["values"]
+            assert "select" not in clauses and _unwrap(values) != values, f"one VALUES row: {n}"
+            exprs = _top_split(values[1:-1], ",")
+            if len(exprs) != len(columns):
+                msg = "INSERT has more target columns than expressions, or the reverse"
+                raise asyncpg.exceptions.PostgresSyntaxError(msg)
+            candidates.append(
+                {
+                    column: self.value(expr, {})
+                    for column, expr in zip(columns, exprs, strict=True)
+                    if expr != "default"
+                }
+            )
+        else:
+            assert "select" in clauses, f"no rows to add: {n}"
+            select = _clauses(
+                "select " + clauses["select"],
+                ("select", "from", "where", "group by", "having", "order by", "limit", "offset"),
+            )
+            unsupported = {"group by", "having", "offset"} & select.keys()
+            assert not unsupported, f"the fake can't read this INSERT ... SELECT: {n}"
+            items = _top_split(select["select"], ",")
+            assert not select["select"].startswith("distinct"), "no DISTINCT in the fake"
+            if len(items) != len(columns):
+                msg = "INSERT has more target columns than expressions, or the reverse"
+                raise asyncpg.exceptions.PostgresSyntaxError(msg)
+            contexts: list[_Context] = [{}]
+            if "from" in select:
+                contexts = self.filtered(
+                    self.contexts(_sources(select["from"])), select.get("where")
+                )
+            if "order by" in select:
+                contexts = self.ordered(contexts, select["order by"])
+            if "limit" in select:
+                contexts = contexts[: self.limit(select["limit"])]
+            candidates.extend(
+                {column: self.value(item, ctx) for column, item in zip(columns, items, strict=True)}
+                for ctx in contexts
+            )
+        rows: list[dict[str, Any]] = []
+        for given in candidates:
+            rows.append(self.db.build_chat_row(table, given, self.now, pending=rows))
+        for row in rows:
+            self.db.store_chat_row(table, row)
+        returned = (
+            [
+                item
+                for row in rows
+                for item in self.project(clauses["returning"], [{table: (table, row)}])
+            ]
+            if "returning" in clauses
+            else []
+        )
+        return returned, len(rows)
 
     def insert_settings(self, n: str) -> tuple[list[dict[str, Any]], int]:
         """An INSERT into a settings table of migration 0013 (see the module docstring)."""

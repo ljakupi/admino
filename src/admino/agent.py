@@ -54,7 +54,9 @@ Security notes:
   (emails, files, events, memory notes) with the run's random boundary. The
   run counts as having received external content once its history (the
   whole of it, not just the LLM's context window; this covers a resumed
-  confirmation and later turns) holds a wrapped ``tool`` message, or a
+  confirmation and later turns) holds a wrapped ``tool`` message, the caller
+  passes ``earlier_external_content=True`` (GH-176: a persisted chat loads
+  only its latest messages, and its sticky flag covers the older ones), or a
   dispatch returns a wrapped result. From then on every dispatch, the resume
   pre-dispatch included, passes ``escalate_side_effects=True`` and the
   registry turns an allowed side effect into ``confirm``. The flag only
@@ -278,6 +280,7 @@ class Agent:
         pending_confirmation: PendingConfirmation | None = None,
         agent_config: AgentConfig | None = None,
         prompt_context: PromptContext | None = None,
+        earlier_external_content: bool = False,
     ) -> AgentResult:
         """Run the agent loop for a single user message.
 
@@ -317,6 +320,14 @@ class Agent:
             prompt_context: The org's and the user's prompt inputs
                 (instructions, response languages, timezone; GH-170), loaded
                 by the caller for this request. None: ``PromptContext()``.
+            earlier_external_content: True when the conversation held external
+                content before ``history`` (GH-176: a persisted chat loads only
+                its latest messages, but GH-243 counts the whole conversation).
+                The run then escalates allowed side effects to ``confirm`` from
+                its first dispatch, the resume pre-dispatch included, exactly
+                as for a history holding a wrapped tool result. False: only
+                ``history`` and this run's results decide. Applies to this run
+                only.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
@@ -336,6 +347,7 @@ class Agent:
                 pending_confirmation=pending_confirmation,
                 agent_config=agent_config,
                 prompt_context=prompt_context,
+                earlier_external_content=earlier_external_content,
             )
 
     # ------------------------------------------------------------------
@@ -353,6 +365,7 @@ class Agent:
         pending_confirmation: PendingConfirmation | None,
         agent_config: AgentConfig | None,
         prompt_context: PromptContext | None,
+        earlier_external_content: bool,
     ) -> AgentResult:
         """Run the agent loop inside the run's untrusted-content boundary (see ``run``)."""
         config = self._config if agent_config is None else agent_config
@@ -373,7 +386,11 @@ class Agent:
         # here or in an earlier turn of the conversation, e.g. the run that
         # asked for the confirmation being resumed), every side effect the
         # policy allows needs the user's confirmation for the rest of the run.
-        received_untrusted = _holds_untrusted_content(working_history)
+        # GH-176: a persisted chat passes only its latest messages, so the
+        # caller's flag covers external content older than that tail. It is a
+        # local of this run, never stored on the agent, so concurrent and later
+        # runs keep their own.
+        received_untrusted = earlier_external_content or _holds_untrusted_content(working_history)
         # Index of this turn's user message, pinned into every context window.
         # On resume there is no new user message, so the request being resumed
         # (the most recent user message) is pinned instead. None only when the
@@ -471,7 +488,9 @@ class Agent:
                 # terminal error. Return it before any LLM call.
                 return pre_result
             # The resumed call's result is now the last history message.
-            received_untrusted = _holds_untrusted_content(working_history)
+            received_untrusted = earlier_external_content or _holds_untrusted_content(
+                working_history
+            )
             tool_calls_used += 1
             carry_confirmation = None  # consumed on pre-dispatch
 

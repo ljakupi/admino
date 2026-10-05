@@ -23,11 +23,18 @@ so this guard reads every shipped migration and pins the rule:
   each have exactly two foreign keys, ``user_id`` -> ``users`` and ``org_id`` ->
   ``organizations``, both ON DELETE CASCADE (deleting a user or purging the org
   removes their connections and notes).
+- GH-176: ``chats`` (migration 0024) has exactly two foreign keys, ``org_id`` ->
+  ``organizations`` and ``owner_user_id`` -> ``users``; ``chat_messages`` has
+  exactly two, ``org_id`` -> ``organizations`` and the composite ``(chat_id,
+  org_id)`` -> ``chats (id, org_id)``; all four ON DELETE CASCADE (deleting a
+  user or purging the org removes the chats and their messages, deleting a chat
+  row removes its messages, and a message can't name another org's chat).
 
 The parser reads the final schema across all migrations, in version order:
-inline column FKs, table-level ``FOREIGN KEY`` constraints, ``ALTER TABLE ...
-ADD [COLUMN | CONSTRAINT] ... REFERENCES``, and ``DROP TABLE`` / ``DROP
-COLUMN`` / ``DROP CONSTRAINT`` (default FK names ``<table>_<columns>_fkey``).
+inline column FKs, table-level ``FOREIGN KEY`` constraints (composite ones
+included, with the referenced columns), ``ALTER TABLE ... ADD [COLUMN |
+CONSTRAINT] ... REFERENCES``, and ``DROP TABLE`` / ``DROP COLUMN`` / ``DROP
+CONSTRAINT`` (default FK names ``<table>_<columns>_fkey``).
 Comments, literals and function bodies are ignored. The parser self-tests at
 the end run it on synthetic SQL for the forms no migration uses yet.
 
@@ -42,7 +49,7 @@ Security notes:
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -73,6 +80,8 @@ class _ForeignKey:
     referenced: str
     on_delete: str  # cascade, restrict, no action, set null, set default
     name: str
+    # The referenced columns as written; () when omitted (the referenced primary key).
+    referenced_columns: tuple[str, ...] = ()
 
 
 @dataclass
@@ -213,6 +222,7 @@ def _add_column(
         referenced=references.group(1),
         on_delete=_on_delete(definition[references.end() :]),
         name=named.group(1) if named else _default_name(table, (column,)),
+        referenced_columns=_names(references.group(2) or ""),
     )
     schema.foreign_keys.append(foreign_key)
     return column, foreign_key
@@ -237,6 +247,7 @@ def _add_table_constraint(schema: _Schema, migration: str, table: str, constrain
             referenced=references.group(1),
             on_delete=_on_delete(constraint[references.end() :]),
             name=start.group(1) or _default_name(table, column_names),
+            referenced_columns=_names(references.group(2) or ""),
         )
     )
 
@@ -302,10 +313,7 @@ def _apply_alter_table(schema: _Schema, migration: str, statement: str) -> None:
         elif rename := re.match(r'rename\s+to\s+"?(\w+)"?', action):
             new = rename.group(1)
             schema.foreign_keys = [
-                _ForeignKey(fk.migration, new, fk.columns, fk.referenced, fk.on_delete, fk.name)
-                if fk.table == table
-                else fk
-                for fk in schema.foreign_keys
+                replace(fk, table=new) if fk.table == table else fk for fk in schema.foreign_keys
             ]
             schema.columns = {(new if t == table else t, c) for t, c in schema.columns}
 
@@ -402,6 +410,38 @@ class TestSchemaForeignKeyGuard:
         assert found == [
             (("org_id",), "organizations", "cascade"),
             (("user_id",), "users", "cascade"),
+        ]
+
+    def test_schema_fk_chats_cascade_from_organizations_and_users(self) -> None:
+        """GH-176: a chat belongs to its owner in one org. chats has exactly two foreign
+        keys, org_id -> organizations and owner_user_id -> users, both ON DELETE CASCADE,
+        so a user delete and the org purge remove the user's chats (migration 0024)."""
+        found = sorted(
+            (fk.columns, fk.referenced, fk.on_delete)
+            for fk in _shipped_schema().foreign_keys
+            if fk.table == "chats"
+        )
+
+        assert found == [
+            (("org_id",), "organizations", "cascade"),
+            (("owner_user_id",), "users", "cascade"),
+        ]
+
+    def test_schema_fk_chat_messages_cascade_from_organizations_and_their_chat(self) -> None:
+        """GH-176: chat_messages has exactly two foreign keys, org_id -> organizations and
+        the composite (chat_id, org_id) -> chats (id, org_id), both ON DELETE CASCADE: the
+        purge, a user delete (through chats) and a chat delete remove the messages, and a
+        message can never sit in another org than its chat (migration 0024)."""
+        found = sorted(
+            # Both referenced tables are keyed by id, so an omitted column list means (id).
+            (fk.columns, fk.referenced, fk.referenced_columns or ("id",), fk.on_delete)
+            for fk in _shipped_schema().foreign_keys
+            if fk.table == "chat_messages"
+        )
+
+        assert found == [
+            (("chat_id", "org_id"), "chats", ("id", "org_id"), "cascade"),
+            (("org_id",), "organizations", ("id",), "cascade"),
         ]
 
     def test_schema_fk_references_to_orgs_and_users_cascade(self) -> None:
@@ -544,6 +584,135 @@ class TestSchemaForeignKeyParser:
         self, sql: str, expected: set[tuple[str, tuple[str, ...], str, str]]
     ) -> None:
         assert _parse(sql) == expected
+
+    @pytest.mark.parametrize(
+        ("sql", "expected"),
+        [
+            pytest.param(
+                "CREATE TABLE t (org_id UUID REFERENCES organizations (id) ON DELETE CASCADE);",
+                {("t", ("org_id",), "organizations", ("id",))},
+                id="inline-with-column",
+            ),
+            pytest.param(
+                "CREATE TABLE t (user_id UUID REFERENCES users ON DELETE CASCADE);",
+                {("t", ("user_id",), "users", ())},
+                id="inline-without-column",
+            ),
+            pytest.param(
+                "CREATE TABLE m (chat_id UUID NOT NULL, org_id UUID NOT NULL,\n"
+                "  CONSTRAINT m_chat_fkey FOREIGN KEY (chat_id, org_id)\n"
+                '    REFERENCES "chats" ("id", org_id) ON DELETE CASCADE);',
+                {("m", ("chat_id", "org_id"), "chats", ("id", "org_id"))},
+                id="table-level-composite",
+            ),
+            pytest.param(
+                "CREATE TABLE m (chat_id UUID, org_id UUID,\n"
+                "  FOREIGN KEY (chat_id, org_id) REFERENCES chats (id, org_id));\n"
+                "ALTER TABLE m RENAME TO n;",
+                {("n", ("chat_id", "org_id"), "chats", ("id", "org_id"))},
+                id="rename-keeps-referenced-columns",
+            ),
+            pytest.param(
+                "ALTER TABLE m ADD CONSTRAINT m_fk FOREIGN KEY (a, b) REFERENCES p (x, y);",
+                {("m", ("a", "b"), "p", ("x", "y"))},
+                id="alter-add-composite",
+            ),
+        ],
+    )
+    def test_schema_fk_parser_reads_referenced_columns(
+        self, sql: str, expected: set[tuple[str, tuple[str, ...], str, tuple[str, ...]]]
+    ) -> None:
+        found = {
+            (fk.table, fk.columns, fk.referenced, fk.referenced_columns)
+            for fk in _schema_of([("x.sql", sql)]).foreign_keys
+        }
+
+        assert found == expected
+
+    def test_schema_fk_parser_reads_the_chat_messages_contract_form(self) -> None:
+        """Migration 0024's form: an inline org_id FK, a named composite FK next to an
+        identity column with an inline UNIQUE, and a named composite UNIQUE on chats."""
+        sql = (
+            "CREATE TABLE chats (\n"
+            "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n"
+            "  org_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,\n"
+            "  owner_user_id UUID NOT NULL REFERENCES users (id) ON DELETE CASCADE,\n"
+            "  title TEXT NOT NULL DEFAULT ''\n"
+            "    CONSTRAINT chats_title_check CHECK (char_length(title) <= 200),\n"
+            "  CONSTRAINT chats_id_org_key UNIQUE (id, org_id)\n"
+            ");\n"
+            "CREATE TABLE chat_messages (\n"
+            "  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),\n"
+            "  seq BIGINT GENERATED ALWAYS AS IDENTITY\n"
+            "    CONSTRAINT chat_messages_seq_key UNIQUE,\n"
+            "  chat_id UUID NOT NULL,\n"
+            "  org_id UUID NOT NULL REFERENCES organizations (id) ON DELETE CASCADE,\n"
+            "  tool_calls JSONB\n"
+            "    CONSTRAINT chat_messages_tool_calls_check CHECK (tool_calls IS NULL\n"
+            "    OR (jsonb_typeof(tool_calls) = 'array'\n"
+            "        AND jsonb_array_length(tool_calls) <= 50)),\n"
+            "  CONSTRAINT chat_messages_chat_fkey FOREIGN KEY (chat_id, org_id)\n"
+            "    REFERENCES chats (id, org_id) ON DELETE CASCADE\n"
+            ");\n"
+            "CREATE INDEX chat_messages_chat_seq_idx ON chat_messages (chat_id, seq DESC);"
+        )
+        schema = _schema_of([("x.sql", sql)])
+        found = {
+            (fk.table, fk.columns, fk.referenced, fk.referenced_columns, fk.on_delete, fk.name)
+            for fk in schema.foreign_keys
+        }
+
+        assert found == {
+            (
+                "chats",
+                ("org_id",),
+                "organizations",
+                ("id",),
+                "cascade",
+                "chats_org_id_fkey",
+            ),
+            (
+                "chats",
+                ("owner_user_id",),
+                "users",
+                ("id",),
+                "cascade",
+                "chats_owner_user_id_fkey",
+            ),
+            (
+                "chat_messages",
+                ("org_id",),
+                "organizations",
+                ("id",),
+                "cascade",
+                "chat_messages_org_id_fkey",
+            ),
+            (
+                "chat_messages",
+                ("chat_id", "org_id"),
+                "chats",
+                ("id", "org_id"),
+                "cascade",
+                "chat_messages_chat_fkey",
+            ),
+        }
+        assert {column for table, column in schema.columns if table == "chat_messages"} == {
+            "id",
+            "seq",
+            "chat_id",
+            "org_id",
+            "tool_calls",
+        }
+
+    def test_schema_fk_parser_drops_a_named_composite_constraint(self) -> None:
+        sql = (
+            "CREATE TABLE m (chat_id UUID, org_id UUID,\n"
+            "  CONSTRAINT m_chat_fkey FOREIGN KEY (chat_id, org_id)\n"
+            "    REFERENCES chats (id, org_id));\n"
+            "ALTER TABLE m DROP CONSTRAINT m_chat_fkey;"
+        )
+
+        assert _parse(sql) == set()
 
     def test_schema_fk_parser_records_org_id_columns(self) -> None:
         """Columns are tracked through CREATE TABLE, ADD COLUMN and DROP COLUMN."""
