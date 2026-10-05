@@ -301,10 +301,13 @@ comes back from it. The full behavior is in
   at most `llm.max_retries` times (0–5), on the same provider and model; a `Retry-After`
   above 10 seconds isn't retried. The provider SDKs' own retries are off.
 - **Chat titles.** After an untitled chat's first exchange, the title call sends only the
-  first message and the reply (each cut to 1,000 characters), with no tools and no
-  identifiers, through the same residency guard and retries. A blocked or failed call,
-  or a turn that ended with an error, gets a title from the first message instead. The
-  title is sanitized like a stored message and never logged.
+  first message and the reply as written (each cut to 1,000 characters), with no tools
+  and no account identifiers (no user, organization or chat IDs, no account name or
+  email address), through the same residency guard and retries. A blocked or failed
+  call, or a turn that ended with an error, gets a title from the first message instead.
+  So does a first reply built from an email, a file or other outside content, with no
+  call at all, so outside content can't choose the title. The title is sanitized like a
+  stored message and never logged.
 
 ## Logs and error tracking
 

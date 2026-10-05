@@ -664,14 +664,18 @@ Viewer's chats from before a role change stay stored, unused.
   aren't recorded in the audit log, and titles and messages are never logged.
 - **Automatic titles.** After an untitled chat's first exchange, the server asks the
   active model for a short title in the background. It sends only your first message and
-  the reply, each cut to 1,000 characters: no tools, no IDs, names or email addresses.
+  the reply as written, each cut to 1,000 characters, with no tools and no account
+  identifiers (no user, organization or chat IDs, no account name or email address).
+  Names or addresses that the message or the reply contain are sent as they are.
   The answer is capped at 40 tokens, and reasoning is off on Infomaniak. The call goes
   through the same [retries](#llm-errors-and-retries). The title is cleaned up (quotes, a
   "Title:" label, a final period and control characters removed, credentials redacted)
   and is at most 80 characters. When the call fails, when the organization's
   [data residency](#data-residency-and-the-provider) blocks the provider (no call is
   made), when the answer has nothing usable, or when the turn ended with an error, the
-  title is your first message instead, cut at a word boundary. A rename always wins, also
+  title is your first message instead, cut at a word boundary. The same goes when the
+  first reply was built from an email, a file or other outside content: no call is made,
+  so outside content can't choose the title. A rename always wins, also
   while the title is being made. The title shows on the next `GET /api/chats` or
   `GET /api/chats/{id}`, with `title_source: "auto"`. The reply doesn't wait for it, and
   titles are never logged.

@@ -165,13 +165,17 @@ Security notes:
   session id.
 - Automatic titles (GH-179, ``admino.chat_titles``): after the first
   exchange of an untitled ``auto`` chat, a background task (after the
-  response, no chat lock) sends the first message and the reply only (each
-  cut to 1,000 characters; no tools, no ids, names or emails) through
-  ``llm_policy.chat`` (the org's residency guard, the stored retry limit)
-  to the client running at that moment, and stores the sanitized title by
-  compare-and-set (``chats.set_auto_title``), so a rename always wins. A
-  failed call, a blocked provider or an ``error`` run stores the fallback
-  (the first message, sanitized). No audit event; titles aren't logged.
+  response, no chat lock) sends the first message and the reply only (as
+  written, each cut to 1,000 characters; no tools, no account identifiers)
+  through ``llm_policy.chat`` (the org's residency guard, the stored retry
+  limit) to the client running at that moment, and stores the sanitized
+  title by compare-and-set (``chats.set_auto_title``), so a rename always
+  wins. A failed call, a blocked provider or an ``error`` run stores the
+  fallback (the first message, sanitized). So does a first run whose tool
+  results hold wrapped external content (GH-243; the same rule as the chat's
+  sticky ``external_content`` flag), with no model call: an email, file or
+  page the reply quotes never chooses the title. No audit event; titles
+  aren't logged.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -497,6 +501,7 @@ from admino import (
     scoped_settings,
     session_management,
     sessions,
+    untrusted,
 )
 from admino.access import Capability, Principal, can
 from admino.chat_runtime import ChatRuntime, ChatRuntimeFullError
@@ -3676,6 +3681,19 @@ async def _finish_run(
     )
 
 
+def _read_external_content(loaded: list[LLMMessage], result: AgentResult) -> bool:
+    """Whether the run's new messages hold wrapped external content (GH-243).
+
+    The same rule as the chat's sticky ``external_content`` flag
+    (``chats.append_messages``): only a ``tool`` result counts, so a marker the
+    user typed or the reply quotes doesn't.
+    """
+    return any(
+        message.role == "tool" and untrusted.contains_wrapped(message.content)
+        for message in result.history[len(loaded) :]
+    )
+
+
 def _running_llm_client() -> LLMClient:
     """The agent's LLM client at the moment of the call (a title task's resolver).
 
@@ -3724,11 +3742,14 @@ async def _chat_turn(
     holds no ``assistant`` message; a GH-66 notice is a user message) gets
     its title after the response is sent (GH-179,
     ``chat_titles.title_chat``): the model's from the message and the reply,
-    or the fallback from the message (an ``error`` run makes no model call).
-    The task gets the agent's client when it runs (``_running_llm_client``),
-    the org's data residency and the stored ``llm.max_retries``, and holds no
-    chat lock: a later turn's history holds the reply, so it schedules no
-    second task. A chat trashed during the run schedules nothing.
+    or the fallback from the message. An ``error`` run makes no model call,
+    nor does a run whose new ``tool`` results hold wrapped external content
+    (``_read_external_content``): the reply may quote an email or a file,
+    which must not choose the title. The task gets the agent's client when it
+    runs (``_running_llm_client``), the org's data residency and the stored
+    ``llm.max_retries``, and holds no chat lock: a later turn's history holds
+    the reply, so it schedules no second task. A chat trashed during the run
+    schedules nothing.
 
     Args:
         principal: The logged-in principal (``chat.send`` checked).
@@ -3825,6 +3846,7 @@ async def _chat_turn(
             user_message=message,
             assistant_message=result.response,
             run_failed=result.status == "error",
+            external_content=_read_external_content(loaded, result),
             data_residency=policy.data_residency,
             max_retries=platform.llm.max_retries,
         )

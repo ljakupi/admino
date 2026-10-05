@@ -10,8 +10,9 @@ title.
 
 Inputs: the pool, the caller's ``TenantContext`` and the chat id; a
 ``get_client`` callable that resolves the running client when the task runs;
-the first user message and the first assistant reply; whether the run failed;
-the org's residency flag and the platform's retry limit.
+the first user message and the first assistant reply; whether the run failed
+and whether it read external content; the org's residency flag and the
+platform's retry limit.
 Outputs: ``title_chat`` stores the title and returns None. The pure helpers
 return the title request's messages (``build_title_messages``) and titles
 (``sanitize_title``, ``fallback_title``, ``truncate_title``): ``""`` when
@@ -22,21 +23,29 @@ nothing usable remains, else a valid ``models.ChatTitle`` of at most
 Security notes:
 - What reaches the provider: the fixed English ``TITLE_SYSTEM_PROMPT`` and one
   user message holding the two excerpts (each stripped, then cut to
-  ``TITLE_EXCERPT_CHARS``). No chat, org or user id, name, email, date, org
-  data or tool definition; no tools, and the output is capped at
-  ``TITLE_MAX_TOKENS``. The prompt says the chat is data, not instructions,
-  and whatever the model replies is only ever used as a title.
+  ``TITLE_EXCERPT_CHARS``), sent as written: nothing is added, so no chat,
+  org or user id, account name or email, date, org data or tool definition
+  (names or addresses the excerpts themselves hold are not removed); no
+  tools, and the output is capped at ``TITLE_MAX_TOKENS``. The prompt says
+  the chat is data, not instructions, and whatever the model replies is only
+  ever used as a title.
+- Third-party content never steers the title (security audit L-2): when the
+  first run read wrapped external content (an email, a file, a page), the
+  reply may quote it, so ``title_chat`` makes no model call and stores the
+  fallback from the user's own first message, as for a failed run.
 - Residency: the call goes through ``llm_policy.chat`` (looked up at call
   time), so a residency org on a non-Swiss provider makes no request at all
   (``residency_blocked``) and gets the fallback.
 - The reply is untrusted: reasoning blocks, extra lines, markdown headings,
   ``title:`` labels and surrounding quotes are dropped; credentials are
   redacted and control characters stripped exactly as for a stored message
-  (NFKC included), then every control, format, surrogate and line/paragraph
-  separator character is removed and credentials are redacted once more (a
-  key split by an invisible character is joined by that removal); the length
-  is capped last, so a credential is never cut before it is redacted. The
-  fallback gets the same redaction and cleanup.
+  (NFKC included), then the control, format, surrogate and line/paragraph
+  separator characters (categories Cc, Cf, Cs, Zl, Zp) are removed and
+  credentials are redacted once more, a best-effort net: a key split by a
+  removed control or format character (soft hyphen, word joiner, DEL) is
+  joined by that removal and caught, one split by another invisible character
+  is not; the length is capped last, so a credential is never cut before it
+  is redacted. The fallback gets the same redaction and cleanup.
 - A user rename always wins: the store is ``chats.set_auto_title``'s
   compare-and-set on the caller's live, untitled, automatic chat, so a rename
   that lands while the title is being generated is never overwritten.
@@ -280,16 +289,18 @@ async def title_chat(
     user_message: str,
     assistant_message: str,
     run_failed: bool,
+    external_content: bool = False,
     data_residency: bool,
     max_retries: int,
 ) -> None:
     """Title a chat after its first exchange (the background task).
 
-    A failed run gets the fallback without a client or a model call; else the
-    client is resolved now (after a provider switch, the new one; failing to
-    resolve one means the fallback) and ``generate_title`` asks it. An empty
-    title stores nothing; any other is stored through the compare-and-set,
-    which a user rename or a trashed chat refuses.
+    A failed run, or one that read external content, gets the fallback
+    without a client or a model call; else the client is resolved now (after
+    a provider switch, the new one; failing to resolve one means the fallback)
+    and ``generate_title`` asks it. An empty title stores nothing; any other
+    is stored through the compare-and-set, which a user rename or a trashed
+    chat refuses.
 
     Args:
         pool: The database pool.
@@ -299,6 +310,9 @@ async def title_chat(
         user_message: The chat's first user message.
         assistant_message: The first assistant reply.
         run_failed: Whether the first run ended in an error.
+        external_content: Whether the first run's tool results held wrapped
+            external content (GH-243): the reply may quote it, so the model
+            isn't asked and the fallback is stored.
         data_residency: The org's residency policy.
         max_retries: The platform's retry limit (0..5).
 
@@ -308,7 +322,7 @@ async def title_chat(
     """
     chat = safe_log(chat_id)
     try:
-        client = None if run_failed else get_client()
+        client = None if run_failed or external_content else get_client()
     except (MemoryError, RecursionError):
         raise
     except Exception:
