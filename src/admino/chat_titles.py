@@ -39,8 +39,11 @@ Security notes:
 - The reply is untrusted: reasoning blocks, extra lines, markdown headings,
   ``title:`` labels and surrounding quotes are dropped; credentials are
   redacted and control characters stripped exactly as for a stored message
-  (NFKC included), then the control, format, surrogate and line/paragraph
-  separator characters (categories Cc, Cf, Cs, Zl, Zp) are removed and
+  (``models.sanitize_display_text``, NFKC included; API keys of the current
+  formats, ``sk-proj-`` and ``sk-ant-`` among them, are redacted in full
+  whatever their length), then the control, format, surrogate and
+  line/paragraph separator characters a ``ChatTitle`` refuses
+  (``models.CHAT_TITLE_BANNED_CATEGORIES``: Cc, Cf, Cs, Zl, Zp) are removed and
   credentials are redacted once more, a best-effort net: a key split by a
   removed control or format character (soft hyphen, word joiner, DEL) is
   joined by that removal and caught, one split by another invisible character
@@ -72,9 +75,10 @@ from typing import TYPE_CHECKING, Final, Literal
 from admino import chats, llm_policy
 from admino.logs import safe_log
 
-# Private names on purpose: a title is redacted and cleaned exactly like a stored
-# message, and refuses exactly the characters a ChatTitle refuses (contract).
-from admino.models import _CHAT_TITLE_BANNED_CATEGORIES, LLMMessage, _sanitize_display_text
+# A title is redacted and cleaned exactly like a stored message
+# (sanitize_display_text) and drops exactly the characters a ChatTitle refuses
+# (CHAT_TITLE_BANNED_CATEGORIES): the same objects, so the two can't drift apart.
+from admino.models import CHAT_TITLE_BANNED_CATEGORIES, LLMMessage, sanitize_display_text
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -170,10 +174,10 @@ def _redact_and_clean(text: str) -> str:
     for _ in range(2):
         kept = "".join(
             char
-            for char in _sanitize_display_text(text)
+            for char in sanitize_display_text(text)
             # Whitespace is collapsed below, not removed: a tab or a newline (Cc)
             # still separates two words.
-            if char.isspace() or unicodedata.category(char) not in _CHAT_TITLE_BANNED_CATEGORIES
+            if char.isspace() or unicodedata.category(char) not in CHAT_TITLE_BANNED_CATEGORIES
         )
         text = _WHITESPACE_RE.sub(" ", kept).strip()
     return text
@@ -289,7 +293,7 @@ async def title_chat(
     user_message: str,
     assistant_message: str,
     run_failed: bool,
-    external_content: bool = False,
+    external_content: bool,
     data_residency: bool,
     max_retries: int,
 ) -> None:
@@ -312,7 +316,8 @@ async def title_chat(
         run_failed: Whether the first run ended in an error.
         external_content: Whether the first run's tool results held wrapped
             external content (GH-243): the reply may quote it, so the model
-            isn't asked and the fallback is stored.
+            isn't asked and the fallback is stored. Required (no default), so
+            no caller can leave it out and fail open.
         data_residency: The org's residency policy.
         max_retries: The platform's retry limit (0..5).
 
