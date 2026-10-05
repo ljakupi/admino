@@ -698,8 +698,10 @@ Viewer's chats from before a role change stay stored, unused.
   denied." A new message in the chat cancels a pending confirmation. Confirming in a chat
   with nothing pending (expired, already answered or never asked for) answers `404`
   `{"detail": "No pending confirmation for this session"}` and nothing runs. Confirming
-  never adds a chat to the server's memory (see below), so it never answers `429` or
-  `503` and never drops another of your confirmations.
+  never adds a chat to the server's memory (see below), so it never answers the
+  `rate_limit` `429` or the `chats_busy` `503` described above and never drops another of
+  your confirmations. Its own per-user rate limit can still answer `429`
+  `{"detail": "Rate limit exceeded"}`.
 - **At most 3 pending confirmations per user.** You can have up to
   `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
   confirmations waiting at once, across your chats. When you're at the limit, a message
