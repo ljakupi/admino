@@ -8,13 +8,15 @@ messages (``append_messages``) and the next run loads the latest ones back
 (``get_or_create_legacy_chat``, ``find_legacy_chat``). GH-66's promotion
 notice reaches every live chat of the org (``append_org_notice``), and the
 Super Admin's org metadata counts the org's chats (``count_org_chats``).
+GH-179's background task stores the automatic title (``set_auto_title``).
 
 Inputs: an executor (an asyncpg pool or connection) or, for the two
 transactional writes (``trash_chat``, ``append_messages``), the pool; the
 caller's ``TenantContext``; a chat id; titles, ``LLMMessage``s and
 ``ToolCallRecord``s; page sizes and opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``MessagePage``, ``LLMMessage`` lists,
-counts and message statuses. Errors: ``ChatNotFoundError``,
+counts, message statuses and whether an automatic title was stored.
+Errors: ``ChatNotFoundError``,
 ``InvalidCursorError``, ``ValueError`` (a ``system`` message to store),
 ``audit_events.AuditRecordError`` and the driver's errors.
 
@@ -48,6 +50,10 @@ Security notes:
   chat, a colleague's chat, a trashed chat and an unknown id raise the same
   ``ChatNotFoundError`` with a fixed text and change nothing. Only the org
   notice and the platform count are org-wide (org id and live chats only).
+- An automatic title never overwrites a user's: ``set_auto_title`` is a
+  compare-and-set on ``title_source = 'auto' AND title = ''`` (plus the
+  owner, org and ``deleted_at IS NULL`` filters) and returns False instead of
+  raising, so a rename that lands while the title is generated always wins.
 - The sticky ``external_content`` flag (GH-243) is set only when an appended
   ``tool`` message holds wrapped external content
   (``untrusted.contains_wrapped``): a user or the model typing a marker can't
@@ -195,6 +201,15 @@ _ORG_NOTICE_SQL: Final = """
 """
 # S13
 _COUNT_ORG_CHATS_SQL: Final = "SELECT count(*) FROM chats WHERE org_id = $1 AND deleted_at IS NULL"
+# S14: #179's automatic title as a compare-and-set: only a still untitled chat
+# whose title the user never set, so a rename (S5) always wins, also one that
+# lands while the title is being generated. last_activity_at is left alone.
+_SET_AUTO_TITLE_SQL: Final = """
+    UPDATE chats SET title = $4
+    WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
+        AND title_source = 'auto' AND title = ''
+    RETURNING id
+"""
 
 
 class ChatNotFoundError(LookupError):
@@ -497,6 +512,33 @@ async def rename_chat(
     if row is None:
         raise ChatNotFoundError
     return _chat_record(row)
+
+
+async def set_auto_title(
+    executor: Executor, tenant: TenantContext, chat_id: UUID, title: str
+) -> bool:
+    """Store an automatic title on the caller's live, still untitled chat (S14).
+
+    A compare-and-set in one statement: ``title_source`` stays ``auto`` and
+    ``last_activity_at`` is untouched. No audit event (an automatic title
+    isn't in the catalog) and no log line.
+
+    Args:
+        executor: The pool or a connection.
+        tenant: The caller's org scope; the caller owns the chat.
+        chat_id: The chat.
+        title: An already sanitized title (1 to 80 characters).
+
+    Returns:
+        True when the title was stored. False, with nothing changed, for a
+        chat the user titled, one already titled automatically, a trashed
+        chat, another owner's or another org's chat and an unknown id (never
+        ``ChatNotFoundError``).
+    """
+    stored = await executor.fetchval(
+        _SET_AUTO_TITLE_SQL, chat_id, tenant.org_id, tenant.user_id, title
+    )
+    return stored is not None
 
 
 async def trash_chat(

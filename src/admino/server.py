@@ -75,9 +75,11 @@ Routes:
 - PATCH /api/chats/{chat_id} — Renames the chat.
 - DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
 - POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
-  ChatResponse (with the run's LLM error code, GH-242).
+  ChatResponse (with the run's LLM error code, GH-242). The first exchange
+  of an untitled chat titles it after the response (GH-179).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created on first use, until #177); returns ChatResponse.
+  Titles the chat like the route above.
 - GET  /api/events        — Legacy SSE stub for a chat session id.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
   (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
@@ -161,6 +163,19 @@ Security notes:
   session id is a chat of the caller's own, and a confirmation never creates
   one. Log lines name chat ids only: never a title, message text or legacy
   session id.
+- Automatic titles (GH-179, ``admino.chat_titles``): after the first
+  exchange of an untitled ``auto`` chat, a background task (after the
+  response, no chat lock) sends the first message and the reply only (as
+  written, each cut to 1,000 characters; no tools, no account identifiers)
+  through ``llm_policy.chat`` (the org's residency guard, the stored retry
+  limit) to the client running at that moment, and stores the sanitized
+  title by compare-and-set (``chats.set_auto_title``), so a rename always
+  wins. A failed call, a blocked provider or an ``error`` run stores the
+  fallback (the first message, sanitized). So does a first run whose tool
+  results hold wrapped external content (GH-243; the same rule as the chat's
+  sticky ``external_content`` flag), with no model call: an email, file or
+  page the reply quotes never chooses the title. No audit event; titles
+  aren't logged.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -447,7 +462,17 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4  # UUID at runtime: FastAPI resolves path parameter annotations
 
 import httpx
-from fastapi import Body, Depends, FastAPI, HTTPException, Path, Query, Request, Response
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    Depends,
+    FastAPI,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+)
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
@@ -461,6 +486,7 @@ from starlette.staticfiles import StaticFiles
 from admino import (
     accounts,
     auth,
+    chat_titles,
     chats,
     invitations,
     llm_policy,
@@ -475,6 +501,7 @@ from admino import (
     scoped_settings,
     session_management,
     sessions,
+    untrusted,
 )
 from admino.access import Capability, Principal, can
 from admino.chat_runtime import ChatRuntime, ChatRuntimeFullError
@@ -3654,7 +3681,40 @@ async def _finish_run(
     )
 
 
-async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -> ChatResponse:
+def _read_external_content(loaded: list[LLMMessage], result: AgentResult) -> bool:
+    """Whether the run's new messages hold wrapped external content (GH-243).
+
+    The same rule as the chat's sticky ``external_content`` flag
+    (``chats.append_messages``): only a ``tool`` result counts, so a marker the
+    user typed or the reply quotes doesn't.
+    """
+    return any(
+        message.role == "tool" and untrusted.contains_wrapped(message.content)
+        for message in result.history[len(loaded) :]
+    )
+
+
+def _running_llm_client() -> LLMClient:
+    """The agent's LLM client at the moment of the call (a title task's resolver).
+
+    A title task calls it after the response was sent, so a platform LLM
+    switch in between gives the new client. An agent without a client
+    raises, which the task turns into the fallback title.
+
+    Raises:
+        RuntimeError: No agent is configured.
+    """
+    if _agent is None:
+        raise RuntimeError("Server not configured")
+    return _agent._llm
+
+
+async def _chat_turn(
+    principal: Principal,
+    message: str,
+    chat_ref: UUID | str,
+    background_tasks: BackgroundTasks,
+) -> ChatResponse:
     """Run one user message in a chat and store the turn (the two turn routes).
 
     The caller spent the ``/api/message`` bucket. Expired confirmations are
@@ -3677,11 +3737,26 @@ async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -
     turn queued behind one that stored wrapped content is escalated by it.
     Then the turn is stored (``_finish_run``).
 
+    Once it is stored, the chat's first exchange (the chat as read under the
+    lock is untitled with ``title_source`` "auto", and the loaded history
+    holds no ``assistant`` message; a GH-66 notice is a user message) gets
+    its title after the response is sent (GH-179,
+    ``chat_titles.title_chat``): the model's from the message and the reply,
+    or the fallback from the message. An ``error`` run makes no model call,
+    nor does a run whose new ``tool`` results hold wrapped external content
+    (``_read_external_content``): the reply may quote an email or a file,
+    which must not choose the title. The task gets the agent's client when it
+    runs (``_running_llm_client``), the org's data residency and the stored
+    ``llm.max_retries``, and holds no chat lock: a later turn's history holds
+    the reply, so it schedules no second task. A chat trashed during the run
+    schedules nothing.
+
     Args:
         principal: The logged-in principal (``chat.send`` checked).
         message: The validated user message.
         chat_ref: The chat's id, or a legacy session id (the caller's chat of
             it, created on its first message, until #177).
+        background_tasks: The request's background tasks (the title task).
 
     Returns:
         The turn's ChatResponse (``session_id`` echoes a legacy session id).
@@ -3754,21 +3829,47 @@ async def _chat_turn(principal: Principal, message: str, chat_ref: UUID | str) -
         except Exception:
             logger.error("Agent run failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
-        return await _finish_run(pool, tenant, chat, loaded, result, session_id)
+        response = await _finish_run(pool, tenant, chat, loaded, result, session_id)
+    # Only an untitled chat's first exchange: a stored reply means it had one (a GH-66
+    # notice is a user message and doesn't count). The task runs after the response.
+    if (
+        chat.title_source == "auto"
+        and chat.title == ""
+        and not any(stored.role == "assistant" for stored in loaded)
+    ):
+        background_tasks.add_task(
+            chat_titles.title_chat,
+            pool,
+            tenant,
+            chat.id,
+            get_client=_running_llm_client,
+            user_message=message,
+            assistant_message=result.response,
+            run_failed=result.status == "error",
+            external_content=_read_external_content(loaded, result),
+            data_residency=policy.data_residency,
+            max_retries=platform.llm.max_retries,
+        )
+    return response
 
 
 async def post_chat_message(
-    principal: _ChatSenderDep, chat_id: UUID, body: ChatMessageCreate
+    principal: _ChatSenderDep,
+    chat_id: UUID,
+    body: ChatMessageCreate,
+    background_tasks: BackgroundTasks,
 ) -> ChatResponse:
     """Handle POST /api/chats/{chat_id}/messages — run a turn in a chat of the caller.
 
     Spends the per-user ``/api/message`` bucket (shared with the legacy
-    route), then runs and stores the turn (``_chat_turn``).
+    route), then runs and stores the turn (``_chat_turn``). The chat's first
+    exchange titles an untitled chat after the response is sent (GH-179).
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
         chat_id: The chat (a UUID; anything else is a 422).
         body: Validated ChatMessageCreate (the message).
+        background_tasks: The request's background tasks (the title task).
 
     Returns:
         ChatResponse with the chat's id (``session_id`` None), the agent's
@@ -3782,12 +3883,13 @@ async def post_chat_message(
             ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
-    return await _chat_turn(principal, body.message, chat_id)
+    return await _chat_turn(principal, body.message, chat_id, background_tasks)
 
 
 async def post_message(
     body: ChatRequest,
     principal: _ChatSenderDep,
+    background_tasks: BackgroundTasks,
 ) -> ChatResponse:
     """Handle POST /api/message — legacy: a turn in the caller's chat of a session id.
 
@@ -3795,11 +3897,13 @@ async def post_message(
     (``chats.legacy_session_id``), created on its first message: another
     user's session id is a chat of the caller's own. The turn then runs like
     POST /api/chats/{chat_id}/messages (``_chat_turn``), on the same per-user
-    ``/api/message`` bucket. Until #177.
+    ``/api/message`` bucket, and titles the chat after its first exchange
+    the same way (GH-179). Until #177.
 
     Args:
         body: Validated ChatRequest with message and session_id.
         principal: The logged-in principal (needs ``chat.send``).
+        background_tasks: The request's background tasks (the title task).
 
     Returns:
         ChatResponse with the chat's id, the echoed session id, the agent's
@@ -3812,7 +3916,7 @@ async def post_message(
             ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
-    return await _chat_turn(principal, body.message, body.session_id)
+    return await _chat_turn(principal, body.message, body.session_id, background_tasks)
 
 
 async def get_events(
