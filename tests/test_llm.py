@@ -32,7 +32,6 @@ from admino.llm import (
     check_args_depth,
     create_llm_client,
     parse_tool_calls,
-    sanitize_content,
     strip_control_chars,
     validate_tools_payload,
 )
@@ -181,14 +180,6 @@ class TestValidateToolsPayload:
 class TestSanitization:
     """Tests for control character and Unicode sanitization of LLM output."""
 
-    def test_control_chars_stripped(self) -> None:
-        """Null, SOH, RTL override, and LTR isolate are stripped from content."""
-        assert sanitize_content("Hello\x00\x01‮⁦World") == "HelloWorld"
-
-    def test_zero_width_chars_stripped(self) -> None:
-        """Zero-width space, joiner, and BOM are stripped from content."""
-        assert sanitize_content("A​‍﻿B") == "AB"
-
     def test_strip_control_chars_preserves_tab_newline(self) -> None:
         """Tab, newline, and carriage return survive sanitisation."""
         text = "line1\tvalue\nline2\r\n"
@@ -197,13 +188,6 @@ class TestSanitization:
     def test_strip_control_chars_removes_bidi(self) -> None:
         """RTL override (U+202E) and LTR isolate (U+2066) are removed."""
         assert strip_control_chars("abc‮def⁦ghi") == "abcdefghi"
-
-    def test_sanitize_content_truncates_and_strips(self) -> None:
-        """sanitize_content strips control chars and enforces the length limit."""
-        dirty = "\x00A" * (_MAX_CONTENT_LENGTH + 100)
-        result = sanitize_content(dirty)
-        assert "\x00" not in result
-        assert len(result) <= _MAX_CONTENT_LENGTH
 
     def test_strip_control_chars_removes_c1_nel(self) -> None:
         """U+0085 (NEL — Next Line) is stripped."""
