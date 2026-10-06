@@ -588,6 +588,7 @@ LLMErrorCode = Literal[
     "timeout",
     "residency_blocked",
     "context_too_long",
+    "malformed_response",
 ]
 """Stable code of a user-facing LLM failure (GH-242); the UI shows its translation."""
 
@@ -1119,6 +1120,14 @@ class AgentResult(BaseModel):
         description=(
             "Set when ``status == 'error'`` and the failure is a coded LLM error"
             " (GH-242); None for any other outcome."
+        ),
+    )
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "True when the run ends ``final`` with an answer the LLM output cap (or"
+            " the 65536-character content cap) cut: ``response`` then ends at its"
+            " last complete word (GH-25). False for every other outcome."
         ),
     )
 

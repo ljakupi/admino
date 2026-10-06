@@ -26,11 +26,12 @@ What these tests pin down:
   JSON string, inside an escape), interleaved with text blocks; no fragment (or
   only ``""``) means ``{}``; ``tool__action`` decodes to ``tool.action``; the
   provider id is kept as ``tool_call_id``; index order; never in any delta.
-  Invalid calls are dropped (bad JSON, non-object, depth 5, 33 keys, a 2049-char
-  string, ``json.dumps`` over 16384, a name that doesn't decode to
-  ``tool.action``) and the valid ones kept; their arguments never reach a log.
-  Bounds: only the first 128 tool_use blocks; a call whose fragments exceed
-  65536 characters is dropped (even when its JSON would be valid).
+  GH-25 (D2): one invalid call (bad JSON, non-object, depth 5, 33 keys, a
+  2049-char string, ``json.dumps`` over 16384, a name that doesn't decode to
+  ``tool.action``) rejects the whole reply with ``malformed_response`` instead
+  of the final response; no argument reaches a log or the error. Bounds: more
+  than 128 tool_use blocks (130) or a call whose fragments exceed 65536
+  characters (even when its JSON would be valid) reject the reply too.
 - ``done`` (C1.5) is False for ``stop_reason == "tool_use"``, True otherwise;
   ``model`` is the message_start model (sanitized, at most 200 characters), else
   the configured one.
@@ -738,14 +739,14 @@ _INVALID_TOOL_CALLS: Final[dict[str, tuple[str, str]]] = {
 @pytest.mark.parametrize(
     ("name", "partial_json"), list(_INVALID_TOOL_CALLS.values()), ids=list(_INVALID_TOOL_CALLS)
 )
-async def test_anthropic_stream_invalid_tool_call_dropped_valid_ones_kept(
+async def test_anthropic_stream_invalid_tool_call_rejects_whole_reply(
     client: AnthropicClient,
     wire: _Wire,
     debug_logs: pytest.LogCaptureFixture,
     name: str,
     partial_json: str,
 ) -> None:
-    """The invalid call goes; the calls before and after it stay; its args never hit a log."""
+    """The invalid call rejects the reply around it (GH-25 D2); its args hit no log or error."""
     alpha = {"query": "alpha"}
     beta = {"key": "beta", "value": "v"}
     frames = _stream(
@@ -755,33 +756,37 @@ async def test_anthropic_stream_invalid_tool_call_dropped_valid_ones_kept(
         stop_reason="tool_use",
     )
     wire.queue(_Reply(frames=frames))
-    _, final = await _run(client)
-    assert final.tool_calls == [
-        ToolCall(tool="gmail", action="search", args=alpha, tool_call_id="toolu_a"),
-        ToolCall(tool="memory", action="store", args=beta, tool_call_id="toolu_b"),
-    ]
-    assert _TOOL_MARK not in debug_logs.text
+    seen, error = await _until_error(client.chat_stream(_messages()))
+    assert (seen, error.code, error.__cause__, error.__suppress_context__) == (
+        [],
+        "malformed_response",
+        None,
+        True,
+    )
+    assert _leak_sites(_TOOL_MARK, error, debug_logs) == []
 
 
-async def test_anthropic_stream_keeps_only_first_128_tool_use_blocks(
+async def test_anthropic_stream_more_than_128_tool_use_blocks_reject_reply(
     client: AnthropicClient, wire: _Wire
 ) -> None:
+    """130 tool_use blocks: the reply is rejected (GH-25 D2), not cut to the first 128."""
     blocks = [
         _tool_block(i, "memory__get", f"toolu_{i:03d}", _tool_json({"key": f"k{i}"}))
         for i in range(130)
     ]
     wire.queue(_Reply(frames=_stream(*blocks, stop_reason="tool_use")))
-    _, final = await _run(client)
-    assert final.tool_calls == [
-        ToolCall(tool="memory", action="get", args={"key": f"k{i}"}, tool_call_id=f"toolu_{i:03d}")
-        for i in range(128)
-    ]
+    seen, error = await _until_error(client.chat_stream(_messages()))
+    assert (seen, error.code) == ([], "malformed_response")
 
 
-async def test_anthropic_stream_drops_tool_call_over_65536_argument_chars(
+async def test_anthropic_stream_tool_call_over_65536_argument_chars_rejects_reply(
     client: AnthropicClient, wire: _Wire
 ) -> None:
-    """Its JSON would parse to a small valid object, but accumulation stops at 65536."""
+    """Its JSON would parse to a small valid object, but its fragments cross 65536 characters.
+
+    GH-25 (D2): the reply is rejected with ``malformed_response``; a cut prefix of
+    the fragments is never parsed as the call.
+    """
     padding = [" " * 4096] * 17  # 69632 characters of JSON whitespace
     frames = _stream(
         _tool_block(0, "gmail__search", "toolu_ok", _tool_json({"query": "ok"})),
@@ -789,27 +794,30 @@ async def test_anthropic_stream_drops_tool_call_over_65536_argument_chars(
         stop_reason="tool_use",
     )
     wire.queue(_Reply(frames=frames))
-    _, final = await _run(client)
-    assert final.tool_calls == [
-        ToolCall(tool="gmail", action="search", args={"query": "ok"}, tool_call_id="toolu_ok")
-    ]
+    seen, error = await _until_error(client.chat_stream(_messages()))
+    assert (seen, error.code) == ([], "malformed_response")
 
 
 async def test_anthropic_stream_never_logs_text_or_tool_arguments(
     client: AnthropicClient, wire: _Wire, debug_logs: pytest.LogCaptureFixture
 ) -> None:
-    frames = _stream(
-        _text_block(0, f"Answer {_TEXT_MARK} "),
-        _tool_block(1, "gmail__search", "toolu_v", _tool_json({"query": _TOOL_MARK})),
-        _tool_block(2, "gmail__search", "toolu_i", '{"query": "' + _TOOL_MARK),
-        stop_reason="tool_use",
+    """Neither a kept reply nor one rejected for an invalid call logs its text or arguments."""
+    text = _text_block(0, f"Answer {_TEXT_MARK} ")
+    valid = _tool_block(1, "gmail__search", "toolu_v", _tool_json({"query": _TOOL_MARK}))
+    invalid = _tool_block(2, "gmail__search", "toolu_i", '{"query": "' + _TOOL_MARK)
+    wire.queue(
+        _Reply(frames=_stream(text, valid, stop_reason="tool_use")),
+        _Reply(frames=_stream(text, valid, invalid, stop_reason="tool_use")),
     )
-    wire.queue(_Reply(frames=frames))
     texts, final = await _run(client)
+    seen, error = await _until_error(client.chat_stream(_messages()))
+    rejected_texts = [item.content for item in seen if isinstance(item, LLMStreamDelta)]
     assert _TEXT_MARK in "".join(texts)
-    assert len(final.tool_calls) == 1
+    assert _TEXT_MARK in "".join(rejected_texts)
+    assert (len(final.tool_calls), error.code) == (1, "malformed_response")
     assert _TEXT_MARK not in debug_logs.text
     assert _TOOL_MARK not in debug_logs.text
+    assert _leak_sites(_TOOL_MARK, error, debug_logs) == []
 
 
 # ===========================================================================

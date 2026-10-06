@@ -46,6 +46,7 @@ def _make_llm_config(anthropic_model: str | None = "claude-sonnet-4-6") -> Any:
         anthropic_model=anthropic_model,
         timeout_s=30,
         max_response_tokens=4096,
+        stream_deadline_s=300.0,
     )
 
 

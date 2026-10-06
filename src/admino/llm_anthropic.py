@@ -19,9 +19,30 @@ shared catalogue in ``llm.py``: a timeout is ``timeout``, a connection error
 429 ``rate_limited`` and any status >= 500 (including 529 "overloaded")
 ``provider_unavailable`` (both with the response's Retry-After), a 413 or a
 400 "prompt is too long" ``context_too_long``; other statuses stay internal
-(code None, ``user_facing=False``, "Claude API returned HTTP <n>"). The SDK
+(code None, ``user_facing=False``, "Claude API returned HTTP <n>"). A reply
+the client can't use is ``malformed_response`` (GH-25, not retried): a body or
+event the SDK can't decode or build its objects from (it raises
+``llm.SDK_DECODE_ERRORS`` raw: ``ValueError``, ``TypeError``, ``AttributeError``
+or ``RuntimeError``, e.g. for an object holding a reserved key such as
+``_fields_set``, or a union no member fits), an event that decodes to JSON
+``null`` (never taken for the end of the stream), ``httpx.DecodingError``
+mid-stream, a field read with the wrong type (a non-str model, text,
+``partial_json``, tool_use id or name, a block index that isn't an int), or
+any tool_use block that doesn't parse (the whole reply is rejected). The SDK
 never retries (``max_retries=0``): one ``chat()`` or ``chat_stream()`` is one
 request; retries belong to ``admino.llm_policy``.
+
+Output (GH-25): text sanitized with ``strip_control_chars`` and capped at 65536
+characters (never cut at a word); tool arguments bounded, then cleaned with
+``sanitize_tool_args``; ``LLMResponse.truncated`` for ``stop_reason ==
+"max_tokens"`` or text past the cap.
+
+History (GH-25 D11): Anthropic rejects an empty text turn, and a cut answer can
+be empty or whitespace-only, so ``_convert_messages_to_anthropic`` leaves out an
+``assistant`` message whose content is blank (``content.strip() == ""``) and
+that has no ``tool_use_blocks``; the user messages around it then merge like any
+same-role neighbours. The stored history is unchanged, and the other providers
+still send such a message.
 
 Output cap: ``chat()``'s keyword-only ``max_tokens`` (GH-179) lowers the
 request's ``max_tokens`` to ``min(max_tokens, config.max_response_tokens)``;
@@ -35,13 +56,16 @@ Streaming (GH-8): ``chat_stream()`` sends ``chat()``'s request body plus
 deltas (capped at 65536 characters, the stream is still read to its end),
 model from ``message_start`` (else the configured one), ``done`` unless the stop
 reason is ``tool_use``. A ``tool_use`` block's ``input_json_delta`` fragments
-are accumulated per block index (at most 128 blocks, 65536 characters each; no
-fragment means ``{}``) and validated by ``_parse_anthropic_tool_calls`` once the
-stream ended; tool calls are never streamed as deltas. Errors: setup errors on
-the first iteration (no request), ``chat()``'s status mapping when opening the
-stream, a mid-stream ``event: error`` (which the SDK raises as a status error
-carrying the stream's 200) or transport failure ``provider_unavailable``, a
-mid-stream timeout ``timeout``.
+are accumulated per block index (at most 128 blocks, 65536 characters each:
+crossing either bound rejects the reply; no fragment means ``{}``) and
+validated by ``_parse_anthropic_tool_calls`` once the stream ended; tool calls
+are never streamed as deltas. The call must end within ``stream_deadline_s`` of
+its first iteration: opening and every event read are bounded (never a
+``yield``). Errors: setup errors on the first iteration (no request),
+``chat()``'s status mapping when opening the stream, a mid-stream ``event:
+error`` (which the SDK raises as a status error carrying the stream's 200),
+transport or ``httpx.StreamError`` failure ``provider_unavailable``, a
+mid-stream timeout or the deadline ``timeout`` (the stream is closed first).
 
 Inputs: conversation messages, tool definitions, ANTHROPIC_API_KEY and the
 configured model and caps. Outputs: ``LLMResponse`` / ``LLMStreamDelta`` items
@@ -53,9 +77,9 @@ Security notes:
   (control characters and lone surrogates stripped).
 - Error messages are fixed strings: never the SDK message, a response body or
   an error event's text (the message only classifies a context-length
-  failure); SDK errors are raised ``from None``. Stream text and tool arguments
-  are never logged (a dropped tool call is logged by its name through
-  ``safe_log``).
+  failure); SDK errors are raised ``from None``. Stream text, events and tool
+  arguments are never logged (a dropped tool call is logged by its name
+  through ``safe_log``, a rejected reply by its label and error type only).
 - No end-user identifier is sent: the request body holds model, messages,
   max_tokens, system, tools and (streaming) ``stream`` only (never ``metadata``).
 - Does not import from agent.py, server.py, or tools/.
@@ -63,6 +87,7 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -75,16 +100,20 @@ from pydantic import ValidationError
 from admino.llm import (
     _MAX_STREAM_TOOL_CALLS,
     _MAX_TOOL_ARGUMENT_CHARS,
+    SDK_DECODE_ERRORS,
     CappedAnswer,
     LLMError,
     LLMResponse,
     LLMStreamDelta,
+    MalformedReplyError,
     check_args_depth,
+    malformed_response_error,
     missing_model_error,
+    next_before,
     not_configured_error,
     output_token_cap,
     provider_status_error,
-    sanitize_content,
+    sanitize_tool_args,
     sdk_status_error,
     strip_control_chars,
     validate_tools_payload,
@@ -94,8 +123,6 @@ from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
-
-    from anthropic.types import RawMessageStreamEvent
 
     from admino.config import LLMConfig
 
@@ -174,9 +201,11 @@ def _convert_messages_to_anthropic(
     Anthropic requires the system prompt as a separate parameter, not
     in the messages array. Also, Anthropic requires alternating
     user/assistant turns — consecutive same-role messages are merged.
+    An assistant message with blank content and no tool_use blocks is left
+    out (GH-25 D11), so the messages around it merge.
 
     Args:
-        messages: Conversation messages.
+        messages: Conversation messages (never changed).
 
     Returns:
         Tuple of (system_prompt, messages_list).
@@ -187,6 +216,9 @@ def _convert_messages_to_anthropic(
     for msg in messages:
         if msg.role == "system":
             system_parts.append(msg.content)
+            continue
+        if msg.role == "assistant" and not msg.tool_use_blocks and not msg.content.strip():
+            # Anthropic rejects an empty text turn, and a cut answer can be blank.
             continue
 
         # Anthropic uses "user" for both user messages and tool results
@@ -257,6 +289,10 @@ def _convert_messages_to_anthropic(
 def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
     """Parse Anthropic tool_use content blocks into ToolCall models.
 
+    The bounds are checked on the decoded ``input``; a kept call's arguments
+    are then cleaned with ``sanitize_tool_args``. An invalid call is dropped
+    and logged by its name only.
+
     Args:
         content_blocks: Content blocks from Anthropic's response.
 
@@ -315,7 +351,14 @@ def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
             continue
 
         try:
-            parsed.append(ToolCall(tool=tool, action=action, args=arguments, tool_call_id=block_id))
+            parsed.append(
+                ToolCall(
+                    tool=tool,
+                    action=action,
+                    args=sanitize_tool_args(arguments),
+                    tool_call_id=block_id,
+                )
+            )
         except ValidationError:
             logger.warning(
                 "Skipping tool call '%s': tool/action failed schema validation",
@@ -323,6 +366,67 @@ def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
             )
 
     return parsed
+
+
+def _all_tool_calls(blocks: list[Any], sent: int) -> list[ToolCall]:
+    """Parse the reply's tool_use blocks; one that doesn't parse rejects the reply.
+
+    Raises:
+        MalformedReplyError: Fewer than ``sent`` calls parsed (the parser logged
+            each dropped call by its name only).
+    """
+    parsed = _parse_anthropic_tool_calls(blocks)
+    if len(parsed) != sent:
+        raise MalformedReplyError
+    return parsed
+
+
+def _message_response(response: object) -> LLMResponse:
+    """Build ``chat()``'s LLMResponse from a Messages API ``message``.
+
+    The SDK builds the message without validation, so every field read is
+    type-checked. The text blocks are joined, sanitized and capped (never cut
+    at a word); every tool_use block must parse.
+
+    Raises:
+        LLMError: ``malformed_response``, raised ``from None``, for a non-str
+            model, text, tool_use id or name, a content that is not a list, or
+            a tool_use block that doesn't parse.
+    """
+    model = getattr(response, "model", None)
+    blocks = getattr(response, "content", None)
+    try:
+        if not isinstance(model, str) or not isinstance(blocks, list):
+            raise MalformedReplyError
+        text_parts: list[str] = []
+        sent = 0
+        for block in blocks:
+            kind = getattr(block, "type", None)
+            if kind == "text":
+                text = getattr(block, "text", None)
+                if not isinstance(text, str):
+                    raise MalformedReplyError
+                text_parts.append(text)
+            elif kind == "tool_use":
+                call_id = getattr(block, "id", None)
+                name = getattr(block, "name", None)
+                if not (isinstance(call_id, str) and isinstance(name, str)):
+                    raise MalformedReplyError
+                sent += 1
+        tool_calls = _all_tool_calls(blocks, sent)
+    except MalformedReplyError:
+        logger.warning("Rejecting malformed %s reply", _LABEL)
+        raise malformed_response_error(_LABEL) from None
+    answer = CappedAnswer()
+    answer.feed(strip_control_chars("\n".join(text_parts)))
+    stop_reason = getattr(response, "stop_reason", None)
+    return LLMResponse(
+        content=answer.answer,
+        tool_calls=tool_calls,
+        model=strip_control_chars(model)[:200],
+        done=stop_reason != "tool_use",
+        truncated=stop_reason == "max_tokens" or answer.truncated,
+    )
 
 
 @dataclass
@@ -342,70 +446,113 @@ class _StreamedMessage:
     Keeps the capped answer text, the tool_use blocks keyed by block index (at
     most ``_MAX_STREAM_TOOL_CALLS``, each one's JSON fragments up to
     ``_MAX_TOOL_ARGUMENT_CHARS``), the model and the stop reason. Events are
-    dispatched on their ``type``: the SDK builds them without validation, so
-    an unknown delta type may arrive as a ``TextDelta``-shaped object.
+    read by their ``type`` and every field read is type-checked: the SDK builds
+    them without validation, so an unknown delta type may arrive as a
+    ``TextDelta``-shaped object and any field may hold any JSON value.
     """
 
     def __init__(self) -> None:
         self._text = CappedAnswer()
         self._calls: dict[int, _StreamedToolUse] = {}
         self._model = ""
-        self._stop_reason: str | None = None
+        self._stop_reason: object = None
 
-    def apply(self, event: RawMessageStreamEvent) -> str:
-        """Apply one stream event; return the newly visible answer text (maybe "")."""
-        if event.type == "message_start":
-            self._model = event.message.model or self._model
-        elif event.type == "message_delta":
-            self._stop_reason = event.delta.stop_reason or self._stop_reason
-        elif event.type == "content_block_start":
-            block = event.content_block
-            if (
-                block.type == "tool_use"
-                and event.index not in self._calls
-                and len(self._calls) < _MAX_STREAM_TOOL_CALLS
-            ):
-                self._calls[event.index] = _StreamedToolUse(id=block.id, name=block.name)
-        elif event.type == "content_block_delta":
-            delta = event.delta
-            if delta.type == "text_delta":
-                return self._text.feed(strip_control_chars(delta.text))
-            call = self._calls.get(event.index)
-            if (
-                delta.type == "input_json_delta"
-                and call is not None
-                and len(call.partial_json) < _MAX_TOOL_ARGUMENT_CHARS
-            ):
-                call.partial_json += delta.partial_json
+    def apply(self, event: object) -> str:
+        """Apply one stream event; return the newly visible answer text (maybe "").
+
+        Raises:
+            MalformedReplyError: A non-str model, text, partial_json, tool_use id
+                or name; a block index that is not an int; a 129th or repeated
+                tool_use block; JSON fragments that would cross 65536 characters.
+        """
+        kind = getattr(event, "type", None)
+        if kind == "message_start":
+            model = getattr(getattr(event, "message", None), "model", None)
+            if not isinstance(model, str):
+                raise MalformedReplyError
+            self._model = model or self._model
+        elif kind == "message_delta":
+            stop_reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+            self._stop_reason = stop_reason or self._stop_reason
+        elif kind in ("content_block_start", "content_block_delta"):
+            index = getattr(event, "index", None)
+            # type() rather than isinstance(): a bool is not an index.
+            if type(index) is not int:
+                raise MalformedReplyError
+            if kind == "content_block_start":
+                self._start_block(index, getattr(event, "content_block", None))
+            else:
+                return self._apply_delta(index, getattr(event, "delta", None))
+        return ""
+
+    def _start_block(self, index: int, block: object) -> None:
+        """Track a tool_use block (every other block type is ignored)."""
+        if getattr(block, "type", None) != "tool_use":
+            return
+        call_id = getattr(block, "id", None)
+        name = getattr(block, "name", None)
+        if (
+            not (isinstance(call_id, str) and isinstance(name, str))
+            or index in self._calls
+            or len(self._calls) >= _MAX_STREAM_TOOL_CALLS
+        ):
+            raise MalformedReplyError
+        self._calls[index] = _StreamedToolUse(id=call_id, name=name)
+
+    def _apply_delta(self, index: int, delta: object) -> str:
+        """Apply a text or input_json delta; return the newly visible text (maybe "")."""
+        kind = getattr(delta, "type", None)
+        if kind == "text_delta":
+            text = getattr(delta, "text", None)
+            if not isinstance(text, str):
+                raise MalformedReplyError
+            return self._text.feed(strip_control_chars(text))
+        if kind == "input_json_delta":
+            fragment = getattr(delta, "partial_json", None)
+            if not isinstance(fragment, str):
+                raise MalformedReplyError
+            call = self._calls.get(index)
+            if call is not None:
+                # Never appended past the bound, so a cut prefix is never parsed.
+                if len(call.partial_json) + len(fragment) > _MAX_TOOL_ARGUMENT_CHARS:
+                    raise MalformedReplyError
+                call.partial_json += fragment
         return ""
 
     def response(self, configured_model: str) -> LLMResponse:
-        """Return the final response (the model falls back to ``configured_model``)."""
+        """Return the final response (the model falls back to ``configured_model``).
+
+        Raises:
+            MalformedReplyError: A tool_use block that doesn't parse.
+        """
         return LLMResponse(
             content=self._text.answer,
             tool_calls=self._tool_calls(),
             model=strip_control_chars(self._model or configured_model)[:200],
             done=self._stop_reason != "tool_use",
+            truncated=self._stop_reason == "max_tokens" or self._text.truncated,
         )
 
     def _tool_calls(self) -> list[ToolCall]:
         """Decode each block's JSON and validate it like ``chat()``, in index order.
 
-        A block without fragments has ``{}`` arguments; malformed JSON drops the
-        block (logged by its name only, never its arguments).
+        A block without fragments has ``{}`` arguments; malformed JSON skips the
+        block (logged by its name only, never its arguments), which rejects the
+        reply.
         """
         blocks: list[_StreamedToolUse] = []
         for index in sorted(self._calls):
             call = self._calls[index]
             try:
                 call.input = json.loads(call.partial_json) if call.partial_json else {}
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                # Invalid JSON, an int over the digit limit, or nesting too deep.
                 logger.warning(
                     "Skipping tool call '%s': malformed JSON arguments", safe_log(call.name)
                 )
                 continue
             blocks.append(call)
-        return _parse_anthropic_tool_calls(blocks)
+        return _all_tool_calls(blocks, len(self._calls))
 
 
 def _api_error(exc: Exception) -> LLMError:
@@ -414,7 +561,8 @@ def _api_error(exc: Exception) -> LLMError:
     A status maps through ``sdk_status_error`` (Anthropic's error bodies carry a
     type but no code: the message alone classifies a context-length 400 and
     never reaches the LLMError; 529 "overloaded" is a plain 5xx). Without a
-    status: ``timeout`` for a timeout, else ``provider_unavailable``.
+    status: ``timeout`` for a timeout (the stream deadline included), else
+    ``provider_unavailable`` (a connection, transport or stream failure).
     """
     import anthropic
 
@@ -427,8 +575,9 @@ def _api_error(exc: Exception) -> LLMError:
             sdk_message=exc.message,
             key_env=_API_KEY_ENV,
         )
-    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream.
-    timed_out = isinstance(exc, anthropic.APITimeoutError | httpx.TimeoutException)
+    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream;
+    # TimeoutError is the stream deadline (GH-25).
+    timed_out = isinstance(exc, anthropic.APITimeoutError | httpx.TimeoutException | TimeoutError)
     return provider_status_error(_LABEL, None, key_env=_API_KEY_ENV, timed_out=timed_out)
 
 
@@ -464,6 +613,7 @@ class AnthropicClient:
 
         self._model = config.anthropic_model or ""
         self._max_tokens = config.max_response_tokens
+        self._stream_deadline_s = config.stream_deadline_s
         api_key = os.environ.get(_API_KEY_ENV, "")
         self._api_key_configured = bool(api_key)
         # Built even without a key so close() stays uniform; chat() refuses to
@@ -493,13 +643,16 @@ class AnthropicClient:
                 ``min(max_tokens, configured cap)``; None sends the configured cap.
 
         Returns:
-            Parsed LLMResponse.
+            Parsed LLMResponse (``truncated`` for ``stop_reason == "max_tokens"``
+            or text past the 65536-character cap).
 
         Raises:
             LLMError: Coded (user-facing) when the key or model is missing, the
                 key is rejected, the model is unknown, the rate limit is hit,
-                Claude is unavailable (5xx, connection), the request timed out or
-                the prompt is too long; internal otherwise.
+                Claude is unavailable (5xx, connection), the request timed out,
+                the prompt is too long or the reply is malformed (undecodable,
+                wrong-typed, or a tool_use block that doesn't parse); internal
+                otherwise.
             ValueError: If stream=True is passed, or ``max_tokens`` is below 1,
                 a bool or not an int (before any request).
         """
@@ -517,26 +670,12 @@ class AnthropicClient:
             # Raised ``from None`` so the SDK exception (and any response body)
             # never travels with the LLMError.
             raise _api_error(exc) from None
-
-        # Extract text content
-        text_parts: list[str] = []
-        for block in response.content:
-            if hasattr(block, "type") and block.type == "text":
-                text_parts.append(getattr(block, "text", ""))
-
-        content = sanitize_content("\n".join(text_parts) if text_parts else "")
-
-        # Parse tool calls
-        tool_calls = _parse_anthropic_tool_calls(response.content)
-
-        model_name = strip_control_chars(response.model)[:200]
-
-        return LLMResponse(
-            content=content,
-            tool_calls=tool_calls,
-            model=model_name,
-            done=response.stop_reason != "tool_use",
-        )
+        except SDK_DECODE_ERRORS:
+            # The SDK decodes the 200 body and builds its objects itself and
+            # raises these raw (a reserved key such as ``_fields_set``, or a
+            # content block no union member fits, included).
+            raise malformed_response_error(_LABEL) from None
+        return _message_response(response)
 
     async def chat_stream(
         self,
@@ -547,7 +686,9 @@ class AnthropicClient:
 
         The request is ``chat()``'s body (configured output cap) plus ``stream:
         true``. Only ``text_delta`` text is streamed (sanitized, stops at the
-        content cap); tool_use blocks come only in the final response.
+        content cap); tool_use blocks come only in the final response. The call
+        must end within ``stream_deadline_s`` of its first iteration (opening
+        included); each provider read is bounded, a yield never is.
 
         Args:
             messages: Conversation messages.
@@ -559,32 +700,42 @@ class AnthropicClient:
         Raises:
             LLMError: ``chat()``'s setup errors on the first iteration (no
                 request), its status mapping when opening the stream (before any
-                delta); ``provider_unavailable`` for a mid-stream error event or
-                transport failure, ``timeout`` for a mid-stream timeout.
+                delta); ``provider_unavailable`` for a mid-stream error event,
+                transport or stream failure, ``timeout`` for a mid-stream timeout
+                or the deadline, ``malformed_response`` for a reply it can't use.
         """
+        deadline = asyncio.get_running_loop().time() + self._stream_deadline_s
         kwargs = self._request(messages, tools, self._max_tokens)
 
         import anthropic
 
         try:
-            stream = await self._client.messages.create(**kwargs, stream=True)
-        except (anthropic.APIConnectionError, anthropic.APIStatusError) as exc:
+            async with asyncio.timeout_at(deadline):
+                stream = await self._client.messages.create(**kwargs, stream=True)
+        except (anthropic.APIConnectionError, anthropic.APIStatusError, TimeoutError) as exc:
             raise _api_error(exc) from None
 
         message = _StreamedMessage()
         async with stream:
+            events = aiter(stream)
             try:
-                async for event in stream:
+                while (event := await next_before(events, deadline)) is not None:
                     piece = message.apply(event)
                     if piece:
                         yield LLMStreamDelta(content=piece)
+                final = message.response(self._model)
             except anthropic.APIStatusError:
                 # A mid-stream ``event: error``: the SDK raises it as a status error
                 # carrying the opened stream's 200, so it is not a status to map.
                 raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
-            except httpx.TransportError as exc:
+            except (httpx.TransportError, httpx.StreamError, TimeoutError) as exc:
                 raise _api_error(exc) from None
-        yield message.response(self._model)
+            except (MalformedReplyError, httpx.DecodingError) as exc:
+                # next_before turns an event the SDK can't decode or build, or a
+                # null event, into MalformedReplyError.
+                logger.warning("Rejecting malformed %s reply (%s)", _LABEL, type(exc).__name__)
+                raise malformed_response_error(_LABEL) from None
+        yield final
 
     def _request(
         self, messages: list[LLMMessage], tools: list[dict[str, Any]] | None, cap: int

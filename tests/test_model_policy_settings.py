@@ -29,9 +29,9 @@ What these tests pin down:
 - ``models.AgentConfig.llm_max_retries`` (default 0, 0 to 5),
   ``models.ToolPolicy.data_residency`` (default False),
   ``models.AgentResult.error_code`` and ``models.ChatResponse.error_code``
-  (default None, one of the seven codes, anything else refused);
+  (default None, one of the eight codes, anything else refused);
   ``models.LLM_ERROR_CODES`` and ``models.LLMErrorCode`` are exactly the
-  seven codes.
+  eight codes (GH-25 adds ``malformed_response``).
 - ``scoped_settings`` against the FakeDb (which knows migration 0022's
   columns): ``seed_platform_settings`` stores config.yaml's
   ``max_input_tokens`` / ``image_input`` on the first boot and re-applies them
@@ -117,6 +117,7 @@ _ERROR_CODES = frozenset(
         "timeout",
         "residency_blocked",
         "context_too_long",
+        "malformed_response",
     }
 )
 _UNKNOWN_CODES = ["unknown", "RATE_LIMITED", "rate-limited", "", "error", _SENTINEL]
@@ -779,15 +780,15 @@ class TestToolPolicyDataResidency:
 
 
 class TestErrorCodes:
-    """The seven LLM error codes and the error_code of a run and a chat response."""
+    """The eight LLM error codes and the error_code of a run and a chat response."""
 
-    def test_models_llm_error_codes_are_exactly_the_seven(self) -> None:
+    def test_models_llm_error_codes_are_exactly_the_eight(self) -> None:
         codes = models_module.LLM_ERROR_CODES
 
         assert isinstance(codes, frozenset)
         assert codes == _ERROR_CODES
 
-    def test_models_llm_error_code_literal_is_exactly_the_seven(self) -> None:
+    def test_models_llm_error_code_literal_is_exactly_the_eight(self) -> None:
         assert set(typing.get_args(models_module.LLMErrorCode)) == _ERROR_CODES
 
     def test_agent_result_error_code_defaults_to_none(self) -> None:

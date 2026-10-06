@@ -17,16 +17,18 @@ What these tests pin:
   same text, also after the delta budget is spent. A stream without an orphan
   close is unchanged: joined deltas == final content, capped at 65536 (paired
   ``<think>`` blocks never count).
-- M-2 (OpenAI, vLLM, Infomaniak; shared stream reader): a streamed tool call
-  whose name fragments add up to more than 256 characters is dropped and its
-  neighbours kept (exactly 256 is kept; a crossing fragment is neither skipped
-  nor sliced into a kept name); 50 name fragments of 100000 characters
-  complete, drop the call, and are never accumulated (the traced memory peak
+- M-2 (OpenAI, vLLM, Infomaniak; shared stream reader), as GH-25 (D2) changed
+  it: a streamed tool call whose name fragments add up to more than 256
+  characters rejects the whole reply with ``malformed_response`` (it used to be
+  dropped and its neighbours kept); exactly 256 is kept (in a reply without the
+  crossing call); a crossing fragment is neither skipped nor sliced into a kept
+  name (either would let the reply through). 50 name fragments of 100000
+  characters reject the reply and are never accumulated (the traced memory peak
   while reading stays far below the joined name). Arguments: a single fragment
-  over the 65536 budget drops its call; arguments that reach exactly 65536
+  over the 65536 budget rejects the reply; arguments that reach exactly 65536
   (single fragment or across fragments) still parse; a fragment that would cross
-  the budget drops the call, even when its in-budget part or a later small
-  fragment would complete valid JSON.
+  the budget rejects the reply, even when its in-budget part or a later small
+  fragment would complete valid JSON (each crossing call in a reply of its own).
 - L-2: ``strip_control_chars`` removes lone surrogates (U+D800..U+DFFF; the
   neighbours U+D7FF / U+E000 and an astral emoji stay). A stream carrying
   JSON-escaped lone surrogates (in the text, a pair split across two chunks,
@@ -51,7 +53,7 @@ import openai._base_client as openai_base_client
 import pytest
 
 from admino.config import LLMConfig
-from admino.llm import LLMResponse, LLMStreamDelta, strip_control_chars
+from admino.llm import LLMError, LLMResponse, LLMStreamDelta, strip_control_chars
 from admino.llm_anthropic import AnthropicClient
 from admino.llm_infomaniak import InfomaniakClient
 from admino.llm_openai import OpenAIClient
@@ -446,6 +448,26 @@ async def _drain(client: Any, tools: list[dict[str, Any]] | None = None) -> list
     return [item async for item in client.chat_stream(_messages(), tools)]
 
 
+async def _drain_error(
+    client: Any, tools: list[dict[str, Any]] | None = None
+) -> tuple[list[Any], LLMError]:
+    """Drain ``client.chat_stream`` until it raises; return what arrived first and the error."""
+    received: list[Any] = []
+    with pytest.raises(LLMError) as exc_info:
+        async for item in client.chat_stream(_messages(), tools):
+            received.append(item)
+    return received, exc_info.value
+
+
+async def _calls_or_code(client: Any) -> Any:
+    """The final response's calls, or the code of the LLMError the stream raised."""
+    try:
+        items = await _drain(client, [_MEMORY_TOOL])
+    except LLMError as exc:
+        return getattr(exc, "code", None)
+    return _calls(_final(items))
+
+
 def _deltas(items: list[Any]) -> list[str]:
     """The text of every streamed delta, in order."""
     return [item.content for item in items if isinstance(item, LLMStreamDelta)]
@@ -577,33 +599,56 @@ async def test_llm_audit_infomaniak_stream_without_orphan_close_unchanged(
 # ===========================================================================
 
 
-@pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_audit_stream_tool_name_over_256_chars_dropped_neighbours_kept(
-    provider: str, wire: _Wire, build: Callable[[str], Any]
-) -> None:
-    """Name fragments of 256 characters are kept, 257 dropped; the calls around them stay.
-
-    The 257th character arrives in a fragment that crosses the bound: it is neither
-    skipped nor sliced into a kept 256-character name. The kept 256-character name
-    is cut to 64 by the chat() parser, as before.
-    """
+def _name_budget_chunks(*, with_crossing: bool) -> list[dict[str, Any]]:
+    """call_0, call_1 (name of exactly 256), call_2 (257, if any) and call_3, interleaved."""
     pad = "e" * ((_NAME_BUDGET - len("memory.store")) // 2)
     chunks = [
         _tools_chunk(_frag(0, call_id="call_0", name="memory.store", arguments='{"key": "first"}')),
         _tools_chunk(_frag(1, call_id="call_1", name="memory.store", arguments='{"key": ')),
         _tools_chunk(_frag(1, name=pad)),
-        _tools_chunk(_frag(2, call_id="call_2", name="memory.store", arguments='{"key": "x"}')),
-        _tools_chunk(_frag(2, name=pad), _frag(1, name=pad, arguments='"second"}')),
-        _tools_chunk(_frag(2, name=pad + "e")),
+    ]
+    if with_crossing:
+        chunks.append(
+            _tools_chunk(_frag(2, call_id="call_2", name="memory.store", arguments='{"key": "x"}'))
+        )
+    chunks.append(
+        _tools_chunk(
+            *([_frag(2, name=pad)] if with_crossing else []),
+            _frag(1, name=pad, arguments='"second"}'),
+        )
+    )
+    if with_crossing:
+        chunks.append(_tools_chunk(_frag(2, name=pad + "e")))
+    chunks += [
         _tools_chunk(_frag(3, call_id="call_3", name="memory.recall", arguments='{"key": "last"}')),
         _finish_tools(),
     ]
-    wire.route = _sse_route(_openai_frames(chunks))
-    final = _final(await _drain(build(provider), [_MEMORY_TOOL]))
-    assert _calls(final) == [
-        ("memory", "store", {"key": "first"}, "call_0"),
-        ("memory", "store" + "e" * 52, {"key": "second"}, "call_1"),
-        ("memory", "recall", {"key": "last"}, "call_3"),
+    return chunks
+
+
+@pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
+async def test_llm_audit_stream_tool_name_over_256_chars_rejects_reply(
+    provider: str, wire: _Wire, build: Callable[[str], Any]
+) -> None:
+    """Name fragments of 256 characters are kept; 257 reject the whole reply (GH-25 D2).
+
+    The 257th character arrives in a fragment that crosses the bound: it is neither
+    skipped nor sliced into a kept 256-character name (either would let the reply
+    through). The kept 256-character name is cut to 64 by the chat() parser, as
+    before (shown by the same reply without the crossing call).
+    """
+    client = build(provider)
+    outcomes = []
+    for with_crossing in (False, True):
+        wire.route = _sse_route(_openai_frames(_name_budget_chunks(with_crossing=with_crossing)))
+        outcomes.append(await _calls_or_code(client))
+    assert outcomes == [
+        [
+            ("memory", "store", {"key": "first"}, "call_0"),
+            ("memory", "store" + "e" * 52, {"key": "second"}, "call_1"),
+            ("memory", "recall", {"key": "last"}, "call_3"),
+        ],
+        "malformed_response",
     ]
 
 
@@ -622,16 +667,13 @@ def _huge_name_chunks() -> Iterator[dict[str, Any]]:
 
 
 @pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_audit_stream_huge_name_fragments_complete_and_drop_call(
+async def test_llm_audit_stream_huge_name_fragments_reject_reply(
     provider: str, wire: _Wire, build: Callable[[str], Any]
 ) -> None:
-    """5,000,000 characters of name fragments: the stream completes and only that call goes."""
+    """5,000,000 characters of name fragments: the reply is rejected (GH-25 D2), no crash."""
     wire.route = _sse_route(_openai_frames(_huge_name_chunks()))
-    final = _final(await _drain(build(provider), [_MEMORY_TOOL]))
-    assert _calls(final) == [
-        ("memory", "store", {"key": "a"}, "call_0"),
-        ("memory", "recall", {"key": "c"}, "call_2"),
-    ]
+    received, error = await _drain_error(build(provider), [_MEMORY_TOOL])
+    assert (received, error.code) == ([], "malformed_response")
 
 
 # The joined name alone would be 5,000,000 bytes (twice that while it grows); reading
@@ -646,8 +688,9 @@ async def test_llm_audit_stream_huge_name_fragments_never_accumulated(
 ) -> None:
     """Reading 50 name fragments of 100000 characters never holds their joined name.
 
-    The traced memory peak while the stream is read stays below 3 MB (one wire event
-    is about 100 KB; an unbounded name would be 5 MB, twice that while it grows).
+    The traced memory peak while the stream is read (until the reply is rejected,
+    GH-25) stays below 3 MB (one wire event is about 100 KB; an unbounded name
+    would be 5 MB, twice that while it grows).
     """
     client = build(provider)
     warm_up = [
@@ -663,25 +706,18 @@ async def test_llm_audit_stream_huge_name_fragments_never_accumulated(
     try:
         tracemalloc.reset_peak()
         before, _ = tracemalloc.get_traced_memory()
-        items = await _drain(client, [_MEMORY_TOOL])
+        _, error = await _drain_error(client, [_MEMORY_TOOL])
         _, peak = tracemalloc.get_traced_memory()
     finally:
         if started:
             tracemalloc.stop()
-    assert (type(items[-1]) is LLMResponse, peak - before < _NAME_PEAK_LIMIT) == (True, True), (
+    assert (error.code, peak - before < _NAME_PEAK_LIMIT) == ("malformed_response", True), (
         peak - before
     )
 
 
-@pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_audit_stream_single_argument_fragment_over_budget_dropped(
-    provider: str, wire: _Wire, build: Callable[[str], Any]
-) -> None:
-    """One fragment of exactly 65536 characters parses; one of 65537 drops its call.
-
-    Both are whitespace-padded valid JSON (small once parsed, so the 16384 check
-    passes); the 65537-character fragment is not sliced into a kept call either.
-    """
+def _single_fragment_chunks(*, with_over_budget: bool) -> list[dict[str, Any]]:
+    """call_0 (one 65536-char fragment), call_1 (one 65537-char fragment, if any), call_2."""
     chunks = [
         _tools_chunk(
             _frag(
@@ -691,58 +727,93 @@ async def test_llm_audit_stream_single_argument_fragment_over_budget_dropped(
                 arguments=_padded('{"key": "a"', _ARG_BUDGET),
             )
         ),
-        _tools_chunk(
-            _frag(
-                1,
-                call_id="call_1",
-                name="memory.store",
-                arguments=_padded('{"key": "b"}', _ARG_BUDGET + 1, tail=""),
+    ]
+    if with_over_budget:
+        chunks.append(
+            _tools_chunk(
+                _frag(
+                    1,
+                    call_id="call_1",
+                    name="memory.store",
+                    arguments=_padded('{"key": "b"}', _ARG_BUDGET + 1, tail=""),
+                )
             )
-        ),
+        )
+    chunks += [
         _tools_chunk(_frag(2, call_id="call_2", name="memory.recall", arguments='{"key": "c"}')),
         _finish_tools(),
     ]
-    wire.route = _sse_route(_openai_frames(chunks))
-    final = _final(await _drain(build(provider), [_MEMORY_TOOL]))
-    assert _calls(final) == [
-        ("memory", "store", {"key": "a"}, "call_0"),
-        ("memory", "recall", {"key": "c"}, "call_2"),
-    ]
+    return chunks
 
 
 @pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_audit_stream_argument_fragment_crossing_budget_drops_call(
+async def test_llm_audit_stream_single_argument_fragment_over_budget_rejects_reply(
     provider: str, wire: _Wire, build: Callable[[str], Any]
 ) -> None:
-    """Across fragments: exactly 65536 parses; a fragment crossing 65536 drops the call.
+    """One fragment of exactly 65536 characters parses; one of 65537 rejects the reply.
 
-    call_1's crossing fragment closes the JSON inside the budget ("}" then spaces);
-    call_2's crossing fragment is whitespace and a later "}" would still fit. Both
-    are dropped; the calls at exactly the budget and after them stay.
+    Both are whitespace-padded valid JSON (small once parsed, so the 16384 check
+    passes); the 65537-character fragment is not sliced into a kept call either
+    (that would let the reply through). GH-25 (D2): rejected, no longer dropped.
     """
+    client = build(provider)
+    outcomes = []
+    for with_over_budget in (False, True):
+        chunks = _single_fragment_chunks(with_over_budget=with_over_budget)
+        wire.route = _sse_route(_openai_frames(chunks))
+        outcomes.append(await _calls_or_code(client))
+    assert outcomes == [
+        [("memory", "store", {"key": "a"}, "call_0"), ("memory", "recall", {"key": "c"}, "call_2")],
+        "malformed_response",
+    ]
+
+
+def _crossing_chunks(crossing: int | None) -> list[dict[str, Any]]:
+    """call_0 (exactly the budget across fragments), crossing call 1 or 2 (or none), call_3."""
     exact = _pieces(_padded('{"key": "a"', _ARG_BUDGET), 16384)
     head_b = _pieces(_padded('{"key": "b"', _ARG_BUDGET - 6, tail=""), 16384)
     head_c = _pieces(_padded('{"key": "c"', _ARG_BUDGET - 6, tail=""), 16384)
-    chunks = [
-        _tools_chunk(_frag(0, call_id="call_0", name="memory.store", arguments=exact[0])),
-        _tools_chunk(_frag(1, call_id="call_1", name="memory.store", arguments=head_b[0])),
-        _tools_chunk(_frag(2, call_id="call_2", name="memory.store", arguments=head_c[0])),
+    rows = [
+        [_frag(0, call_id="call_0", name="memory.store", arguments=exact[0])],
+        [_frag(1, call_id="call_1", name="memory.store", arguments=head_b[0])],
+        [_frag(2, call_id="call_2", name="memory.store", arguments=head_c[0])],
     ]
     for a, b, c in zip(exact[1:], head_b[1:], head_c[1:], strict=True):
-        chunks.append(
-            _tools_chunk(_frag(0, arguments=a), _frag(1, arguments=b), _frag(2, arguments=c))
-        )
-    chunks += [
-        _tools_chunk(_frag(1, arguments="}" + " " * 10), _frag(2, arguments=" " * 10)),
-        _tools_chunk(_frag(2, arguments="}")),
-        _tools_chunk(_frag(3, call_id="call_3", name="memory.recall", arguments='{"key": "d"}')),
-        _finish_tools(),
+        rows.append([_frag(0, arguments=a), _frag(1, arguments=b), _frag(2, arguments=c)])
+    rows += [
+        [_frag(1, arguments="}" + " " * 10), _frag(2, arguments=" " * 10)],
+        [_frag(2, arguments="}")],
+        [_frag(3, call_id="call_3", name="memory.recall", arguments='{"key": "d"}')],
     ]
-    wire.route = _sse_route(_openai_frames(chunks))
-    final = _final(await _drain(build(provider), [_MEMORY_TOOL]))
-    assert _calls(final) == [
-        ("memory", "store", {"key": "a"}, "call_0"),
-        ("memory", "recall", {"key": "d"}, "call_3"),
+    chunks = []
+    for row in rows:
+        kept = [fragment for fragment in row if fragment["index"] in (0, 3, crossing)]
+        if kept:
+            chunks.append(_tools_chunk(*kept))
+    chunks.append(_finish_tools())
+    return chunks
+
+
+@pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
+async def test_llm_audit_stream_argument_fragment_crossing_budget_rejects_reply(
+    provider: str, wire: _Wire, build: Callable[[str], Any]
+) -> None:
+    """Across fragments: exactly 65536 parses; a fragment crossing 65536 rejects the reply.
+
+    call_1's crossing fragment closes the JSON inside the budget ("}" then spaces);
+    call_2's crossing fragment is whitespace and a later "}" would still fit. Each
+    rejects its reply (GH-25 D2) in a reply of its own, so neither can hide behind
+    the other; the reply with only the call at exactly the budget is kept.
+    """
+    client = build(provider)
+    outcomes = []
+    for crossing in (None, 1, 2):
+        wire.route = _sse_route(_openai_frames(_crossing_chunks(crossing)))
+        outcomes.append(await _calls_or_code(client))
+    assert outcomes == [
+        [("memory", "store", {"key": "a"}, "call_0"), ("memory", "recall", {"key": "d"}, "call_3")],
+        "malformed_response",
+        "malformed_response",
     ]
 
 

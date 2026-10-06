@@ -219,8 +219,14 @@ Security notes:
   reply's cleanup and credential redaction, word by word, a trailing
   ``Bearer`` held for the next word), so a key never streams in part; an
   answer that doesn't complete (a ``stopped`` or ``error`` run, an agent
-  that raised, a chat trashed meanwhile) ends at its last ASCII whitespace,
-  its unfinished last word (maybe a key cut short) never sent;
+  that raised, a chat trashed meanwhile, GH-25: a ``final`` run whose
+  answer an output cap cut, ``AgentResult.truncated``) ends at its last
+  ASCII whitespace, its unfinished last word (maybe a key cut short) never
+  sent, as the agent's stored reply ends. A ``timeout`` after text stores
+  that text, cut the same way, before the error reply, so the deltas end at
+  the stored partial's last word and ``message_saved`` names the error
+  reply. A ``malformed_response`` failure is reported like any coded LLM
+  error (``error{malformed_response}``, never ``internal_error``).
   ``tool_call`` and ``confirm`` carry the JSON response's redacted items. A
   frame that can't be built is dropped (its event name and the exception
   class logged, never its payload) and the run goes on: building or queueing
@@ -4036,9 +4042,10 @@ _CHAT_GONE_PAYLOAD: Final = ErrorPayload(
     code="chat_not_found", message=_CHAT_NOT_FOUND_BODY["detail"]
 )
 # The run outcomes whose last answer ended as the model meant it (C11): its last
-# word is sent. Any other end (stopped, error) cuts it, as the stored stopped
-# reply is cut. A confirmation refused at the pending limit is stored as error
-# but its run (awaiting_confirmation) ended its answer with the gated call.
+# word is sent, unless an output cap cut the answer (GH-25: ``result.truncated``).
+# Any other end (stopped, error) cuts it, as the stored stopped reply is cut. A
+# confirmation refused at the pending limit is stored as error but its run
+# (awaiting_confirmation) ended its answer with the gated call.
 _COMPLETE_ANSWERS: Final[frozenset[AgentStatus]] = frozenset(
     {"final", "limit_reached", "awaiting_confirmation"}
 )
@@ -4200,8 +4207,9 @@ async def _streamed_run(
     The answer's held text is sent once the outcome is known (a trashed chat
     only shows when the store raises): whole for a stored ``final``,
     ``limit_reached`` or ``awaiting_confirmation`` run, without its
-    unfinished last word for any other end (C11: a key the stop or error cut
-    short is never shown in part).
+    unfinished last word for any other end and for a ``truncated`` final
+    answer (C11, GH-25: a key the stop, error or output cap cut short is
+    never shown in part).
     """
     chat_id = run.chat.id
     try:
@@ -4220,6 +4228,9 @@ async def _streamed_run(
                 complete=stored is not None
                 and result is not None
                 and result.status in _COMPLETE_ANSWERS
+                # GH-25 (D7): a final answer an output cap cut is stored without
+                # its unfinished last word, so the stream drops it as well.
+                and not result.truncated
             )
         if result is None:
             frames.send("error", _INTERNAL_ERROR_PAYLOAD)

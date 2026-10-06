@@ -1,7 +1,8 @@
 """Tests for GH-242 section 1: coded LLM errors and how each provider client maps SDK failures.
 
 Spec (GH-242 contract section 1, #139 sections 1 and 5):
-- ``admino.models.LLMErrorCode`` / ``LLM_ERROR_CODES``: the seven error codes.
+- ``admino.models.LLMErrorCode`` / ``LLM_ERROR_CODES``: the eight error codes (GH-25 adds
+  ``malformed_response``, not retryable).
 - ``LLMError(..., code=..., retry_after_s=...)``: a coded error is always user-facing,
   ``retryable`` is True exactly for provider_unavailable / rate_limited / timeout, and an
   uncoded ``LLMError("x", user_facing=True)`` stays valid.
@@ -74,6 +75,7 @@ _ALL_CODES = frozenset(
         "timeout",
         "residency_blocked",
         "context_too_long",
+        "malformed_response",
     }
 )
 _RETRYABLE_CODES = frozenset({"provider_unavailable", "rate_limited", "timeout"})
@@ -549,16 +551,16 @@ async def _raise_failure(kind: str, failure: _Failure, monkeypatch: pytest.Monke
 
 
 class TestLLMErrorCodeCatalogue:
-    """The seven codes live in admino.models."""
+    """The eight codes live in admino.models."""
 
-    def test_models_llm_error_codes_constant_is_frozenset_of_seven_codes(self) -> None:
-        """LLM_ERROR_CODES is a frozenset of exactly the seven codes."""
+    def test_models_llm_error_codes_constant_is_frozenset_of_eight_codes(self) -> None:
+        """LLM_ERROR_CODES is a frozenset of exactly the eight codes."""
         codes = models_mod.LLM_ERROR_CODES
         assert isinstance(codes, frozenset)
         assert codes == _ALL_CODES
 
-    def test_models_llm_error_code_literal_lists_the_seven_codes(self) -> None:
-        """LLMErrorCode is a Literal over exactly the seven codes."""
+    def test_models_llm_error_code_literal_lists_the_eight_codes(self) -> None:
+        """LLMErrorCode is a Literal over exactly the eight codes."""
         alias = models_mod.LLMErrorCode
         literal = getattr(alias, "__value__", alias)
         assert set(get_args(literal)) == _ALL_CODES

@@ -27,12 +27,13 @@ What these tests pin (each for OpenAI and vLLM unless noted):
 - Tool calls (OpenAI, vLLM and Infomaniak): fragments accumulated by index (id
   only in the first fragment, the name split, arguments split inside a JSON
   string, inside an escape sequence and between the halves of a surrogate pair;
-  two calls interleaved), returned in index order, never as deltas; invalid
-  calls dropped and valid ones kept (bad JSON, non-object JSON, depth 5, 33
-  keys, a 2049-character top-level string, more than 16384 characters of JSON,
-  a name without a dot, a schema-invalid name), the dropped call's arguments
-  never logged; at most 128 calls (the first 128 indexes); a call whose
-  arguments grow past 65536 characters is dropped, the others kept.
+  two calls interleaved), returned in index order, never as deltas. GH-25
+  (D2): one invalid call between two valid ones rejects the whole reply with
+  ``malformed_response`` instead of the final response (bad JSON, non-object
+  JSON, depth 5, 33 keys, a 2049-character top-level string, more than 16384
+  characters of JSON, a name without a dot, a schema-invalid name), its
+  arguments never logged; so do more than 128 calls (130 indexes) and a call
+  whose arguments grow past 65536 characters (59010 characters still parse).
 - ``done`` is False on ``finish_reason == "tool_calls"`` and True otherwise;
   the model is the stream's (sanitized, at most 200 characters) or the
   configured one when the stream names none.
@@ -819,7 +820,7 @@ def _nested(levels: int) -> dict[str, Any]:
     return value
 
 
-# (name, JSON arguments) of one invalid call each: every one is dropped.
+# (name, JSON arguments) of one invalid call each: every one rejects the reply (GH-25).
 _INVALID_CALLS: Final[dict[str, tuple[str, str]]] = {
     "bad-json": ("memory.store", '{"key": "' + _ARG_MARKER),
     "non-object-json": ("memory.store", json.dumps([_ARG_MARKER])),
@@ -837,14 +838,18 @@ _INVALID_CALLS: Final[dict[str, tuple[str, str]]] = {
 
 @pytest.mark.parametrize("kind", list(_INVALID_CALLS))
 @pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_stream_invalid_tool_call_dropped_valid_kept(
+async def test_llm_stream_invalid_tool_call_rejects_whole_reply(
     provider: str,
     kind: str,
     wire: _Wire,
     build: Callable[..., Any],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """The invalid call between two valid ones is dropped; its arguments are never logged."""
+    """The invalid call between two valid ones rejects the whole reply (GH-25 D2).
+
+    ``malformed_response`` (raised ``from None``) instead of a final response; the
+    invalid call's arguments reach neither the error nor any log record.
+    """
     caplog.set_level(logging.DEBUG)
     name, arguments = _INVALID_CALLS[kind]
     chunks = [
@@ -854,19 +859,22 @@ async def test_llm_stream_invalid_tool_call_dropped_valid_kept(
         _chunk({}, finish_reason="tool_calls"),
     ]
     wire.answer_with(_sse(chunks))
-    items = await _drain(build(provider), [_MEMORY_TOOL])
-    assert _calls(_final(items)) == [
-        ("memory", "store", {"key": "first"}, "call_0"),
-        ("memory", "recall", {"key": "third"}, "call_2"),
-    ]
+    received, error = await _drain_error(build(provider))
+    assert (received, error.code, error.__cause__, error.__suppress_context__) == (
+        [],
+        "malformed_response",
+        None,
+        True,
+    )
     assert _ARG_MARKER not in caplog.text
+    assert _ARG_MARKER not in f"{error} {error!r} {error.message}"
 
 
 @pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_stream_at_most_128_tool_calls_first_indexes_kept(
+async def test_llm_stream_more_than_128_tool_calls_reject_reply(
     provider: str, wire: _Wire, build: Callable[..., Any]
 ) -> None:
-    """130 tool-call indexes: the calls of indexes 0..127 only, in order."""
+    """130 tool-call indexes: the reply is rejected (GH-25 D2), not cut to the first 128."""
     fragments = [
         _frag(i, call_id=f"call_{i}", name="memory.store", arguments=json.dumps({"n": i}))
         for i in range(130)
@@ -874,33 +882,63 @@ async def test_llm_stream_at_most_128_tool_calls_first_indexes_kept(
     chunks = [_tools_chunk(*fragments[start : start + 10]) for start in range(0, 130, 10)]
     chunks.append(_chunk({}, finish_reason="tool_calls"))
     wire.answer_with(_sse(chunks))
-    final = _final(await _drain(build(provider), [_MEMORY_TOOL]))
-    assert [call.args["n"] for call in final.tool_calls] == list(range(128))
+    received, error = await _drain_error(build(provider))
+    assert (received, error.code) == ([], "malformed_response")
 
 
-@pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
-async def test_llm_stream_tool_arguments_past_65536_chars_dropped(
-    provider: str, wire: _Wire, build: Callable[..., Any]
-) -> None:
-    """Whitespace-padded JSON: 59010 chars is kept, 72010 chars stops growing and is dropped."""
+def _padded_argument_chunks(*, with_overflow: bool) -> list[dict[str, Any]]:
+    """Whitespace-padded JSON: call_0 59010 chars, call_2 small, call_1 (if any) 72010 chars."""
     pad = " " * 8000
     chunks = [
         _tools_chunk(_frag(0, call_id="call_0", name="memory.store", arguments='{"key": "a"')),
-        _tools_chunk(_frag(1, call_id="call_1", name="memory.store", arguments='{"key": "b"')),
-        _tools_chunk(_frag(2, call_id="call_2", name="memory.store", arguments='{"key": "c"}')),
     ]
+    if with_overflow:
+        chunks.append(
+            _tools_chunk(_frag(1, call_id="call_1", name="memory.store", arguments='{"key": "b"'))
+        )
+    chunks.append(
+        _tools_chunk(_frag(2, call_id="call_2", name="memory.store", arguments='{"key": "c"}'))
+    )
     for _ in range(7):
-        chunks.append(_tools_chunk(_frag(0, arguments=pad), _frag(1, arguments=pad)))
-    chunks.append(_tools_chunk(_frag(0, arguments=" " * 3000 + "}"), _frag(1, arguments=pad)))
-    chunks.append(_tools_chunk(_frag(1, arguments=pad)))
-    chunks.append(_tools_chunk(_frag(1, arguments="}")))
+        chunks.append(
+            _tools_chunk(
+                _frag(0, arguments=pad), *([_frag(1, arguments=pad)] if with_overflow else [])
+            )
+        )
+    chunks.append(
+        _tools_chunk(
+            _frag(0, arguments=" " * 3000 + "}"),
+            *([_frag(1, arguments=pad)] if with_overflow else []),
+        )
+    )
+    if with_overflow:
+        chunks.append(_tools_chunk(_frag(1, arguments=pad)))
+        chunks.append(_tools_chunk(_frag(1, arguments="}")))
     chunks.append(_chunk({}, finish_reason="tool_calls"))
-    wire.answer_with(_sse(chunks))
-    final = _final(await _drain(build(provider), [_MEMORY_TOOL]))
-    assert _calls(final) == [
-        ("memory", "store", {"key": "a"}, "call_0"),
-        ("memory", "store", {"key": "c"}, "call_2"),
-    ]
+    return chunks
+
+
+@pytest.mark.parametrize("provider", OPENAI_COMPATIBLE)
+async def test_llm_stream_tool_arguments_past_65536_chars_reject_reply(
+    provider: str, wire: _Wire, build: Callable[..., Any]
+) -> None:
+    """Whitespace-padded JSON: 59010 chars is kept; a call reaching 72010 chars rejects the reply.
+
+    GH-25 (D2): the overflowing call no longer just stops growing and gets dropped;
+    the reply around it is rejected with ``malformed_response``.
+    """
+    client = build(provider)
+    wire.answer_with(
+        _sse(_padded_argument_chunks(with_overflow=False)),
+        _sse(_padded_argument_chunks(with_overflow=True)),
+    )
+    final = _final(await _drain(client, [_MEMORY_TOOL]))
+    received, error = await _drain_error(client)
+    assert (_calls(final), received, error.code) == (
+        [("memory", "store", {"key": "a"}, "call_0"), ("memory", "store", {"key": "c"}, "call_2")],
+        [],
+        "malformed_response",
+    )
 
 
 # ===========================================================================

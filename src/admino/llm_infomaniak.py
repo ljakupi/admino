@@ -2,7 +2,8 @@
 
 ``InfomaniakClient`` wraps the official ``openai`` SDK pointed at
 ``https://api.infomaniak.com/2/ai/{product_id}/openai/v1`` and serves
-``config.infomaniak_model``. It reuses the OpenAI conversion/parse helpers, the
+``config.infomaniak_model``. It reuses the OpenAI conversion helpers, the
+``chat()`` response builder (``llm_openai._completion_response``), the
 OpenAI-compatible stream reader (``llm_openai._stream_reply``: tool-call
 fragments accumulated per index, at most 128 calls, 256 name and 65536 argument
 characters each, parsed once the stream ended) and the shared ``admino.llm``
@@ -15,10 +16,12 @@ Inputs:
   only; when unset, the product is discovered with ``GET /1/ai``.
 Outputs:
 - ``chat()`` returns one sanitized ``LLMResponse`` (content, tool_calls, model,
-  done, usage). ``chat_stream()`` yields ``LLMStreamDelta`` pieces and then
-  exactly one final ``LLMResponse``. ``list_models()`` returns the served model
-  ids (``[]`` on any failure). ``discover_product_id()`` / ``resolve_product_id()``
-  return the product id used in every product-scoped URL.
+  done, usage, truncated). ``chat_stream()`` yields ``LLMStreamDelta`` pieces and
+  then exactly one final ``LLMResponse``, within ``config.stream_deadline_s`` of
+  its first iteration (product discovery and opening included, GH-25).
+  ``list_models()`` returns the served model ids (``[]`` on any failure).
+  ``discover_product_id()`` / ``resolve_product_id()`` return the product id
+  used in every product-scoped URL.
 
 Construction never raises for a missing token, product id or model and performs
 no I/O: those problems surface as coded ``LLMError`` chat replies (GH-242). The
@@ -30,11 +33,14 @@ constructed (discovery, model listing and the SDK all go through it).
 Error codes: a missing token, a non-digit INFOMANIAK_PRODUCT_ID, no AI product
 or several of them are ``not_configured``; a missing model ``missing_model``.
 Chat, stream (also mid-stream) and discovery failures map through the shared
-catalogue: a timeout is ``timeout``, a transport error ``provider_unavailable``,
+catalogue: a timeout (the stream deadline included) is ``timeout``, a transport
+or stream error and a mid-stream ``error`` event ``provider_unavailable``,
 401/403 ``not_configured``, 404 ``missing_model`` (chat only; a discovery 404 is
 internal), 429 ``rate_limited`` and 5xx ``provider_unavailable`` (both with the
 response's Retry-After), a chat 400/413 whose input exceeds the context
-``context_too_long``; other statuses stay internal.
+``context_too_long``; other statuses stay internal. A reply the client can't
+use (undecodable, an object the SDK can't build, a null stream line,
+wrong-typed, a tool call that doesn't parse) is ``malformed_response`` (GH-25).
 
 Request shape follows Infomaniak's documented schema for
 ``POST /2/ai/{product_id}/openai/v1/chat/completions``: the output cap is sent as
@@ -73,15 +79,19 @@ Security notes:
   and project headers are cleared).
 - The product id must be ASCII digits before it is placed in a URL.
 - LLM output is sanitized (control/bidi characters and lone surrogates
-  stripped, 65536-char cap). A stream's deltas total at most 65536 characters
-  too; orphan ``</think>`` tags never reset that budget.
+  stripped, 65536-char cap, never cut at a word). A stream's deltas total at
+  most 65536 characters too; orphan ``</think>`` tags never reset that budget.
+  ``truncated`` is True for ``finish_reason == "length"`` or when either cap
+  dropped answer text (reasoning never counts). Tool arguments are bounded,
+  then cleaned (``sanitize_tool_args``: a lone surrogate becomes U+FFFD).
 - Streamed tool calls share the OpenAI reader's bounds (128 calls, 256-char
-  names, 65536-char arguments; a call crossing a bound is dropped).
+  names, 65536-char arguments; crossing one rejects the reply).
 - Does not import from agent.py, server.py, or tools/.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -92,8 +102,10 @@ import httpx
 
 from admino.llm import (
     _MAX_CONTENT_LENGTH,
+    SDK_DECODE_ERRORS,
     LLMError,
     LLMResponse,
+    malformed_response_error,
     missing_model_error,
     not_configured_error,
     output_token_cap,
@@ -104,12 +116,12 @@ from admino.llm import (
     validate_tools_payload,
 )
 
-# The endpoint is OpenAI-compatible: reuse the OpenAI translation helpers and
-# stream reader verbatim.
+# The endpoint is OpenAI-compatible: reuse the OpenAI translation helpers, chat()
+# response builder and stream reader verbatim.
 from admino.llm_openai import (
+    _completion_response,
     _convert_messages_to_openai,
     _convert_tools_to_openai,
-    _parse_openai_tool_calls,
     _stream_reply,
     _usage,
 )
@@ -148,7 +160,6 @@ _SEVERAL_PRODUCTS_MESSAGE: Final = (
 )
 _DISCOVERY_FAILED_MESSAGE: Final = "Infomaniak product discovery failed"
 _DISCOVERY_MALFORMED_MESSAGE: Final = "Infomaniak product discovery returned unexpected data"
-_UNEXPECTED_ERROR_MESSAGE: Final = "Infomaniak returned an unexpected error"
 
 _THINK_OPEN: Final = "<think>"
 _THINK_CLOSE: Final = "</think>"
@@ -240,8 +251,11 @@ async def discover_product_id(token: str, *, timeout_s: float = _METADATA_TIMEOU
 def _api_error(exc: Exception) -> LLMError:
     """Map an SDK / transport failure to the fixed catalogue (no message or body).
 
-    The SDK's error code and message only classify a context-length 400; they
-    are never logged or kept.
+    A status maps through ``sdk_status_error``: the SDK's error code and message
+    only classify a context-length 400; they are never logged or kept. Anything
+    without a status is ``timeout`` for a timeout (the stream deadline
+    included), else ``provider_unavailable``: a connection, transport or stream
+    failure, or the SDK's error for a mid-stream ``error`` event (GH-25).
     """
     import openai
 
@@ -258,12 +272,10 @@ def _api_error(exc: Exception) -> LLMError:
             key_env=_AUTH_ENV_VAR,
             key_noun=_KEY_NOUN,
         )
-    if not isinstance(exc, openai.APIConnectionError | httpx.TransportError):
-        logger.warning("Infomaniak request failed: %s", type(exc).__name__)
-        return LLMError(_UNEXPECTED_ERROR_MESSAGE)
-    logger.warning("Infomaniak request failed: %s (no response)", type(exc).__name__)
-    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream.
-    timed_out = isinstance(exc, openai.APITimeoutError | httpx.TimeoutException)
+    logger.warning("Infomaniak request failed: %s (no status)", type(exc).__name__)
+    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream;
+    # TimeoutError is the stream deadline (GH-25).
+    timed_out = isinstance(exc, openai.APITimeoutError | httpx.TimeoutException | TimeoutError)
     return provider_status_error(
         _LABEL, None, key_env=_AUTH_ENV_VAR, key_noun=_KEY_NOUN, timed_out=timed_out
     )
@@ -292,7 +304,8 @@ class _ThinkFilter:
     by a later orphan ``</think>``: that text is capped at the content limit in
     total, a budget no orphan tag resets, so a hostile stream can't send more
     than 65536 delta characters by repeating orphan tags. Without an orphan tag
-    the returned text is exactly ``answer``.
+    the returned text is exactly ``answer``. ``truncated`` tells whether either
+    cap dropped answer text (reasoning never counts).
     """
 
     def __init__(self) -> None:
@@ -302,11 +315,17 @@ class _ThinkFilter:
         self._parts: list[str] = []
         self._length = 0
         self._emitted = 0
+        self._dropped = False
 
     @property
     def answer(self) -> str:
         """The visible answer collected so far."""
         return "".join(self._parts)
+
+    @property
+    def truncated(self) -> bool:
+        """True once the answer cap or the delta budget dropped answer text."""
+        return self._dropped
 
     def feed(self, text: str) -> str:
         """Consume a sanitized piece of text; return the newly visible answer text."""
@@ -350,28 +369,22 @@ class _ThinkFilter:
 
     def _emit(self, text: str) -> str:
         """Return what of ``text`` fits the stream's delta budget (never reset)."""
-        text = text[: _MAX_CONTENT_LENGTH - self._emitted]
-        self._emitted += len(text)
-        return text
+        kept = text[: _MAX_CONTENT_LENGTH - self._emitted]
+        self._dropped = self._dropped or len(kept) < len(text)
+        self._emitted += len(kept)
+        return kept
 
     def _keep(self, text: str) -> str:
         """Append visible text to the answer (trim + cap); return what was kept."""
         if self._trim:
             text = text.lstrip()
             self._trim = not text
-        text = text[: _MAX_CONTENT_LENGTH - self._length]
-        if text:
-            self._parts.append(text)
-            self._length += len(text)
-        return text
-
-
-def _answer_text(raw: str) -> str:
-    """Sanitize a complete reply and remove its reasoning."""
-    think = _ThinkFilter()
-    think.feed(strip_control_chars(raw))
-    think.finish()
-    return think.answer
+        kept = text[: _MAX_CONTENT_LENGTH - self._length]
+        self._dropped = self._dropped or len(kept) < len(text)
+        if kept:
+            self._parts.append(kept)
+            self._length += len(kept)
+        return kept
 
 
 class InfomaniakClient:
@@ -411,6 +424,7 @@ class InfomaniakClient:
         self._model: str = config.infomaniak_model or ""
         self._timeout_s: float = float(config.timeout_s)
         self._max_tokens: int = config.max_response_tokens
+        self._stream_deadline_s: float = config.stream_deadline_s
         self._client: AsyncOpenAI | None = None
 
     def _require_token(self) -> str:
@@ -497,10 +511,12 @@ class InfomaniakClient:
                 None sends the configured cap.
 
         Returns:
-            Parsed LLMResponse with reasoning removed.
+            Parsed LLMResponse with reasoning removed (``truncated`` for
+            ``finish_reason == "length"`` or an answer past the 65536-character cap).
 
         Raises:
-            LLMError: Catalogue errors (user-facing or internal, never a body).
+            LLMError: Catalogue errors (user-facing or internal, never a body),
+                ``malformed_response`` for a reply it can't use.
             ValueError: If stream=True is passed, or ``max_tokens`` is below 1,
                 a bool or not an int (before any request or discovery).
         """
@@ -518,18 +534,16 @@ class InfomaniakClient:
             response = await client.chat.completions.create(**kwargs, stream=False)
         except openai.APIError as exc:
             raise _api_error(exc) from None
-
-        model = strip_control_chars(response.model or self._model)[:200]
-        usage = _usage(response.usage)
-        if not response.choices:
-            return LLMResponse(model=model, done=True, usage=usage)
-        choice = response.choices[0]
-        return LLMResponse(
-            content=_answer_text(choice.message.content or ""),
-            tool_calls=_parse_openai_tool_calls(choice.message.tool_calls),
-            model=model,
-            done=choice.finish_reason != "tool_calls",
-            usage=usage,
+        except SDK_DECODE_ERRORS:
+            # The SDK decodes the 200 body and builds its objects itself and
+            # raises these raw (a reserved key such as ``_fields_set`` included).
+            raise malformed_response_error(_LABEL) from None
+        return _completion_response(
+            response,
+            _ThinkFilter(),
+            label=_LABEL,
+            configured_model=self._model,
+            usage=_usage(getattr(response, "usage", None)),
         )
 
     async def chat_stream(
@@ -540,7 +554,9 @@ class InfomaniakClient:
         """Stream a chat reply: answer deltas, then exactly one final LLMResponse.
 
         Deltas are sanitized with reasoning removed and stop at the content cap.
-        Tool-call fragments are accumulated per index and parsed at the end.
+        Tool-call fragments are accumulated per index and parsed at the end. The
+        call must end within ``stream_deadline_s`` of its first iteration
+        (product discovery and opening the stream included).
 
         Args:
             messages: Conversation messages.
@@ -548,23 +564,31 @@ class InfomaniakClient:
 
         Yields:
             ``LLMStreamDelta`` pieces, then the final ``LLMResponse`` (content,
-            tool_calls, model, usage, done).
+            tool_calls, model, usage, done, truncated).
 
         Raises:
             LLMError: Catalogue errors; HTTP errors are raised before any delta,
-                a transport failure or timeout may also come after one.
+                a transport failure, timeout (the deadline included), error
+                event or malformed reply may also come after one.
         """
         import openai
 
-        client, kwargs = await self._prepare(messages, tools, self._max_tokens)
+        deadline = asyncio.get_running_loop().time() + self._stream_deadline_s
         try:
-            stream = await client.chat.completions.create(
-                **kwargs, stream=True, stream_options={"include_usage": True}
-            )
-        except openai.APIError as exc:
+            async with asyncio.timeout_at(deadline):
+                client, kwargs = await self._prepare(messages, tools, self._max_tokens)
+                stream = await client.chat.completions.create(
+                    **kwargs, stream=True, stream_options={"include_usage": True}
+                )
+        except (openai.APIError, TimeoutError) as exc:
             raise _api_error(exc) from None
         reply = _stream_reply(
-            stream, _ThinkFilter(), configured_model=self._model, stream_error=_api_error
+            stream,
+            _ThinkFilter(),
+            label=_LABEL,
+            configured_model=self._model,
+            deadline=deadline,
+            stream_error=_api_error,
         )
         # aclosing: closing this generator early closes the HTTP stream at once.
         async with aclosing(reply) as items:
