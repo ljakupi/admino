@@ -98,8 +98,12 @@ Security notes:
   waits for its next item it races the stop, so a stop closes the provider's
   stream at once even when nothing arrives. A dispatch in progress is never
   cancelled: it finishes and is recorded first. A stopped run ends with status
-  "stopped", keeping the interrupted call's forwarded text as its reply. Only
-  a content-free "run stopped" line with the tool-call count is logged.
+  "stopped", keeping the interrupted call's forwarded text up to its last
+  ASCII whitespace as its reply: the unfinished last word is dropped, so a key
+  the stop cut short is never stored in part; the reply is stripped of control
+  characters and lone surrogates and capped at 65536 characters, so it never
+  raises a ``ValidationError`` carrying answer text. Only a content-free "run
+  stopped" line with the tool-call count is logged.
   Without a stream the run is exactly the JSON path (``llm_policy.chat``, not
   stoppable).
 - Exceptions from the LLM client are caught and converted into a safe
@@ -141,7 +145,7 @@ from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
 from admino import llm_policy, prompt_assembly, untrusted
-from admino.llm import LLMError, LLMResponse
+from admino.llm import LLMError, LLMResponse, strip_control_chars
 from admino.models import (
     AgentConfig,
     AgentResult,
@@ -188,6 +192,10 @@ _AUDIT_UNAVAILABLE_MESSAGE: str = "Internal error: audit unavailable."
 # GH-162: the outcome of a tool call in a run without a tool context (a
 # principal without an organization): nothing is dispatched.
 _NO_ORG_CONTEXT_MESSAGE: str = "No organization context."
+# GH-8: a stopped reply ends at the last of these (the display deltas' word
+# boundary), and is at most as long as a run's response may be.
+_ASCII_WHITESPACE: str = " \t\n\r"
+_MAX_STOPPED_REPLY_CHARS: int = 65536
 
 
 # ---------------------------------------------------------------------------
@@ -586,7 +594,7 @@ class Agent:
                     error_code=error_code,
                 )
             if isinstance(reply, str):
-                # GH-8 (b): stopped during the call; its forwarded text is the reply.
+                # GH-8 (b): stopped during the call; its forwarded text, cut, is the reply.
                 return _stopped(working_history, tool_records, reply)
             response = reply
 
@@ -1182,14 +1190,22 @@ async def _keep_record(
 
 
 def _stopped(
-    history: list[LLMMessage], tool_records: list[ToolCallRecord], response: str
+    history: list[LLMMessage], tool_records: list[ToolCallRecord], forwarded: str
 ) -> AgentResult:
     """Build the result of a run the user stopped (GH-8).
 
-    ``response`` is the text the interrupted LLM call forwarded ("" when the
-    stop came between calls or dispatches); when non-empty it also ends the
+    ``forwarded`` is the text the interrupted LLM call forwarded ("" when the
+    stop came between calls or dispatches). The reply keeps it up to and
+    including its last ASCII whitespace: the unfinished last word is dropped,
+    as the stream's display deltas drop it, so a key the stop cut short of its
+    format's length (which no credential rule matches) is never stored or
+    shown in part. Control characters and lone surrogates are stripped and the
+    reply capped first, so building the result never raises a
+    ``ValidationError`` carrying answer text. A non-empty reply also ends the
     history as a plain assistant message (the call's tool calls are dropped).
     """
+    kept = strip_control_chars(forwarded)[:_MAX_STOPPED_REPLY_CHARS]
+    response = kept[: max(kept.rfind(char) for char in _ASCII_WHITESPACE) + 1]
     if response:
         history.append(LLMMessage(role="assistant", content=response))
     logger.info("Agent run stopped (%d tool calls)", len(tool_records))

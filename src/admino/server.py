@@ -215,12 +215,21 @@ Security notes:
   each (no raw CR/LF, no NaN/Infinity literal), a validated event name.
   ``delta`` texts are display text (``streaming.DisplayDeltas``: the JSON
   reply's cleanup and credential redaction, word by word, a trailing
-  ``Bearer`` held for the next word), so a key never streams in part;
-  ``tool_call`` and ``confirm`` carry the JSON response's redacted items.
-  Frames queue in memory and nothing waits for the client:
-  ``EventStreamResponse`` watches for its disconnect (also under ASGI 2.4,
-  where Starlette doesn't), which sets the run's stop like the stop route;
-  the run still ends by the agent's stop rules and is stored and titled.
+  ``Bearer`` held for the next word), so a key never streams in part; an
+  answer that doesn't complete (a ``stopped`` or ``error`` run, an agent
+  that raised, a chat trashed meanwhile) ends at its last ASCII whitespace,
+  its unfinished last word (maybe a key cut short) never sent;
+  ``tool_call`` and ``confirm`` carry the JSON response's redacted items. A
+  frame that can't be built is dropped (its event name and the exception
+  class logged, never its payload) and the run goes on: building or queueing
+  a frame never raises into the run. Frames queue in memory and nothing
+  waits for the client: ``EventStreamResponse`` watches for its disconnect
+  (also under ASGI 2.4, where Starlette doesn't), which sets the run's stop
+  like the stop route; the run still ends by the agent's stop rules and is
+  stored and titled. At shutdown the lifespan sets every detached run's stop
+  and waits for them (at most ``_DRAIN_TIMEOUT_S``; the count of runs still
+  going is logged) before it stops the background jobs and closes the pool,
+  so a run whose client left still audits its tool call and stores its turn.
 - One run per chat (GH-8): a message takes its chat with
   ``ChatRuntime.hold(wait=False)``: while a run of the chat is going it is
   the 409 ``{"detail": "A message is already running in this chat.",
@@ -1211,6 +1220,10 @@ _chat_runtime = ChatRuntime(
 # The background reaper's pause between two passes (GH-24): an expired confirmation
 # is gone within this long even when no chat request comes in.
 _CONFIRMATION_REAP_INTERVAL_S: Final = 30.0
+# How long the shutdown waits for the detached streamed runs it asked to stop (GH-8):
+# one tool call's time plus the store. The container's stop grace period must be
+# longer, or the process is killed first. Read by the lifespan at shutdown.
+_DRAIN_TIMEOUT_S: Final = 30.0
 
 # OAuth state binding (GH-162): the authorize route stores the state with the
 # initiating user and session, and sets this short-lived cookie (HttpOnly,
@@ -3972,6 +3985,13 @@ _INTERNAL_ERROR_PAYLOAD: Final = ErrorPayload(code="internal_error", message=_IN
 _CHAT_GONE_PAYLOAD: Final = ErrorPayload(
     code="chat_not_found", message=_CHAT_NOT_FOUND_BODY["detail"]
 )
+# The run outcomes whose last answer ended as the model meant it (C11): its last
+# word is sent. Any other end (stopped, error) cuts it, as the stored stopped
+# reply is cut. A confirmation refused at the pending limit is stored as error
+# but its run (awaiting_confirmation) ended its answer with the gated call.
+_COMPLETE_ANSWERS: Final[frozenset[AgentStatus]] = frozenset(
+    {"final", "limit_reached", "awaiting_confirmation"}
+)
 # The OpenAPI 200 of the two streaming routes: the JSON ChatResponse (their
 # response_model) or, with ``Accept: text/event-stream``, the run's events.
 _EVENT_STREAM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
@@ -3998,18 +4018,38 @@ class _RunFrames:
     ``on_delta`` and ``on_tool_call`` are the run's ``RunStream`` sinks: the
     answer text goes through one ``DisplayDeltas``, flushed before every
     ``tool_call`` and when the run ends (``end_answer``), so a ``delta``
-    carries display text only and never part of a credential.
+    carries display text only and never part of a credential. Neither sink
+    nor ``send`` ever raises into the run or waits: a frame that can't be
+    built is dropped, so a reporting failure can't lose a turn whose tool
+    calls already ran.
     """
 
     def __init__(self, chat_id: UUID) -> None:
         """Queue ``run_started`` for the chat."""
+        self._chat_id = chat_id
         self._queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._deltas = DisplayDeltas()
         self.send("run_started", RunStartedPayload(chat_id=chat_id))
 
     def send(self, event: str, payload: BaseModel) -> None:
-        """Queue one frame: ``payload`` as JSON (a non-finite number is null)."""
-        self._queue.put_nowait(_make_sse_event(event, payload.model_dump(mode="json")))
+        """Queue one frame: ``payload`` as JSON (a non-finite number is null).
+
+        A frame ``SSEEvent`` refuses (over its size cap, say) is dropped: only
+        the event name and the exception class are logged, never the payload
+        or the exception's text, which may quote it.
+        """
+        try:
+            frame = _make_sse_event(event, payload.model_dump(mode="json"))
+        except ValueError as exc:
+            # ValueError covers a pydantic ValidationError and a non-finite number.
+            logger.warning(
+                "Dropped the %s frame of chat %s: %s",
+                event,
+                safe_log(self._chat_id),
+                type(exc).__name__,
+            )
+            return
+        self._queue.put_nowait(frame)
 
     def text(self, pieces: list[str]) -> None:
         """Queue a ``delta`` per display piece."""
@@ -4021,13 +4061,20 @@ class _RunFrames:
         self.text(self._deltas.feed(text))
 
     async def on_tool_call(self, record: ToolCallRecord) -> None:
-        """Send the answer so far, then the recorded dispatch's ``tool_call``."""
-        self.end_answer()
+        """Send the answer so far, then the recorded dispatch's ``tool_call``.
+
+        The answer before a tool call is complete: its last word is sent.
+        """
+        self.end_answer(complete=True)
         self.send("tool_call", record)
 
-    def end_answer(self) -> None:
-        """Send what is held of the current answer."""
-        self.text(self._deltas.flush())
+    def end_answer(self, *, complete: bool) -> None:
+        """Send what is held of the current answer.
+
+        ``complete=False`` (the answer was cut: a stop, an error) drops its
+        unfinished last word, so a key cut short is never shown in part.
+        """
+        self.text(self._deltas.flush(complete=complete))
 
     def end(self) -> None:
         """Queue ``done``, the last frame."""
@@ -4099,6 +4146,12 @@ async def _streamed_run(
     is titled (``_send_title``). ``done`` always ends the stream. Nothing here
     waits for the client, so a turn whose client left is still stored and
     titled. Log lines name the chat id and an exception class only.
+
+    The answer's held text is sent once the outcome is known (a trashed chat
+    only shows when the store raises): whole for a stored ``final``,
+    ``limit_reached`` or ``awaiting_confirmation`` run, without its
+    unfinished last word for any other end (C11: a key the stop or error cut
+    short is never shown in part).
     """
     chat_id = run.chat.id
     try:
@@ -4110,10 +4163,14 @@ async def _streamed_run(
             except Exception:
                 # Nothing is stored, like the JSON route's 500; the deltas sent stay sent.
                 logger.error("Agent run failed for chat %s", safe_log(chat_id))
-            frames.end_answer()
             if result is not None:
                 with contextlib.suppress(chats.ChatNotFoundError):
                     stored = await _finish_run(run, result)
+            frames.end_answer(
+                complete=stored is not None
+                and result is not None
+                and result.status in _COMPLETE_ANSWERS
+            )
         if result is None:
             frames.send("error", _INTERNAL_ERROR_PAYLOAD)
         elif stored is None:
@@ -4145,7 +4202,7 @@ def _start_stream(
     stop = held.enter_context(_chat_runtime.stoppable(run.chat.id))
     frames = _RunFrames(run.chat.id)
     stream = RunStream(on_delta=frames.on_delta, on_tool_call=frames.on_tool_call, stop=stop)
-    event_stream.detach(_streamed_run(held.pop_all(), run, start, stream, frames))
+    event_stream.detach(_streamed_run(held.pop_all(), run, start, stream, frames), stop=stop)
     return EventStreamResponse(frames.relay(), stop=stop)
 
 
@@ -5924,8 +5981,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
     expired-session purge, the organization purge, the expired login-throttle
     purge, the expired-confirmation reaper and, when SMTP is configured, the
-    email outbox sender on startup; stop the background tasks, then close the
-    pool, on shutdown.
+    email outbox sender on startup; on shutdown, stop the detached streamed
+    runs and wait for them (at most ``_DRAIN_TIMEOUT_S``, GH-8), then stop the
+    background tasks, then close the pool.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -5995,6 +6053,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # every chat run loads its own org's tool policy.
 
     yield
+    # GH-8: a detached streamed run outlives its request (uvicorn waits only for
+    # those), so the shutdown asks each one to stop and waits for it (bounded)
+    # before anything it needs goes: a run whose client left may be inside a tool
+    # call whose tool.call audit row and turn are still to be written.
+    unfinished = await event_stream.drain(_DRAIN_TIMEOUT_S)
+    if unfinished:
+        logger.warning("Shutdown: %d streamed chat runs still running", unfinished)
     confirmation_reaper_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await confirmation_reaper_task

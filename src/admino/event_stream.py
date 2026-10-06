@@ -1,6 +1,7 @@
 """Server-sent event transport of streamed chat runs (GH-8).
 
-Three pieces the chat routes use to answer a run as ``text/event-stream``:
+What the chat routes use to answer a run as ``text/event-stream``, and the
+app's shutdown to end the detached runs:
 
 - ``accepts_event_stream``: the content negotiation. A request streams when
   its ``Accept`` header lists ``text/event-stream`` (in any position, in any
@@ -13,12 +14,16 @@ Three pieces the chat routes use to answer a run as ``text/event-stream``:
   client leaves before the last frame, the relay ends and the run's stop
   signal is set; the run itself goes on and is stored.
 - ``detach``: starts a run's task apart from its response and keeps it
-  referenced until it ends, so a gone client never ends (or lets the garbage
-  collector drop) a run.
+  referenced, with its stop signal, until it ends, so a gone client never
+  ends (or lets the garbage collector drop) a run.
+- ``drain``: the app's shutdown asks every detached run to stop and waits for
+  them (bounded) before it closes the database pool, so a run whose client
+  left still writes its tool call's audit row and stores its turn.
 
 Inputs: the ``Accept`` header value; frames (SSE text, formatted by the
-server); the run's stop event.
-Outputs: the response's ASGI messages; whether a request streams.
+server); the run's stop event; the shutdown's bound.
+Outputs: the response's ASGI messages; whether a request streams; how many
+runs a bounded shutdown wait left running.
 
 Security notes:
 - Frames carry message text, deltas, titles and tool arguments: nothing here
@@ -26,6 +31,8 @@ Security notes:
 - Nothing waits on a gone client: the relay ends at the disconnect (or the
   failed send), and the run's remaining frames stay in its own queue, bounded
   by the run's output.
+- A run is never cancelled here: ``drain`` only sets its stop signal, so a
+  dispatch in progress finishes and is recorded.
 - Imports nothing of the server, agent, database, LLM or tool modules.
 """
 
@@ -48,9 +55,9 @@ _QVALUE: Final = re.compile(r"0(?:\.\d{0,3})?|1(?:\.0{0,3})?")
 # Proxies (nginx) must neither cache nor buffer the stream.
 _HEADERS: Final = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
-# The detached run tasks. The event loop keeps only weak references to tasks,
-# so this set holds each one until it ends.
-_detached: set[asyncio.Task[None]] = set()
+# The detached run tasks and their stop signals. The event loop keeps only weak
+# references to tasks, so this map holds each one until it ends.
+_detached: dict[asyncio.Task[None], asyncio.Event] = {}
 
 
 def accepts_event_stream(accept: str) -> bool:
@@ -75,14 +82,30 @@ def accepts_event_stream(accept: str) -> bool:
     return False
 
 
-def detach(run: Coroutine[object, None, None]) -> None:
+def detach(run: Coroutine[object, None, None], *, stop: asyncio.Event) -> None:
     """Run ``run`` as a task of its own, referenced until it ends.
 
-    ``run`` must handle its own errors: its task is never awaited.
+    ``run`` must handle its own errors: its task is never awaited. ``stop`` is
+    the run's stop signal, which ``drain`` sets.
     """
     task = asyncio.create_task(run)
-    _detached.add(task)
-    task.add_done_callback(_detached.discard)
+    _detached[task] = stop
+    task.add_done_callback(_detached.pop)
+
+
+async def drain(timeout: float) -> int:
+    """Ask every detached run to stop, then wait for them, at most ``timeout`` seconds.
+
+    Returns:
+        The number of runs still going when the wait ended (0 at once when
+        none is detached).
+    """
+    if not _detached:
+        return 0
+    for stop in _detached.values():
+        stop.set()
+    _, running = await asyncio.wait(set(_detached), timeout=timeout)
+    return len(running)
 
 
 def _failure(task: asyncio.Task[None]) -> BaseException | None:

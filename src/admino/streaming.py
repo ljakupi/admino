@@ -25,7 +25,10 @@ the next word (the token the rule would redact). Each settled segment is
 cleaned on its own once, which equals cleaning the whole text, so the joined
 pieces of an answer are exactly ``sanitize_display_text`` of its whole raw
 text, and a key split across pieces is never sent in part. Linear: every raw
-character is read once to find words and cleaned once.
+character is read once to find words and cleaned once. An answer that doesn't
+complete (``flush(complete=False)``: a stop, an error) ends at its last ASCII
+whitespace instead: its unfinished last word is never sent, so a key cut
+short of its format's length is never shown in part either.
 
 Security notes:
 - Imports only the standard library and ``admino.models``: never the server,
@@ -78,7 +81,9 @@ class DisplayDeltas:
 
     ``feed`` returns what is settled now, ``flush`` the rest at the end of the
     answer. The concatenation of everything one answer returned equals
-    ``sanitize_display_text`` of all its raw text (see the module docstring).
+    ``sanitize_display_text`` of all its raw text (see the module docstring);
+    for a cut answer (``flush(complete=False)``), of its raw text up to and
+    including its last ASCII whitespace.
     """
 
     __slots__ = ("_held", "_tail")
@@ -120,9 +125,17 @@ class DisplayDeltas:
         self._held = [] if bearer_at is None else [ended[settle:]]
         return display_pieces(settled)
 
-    def flush(self) -> list[str]:
-        """End the answer: return the display pieces of everything not sent yet, then reset."""
-        rest = "".join(self._held) + "".join(self._tail)
+    def flush(self, *, complete: bool = True) -> list[str]:
+        """End the answer: return the display pieces of what is not sent yet, then reset.
+
+        ``complete=False`` ends an answer that was cut (a stopped run, or one
+        that ended in an error): its unfinished last word, the raw text after
+        its last ASCII whitespace, is dropped instead of sent, so a key the cut
+        left shorter than its format's minimum (which no credential rule
+        matches) is never shown in part. A held ``Bearer`` word is sent: no
+        token follows it any more.
+        """
+        rest = "".join(self._held) + ("".join(self._tail) if complete else "")
         self._held, self._tail = [], []
         return display_pieces(rest)
 

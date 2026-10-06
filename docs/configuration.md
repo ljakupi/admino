@@ -934,9 +934,10 @@ confirm, as soon as you see `message_saved` or `confirm`.
   redaction as the JSON reply (see Messages above), so joined together they equal what
   `GET /api/chats/{id}` shows for the reply afterwards, and a key is never sent in part.
   That's why a word is sent only once the space, tab or line break after it has arrived,
-  and a word that reads `Bearer` waits for the word after it. Text without spaces (a long
-  link, for example) arrives once it ends. A `delta` carries at most 4,096 characters;
-  longer text comes in several.
+  and a word that reads `Bearer` waits for the word after it. A stopped or failed reply
+  ends at its last complete word: a word the stop or failure cut off is neither streamed
+  nor stored. Text without spaces (a long link, for example) arrives once it ends. A
+  `delta` carries at most 4,096 characters; longer text comes in several.
 - **Confirming with streaming.** Approving streams the rest of the message like a new
   one, starting with `run_started` and the approved action's `tool_call`; it never sends a
   `title`. Denying streams `run_started`, one `delta` with "Action … was denied.",
@@ -953,10 +954,10 @@ turn is still stored and titled as described below, even with nobody reading.
   sending nothing, and no further model call is made. An action that's already running
   is never interrupted: it finishes and is recorded in the audit log, and its
   `tool_call` is sent. The other actions the model asked for with it don't run. An
-  action you approved always runs. The text written so far is stored as the reply (no
-  reply when there was no text yet), and the turn's last message has
-  `status: "stopped"`. The stream ends with `message_saved` (`stopped`), a first
-  exchange's `title`, and `done`.
+  action you approved always runs. The text written so far, up to its last complete
+  word, is stored as the reply (no reply when there was no complete word yet), and the
+  turn's last message has `status: "stopped"`. The stream ends with `message_saved`
+  (`stopped`), a first exchange's `title`, and `done`.
 - **Titles.** A stopped first exchange makes no title call: the chat gets your first
   message as its title, sent as the `title` event.
 - **JSON requests can't be stopped.** For a message sent without streaming, stop answers
