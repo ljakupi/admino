@@ -16,7 +16,8 @@ Pinned here:
   item; an LLM error ends the run like today's (deltas already sent stay sent).
 - Stop (``stream.stop``): (a) set before an LLM call, there is no call; (b) set
   during a call, the call's stream is closed at once, also while the provider
-  sends nothing, and the text forwarded from THAT call becomes the response and
+  sends nothing (and, for a stop set between two items, already closed when
+  ``run()`` returns), and the text forwarded from THAT call becomes the response and
   the assistant message (no tool_use blocks); (c) set before a dispatch, that
   call and the rest of the batch are not dispatched; (d) a dispatch in progress
   is never cancelled: it finishes, is recorded once, its record is emitted and
@@ -980,6 +981,23 @@ class TestStop:
         assert sink.deltas == ["One "]
         assert result.history == [_user("hello"), _assistant("One ")]
         assert len(fake.calls) == 1
+
+    async def test_agent_stream_stop_from_on_delta_closes_the_provider_stream_before_run_returns(
+        self, recorder: _Recorder
+    ) -> None:
+        """(b) Decision 7 "closed at once" for a stop set between two items: when ``run()``
+        returns, the provider's stream is already closed (its generator ended at the item
+        it was suspended at), not left for the garbage collector to close later."""
+        sink = _Sink()
+        stream = _run_stream(sink)
+        sink.on_delta_hook = lambda _text: stream.stop.set()
+        fake = StreamLLM([[_delta("One "), _delta("two "), _final("One two")]])
+
+        result = await _run(_agent(fake, recorder), stream=stream)
+        endings_at_return = dict(fake.endings)
+
+        assert endings_at_return == {0: "running"}
+        _assert_stopped(result, response="One ", records=[])
 
     async def test_agent_stream_stop_during_a_dispatch_lets_it_finish_and_be_recorded(
         self, recorder: _Recorder, echo: _Echo, slow: _SlowTool

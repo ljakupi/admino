@@ -37,8 +37,9 @@ What is pinned:
   error, the same status and body as without the header: 401, CSRF 403, Viewer
   and Super Admin 403 (no chat statement), 422 (extra field, over the stored
   ``max_message_length``, a non-UUID id; the input never echoed), the identical
-  404 ``chat_not_found`` (unknown, other org, colleague, trashed), 429, and
-  the confirm route's 404 with nothing pending; no run, nothing stored.
+  404 ``chat_not_found`` (unknown, other org, colleague, trashed), the 503
+  ``chats_busy`` (a full runtime with nothing to evict), 429, and the confirm
+  route's 404 with nothing pending; no run, nothing stored.
 - Frames per outcome (C5.3): ``run_started {chat_id}`` first and ``done {}``
   last; deltas word by word (``DisplayDeltas``: flushed before every
   ``tool_call`` and at the end of the run); ``tool_call`` = the record's JSON;
@@ -70,7 +71,16 @@ What is pinned:
   is parked, a send in either mode is ``409 run_active`` (JSON), with no run
   and nothing stored; the same on the legacy route; the chat's pending
   confirmation survives the refusal; the next send after the run runs; an
-  approval sent meanwhile waits and then streams the resumed run.
+  approval sent meanwhile waits and then streams the resumed run. Two first
+  messages of one legacy session id racing (the loser's lookup missed, its
+  create finds the winner's chat, whose run is parked): the loser is ``409
+  run_active`` at once, with no run, nothing stored and still one chat.
+- The chat is free again before ``confirm`` / ``message_saved`` (Decision 2):
+  while an untitled chat's first streamed exchange is stored and its title
+  model call is parked (before ``title`` and ``done``), a second message (JSON
+  or streamed) runs and answers 200, and for a first exchange that kept a
+  confirmation, a streamed approval runs and ends, both before the title call
+  is released.
 - Confirm with SSE: an approval streams the resumed run (no ``title``); a
   denial is exactly ``run_started``, the denial ``delta``,
   ``message_saved{complete}``, ``done``, and is stored like the JSON denial.
@@ -162,6 +172,10 @@ _NO_PENDING: Final = {"detail": "No pending confirmation for this session"}
 _RUN_ACTIVE: Final = {
     "detail": "A message is already running in this chat.",
     "reason": "run_active",
+}
+_CHATS_BUSY: Final = {
+    "detail": "Too many active chats. Try again shortly.",
+    "reason": "chats_busy",
 }
 _CSRF_REFUSED: Final = {"detail": "Cross-origin request refused"}
 _RATE_LIMITED: Final = {"detail": "Rate limit exceeded"}
@@ -497,6 +511,28 @@ class _TitleLLM:
 
     async def close(self) -> None:
         """Nothing to close."""
+
+
+class _ParkedTitleLLM(_TitleLLM):
+    """A ``_TitleLLM`` whose title call parks: ``parked`` is set when the call is made,
+    and it answers (and is recorded) once ``release`` is set (bounded)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def chat(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        stream: bool = False,
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        self.parked.set()
+        await asyncio.wait_for(self.release.wait(), _WAIT_S)
+        return await super().chat(messages, tools, stream=stream, max_tokens=max_tokens)
 
 
 # ---------------------------------------------------------------------------
@@ -1110,6 +1146,40 @@ def test_chat_stream_rate_limited_send_is_the_json_429(
         _JSON,
     )
     assert agent.run.await_count == 1
+
+
+def test_chat_stream_full_runtime_send_is_the_json_503_chats_busy(
+    world: World, client: TestClient, agent: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full runtime with nothing to evict (2 entries: other users' chats, each holding a
+    pending confirmation): a streamed send to a chat without an entry is the JSON 503
+    ``chats_busy`` it is without the header, with no run, nothing stored and no entry
+    made. Once one of those confirmations is gone, the same streamed send streams."""
+    from admino.chat_runtime import ChatRuntime
+
+    monkeypatch.setattr(server, "_chat_runtime", ChatRuntime(max_entries=2, idle_s=900.0))
+    occupied: list[uuid.UUID] = []
+    for owner in (world.a["org_admin"], world.b["editor"]):
+        occupied.append(_chat(world.db, owner))
+        seed_pending_confirmation(owner, occupied[-1], f"confirm-8-full-{len(occupied)}")
+    editor = world.a["editor"]
+    chat_id = _chat(world.db, editor)
+    message_count = len(world.db.chat_messages)
+
+    as_json = _send(client, editor, chat_id, sse=False)
+    streamed = _send(client, editor, chat_id)
+
+    assert (streamed.status_code, streamed.json(), streamed.headers["content-type"]) == (
+        503,
+        _CHATS_BUSY,
+        _JSON,
+    )
+    assert (as_json.status_code, as_json.json()) == (503, _CHATS_BUSY)
+    assert agent.run.await_count == 0
+    assert len(world.db.chat_messages) == message_count
+    assert chat_id not in server._chat_runtime
+    server._chat_runtime.pop_pending(occupied[0])
+    assert _names(_stream(_send(client, editor, chat_id)))[0] == "run_started"
 
 
 def test_chat_stream_confirm_with_nothing_pending_is_the_json_404(
@@ -1859,6 +1929,135 @@ async def test_chat_stream_approval_sent_during_a_turn_waits_then_streams(
     resumed = script.runs[2]
     assert resumed.arguments["pending_confirmation"].tool_call == _PENDING_CALL
     assert "stream" in resumed.keywords
+
+
+async def test_chat_stream_racing_first_legacy_message_on_the_winners_busy_chat_gets_409(
+    world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two first messages of one legacy session id race: the winner created the session's
+    chat and its run is parked; the loser's lookup ran before that chat existed (it
+    misses), so it creates its chat under a new id, finds the winner's chat there and
+    takes that chat's hold without waiting: ``409 run_active`` at once, no run, nothing of
+    it stored, and the session keeps its one chat."""
+    from admino import chats as chats_module
+
+    editor = world.a["editor"]
+    find_legacy_chat = chats_module.find_legacy_chat
+    stale: list[str] = []
+
+    async def lookup_before_the_winners_insert(*args: Any, **kwargs: Any) -> Any:
+        # Only the loser's first lookup is stale; its create then finds the winner's chat.
+        if stale == ["loser"]:
+            stale.append("missed")
+            raise chats_module.ChatNotFoundError
+        return await find_legacy_chat(*args, **kwargs)
+
+    monkeypatch.setattr(chats_module, "find_legacy_chat", lookup_before_the_winners_insert)
+    before = {plain(row["id"]) for row in world.db.chats_of(editor.user_id)}
+    app = make_app(agent)
+
+    async with _parked(app, script, lambda http: _post_legacy(http, editor, "first")) as parked:
+        (winner,) = [
+            plain(row["id"])
+            for row in world.db.chats_of(editor.user_id)
+            if row["legacy_session_id"] == _LEGACY_SESSION
+        ]
+        stale.append("loser")
+        refused = await asyncio.wait_for(_post_legacy(parked.http, editor, "second"), _QUICK_S)
+        while_parked = [run.user_message for run in script.runs]
+
+    assert (refused.status_code, refused.json()) == (409, _RUN_ACTIVE)
+    assert stale == ["loser", "missed"]
+    assert while_parked == ["first"]
+    assert parked.first.result().status_code == 200
+    assert {plain(row["id"]) for row in world.db.chats_of(editor.user_id)} == before | {winner}
+    assert [row[1] for row in _stored(world.db, winner)] == ["first", "Done."]
+
+
+# Decision 2: confirm / message_saved / error / title / done go out once the chat is free.
+
+
+@pytest.mark.parametrize("second_mode", ["json", "sse"])
+async def test_chat_stream_next_message_runs_while_the_first_exchanges_title_call_is_parked(
+    world: World, agent: MagicMock, script: _Script, second_mode: str
+) -> None:
+    """An untitled chat's first streamed exchange is stored and its title model call
+    parks (after ``message_saved``, before ``title`` and ``done``): a second message to
+    the chat, JSON or streamed, runs and answers 200 (not ``409 run_active``) while the
+    title call is still parked. Released, the first stream ends ``message_saved``,
+    ``title``, ``done``."""
+    llm = _ParkedTitleLLM()
+    agent._llm = llm
+    editor = world.a["editor"]
+    chat_id = _chat(world.db, editor, titled=False)
+    script.queue(_reply("Here is the VAT summary."), _reply("Second answer."))
+    app = make_app(agent)
+
+    async with _async_client(app) as http:
+        first = asyncio.create_task(_post_turn(http, editor, chat_id, _TITLE_MESSAGE, sse=True))
+        try:
+            await asyncio.wait_for(llm.parked.wait(), _WAIT_S)
+            second = await asyncio.wait_for(
+                _post_turn(
+                    http, editor, chat_id, "And the next quarter?", sse=second_mode == "sse"
+                ),
+                _QUICK_S,
+            )
+            title_still_parked = not first.done() and llm.calls == []
+        finally:
+            llm.release.set()
+        frames = _stream(await asyncio.wait_for(first, _WAIT_S))
+
+    assert second.status_code == 200, second.text
+    assert _mode(second) == second_mode
+    assert title_still_parked
+    assert _stored(world.db, chat_id) == [
+        ("user", _TITLE_MESSAGE, "complete"),
+        ("assistant", "Here is the VAT summary.", "complete"),
+        ("user", "And the next quarter?", "complete"),
+        ("assistant", "Second answer.", "complete"),
+    ]
+    assert _names(frames)[-3:] == ["message_saved", "title", "done"]
+    assert _of(frames, "title") == [{"title": _TITLE}]
+
+
+async def test_chat_stream_approval_runs_while_the_first_exchanges_title_call_is_parked(
+    world: World, agent: MagicMock, script: _Script
+) -> None:
+    """An untitled chat's first streamed exchange keeps a confirmation and its title model
+    call parks (after ``confirm`` and ``message_saved``): a streamed approval sent then
+    runs the approved call and its stream ends (``done``) while the title call is still
+    parked. Released, the first stream ends ``confirm``, ``message_saved``, ``title``,
+    ``done``."""
+    llm = _ParkedTitleLLM()
+    agent._llm = llm
+    editor = world.a["editor"]
+    chat_id = _chat(world.db, editor, titled=False)
+    script.queue(_reply("Storing ", ask=_PENDING_CALL), _resumed(_PENDING_CALL, "Stored ", "it."))
+    app = make_app(agent)
+
+    async with _async_client(app) as http:
+        first = asyncio.create_task(_post_turn(http, editor, chat_id, _TITLE_MESSAGE, sse=True))
+        try:
+            await asyncio.wait_for(llm.parked.wait(), _WAIT_S)
+            approved = await asyncio.wait_for(_post_approval(http, editor, chat_id), _QUICK_S)
+            title_still_parked = not first.done() and llm.calls == []
+        finally:
+            llm.release.set()
+        frames = _stream(await asyncio.wait_for(first, _WAIT_S))
+
+    assert _stream(approved) == [
+        _started(chat_id),
+        _tool_call(_record(_PENDING_CALL, "confirm")),
+        _delta("Stored "),
+        _delta("it."),
+        _saved(world.db, chat_id, "complete"),
+        _DONE,
+    ]
+    assert title_still_parked
+    assert script.runs[1].arguments["pending_confirmation"].tool_call == _PENDING_CALL
+    assert _names(frames)[-4:] == ["confirm", "message_saved", "title", "done"]
+    assert _of(frames, "title") == [{"title": _TITLE}]
 
 
 # ---------------------------------------------------------------------------
