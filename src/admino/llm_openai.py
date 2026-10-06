@@ -18,8 +18,11 @@ SDK failures map to the shared catalogue in ``llm.py`` (GH-242): a timeout is
 whose input exceeds the context ``context_too_long``; other statuses stay
 internal (code None, ``user_facing=False``, "OpenAI API returned HTTP <n>").
 A reply the client can't use is ``malformed_response`` (GH-25, not retried): a
-body or stream line the SDK can't decode (it raises ``ValueError`` /
-``RecursionError`` raw), ``httpx.DecodingError`` mid-stream, a field read with
+body or stream line the SDK can't decode or build its objects from (it raises
+``llm.SDK_DECODE_ERRORS`` raw: ``ValueError``, ``TypeError``, ``AttributeError``
+or ``RuntimeError``, e.g. for an object holding a reserved key such as
+``_fields_set``), a stream line that decodes to JSON ``null`` (never taken for
+the end of the stream), ``httpx.DecodingError`` mid-stream, a field read with
 the wrong type (``model`` / ``content`` not a str or None, a tool-call list
 that isn't a list, a fragment index that isn't an int, a fragment id / name /
 arguments not a str or None), or any tool call that doesn't parse (the whole
@@ -99,6 +102,7 @@ from admino.llm import (
     _MAX_STREAM_TOOL_CALLS,
     _MAX_TOOL_ARGUMENT_CHARS,
     _MAX_TOOL_NAME_CHARS,
+    SDK_DECODE_ERRORS,
     CappedAnswer,
     LLMError,
     LLMResponse,
@@ -487,9 +491,9 @@ async def _stream_reply(
 
     Raises:
         LLMError: ``stream_error(exc)`` for a mid-stream failure or the deadline,
-            ``malformed_response_error(label)`` for undecodable or wrong-typed
-            data or a tool call that doesn't parse; raised ``from None`` so no
-            SDK exception (or provider text) travels with it.
+            ``malformed_response_error(label)`` for undecodable, null or
+            wrong-typed data or a tool call that doesn't parse; raised ``from
+            None`` so no SDK exception (or provider text) travels with it.
     """
     import openai
 
@@ -530,8 +534,9 @@ async def _stream_reply(
             tool_calls = _all_tool_calls([calls[index] for index in sorted(calls)])
         except (openai.APIError, httpx.TransportError, httpx.StreamError, TimeoutError) as exc:
             raise stream_error(exc) from None
-        except (MalformedReplyError, ValueError, RecursionError, httpx.DecodingError) as exc:
-            # The SDK raises ValueError / RecursionError raw for a line it can't decode.
+        except (MalformedReplyError, httpx.DecodingError) as exc:
+            # next_before turns a line the SDK can't decode or build, or a null
+            # line, into MalformedReplyError.
             logger.warning("Rejecting malformed %s reply (%s)", label, type(exc).__name__)
             raise malformed_response_error(label) from None
 
@@ -723,8 +728,9 @@ class OpenAIClient:
             # Raised ``from None`` so the SDK exception (and any response body)
             # never travels with the LLMError.
             raise _api_error(exc) from None
-        except (ValueError, RecursionError):
-            # The SDK decodes the 200 body itself and raises these raw.
+        except SDK_DECODE_ERRORS:
+            # The SDK decodes the 200 body and builds its objects itself and
+            # raises these raw (a reserved key such as ``_fields_set`` included).
             raise malformed_response_error(_LABEL) from None
         return _completion_response(
             response, CappedAnswer(), label=_LABEL, configured_model=self._model

@@ -25,8 +25,10 @@ chat shows a generic reply. The helpers below build the shared catalogue:
 - ``sdk_status_error`` maps an SDK HTTP status error: Retry-After read with
   ``parse_retry_after``, a 400/413 classified with ``is_context_too_long``.
 - ``malformed_response_error`` (GH-25) is a reply the client can't use: data
-  the SDK can't decode, a field of the wrong type, or any tool call that
-  doesn't parse (the whole reply is rejected, never a subset kept). Not
+  the SDK can't decode or build into its objects (``SDK_DECODE_ERRORS``, also
+  for an object holding a reserved key such as ``_fields_set``), a stream item
+  that decodes to JSON ``null``, a field of the wrong type, or any tool call
+  that doesn't parse (the whole reply is rejected, never a subset kept). Not
   retried. Inside a client, ``MalformedReplyError`` signals it.
 
 Output sanitization (GH-25): every client sanitizes before the agent sees
@@ -60,7 +62,9 @@ as deltas. Stream deadline (GH-25): each ``chat_stream`` call must end within
 provider await (``create()``, then each read through ``next_before``) is
 bounded by that loop-clock deadline, never a ``yield``, so the consumer is
 never cancelled; past it the client closes the provider stream and raises its
-read-timeout error (code ``timeout``).
+read-timeout error (code ``timeout``). ``next_before`` tells the end of a
+stream apart with a private sentinel: an item that decodes to JSON ``null``
+or that the SDK can't build is ``MalformedReplyError``, never a normal end.
 
 Inputs: provider statuses, response headers, and (for classification only)
 the provider's error code and message, a per-call output cap, streamed answer
@@ -97,6 +101,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
+import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from admino.logs import safe_log
@@ -186,6 +191,16 @@ class MalformedReplyError(Exception):
     and raises ``malformed_response_error(label) from None`` instead, so only an
     ``LLMError`` leaves the client.
     """
+
+
+# What the SDKs raise raw while they decode a body or stream line and build their
+# objects from it without validation (GH-25): ValueError for JSON or UTF-8 they
+# can't decode (or an int over the digit limit), RecursionError (a RuntimeError)
+# for deep nesting, AttributeError / TypeError for an object holding a reserved
+# ``construct()`` key (``_fields_set``, ``_BaseModel__cls``), and RuntimeError when
+# no member of a union fits (Anthropic). Caught only around an SDK read
+# (``create()``, ``next_before``), where each means a malformed reply.
+SDK_DECODE_ERRORS: Final = (ValueError, TypeError, AttributeError, RuntimeError)
 
 
 # ---------------------------------------------------------------------------
@@ -574,18 +589,6 @@ def strip_control_chars(content: str) -> str:
     return content.translate(_CONTROL_CHAR_TABLE)
 
 
-def sanitize_content(content: str) -> str:
-    """Truncate and strip dangerous control/Unicode characters from LLM content.
-
-    Args:
-        content: Raw string from LLM response.
-
-    Returns:
-        Sanitized, length-limited string.
-    """
-    return strip_control_chars(content)[:_MAX_CONTENT_LENGTH]
-
-
 class CappedAnswer:
     """Collect answer text up to the ``LLMResponse`` content cap.
 
@@ -756,11 +759,26 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
     return parsed
 
 
+class _StreamEnd:
+    """Type of ``_END``, the end-of-stream marker ``next_before`` gives ``anext``."""
+
+
+# A provider stream never yields this object, so an item that decodes to JSON
+# ``null`` (None) can't pass for the end of the stream.
+_END: Final = _StreamEnd()
+
+
 async def next_before[T](items: AsyncIterator[T], deadline: float) -> T | None:
     """Return the next item of a provider stream, or None at its end (GH-25 deadline).
 
     Only this await is bounded: the caller yields each item outside of it, so
     the deadline's cancellation reaches the provider read and never a consumer.
+    The end is told apart by a private sentinel, so None is returned only there:
+    an item that decodes to JSON ``null``, or one the SDK can't decode or build
+    (``SDK_DECODE_ERRORS``), is malformed and never ends the stream as if it
+    were complete. Any other error of the read (an SDK status error, a
+    transport or ``httpx.StreamError`` failure) propagates unchanged for the
+    caller to map.
 
     Args:
         items: The provider stream's iterator.
@@ -768,9 +786,22 @@ async def next_before[T](items: AsyncIterator[T], deadline: float) -> T | None:
 
     Raises:
         TimeoutError: The deadline passed while waiting (the read is cancelled).
+        MalformedReplyError: The item is None, or the SDK raised one of
+            ``SDK_DECODE_ERRORS`` while reading it (raised ``from None``).
     """
     async with asyncio.timeout_at(deadline):
-        return await anext(items, None)
+        try:
+            item = await anext(items, _END)
+        except httpx.StreamError:
+            # A RuntimeError subclass, but a transport failure: the caller maps it.
+            raise
+        except SDK_DECODE_ERRORS:
+            raise MalformedReplyError from None
+    if isinstance(item, _StreamEnd):
+        return None
+    if item is None:
+        raise MalformedReplyError
+    return item
 
 
 def output_token_cap(configured: int, max_tokens: int | None) -> int:

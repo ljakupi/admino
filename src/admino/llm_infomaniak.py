@@ -39,8 +39,8 @@ or stream error and a mid-stream ``error`` event ``provider_unavailable``,
 internal), 429 ``rate_limited`` and 5xx ``provider_unavailable`` (both with the
 response's Retry-After), a chat 400/413 whose input exceeds the context
 ``context_too_long``; other statuses stay internal. A reply the client can't
-use (undecodable, wrong-typed, a tool call that doesn't parse) is
-``malformed_response`` (GH-25).
+use (undecodable, an object the SDK can't build, a null stream line,
+wrong-typed, a tool call that doesn't parse) is ``malformed_response`` (GH-25).
 
 Request shape follows Infomaniak's documented schema for
 ``POST /2/ai/{product_id}/openai/v1/chat/completions``: the output cap is sent as
@@ -102,6 +102,7 @@ import httpx
 
 from admino.llm import (
     _MAX_CONTENT_LENGTH,
+    SDK_DECODE_ERRORS,
     LLMError,
     LLMResponse,
     malformed_response_error,
@@ -533,8 +534,9 @@ class InfomaniakClient:
             response = await client.chat.completions.create(**kwargs, stream=False)
         except openai.APIError as exc:
             raise _api_error(exc) from None
-        except (ValueError, RecursionError):
-            # The SDK decodes the 200 body itself and raises these raw.
+        except SDK_DECODE_ERRORS:
+            # The SDK decodes the 200 body and builds its objects itself and
+            # raises these raw (a reserved key such as ``_fields_set`` included).
             raise malformed_response_error(_LABEL) from None
         return _completion_response(
             response,

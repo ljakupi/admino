@@ -32,8 +32,9 @@ error (``missing_model``) instead (``chat_stream()`` on its first iteration,
 before any request). Connection failures (``provider_unavailable``) and
 timeouts (``timeout``, the stream deadline included), also mid-stream, carry a
 "starting or unavailable" message pointing to ``make start-local``. A reply
-the client can't use (undecodable, wrong-typed, a tool call that doesn't
-parse) is ``malformed_response`` (GH-25); 404, 429, 5xx and a 400/413 whose
+the client can't use (undecodable, an object the SDK can't build, a null
+stream line, wrong-typed, a tool call that doesn't parse) is
+``malformed_response`` (GH-25); 404, 429, 5xx and a 400/413 whose
 input exceeds the context map to the shared catalogue in ``llm.py`` (429/5xx
 with the response's Retry-After). vLLM has no key, so every other status
 (including 401/403) stays internal (code None, ``user_facing=False``, "vLLM API
@@ -66,6 +67,7 @@ from typing import TYPE_CHECKING, Any, Final
 import httpx
 
 from admino.llm import (
+    SDK_DECODE_ERRORS,
     CappedAnswer,
     LLMError,
     LLMResponse,
@@ -235,8 +237,9 @@ class VLLMClient:
             # The local server may still be loading the model, or be down: raised
             # ``from None`` so the SDK cause/body never travels with the error.
             raise _api_error(exc) from None
-        except (ValueError, RecursionError):
-            # The SDK decodes the 200 body itself and raises these raw.
+        except SDK_DECODE_ERRORS:
+            # The SDK decodes the 200 body and builds its objects itself and
+            # raises these raw (a reserved key such as ``_fields_set`` included).
             raise malformed_response_error(_LABEL) from None
         return _completion_response(
             response, CappedAnswer(), label=_LABEL, configured_model=self._model

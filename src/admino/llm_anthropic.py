@@ -21,17 +21,28 @@ shared catalogue in ``llm.py``: a timeout is ``timeout``, a connection error
 400 "prompt is too long" ``context_too_long``; other statuses stay internal
 (code None, ``user_facing=False``, "Claude API returned HTTP <n>"). A reply
 the client can't use is ``malformed_response`` (GH-25, not retried): a body or
-event the SDK can't decode, ``httpx.DecodingError`` mid-stream, a field read
-with the wrong type (a non-str model, text, ``partial_json``, tool_use id or
-name, a block index that isn't an int), or any tool_use block that doesn't
-parse (the whole reply is rejected). The SDK never retries
-(``max_retries=0``): one ``chat()`` or ``chat_stream()`` is one request;
-retries belong to ``admino.llm_policy``.
+event the SDK can't decode or build its objects from (it raises
+``llm.SDK_DECODE_ERRORS`` raw: ``ValueError``, ``TypeError``, ``AttributeError``
+or ``RuntimeError``, e.g. for an object holding a reserved key such as
+``_fields_set``, or a union no member fits), an event that decodes to JSON
+``null`` (never taken for the end of the stream), ``httpx.DecodingError``
+mid-stream, a field read with the wrong type (a non-str model, text,
+``partial_json``, tool_use id or name, a block index that isn't an int), or
+any tool_use block that doesn't parse (the whole reply is rejected). The SDK
+never retries (``max_retries=0``): one ``chat()`` or ``chat_stream()`` is one
+request; retries belong to ``admino.llm_policy``.
 
 Output (GH-25): text sanitized with ``strip_control_chars`` and capped at 65536
 characters (never cut at a word); tool arguments bounded, then cleaned with
 ``sanitize_tool_args``; ``LLMResponse.truncated`` for ``stop_reason ==
 "max_tokens"`` or text past the cap.
+
+History (GH-25 D11): Anthropic rejects an empty text turn, and a cut answer can
+be empty or whitespace-only, so ``_convert_messages_to_anthropic`` leaves out an
+``assistant`` message whose content is blank (``content.strip() == ""``) and
+that has no ``tool_use_blocks``; the user messages around it then merge like any
+same-role neighbours. The stored history is unchanged, and the other providers
+still send such a message.
 
 Output cap: ``chat()``'s keyword-only ``max_tokens`` (GH-179) lowers the
 request's ``max_tokens`` to ``min(max_tokens, config.max_response_tokens)``;
@@ -89,6 +100,7 @@ from pydantic import ValidationError
 from admino.llm import (
     _MAX_STREAM_TOOL_CALLS,
     _MAX_TOOL_ARGUMENT_CHARS,
+    SDK_DECODE_ERRORS,
     CappedAnswer,
     LLMError,
     LLMResponse,
@@ -189,9 +201,11 @@ def _convert_messages_to_anthropic(
     Anthropic requires the system prompt as a separate parameter, not
     in the messages array. Also, Anthropic requires alternating
     user/assistant turns — consecutive same-role messages are merged.
+    An assistant message with blank content and no tool_use blocks is left
+    out (GH-25 D11), so the messages around it merge.
 
     Args:
-        messages: Conversation messages.
+        messages: Conversation messages (never changed).
 
     Returns:
         Tuple of (system_prompt, messages_list).
@@ -202,6 +216,9 @@ def _convert_messages_to_anthropic(
     for msg in messages:
         if msg.role == "system":
             system_parts.append(msg.content)
+            continue
+        if msg.role == "assistant" and not msg.tool_use_blocks and not msg.content.strip():
+            # Anthropic rejects an empty text turn, and a cut answer can be blank.
             continue
 
         # Anthropic uses "user" for both user messages and tool results
@@ -653,8 +670,10 @@ class AnthropicClient:
             # Raised ``from None`` so the SDK exception (and any response body)
             # never travels with the LLMError.
             raise _api_error(exc) from None
-        except (ValueError, RecursionError):
-            # The SDK decodes the 200 body itself and raises these raw.
+        except SDK_DECODE_ERRORS:
+            # The SDK decodes the 200 body and builds its objects itself and
+            # raises these raw (a reserved key such as ``_fields_set``, or a
+            # content block no union member fits, included).
             raise malformed_response_error(_LABEL) from None
         return _message_response(response)
 
@@ -711,8 +730,9 @@ class AnthropicClient:
                 raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
             except (httpx.TransportError, httpx.StreamError, TimeoutError) as exc:
                 raise _api_error(exc) from None
-            except (MalformedReplyError, ValueError, RecursionError, httpx.DecodingError) as exc:
-                # The SDK raises ValueError / RecursionError raw for an event it can't decode.
+            except (MalformedReplyError, httpx.DecodingError) as exc:
+                # next_before turns an event the SDK can't decode or build, or a
+                # null event, into MalformedReplyError.
                 logger.warning("Rejecting malformed %s reply (%s)", _LABEL, type(exc).__name__)
                 raise malformed_response_error(_LABEL) from None
         yield final
