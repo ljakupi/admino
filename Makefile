@@ -1,4 +1,4 @@
-.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down migrate run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down docker-build-prod docker-up-prod docker-down-prod docker-logs-prod start-prod
+.PHONY: lint format format-check typecheck test check docker-build docker-up docker-down docker-logs dev-db dev-db-down migrate run clean start start-local create-superadmin create-org docker-up-local vllm-ensure vllm-pull vllm-up vllm-down docker-build-prod docker-up-prod docker-down-prod docker-logs-prod start-prod perf ttft test-proxy
 
 # Source and package configuration
 SRC_DIR    := src
@@ -65,6 +65,22 @@ test:
 # Minimum overall test coverage. CI fails the build below this; `check` enforces
 # the same number locally so a green `make check` guarantees a green CI run.
 COV_MIN := 90
+
+# Performance (GH-244). Dev-only helpers: not part of `check` or CI.
+# perf: the budget gate (server overhead and GET /api/chats p95) against a throwaway
+#   postgres:16 container and a fake LLM. Needs Docker.
+perf:
+	python -m tests.perf.chat_budgets
+
+# ttft: manual time-to-first-token and tokens/s measurement against Infomaniak.
+#   Needs INFOMANIAK_API_TOKEN in the shell: set -a; source .env; set +a
+ttft:
+	python -m tests.perf.ttft
+
+# test-proxy: the Docker test of the production Caddyfile (compression, unbuffered
+#   event streams) in the official caddy image. On demand: skipped without Docker.
+test-proxy:
+	ADMINO_DOCKER_TESTS=1 python -m pytest $(TESTS_DIR)/test_proxy_profile.py -v --no-cov
 
 # Full CI-parity gate bundle — the single source of truth for "are we green?".
 # CI (.github/workflows/ci.yml) and the local/dev loop both run this exact target

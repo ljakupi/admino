@@ -19,6 +19,8 @@
 #
 # What this profile guarantees:
 #   - HTTPS only: HTTP redirects to HTTPS, and Caddy sends HSTS.
+#   - Responses are compressed (zstd, gzip) except event streams, which are never
+#     buffered; long-lived caching of hashed assets is set by the app (GH-244).
 #   - The agent trusts X-Forwarded-For / X-Forwarded-Proto only from Caddy's
 #     fixed address (ADMINO_TRUSTED_PROXIES), so client IPs in rate limits and
 #     audit events are real and can't be spoofed by other peers.
