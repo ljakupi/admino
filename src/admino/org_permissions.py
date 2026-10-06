@@ -18,7 +18,9 @@ every chat run loads its own org's policy:
   shows them "disabled"; the stored switches are untouched. The same read
   sets the policy's ``data_residency`` (GH-242), which the agent checks
   before any LLM call: a residency org's run never reaches a non-Swiss
-  provider.
+  provider. ``policy_from_rows`` is its pure conversion of the stored values,
+  shared with the send path's one-statement turn setup
+  (``turn_setup.load_turn_setup``, GH-244).
 - The matrix (``Capability.ORG_PERMISSIONS_MANAGE``): ``get_org_permissions``
   reads it; ``update_org_permission`` changes one pair (the normalized value
   of ``validate_permissions_config``) and records ``org.permission_change``.
@@ -42,7 +44,8 @@ Inputs: the database pool (or the caller's connection for the seed and the
 policy), the acting ``Principal`` (from the session) or a ``TenantContext``,
 the validated ``PermissionPatch``, a (tool, action) pair, the typed password,
 the client IP and, for tests, the time (``now``; it defaults to
-``current_time()``, the clock seam).
+``current_time()``, the clock seam); for ``policy_from_rows``, an org's
+stored rows, switches and residency flag.
 Outputs: ``ToolPolicy``, ``PermissionsResponse``,
 ``CriticalPermissionsResponse``, ``CriticalPermissionState``,
 ``PermissionsSummaryResponse``, the resolved pairs and the number of orgs
@@ -113,7 +116,7 @@ from admino.permissions import (
 from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
     from uuid import UUID
 
     import asyncpg
@@ -340,18 +343,44 @@ async def load_tool_policy(executor: Executor, tenant: TenantContext) -> ToolPol
         row, fail closed; False otherwise).
     """
     rows = await executor.fetch(_ORG_ROWS_SQL, tenant.org_id)
+    enabled_tools = await scoped_settings.org_tools_enabled(executor, tenant)
+    data_residency = await scoped_settings.org_residency(executor, tenant)
+    return policy_from_rows(
+        [(row["tool"], row["action"], row["permission"]) for row in rows],
+        enabled_tools=enabled_tools,
+        data_residency=data_residency,
+    )
+
+
+def policy_from_rows(
+    rows: Iterable[Sequence[str]], *, enabled_tools: dict[str, bool], data_residency: bool
+) -> ToolPolicy:
+    """Build an org's run policy from its stored permission rows, switches and residency.
+
+    Pure: the conversion ``load_tool_policy`` and the send path's turn setup
+    (``turn_setup.load_turn_setup``, GH-244) share, so both read a stored
+    state as the same policy.
+
+    Args:
+        rows: The org's stored ``(tool, action, permission)`` rows.
+        enabled_tools: The org's stored switches (tool name -> enabled).
+        data_residency: The org's residency flag (True for a missing org row).
+
+    Returns:
+        The frozen ToolPolicy: the validated config of the rows (a hardcoded
+        pair reads 'deny', a write-mutating 'allow' reads 'confirm'), the
+        tier-2 pairs stored 'confirm' as ``promoted``, the switches with every
+        ``RESIDENCY_BLOCKED_TOOLS`` tool off under residency, and the flag.
+    """
     raw: dict[str, dict[str, str]] = {}
     promoted: set[tuple[str, str]] = set()
-    for row in rows:
-        tool, action, state = row["tool"], row["action"], row["permission"]
+    for tool, action, state in rows:
         if (tool, action) in PROMOTABLE_DENIALS and state == "confirm":
             # A promotion lives in ``promoted``; the config keeps the hardcoded
             # 'deny' (validate_permissions_config would enforce it anyway).
             promoted.add((tool, action))
             state = "deny"
         raw.setdefault(tool, {})[action] = state
-    enabled_tools = await scoped_settings.org_tools_enabled(executor, tenant)
-    data_residency = await scoped_settings.org_residency(executor, tenant)
     if data_residency:
         enabled_tools = {**enabled_tools, **dict.fromkeys(RESIDENCY_BLOCKED_TOOLS, False)}
     return ToolPolicy(
