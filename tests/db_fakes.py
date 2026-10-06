@@ -122,12 +122,16 @@ The settings scopes (GH-159, migration 0013):
     (count: 0), as in PostgreSQL; FOR UPDATE with an aggregate fails with
     FeatureNotSupportedError.
 
-Chats (GH-176, migration 0024; GH-266, migration 0025):
+Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
 - ``chats`` (``chats``, keyed by id): ``id`` (UUID primary key, default a new
   uuid4), ``org_id`` (UUID NOT NULL, references organizations ON DELETE
-  CASCADE), ``owner_user_id`` (UUID NOT NULL, references users ON DELETE
-  CASCADE), ``title`` (TEXT NOT NULL, default '', CHECK ``char_length(title)
-  <= 200``), ``title_source`` (TEXT NOT NULL, default 'auto', auto / user),
+  CASCADE), ``owner_user_id`` (UUID NOT NULL; migration 0026: the composite
+  foreign key ``CHAT_OWNER_FKEY`` (owner_user_id, org_id) references users (id,
+  org_id) ON DELETE CASCADE, so the owner is a member of the chat's org:
+  another org's member, a Super Admin (no org) or an unknown user is a
+  ForeignKeyViolationError), ``title`` (TEXT NOT NULL, default '', CHECK
+  ``char_length(title) <= 200``), ``title_source`` (TEXT NOT NULL, default
+  'auto', auto / user),
   ``legacy_session_id`` (NULL or fully matching ``[a-zA-Z0-9_-]{1,64}``: no
   trailing newline), ``external_content`` (BOOLEAN NOT NULL, default false),
   ``created_at`` and ``last_activity_at`` (NOT NULL, default now()) and
@@ -183,7 +187,10 @@ Chats (GH-176, migration 0024; GH-266, migration 0025):
   title_source, last_activity_at, external_content and deleted_at
   (``CHAT_UPDATE_COLUMNS``); naming id, org_id, owner_user_id, created_at or
   legacy_session_id is InsufficientPrivilegeError "permission denied for table
-  chats", raised before the statement runs (nothing changes). Its BEFORE
+  chats", raised before the statement runs (nothing changes), in a ``col =``
+  piece and (GH-271) in a row-constructor piece ``(a, b) = (...)`` (a row,
+  ``ROW(...)`` or a sub-select; reading one over allowed columns only stays
+  unsupported, the app doesn't use the form). Its BEFORE
   UPDATE row trigger refuses turning a row's external_content from true to
   false: CheckViolationError ``CHAT_EXTERNAL_CONTENT_RESET`` ("chats.external_content
   can't be reset", SQLSTATE 23514, no row data), raised before the row's other
@@ -224,7 +231,8 @@ Chats (GH-176, migration 0024; GH-266, migration 0025):
 - Helpers: ``add_chat(owner_user_id, *, org_id=None, chat_id=None, title='',
   title_source='auto', legacy_session_id=None, external_content=False,
   created_at=None, last_activity_at=None, deleted_at=None)`` (org_id: the
-  owner's; last_activity_at: created_at, itself now) and
+  owner's, another org refused by ``CHAT_OWNER_FKEY``; last_activity_at:
+  created_at, itself now) and
   ``add_chat_message(chat_id, role, content, *, tool_use_blocks=None,
   tool_call_id=None, tool_calls=None, status='complete', created_at=None)``
   (org_id: the chat's; the next seq; the JSONB values as Python lists) seed
@@ -835,6 +843,10 @@ CHAT_UPDATE_COLUMNS: Final = frozenset(
     {"title", "title_source", "last_activity_at", "external_content", "deleted_at"}
 )
 CHAT_EXTERNAL_CONTENT_RESET: Final = "chats.external_content can't be reset"
+# GH-271 (migration 0026): the composite foreign key (owner_user_id, org_id) ->
+# users (id, org_id) that ties a chat's owner to the chat's org (the only chats ->
+# users key: it replaced 0024's chats_owner_user_id_fkey).
+CHAT_OWNER_FKEY: Final = "chats_owner_org_fkey"
 # An UPDATE of chats (normalized SQL), whose SET 0025's column grant limits.
 _CHATS_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?chats\b")
 # What a ``$n::<type>`` cast tells about a bind parameter's type.
@@ -1556,14 +1568,15 @@ class FakeDb:
         last_activity_at: datetime | None = None,
         deleted_at: datetime | None = None,
     ) -> uuid.UUID:
-        """Store a chats row (GH-176) as migration 0024 allows it; return its id.
+        """Store a chats row (GH-176) as migrations 0024 to 0026 allow it; return its id.
 
-        ``org_id`` defaults to the owner's org (an owner that doesn't exist is a
-        ForeignKeyViolationError); ``chat_id`` to a new uuid4; ``created_at`` to
-        now and ``last_activity_at`` to ``created_at``. Every value is checked
-        like an INSERT (DataError, CharacterNotInRepertoireError, NotNull, the
-        CHECKs, the partial unique legacy session key, the foreign keys).
-        Returns a plain uuid.UUID.
+        ``org_id`` defaults to the owner's org; an owner that doesn't exist, or
+        (GH-271, migration 0026) isn't a member of ``org_id``'s org, is a
+        ForeignKeyViolationError on ``CHAT_OWNER_FKEY``. ``chat_id`` defaults to
+        a new uuid4, ``created_at`` to now and ``last_activity_at`` to
+        ``created_at``. Every value is checked like an INSERT (DataError,
+        CharacterNotInRepertoireError, NotNull, the CHECKs, the partial unique
+        legacy session key, the foreign keys). Returns a plain uuid.UUID.
         """
         if org_id is None:
             owner = (
@@ -1575,9 +1588,9 @@ class FakeDb:
                 raise _pg_error(
                     asyncpg.exceptions.ForeignKeyViolationError,
                     'insert or update on table "chats" violates foreign key constraint'
-                    ' "chats_owner_user_id_fkey"',
+                    f' "{CHAT_OWNER_FKEY}"',
                     table="chats",
-                    constraint="chats_owner_user_id_fkey",
+                    constraint=CHAT_OWNER_FKEY,
                 )
             org_id = owner["org_id"]
         now = datetime.now(UTC)
@@ -2354,8 +2367,10 @@ class FakeDb:
         NOT NULL (column order), the CHECKs (by constraint name), the unique keys
         (the primary key, chat_messages.seq, the partial unique
         ``chats_legacy_session_key`` over live chats only), then the foreign
-        keys (chats -> organizations and users; chat_messages -> organizations
-        and the composite (chat_id, org_id) -> chats(id, org_id); a chat whose
+        keys in creation order (chats -> organizations, then migration 0026's
+        composite ``CHAT_OWNER_FKEY`` (owner_user_id, org_id) -> users (id,
+        org_id): the owner must exist with the row's org; chat_messages ->
+        organizations and the composite (chat_id, org_id) -> chats(id, org_id); a chat whose
         (id, org_id) changes while messages reference it is refused, NO ACTION).
         Each error carries the table, column or constraint name, and the
         CHECK / NOT NULL ones the "Failing row contains" detail (with content,
@@ -2465,17 +2480,25 @@ class FakeDb:
                     f" {row['legacy_session_id']}) already exists."
                 ),
             )
-        foreign = [("org_id", "organizations", row["org_id"] in self.orgs)]
+        foreign = [(f"{table}_org_id_fkey", "organizations", row["org_id"] in self.orgs)]
         if table == "chats":
-            foreign.append(("owner_user_id", "users", row["owner_user_id"] in self.users))
+            # GH-271 (migration 0026): (owner_user_id, org_id) -> users (id, org_id).
+            # A Super Admin (org_id NULL) or another org's member matches no key.
+            owner = self.users.get(row["owner_user_id"])
+            foreign.append(
+                (CHAT_OWNER_FKEY, "users", owner is not None and owner["org_id"] == row["org_id"])
+            )
         else:
             parent = self.chats.get(row["chat_id"])
             foreign.append(
-                ("chat", "chats", parent is not None and parent["org_id"] == row["org_id"])
+                (
+                    "chat_messages_chat_fkey",
+                    "chats",
+                    parent is not None and parent["org_id"] == row["org_id"],
+                )
             )
-        for name, parent_table, valid in foreign:
+        for constraint, parent_table, valid in foreign:
             if not valid:
-                constraint = f"{table}_{name}_fkey"
                 raise _pg_error(
                     asyncpg.exceptions.ForeignKeyViolationError,
                     f'insert or update on table "{table}" violates foreign key constraint'
@@ -2782,7 +2805,8 @@ class FakeDb:
             key: value for key, value in self.oauth_tokens.items() if key[0] != user_id
         }
         self.memory = {key: value for key, value in self.memory.items() if key[0] != user_id}
-        # GH-176: chats.owner_user_id cascades, and each chat's messages with it.
+        # GH-176 / GH-271: the chats owner key (owner_user_id, org_id) -> users
+        # (id, org_id) cascades, and each chat's messages with it.
         self.drop_chats(
             {key for key, chat in self.chats.items() if chat["owner_user_id"] == user_id}
         )
@@ -3850,7 +3874,9 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     migration 0025 (GH-266): an UPDATE of chats may SET only the
     ``CHAT_UPDATE_COLUMNS`` (another existing column: InsufficientPrivilegeError;
     a column chats doesn't have is left to the reader's UndefinedColumnError,
-    which PostgreSQL raises first).
+    which PostgreSQL raises first). GH-271: every column of a row-constructor
+    piece ``(a, b, ...) = ...`` (a row, ``ROW(...)`` or a sub-select) is
+    checked too, as PostgreSQL does.
     """
     masked = _masked_literals(n)
     numbers = {int(number) for number in re.findall(r"\$(\d+)", masked)}
@@ -3884,11 +3910,18 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     if _CHATS_UPDATE_RE.match(n) is not None:
         clauses = _clauses(n, ("update", "set", "from", "where", "returning"))
         for piece in _top_split(clauses["set"], ","):
-            target = re.match(r"(?:\w+\.)?(\w+) ?=", piece)
-            column = target.group(1) if target is not None else None
-            if column in _CHAT_TYPES["chats"] and column not in CHAT_UPDATE_COLUMNS:
-                msg = "permission denied for table chats"
-                raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+            # GH-271: a row-constructor piece ``(a, b, ...) = ...`` (a row, ROW(...) or a
+            # sub-select) names every column of its list; PostgreSQL checks each one.
+            row_target = re.match(r"\(([^()]*)\) ?=", piece)
+            if row_target is not None:
+                columns = [column.strip() for column in row_target.group(1).split(",")]
+            else:
+                target = re.match(r"(?:\w+\.)?(\w+) ?=", piece)
+                columns = [target.group(1)] if target is not None else []
+            for column in columns:
+                if column in _CHAT_TYPES["chats"] and column not in CHAT_UPDATE_COLUMNS:
+                    msg = "permission denied for table chats"
+                    raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
 
 
 _Context = dict[str, tuple[str, dict[str, Any] | None]]
