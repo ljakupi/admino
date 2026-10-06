@@ -125,7 +125,11 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
 - JWT pattern only matches tokens whose first segment starts with ``ey``.
 - Residual limits (GH-270), still not redacted:
   - Keys not redacted at all:
-    - key formats with no rule;
+    - key formats with no rule, and a JWT whose header doesn't start with
+      ``ey`` (the JWT rule needs that start): a header encoded from JSON
+      that starts with ``{`` and a newline (``ewo...``) isn't caught by the
+      JWT rule, or only from a later ``ey`` in it (a nested object), and the
+      header's start then stays visible;
     - a key glued directly to an ASCII letter, digit or ``_`` (``ask-...``,
       ``xhf_...``, a key in ``_`` emphasis ``_<key>_``): not a token start,
       by design. Only a model title trims a ``_`` at its start before it
@@ -140,10 +144,12 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
       (``a<think>...</think>sk-...``): it glues the two, a key glued
       directly.
   - Keys redacted only in part:
-    - a key split by an invisible character outside the removal set (a
-      combining grapheme joiner, a variation selector, a Hangul filler,
-      U+2800): it isn't joined, so it isn't redacted whole, or not at all
-      when the split falls within the rule's minimum length;
+    - a key split by an invisible character outside the removal set (for
+      example a combining grapheme joiner, a variation selector, a Hangul
+      filler, U+2800, the Khmer vowels U+17B4 / U+17B5 or an unassigned
+      default-ignorable code point such as U+2065): it isn't joined, so it
+      isn't redacted whole, or not at all when the split falls within the
+      rule's minimum length;
     - a key split by whitespace, a line break or any visible character its
       format doesn't allow (a key hard-wrapped in a pasted log; NBSP and
       U+3000 become spaces under NFKC): only the piece that starts with the
@@ -159,7 +165,11 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
       right after a ``-`` (``GOCSPX-<4>-sk-<20>``): the key rules run first,
       so the characters before the prefix stay visible when they are shorter
       than their rule's minimum (``1//`` and ``ya29.`` run before the key
-      rules and are redacted whole);
+      rules and are redacted whole). When the inner key's format allows no
+      ``-`` (``hf_``, ``gho_`` / ``ghu_`` / ``ghr_``, ``gsk_``, Stripe
+      ``sk_live_`` / ``sk_test_``, ``github_pat_``), the characters after
+      that key stay visible too (``GOCSPX-<4>-hf_<34>-<20>`` shows the last
+      20);
     - a key of a rule without a token start (``GOCSPX-``, ``rk_live_`` /
       ``rk_test_``, ``ghp_`` / ``ghs_``, ``xox...``, ``1//``, ``ya29.``)
       split by a removed character right before a complete key inside its

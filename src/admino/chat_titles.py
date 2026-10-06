@@ -60,7 +60,11 @@ Security notes:
   gets the same redaction and cleanup, without the trims.
 - Residual limit (GH-270), still not redacted:
   - keys not redacted at all:
-    - key formats with no rule;
+    - key formats with no rule, and a JWT whose header doesn't start with
+      ``ey`` (the JWT rule needs that start): a header encoded from JSON
+      that starts with ``{`` and a newline (``ewo...``) isn't caught by the
+      JWT rule, or only from a later ``ey`` in it (a nested object), and the
+      header's start then stays visible;
     - a key glued directly to an ASCII letter, digit or ``_`` (``ask-...``,
       ``xhf_...``, ``_<key>_``): not a token start, by design. A ``_`` at
       the start of a model title is the exception: it is trimmed before the
@@ -74,10 +78,12 @@ Security notes:
       (``a<think>...</think>sk-...``): it glues the two, the same "glued
       directly" case;
   - keys redacted only in part:
-    - a key split by an invisible character outside the removal set (a
-      combining grapheme joiner, a variation selector, a Hangul filler,
-      U+2800): it isn't joined, so it isn't redacted whole, or not at all
-      when the split falls within the rule's minimum length;
+    - a key split by an invisible character outside the removal set (for
+      example a combining grapheme joiner, a variation selector, a Hangul
+      filler, U+2800, the Khmer vowels U+17B4 / U+17B5 or an unassigned
+      default-ignorable code point such as U+2065): it isn't joined, so it
+      isn't redacted whole, or not at all when the split falls within the
+      rule's minimum length;
     - a key split by whitespace, a line break or any visible character its
       format doesn't allow (hard-wrapped in a pasted log; NBSP and U+3000
       become spaces under NFKC): only the piece that starts with the prefix
@@ -91,7 +97,10 @@ Security notes:
     - a ``GOCSPX-`` or ``xox...`` credential whose body holds a key prefix
       right after a ``-`` (``GOCSPX-<4>-sk-<20>``): the characters before
       the prefix stay visible when they are shorter than their rule's
-      minimum;
+      minimum. When the inner key's format allows no ``-`` (``hf_``,
+      ``gho_`` / ``ghu_`` / ``ghr_``, ``gsk_``, Stripe ``sk_live_`` /
+      ``sk_test_``, ``github_pat_``), the characters after that key stay
+      visible too (``GOCSPX-<4>-hf_<34>-<20>`` shows the last 20);
     - the start of a key of a rule without a token start (``GOCSPX-``,
       ``rk_live_`` / ``rk_test_``, ``ghp_`` / ``ghs_``, ``xox...``, ``1//``,
       ``ya29.``) split by a removed character right before a complete key

@@ -702,7 +702,10 @@ Viewer's chats from before a role change stay stored, unused.
 - **What redaction still misses.** Redaction is a safety net, not a guarantee. These
   stay visible in messages and titles.
   - Keys that aren't redacted at all:
-    - key formats with no rule;
+    - key formats with no rule, and a JWT whose header doesn't start with `ey`: the JWT
+      rule recognises a JWT only by that start. A header encoded from JSON that starts
+      with `{` and a line break (`ewo…`) isn't caught by the JWT rule, or only from an
+      `ey` later in the header (a nested object), and then the header's start stays;
     - a key glued directly to a letter, digit or `_` (`ask-…`, `xhf_…`, or a key in `_`
       emphasis such as `_AIza…_`): that isn't the start of a key, by design. The one
       exception is a `_` at the very start of a title written by the model (`_AIza…_`,
@@ -716,10 +719,11 @@ Viewer's chats from before a role change stay stored, unused.
       reasoning (`a<think>…</think>sk-…`): the reasoning is removed, which glues the word
       and the key, a key glued directly.
   - Keys redacted only in part:
-    - a key split by an invisible character that isn't removed (a combining grapheme
-      joiner, a variation selector, a Hangul filler, the Braille blank U+2800): the
-      parts aren't joined, so the key isn't redacted whole, or not at all when the split
-      falls within the characters its rule needs at least;
+    - a key split by an invisible character that isn't removed (for example a combining
+      grapheme joiner, a variation selector, a Hangul filler, the Braille blank U+2800,
+      the Khmer vowels U+17B4 and U+17B5, or an unassigned default-ignorable code point
+      such as U+2065): the parts aren't joined, so the key isn't redacted whole, or not
+      at all when the split falls within the characters its rule needs at least;
     - a key split by a space, a line break or any visible character the key can't
       contain, for example a key hard-wrapped in a pasted log (a non-breaking space and
       the ideographic space U+3000 count as spaces): only the piece that starts with the
@@ -731,7 +735,10 @@ Viewer's chats from before a role change stay stored, unused.
       the prefix is in the payload. The JWT can't be used without the redacted part;
     - a Google OAuth client secret (`GOCSPX-…`) or a Slack token (`xox…`) whose body
       holds a key right after a `-` (`GOCSPX-abcd-sk-…`): the key is redacted, and the
-      characters before it stay when they're shorter than their format's minimum;
+      characters before it stay when they're shorter than their format's minimum. When
+      the inner key's format allows no `-` (`hf_`, `gho_`/`ghu_`/`ghr_`, `gsk_`, Stripe
+      `sk_live_`/`sk_test_`, `github_pat_`), the characters after that key stay too:
+      `GOCSPX-<4>-hf_<34>-<20>` (the numbers are character counts) shows the last 20;
     - the start of a Google OAuth secret or token (`GOCSPX-…`, `1//…`, `ya29.…`), a
       Stripe restricted key (`rk_live_…`, `rk_test_…`), a GitHub `ghp_…`/`ghs_…` token
       or a Slack token (`xox…`) split by an invisible character right before a complete
