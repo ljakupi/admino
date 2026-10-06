@@ -53,6 +53,8 @@ llm:
   provider: "infomaniak"
 
   timeout_s: 120
+  # Seconds a whole streamed reply may take before it ends with a timeout (0 < x <= 3600).
+  stream_deadline_s: 300
 
   # Infomaniak model ID.
   infomaniak_model: "Qwen/Qwen3.5-397B-A17B-FP8"

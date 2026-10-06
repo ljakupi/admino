@@ -14,16 +14,31 @@ Provider modules:
 User-facing errors (GH-242): setup and availability problems carry a stable
 ``code`` (``admino.models.LLMErrorCode``: not_configured, missing_model,
 provider_unavailable, rate_limited, timeout, residency_blocked,
-context_too_long) and a fixed English message; a coded ``LLMError`` is always
-user-facing, the PWA shows the code's translation and the agent's ``response``
-keeps the English text. ``retryable`` is True for provider_unavailable,
-rate_limited and timeout only (``admino.llm_policy`` retries those). Every
-other failure is uncoded and ``user_facing=False``: the chat shows a generic
-reply. The helpers below build the shared catalogue:
+context_too_long, malformed_response) and a fixed English message; a coded
+``LLMError`` is always user-facing, the PWA shows the code's translation and
+the agent's ``response`` keeps the English text. ``retryable`` is True for
+provider_unavailable, rate_limited and timeout only (``admino.llm_policy``
+retries those). Every other failure is uncoded and ``user_facing=False``: the
+chat shows a generic reply. The helpers below build the shared catalogue:
 - ``provider_status_error`` maps an HTTP status (or a timeout / transport
   failure) to its code; 429/5xx carry ``retry_after_s``.
 - ``sdk_status_error`` maps an SDK HTTP status error: Retry-After read with
   ``parse_retry_after``, a 400/413 classified with ``is_context_too_long``.
+- ``malformed_response_error`` (GH-25) is a reply the client can't use: data
+  the SDK can't decode, a field of the wrong type, or any tool call that
+  doesn't parse (the whole reply is rejected, never a subset kept). Not
+  retried. Inside a client, ``MalformedReplyError`` signals it.
+
+Output sanitization (GH-25): every client sanitizes before the agent sees
+anything. Text (``chat()`` content and every stream delta) goes through
+``strip_control_chars`` and is capped at 65536 characters counted after
+sanitizing (``CappedAnswer``), never cut at a word by the client. Tool-call
+arguments are bounded on the decoded JSON, then cleaned by
+``sanitize_tool_args`` (lone surrogates to U+FFFD, then the text removals, in
+keys and values at any depth). ``LLMResponse.truncated`` is True when the
+reply stopped at the output cap (``finish_reason`` "length", Anthropic
+``stop_reason`` "max_tokens") or the 65536 cap dropped text; the agent then
+cuts the answer at its last whole word.
 
 Per-call output cap (GH-179): ``LLMClient.chat`` takes a keyword-only
 ``max_tokens`` (default None = the configured ``max_response_tokens``). Every
@@ -37,14 +52,20 @@ content is the joined deltas. ``CappedAnswer`` keeps a streamed answer within
 the 65536-character content cap (counted after sanitizing); streamed tool-call
 fragments are bounded by ``_MAX_STREAM_TOOL_CALLS`` calls and
 ``_MAX_TOOL_ARGUMENT_CHARS`` argument characters per call (plus
-``_MAX_TOOL_NAME_CHARS`` name characters in the OpenAI-compatible reader, which
-drops a call whose fragments would cross either bound), and are parsed only
-once the stream ended, never streamed as deltas.
+``_MAX_TOOL_NAME_CHARS`` name characters in the OpenAI-compatible reader): a
+fragment that would cross a bound, or one call too many, makes the reply
+malformed (GH-25). Calls are parsed only once the stream ended, never streamed
+as deltas. Stream deadline (GH-25): each ``chat_stream`` call must end within
+``LLMConfig.stream_deadline_s`` of its first iteration, opening included. Every
+provider await (``create()``, then each read through ``next_before``) is
+bounded by that loop-clock deadline, never a ``yield``, so the consumer is
+never cancelled; past it the client closes the provider stream and raises its
+read-timeout error (code ``timeout``).
 
 Inputs: provider statuses, response headers, and (for classification only)
 the provider's error code and message, a per-call output cap, streamed answer
-text. Outputs: ``LLMError`` instances, the cap a request sends, the capped
-answer text.
+text, decoded tool-call arguments. Outputs: ``LLMError`` instances, the cap a
+request sends, the capped answer text, cleaned tool arguments.
 
 Security notes:
 - No credentials are stored or logged by this module.
@@ -54,7 +75,10 @@ Security notes:
   fixed phrases by ``is_context_too_long``; they are never stored or logged.
 - LLM output is sanitized: control characters (and lone surrogates, which no
   UTF-8 encoder accepts) stripped, length bounded.
-- Tool call arguments are validated for size and nesting depth.
+- Tool call arguments are validated for size and nesting depth, then every
+  string in them is cleaned (lone surrogates become U+FFFD).
+- ``malformed_response_error`` is raised ``from None``: no SDK exception, body,
+  stream line or argument travels with it or reaches a log.
 - Callers log an LLMError by its type, status_code and code only (GH-158),
   never its message, __cause__ or repr(), so no provider text or HTTP response
   body (conversation context) reaches the log.
@@ -63,6 +87,7 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import email.utils
 import json
 import logging
@@ -78,7 +103,7 @@ from admino.logs import safe_log
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
     from admino.config import LLMConfig
     from admino.models import LLMErrorCode
@@ -92,13 +117,11 @@ _MAX_CONTENT_LENGTH: int = 65536
 _MAX_TOOLS_COUNT: int = 64
 _MAX_TOOLS_PAYLOAD: int = 65536
 
-# Bounds on streamed tool-call fragments (untrusted provider data): calls past
-# the first 128 are ignored. The OpenAI-compatible reader bounds a call's name at
-# 256 chars and its arguments at 65536: a fragment that would cross a bound is
-# never appended, it marks the call overflowed (no further growth, dropped at
-# parse time), so a hostile stream can't grow either string. Anthropic's argument
-# fragments stop growing at 65536 chars (and then fail JSON parsing); its name
-# arrives in one event.
+# Bounds on streamed tool-call fragments (untrusted provider data): a 129th call
+# makes the reply malformed (GH-25). The OpenAI-compatible reader bounds a call's
+# name at 256 chars and every reader bounds its arguments at 65536: a fragment
+# that would cross a bound is never appended and makes the reply malformed, so a
+# hostile stream can't grow either string and a cut prefix is never parsed.
 _MAX_STREAM_TOOL_CALLS: Final = 128
 _MAX_TOOL_NAME_CHARS: Final = 256
 _MAX_TOOL_ARGUMENT_CHARS: Final = 65536
@@ -154,6 +177,15 @@ class LLMError(Exception):
     def retryable(self) -> bool:
         """True for a transient failure (provider_unavailable, rate_limited, timeout)."""
         return self.code in _RETRYABLE_CODES
+
+
+class MalformedReplyError(Exception):
+    """The provider sent data a client can't use (GH-25): wrong type, bound crossed.
+
+    Carries nothing from the reply. A client catches it where it reads the reply
+    and raises ``malformed_response_error(label) from None`` instead, so only an
+    ``LLMError`` leaves the client.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +302,23 @@ def provider_status_error(
     return LLMError(
         message=internal_message or f"{label} API returned HTTP {status_code}",
         status_code=status_code,
+    )
+
+
+def malformed_response_error(label: str) -> LLMError:
+    """Return the ``malformed_response`` error for a reply the client can't use (GH-25).
+
+    A reply is malformed when the provider sent data that does not decode, has
+    the wrong type, or holds a tool call that fails to parse. It is not retried
+    (the same request likely gives the same reply). Callers raise it ``from
+    None``: no SDK exception, body or line travels with it.
+
+    Args:
+        label: Provider name shown to the user.
+    """
+    return LLMError(
+        message=f"{label} returned a malformed response. Please try again.",
+        code="malformed_response",
     )
 
 
@@ -443,6 +492,13 @@ class LLMResponse(BaseModel):
         default=None,
         description="Token usage, when the provider reports it.",
     )
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "True when the reply stopped at the output cap (finish_reason 'length',"
+            " stop_reason 'max_tokens') or the 65536-character cap dropped text."
+        ),
+    )
 
 
 class LLMStreamDelta(BaseModel):
@@ -488,6 +544,15 @@ _CONTROL_CHAR_TABLE = dict.fromkeys(
 )
 
 
+# Tool-argument strings (GH-25): the same removals as text, except that a lone
+# surrogate becomes U+FFFD (one per surrogate) instead of being dropped, so the
+# value keeps a visible mark where the model sent something undecodable.
+_TOOL_ARG_TABLE: Final = {
+    **_CONTROL_CHAR_TABLE,
+    **dict.fromkeys(range(0xD800, 0xE000), chr(0xFFFD)),
+}
+
+
 def strip_control_chars(content: str) -> str:
     """Strip dangerous control and Unicode characters without truncating.
 
@@ -522,25 +587,33 @@ def sanitize_content(content: str) -> str:
 
 
 class CappedAnswer:
-    """Collect streamed answer text up to the ``LLMResponse`` content cap.
+    """Collect answer text up to the ``LLMResponse`` content cap.
 
     Callers feed text that is already sanitized, so the cap counts sanitized
-    characters. Text past the cap is dropped; the caller keeps reading its
-    stream so tool calls and the stop reason still arrive.
+    characters. Text past the cap is dropped (and ``truncated`` set); a stream
+    reader keeps reading so tool calls and the stop reason still arrive.
+    ``chat()`` feeds its whole reply at once.
     """
 
     def __init__(self) -> None:
         self._parts: list[str] = []
         self._length = 0
+        self._dropped = False
 
     @property
     def answer(self) -> str:
         """The answer collected so far (at most ``_MAX_CONTENT_LENGTH`` characters)."""
         return "".join(self._parts)
 
+    @property
+    def truncated(self) -> bool:
+        """True once the cap dropped text (exactly 65536 characters drop nothing)."""
+        return self._dropped
+
     def feed(self, text: str) -> str:
         """Keep what fits under the cap of ``text``; return the kept text (maybe "")."""
         kept = text[: _MAX_CONTENT_LENGTH - self._length]
+        self._dropped = self._dropped or len(kept) < len(text)
         if kept:
             self._parts.append(kept)
             self._length += len(kept)
@@ -549,6 +622,40 @@ class CappedAnswer:
     def finish(self) -> str:
         """Return the held-back text at the end of the stream: none is ever held."""
         return ""
+
+
+# Any: tool arguments are arbitrary decoded JSON (dict / list / str / number / bool / None).
+def _clean_arg(value: Any) -> Any:
+    """Return ``value`` with every str (dict keys included) cleaned; a new structure."""
+    if isinstance(value, str):
+        return value.translate(_TOOL_ARG_TABLE)
+    if isinstance(value, dict):
+        # A comprehension keeps the LATER value when two keys clean alike, as JSON does.
+        return {_clean_arg(key): _clean_arg(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clean_arg(item) for item in value]
+    return value
+
+
+def sanitize_tool_args(args: dict[str, Any]) -> dict[str, Any]:
+    """Clean every string in decoded tool-call arguments (GH-25, D5).
+
+    Every str at any depth (dict keys, values, list items) gets each lone
+    surrogate (U+D800..U+DFFF) replaced by one U+FFFD, then the characters
+    ``strip_control_chars`` removes are removed. Non-str leaves keep their type
+    and value. When two keys clean to the same key, the later one wins.
+
+    The parsers call this after the size and depth bounds were checked on the
+    decoded arguments, so the recursion is at most a few levels deep.
+
+    Args:
+        args: Decoded tool-call arguments (never mutated).
+
+    Returns:
+        A new, cleaned structure.
+    """
+    cleaned: dict[str, Any] = _clean_arg(args)
+    return cleaned
 
 
 def check_args_depth(obj: object, limit: int = 4) -> bool:
@@ -570,6 +677,10 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
 
     The function name uses dot notation (e.g. "gmail.read") which is split
     into separate tool and action fields.
+
+    The bounds below are checked on the arguments as given; the kept calls'
+    arguments are then cleaned with ``sanitize_tool_args``. An invalid call is
+    dropped and logged by its name only (through ``safe_log``).
 
     Args:
         raw_tool_calls: List of raw tool call dicts from the LLM response.
@@ -635,7 +746,7 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
             logger.warning("Skipping tool call '%s': empty tool or action component", log_name)
             continue
         try:
-            parsed.append(ToolCall(tool=tool, action=action, args=arguments))
+            parsed.append(ToolCall(tool=tool, action=action, args=sanitize_tool_args(arguments)))
         except ValidationError:
             logger.warning(
                 "Skipping tool call '%s': tool/action failed schema validation",
@@ -643,6 +754,23 @@ def parse_tool_calls(raw_tool_calls: list[dict[str, Any]]) -> list[ToolCall]:
             )
 
     return parsed
+
+
+async def next_before[T](items: AsyncIterator[T], deadline: float) -> T | None:
+    """Return the next item of a provider stream, or None at its end (GH-25 deadline).
+
+    Only this await is bounded: the caller yields each item outside of it, so
+    the deadline's cancellation reaches the provider read and never a consumer.
+
+    Args:
+        items: The provider stream's iterator.
+        deadline: The event loop time (``loop.time()``) the stream must end by.
+
+    Raises:
+        TimeoutError: The deadline passed while waiting (the read is cancelled).
+    """
+    async with asyncio.timeout_at(deadline):
+        return await anext(items, None)
 
 
 def output_token_cap(configured: int, max_tokens: int | None) -> int:

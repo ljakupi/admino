@@ -106,6 +106,18 @@ Security notes:
   stopped" line with the tool-call count is logged.
   Without a stream the run is exactly the JSON path (``llm_policy.chat``, not
   stoppable).
+- Cut answers (GH-25): a final answer (no tool calls) whose
+  ``LLMResponse.truncated`` is set (the provider stopped at its output cap,
+  or the 65536-character cap dropped text) is cut like a stopped reply, up to
+  and including its last ASCII whitespace ("" when it has none). That cut
+  text is the response and the assistant message, and the run reports
+  ``AgentResult.truncated``; the stream still got every raw piece (the
+  server's display deltas drop the cut word). Text before tool calls is never
+  cut: it isn't a final answer. A streamed call that fails with the
+  ``timeout`` code after it forwarded text keeps that call's text, stripped,
+  capped and cut like a stop's, as an assistant message before the error
+  reply (none when the cut leaves nothing); any other failure stores the
+  error reply only.
 - Exceptions from the LLM client are caught and converted into a safe
   "error" AgentResult carrying the ``LLMError``'s ``code`` as ``error_code``
   (None for an uncoded error and any other exception). An ``LLMError`` with
@@ -115,9 +127,17 @@ Security notes:
   other exception gets the generic reply. The failure is logged by type, HTTP status and code
   only, never message text. ``MemoryError`` and ``RecursionError`` are
   re-raised (mirroring the registry pattern).
-- Malformed LLM output (e.g. validation errors on LLM responses) is
-  converted to an assistant message with a generic note and returned —
-  never crashes the loop.
+- Malformed LLM output never crashes the loop. A reply the client rejected
+  as a whole (a malformed tool call, undecodable or wrong-typed data; GH-25)
+  is an ``LLMError`` with the code ``malformed_response``: the run ends like
+  any coded failure, with that code and the error's fixed message, and it
+  isn't retried. Any other failure (e.g. a validation error on an LLM
+  response) gets the generic reply.
+- Unknown tools (GH-25, D4): a well-formed ``tool.action`` the registry
+  doesn't know is denied by ``dispatch_tool_call`` before the permission
+  engine, recorded once as a ``deny`` (the recorder gets the requested
+  names), reported as the run's ``deny`` record, and the model gets
+  ``Unknown tool: <tool>.<action>`` as its result, so the run goes on.
 - ``max_tool_calls`` is a hard cap enforced per-call inside the dispatch
   batch — the loop breaks the moment it is reached, even mid-batch.
 - A run's limits come from its own ``agent_config`` (the server builds it
@@ -192,10 +212,10 @@ _AUDIT_UNAVAILABLE_MESSAGE: str = "Internal error: audit unavailable."
 # GH-162: the outcome of a tool call in a run without a tool context (a
 # principal without an organization): nothing is dispatched.
 _NO_ORG_CONTEXT_MESSAGE: str = "No organization context."
-# GH-8: a stopped reply ends at the last of these (the display deltas' word
-# boundary), and is at most as long as a run's response may be.
+# GH-8/GH-25: a stopped, cut or timed-out reply ends at the last of these (the
+# display deltas' word boundary), and is at most as long as a run's response may be.
 _ASCII_WHITESPACE: str = " \t\n\r"
-_MAX_STOPPED_REPLY_CHARS: int = 65536
+_MAX_PARTIAL_REPLY_CHARS: int = 65536
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +564,9 @@ class Agent:
                     max_messages=config.max_context_messages,
                 ),
             )
+            # The text this call forwards to the stream (a streamed call only), kept
+            # so a timeout can store it (GH-25, D9).
+            forwarded: list[str] = []
             try:
                 # GH-242: the model policy (residency guard + bounded retries on
                 # this same client with this same context).
@@ -561,6 +584,7 @@ class Agent:
                         context,
                         tools_payload,
                         stream=stream,
+                        forwarded=forwarded,
                         data_residency=tool_policy.data_residency,
                         max_retries=config.llm_max_retries,
                     )
@@ -585,6 +609,12 @@ class Agent:
                     if exc.user_facing:
                         message = exc.message
                     error_code = exc.code
+                    # GH-25 (D9): a timeout keeps the text its call already showed, cut
+                    # like a stop's, before the error reply. Other failures keep none.
+                    if exc.code == "timeout":
+                        partial = _partial_reply("".join(forwarded))
+                        if partial:
+                            working_history.append(LLMMessage(role="assistant", content=partial))
                 else:
                     logger.error("LLM chat call failed: %s", type(exc).__name__)
                 return self._terminal_error(
@@ -601,12 +631,17 @@ class Agent:
             # 2. Text-only response → we are done.
             if not response.tool_calls:
                 assistant_text = response.content or ""
+                if response.truncated:
+                    # GH-25 (D7): an answer an output cap cut ends like a stopped
+                    # one, so a key cut short is never returned or stored in part.
+                    assistant_text = _to_last_word(assistant_text)
                 working_history.append(LLMMessage(role="assistant", content=assistant_text))
                 return AgentResult(
                     status="final",
                     response=assistant_text,
                     history=working_history,
                     tool_calls=tool_records,
+                    truncated=response.truncated,
                 )
 
             # 3. LLM requested tool calls. Dispatch each one, honouring the
@@ -748,16 +783,18 @@ class Agent:
         tools_payload: list[dict[str, object]],
         *,
         stream: RunStream,
+        forwarded: list[str],
         data_residency: bool,
         max_retries: int,
     ) -> LLMResponse | str:
         """Make one LLM call through ``llm_policy.chat_stream``, reporting its text to ``stream``.
 
-        Each delta's text goes to ``stream.on_delta`` in order as it arrives.
-        The wait for the next item races ``stream.stop``: a stop cancels the
-        pending read at once (also while the provider sends nothing), and a
-        stop set between items ends the call before the next read. The stream
-        is closed however the call ends.
+        Each delta's text goes to ``stream.on_delta`` in order as it arrives,
+        and is first appended to ``forwarded`` (the caller's empty list), so the
+        caller still has it when the call raises. The wait for the next item
+        races ``stream.stop``: a stop cancels the pending read at once (also
+        while the provider sends nothing), and a stop set between items ends the
+        call before the next read. The stream is closed however the call ends.
 
         Returns:
             The final ``LLMResponse``, used like ``chat()``'s; or, once stopped
@@ -774,7 +811,6 @@ class Agent:
             data_residency=data_residency,
             max_retries=max_retries,
         )
-        forwarded: list[str] = []
         stopped = asyncio.ensure_future(stream.stop.wait())
         read: asyncio.Future[LLMStreamDelta | LLMResponse] | None = None
         try:
@@ -1189,23 +1225,39 @@ async def _keep_record(
         await stream.on_tool_call(record)
 
 
+def _to_last_word(text: str) -> str:
+    """Return ``text`` up to and including its last ASCII whitespace ("" when it has none).
+
+    The cut of an answer that didn't end as the model meant it (GH-8: a stop;
+    GH-25: an output cap, a timeout): its unfinished last word is dropped, as
+    the stream's display deltas drop it, so a key cut short of its format's
+    length (which no credential rule matches) is never stored or shown in part.
+    """
+    return text[: max(text.rfind(char) for char in _ASCII_WHITESPACE) + 1]
+
+
+def _partial_reply(forwarded: str) -> str:
+    """Return what is kept of an interrupted LLM call's forwarded text (a stop, a timeout).
+
+    Control characters and lone surrogates are stripped and the text capped
+    first (the stream's deltas bypass ``LLMResponse`` validation), so the
+    message built from it never raises a ``ValidationError`` carrying answer
+    text; then it is cut by :func:`_to_last_word`.
+    """
+    return _to_last_word(strip_control_chars(forwarded)[:_MAX_PARTIAL_REPLY_CHARS])
+
+
 def _stopped(
     history: list[LLMMessage], tool_records: list[ToolCallRecord], forwarded: str
 ) -> AgentResult:
     """Build the result of a run the user stopped (GH-8).
 
     ``forwarded`` is the text the interrupted LLM call forwarded ("" when the
-    stop came between calls or dispatches). The reply keeps it up to and
-    including its last ASCII whitespace: the unfinished last word is dropped,
-    as the stream's display deltas drop it, so a key the stop cut short of its
-    format's length (which no credential rule matches) is never stored or
-    shown in part. Control characters and lone surrogates are stripped and the
-    reply capped first, so building the result never raises a
-    ``ValidationError`` carrying answer text. A non-empty reply also ends the
-    history as a plain assistant message (the call's tool calls are dropped).
+    stop came between calls or dispatches); the reply is its
+    :func:`_partial_reply`. A non-empty reply also ends the history as a plain
+    assistant message (the call's tool calls are dropped).
     """
-    kept = strip_control_chars(forwarded)[:_MAX_STOPPED_REPLY_CHARS]
-    response = kept[: max(kept.rfind(char) for char in _ASCII_WHITESPACE) + 1]
+    response = _partial_reply(forwarded)
     if response:
         history.append(LLMMessage(role="assistant", content=response))
     logger.info("Agent run stopped (%d tool calls)", len(tool_records))

@@ -112,9 +112,10 @@ A chat reply that fails has `status: "error"`, and the `POST /api/chats/{id}/mes
 | `missing_model` | No model is set for the provider, or the provider doesn't know it (404). |
 | `provider_unavailable` | The provider can't be reached, or it failed (5xx). |
 | `rate_limited` | The provider refused the request for its rate limit (429). |
-| `timeout` | The provider didn't answer within `llm.timeout_s`. |
+| `timeout` | The provider didn't answer within `llm.timeout_s`, or a streamed reply didn't end within `llm.stream_deadline_s` (300 seconds by default, see the [`config.yaml` reference](#configyaml-reference)). |
 | `context_too_long` | The conversation is longer than the model accepts (400/413). Start a new chat. |
 | `residency_blocked` | The organization's data residency policy is on and the provider isn't Swiss (see [above](#data-residency-and-the-provider)). |
+| `malformed_response` | The provider's reply couldn't be used: a tool call in it was malformed, or its data couldn't be read (see [Cleaning the model's output](#cleaning-the-models-output)). The whole reply is rejected. It isn't retried. |
 | `rate_limit` | Not an LLM failure: you already have as many pending confirmations as allowed (`max_pending_confirmations`, a [platform default](#platform-defaults), 3 by default), so the action that needed one more wasn't run. The turn is stored (see [Chats](#chats)). Unlike `rate_limited`, it's admino's own limit, not the provider's. |
 
 Any other failure has `error_code: null`. The chat shows the code's translated text
@@ -126,7 +127,7 @@ by their type, HTTP status and code only.
 
 **Retries.** A `timeout`, `provider_unavailable` or `rate_limited` failure is retried up to
 `llm.max_retries` times (a [platform default](#platform-defaults): 2, from 0 to 5, `0`
-turns retries off). Every other failure fails at once.
+turns retries off). Every other failure fails at once, `malformed_response` included.
 
 - Before each retry admino waits the provider's `Retry-After` (or `retry-after-ms`) when
   it sends one, up to 10 seconds. A longer `Retry-After` isn't retried: the reply fails
@@ -134,10 +135,35 @@ turns retries off). Every other failure fails at once.
 - Without one it waits an exponential backoff with jitter: up to 1, 2, 4, then 8 seconds
   (at most 8), each at least half of that.
 - A retry sends the same request to the same provider and model, never to another one. A
-  streamed reply is retried only before its first piece has arrived.
+  streamed reply is retried only before its first piece has arrived, and each attempt
+  gets its own `llm.stream_deadline_s`.
 - The provider SDKs' own retries are off, so each attempt is exactly one request and the
   limit above is the only one. Each retry logs one warning with its code, attempt number
   and delay.
+
+### Cleaning the model's output
+
+admino cleans every provider's output before the assistant uses it, in JSON and
+streamed replies alike.
+
+- **Text.** Control characters are removed: C0 controls except tab, line feed and
+  carriage return, C1 controls, direction overrides and isolates, zero-width characters,
+  the line and paragraph separators (U+2028, U+2029), the byte order mark and lone
+  surrogates. An ANSI escape sequence loses its `ESC` (or `CSI`), so the rest (`[31m`,
+  say) is plain text. A reply holds at most 65,536 characters (64 KiB), counted after
+  cleaning. A reply cut there, or by the model's output cap
+  (`llm.max_response_tokens`), ends at its last complete word.
+- **Tool arguments.** Every string in a tool call's arguments, keys and values at any
+  depth, is cleaned in two steps: each lone surrogate becomes U+FFFD (the replacement
+  character), then the same characters as in text are removed. The argument limits (4
+  levels deep, 32 keys, 2,048-character top-level strings, 16,384 characters of JSON)
+  are checked before that.
+- **Malformed tool calls.** When any tool call in a reply can't be used (its arguments
+  don't decode, aren't a JSON object or exceed the limits, or its name isn't
+  `tool.action`), the whole reply is rejected with `malformed_response`, even when its
+  other tool calls were fine. So is a streamed reply with more than 128 tool calls or
+  with a name or arguments too long, and a reply whose data can't be read. The error's
+  message never quotes the reply, and no part of the reply is logged.
 
 ## Infomaniak AI Services (default)
 
@@ -226,7 +252,7 @@ The shipped [`config/config.yaml`](../config/config.yaml) is fully commented. Th
 | --- | --- |
 | `server` | Bind `host` / `port` for the ASGI server, the session cookie's `cookie_secure` flag, the `public_url` users open admino at, and the `trusted_proxies` whose `X-Forwarded-*` headers are believed (see [Production deployment](#production-deployment-tls-reverse-proxy)). |
 | `database` | Connection pool sizing (`min_pool_size`, `max_pool_size`). |
-| `llm` | `provider`, request `timeout_s`, the cloud `*_model` IDs, and the active model's capabilities: `max_input_tokens` (the most input tokens it accepts, default 200000, from 1000 to 2000000) and `image_input` (whether it accepts images, default `true`). The provider, the model IDs and the capabilities are also [platform settings](#platform-defaults); this section is applied again at every start. The retry limit isn't in `config.yaml`: it's a platform setting only. |
+| `llm` | `provider`, request `timeout_s`, `stream_deadline_s` (the most time one attempt of a streamed model call may take, opening the stream included: 300 seconds by default, above 0 up to 3600; past it the reply fails with `timeout`), the cloud `*_model` IDs, and the active model's capabilities: `max_input_tokens` (the most input tokens it accepts, default 200000, from 1000 to 2000000) and `image_input` (whether it accepts images, default `true`). The provider, the model IDs and the capabilities are also [platform settings](#platform-defaults); this section is applied again at every start. The retry limit isn't in `config.yaml`: it's a platform setting only. |
 | `limits` | Guardrails: max tool calls per message, pending confirmations, message length, context window (how many of a chat's latest messages are sent to the model; the system prompt and your latest message are always sent, see [Chats](#chats)). They seed the [platform settings](#settings-mine-organization-platform) on the first start; later edits here don't apply. Change them with `PATCH /api/platform/settings` instead. |
 | `egress` | `allowed_hosts` — the single source of truth for the outbound whitelist. |
 | `log_level` | Top-level key: `DEBUG`, `INFO` (default), `WARNING`, `ERROR` or `CRITICAL`. The `LOG_LEVEL` env var overrides it. |
@@ -914,8 +940,8 @@ confirm, as soon as you see `message_saved` or `confirm`.
 - **Error codes.** `error.code` is one of the codes in
   [LLM errors and retries](#llm-errors-and-retries) (`not_configured`, `missing_model`,
   `provider_unavailable`, `rate_limited`, `timeout`, `context_too_long`,
-  `residency_blocked`, and `rate_limit` for too many pending confirmations), or one of
-  these two:
+  `residency_blocked`, `malformed_response`, and `rate_limit` for too many pending
+  confirmations), or one of these two:
   - `internal_error`: the message failed for another reason. When its turn was stored
     with the generic error reply, `message_saved` comes first. When it failed after the
     stream started and nothing could be stored (where the JSON route answers `500`),
@@ -926,18 +952,23 @@ confirm, as soon as you see `message_saved` or `confirm`.
   `message` is the English fallback text: for a stored turn, the reply the JSON route
   returns in `response`.
 - **A model failure in the middle of the reply** is stored like any failed message: the
-  turn's last message is the error reply, with `status: "error"`, not the text that
-  already arrived. The stream ends with `message_saved`, `error` and `done`. A failed
-  model call is [retried](#llm-errors-and-retries) only until the model's first piece of
-  text has arrived.
+  turn's last message is the error reply, with `status: "error"`. The text that already
+  arrived isn't stored, except after a `timeout`: then that text, up to its last complete
+  word, is stored as a message of its own just before the error reply (none when no word
+  was complete yet), and the `delta` events end at that same word. The stream ends with
+  `message_saved` (naming the error reply), `error` and `done`. A failed model call is
+  [retried](#llm-errors-and-retries) only until the model's first piece of text has
+  arrived.
 - **Text arrives word by word.** The `delta` texts get the same cleanup and credential
   redaction as the JSON reply (see Messages above), so joined together they equal what
   `GET /api/chats/{id}` shows for the reply afterwards, and a key is never sent in part.
   That's why a word is sent only once the space, tab or line break after it has arrived,
   and a word that reads `Bearer` waits for the word after it. A stopped or failed reply
   ends at its last complete word: a word the stop or failure cut off is neither streamed
-  nor stored. Text without spaces (a long link, for example) arrives once it ends. A
-  `delta` carries at most 4,096 characters; longer text comes in several.
+  nor stored. So does a reply cut by the model's output cap
+  (`llm.max_response_tokens`) or by the 64 KiB cap; its message is still `complete`.
+  Text without spaces (a long link, for example) arrives once it ends. A `delta`
+  carries at most 4,096 characters; longer text comes in several.
 - **Confirming with streaming.** Approving streams the rest of the message like a new
   one, starting with `run_started` and the approved action's `tool_call`; it never sends a
   `title`. Denying streams `run_started`, one `delta` with "Action … was denied.",

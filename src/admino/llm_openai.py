@@ -17,28 +17,45 @@ SDK failures map to the shared catalogue in ``llm.py`` (GH-242): a timeout is
 ``provider_unavailable`` (both with the response's Retry-After), a 400/413
 whose input exceeds the context ``context_too_long``; other statuses stay
 internal (code None, ``user_facing=False``, "OpenAI API returned HTTP <n>").
-The SDK never retries (``max_retries=0``): one ``chat()`` or ``chat_stream()``
-is exactly one HTTP request; retries belong to ``admino.llm_policy``.
+A reply the client can't use is ``malformed_response`` (GH-25, not retried): a
+body or stream line the SDK can't decode (it raises ``ValueError`` /
+``RecursionError`` raw), ``httpx.DecodingError`` mid-stream, a field read with
+the wrong type (``model`` / ``content`` not a str or None, a tool-call list
+that isn't a list, a fragment index that isn't an int, a fragment id / name /
+arguments not a str or None), or any tool call that doesn't parse (the whole
+reply is rejected). The SDK never retries (``max_retries=0``): one ``chat()``
+or ``chat_stream()`` is exactly one HTTP request; retries belong to
+``admino.llm_policy``.
 
 Output cap: ``chat()``'s keyword-only ``max_tokens`` (GH-179) lowers the
 request's ``max_tokens`` to ``min(max_tokens, config.max_response_tokens)``;
 None keeps the configured cap, an invalid value is a ``ValueError`` before any
 request.
 
+Output (GH-25): the content and every delta are sanitized with
+``strip_control_chars`` and capped at 65536 characters (never cut at a word);
+tool-call arguments are bounded, then cleaned with ``sanitize_tool_args``.
+``LLMResponse.truncated`` is True for ``finish_reason == "length"`` or when the
+cap dropped text.
+
 Streaming (GH-8): ``chat_stream()`` sends ``chat()``'s request body plus
 ``stream: true`` (configured cap) and yields sanitized ``LLMStreamDelta`` pieces,
 then exactly one final ``LLMResponse`` (content = the joined deltas, capped at
 65536 characters while the stream is still read to its end). Setup errors come
 on the first iteration, before any request; HTTP statuses when opening map like
-``chat()``; a mid-stream timeout is ``timeout``, a transport failure or a
-mid-stream error event ``provider_unavailable``. This module also holds the
-stream reader shared by the OpenAI-compatible clients (OpenAI, vLLM,
-Infomaniak): ``_stream_reply`` accumulates tool-call fragments per index
-(``_accumulate_tool_calls``: at most 128 calls, each with a name of at most 256
-characters and arguments of at most 65536; a fragment that would cross a bound
-is never appended and its call is dropped, the others kept) and parses them with
-``_parse_openai_tool_calls`` once the stream ended; tool calls are never
-streamed as deltas.
+``chat()``; a mid-stream timeout is ``timeout``, a transport or
+``httpx.StreamError`` failure or a mid-stream error event
+``provider_unavailable``. The call must end within ``stream_deadline_s`` of its
+first iteration: opening and every read are bounded (never a ``yield``), and
+past the deadline the stream is closed and the read-timeout ``timeout`` error
+raised. This module also holds the reader shared by the OpenAI-compatible
+clients (OpenAI, vLLM, Infomaniak): ``_stream_reply`` accumulates tool-call
+fragments per index (``_accumulate_tool_calls``: at most 128 calls, each with a
+name of at most 256 characters and arguments of at most 65536; a fragment that
+would cross a bound is never appended and makes the reply malformed) and parses
+them with ``_parse_openai_tool_calls`` once the stream ended; tool calls are
+never streamed as deltas. A malformed usage block is ignored with at most one
+warning per stream. ``_completion_response`` builds their ``chat()`` reply.
 
 Inputs: conversation messages, tool definitions, OPENAI_API_KEY and the
 configured model and caps. Outputs: ``LLMResponse`` / ``LLMStreamDelta`` items
@@ -51,11 +68,13 @@ Security notes:
   response encode as UTF-8).
 - Streamed tool-call names and arguments are bounded while they accumulate: a
   hostile stream can't grow them past 256 / 65536 characters (memory stays
-  bounded whatever the fragment count or size).
+  bounded whatever the fragment count or size), and the deadline bounds how
+  long a stream can hold the connection.
 - Error messages are fixed strings: never the SDK message, a response body or
   the body's error code (those only classify a context-length failure); SDK
-  errors are raised ``from None``. Stream text and tool arguments are never
-  logged (a dropped tool call is logged by its name through ``safe_log``).
+  errors are raised ``from None``. Stream text, lines and tool arguments are
+  never logged (a dropped tool call is logged by its name through
+  ``safe_log``, a rejected reply by its provider label and error type only).
 - No end-user or account identifier is sent: no ``user``, ``metadata``,
   ``safety_identifier``, ``prompt_cache_key`` or ``store`` key, and the SDK's
   env-derived ``OpenAI-Organization`` / ``OpenAI-Project`` headers
@@ -65,6 +84,7 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -84,12 +104,15 @@ from admino.llm import (
     LLMResponse,
     LLMStreamDelta,
     LLMUsage,
+    MalformedReplyError,
     check_args_depth,
+    malformed_response_error,
     missing_model_error,
+    next_before,
     not_configured_error,
     output_token_cap,
     provider_status_error,
-    sanitize_content,
+    sanitize_tool_args,
     sdk_status_error,
     strip_control_chars,
     validate_tools_payload,
@@ -101,9 +124,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
 
     from openai import AsyncStream
-    from openai.types import CompletionUsage
     from openai.types.chat import ChatCompletionChunk
-    from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 
     from admino.config import LLMConfig
 
@@ -216,7 +237,10 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
         {"id": "...", "type": "function",
          "function": {"name": "tool.action", "arguments": "{...}"}}
 
-    Note: OpenAI returns arguments as a JSON string, not a dict.
+    Note: OpenAI returns arguments as a JSON string, not a dict. The bounds
+    are checked on the decoded arguments; a kept call's arguments are then
+    cleaned with ``sanitize_tool_args``. An invalid call is dropped and logged
+    by its name only; provider data never makes this function raise.
 
     Args:
         tool_calls: Tool calls from OpenAI's response.
@@ -250,7 +274,8 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
         if isinstance(raw_args, str):
             try:
                 arguments = json.loads(raw_args)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                # Invalid JSON, an int over the digit limit, or nesting too deep.
                 logger.warning("Skipping tool call '%s': malformed JSON arguments", log_name)
                 continue
         elif isinstance(raw_args, dict):
@@ -292,7 +317,14 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
             continue
 
         try:
-            parsed.append(ToolCall(tool=tool, action=action, args=arguments, tool_call_id=call_id))
+            parsed.append(
+                ToolCall(
+                    tool=tool,
+                    action=action,
+                    args=sanitize_tool_args(arguments),
+                    tool_call_id=call_id,
+                )
+            )
         except ValidationError:
             logger.warning(
                 "Skipping tool call '%s': tool/action failed schema validation",
@@ -302,18 +334,32 @@ def _parse_openai_tool_calls(tool_calls: Any) -> list[ToolCall]:
     return parsed
 
 
-def _usage(usage: CompletionUsage | None) -> LLMUsage | None:
-    """Convert provider token usage; a missing or malformed block yields None."""
+def _usage(usage: object, *, warn: bool = True) -> LLMUsage | None:
+    """Convert provider token usage; a missing or malformed block yields None.
+
+    A malformed block logs one content-free warning when ``warn`` is True (a
+    stream passes False once it warned, so it warns at most once per call).
+    """
     if usage is None:
         return None
     try:
-        return LLMUsage(
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
+        # The SDK builds the block without validation: any field may be missing
+        # or of any type, so validate what was sent.
+        return LLMUsage.model_validate(
+            {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+            }
         )
     except ValidationError:
-        logger.warning("Ignoring malformed usage block")
+        if warn:
+            logger.warning("Ignoring malformed usage block")
         return None
+
+
+def _optional_str(value: object) -> bool:
+    """True for a str or None: the types a field the client reads may have."""
+    return value is None or isinstance(value, str)
 
 
 @dataclass
@@ -326,62 +372,63 @@ class _StreamedFunction:
 
 @dataclass
 class _StreamedToolCall:
-    """One tool call rebuilt from stream deltas (shape read by the OpenAI parser).
-
-    ``overflowed`` marks a call whose fragments would have crossed the name or
-    argument bound: it stops growing and is dropped once the stream ended.
-    """
+    """One tool call rebuilt from stream deltas (shape read by the OpenAI parser)."""
 
     id: str | None = None
     function: _StreamedFunction = field(default_factory=_StreamedFunction)
-    overflowed: bool = False
 
 
-def _accumulate_tool_calls(
-    calls: dict[int, _StreamedToolCall], fragments: list[ChoiceDeltaToolCall]
-) -> None:
+def _accumulate_tool_calls(calls: dict[int, _StreamedToolCall], fragments: object) -> None:
     """Merge streamed tool-call fragments into ``calls``, keyed by their index.
 
     A fragment is appended only when it fits entirely within the call's name
-    (256) and argument (65536) bounds. One that would cross a bound marks the
-    call overflowed instead, so an oversized name or argument string is never
-    built and a cut prefix never parses as the call.
+    (256) and argument (65536) bounds, so an oversized name or argument string
+    is never built and a cut prefix never parses as the call.
+
+    Raises:
+        MalformedReplyError: ``fragments`` is not a list; a fragment's index is
+            not an int, or its id / name / arguments is not a str (or None); a
+            129th index; a fragment that would cross a bound.
     """
+    if not isinstance(fragments, list):
+        raise MalformedReplyError
     for fragment in fragments:
-        call = calls.get(fragment.index)
+        index = getattr(fragment, "index", None)
+        call_id = getattr(fragment, "id", None)
+        function = getattr(fragment, "function", None)
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+        # type() rather than isinstance(): a bool is not an index.
+        if type(index) is not int or not all(map(_optional_str, (call_id, name, arguments))):
+            raise MalformedReplyError
+        call = calls.get(index)
         if call is None:
             if len(calls) >= _MAX_STREAM_TOOL_CALLS:
-                continue
-            call = calls[fragment.index] = _StreamedToolCall()
-        call.id = call.id or fragment.id
-        function = fragment.function
-        if function is None or call.overflowed:
-            continue
-        name = function.name or ""
-        arguments = function.arguments or ""
+                raise MalformedReplyError
+            call = calls[index] = _StreamedToolCall()
+        call.id = call.id or call_id
+        name = name or ""
+        arguments = arguments or ""
         if (
             len(call.function.name) + len(name) > _MAX_TOOL_NAME_CHARS
             or len(call.function.arguments) + len(arguments) > _MAX_TOOL_ARGUMENT_CHARS
         ):
-            call.overflowed = True
-            continue
+            raise MalformedReplyError
         call.function.name += name
         call.function.arguments += arguments
 
 
-def _bounded_calls(calls: dict[int, _StreamedToolCall]) -> list[_StreamedToolCall]:
-    """Return the accumulated calls in index order without the overflowed ones."""
-    kept: list[_StreamedToolCall] = []
-    for index in sorted(calls):
-        call = calls[index]
-        if call.overflowed:
-            logger.warning(
-                "Skipping streamed tool call '%s': fragments exceed size limits",
-                safe_log(call.function.name),
-            )
-            continue
-        kept.append(call)
-    return kept
+def _all_tool_calls(sent: list[Any]) -> list[ToolCall]:
+    """Parse every tool call the provider sent; one that doesn't parse rejects the reply.
+
+    Raises:
+        MalformedReplyError: Fewer calls parsed than were sent (the parser
+            logged each dropped call by its name only).
+    """
+    parsed = _parse_openai_tool_calls(sent)
+    if len(parsed) != len(sent):
+        raise MalformedReplyError
+    return parsed
 
 
 class _AnswerText(Protocol):
@@ -390,6 +437,11 @@ class _AnswerText(Protocol):
     @property
     def answer(self) -> str:
         """The answer collected so far."""
+        ...
+
+    @property
+    def truncated(self) -> bool:
+        """True once the content cap dropped answer text."""
         ...
 
     def feed(self, text: str) -> str:
@@ -405,65 +457,151 @@ async def _stream_reply(
     stream: AsyncStream[ChatCompletionChunk],
     text: _AnswerText,
     *,
+    label: str,
     configured_model: str,
+    deadline: float,
     stream_error: Callable[[Exception], LLMError],
 ) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
     """Read an opened chat-completions stream: deltas, then one final LLMResponse.
 
     Shared by the OpenAI-compatible clients. Each chunk's text is sanitized and
     passed through ``text``; tool-call fragments are accumulated per index
-    (bounded, see ``_accumulate_tool_calls``) and the calls within their bounds
-    are parsed with ``_parse_openai_tool_calls`` once the stream ended, so they
-    never become deltas. The stream is read to its end (also past the content
-    cap) and closed when this generator ends or is closed.
+    (bounded, see ``_accumulate_tool_calls``) and parsed with
+    ``_parse_openai_tool_calls`` once the stream ended, so they never become
+    deltas. Every call sent must parse, else the reply is rejected. The stream
+    is read to its end (also past the content cap) and closed when this
+    generator ends, fails or is closed. Each provider read is bounded by
+    ``deadline``; a yield never is (the consumer is never cancelled).
 
     Args:
         stream: The SDK stream returned by ``chat.completions.create(stream=True)``.
         text: Answer filter (``CappedAnswer``, or Infomaniak's reasoning filter).
+        label: Provider name of the ``malformed_response`` message.
         configured_model: The model reported when the stream names none.
-        stream_error: Maps an SDK error or transport failure to the client's
-            catalogue ``LLMError``.
+        deadline: Event loop time by which the stream must have ended.
+        stream_error: Maps an SDK error, transport failure or the deadline's
+            ``TimeoutError`` to the client's catalogue ``LLMError``.
 
     Yields:
         ``LLMStreamDelta`` pieces, then the final ``LLMResponse``.
 
     Raises:
-        LLMError: ``stream_error(exc)`` for a mid-stream failure, raised ``from
-            None`` so no SDK exception (or provider text) travels with it.
+        LLMError: ``stream_error(exc)`` for a mid-stream failure or the deadline,
+            ``malformed_response_error(label)`` for undecodable or wrong-typed
+            data or a tool call that doesn't parse; raised ``from None`` so no
+            SDK exception (or provider text) travels with it.
     """
     import openai
 
     calls: dict[int, _StreamedToolCall] = {}
     model = ""
     usage: LLMUsage | None = None
-    finish_reason: str | None = None
+    usage_warned = False
+    finish_reason: object = None
     async with stream:
+        chunks = aiter(stream)
         try:
-            async for chunk in stream:
-                model = chunk.model or model
-                if chunk.usage is not None:
-                    usage = _usage(chunk.usage)
-                if not chunk.choices:
+            while (chunk := await next_before(chunks, deadline)) is not None:
+                chunk_model = getattr(chunk, "model", None)
+                if not _optional_str(chunk_model):
+                    raise MalformedReplyError
+                model = chunk_model or model
+                chunk_usage = getattr(chunk, "usage", None)
+                if chunk_usage is not None:
+                    usage = _usage(chunk_usage, warn=not usage_warned)
+                    usage_warned = usage_warned or usage is None
+                choices = getattr(chunk, "choices", None)
+                if not choices:
                     continue
-                choice = chunk.choices[0]
-                finish_reason = choice.finish_reason or finish_reason
-                if choice.delta.tool_calls:
-                    _accumulate_tool_calls(calls, choice.delta.tool_calls)
-                piece = text.feed(strip_control_chars(choice.delta.content or ""))
+                if not isinstance(choices, list):
+                    raise MalformedReplyError
+                choice = choices[0]
+                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+                delta = getattr(choice, "delta", None)
+                content = getattr(delta, "content", None)
+                if not _optional_str(content):
+                    raise MalformedReplyError
+                fragments = getattr(delta, "tool_calls", None)
+                if fragments:
+                    _accumulate_tool_calls(calls, fragments)
+                piece = text.feed(strip_control_chars(content or ""))
                 if piece:
                     yield LLMStreamDelta(content=piece)
-        except (openai.APIError, httpx.TransportError) as exc:
+            tool_calls = _all_tool_calls([calls[index] for index in sorted(calls)])
+        except (openai.APIError, httpx.TransportError, httpx.StreamError, TimeoutError) as exc:
             raise stream_error(exc) from None
+        except (MalformedReplyError, ValueError, RecursionError, httpx.DecodingError) as exc:
+            # The SDK raises ValueError / RecursionError raw for a line it can't decode.
+            logger.warning("Rejecting malformed %s reply (%s)", label, type(exc).__name__)
+            raise malformed_response_error(label) from None
 
     tail = text.finish()
     if tail:
         yield LLMStreamDelta(content=tail)
     yield LLMResponse(
         content=text.answer,
-        tool_calls=_parse_openai_tool_calls(_bounded_calls(calls)),
+        tool_calls=tool_calls,
         model=strip_control_chars(model or configured_model)[:200],
         done=finish_reason != "tool_calls",
         usage=usage,
+        truncated=finish_reason == "length" or text.truncated,
+    )
+
+
+def _completion_response(
+    response: object,
+    text: _AnswerText,
+    *,
+    label: str,
+    configured_model: str,
+    usage: LLMUsage | None = None,
+) -> LLMResponse:
+    """Build ``chat()``'s LLMResponse from a ``chat.completion`` (OpenAI-compatible clients).
+
+    The SDK builds the response without validation, so every field read is
+    type-checked. The content is sanitized and passed through ``text`` (capped,
+    never cut at a word); every tool call sent must parse.
+
+    Args:
+        response: The SDK's ``chat.completion`` object.
+        text: Answer filter (``CappedAnswer``, or Infomaniak's reasoning filter).
+        label: Provider name of the ``malformed_response`` message.
+        configured_model: The model reported when the response names none.
+        usage: The reply's token usage, for a client that reads it.
+
+    Raises:
+        LLMError: ``malformed_response_error(label)``, raised ``from None``, for
+            a wrong-typed model, choices, content or tool-call list, or a tool
+            call that doesn't parse.
+    """
+    try:
+        model = getattr(response, "model", None)
+        choices = getattr(response, "choices", None)
+        if not _optional_str(model) or not isinstance(choices, list | None):
+            raise MalformedReplyError
+        model_name = strip_control_chars(model or configured_model)[:200]
+        if not choices:
+            return LLMResponse(model=model_name, done=True, usage=usage)
+        choice = choices[0]
+        message = getattr(choice, "message", None)
+        content = getattr(message, "content", None)
+        sent = getattr(message, "tool_calls", None)
+        if not _optional_str(content) or not isinstance(sent, list | None):
+            raise MalformedReplyError
+        tool_calls = _all_tool_calls(sent or [])
+    except MalformedReplyError:
+        logger.warning("Rejecting malformed %s reply", label)
+        raise malformed_response_error(label) from None
+    text.feed(strip_control_chars(content or ""))
+    text.finish()
+    finish_reason = getattr(choice, "finish_reason", None)
+    return LLMResponse(
+        content=text.answer,
+        tool_calls=tool_calls,
+        model=model_name,
+        done=finish_reason != "tool_calls",
+        usage=usage,
+        truncated=finish_reason == "length" or text.truncated,
     )
 
 
@@ -471,9 +609,10 @@ def _api_error(exc: Exception) -> LLMError:
     """Map an SDK or transport failure (opening or mid-stream) to the catalogue.
 
     A status maps through ``sdk_status_error`` (the body's code and message only
-    classify a context-length 400). Without a status: ``timeout`` for a timeout,
-    else ``provider_unavailable`` (a connection or transport failure, or an
-    error event inside an opened stream).
+    classify a context-length 400). Without a status: ``timeout`` for a timeout
+    (the stream deadline included), else ``provider_unavailable`` (a connection,
+    transport or ``httpx.StreamError`` failure, or an error event inside an
+    opened stream).
     """
     import openai
 
@@ -486,8 +625,9 @@ def _api_error(exc: Exception) -> LLMError:
             sdk_message=exc.message,
             key_env=_API_KEY_ENV,
         )
-    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream.
-    timed_out = isinstance(exc, openai.APITimeoutError | httpx.TimeoutException)
+    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream;
+    # TimeoutError is the stream deadline (GH-25).
+    timed_out = isinstance(exc, openai.APITimeoutError | httpx.TimeoutException | TimeoutError)
     return provider_status_error(_LABEL, None, key_env=_API_KEY_ENV, timed_out=timed_out)
 
 
@@ -523,6 +663,7 @@ class OpenAIClient:
 
         self._model = config.openai_model or ""
         self._max_tokens = config.max_response_tokens
+        self._stream_deadline_s = config.stream_deadline_s
         api_key = os.environ.get(_API_KEY_ENV, "")
         self._api_key_configured = bool(api_key)
         # Built even without a key so close() stays uniform; chat() refuses to
@@ -556,13 +697,15 @@ class OpenAIClient:
                 ``min(max_tokens, configured cap)``; None sends the configured cap.
 
         Returns:
-            Parsed LLMResponse.
+            Parsed LLMResponse (``truncated`` for ``finish_reason == "length"`` or
+            content past the 65536-character cap).
 
         Raises:
             LLMError: Coded (user-facing) when the key or model is missing, the
                 key is rejected, the model is unknown, the rate limit is hit,
-                OpenAI is unavailable (5xx, connection), the request timed out or
-                the input is too long; internal otherwise.
+                OpenAI is unavailable (5xx, connection), the request timed out,
+                the input is too long or the reply is malformed (undecodable,
+                wrong-typed, or a tool call that doesn't parse); internal otherwise.
             ValueError: If stream=True is passed, or ``max_tokens`` is below 1,
                 a bool or not an int (before any request).
         """
@@ -580,26 +723,11 @@ class OpenAIClient:
             # Raised ``from None`` so the SDK exception (and any response body)
             # never travels with the LLMError.
             raise _api_error(exc) from None
-
-        # Extract the first choice
-        if not response.choices:
-            return LLMResponse(content="", tool_calls=[], model=self._model, done=True)
-
-        choice = response.choices[0]
-        message = choice.message
-
-        content = sanitize_content(message.content or "")
-
-        # Parse tool calls
-        tool_calls = _parse_openai_tool_calls(message.tool_calls)
-
-        model_name = strip_control_chars(response.model or self._model)[:200]
-
-        return LLMResponse(
-            content=content,
-            tool_calls=tool_calls,
-            model=model_name,
-            done=choice.finish_reason != "tool_calls",
+        except (ValueError, RecursionError):
+            # The SDK decodes the 200 body itself and raises these raw.
+            raise malformed_response_error(_LABEL) from None
+        return _completion_response(
+            response, CappedAnswer(), label=_LABEL, configured_model=self._model
         )
 
     async def chat_stream(
@@ -611,7 +739,8 @@ class OpenAIClient:
 
         The request is ``chat()``'s body (configured output cap) plus ``stream:
         true``. Deltas are sanitized and stop at the content cap; tool calls
-        come only in the final response.
+        come only in the final response. The call must end within
+        ``stream_deadline_s`` of its first iteration (opening included).
 
         Args:
             messages: Conversation messages.
@@ -623,18 +752,26 @@ class OpenAIClient:
         Raises:
             LLMError: ``chat()``'s setup errors on the first iteration (no
                 request), its status mapping when opening the stream (before any
-                delta); ``timeout`` / ``provider_unavailable`` mid-stream.
+                delta); ``timeout`` (also the deadline) / ``provider_unavailable``
+                / ``malformed_response`` mid-stream.
         """
+        deadline = asyncio.get_running_loop().time() + self._stream_deadline_s
         kwargs = self._request(messages, tools, self._max_tokens)
 
         import openai
 
         try:
-            stream = await self._client.chat.completions.create(**kwargs, stream=True)
-        except (openai.APIConnectionError, openai.APIStatusError) as exc:
+            async with asyncio.timeout_at(deadline):
+                stream = await self._client.chat.completions.create(**kwargs, stream=True)
+        except (openai.APIConnectionError, openai.APIStatusError, TimeoutError) as exc:
             raise _api_error(exc) from None
         reply = _stream_reply(
-            stream, CappedAnswer(), configured_model=self._model, stream_error=_api_error
+            stream,
+            CappedAnswer(),
+            label=_LABEL,
+            configured_model=self._model,
+            deadline=deadline,
+            stream_error=_api_error,
         )
         # aclosing: closing this generator early closes the HTTP stream at once.
         async with aclosing(reply) as items:

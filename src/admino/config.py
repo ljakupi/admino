@@ -264,6 +264,15 @@ class LLMConfig(BaseModel):
         le=600,
         description="Request timeout in seconds for LLM API calls.",
     )
+    # A whole streamed reply (one attempt) must end within this time, even when
+    # the provider keeps the connection alive with empty chunks or pings (GH-25).
+    # gt/le also reject NaN, infinity and False (0).
+    stream_deadline_s: float = Field(
+        default=300.0,
+        gt=0,
+        le=3600,
+        description="Seconds a streamed LLM reply may take in total before it times out.",
+    )
 
     # -- Infomaniak settings (used when provider=infomaniak, the default) --
     # Credentials come from env vars only (INFOMANIAK_API_TOKEN,
