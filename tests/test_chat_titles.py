@@ -1120,8 +1120,11 @@ class TestFallbackTitle:
 def _split_credential(kind: str, char: str) -> tuple[str, str, str]:
     """(text with a credential split by ``char``, the same text joined, the expected title).
 
-    ``models.sanitize_display_text`` keeps ``char``, so redacting the raw text
-    misses the split credential; removing ``char`` joins it again.
+    The credential rules alone (``models._strip_credentials``) miss the split
+    credential. ``char`` is outside ``models._CONTROL_CHAR_TABLE``, but the
+    message view (``models.sanitize_display_text``) and the titles both remove
+    it before the redaction (GH-270 Decision 1), which joins the credential
+    again.
     """
     if kind == "key":
         joined = "Key sk-" + "a" * 24
@@ -1133,9 +1136,11 @@ def _split_credential(kind: str, char: str) -> tuple[str, str, str]:
 class TestSecondRedaction:
     """Step 6 (amended): a credential split by a banned character is redacted.
 
-    A soft hyphen, a word joiner or DEL inside a credential hides it from
-    ``models.sanitize_display_text`` (``models._CONTROL_CHAR_TABLE`` keeps
-    them); removing them would hand a clean, unredacted credential to the title.
+    A soft hyphen, a word joiner or DEL inside a credential hides it from the
+    credential rules; removing them after the redaction would hand a clean,
+    unredacted credential to the title. The titles and, since GH-270 Decision 1,
+    the message view remove them before the redaction, so both redact the split
+    credential (the message view's removal set: tests/test_credential_separator.py).
     """
 
     @pytest.mark.parametrize(
@@ -1147,9 +1152,10 @@ class TestSecondRedaction:
         self, ct: ModuleType, function: str, kind: str, char: str
     ) -> None:
         raw, joined, expected = _split_credential(kind, char)
-        assert models._REDACTED not in models.sanitize_display_text(raw)  # first pass misses it
+        assert models._REDACTED not in models._strip_credentials(raw)  # the rules alone miss it
         result = getattr(ct, function)(raw)
-        assert result == expected == models.sanitize_display_text(joined)
+        message = models.sanitize_display_text(raw)
+        assert result == expected == message == models.sanitize_display_text(joined)
         assert _invariant_violation(result) is None
 
     @pytest.mark.parametrize("function", ["sanitize_title", "fallback_title"])
