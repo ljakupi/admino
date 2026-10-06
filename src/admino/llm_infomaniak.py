@@ -4,7 +4,7 @@
 ``https://api.infomaniak.com/2/ai/{product_id}/openai/v1`` and serves
 ``config.infomaniak_model``. It reuses the OpenAI conversion/parse helpers, the
 OpenAI-compatible stream reader (``llm_openai._stream_reply``: tool-call
-fragments accumulated per index, at most 128 calls and 65536 argument
+fragments accumulated per index, at most 128 calls, 256 name and 65536 argument
 characters each, parsed once the stream ended) and the shared ``admino.llm``
 sanitizers, so requests and responses have the same shape as the other
 OpenAI-compatible backends.
@@ -53,7 +53,11 @@ default for most models). Reasoning never reaches the answer: the
 never read; ``<think>…</think>`` blocks are removed from the content (also when a
 tag is split across stream chunks); an unclosed ``<think>`` drops the rest of the
 reply; an orphan ``</think>`` (its opening tag was in the prompt template) drops
-everything before it.
+everything before it. A stream's deltas already sent can't be taken back: after an
+orphan ``</think>`` the final content (``chat()``'s rule) is shorter than the
+joined deltas, which total at most 65536 characters whatever the orphan tags (a
+budget that never resets). Without an orphan tag, the final content is the
+joined deltas.
 
 Security notes:
 - The token is read from the environment only; it is sent solely as the
@@ -68,7 +72,11 @@ Security notes:
   ``prompt_cache_key``, ``metadata``; the SDK's env-derived OpenAI organization
   and project headers are cleared).
 - The product id must be ASCII digits before it is placed in a URL.
-- LLM output is sanitized (control/bidi characters stripped, 65536-char cap).
+- LLM output is sanitized (control/bidi characters and lone surrogates
+  stripped, 65536-char cap). A stream's deltas total at most 65536 characters
+  too; orphan ``</think>`` tags never reset that budget.
+- Streamed tool calls share the OpenAI reader's bounds (128 calls, 256-char
+  names, 65536-char arguments; a call crossing a bound is dropped).
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -279,6 +287,12 @@ class _ThinkFilter:
     orphan ``</think>`` discards the answer collected so far. Leading whitespace
     left behind by removed reasoning is trimmed, and the answer is capped at the
     ``LLMResponse`` content limit.
+
+    What ``feed()`` / ``finish()`` return (a stream's deltas) can't be taken back
+    by a later orphan ``</think>``: that text is capped at the content limit in
+    total, a budget no orphan tag resets, so a hostile stream can't send more
+    than 65536 delta characters by repeating orphan tags. Without an orphan tag
+    the returned text is exactly ``answer``.
     """
 
     def __init__(self) -> None:
@@ -287,6 +301,7 @@ class _ThinkFilter:
         self._trim = False
         self._parts: list[str] = []
         self._length = 0
+        self._emitted = 0
 
     @property
     def answer(self) -> str:
@@ -326,12 +341,18 @@ class _ThinkFilter:
                 self._parts.clear()
                 self._length = 0
                 self._trim = True
-        return "".join(visible)
+        return self._emit("".join(visible))
 
     def finish(self) -> str:
         """Flush held-back text at the end; an unclosed block's text is dropped."""
         held, self._held = self._held, ""
-        return "" if self._inside else self._keep(held)
+        return "" if self._inside else self._emit(self._keep(held))
+
+    def _emit(self, text: str) -> str:
+        """Return what of ``text`` fits the stream's delta budget (never reset)."""
+        text = text[: _MAX_CONTENT_LENGTH - self._emitted]
+        self._emitted += len(text)
+        return text
 
     def _keep(self, text: str) -> str:
         """Append visible text to the answer (trim + cap); return what was kept."""

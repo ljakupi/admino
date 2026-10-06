@@ -43,7 +43,10 @@ Security notes:
 - No end-user or account identifier is sent: no ``user``/``metadata``-style
   body key, and the SDK's env-derived OpenAI organization and project headers
   (OPENAI_ORG_ID / OPENAI_PROJECT_ID) are cleared.
-- LLM output is sanitized by the shared llm.py utilities.
+- LLM output is sanitized by the shared llm.py utilities (control characters
+  and lone surrogates stripped). Streamed tool calls share the OpenAI reader's
+  bounds (128 calls, 256-char names, 65536-char arguments; a call crossing a
+  bound is dropped).
 - Does not import from agent.py, server.py, or tools/.
 """
 

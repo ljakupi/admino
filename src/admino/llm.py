@@ -36,7 +36,9 @@ Streaming (GH-8): ``LLMClient.chat_stream`` yields sanitized, non-empty
 content is the joined deltas. ``CappedAnswer`` keeps a streamed answer within
 the 65536-character content cap (counted after sanitizing); streamed tool-call
 fragments are bounded by ``_MAX_STREAM_TOOL_CALLS`` calls and
-``_MAX_TOOL_ARGUMENT_CHARS`` argument characters per call, and are parsed only
+``_MAX_TOOL_ARGUMENT_CHARS`` argument characters per call (plus
+``_MAX_TOOL_NAME_CHARS`` name characters in the OpenAI-compatible reader, which
+drops a call whose fragments would cross either bound), and are parsed only
 once the stream ended, never streamed as deltas.
 
 Inputs: provider statuses, response headers, and (for classification only)
@@ -50,7 +52,8 @@ Security notes:
   and ``repr()``) is a fixed catalogue text or "<label> API returned HTTP
   <status>". The provider's error code and message are only matched against
   fixed phrases by ``is_context_too_long``; they are never stored or logged.
-- LLM output is sanitized: control characters stripped, length bounded.
+- LLM output is sanitized: control characters (and lone surrogates, which no
+  UTF-8 encoder accepts) stripped, length bounded.
 - Tool call arguments are validated for size and nesting depth.
 - Callers log an LLMError by its type, status_code and code only (GH-158),
   never its message, __cause__ or repr(), so no provider text or HTTP response
@@ -90,9 +93,14 @@ _MAX_TOOLS_COUNT: int = 64
 _MAX_TOOLS_PAYLOAD: int = 65536
 
 # Bounds on streamed tool-call fragments (untrusted provider data): calls past
-# the first 128 are ignored, a call's arguments stop growing at 65536 chars
-# (and then fail JSON parsing).
+# the first 128 are ignored. The OpenAI-compatible reader bounds a call's name at
+# 256 chars and its arguments at 65536: a fragment that would cross a bound is
+# never appended, it marks the call overflowed (no further growth, dropped at
+# parse time), so a hostile stream can't grow either string. Anthropic's argument
+# fragments stop growing at 65536 chars (and then fail JSON parsing); its name
+# arrives in one event.
 _MAX_STREAM_TOOL_CALLS: Final = 128
+_MAX_TOOL_NAME_CHARS: Final = 256
 _MAX_TOOL_ARGUMENT_CHARS: Final = 65536
 
 
@@ -452,9 +460,14 @@ class LLMStreamDelta(BaseModel):
 # used to spoof displayed text in confirmation dialogs (display-spoofing attack).
 # Includes C1 controls (0x80-0x9F) — notably U+009B (CSI) which can trigger
 # terminal escape sequences, and U+0085 (NEL) which is a Unicode line break.
+# Surrogate code points (U+D800-U+DFFF) only exist in a str as lone surrogates (a
+# JSON escape without its partner, or a pair split across stream chunks): they
+# can't be encoded as UTF-8, so a Pydantic str field, asyncpg and the SSE writer
+# would reject them. A valid astral character is one code point and stays.
 _CONTROL_CHAR_TABLE = dict.fromkeys(
     [i for i in range(32) if i not in (9, 10, 13)]  # ASCII controls except \t \n \r
     + list(range(0x80, 0xA0))  # C1 controls (includes CSI U+009B, NEL U+0085)
+    + list(range(0xD800, 0xE000))  # lone surrogates
     + [
         0x200B,  # ZERO WIDTH SPACE
         0x200C,  # ZERO WIDTH NON-JOINER
@@ -485,6 +498,7 @@ def strip_control_chars(content: str) -> str:
     - BiDi isolate characters (U+2066-U+2069)
     - Zero-width characters (U+200B-U+200D, U+FEFF)
     - Line/paragraph separators (U+2028, U+2029)
+    - Lone surrogates (U+D800-U+DFFF), which no UTF-8 encoder accepts
 
     Args:
         content: Raw string from LLM response.

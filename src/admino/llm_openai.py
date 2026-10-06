@@ -34,9 +34,11 @@ on the first iteration, before any request; HTTP statuses when opening map like
 mid-stream error event ``provider_unavailable``. This module also holds the
 stream reader shared by the OpenAI-compatible clients (OpenAI, vLLM,
 Infomaniak): ``_stream_reply`` accumulates tool-call fragments per index
-(``_accumulate_tool_calls``, at most 128 calls and 65536 argument characters
-each) and parses them with ``_parse_openai_tool_calls`` once the stream ended;
-tool calls are never streamed as deltas.
+(``_accumulate_tool_calls``: at most 128 calls, each with a name of at most 256
+characters and arguments of at most 65536; a fragment that would cross a bound
+is never appended and its call is dropped, the others kept) and parses them with
+``_parse_openai_tool_calls`` once the stream ended; tool calls are never
+streamed as deltas.
 
 Inputs: conversation messages, tool definitions, OPENAI_API_KEY and the
 configured model and caps. Outputs: ``LLMResponse`` / ``LLMStreamDelta`` items
@@ -44,7 +46,12 @@ or a catalogue ``LLMError``.
 
 Security notes:
 - API key is read from OPENAI_API_KEY env var, never from config files.
-- No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
+- No credentials are logged. LLM output is sanitized by the shared llm.py utilities
+  (control characters and lone surrogates stripped, so every delta and the final
+  response encode as UTF-8).
+- Streamed tool-call names and arguments are bounded while they accumulate: a
+  hostile stream can't grow them past 256 / 65536 characters (memory stays
+  bounded whatever the fragment count or size).
 - Error messages are fixed strings: never the SDK message, a response body or
   the body's error code (those only classify a context-length failure); SDK
   errors are raised ``from None``. Stream text and tool arguments are never
@@ -71,6 +78,7 @@ from pydantic import ValidationError
 from admino.llm import (
     _MAX_STREAM_TOOL_CALLS,
     _MAX_TOOL_ARGUMENT_CHARS,
+    _MAX_TOOL_NAME_CHARS,
     CappedAnswer,
     LLMError,
     LLMResponse,
@@ -318,16 +326,27 @@ class _StreamedFunction:
 
 @dataclass
 class _StreamedToolCall:
-    """One tool call rebuilt from stream deltas (shape read by the OpenAI parser)."""
+    """One tool call rebuilt from stream deltas (shape read by the OpenAI parser).
+
+    ``overflowed`` marks a call whose fragments would have crossed the name or
+    argument bound: it stops growing and is dropped once the stream ended.
+    """
 
     id: str | None = None
     function: _StreamedFunction = field(default_factory=_StreamedFunction)
+    overflowed: bool = False
 
 
 def _accumulate_tool_calls(
     calls: dict[int, _StreamedToolCall], fragments: list[ChoiceDeltaToolCall]
 ) -> None:
-    """Merge streamed tool-call fragments into ``calls``, keyed by their index."""
+    """Merge streamed tool-call fragments into ``calls``, keyed by their index.
+
+    A fragment is appended only when it fits entirely within the call's name
+    (256) and argument (65536) bounds. One that would cross a bound marks the
+    call overflowed instead, so an oversized name or argument string is never
+    built and a cut prefix never parses as the call.
+    """
     for fragment in fragments:
         call = calls.get(fragment.index)
         if call is None:
@@ -336,12 +355,33 @@ def _accumulate_tool_calls(
             call = calls[fragment.index] = _StreamedToolCall()
         call.id = call.id or fragment.id
         function = fragment.function
-        if function is None:
+        if function is None or call.overflowed:
             continue
-        if function.name:
-            call.function.name += function.name
-        if function.arguments and len(call.function.arguments) < _MAX_TOOL_ARGUMENT_CHARS:
-            call.function.arguments += function.arguments
+        name = function.name or ""
+        arguments = function.arguments or ""
+        if (
+            len(call.function.name) + len(name) > _MAX_TOOL_NAME_CHARS
+            or len(call.function.arguments) + len(arguments) > _MAX_TOOL_ARGUMENT_CHARS
+        ):
+            call.overflowed = True
+            continue
+        call.function.name += name
+        call.function.arguments += arguments
+
+
+def _bounded_calls(calls: dict[int, _StreamedToolCall]) -> list[_StreamedToolCall]:
+    """Return the accumulated calls in index order without the overflowed ones."""
+    kept: list[_StreamedToolCall] = []
+    for index in sorted(calls):
+        call = calls[index]
+        if call.overflowed:
+            logger.warning(
+                "Skipping streamed tool call '%s': fragments exceed size limits",
+                safe_log(call.function.name),
+            )
+            continue
+        kept.append(call)
+    return kept
 
 
 class _AnswerText(Protocol):
@@ -371,10 +411,11 @@ async def _stream_reply(
     """Read an opened chat-completions stream: deltas, then one final LLMResponse.
 
     Shared by the OpenAI-compatible clients. Each chunk's text is sanitized and
-    passed through ``text``; tool-call fragments are accumulated per index and
-    parsed with ``_parse_openai_tool_calls`` once the stream ended, so they never
-    become deltas. The stream is read to its end (also past the content cap) and
-    closed when this generator ends or is closed.
+    passed through ``text``; tool-call fragments are accumulated per index
+    (bounded, see ``_accumulate_tool_calls``) and the calls within their bounds
+    are parsed with ``_parse_openai_tool_calls`` once the stream ended, so they
+    never become deltas. The stream is read to its end (also past the content
+    cap) and closed when this generator ends or is closed.
 
     Args:
         stream: The SDK stream returned by ``chat.completions.create(stream=True)``.
@@ -419,7 +460,7 @@ async def _stream_reply(
         yield LLMStreamDelta(content=tail)
     yield LLMResponse(
         content=text.answer,
-        tool_calls=_parse_openai_tool_calls([calls[index] for index in sorted(calls)]),
+        tool_calls=_parse_openai_tool_calls(_bounded_calls(calls)),
         model=strip_control_chars(model or configured_model)[:200],
         done=finish_reason != "tool_calls",
         usage=usage,

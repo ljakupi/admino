@@ -49,7 +49,8 @@ or a catalogue ``LLMError``.
 
 Security notes:
 - API key is read from ANTHROPIC_API_KEY env var, never from config files.
-- No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
+- No credentials are logged. LLM output is sanitized by the shared llm.py utilities
+  (control characters and lone surrogates stripped).
 - Error messages are fixed strings: never the SDK message, a response body or
   an error event's text (the message only classifies a context-length
   failure); SDK errors are raised ``from None``. Stream text and tool arguments
