@@ -710,9 +710,17 @@ Viewer's chats from before a role change stay stored, unused.
   - a key whose `sk` is split by an invisible character with no invisible character
     before it, glued to a letter (`as<soft hyphen>k-proj-…`): once the character is
     removed it reads `ask-proj-…`, a key glued directly;
-  - the start of a key split by an invisible character right before a complete key
-    inside its own body (`sk-proj-ab<soft hyphen>sk-…`): the inner key is redacted, and
-    the start stays when it's shorter than a key;
+  - the start of a Google OAuth secret or token (`GOCSPX-…`, `1//…`, `ya29.…`), a Stripe
+    restricted key (`rk_live_…`, `rk_test_…`), a GitHub `ghp_…`/`ghs_…` token or a Slack
+    token (`xox…`) split by an invisible character right before a complete key inside
+    its own body (`GOCSPX-ab<soft hyphen>sk-…`): the inner key is redacted, and the start
+    stays when it alone is shorter than its format's minimum;
+  - the start of a key split by an invisible character right before another key inside
+    its own body, when the joined key wouldn't cover that inner key
+    (`github_pat_<50 characters><soft hyphen>AIza<35 characters>-<10 characters>`), or
+    when a word and an invisible character come before it
+    (`x<soft hyphen>sk-proj-ab<zero-width space>sk-…`): the inner key is redacted, and
+    the start stays when it's shorter than its format's minimum;
   - in tool call `args`, a key split by any invisible character: arguments get the
     credential rules only, invisible characters aren't removed from them;
   - key formats with no rule;

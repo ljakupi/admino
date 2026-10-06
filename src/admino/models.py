@@ -132,10 +132,19 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
     character before it, glued to a preceding letter (``as<SHY>k-proj-...``):
     once the character is removed it reads ``ask-proj-...``, a key glued
     directly;
-  - the head of a key split by a removed character right before a complete
-    key inside its own body (``sk-proj-ab<SHY>sk-<20 or more>``): the run is
-    a separator, so the inner key is redacted, and the head stays visible when
-    it is shorter than its rule's minimum;
+  - a key of a rule without a token start (``GOCSPX-``, ``rk_live_`` /
+    ``rk_test_``, ``ghp_`` / ``ghs_``, ``xox...``, ``1//``, ``ya29.``) split
+    by a removed character right before a complete key inside its own body
+    (``GOCSPX-ab<SHY>sk-<20 or more>``): the run is a separator, so the inner
+    key is redacted, and the outer key's start stays visible when it alone is
+    shorter than its rule's minimum;
+  - a key split by a removed character right before another key inside its
+    own body when the joined match wouldn't cover that inner key
+    (``github_pat_<50><SHY>AIza<35>-<10>``: the ``github_pat_`` body has no
+    ``-``), or when a word and a run come before the outer key
+    (``x<SHY>sk-proj-ab<ZWSP>sk-...``): the run is a separator, so the inner
+    key is redacted, and the outer key's start stays visible when it is
+    shorter than its rule's minimum;
   - in tool arguments, a key split by any invisible character: arguments get
     the credential rules only, not the display cleanup;
   - key formats with no rule;
@@ -157,7 +166,7 @@ import zoneinfo
 from datetime import UTC, datetime
 from decimal import Decimal
 from types import MappingProxyType
-from typing import Annotated, Any, Final, Literal, get_args
+from typing import Annotated, Any, Final, Literal, cast, get_args
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
 from pydantic import (
@@ -259,7 +268,9 @@ _REMOVED_RUN: Final[re.Pattern[str]] = re.compile(f"[{_removed_class()}]+")
 # sk-ant-<version>- (GH-264); Stripe secret keys, Google API keys, GitHub
 # fine-grained, OAuth, user-to-server and refresh tokens, Hugging Face and Groq
 # keys (GH-270 decision 4). One table builds both the rule and the separator
-# check below, so the two can't drift apart.
+# check below, so the two can't drift apart. The body classes nest
+# ([A-Za-z0-9] inside [A-Za-z0-9_] inside [A-Za-z0-9_-]): _remove_runs relies on
+# it to decide in one step whether a run inside a key joins.
 _TOKEN_START_KEYS: Final[tuple[tuple[str, str, int], ...]] = (
     ("sk-", r"[A-Za-z0-9_\-]", 20),
     ("sk_(?:live|test)_", "[A-Za-z0-9]", 24),
@@ -290,11 +301,16 @@ _KEY_RULE: Final[re.Pattern[str]] = re.compile(
 # Where a run of removed characters separates a word from a key (GH-270
 # decision 2): right after an ASCII letter, digit or "_", a key prefix and its
 # rule's minimum body. Exact counts, no open bound: one check reads at most
-# 93 characters, so a text full of runs stays linear.
+# 93 characters, so a text full of runs stays linear. One group per format, so
+# a match's lastindex names the format of the key after the run.
 _KEY_AFTER_WORD: Final[re.Pattern[str]] = re.compile(
     "(?<=[A-Za-z0-9_])(?:"
-    + "|".join(f"{prefix}{body}{{{minimum}}}" for prefix, body, minimum in _TOKEN_START_KEYS)
+    + "|".join(f"({prefix}{body}{{{minimum}}})" for prefix, body, minimum in _TOKEN_START_KEYS)
     + ")"
+)
+# One body character of each format, in _KEY_AFTER_WORD's group order.
+_KEY_BODY_CHAR: Final[tuple[re.Pattern[str], ...]] = tuple(
+    re.compile(body) for _, body, _ in _TOKEN_START_KEYS
 )
 # Marks a separator while the credential rules run, then goes: NUL is in the
 # removal set, so the cleaned text never holds one, and it isn't an ASCII word
@@ -366,25 +382,62 @@ def _strip_credentials(value: str) -> str:
 
 
 def _remove_runs(text: str) -> str:
-    """Remove every run of removed characters; one before a key becomes ``_SEPARATOR``.
+    """Remove every run of removed characters; one between a word and a key becomes ``_SEPARATOR``.
 
     Removed, a run between an ASCII letter, digit or ``_`` and a key
     (``a<SHY>sk-...``) would glue the two together, so the key would no longer
     start at a token start and would show in full (GH-270 decision 2). The key
-    is looked up in the text with every run removed, so removed characters
-    inside its prefix or body (``a<SHY>s<SHY>k-...``) don't hide it. Any other
-    run just goes, so a credential split by one is joined and redacted whole
-    (GH-264 L-2). Linear: one split, then one bounded check per run.
+    is looked up in the text with every run removed (the joined text), so
+    removed characters inside its prefix or body (``a<SHY>s<SHY>k-...``) don't
+    hide it. Any other run just goes, so a credential split by one is joined
+    and redacted whole (GH-264 L-2).
+
+    A run inside a key joins too (decision 9): criterion 2, a key split inside
+    its body is redacted whole, wins over criterion 1. When a key match on the
+    joined text starts before the run and reaches at least the end of the
+    whole key after it, ``sk-proj-ab<SHY>sk-<20 or more>`` is one key, not
+    ``sk-proj-ab`` and a key. When that match stops inside the key after the
+    run (``hf_<34><SHY>sk-<20>``: an ``hf_`` body has no ``-``), joining would
+    show the rest of that key, so the run separates.
+
+    Linear: one split, one bounded check per run, and the key matches on the
+    joined text read once, lazily, by a pointer that only moves forward.
     """
     pieces = _REMOVED_RUN.split(text)
     if len(pieces) == 1:
         return text
     cleaned = "".join(pieces)
+    # finditer's matches don't overlap, and a key that starts inside one ends
+    # inside it too: only a "-" in a body makes a token start there, only the
+    # widest class holds one, and the key starting there has no wider class.
+    # So the last match that starts before the run is the only one that can
+    # span it. None starts at the run: a word character precedes it.
+    keys = _KEY_RULE.finditer(cleaned)
+    spanning: re.Match[str] | None = None
+    following: re.Match[str] | None = None
     kept = [pieces[0]]
     position = len(pieces[0])
     for piece in pieces[1:]:
-        if _KEY_AFTER_WORD.match(cleaned, position):
-            kept.append(_SEPARATOR)
+        inner = _KEY_AFTER_WORD.match(cleaned, position)
+        if inner is not None:
+            while (following := following or next(keys, None)) and following.start() < position:
+                spanning, following = following, None
+            # The key after the run ends within the spanning match (which then
+            # spans the run) when its minimum fits and the character right after
+            # the match doesn't continue it. That one character decides because
+            # the body classes nest: a wider key class holds every body character
+            # of the match, a narrower one can't hold the character the match
+            # stopped at. One check, not a scan of the key's unbounded body, so
+            # many runs inside one long key stay linear. Every alternative of
+            # _KEY_AFTER_WORD is a group, so a match always sets lastindex.
+            body_char = _KEY_BODY_CHAR[cast("int", inner.lastindex) - 1]
+            joins = (
+                spanning is not None
+                and inner.end() <= spanning.end()
+                and body_char.match(cleaned, spanning.end()) is None
+            )
+            if not joins:
+                kept.append(_SEPARATOR)
         kept.append(piece)
         position += len(piece)
     return "".join(kept)

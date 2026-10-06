@@ -45,14 +45,15 @@ Security notes:
   before the redaction, so a key split anywhere by one (soft hyphen, word
   joiner, DEL) is joined first and redacted whole (security audit L-2), and
   a run of them between a word and a key (``a<SHY>sk-...``) separates the
-  two instead of gluing them (GH-270). API keys of the current formats
-  (``sk-``, ``sk-proj-``, ``sk-ant-``, Stripe, Google, GitHub, Hugging Face,
-  Groq) are redacted in full whatever their length. The banned characters
-  are removed once more and whitespace is collapsed. A model title is
-  redacted before its quotes and emphasis are trimmed (a key may end in
-  ``_``) and once more after. The length is capped last, so a credential is
-  never cut before it is redacted. The fallback gets the same redaction and
-  cleanup.
+  two instead of gluing them (GH-270), unless one key covers both once
+  joined (``sk-proj-ab<SHY>sk-...`` is one key). API keys of the current
+  formats (``sk-``, ``sk-proj-``, ``sk-ant-``, Stripe, Google, GitHub,
+  Hugging Face, Groq) are redacted in full whatever their length. The
+  banned characters are removed once more and whitespace is collapsed. A
+  model title is redacted before its quotes and emphasis are trimmed (a key
+  may end in ``_``) and once more after. The length is capped last, so a
+  credential is never cut before it is redacted. The fallback gets the same
+  redaction and cleanup.
 - Residual limit (GH-270), still not redacted:
   - a key split by an invisible character outside the removal set (a
     combining grapheme joiner, a variation selector, a Hangul filler,
@@ -64,9 +65,16 @@ Security notes:
     removed character before it, glued to a preceding letter
     (``as<SHY>k-proj-...``): once the character is removed it reads
     ``ask-proj-...``, a key glued directly;
-  - the head of a key split by a removed character right before a complete
-    key inside its own body (``sk-proj-ab<SHY>sk-<20 or more>``), when that
-    head is shorter than its rule's minimum;
+  - the start of a key of a rule without a token start (``GOCSPX-``,
+    ``rk_live_`` / ``rk_test_``, ``ghp_`` / ``ghs_``, ``xox...``, ``1//``,
+    ``ya29.``) split by a removed character right before a complete key
+    inside its own body (``GOCSPX-ab<SHY>sk-<20 or more>``), when that start
+    alone is shorter than its rule's minimum;
+  - the start of a key split by a removed character right before another key
+    inside its own body when the joined match wouldn't cover that inner key
+    (``github_pat_<50><SHY>AIza<35>-<10>``), or when a word and a run come
+    before the outer key (``x<SHY>sk-proj-ab<ZWSP>sk-...``), when that start
+    is shorter than its rule's minimum;
   - in tool arguments (never part of a title), a key split by any invisible
     character: they get the credential rules only;
   - key formats with no rule;
