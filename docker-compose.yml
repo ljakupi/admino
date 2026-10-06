@@ -160,6 +160,9 @@ services:
     container_name: admino-agent
     restart: unless-stopped
 
+    # Stop drains streamed chat runs for up to 30 s (server._DRAIN_TIMEOUT_S); 40 s keeps Docker's default 10 s SIGKILL from cutting it short.
+    stop_grace_period: 40s
+
     # Least-privilege capabilities. Drop everything, then add back only what the
     # root entrypoint needs before it drops to the unprivileged admino user:
     #   NET_ADMIN — apply the iptables egress whitelist (entrypoint.sh)

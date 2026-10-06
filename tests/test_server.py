@@ -9,13 +9,16 @@ Tests the FastAPI application created by ``create_app()``, covering:
   old bearer token / vpn mode is gone (an ``Authorization`` header authenticates
   nothing, ``config.auth`` is never read, no VPN warning).
 - The ``chat.send`` role gate: Org Admins and Editors may chat; Viewers and
-  Super Admins get 403 ``{"detail": "Forbidden"}`` on POST /api/message,
-  POST /api/confirm/{id} and GET /api/events.
+  Super Admins get 403 ``{"detail": "Forbidden"}`` on POST /api/message and
+  POST /api/confirm/{id}.
 - POST /api/message and POST /api/confirm/{id} pass the logged-in principal to
   ``agent.run(principal=...)`` (and, through a real Agent, to the tool-call
   recorder).
 - POST /api/message (happy path, agent status variants, input validation)
-- SSE streaming via GET /api/events
+- GH-8: ``GET /api/events`` (handler ``get_events``, its rate-limit entry) and
+  ``_stream_agent_result`` are removed: the path answers like any unknown
+  ``/api`` path. The SSE frame helpers ``_format_sse`` / ``_make_sse_event``
+  stay (the streamed chat routes are pinned in tests/test_chat_stream_api.py).
 - Confirmation flow via POST /api/confirm/{confirmation_id}
 - GH-176: the legacy ``session_id`` routes are backed by persisted chats (one
   ``chats`` row per (user, session id) through ``legacy_session_id``, here a
@@ -32,7 +35,8 @@ Tests the FastAPI application created by ``create_app()``, covering:
   session id: another user's turn never reads or changes it, and nobody else
   can confirm, deny or cancel its pending confirmation. A denial persists the
   closing ``tool`` result(s) and the denial message, so the stored history
-  stays well-formed.
+  stays well-formed. GH-8: a message to a chat whose run is still going is
+  ``409 run_active`` (never queued behind it, never run).
 - CORS middleware (``Authorization`` is no longer an allowed header)
 - Per-caller rate limits (GH-149): ``_check_rate_limit(route, caller)`` keeps
   one token bucket per (route, caller) in ``_rate_buckets``; one user (or IP)
@@ -500,15 +504,14 @@ _CONFIRM_BODY: dict[str, Any] = {
 
 
 async def _call_chat_route(client: AsyncClient, route: str, **kwargs: Any) -> Any:
-    """Send a well-formed request to one of the three chat routes."""
+    """Send a well-formed request to one of the two legacy chat routes (GH-8: GET
+    /api/events is gone)."""
     if route == "message":
         return await client.post("/api/message", json=_MESSAGE_BODY, **kwargs)
-    if route == "confirm":
-        return await client.post("/api/confirm/some-id", json=_CONFIRM_BODY, **kwargs)
-    return await client.get("/api/events", params={"session_id": "sess1"}, **kwargs)
+    return await client.post("/api/confirm/some-id", json=_CONFIRM_BODY, **kwargs)
 
 
-_CHAT_ROUTES = ["message", "confirm", "events"]
+_CHAT_ROUTES = ["message", "confirm"]
 
 
 class TestAuth:
@@ -595,13 +598,6 @@ class TestAuth:
         assert resp.status_code == 401
         resolve.assert_not_awaited()
 
-    async def test_server_get_events_no_auth_returns_401(self) -> None:
-        app = _make_app(anonymous=True)
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/events", params={"session_id": "sess1"})
-        assert resp.status_code == 401
-        assert resp.json() == _UNAUTHORIZED
-
     async def test_server_post_confirm_no_auth_returns_401(self) -> None:
         app = _make_app(anonymous=True)
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
@@ -664,13 +660,6 @@ class TestChatRoleGate:
         app = _make_app(session=member_session(role))
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             resp = await c.post("/api/message", json=_MESSAGE_BODY)
-        assert resp.status_code == 200
-
-    @pytest.mark.parametrize("role", ["org_admin", "editor"])
-    async def test_server_get_events_chat_sender_role_succeeds(self, role: MemberRole) -> None:
-        app = _make_app(session=member_session(role))
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get("/api/events", params={"session_id": "sess1"})
         assert resp.status_code == 200
 
     @pytest.mark.parametrize("route", _CHAT_ROUTES)
@@ -1159,108 +1148,31 @@ class TestInputValidation:
         assert resp.status_code == 422
 
 
-class TestSSE:
-    """GET /api/events — SSE streaming endpoint."""
+class TestEventsRouteRemoved:
+    """GH-8 (C5.8): the GET /api/events stub and ``_stream_agent_result`` are gone."""
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_events_returns_event_stream_content_type(self) -> None:
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": "sess1"},
-            )
-        assert resp.status_code == 200
-        assert "text/event-stream" in resp.headers["content-type"]
+    async def test_server_get_events_answers_like_an_unknown_api_path(self) -> None:
+        """A logged-in member's ``GET /api/events?session_id=x`` gets exactly what an
+        unknown ``/api`` path gets (``404 {"detail": "Not Found"}``, same content type),
+        no run; no route serves the path, ``admino.server`` has no ``get_events`` or
+        ``_stream_agent_result`` and the rate table no ``/api/events`` entry."""
+        from admino import server
 
-    async def test_server_events_empty_session_streams_done(self) -> None:
-        """Empty session streams just a done event."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": "sess1"},
-            )
-        assert resp.status_code == 200
-        body = resp.text
-        assert "event: done" in body
-
-    async def test_server_events_with_session_history_streams_status_and_done(self) -> None:
-        """Session with history streams status and done events."""
         agent = FakeAgent([_make_agent_result()])
         app = _make_app(agent)
-        # First, create a session by posting a message
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            await c.post(
-                "/api/message",
-                json={"message": "hello", "session_id": "sess1"},
-            )
-            # Now get events for that session
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": "sess1"},
-            )
-        assert resp.status_code == 200
-        body = resp.text
-        assert "event: status" in body
-        assert "event: done" in body
+            unknown = await c.get("/api/nope", params={"session_id": "x"})
+            events = await c.get("/api/events", params={"session_id": "x"})
 
-    async def test_server_events_sse_frame_format(self) -> None:
-        """Each SSE frame must be properly formatted: event: ...\\ndata: ...\\n\\n."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": "empty-sess"},
-            )
-        body = resp.text
-        # Split into frames by double newline
-        frames = [f.strip() for f in body.split("\n\n") if f.strip()]
-        for frame in frames:
-            lines = frame.split("\n")
-            assert any(line.startswith("event: ") for line in lines)
-            assert any(line.startswith("data: ") for line in lines)
-
-    async def test_server_events_invalid_session_id_returns_422(self) -> None:
-        """Oversized session_id returns 422 (Pydantic Query validation)."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": "x" * 65},
-            )
-        assert resp.status_code == 422
-
-    async def test_server_events_empty_session_id_returns_422(self) -> None:
-        """Empty session_id returns 422 (Pydantic Query validation)."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": ""},
-            )
-        assert resp.status_code == 422
-
-    @pytest.mark.parametrize(
-        "session_id",
-        [
-            "invalid session!@#",
-            "../traversal",
-            "<script>alert(1)</script>",
-        ],
-    )
-    async def test_server_events_invalid_session_id_pattern_returns_422(
-        self, session_id: str
-    ) -> None:
-        """Session IDs with invalid characters return 422."""
-        app = _make_app()
-        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-            resp = await c.get(
-                "/api/events",
-                params={"session_id": session_id},
-            )
-        assert resp.status_code == 422
+        assert (unknown.status_code, unknown.json()) == (404, {"detail": "Not Found"})
+        assert (events.status_code, events.text) == (unknown.status_code, unknown.text)
+        assert events.headers.get("content-type") == unknown.headers.get("content-type")
+        assert agent.run_calls == []
+        assert [r for r in app.routes if getattr(r, "path", None) == "/api/events"] == []
+        assert [n for n in ("get_events", "_stream_agent_result") if hasattr(server, n)] == []
+        assert "/api/events" not in server._RATE_LIMITS
 
 
 class TestConfirmation:
@@ -2028,62 +1940,6 @@ class TestStaticFiles:
         assert resp.status_code == 200
 
 
-class TestSSEStreamHelper:
-    """Test the SSE formatting helpers via the streaming endpoint."""
-
-    pytestmark = pytest.mark.asyncio
-
-    async def test_server_stream_agent_result_includes_tool_calls(self) -> None:
-        """Stream from an AgentResult with tool calls includes tool_call events."""
-        from admino.server import _stream_agent_result
-
-        tc = ToolCallRecord(tool="gmail", action="read", permission="allow", success=True)
-        result = _make_agent_result(
-            response="Done reading.",
-            tool_calls=[tc],
-        )
-        frames: list[str] = []
-        async for frame in _stream_agent_result(result):
-            frames.append(frame)
-
-        combined = "".join(frames)
-        assert "event: status" in combined
-        assert "event: tool_call" in combined
-        assert "event: message" in combined
-        assert "event: done" in combined
-
-    async def test_server_stream_agent_result_error_status(self) -> None:
-        """Error status result streams an error event."""
-        from admino.server import _stream_agent_result
-
-        result = _make_agent_result(status="error", response="Something failed.")
-        frames: list[str] = []
-        async for frame in _stream_agent_result(result):
-            frames.append(frame)
-
-        combined = "".join(frames)
-        assert "event: error" in combined
-        assert "event: done" in combined
-
-    async def test_server_stream_agent_result_awaiting_confirmation(self) -> None:
-        """Awaiting confirmation result streams a confirm event."""
-        from admino.server import _stream_agent_result
-
-        pending = _make_pending_confirmation()
-        result = _make_agent_result(
-            status="awaiting_confirmation",
-            response="Needs confirmation.",
-            pending_confirmation=pending,
-        )
-        frames: list[str] = []
-        async for frame in _stream_agent_result(result):
-            frames.append(frame)
-
-        combined = "".join(frames)
-        assert "event: confirm" in combined
-        assert "event: done" in combined
-
-
 class TestSSEHelperFunctions:
     """Sync helper function tests for SSE formatting (no event loop needed)."""
 
@@ -2702,53 +2558,6 @@ class TestPytestAsyncioCanary:
 
 
 # ---------------------------------------------------------------------------
-# F-12: SSE frame injection via hostile LLM response
-# ---------------------------------------------------------------------------
-
-
-class TestSSEFrameInjection:
-    """Verify SSE sanitisation blocks frame injection from LLM output."""
-
-    pytestmark = pytest.mark.asyncio
-
-    async def test_server_sse_stream_no_frame_injection(self) -> None:
-        """An AgentResult with newlines in response must not inject extra SSE frames."""
-        from admino.server import _stream_agent_result
-
-        hostile_response = "line1\n\nevent: injected\ndata: evil\n\n"
-        result = _make_agent_result(response=hostile_response)
-        frames: list[str] = []
-        async for frame in _stream_agent_result(result):
-            frames.append(frame)
-
-        # Should be exactly 3 SSE frames: status, message, done
-        assert len(frames) == 3, f"Expected 3 SSE frames, got {len(frames)}"
-
-        combined = "".join(frames)
-        # Count real SSE frame starts (lines beginning with "event: ")
-        real_events = [line for line in combined.split("\n") if line.startswith("event: ")]
-        assert len(real_events) == 3, f"Expected 3 real SSE events, got {len(real_events)}"
-
-        # The injected event type must not appear as a real SSE event
-        event_types = [line.split("event: ", 1)[1] for line in real_events]
-        assert "injected" not in event_types
-
-    async def test_server_sse_stream_control_chars_stripped(self) -> None:
-        """Control characters in LLM response are stripped in SSE output."""
-        from admino.server import _stream_agent_result
-
-        # U+202E RIGHT-TO-LEFT OVERRIDE — spoofing attack
-        hostile_response = "Hello \u202e dlrow"
-        result = _make_agent_result(response=hostile_response)
-        frames: list[str] = []
-        async for frame in _stream_agent_result(result):
-            frames.append(frame)
-
-        combined = "".join(frames)
-        assert "\u202e" not in combined
-
-
-# ---------------------------------------------------------------------------
 # F-13: Additional confirmation_id path parameter validation
 # ---------------------------------------------------------------------------
 
@@ -2994,7 +2803,6 @@ class _Clock:
 _EXPECTED_RATE_LIMITS: list[tuple[str, float, int]] = [
     ("/api/message", 0.5, 5),
     ("/api/confirm", 0.5, 5),
-    ("/api/events", 0.17, 3),
     # GH-159: the settings scopes, per user (the old /api/settings keys are gone).
     ("/api/me/settings/get", 1.0, 10),
     ("/api/me/settings/patch", 0.5, 5),
@@ -3168,7 +2976,9 @@ def _recording_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Swap ``server._chat_runtime`` for a ChatRuntime that records each ``hold`` (GH-176).
 
     Same bound as the server's; ``held`` lists ``(chat_id, owner_user_id)`` per
-    ``hold()`` call. Call it after ``_make_app`` (``create_app`` clears the runtime).
+    ``hold()`` call, recorded when the call is made (before it waits, or refuses a
+    busy chat: GH-8's ``wait`` keyword is passed through). Call it after ``_make_app``
+    (``create_app`` clears the runtime).
     """
     import admino.server as srv
     from admino.chat_runtime import ChatRuntime
@@ -3180,9 +2990,9 @@ def _recording_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
             )
             self.held: list[tuple[UUID, UUID]] = []
 
-        def hold(self, chat_id: UUID, owner_user_id: UUID) -> Any:
+        def hold(self, chat_id: UUID, owner_user_id: UUID, **kwargs: Any) -> Any:
             self.held.append((UUID(str(chat_id)), UUID(str(owner_user_id))))
-            return super().hold(chat_id, owner_user_id)
+            return super().hold(chat_id, owner_user_id, **kwargs)
 
     runtime = _RecordingRuntime()
     monkeypatch.setattr(srv, "_chat_runtime", runtime)
@@ -3235,19 +3045,22 @@ class _BarrierAgent(FakeAgent):
 
 
 class TestChatRunLocks:
-    """GH-176: runs of one chat are serialised through ``server._chat_runtime.hold``.
+    """GH-176: runs of one chat go through ``server._chat_runtime.hold``.
 
-    Two messages to the same legacy chat never run at once (the second one
-    loads the history the first one stored); messages to different chats
-    run concurrently. The run locks moved from ``_session_locks`` into the
-    bounded chat runtime (``create_app`` clearing it is pinned in TestAppFactory).
+    GH-8: two messages to the same legacy chat never run at once, and the second
+    one never waits either: while the first still runs it is ``409 run_active``
+    (no run, nothing stored). Messages to different chats run concurrently. The
+    run locks live in the bounded chat runtime (``create_app`` clearing it is
+    pinned in TestAppFactory).
     """
 
     pytestmark = pytest.mark.asyncio
 
-    async def test_server_concurrent_messages_to_one_chat_are_serialised(
+    async def test_server_message_to_a_chat_whose_run_is_going_gets_409_run_active(
         self, db: FakeDb, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """m2, sent to the legacy chat while m1's run is parked, answers 409 at once (before
+        m1 is released): it never runs and stores nothing; m1 completes and is stored."""
         agent = _ParkingAgent([_turn("m1", "first"), _turn("m2", "second")])
         app = _make_app(agent)
         runtime = _recording_runtime(monkeypatch)
@@ -3259,16 +3072,25 @@ class TestChatRunLocks:
             second = asyncio.create_task(
                 c.post("/api/message", json={"message": "m2", "session_id": "sess1"})
             )
-            await asyncio.sleep(0.05)
+
+            async def second_held_or_answered() -> None:
+                while len(runtime.held) < 2 and not second.done():
+                    await asyncio.sleep(0.001)
+
+            await asyncio.wait_for(second_held_or_answered(), timeout=5)
             started_while_first_ran = list(agent.started)
             agent.release.set()
             responses = await asyncio.gather(first, second)
 
-        assert [resp.status_code for resp in responses] == [200, 200]
+        assert [resp.status_code for resp in responses] == [200, 409]
+        assert responses[1].json() == {
+            "detail": "A message is already running in this chat.",
+            "reason": "run_active",
+        }
         assert started_while_first_ran == ["m1"]
-        assert agent.max_active == 1
-        assert _pairs(agent.run_calls[1]["history"]) == [("user", "m1"), ("assistant", "first")]
+        assert agent.started == ["m1"]
         chat_id = _legacy_chat_id(db, "sess1")
+        assert _rows(db, chat_id) == [("user", "m1"), ("assistant", "first")]
         assert runtime.held == [(chat_id, TEST_MEMBER_ID)] * 2
 
     async def test_server_messages_to_different_chats_run_concurrently(

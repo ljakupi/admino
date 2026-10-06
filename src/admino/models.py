@@ -69,6 +69,15 @@ Security notes:
   sanitized ``ToolCallRecord``s only, never the raw tool inputs.
   ``ConfirmRequest`` names exactly one of ``chat_id`` and the legacy
   ``session_id``.
+- Streamed chat turns (GH-8): ``AgentStatus`` gains ``stopped`` (a streamed
+  run the user stopped; ``ChatResponse.status`` never carries it, a JSON run
+  can't be stopped). The SSE event payloads (``RunStartedPayload`` to
+  ``DonePayload``) and ``ChatStopResponse`` refuse unknown keys;
+  ``StreamErrorCode`` is the closed set of ``error`` event codes. A delta's
+  text arrives as display text (``admino.streaming.DisplayDeltas``) and is
+  not cleaned again; the ``error`` message is cleaned like
+  ``ChatResponse.response``. ``normalize_display_text`` is the cleanup of
+  text shown to users without the credential rules: never shown itself.
 - ``PlatformDiagnosticsResponse`` (GH-158) carries the LLM provider, model
   and statuses only, for the Super Admin; the public /health is status-only.
 - Settings scopes (GH-159): ``UserSettingsPatch``, ``OrgSettingsPatch`` and
@@ -509,6 +518,17 @@ def sanitize_display_text(value: str) -> str:
     """
     text = _remove_runs(unicodedata.normalize("NFKC", value))
     return _strip_credentials(text).replace(_SEPARATOR, "")
+
+
+def normalize_display_text(value: str) -> str:
+    """Return ``value`` as text shown to users reads it before credential redaction.
+
+    NFKC, then every removed character (``sanitize_display_text``'s set) taken
+    out; no credential rule runs, so the result is NOT safe to show. Public
+    because the live stream (``admino.streaming``) reads how a word displays to
+    decide whether the ``Bearer`` rule could reach past it.
+    """
+    return _REMOVED_RUN.sub("", unicodedata.normalize("NFKC", value))
 
 
 # The deepest tool-argument value kept (GH-270 decision 5): ``args[k]`` is at
@@ -1035,7 +1055,7 @@ class PendingConfirmation(BaseModel):
         return self
 
 
-AgentStatus = Literal["final", "awaiting_confirmation", "limit_reached", "error"]
+AgentStatus = Literal["final", "awaiting_confirmation", "limit_reached", "error", "stopped"]
 """Terminal status of an agent run.
 
 - ``final``: the LLM produced a plain text response; history contains it.
@@ -1045,6 +1065,8 @@ AgentStatus = Literal["final", "awaiting_confirmation", "limit_reached", "error"
   producing a final text response.
 - ``error``: an upstream error (e.g. LLM client failure) prevented completion;
   ``response`` contains a safe human-readable message, never raw exception data.
+- ``stopped`` (GH-8): the user stopped a streamed run; ``response`` is the text
+  the interrupted LLM call had forwarded (empty when none).
 """
 
 
@@ -3322,3 +3344,87 @@ class ChatDetailResponse(ChatSummary):
     pending_confirmation: PendingConfirmationSummary | None = None
     confirmation_status: Literal["none", "pending", "expired"]
     context: ChatContext
+
+
+# ---------------------------------------------------------------------------
+# Streamed chat turns (GH-8): the SSE event payloads and the stop route
+# ---------------------------------------------------------------------------
+
+DELTA_MAX_LENGTH: Final = 4096
+"""The most characters one ``delta`` event carries (``admino.streaming.MAX_DELTA_CHARS``)."""
+
+StreamErrorCode = Literal[LLMErrorCode, "rate_limit", "internal_error", "chat_not_found"]
+"""Stable code of a streamed turn's ``error`` event; the UI shows its translation.
+
+The run's LLM error codes (GH-242), ``rate_limit`` (GH-24: too many pending
+confirmations), ``internal_error`` (an uncoded failure, also an agent that
+raised: nothing stored) and ``chat_not_found`` (the chat was trashed during the
+run: nothing stored).
+"""
+
+
+class RunStartedPayload(BaseModel):
+    """``run_started`` event: the first frame, naming the chat the run belongs to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    chat_id: UUID
+
+
+class DeltaPayload(BaseModel):
+    """``delta`` event: the next piece of the answer as it is shown.
+
+    The text is ``admino.streaming.DisplayDeltas`` output, display text already;
+    it is not cleaned again here, since a piece cleaned on its own can differ
+    from the same characters cleaned within the whole answer.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str = Field(min_length=1, max_length=DELTA_MAX_LENGTH)
+
+
+class MessageSavedPayload(BaseModel):
+    """``message_saved`` event: the turn is stored; its last message's id and status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: UUID
+    status: MessageStatus
+
+
+class ErrorPayload(BaseModel):
+    """``error`` event: a stable code and the English fallback the JSON route returns."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: StreamErrorCode
+    message: str = Field(max_length=65536)
+
+    @field_validator("message")
+    @classmethod
+    def _sanitize_message(cls, value: str) -> str:
+        """Clean the message like ``ChatResponse.response``, so both modes read the same."""
+        return sanitize_display_text(value)
+
+
+class TitlePayload(BaseModel):
+    """``title`` event: the chat's stored automatic title."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=_CHAT_TITLE_MAX_LENGTH)
+
+
+class DonePayload(BaseModel):
+    """``done`` event: the last frame; no data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class ChatStopResponse(BaseModel):
+    """POST /api/chats/{chat_id}/stop response: whether a streamed run of the chat was stopped."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stopped: bool

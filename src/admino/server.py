@@ -1,8 +1,9 @@
 """FastAPI web server for admino — the HTTP/SSE boundary layer.
 
-Exposes the REST API and SSE streaming endpoint that clients interact with.
-All user input enters through this module and all responses leave through it.
-The server is a thin HTTP layer that delegates business logic to the agent.
+Exposes the REST API, with the chat turns streamed as server-sent events on
+request (GH-8), that clients interact with. All user input enters through this
+module and all responses leave through it. The server is a thin HTTP layer
+that delegates business logic to the agent.
 
 Routes:
 - POST /api/auth/login    — Email/password login; sets the session cookie (public).
@@ -76,17 +77,20 @@ Routes:
 - DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
 - POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
   ChatResponse (with the run's LLM error code, GH-242, or ``rate_limit`` when
-  the caller's pending-confirmation limit refused its confirmation, GH-24).
-  The first exchange of an untitled chat titles it after the response
-  (GH-179).
+  the caller's pending-confirmation limit refused its confirmation, GH-24),
+  or, with ``Accept: text/event-stream``, streams the run as server-sent
+  events (GH-8). The first exchange of an untitled chat titles it after the
+  response (GH-179; a streamed one before its ``done``). 409 ``run_active``
+  while a run of the chat is going.
+- POST /api/chats/{chat_id}/stop — Stops the chat's streamed run
+  (``{"stopped": bool}``, GH-8).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created by its first run, until #177: a refused first
-  message creates none); returns ChatResponse. Titles the chat like the
-  route above.
-- GET  /api/events        — Legacy SSE stub for a chat session id.
+  message creates none); returns ChatResponse, always JSON. Titles the chat
+  and refuses a busy one like the route above.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
   (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
-  resumed run's LLM error code).
+  resumed run's LLM error code), or streams like a turn (GH-8).
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -153,14 +157,14 @@ Security notes:
   that doesn't decode is a 422 ``invalid_cursor``; no error repeats a title,
   message or cursor. A turn runs on the latest ``max_context_messages``
   messages (``chats.load_recent_history``) and passes the chat's sticky
-  ``external_content`` flag, read under the chat's lock (a turn queued behind
-  one that stored wrapped content gets it), as ``earlier_external_content``
-  (GH-243 covers the whole conversation); its new messages are stored after
-  the run (an agent failure stores nothing; a chat trashed meanwhile is the
-  404). A
-  denial is stored too (the closing ``tool`` results and the assistant's
-  denial), so the history stays well-formed. The agent's ``session_id`` is
-  ``str(chat.id)``, so ``tool.call`` rows target the chat. Trashing records
+  ``external_content`` flag, read under the chat's lock (an approval that
+  waited for a running turn gets what that turn stored), as
+  ``earlier_external_content`` (GH-243 covers the whole conversation); its new
+  messages are stored after the run (an agent failure stores nothing; a chat
+  trashed meanwhile is the 404). A denial is stored too (the closing ``tool``
+  results and the assistant's denial), so the history stays well-formed. The
+  agent's ``session_id`` is ``str(chat.id)``, so ``tool.call`` rows target
+  the chat. Trashing records
   ``chat.delete`` in the same transaction. The legacy ``session_id`` names
   the caller's own chat (``chats.legacy_session_id``): another user's
   session id is a chat of the caller's own, and a confirmation never creates
@@ -192,8 +196,56 @@ Security notes:
   fallback (the first message, sanitized). So does a first run whose tool
   results hold wrapped external content (GH-243; the same rule as the chat's
   sticky ``external_content`` flag), with no model call: an email, file or
-  page the reply quotes never chooses the title. No audit event; titles
-  aren't logged.
+  page the reply quotes never chooses the title. GH-8: a streamed first
+  exchange is titled by its run task after ``message_saved`` (no chat lock;
+  a ``stopped`` turn also gets the fallback, with no model call) and sends
+  the stored automatic title as ``title`` before ``done``. No audit event;
+  titles aren't logged.
+- Streamed turns (GH-8, ``admino.event_stream``, ``admino.streaming``): the
+  turn route and the confirm route answer server-sent events when the
+  ``Accept`` header lists ``text/event-stream`` with a ``q`` above 0 (the
+  legacy POST /api/message never does). Every check before the run (401,
+  CSRF 403, 403, 404, 409, 422, 429, 503) is the usual JSON error; the
+  stream starts once the run holds its chat. The run executes in a detached
+  task (kept referenced until it ends) that stores the turn, frees the chat,
+  and only then sends ``confirm`` / ``message_saved`` / ``error``, the title
+  and ``done``; an agent that raised is ``error{internal_error}`` and a chat
+  trashed meanwhile ``error{chat_not_found}``, with nothing stored. Frames
+  are built through ``SSEEvent`` (``_make_sse_event``): one line of JSON
+  each (no raw CR/LF, no NaN/Infinity literal), a validated event name.
+  ``delta`` texts are display text (``streaming.DisplayDeltas``: the JSON
+  reply's cleanup and credential redaction, word by word, a trailing
+  ``Bearer`` held for the next word), so a key never streams in part; an
+  answer that doesn't complete (a ``stopped`` or ``error`` run, an agent
+  that raised, a chat trashed meanwhile) ends at its last ASCII whitespace,
+  its unfinished last word (maybe a key cut short) never sent;
+  ``tool_call`` and ``confirm`` carry the JSON response's redacted items. A
+  frame that can't be built is dropped (its event name and the exception
+  class logged, never its payload) and the run goes on: building or queueing
+  a frame never raises into the run. Frames queue in memory and nothing
+  waits for the client: ``EventStreamResponse`` watches for its disconnect
+  (also under ASGI 2.4, where Starlette doesn't), which sets the run's stop
+  like the stop route; the run still ends by the agent's stop rules and is
+  stored and titled. At shutdown the lifespan sets every detached run's stop
+  and waits for them (at most ``_DRAIN_TIMEOUT_S``; the count of runs still
+  going is logged) before it stops the background jobs and closes the pool,
+  so a run whose client left still audits its tool call and stores its turn.
+- One run per chat (GH-8): a message takes its chat with
+  ``ChatRuntime.hold(wait=False)``: while a run of the chat is going it is
+  the 409 ``{"detail": "A message is already running in this chat.",
+  "reason": "run_active"}`` (after the rate limit, the 422 checks and the
+  404), with nothing run or stored and the chat's pending confirmation
+  untouched. A confirmation still waits for the chat (the running turn may
+  store the confirmation it approves).
+- Stop (GH-8): ``POST /api/chats/{chat_id}/stop`` needs ``chat.send`` (403
+  before any database work), the CSRF check and its per-user bucket; the
+  chat is read with the caller's tenant (the same 404 as the other chat
+  routes), then ``ChatRuntime.request_stop`` sets the stop signal a streamed
+  run registered (``stoppable``); it never creates a runtime entry, a JSON
+  run can't be stopped, and no request body is read. A stop isn't audited
+  (every tool call still is, as ``tool.call``); at most an INFO line names
+  the chat id. No message, delta, title, tool argument or legacy session id
+  is ever logged.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -417,6 +469,10 @@ Security notes:
   random cookies is refused (429) before it costs database lookups.
 - No raw user content, assistant text, or tool args logged at INFO or below.
 - Error responses use generic messages; never leak internal paths or config.
+- ``SecurityHeadersMiddleware`` is pure ASGI (GH-8): it sets the headers on
+  the response start and passes ``receive`` and every body message through,
+  so a stream reaches the client frame by frame and its disconnect reaches
+  the route.
 - Request IDs and unhandled errors (GH-158): ``RequestIdMiddleware`` (pure
   ASGI, outermost) gives every HTTP request a fresh ``uuid4().hex`` in
   ``logs.request_id_var``, so every log line of the request carries it, and
@@ -445,9 +501,10 @@ Security notes:
 
 Deployment note:
 - Chats and their messages live in PostgreSQL. In-memory state: the bounded
-  ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run locks
-  and pending confirmations, at most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries
-  and ``_MAX_CHAT_RUNTIME_ENTRIES_PER_USER`` per user, idle ones evicted
+  ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run
+  locks, streamed runs' stop signals (GH-8) and pending confirmations, at
+  most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries and
+  ``_MAX_CHAT_RUNTIME_ENTRIES_PER_USER`` per user, idle ones evicted
   after ``_CHAT_IDLE_EVICT_S``; GH-24: only the two message routes create
   entries (a confirm on a chat without one is the 404 "No pending
   confirmation for this session"); a user at their bound loses their own
@@ -456,9 +513,10 @@ Deployment note:
   entry goes first, then anyone's, then the requester's own pending
   confirmation, never another user's; 503 ``chats_busy`` when nothing can
   go; cleared by ``create_app``, so a restart turns a pending confirmation
-  into ``expired``), ``_rate_buckets`` and
-  ``_oauth_pending_states``; ``admino.org_permissions`` keeps the pending
-  promotions in memory (as ``admino.oauth`` does the access-token cache).
+  into ``expired``), ``_rate_buckets``, ``_oauth_pending_states`` and
+  the detached streamed runs (``event_stream.detach``);
+  ``admino.org_permissions`` keeps the pending promotions in memory (as
+  ``admino.oauth`` does the access-token cache).
   This requires a **single-worker** ASGI deployment. Running multiple
   workers (e.g. uvicorn --workers 2) will silently split state across
   processes. Use ``--workers 1`` (the default).
@@ -478,6 +536,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -485,6 +544,7 @@ import secrets
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path as PathLib
 from typing import TYPE_CHECKING, Annotated, Final, Literal, NamedTuple, cast
@@ -505,12 +565,11 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import ValidationError
 from starlette.background import BackgroundTask
-from starlette.datastructures import Headers
+from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.staticfiles import StaticFiles
 
 from admino import (
@@ -518,6 +577,7 @@ from admino import (
     auth,
     chat_titles,
     chats,
+    event_stream,
     invitations,
     llm_policy,
     login_throttle,
@@ -535,11 +595,13 @@ from admino import (
 )
 from admino.access import Capability, Principal, can
 from admino.chat_runtime import (
+    ChatRunActiveError,
     ChatRuntime,
     ChatRuntimeFullError,
     ChatRuntimeUserLimitError,
     PendingConfirmationLimitError,
 )
+from admino.event_stream import EventStreamResponse
 from admino.logs import request_id_var, safe_log
 from admino.models import (
     PROVIDER_TOOLS,
@@ -553,12 +615,16 @@ from admino.models import (
     ChatMessageView,
     ChatRequest,
     ChatResponse,
+    ChatStopResponse,
     ChatSummary,
     ChatUpdateRequest,
     ConfirmRequest,
     CriticalPermissionPromote,
     CriticalPermissionsResponse,
     CriticalPermissionState,
+    DeltaPayload,
+    DonePayload,
+    ErrorPayload,
     InvitationAcceptRequest,
     InvitationCreateRequest,
     InvitationDetails,
@@ -567,6 +633,7 @@ from admino.models import (
     LLMMessage,
     LoginRequest,
     MeResponse,
+    MessageSavedPayload,
     MyAccountPatch,
     MyAccountResponse,
     OAuthAuthorizeResponse,
@@ -598,9 +665,11 @@ from admino.models import (
     PlatformSettingsResponse,
     PlatformUserListResponse,
     PlatformUserSummary,
+    RunStartedPayload,
     SessionListResponse,
     SettingsLLM,
     SSEEvent,
+    TitlePayload,
     UserSettingsPatch,
     UserSettingsResponse,
 )
@@ -621,18 +690,27 @@ from admino.oauth import (
 )
 from admino.permissions import PROMOTABLE_DENIALS
 from admino.proxy_headers import TrustedProxyHeadersMiddleware
+from admino.streaming import DisplayDeltas, RunStream, display_pieces
 from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable
 
     import asyncpg
+    from pydantic import BaseModel
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from admino.agent import Agent
     from admino.config import AppConfig
     from admino.llm import LLMClient
-    from admino.models import AgentStatus, LLMErrorCode, MessageStatus, SettingsPatchLLM
+    from admino.models import (
+        AgentStatus,
+        LLMErrorCode,
+        MessageStatus,
+        SettingsPatchLLM,
+        ToolCallRecord,
+        ToolPolicy,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -657,7 +735,7 @@ _SECURITY_HEADERS: Final[dict[str, str]] = {
 }
 
 
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+class SecurityHeadersMiddleware:
     """Injects security response headers on every HTTP response.
 
     Mitigates XSS (CSP), clickjacking (X-Frame-Options), MIME-sniffing
@@ -665,20 +743,31 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     Permissions-Policy). Applied even for local-only deployments because
     the PWA runs in a browser that respects these headers.
 
+    A pure ASGI middleware (GH-8): it sets the headers on the response start
+    and passes ``receive`` and every body message through untouched, so a
+    streamed chat reply reaches the client frame by frame and its client's
+    disconnect reaches the route.
+
     Note: ``Strict-Transport-Security`` (HSTS) is intentionally omitted: the
     app itself serves plain HTTP, and TLS terminates at the reverse proxy. The
     production profile's Caddy proxy (docker-compose.prod.yml) sends HSTS.
     """
 
-    async def dispatch(
-        self,
-        request: Request,
-        call_next: Callable[[Request], Awaitable[Response]],
-    ) -> Response:
-        """Add security headers to every response."""
-        response = await call_next(request)
-        response.headers.update(_SECURITY_HEADERS)
-        return response
+    def __init__(self, app: ASGIApp) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Pass the request on, adding the security headers to its response (replacing any)."""
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message).update(_SECURITY_HEADERS)
+            await send(message)
+
+        await self._app(scope, receive, send_with_headers)
 
 
 # ---------------------------------------------------------------------------
@@ -911,7 +1000,6 @@ class _TokenBucket:
 _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
-    "/api/events": (0.17, 3),
     # GH-176: persisted chats, per user. A chat turn spends "/api/message"
     # (one LLM bucket per user, shared with the legacy route).
     "/api/chats/create": (0.5, 5),
@@ -919,6 +1007,8 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/chats/get": (1.0, 10),
     "/api/chats/patch": (0.5, 5),
     "/api/chats/delete": (0.5, 5),
+    # GH-8: stopping a chat's streamed run, per user.
+    "/api/chats/stop": (1.0, 10),
     # GH-159: the settings scopes, per user.
     "/api/me/settings/get": (1.0, 10),
     "/api/me/settings/patch": (0.5, 5),
@@ -1130,6 +1220,10 @@ _chat_runtime = ChatRuntime(
 # The background reaper's pause between two passes (GH-24): an expired confirmation
 # is gone within this long even when no chat request comes in.
 _CONFIRMATION_REAP_INTERVAL_S: Final = 30.0
+# How long the shutdown waits for the detached streamed runs it asked to stop (GH-8):
+# one tool call's time plus the store. The container's stop grace period must be
+# longer, or the process is killed first. Read by the lifespan at shutdown.
+_DRAIN_TIMEOUT_S: Final = 30.0
 
 # OAuth state binding (GH-162): the authorize route stores the state with the
 # initiating user and session, and sets this short-lived cookie (HttpOnly,
@@ -1243,6 +1337,11 @@ _USER_CHATS_BUSY_BODY: Final = {
     "detail": "Too many of your chats are active. Try again shortly.",
     "reason": "rate_limit",
 }
+# GH-8: a message to a chat whose run is going (never queued behind it).
+_RUN_ACTIVE_BODY: Final = {
+    "detail": "A message is already running in this chat.",
+    "reason": "run_active",
+}
 
 # The stored status of a run's last message: a run's ``final`` is ``complete``.
 _STORED_STATUS: Final[dict[AgentStatus, MessageStatus]] = {
@@ -1250,7 +1349,10 @@ _STORED_STATUS: Final[dict[AgentStatus, MessageStatus]] = {
     "awaiting_confirmation": "awaiting_confirmation",
     "limit_reached": "limit_reached",
     "error": "error",
+    "stopped": "stopped",
 }
+# ChatResponse.status: a JSON run passes the agent no stream, so it never ends "stopped".
+_JsonStatus = Literal["final", "awaiting_confirmation", "limit_reached", "error"]
 
 
 def _summarise_pending(pending: PendingConfirmation) -> PendingConfirmationSummary:
@@ -1435,63 +1537,25 @@ def _format_sse(event: SSEEvent) -> str:
 def _make_sse_event(event_type: str, payload: dict[str, object]) -> str:
     """Create and format an SSE frame from an event type and payload dict.
 
+    The data is one line of JSON: ``json.dumps`` escapes every control and
+    non-ASCII character (CR, LF, U+2028 included), so no payload value can end
+    the frame or forge another one. A non-finite number is refused rather than
+    written as a ``NaN``/``Infinity`` literal that isn't JSON (GH-8: the
+    streamed payloads come from ``model_dump(mode="json")``, which writes null).
+
     Args:
-        event_type: The SSE event name (e.g. 'message', 'status', 'done').
+        event_type: The SSE event name (e.g. 'delta', 'message_saved', 'done').
         payload: JSON-serializable dict for the data field.
 
     Returns:
         Wire-format SSE string.
+
+    Raises:
+        ValidationError: The event name could inject a field or a frame.
+        ValueError: The payload holds a non-finite number.
     """
-    sse = SSEEvent(event=event_type, data=json.dumps(payload, default=str))
+    sse = SSEEvent(event=event_type, data=json.dumps(payload, default=str, allow_nan=False))
     return _format_sse(sse)
-
-
-async def _stream_agent_result(result: AgentResult) -> AsyncIterator[str]:
-    """Convert an AgentResult into a sequence of SSE frames.
-
-    Streams:
-    - status: processing
-    - tool_call: for each tool call in the result
-    - message: the final text response (or confirm/error as appropriate)
-    - done: stream end signal
-
-    Args:
-        result: The completed agent result to stream.
-
-    Yields:
-        SSE wire-format strings.
-    """
-    # 1. Status: processing
-    yield _make_sse_event("status", {"status": "processing"})
-
-    # 2. Tool call summaries
-    for tc in result.tool_calls:
-        yield _make_sse_event(
-            "tool_call",
-            {
-                "tool": tc.tool,
-                "action": tc.action,
-                "success": tc.success,
-            },
-        )
-
-    # 3. Main result based on status
-    if result.status == "awaiting_confirmation" and result.pending_confirmation is not None:
-        yield _make_sse_event(
-            "confirm",
-            {
-                "confirmation_id": result.pending_confirmation.confirmation_id,
-                "tool": result.pending_confirmation.tool_call.tool,
-                "action": result.pending_confirmation.tool_call.action,
-            },
-        )
-    elif result.status == "error":
-        yield _make_sse_event("error", {"message": result.response})
-    else:
-        yield _make_sse_event("message", {"content": result.response})
-
-    # 4. Done signal
-    yield _make_sse_event("done", {})
 
 
 # ---------------------------------------------------------------------------
@@ -3706,53 +3770,75 @@ def _denied_tool_results(
     ]
 
 
-async def _finish_run(
-    pool: asyncpg.Pool,
-    tenant: TenantContext,
-    chat: chats.ChatRecord,
-    loaded: list[LLMMessage],
-    result: AgentResult,
-    session_id: str | None,
-    *,
-    max_pending: int,
-) -> ChatResponse:
-    """Store a run's new messages, keep its pending confirmation and build the response.
+@dataclass(frozen=True, slots=True)
+class _HeldRun:
+    """A chat's run about to start, under the chat's hold.
+
+    What the run's turn is stored against (``_finish_run``) and, for an
+    untitled chat's first exchange, the message its automatic title is made
+    from. A streamed run's detached task (GH-8) gets it with the hold.
+    """
+
+    pool: asyncpg.Pool
+    tenant: TenantContext
+    # The chat as read under the hold.
+    chat: chats.ChatRecord
+    # The stored messages the run's history was built from.
+    loaded: list[LLMMessage]
+    platform: scoped_settings.StoredPlatformSettings
+    policy: ToolPolicy
+    # The user message of an untitled chat's first exchange (GH-179); None: no title.
+    title_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _StoredRun:
+    """A run's turn as ``_finish_run`` stored it: what the JSON answer and the stream report."""
+
+    status: AgentStatus
+    response: str
+    error_code: Literal[LLMErrorCode, "rate_limit"] | None
+    pending: PendingConfirmationSummary | None
+    # The turn's last stored message; None when the run added no message.
+    message_id: UUID | None
+
+
+async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
+    """Store a run's new messages and keep its pending confirmation.
 
     Called under the chat's lock. The agent returns the history it got
     followed by the run's messages, so the new ones are
-    ``result.history[len(loaded):]`` (synthetic cancelled results included).
-    The last one is stored with the run's status (``final`` as ``complete``)
-    and its tool calls, in one append.
+    ``result.history[len(run.loaded):]`` (synthetic cancelled results
+    included). The last one is stored with the run's status (``final`` as
+    ``complete``, GH-8: ``stopped`` as ``stopped``) and its tool calls, in one
+    append.
 
     An ``awaiting_confirmation`` run's confirmation goes to ``_chat_runtime``
-    before the append, checked against the caller's pending limit in the same
-    step (GH-24), and is dropped again when the append fails. At the limit
-    nothing is kept: the turn is stored with the closing ``tool`` results of
-    the dangling calls (the pending call's ``_PENDING_LIMIT_TOOL_RESULT_MSG``,
-    any other the cancelled result) and a reply naming the call, the last
-    one with status ``error``, and the answer is a 200 with ``error_code:
-    "rate_limit"``.
+    before the append, checked against the caller's pending limit (the stored
+    platform ``max_pending_confirmations``: the most the caller may hold in
+    their other chats) in the same step (GH-24), and is dropped again when the
+    append fails. At the limit nothing is kept: the turn is stored with the
+    closing ``tool`` results of the dangling calls (the pending call's
+    ``_PENDING_LIMIT_TOOL_RESULT_MSG``, any other the cancelled result) and a
+    reply naming the call, the last one with status ``error``, and the run
+    reports ``error_code: "rate_limit"``.
 
     Args:
-        pool: The database pool.
-        tenant: The caller's org scope.
-        chat: The chat the run ran in.
-        loaded: The stored messages the run's history was built from.
+        run: The held run (the pool, the caller's org scope, the chat, the
+            loaded messages and the platform settings read for the request).
         result: The run's result.
-        session_id: The legacy session id to echo, or None.
-        max_pending: The stored platform ``max_pending_confirmations`` read
-            for this request: the most pending confirmations the caller may
-            hold in their other chats.
 
     Returns:
-        The ChatResponse naming the chat (with the run's LLM error code, or
-        ``rate_limit`` when its confirmation was refused).
+        The stored turn: its status, reply, error code (the run's LLM error
+        code, or ``rate_limit`` when its confirmation was refused), kept
+        confirmation and last message id.
 
     Raises:
         chats.ChatNotFoundError: The chat was trashed during the run; nothing
             is stored and no confirmation kept.
     """
-    new_messages = result.history[len(loaded) :]
+    chat = run.chat
+    new_messages = result.history[len(run.loaded) :]
     status: AgentStatus = result.status
     response = result.response
     error_code: Literal[LLMErrorCode, "rate_limit"] | None = result.error_code
@@ -3763,7 +3849,10 @@ async def _finish_run(
             # Checks the limit and stores without an await in between, so two concurrent
             # turns of the caller can't both take the last slot.
             _chat_runtime.set_pending(
-                chat.id, tenant.user_id, pending, max_pending_per_user=max_pending
+                chat.id,
+                run.tenant.user_id,
+                pending,
+                max_pending_per_user=run.platform.limits.max_pending_confirmations,
             )
         except PendingConfirmationLimitError:
             # A 200, not a 429: the turn already ran and is stored, and a client
@@ -3784,9 +3873,9 @@ async def _finish_run(
         else:
             pending_summary = _summarise_pending(pending)
     try:
-        await chats.append_messages(
-            pool,
-            tenant,
+        message_id = await chats.append_messages(
+            run.pool,
+            run.tenant,
             chat.id,
             new_messages,
             final_status=_STORED_STATUS[status],
@@ -3804,14 +3893,27 @@ async def _finish_run(
         status,
         len(result.tool_calls),
     )
-    return ChatResponse(
-        chat_id=chat.id,
-        session_id=session_id,
-        response=response,
-        tool_calls=result.tool_calls,
+    return _StoredRun(
         status=status,
-        pending_confirmation=pending_summary,
+        response=response,
         error_code=error_code,
+        pending=pending_summary,
+        message_id=message_id,
+    )
+
+
+def _chat_response(
+    chat_id: UUID, session_id: str | None, result: AgentResult, stored: _StoredRun
+) -> ChatResponse:
+    """The JSON answer of a stored run (``session_id`` echoes a legacy session id)."""
+    return ChatResponse(
+        chat_id=chat_id,
+        session_id=session_id,
+        response=stored.response,
+        tool_calls=result.tool_calls,
+        status=cast("_JsonStatus", stored.status),
+        pending_confirmation=stored.pending,
+        error_code=stored.error_code,
     )
 
 
@@ -3843,12 +3945,275 @@ def _running_llm_client() -> LLMClient:
     return _agent._llm
 
 
+def _title_call(
+    run: _HeldRun, result: AgentResult, stored: _StoredRun
+) -> Callable[[], Awaitable[None]] | None:
+    """The automatic title of an untitled chat's first exchange (GH-179); None for any other run.
+
+    ``chat_titles.title_chat`` with the model's title made from the message
+    and the reply, or the fallback from the message. A turn stored as
+    ``error`` (a confirmation refused with ``rate_limit`` included) or
+    ``stopped`` (GH-8) makes no model call, nor does a run whose new ``tool``
+    results hold wrapped external content (``_read_external_content``): the
+    reply may quote an email or a file, which must not choose the title. The
+    call gets the agent's client when it runs (``_running_llm_client``), the
+    org's data residency and the stored ``llm.max_retries``, and holds no chat
+    lock: a later turn's history holds the reply, so it titles nothing again.
+    """
+    if run.title_message is None:
+        return None
+    return functools.partial(
+        chat_titles.title_chat,
+        run.pool,
+        run.tenant,
+        run.chat.id,
+        get_client=_running_llm_client,
+        user_message=run.title_message,
+        assistant_message=result.response,
+        run_failed=stored.status in ("error", "stopped"),
+        external_content=_read_external_content(run.loaded, result),
+        data_residency=run.policy.data_residency,
+        max_retries=run.platform.llm.max_retries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streamed runs (GH-8): the frames, the detached run task
+# ---------------------------------------------------------------------------
+
+_INTERNAL_ERROR_PAYLOAD: Final = ErrorPayload(code="internal_error", message=_INTERNAL_ERROR_DETAIL)
+_CHAT_GONE_PAYLOAD: Final = ErrorPayload(
+    code="chat_not_found", message=_CHAT_NOT_FOUND_BODY["detail"]
+)
+# The run outcomes whose last answer ended as the model meant it (C11): its last
+# word is sent. Any other end (stopped, error) cuts it, as the stored stopped
+# reply is cut. A confirmation refused at the pending limit is stored as error
+# but its run (awaiting_confirmation) ended its answer with the gated call.
+_COMPLETE_ANSWERS: Final[frozenset[AgentStatus]] = frozenset(
+    {"final", "limit_reached", "awaiting_confirmation"}
+)
+# The OpenAPI 200 of the two streaming routes: the JSON ChatResponse (their
+# response_model) or, with ``Accept: text/event-stream``, the run's events.
+_EVENT_STREAM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    200: {
+        "description": (
+            "The ChatResponse, or the run's events with Accept: text/event-stream "
+            "(run_started, delta, tool_call, confirm, message_saved, error, title, done)."
+        ),
+        "content": {"text/event-stream": {"schema": {"type": "string"}}},
+    }
+}
+
+
+def _wants_event_stream(request: Request) -> bool:
+    """Whether a chat request's ``Accept`` header asks for the SSE answer (GH-8)."""
+    return event_stream.accepts_event_stream(", ".join(request.headers.getlist("accept")))
+
+
+class _RunFrames:
+    """The SSE frames of one streamed run, queued for its response (GH-8).
+
+    Starts with ``run_started``. ``send`` never waits for the client: the
+    response relays the queue, and a gone client leaves the rest unread.
+    ``on_delta`` and ``on_tool_call`` are the run's ``RunStream`` sinks: the
+    answer text goes through one ``DisplayDeltas``, flushed before every
+    ``tool_call`` and when the run ends (``end_answer``), so a ``delta``
+    carries display text only and never part of a credential. Neither sink
+    nor ``send`` ever raises into the run or waits: a frame that can't be
+    built is dropped, so a reporting failure can't lose a turn whose tool
+    calls already ran.
+    """
+
+    def __init__(self, chat_id: UUID) -> None:
+        """Queue ``run_started`` for the chat."""
+        self._chat_id = chat_id
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._deltas = DisplayDeltas()
+        self.send("run_started", RunStartedPayload(chat_id=chat_id))
+
+    def send(self, event: str, payload: BaseModel) -> None:
+        """Queue one frame: ``payload`` as JSON (a non-finite number is null).
+
+        A frame ``SSEEvent`` refuses (over its size cap, say) is dropped: only
+        the event name and the exception class are logged, never the payload
+        or the exception's text, which may quote it.
+        """
+        try:
+            frame = _make_sse_event(event, payload.model_dump(mode="json"))
+        except ValueError as exc:
+            # ValueError covers a pydantic ValidationError and a non-finite number.
+            logger.warning(
+                "Dropped the %s frame of chat %s: %s",
+                event,
+                safe_log(self._chat_id),
+                type(exc).__name__,
+            )
+            return
+        self._queue.put_nowait(frame)
+
+    def text(self, pieces: list[str]) -> None:
+        """Queue a ``delta`` per display piece."""
+        for piece in pieces:
+            self.send("delta", DeltaPayload(text=piece))
+
+    async def on_delta(self, text: str) -> None:
+        """Take the run's next raw answer text; send what is settled."""
+        self.text(self._deltas.feed(text))
+
+    async def on_tool_call(self, record: ToolCallRecord) -> None:
+        """Send the answer so far, then the recorded dispatch's ``tool_call``.
+
+        The answer before a tool call is complete: its last word is sent.
+        """
+        self.end_answer(complete=True)
+        self.send("tool_call", record)
+
+    def end_answer(self, *, complete: bool) -> None:
+        """Send what is held of the current answer.
+
+        ``complete=False`` (the answer was cut: a stop, an error) drops its
+        unfinished last word, so a key cut short is never shown in part.
+        """
+        self.text(self._deltas.flush(complete=complete))
+
+    def end(self) -> None:
+        """Queue ``done``, the last frame."""
+        self.send("done", DonePayload())
+        self._queue.put_nowait(None)
+
+    async def relay(self) -> AsyncIterator[str]:
+        """The queued frames in order, up to ``done``."""
+        while (frame := await self._queue.get()) is not None:
+            yield frame
+
+
+def _report_stored(frames: _RunFrames, stored: _StoredRun) -> None:
+    """Send how a stored run ended: the frames after its deltas and tool calls (C5.3)."""
+    if stored.status == "limit_reached":
+        # The agent adds the limit notice without streaming it.
+        frames.text(display_pieces(stored.response))
+    if stored.pending is not None:
+        frames.send("confirm", stored.pending)
+    if stored.message_id is not None:
+        frames.send(
+            "message_saved",
+            MessageSavedPayload(message_id=stored.message_id, status=_STORED_STATUS[stored.status]),
+        )
+    if stored.status == "error":
+        frames.send(
+            "error",
+            ErrorPayload(code=stored.error_code or "internal_error", message=stored.response),
+        )
+
+
+async def _send_title(
+    frames: _RunFrames, run: _HeldRun, result: AgentResult, stored: _StoredRun
+) -> None:
+    """Title an untitled chat's first streamed exchange, then send the stored title (C5.6).
+
+    The chat is read after ``_title_call``'s call: a ``title`` frame only for
+    an automatic title that is stored (a rename during the run wins and sends
+    none; a chat trashed meanwhile sends none).
+    """
+    title = _title_call(run, result, stored)
+    if title is None:
+        return
+    await title()
+    try:
+        chat = await chats.get_chat(run.pool, run.tenant, run.chat.id)
+    except chats.ChatNotFoundError:
+        return
+    if chat.title_source == "auto" and chat.title:
+        frames.send("title", TitlePayload(title=chat.title))
+
+
+async def _streamed_run(
+    held: contextlib.AsyncExitStack,
+    run: _HeldRun,
+    start: Callable[..., Awaitable[AgentResult]],
+    stream: RunStream,
+    frames: _RunFrames,
+) -> None:
+    """A streamed run's detached task: run and store the turn, free the chat, then report it.
+
+    ``held`` is the chat's hold and the run's stop registration the route
+    took; they go once the turn is stored and before ``confirm``,
+    ``message_saved`` or ``error`` is sent, so a client may send the next
+    message or confirm as soon as it sees them. An agent that raised is
+    ``error{internal_error}`` and a chat trashed during the run
+    ``error{chat_not_found}``, both with nothing stored (the JSON route's 500
+    and 404). A stored turn is reported, then an untitled chat's first exchange
+    is titled (``_send_title``). ``done`` always ends the stream. Nothing here
+    waits for the client, so a turn whose client left is still stored and
+    titled. Log lines name the chat id and an exception class only.
+
+    The answer's held text is sent once the outcome is known (a trashed chat
+    only shows when the store raises): whole for a stored ``final``,
+    ``limit_reached`` or ``awaiting_confirmation`` run, without its
+    unfinished last word for any other end (C11: a key the stop or error cut
+    short is never shown in part).
+    """
+    chat_id = run.chat.id
+    try:
+        result: AgentResult | None = None
+        stored: _StoredRun | None = None
+        async with held:
+            try:
+                result = await start(stream=stream)
+            except Exception:
+                # Nothing is stored, like the JSON route's 500; the deltas sent stay sent.
+                logger.error("Agent run failed for chat %s", safe_log(chat_id))
+            if result is not None:
+                with contextlib.suppress(chats.ChatNotFoundError):
+                    stored = await _finish_run(run, result)
+            frames.end_answer(
+                complete=stored is not None
+                and result is not None
+                and result.status in _COMPLETE_ANSWERS
+            )
+        if result is None:
+            frames.send("error", _INTERNAL_ERROR_PAYLOAD)
+        elif stored is None:
+            frames.send("error", _CHAT_GONE_PAYLOAD)
+        else:
+            _report_stored(frames, stored)
+            await _send_title(frames, run, result, stored)
+    except Exception as exc:
+        # A failed store (other than a trashed chat) or title read: the JSON route's 500.
+        logger.error("Streamed run failed for chat %s: %s", safe_log(chat_id), type(exc).__name__)
+        frames.send("error", _INTERNAL_ERROR_PAYLOAD)
+    finally:
+        frames.end()
+
+
+def _start_stream(
+    held: contextlib.AsyncExitStack,
+    run: _HeldRun,
+    start: Callable[..., Awaitable[AgentResult]],
+) -> EventStreamResponse:
+    """Hand a held run to a detached task and answer with its event stream (GH-8).
+
+    Called under the chat's hold (``held``). The run's stop signal is
+    registered there (``ChatRuntime.stoppable``, read at request time), so
+    ``POST /api/chats/{id}/stop`` reaches it, and the task takes the hold and
+    the registration over (``_streamed_run``). The client leaving sets the
+    same signal (``EventStreamResponse``).
+    """
+    stop = held.enter_context(_chat_runtime.stoppable(run.chat.id))
+    frames = _RunFrames(run.chat.id)
+    stream = RunStream(on_delta=frames.on_delta, on_tool_call=frames.on_tool_call, stop=stop)
+    event_stream.detach(_streamed_run(held.pop_all(), run, start, stream, frames), stop=stop)
+    return EventStreamResponse(frames.relay(), stop=stop)
+
+
 async def _chat_turn(
     principal: Principal,
     message: str,
     chat_ref: UUID | str,
     background_tasks: BackgroundTasks,
-) -> ChatResponse:
+    *,
+    streamed: bool = False,
+) -> ChatResponse | EventStreamResponse:
     """Run one user message in a chat and store the turn (the two turn routes).
 
     The caller spent the ``/api/message`` bucket. Expired confirmations are
@@ -3868,49 +4233,51 @@ async def _chat_turn(
     (``chats.get_or_create_legacy_chat``, GH-266): a 429 ``rate_limit`` or a
     503 ``chats_busy`` writes nothing. When a concurrent first message of
     the same session created the chat meanwhile, the turn runs in that chat,
-    under that chat's lock too, so the session keeps one chat.
+    under that chat's hold too, so the session keeps one chat.
 
-    Under the chat's lock the chat is read again (a chat trashed meanwhile is
-    the 404), a pending confirmation of the chat is cancelled (a message
-    instead of a confirmation), the latest ``max_context_messages`` messages
-    are loaded, a dangling ``tool_use`` gets its synthetic cancelled result,
-    and the agent runs with ``str(chat.id)`` as its session id and the chat's
-    sticky ``external_content`` flag (GH-243) as read under the lock, so a
-    turn queued behind one that stored wrapped content is escalated by it.
-    Then the turn is stored (``_finish_run``: a confirmation it asks for is
-    kept within the caller's stored ``max_pending_confirmations``, else
-    refused with ``rate_limit``, GH-24).
+    GH-8: the chat is taken with ``hold(wait=False)``: while a run of the chat
+    is going (a message, an approved confirmation, a denial being stored) the
+    message is refused at once (``ChatRunActiveError``, the 409
+    ``run_active``), with nothing run or stored and the chat's pending
+    confirmation untouched. Under the hold the chat is read again (a chat
+    trashed meanwhile is the 404), a pending confirmation of the chat is
+    cancelled (a message instead of a confirmation), the latest
+    ``max_context_messages`` messages are loaded, a dangling ``tool_use`` gets
+    its synthetic cancelled result, and the agent runs with ``str(chat.id)``
+    as its session id and the chat's sticky ``external_content`` flag
+    (GH-243) as read under the hold. Then the turn is stored
+    (``_finish_run``: a confirmation it asks for is kept within the caller's
+    stored ``max_pending_confirmations``, else refused with ``rate_limit``,
+    GH-24).
 
-    Once it is stored, the chat's first exchange (the chat as read under the
-    lock is untitled with ``title_source`` "auto", and the loaded history
-    holds no ``assistant`` message; a GH-66 notice is a user message) gets
-    its title after the response is sent (GH-179,
-    ``chat_titles.title_chat``): the model's from the message and the reply,
-    or the fallback from the message. A turn stored as ``error`` (a
-    confirmation refused with ``rate_limit`` included) makes no model call,
-    nor does a run whose new ``tool`` results hold wrapped external content
-    (``_read_external_content``): the reply may quote an email or a file,
-    which must not choose the title. The task gets the agent's client when it
-    runs (``_running_llm_client``), the org's data residency and the stored
-    ``llm.max_retries``, and holds no chat lock: a later turn's history holds
-    the reply, so it schedules no second task. A chat trashed during the run
-    schedules nothing.
+    A JSON turn runs here and its chat's first exchange (the chat as read
+    under the hold is untitled with ``title_source`` "auto", and the loaded
+    history holds no ``assistant`` message; a GH-66 notice is a user message)
+    is titled after the response is sent (``_title_call``, a background
+    task). A streamed turn (GH-8) runs in a detached task that stores it,
+    frees the chat, reports it and titles a first exchange before ``done``
+    (``_start_stream``). A chat trashed during the run titles nothing.
 
     Args:
         principal: The logged-in principal (``chat.send`` checked).
         message: The validated user message.
         chat_ref: The chat's id, or a legacy session id (the caller's chat of
             it, created by its first run, until #177).
-        background_tasks: The request's background tasks (the title task).
+        background_tasks: The request's background tasks (a JSON turn's title).
+        streamed: Answer with the run's event stream (the chat route with
+            ``Accept: text/event-stream``) instead of the JSON ChatResponse.
 
     Returns:
-        The turn's ChatResponse (``session_id`` echoes a legacy session id).
+        The turn's ChatResponse (``session_id`` echoes a legacy session id),
+        or the streamed turn's EventStreamResponse.
 
     Raises:
         HTTPException: 422 over the stored message length; 500 when the agent
-            fails (nothing stored).
+            of a JSON turn fails (nothing stored).
         chats.ChatNotFoundError: The chat isn't the caller's, or was trashed
-            during the run (404 ``chat_not_found``, nothing stored).
+            during a JSON turn's run (404 ``chat_not_found``, nothing stored).
+        ChatRunActiveError: A run of the chat is going (409 ``run_active``,
+            GH-8; no run, nothing stored).
         ChatRuntimeUserLimitError: The chat has no runtime entry and the
             caller's entries are all in use or hold a pending confirmation
             (429 ``rate_limit``, GH-24; no run, nothing stored, no chat
@@ -3940,9 +4307,9 @@ async def _chat_turn(
     prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
     session_id: str | None = None
-    # A legacy session id without a chat yet: its chat is created under the lock.
+    # A legacy session id without a chat yet: its chat is created under the hold.
     new_session: str | None = None
-    # Resolves the chat (the 404); its flag may be stale by the time the lock is free.
+    # Resolves the chat (the 404); its flag may be stale by the time the hold is taken.
     if isinstance(chat_ref, UUID):
         chat_id = (await chats.get_chat(pool, tenant, chat_ref)).id
     else:
@@ -3954,21 +4321,25 @@ async def _chat_turn(
             # rate_limit, 503 chats_busy) leaves no empty chat behind (GH-266).
             chat_id, new_session = uuid4(), chat_ref
 
-    # Runs of one chat are serialised, so each one loads what the previous stored.
+    # One run per chat at a time (GH-8): a busy chat refuses the message, so each run
+    # loads what the previous one stored.
     async with contextlib.AsyncExitStack() as held:
-        await held.enter_async_context(_chat_runtime.hold(chat_id, tenant.user_id))
+        await held.enter_async_context(_chat_runtime.hold(chat_id, tenant.user_id, wait=False))
         if new_session is not None:
             created = await chats.get_or_create_legacy_chat(
                 pool, tenant, new_session, chat_id=chat_id
             )
             if created.id != chat_id:
                 # A concurrent first message of the session created its chat meanwhile:
-                # run there under that chat's lock too. Only for another id: hold isn't
-                # reentrant, and the provisional entry stays an idle lock-only one.
+                # run there under that chat's hold too (busy: the 409). Only for another
+                # id: hold isn't reentrant, and the provisional entry stays an idle
+                # lock-only one.
                 chat_id = created.id
-                await held.enter_async_context(_chat_runtime.hold(chat_id, tenant.user_id))
-        # Read again under the lock: a run queued ahead may have set external_content
-        # (GH-243), and this run must be escalated by it (security audit M-1).
+                await held.enter_async_context(
+                    _chat_runtime.hold(chat_id, tenant.user_id, wait=False)
+                )
+        # Read again under the hold: an approval that ran in front may have set
+        # external_content (GH-243), and this run must be escalated by it (audit M-1).
         chat = await chats.get_chat(pool, tenant, chat_id)
         if _chat_runtime.pop_pending(chat.id) is not None:
             logger.info(
@@ -3979,69 +4350,68 @@ async def _chat_turn(
             pool, tenant, chat.id, limit=platform.limits.max_context_messages
         )
         logger.info("Processing message for chat %s", safe_log(chat.id))
+        # Only an untitled chat's first exchange is titled: a stored reply means it had
+        # one (a GH-66 notice is a user message and doesn't count).
+        first_exchange = (
+            chat.title_source == "auto"
+            and chat.title == ""
+            and not any(stored.role == "assistant" for stored in loaded)
+        )
+        run = _HeldRun(
+            pool=pool,
+            tenant=tenant,
+            chat=chat,
+            loaded=loaded,
+            platform=platform,
+            policy=policy,
+            title_message=message if first_exchange else None,
+        )
+        start = functools.partial(
+            _agent.run,
+            user_message=message,
+            session_id=str(chat.id),
+            history=_close_dangling_tool_use(loaded),
+            principal=principal,
+            tool_policy=policy,
+            agent_config=_run_config(platform),
+            prompt_context=prompt_context,
+            earlier_external_content=chat.external_content,
+        )
+        if streamed:
+            return _start_stream(held, run, start)
         try:
-            result = await _agent.run(
-                user_message=message,
-                session_id=str(chat.id),
-                history=_close_dangling_tool_use(loaded),
-                principal=principal,
-                tool_policy=policy,
-                agent_config=_run_config(platform),
-                prompt_context=prompt_context,
-                earlier_external_content=chat.external_content,
-            )
+            result = await start()
         except (MemoryError, RecursionError):
             raise
         except Exception:
             logger.error("Agent run failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
-        response = await _finish_run(
-            pool,
-            tenant,
-            chat,
-            loaded,
-            result,
-            session_id,
-            max_pending=platform.limits.max_pending_confirmations,
-        )
-    # Only an untitled chat's first exchange: a stored reply means it had one (a GH-66
-    # notice is a user message and doesn't count). The task runs after the response.
-    if (
-        chat.title_source == "auto"
-        and chat.title == ""
-        and not any(stored.role == "assistant" for stored in loaded)
-    ):
-        background_tasks.add_task(
-            chat_titles.title_chat,
-            pool,
-            tenant,
-            chat.id,
-            get_client=_running_llm_client,
-            user_message=message,
-            assistant_message=result.response,
-            # The stored status: a confirmation refused by the pending limit (GH-24)
-            # stored an error turn, which gets the fallback like any other.
-            run_failed=response.status == "error",
-            external_content=_read_external_content(loaded, result),
-            data_residency=policy.data_residency,
-            max_retries=platform.llm.max_retries,
-        )
-    return response
+        stored = await _finish_run(run, result)
+    # Runs after the response, without the chat's hold.
+    title = _title_call(run, result, stored)
+    if title is not None:
+        background_tasks.add_task(title)
+    return _chat_response(chat.id, session_id, result, stored)
 
 
 async def post_chat_message(
+    request: Request,
     principal: _ChatSenderDep,
     chat_id: UUID,
     body: ChatMessageCreate,
     background_tasks: BackgroundTasks,
-) -> ChatResponse:
+) -> ChatResponse | EventStreamResponse:
     """Handle POST /api/chats/{chat_id}/messages — run a turn in a chat of the caller.
 
     Spends the per-user ``/api/message`` bucket (shared with the legacy
-    route), then runs and stores the turn (``_chat_turn``). The chat's first
-    exchange titles an untitled chat after the response is sent (GH-179).
+    route), then runs and stores the turn (``_chat_turn``). GH-8: with an
+    ``Accept`` header listing ``text/event-stream`` (q above 0) the answer is
+    the run's event stream; every refusal before the run is the same JSON
+    error either way. A JSON turn's first exchange titles an untitled chat
+    after the response is sent (GH-179); a streamed one before ``done``.
 
     Args:
+        request: The incoming request (its ``Accept`` header).
         principal: The logged-in principal (needs ``chat.send``).
         chat_id: The chat (a UUID; anything else is a 422).
         body: Validated ChatMessageCreate (the message).
@@ -4052,24 +4422,32 @@ async def post_chat_message(
         reply, the tool call summary, the pending confirmation and the error
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
-        ``max_pending_confirmations`` in other chats; None otherwise.
+        ``max_pending_confirmations`` in other chats; None otherwise. Or the
+        streamed run's EventStreamResponse.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
-            length, 500 when the agent fails. A chat the caller can't reach is
-            the 404 ``chat_not_found``; the caller at their chat-runtime
-            bound the 429 ``rate_limit`` (GH-24); a full chat runtime with
-            nothing to evict the 503 ``chats_busy``.
+            length, 500 when a JSON turn's agent fails. A chat the caller
+            can't reach is the 404 ``chat_not_found``; a chat whose run is
+            going the 409 ``run_active`` (GH-8); the caller at their
+            chat-runtime bound the 429 ``rate_limit`` (GH-24); a full chat
+            runtime with nothing to evict the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
-    return await _chat_turn(principal, body.message, chat_id, background_tasks)
+    return await _chat_turn(
+        principal,
+        body.message,
+        chat_id,
+        background_tasks,
+        streamed=_wants_event_stream(request),
+    )
 
 
 async def post_message(
     body: ChatRequest,
     principal: _ChatSenderDep,
     background_tasks: BackgroundTasks,
-) -> ChatResponse:
+) -> ChatResponse | EventStreamResponse:
     """Handle POST /api/message — legacy: a turn in the caller's chat of a session id.
 
     The session id names the caller's own persisted chat
@@ -4078,7 +4456,8 @@ async def post_message(
     chat of the caller's own. The turn then runs like
     POST /api/chats/{chat_id}/messages (``_chat_turn``), on the same per-user
     ``/api/message`` bucket, and titles the chat after its first exchange
-    the same way (GH-179). Until #177.
+    the same way (GH-179). Always JSON, whatever the ``Accept`` header
+    (GH-8). Until #177.
 
     Args:
         body: Validated ChatRequest with message and session_id.
@@ -4094,86 +4473,51 @@ async def post_message(
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
-            length, 500 when the agent fails. The caller at their
-            chat-runtime bound is the 429 ``rate_limit`` (GH-24); a full chat
-            runtime with nothing to evict the 503 ``chats_busy``.
+            length, 500 when the agent fails. A chat whose run is going is
+            the 409 ``run_active`` (GH-8); the caller at their chat-runtime
+            bound the 429 ``rate_limit`` (GH-24); a full chat runtime with
+            nothing to evict the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
     return await _chat_turn(principal, body.message, body.session_id, background_tasks)
 
 
-async def get_events(
-    principal: _ChatSenderDep,
-    session_id: str = Query(
-        min_length=1,
-        max_length=64,
-        pattern=r"^[a-zA-Z0-9_-]+$",
-        description="Session identifier. Alphanumeric, hyphens, underscores only.",
-    ),
-) -> StreamingResponse:
-    """Handle GET /api/events — legacy SSE stub for one of the caller's chats.
+async def post_chat_stop(principal: _ChatSenderDep, chat_id: UUID) -> ChatStopResponse:
+    """Handle POST /api/chats/{chat_id}/stop — stop a chat's streamed run (GH-8).
 
-    For v1, this is a stub that returns session status. ``_stream_agent_result``
-    is implemented and tested but not yet wired into this endpoint — it will
-    be connected in v2 when full SSE streaming is completed. The chat "has
-    history" when the caller's chat of the session id exists and holds a
-    message; the stream only looks it up, never creates it.
+    Spends the per-user ``/api/chats/stop`` bucket, then reads the chat with
+    the caller's tenant (the owner check) and sets its streamed run's stop
+    signal (``ChatRuntime.request_stop``: never creates a runtime entry, never
+    waits). The run then ends as the agent's stop allows (a running tool call
+    finishes and is recorded) and is stored ``stopped``; its stream reports
+    it. No request body is read; no audit event (sending isn't one either).
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
-        session_id: Session identifier from query parameter (Pydantic-validated).
+        chat_id: The chat (a UUID; anything else is a 422).
 
     Returns:
-        StreamingResponse with text/event-stream content type.
-    """
-    if _agent is None:
-        raise HTTPException(status_code=500, detail="Server not configured")
+        ``{"stopped": true}`` when a streamed run of the chat was stopped;
+        ``{"stopped": false}`` when the chat has none (nothing running, or a
+        JSON request's run, which can't be stopped).
 
-    _check_rate_limit("/api/events", _user_caller(principal))
+    Raises:
+        HTTPException: 429 when rate-limited. Another org's, a colleague's,
+            a trashed and an unknown chat are the 404 ``chat_not_found``.
+    """
+    _check_rate_limit("/api/chats/stop", _user_caller(principal))
 
     from admino.database import get_pool
 
-    pool = get_pool()
-    tenant = TenantContext.from_principal(principal)
-    try:
-        chat = await chats.find_legacy_chat(pool, tenant, session_id)
-        has_history = await chats.count_messages(pool, tenant, chat.id) > 0
-    except chats.ChatNotFoundError:
-        has_history = False
-    if not has_history:
-        # No messages in session yet — stream an empty done.
-        async def _empty_stream() -> AsyncIterator[str]:
-            yield _make_sse_event("done", {})
-
-        return StreamingResponse(
-            _empty_stream(),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
-
-    # For v1, find the last user message and re-run if needed.
-    # The SSE endpoint primarily streams results of previous POST /api/message calls.
-    # Build a result from current session state.
-    async def _session_stream() -> AsyncIterator[str]:
-        yield _make_sse_event("status", {"status": "connected"})
-        yield _make_sse_event("done", {})
-
-    return StreamingResponse(
-        _session_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    chat = await chats.get_chat(get_pool(), TenantContext.from_principal(principal), chat_id)
+    stopped = _chat_runtime.request_stop(chat.id)
+    if stopped:
+        logger.info("Stop requested for chat %s", safe_log(chat.id))
+    return ChatStopResponse(stopped=stopped)
 
 
 async def post_confirm(
+    request: Request,
     principal: _ChatSenderDep,
     confirmation_id: str = Path(
         min_length=1,
@@ -4182,40 +4526,47 @@ async def post_confirm(
         description="Confirmation identifier. Alphanumeric, hyphens, underscores only.",
     ),
     body: ConfirmRequest = ...,  # type: ignore[assignment]
-) -> ChatResponse:
+) -> ChatResponse | EventStreamResponse:
     """Handle POST /api/confirm/{confirmation_id} — approve or deny a pending action.
 
     The body names the chat by ``chat_id`` or by the legacy ``session_id``
     (looked up, never created); a chat the caller can't reach, or one
     without a pending confirmation in ``_chat_runtime``, is the same 404.
     A confirm never creates a runtime entry: a chat without one is that 404
-    before its lock is taken, so nothing is evicted, run or stored (GH-24).
-    Expired confirmations are reaped first. Under the chat's lock the
-    confirmation id and the expiry are checked (``_utc_now``) and the
-    confirmation is consumed: one that expired meanwhile (while the request
-    waited for the lock) is popped and answers the same 404 as one already
-    reaped, with nothing run or stored (GH-24). A denial stores the closing ``tool``
-    results (the denied call's "Tool call denied by the user.", any other
-    dangling call's cancelled result) and the assistant's denial, so the
-    history stays well-formed. An approval resumes the agent on the latest
-    ``max_context_messages`` stored messages (the dangling ``tool_use`` left
-    as it is: the resume dispatches it), with the caller's principal, the
-    chat's ``external_content`` flag (read again under the lock, so a turn
-    that ran in front of the approval counts), the stored platform limits
-    and LLM retry limit (read on every request, GH-160, GH-242) and their org's tool
-    policy as it is now (loaded again, after completing the org's due
-    promotions; GH-161), then stores the run like a turn (a confirmation it
-    asks for counts against the caller's stored ``max_pending_confirmations``
-    in their other chats, the consumed one not included; GH-24). An approved resume
-    also loads the caller's prompt context again (GH-170), so a change made
-    while the confirmation was pending applies; a failing load is the
-    generic 500 with nothing resumed, echoed or logged. Under the org's data
-    residency a resumed run whose LLM provider has meanwhile become
-    non-Swiss ends with ``residency_blocked`` before the approved tool is
-    dispatched (the agent's guard). Another user's pending confirmation is
-    never found (404).
+    before its hold is taken, so nothing is evicted, run or stored (GH-24).
+    Expired confirmations are reaped first. A confirmation waits for a run of
+    its chat that is going (``hold()``: that run may store the confirmation
+    being approved). Under the chat's hold the confirmation id and the expiry
+    are checked (``_utc_now``) and the confirmation is consumed: one that
+    expired meanwhile (while the request waited for the hold) is popped and
+    answers the same 404 as one already reaped, with nothing run or stored
+    (GH-24). A denial stores the closing ``tool`` results (the denied call's
+    "Tool call denied by the user.", any other dangling call's cancelled
+    result) and the assistant's denial, so the history stays well-formed. An
+    approval resumes the agent on the latest ``max_context_messages`` stored
+    messages (the dangling ``tool_use`` left as it is: the resume dispatches
+    it), with the caller's principal, the chat's ``external_content`` flag
+    (read again under the hold, so a turn that ran in front of the approval
+    counts), the stored platform limits and LLM retry limit (read on every
+    request, GH-160, GH-242) and their org's tool policy as it is now (loaded
+    again, after completing the org's due promotions; GH-161), then stores the
+    run like a turn (a confirmation it asks for counts against the caller's
+    stored ``max_pending_confirmations`` in their other chats, the consumed
+    one not included; GH-24). An approved resume also loads the caller's
+    prompt context again (GH-170), so a change made while the confirmation
+    was pending applies; a failing load is the generic 500 with nothing
+    resumed, echoed or logged. Under the org's data residency a resumed run
+    whose LLM provider has meanwhile become non-Swiss ends with
+    ``residency_blocked`` before the approved tool is dispatched (the agent's
+    guard). Another user's pending confirmation is never found (404).
+
+    GH-8: with an ``Accept`` header listing ``text/event-stream`` an approval
+    streams the resumed run like a turn (no title), and a denial streams
+    ``run_started``, the denial as a ``delta``, ``message_saved`` and ``done``
+    once it is stored and the chat is free; every refusal is the JSON error.
 
     Args:
+        request: The incoming request (its ``Accept`` header).
         principal: The logged-in principal (needs ``chat.send``).
         confirmation_id: The confirmation ID from the URL path (Pydantic-validated).
         body: Validated ConfirmRequest with ``chat_id`` or ``session_id``, the
@@ -4225,13 +4576,13 @@ async def post_confirm(
         ChatResponse naming the chat (``session_id`` echoed when given) with
         the result of the resumed agent run (its LLM error code, or
         ``rate_limit`` when the confirmation it asked for was refused; None
-        for a denial).
+        for a denial); or the streamed EventStreamResponse.
 
     Raises:
         HTTPException: 404 if no confirmation is pending for the chat, it has
             expired or the id doesn't match, 400 if the IDs mismatch, 500
-            when the agent fails. A chat trashed meanwhile is the 404
-            ``chat_not_found``.
+            when a JSON approval's agent fails. A chat trashed meanwhile is
+            the 404 ``chat_not_found``.
     """
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -4260,13 +4611,15 @@ async def post_confirm(
     # one: otherwise a stale confirm could hit the per-user 429 or, at capacity, evict
     # the caller's own pending confirmation elsewhere (GH-24, audit L-1). Only "no
     # entry" answers here: an approval queued behind a running turn of the chat must
-    # still wait for the lock (the turn may store the confirmation it approves). No
+    # still wait for the hold (the turn may store the confirmation it approves). No
     # await before hold(), so the entry checked is the one hold() finds.
     if chat.id not in _chat_runtime:
         raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
 
-    # Per-chat lock serialises with concurrent turns of the chat.
-    async with _chat_runtime.hold(chat.id, tenant.user_id):
+    streamed = _wants_event_stream(request)
+    # The chat's hold serialises with its runs; a streamed approval's task takes it over.
+    async with contextlib.AsyncExitStack() as held:
+        await held.enter_async_context(_chat_runtime.hold(chat.id, tenant.user_id))
         pending = _chat_runtime.get_pending(chat.id)
 
         if pending is None:
@@ -4279,7 +4632,7 @@ async def post_confirm(
         if body.confirmation_id != confirmation_id:
             raise HTTPException(status_code=400, detail="Confirmation ID mismatch")
 
-        # It may have expired while this request waited for the lock (after its reap
+        # It may have expired while this request waited for the hold (after its reap
         # kept it): the same 404 as one already reaped, nothing run or stored (GH-24).
         if _utc_now() >= pending.expires_at:
             _chat_runtime.pop_pending(chat.id)
@@ -4297,7 +4650,7 @@ async def post_confirm(
             # pattern=r"^[a-z][a-z0-9_]{0,62}$", restricting to alphanumeric/
             # underscore. ChatResponse.sanitize_response provides defence-in-depth.
             denial = f"Action {pending.tool_call.tool}.{pending.tool_call.action} was denied."
-            await chats.append_messages(
+            message_id = await chats.append_messages(
                 pool,
                 tenant,
                 chat.id,
@@ -4306,6 +4659,22 @@ async def post_confirm(
                     LLMMessage(role="assistant", content=denial),
                 ],
             )
+            if streamed:
+                # Sent once the handler returned: the chat is free by then.
+                frames = _RunFrames(chat.id)
+                frames.text(display_pieces(denial))
+                _report_stored(
+                    frames,
+                    _StoredRun(
+                        status="final",
+                        response=denial,
+                        error_code=None,
+                        pending=None,
+                        message_id=message_id,
+                    ),
+                )
+                frames.end()
+                return EventStreamResponse(frames.relay(), stop=None)
             return ChatResponse(
                 chat_id=chat.id,
                 session_id=body.session_id,
@@ -4316,7 +4685,7 @@ async def post_confirm(
             )
 
         # Approved — resume the agent with the pending confirmation, the chat's
-        # external_content flag as read under the lock (a turn queued ahead may have
+        # external_content flag as read under the hold (a turn that ran ahead may have
         # set it; security audit M-1) and the prompt context as it is now (GH-170: a
         # change made while the confirmation was pending applies to the resumed run).
         chat = await chats.get_chat(pool, tenant, chat.id)
@@ -4324,33 +4693,32 @@ async def post_confirm(
 
         logger.info("Resuming agent for chat %s after a confirmation", safe_log(chat.id))
 
+        run = _HeldRun(
+            pool=pool, tenant=tenant, chat=chat, loaded=loaded, platform=platform, policy=policy
+        )
+        start = functools.partial(
+            _agent.run,
+            user_message="",
+            session_id=str(chat.id),
+            history=loaded,
+            principal=principal,
+            tool_policy=policy,
+            pending_confirmation=pending,
+            agent_config=_run_config(platform),
+            prompt_context=prompt_context,
+            earlier_external_content=chat.external_content,
+        )
+        if streamed:
+            return _start_stream(held, run, start)
         try:
-            result = await _agent.run(
-                user_message="",
-                session_id=str(chat.id),
-                history=loaded,
-                principal=principal,
-                tool_policy=policy,
-                pending_confirmation=pending,
-                agent_config=_run_config(platform),
-                prompt_context=prompt_context,
-                earlier_external_content=chat.external_content,
-            )
+            result = await start()
         except (MemoryError, RecursionError):
             raise
         except Exception:
             logger.error("Agent resume failed for chat %s", safe_log(chat.id))
             raise HTTPException(status_code=500, detail="Internal error") from None
-
-        return await _finish_run(
-            pool,
-            tenant,
-            chat,
-            loaded,
-            result,
-            body.session_id,
-            max_pending=platform.limits.max_pending_confirmations,
-        )
+        stored = await _finish_run(run, result)
+    return _chat_response(chat.id, body.session_id, result, stored)
 
 
 # ---------------------------------------------------------------------------
@@ -5594,6 +5962,15 @@ async def _user_chats_busy_handler(request: Request, exc: Exception) -> JSONResp
     return JSONResponse(status_code=429, content=_USER_CHATS_BUSY_BODY)
 
 
+async def _run_active_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``ChatRunActiveError``: the 409 ``run_active`` (GH-8).
+
+    A message to a chat whose run is going; refused before any run, with
+    nothing stored, streamed or not.
+    """
+    return JSONResponse(status_code=409, content=_RUN_ACTIVE_BODY)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -5604,8 +5981,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
     expired-session purge, the organization purge, the expired login-throttle
     purge, the expired-confirmation reaper and, when SMTP is configured, the
-    email outbox sender on startup; stop the background tasks, then close the
-    pool, on shutdown.
+    email outbox sender on startup; on shutdown, stop the detached streamed
+    runs and wait for them (at most ``_DRAIN_TIMEOUT_S``, GH-8), then stop the
+    background tasks, then close the pool.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -5675,6 +6053,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # every chat run loads its own org's tool policy.
 
     yield
+    # GH-8: a detached streamed run outlives its request (uvicorn waits only for
+    # those), so the shutdown asks each one to stop and waits for it (bounded)
+    # before anything it needs goes: a run whose client left may be inside a tool
+    # call whose tool.call audit row and turn are still to be written.
+    unfinished = await event_stream.drain(_DRAIN_TIMEOUT_S)
+    if unfinished:
+        logger.warning("Shutdown: %d streamed chat runs still running", unfinished)
     confirmation_reaper_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await confirmation_reaper_task
@@ -5787,6 +6172,8 @@ def create_app(
     app.add_exception_handler(ChatRuntimeFullError, _chats_busy_handler)
     # GH-24: the caller's per-user chat-runtime bound.
     app.add_exception_handler(ChatRuntimeUserLimitError, _user_chats_busy_handler)
+    # GH-8: one run per chat at a time.
+    app.add_exception_handler(ChatRunActiveError, _run_active_handler)
 
     # --- Routes ---
     # Public: health check, login, password reset, the invitation link routes
@@ -5893,10 +6280,18 @@ def create_app(
     app.get("/api/chats/{chat_id}", response_model=ChatDetailResponse)(get_chat_detail)
     app.patch("/api/chats/{chat_id}", response_model=ChatSummary)(patch_chat)
     app.delete("/api/chats/{chat_id}", status_code=204, response_model=None)(delete_chat)
-    app.post("/api/chats/{chat_id}/messages", response_model=ChatResponse)(post_chat_message)
+    app.post(
+        "/api/chats/{chat_id}/messages",
+        response_model=ChatResponse,
+        responses=_EVENT_STREAM_RESPONSES,
+    )(post_chat_message)
+    app.post("/api/chats/{chat_id}/stop", response_model=ChatStopResponse)(post_chat_stop)
     app.post("/api/message", response_model=ChatResponse)(post_message)
-    app.get("/api/events")(get_events)
-    app.post("/api/confirm/{confirmation_id}", response_model=ChatResponse)(post_confirm)
+    app.post(
+        "/api/confirm/{confirmation_id}",
+        response_model=ChatResponse,
+        responses=_EVENT_STREAM_RESPONSES,
+    )(post_confirm)
     app.get("/api/me/settings", response_model=UserSettingsResponse)(get_my_settings)
     app.patch("/api/me/settings", response_model=UserSettingsResponse)(patch_my_settings)
     app.post("/api/me/settings/reset", response_model=UserSettingsResponse)(reset_my_settings)

@@ -98,7 +98,7 @@ What these tests pin down (contract §2; GH-266 contract §2):
   (with or without a bad cursor) and an invalid cursor run S2 only; the
   status read selects only ``status`` (no statement but the page selects
   ``content``).
-- ``count_messages``, ``append_org_notice`` (one user/complete message, the
+- ``append_org_notice`` (one user/complete message, the
   text verbatim, in every live chat of the org, of every member; none in
   another org's or a trashed chat; ``last_activity_at`` unchanged; returns the
   count) and ``count_org_chats`` (the org's live chats).
@@ -195,7 +195,6 @@ _CHAT_ID_FUNCTIONS: Final = (
     "append_messages",
     "load_recent_history",
     "read_chat_detail",
-    "count_messages",
 )
 _ALL_FUNCTIONS: Final = (
     *_CHAT_ID_FUNCTIONS,
@@ -218,7 +217,6 @@ _SIGNATURES: Final[dict[str, tuple[int, set[str]]]] = {
     "append_messages": (4, {"final_status", "tool_calls"}),
     "load_recent_history": (3, {"limit"}),
     "read_chat_detail": (3, {"limit", "cursor"}),
-    "count_messages": (3, set()),
     "append_org_notice": (3, set()),
     "count_org_chats": (2, set()),
 }
@@ -411,10 +409,8 @@ async def _call_with_chat(
         )
     if name == "load_recent_history":
         return await chats.load_recent_history(pool, tenant, chat_id, limit=10)
-    if name == "read_chat_detail":
-        return await chats.read_chat_detail(pool, tenant, chat_id, limit=10, cursor=None)
-    assert name == "count_messages"
-    return await chats.count_messages(pool, tenant, chat_id)
+    assert name == "read_chat_detail"
+    return await chats.read_chat_detail(pool, tenant, chat_id, limit=10, cursor=None)
 
 
 def _as_uuid(value: Any) -> uuid.UUID | None:
@@ -1728,7 +1724,7 @@ class TestTrashChat:
 
         page = await chats.list_chats(db.pool, alice.tenant, limit=50, cursor=None)
         assert [plain(record.id) for record in page.chats] == [kept]
-        for name in ("get_chat", "read_chat_detail", "load_recent_history", "count_messages"):
+        for name in ("get_chat", "read_chat_detail", "load_recent_history"):
             with pytest.raises(chats.ChatNotFoundError):
                 await _call_with_chat(chats, db, name, alice.tenant, chat_id)
 
@@ -2598,29 +2594,12 @@ class TestChatDetail:
 
 
 # ---------------------------------------------------------------------------
-# 11. count_messages and the latest message status
+# 11. The message count and the latest message status
 # ---------------------------------------------------------------------------
 
 
 class TestCounts:
     """Per-chat counts and the latest status (by seq, through read_chat_detail)."""
-
-    async def test_chats_count_messages_counts_only_this_chat(
-        self, chats: ModuleType, db: FakeDb
-    ) -> None:
-        alice = _member(db)
-        chat_id, other, empty = (db.add_chat(alice.user_id) for _ in range(3))
-        for index in range(4):
-            db.add_chat_message(chat_id, "user", f"m{index}")
-        db.add_chat_message(other, "user", "elsewhere")
-
-        counts = [
-            await chats.count_messages(db.pool, alice.tenant, target)
-            for target in (chat_id, other, empty)
-        ]
-
-        assert counts == [4, 1, 0]
-        assert all(type(count) is int for count in counts)
 
     async def test_chats_latest_status_is_the_highest_seq(
         self, chats: ModuleType, db: FakeDb
@@ -3140,7 +3119,6 @@ class TestLogs:
         await chats.list_chats(pool, tenant, limit=10, cursor=None)
         await chats.load_recent_history(pool, tenant, chat.id, limit=10)
         await chats.read_chat_detail(pool, tenant, chat.id, limit=1, cursor=None)
-        await chats.count_messages(pool, tenant, chat.id)
         await chats.append_org_notice(pool, tenant, _MARK_NOTICE)
         await chats.get_or_create_legacy_chat(pool, tenant, _MARK_SESSION, chat_id=uuid.uuid4())
         await chats.find_legacy_chat(pool, tenant, _MARK_SESSION)

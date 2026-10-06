@@ -18,7 +18,8 @@ transactional writes (``trash_chat``, ``append_messages`` and
 ``LLMMessage``s and ``ToolCallRecord``s; page sizes and opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
 ``MessagePage``, its message count and latest message status),
-``LLMMessage`` lists, counts and whether an automatic title was stored.
+``LLMMessage`` lists, counts, whether an automatic title was stored and the
+id of a turn's last appended message.
 Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
 ``system`` message to store), ``audit_events.AuditRecordError`` and the
 driver's errors.
@@ -210,6 +211,7 @@ _INSERT_MESSAGE_SQL: Final = """
     INSERT INTO chat_messages
         (chat_id, org_id, role, content, tool_use_blocks, tool_call_id, tool_calls, status)
     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
+    RETURNING id
 """
 # S9: a chat's latest messages (newest first) ...
 _LATEST_MESSAGES_SQL: Final = """
@@ -677,7 +679,7 @@ async def append_messages(
     *,
     final_status: MessageStatus = "complete",
     tool_calls: Sequence[ToolCallRecord] | None = None,
-) -> None:
+) -> UUID | None:
     """Append a run's new messages to the caller's chat, in one transaction.
 
     Every message is stored ``complete`` without tool calls except the last,
@@ -698,13 +700,17 @@ async def append_messages(
         final_status: The stored status of the run's last message.
         tool_calls: The run's tool-call summaries, stored on the last message.
 
+    Returns:
+        The id of the last appended message (GH-8: a streamed turn's
+        ``message_saved`` names it); None for an empty sequence.
+
     Raises:
         ValueError: If a ``system`` message is passed; nothing is written.
         ChatNotFoundError: Unless the chat is the caller's and not trashed;
             nothing is written.
     """
     if not messages:
-        return
+        return None
     if any(message.role == "system" for message in messages):
         msg = "System messages are never stored."
         raise ValueError(msg)
@@ -733,8 +739,9 @@ async def append_messages(
         )
         if touched is None:
             raise ChatNotFoundError
+        message_id: UUID | None = None
         for role, content, blocks, call_id, stored_calls, status in rows:
-            await conn.execute(
+            message_id = await conn.fetchval(
                 _INSERT_MESSAGE_SQL,
                 chat_id,
                 tenant.org_id,
@@ -745,6 +752,7 @@ async def append_messages(
                 stored_calls,
                 status,
             )
+    return message_id
 
 
 async def load_recent_history(
@@ -830,16 +838,6 @@ async def read_chat_detail(
         message_count=message_count,
         latest_status=latest_status,
     )
-
-
-async def count_messages(executor: Executor, tenant: TenantContext, chat_id: UUID) -> int:
-    """Return how many messages the caller's chat holds.
-
-    Raises:
-        ChatNotFoundError: Unless the chat is the caller's and not trashed.
-    """
-    await get_chat(executor, tenant, chat_id)
-    return int(await executor.fetchval(_COUNT_MESSAGES_SQL, chat_id, tenant.org_id))
 
 
 async def append_org_notice(pool: asyncpg.Pool, tenant: TenantContext, content: str) -> int:

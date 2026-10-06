@@ -20,20 +20,44 @@ shared catalogue in ``llm.py``: a timeout is ``timeout``, a connection error
 ``provider_unavailable`` (both with the response's Retry-After), a 413 or a
 400 "prompt is too long" ``context_too_long``; other statuses stay internal
 (code None, ``user_facing=False``, "Claude API returned HTTP <n>"). The SDK
-never retries (``max_retries=0``): retries belong to ``admino.llm_policy``.
+never retries (``max_retries=0``): one ``chat()`` or ``chat_stream()`` is one
+request; retries belong to ``admino.llm_policy``.
 
 Output cap: ``chat()``'s keyword-only ``max_tokens`` (GH-179) lowers the
 request's ``max_tokens`` to ``min(max_tokens, config.max_response_tokens)``;
 None keeps the configured cap, an invalid value is a ``ValueError`` before any
 request.
 
+Streaming (GH-8): ``chat_stream()`` sends ``chat()``'s request body plus
+``stream: true`` (configured cap) and yields the sanitized text of each
+``text_delta`` (every other delta or event type is ignored) as an
+``LLMStreamDelta``, then exactly one final ``LLMResponse``: content = the joined
+deltas (capped at 65536 characters, the stream is still read to its end),
+model from ``message_start`` (else the configured one), ``done`` unless the stop
+reason is ``tool_use``. A ``tool_use`` block's ``input_json_delta`` fragments
+are accumulated per block index (at most 128 blocks, 65536 characters each; no
+fragment means ``{}``) and validated by ``_parse_anthropic_tool_calls`` once the
+stream ended; tool calls are never streamed as deltas. Errors: setup errors on
+the first iteration (no request), ``chat()``'s status mapping when opening the
+stream, a mid-stream ``event: error`` (which the SDK raises as a status error
+carrying the stream's 200) or transport failure ``provider_unavailable``, a
+mid-stream timeout ``timeout``.
+
+Inputs: conversation messages, tool definitions, ANTHROPIC_API_KEY and the
+configured model and caps. Outputs: ``LLMResponse`` / ``LLMStreamDelta`` items
+or a catalogue ``LLMError``.
+
 Security notes:
 - API key is read from ANTHROPIC_API_KEY env var, never from config files.
-- No credentials are logged. LLM output is sanitized by the shared llm.py utilities.
-- Error messages are fixed strings: never the SDK message or a response body
-  (the message only classifies a context-length failure).
+- No credentials are logged. LLM output is sanitized by the shared llm.py utilities
+  (control characters and lone surrogates stripped).
+- Error messages are fixed strings: never the SDK message, a response body or
+  an error event's text (the message only classifies a context-length
+  failure); SDK errors are raised ``from None``. Stream text and tool arguments
+  are never logged (a dropped tool call is logged by its name through
+  ``safe_log``).
 - No end-user identifier is sent: the request body holds model, messages,
-  max_tokens, system and tools only (never ``metadata``).
+  max_tokens, system, tools and (streaming) ``stream`` only (never ``metadata``).
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -42,13 +66,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
+import httpx
 from pydantic import ValidationError
 
 from admino.llm import (
+    _MAX_STREAM_TOOL_CALLS,
+    _MAX_TOOL_ARGUMENT_CHARS,
+    CappedAnswer,
     LLMError,
     LLMResponse,
+    LLMStreamDelta,
     check_args_depth,
     missing_model_error,
     not_configured_error,
@@ -63,6 +93,10 @@ from admino.logs import safe_log
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from anthropic.types import RawMessageStreamEvent
+
     from admino.config import LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -291,6 +325,113 @@ def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:
     return parsed
 
 
+@dataclass
+class _StreamedToolUse:
+    """One tool_use block rebuilt from stream events (shape read by the Anthropic parser)."""
+
+    id: str
+    name: str
+    partial_json: str = ""
+    input: object = None
+    type: str = "tool_use"
+
+
+class _StreamedMessage:
+    """One Anthropic message rebuilt from its stream events.
+
+    Keeps the capped answer text, the tool_use blocks keyed by block index (at
+    most ``_MAX_STREAM_TOOL_CALLS``, each one's JSON fragments up to
+    ``_MAX_TOOL_ARGUMENT_CHARS``), the model and the stop reason. Events are
+    dispatched on their ``type``: the SDK builds them without validation, so
+    an unknown delta type may arrive as a ``TextDelta``-shaped object.
+    """
+
+    def __init__(self) -> None:
+        self._text = CappedAnswer()
+        self._calls: dict[int, _StreamedToolUse] = {}
+        self._model = ""
+        self._stop_reason: str | None = None
+
+    def apply(self, event: RawMessageStreamEvent) -> str:
+        """Apply one stream event; return the newly visible answer text (maybe "")."""
+        if event.type == "message_start":
+            self._model = event.message.model or self._model
+        elif event.type == "message_delta":
+            self._stop_reason = event.delta.stop_reason or self._stop_reason
+        elif event.type == "content_block_start":
+            block = event.content_block
+            if (
+                block.type == "tool_use"
+                and event.index not in self._calls
+                and len(self._calls) < _MAX_STREAM_TOOL_CALLS
+            ):
+                self._calls[event.index] = _StreamedToolUse(id=block.id, name=block.name)
+        elif event.type == "content_block_delta":
+            delta = event.delta
+            if delta.type == "text_delta":
+                return self._text.feed(strip_control_chars(delta.text))
+            call = self._calls.get(event.index)
+            if (
+                delta.type == "input_json_delta"
+                and call is not None
+                and len(call.partial_json) < _MAX_TOOL_ARGUMENT_CHARS
+            ):
+                call.partial_json += delta.partial_json
+        return ""
+
+    def response(self, configured_model: str) -> LLMResponse:
+        """Return the final response (the model falls back to ``configured_model``)."""
+        return LLMResponse(
+            content=self._text.answer,
+            tool_calls=self._tool_calls(),
+            model=strip_control_chars(self._model or configured_model)[:200],
+            done=self._stop_reason != "tool_use",
+        )
+
+    def _tool_calls(self) -> list[ToolCall]:
+        """Decode each block's JSON and validate it like ``chat()``, in index order.
+
+        A block without fragments has ``{}`` arguments; malformed JSON drops the
+        block (logged by its name only, never its arguments).
+        """
+        blocks: list[_StreamedToolUse] = []
+        for index in sorted(self._calls):
+            call = self._calls[index]
+            try:
+                call.input = json.loads(call.partial_json) if call.partial_json else {}
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Skipping tool call '%s': malformed JSON arguments", safe_log(call.name)
+                )
+                continue
+            blocks.append(call)
+        return _parse_anthropic_tool_calls(blocks)
+
+
+def _api_error(exc: Exception) -> LLMError:
+    """Map an SDK failure when sending a request, or a transport failure, to the catalogue.
+
+    A status maps through ``sdk_status_error`` (Anthropic's error bodies carry a
+    type but no code: the message alone classifies a context-length 400 and
+    never reaches the LLMError; 529 "overloaded" is a plain 5xx). Without a
+    status: ``timeout`` for a timeout, else ``provider_unavailable``.
+    """
+    import anthropic
+
+    if isinstance(exc, anthropic.APIStatusError):
+        return sdk_status_error(
+            _LABEL,
+            exc.status_code,
+            headers=exc.response.headers,
+            error_code=None,
+            sdk_message=exc.message,
+            key_env=_API_KEY_ENV,
+        )
+    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream.
+    timed_out = isinstance(exc, anthropic.APITimeoutError | httpx.TimeoutException)
+    return provider_status_error(_LABEL, None, key_env=_API_KEY_ENV, timed_out=timed_out)
+
+
 class AnthropicClient:
     """Async client for Anthropic's Messages API.
 
@@ -366,56 +507,16 @@ class AnthropicClient:
             msg = "Streaming not yet supported for Anthropic provider"
             raise ValueError(msg)
         cap = output_token_cap(self._max_tokens, max_tokens)
-        if not self._api_key_configured:
-            raise not_configured_error(_LABEL, _API_KEY_ENV)
-        if not self._model:
-            raise missing_model_error(_LABEL)
+        kwargs = self._request(messages, tools, cap)
 
         import anthropic
 
-        system_prompt, api_messages = _convert_messages_to_anthropic(messages)
-
-        # Ensure we have at least one message
-        if not api_messages:
-            api_messages = [{"role": "user", "content": "Hello"}]
-
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "messages": api_messages,
-            "max_tokens": cap,
-        }
-        if system_prompt:
-            kwargs["system"] = system_prompt
-        if tools:
-            try:
-                validate_tools_payload(tools)
-            except ValueError as exc:
-                raise LLMError(message=str(exc), status_code=None) from None
-            kwargs["tools"] = _convert_tools_to_anthropic(tools)
-
         try:
             response = await self._client.messages.create(**kwargs)
-        except anthropic.APITimeoutError:
-            # Checked first: a subclass of APIConnectionError. Raised ``from None``
-            # so the SDK exception (and any response body) never travels with it.
-            raise provider_status_error(
-                _LABEL, None, key_env=_API_KEY_ENV, timed_out=True
-            ) from None
-        except anthropic.APIConnectionError:
-            raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
-        except anthropic.APIStatusError as exc:
-            # Mapping goes by status code, so 529 "overloaded" (a plain
-            # APIStatusError) is treated like any other 5xx. Anthropic's error
-            # bodies carry a type but no code: exc.message alone classifies a
-            # context-length 400 and never reaches the LLMError.
-            raise sdk_status_error(
-                _LABEL,
-                exc.status_code,
-                headers=exc.response.headers,
-                error_code=None,
-                sdk_message=exc.message,
-                key_env=_API_KEY_ENV,
-            ) from None
+        except (anthropic.APIConnectionError, anthropic.APIStatusError) as exc:
+            # Raised ``from None`` so the SDK exception (and any response body)
+            # never travels with the LLMError.
+            raise _api_error(exc) from None
 
         # Extract text content
         text_parts: list[str] = []
@@ -436,6 +537,86 @@ class AnthropicClient:
             model=model_name,
             done=response.stop_reason != "tool_use",
         )
+
+    async def chat_stream(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
+        """Stream a reply from Claude: answer deltas, then exactly one final LLMResponse.
+
+        The request is ``chat()``'s body (configured output cap) plus ``stream:
+        true``. Only ``text_delta`` text is streamed (sanitized, stops at the
+        content cap); tool_use blocks come only in the final response.
+
+        Args:
+            messages: Conversation messages.
+            tools: Optional tool definitions (admino tool format).
+
+        Yields:
+            ``LLMStreamDelta`` pieces, then the final ``LLMResponse``.
+
+        Raises:
+            LLMError: ``chat()``'s setup errors on the first iteration (no
+                request), its status mapping when opening the stream (before any
+                delta); ``provider_unavailable`` for a mid-stream error event or
+                transport failure, ``timeout`` for a mid-stream timeout.
+        """
+        kwargs = self._request(messages, tools, self._max_tokens)
+
+        import anthropic
+
+        try:
+            stream = await self._client.messages.create(**kwargs, stream=True)
+        except (anthropic.APIConnectionError, anthropic.APIStatusError) as exc:
+            raise _api_error(exc) from None
+
+        message = _StreamedMessage()
+        async with stream:
+            try:
+                async for event in stream:
+                    piece = message.apply(event)
+                    if piece:
+                        yield LLMStreamDelta(content=piece)
+            except anthropic.APIStatusError:
+                # A mid-stream ``event: error``: the SDK raises it as a status error
+                # carrying the opened stream's 200, so it is not a status to map.
+                raise provider_status_error(_LABEL, None, key_env=_API_KEY_ENV) from None
+            except httpx.TransportError as exc:
+                raise _api_error(exc) from None
+        yield message.response(self._model)
+
+    def _request(
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]] | None, cap: int
+    ) -> dict[str, Any]:
+        """Check the setup and return the request body shared by chat() and chat_stream().
+
+        Raises:
+            LLMError: ``not_configured`` / ``missing_model`` for a missing key or
+                model; an internal error for a tools payload over its limits.
+        """
+        if not self._api_key_configured:
+            raise not_configured_error(_LABEL, _API_KEY_ENV)
+        if not self._model:
+            raise missing_model_error(_LABEL)
+        system_prompt, api_messages = _convert_messages_to_anthropic(messages)
+        # Ensure we have at least one message
+        if not api_messages:
+            api_messages = [{"role": "user", "content": "Hello"}]
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": api_messages,
+            "max_tokens": cap,
+        }
+        if system_prompt:
+            kwargs["system"] = system_prompt
+        if tools:
+            try:
+                validate_tools_payload(tools)
+            except ValueError as exc:
+                raise LLMError(message=str(exc), status_code=None) from None
+            kwargs["tools"] = _convert_tools_to_anthropic(tools)
+        return kwargs
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

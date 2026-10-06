@@ -18,7 +18,9 @@ chat of the caller's own (a Viewer's too: chats from before a demotion stay
 stored, so its 403 is the role's, not a missing chat's) with a live pending
 confirmation in ``server._chat_runtime``; the Super Admin, who can own no chat,
 is pointed at org A's Org Admin's. The legacy confirm acts on the caller's
-legacy chat (``chats.legacy_session_id``) and its pending confirmation.
+legacy chat (``chats.legacy_session_id``) and its pending confirmation. GH-8:
+the stop route acts on the caller's own idle chat (no run to stop: ``200
+{"stopped": false}``) and never touches the chat runtime.
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -456,9 +458,6 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
         ),
         200,
     ),
-    ("GET", "/api/events"): _Setup(
-        _plain("GET", "/api/events", params={"session_id": _CHAT_ID}), 200
-    ),
     ("POST", "/api/confirm/{confirmation_id}"): _Setup(_confirm, 200),
     # GH-176: persisted chats (a title on create: "user"; the turn runs the stub agent).
     ("POST", "/api/chats"): _Setup(
@@ -476,6 +475,8 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
         ),
         200,
     ),
+    # GH-8: stop the caller's own idle chat (no streamed run: 200 {"stopped": false}).
+    ("POST", "/api/chats/{chat_id}/stop"): _Setup(_own_chat("POST", "/stop"), 200),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _Setup(
         _plain("GET", "/api/oauth/google/authorize"), 200

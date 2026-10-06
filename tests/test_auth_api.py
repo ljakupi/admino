@@ -129,7 +129,6 @@ _PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset(
 _KNOWN_PROTECTED_ROUTES: frozenset[tuple[str, str]] = frozenset(
     {
         ("POST", "/api/message"),
-        ("GET", "/api/events"),
         ("POST", "/api/confirm/{confirmation_id}"),
         # GH-159: the settings scopes (the old /api/settings is gone).
         ("GET", "/api/me/settings"),
@@ -236,7 +235,7 @@ class _FakeDb:
       the shared tests/db_fakes.py database (``shared``), so several failures
       sharing an email or an IP are counted, delayed and locked as in production.
     - GH-176: so do the statements naming chats or chat_messages (the persisted
-      legacy chats of POST /api/message, POST /api/confirm and GET /api/events).
+      legacy chats of POST /api/message and POST /api/confirm).
       Every account added here is also stored, with the same id, in the shared
       database's users table (the chats' owner foreign key).
     """
@@ -1183,22 +1182,21 @@ class TestOpenSessionRevalidated:
 
 
 def _chat_request(client: TestClient, route: str, token: str) -> Any:
-    """Call one of the chat routes with a valid request."""
+    """Call one of the legacy chat routes with a valid request (GH-8: GET /api/events
+    is gone)."""
     if route == "message":
         return client.post("/api/message", json=_CHAT_BODY, headers=_cookie(token))
-    if route == "confirm":
-        return client.post(
-            "/api/confirm/c1",
-            json={"session_id": "chat-1", "confirmation_id": "c1", "approved": True},
-            headers=_cookie(token),
-        )
-    return client.get("/api/events", params={"session_id": "chat-1"}, headers=_cookie(token))
+    return client.post(
+        "/api/confirm/c1",
+        json={"session_id": "chat-1", "confirmation_id": "c1", "approved": True},
+        headers=_cookie(token),
+    )
 
 
 class TestChatRoleGate:
-    """POST /api/message, POST /api/confirm/{id} and GET /api/events need chat.send."""
+    """POST /api/message and POST /api/confirm/{id} need chat.send."""
 
-    @pytest.mark.parametrize("route", ["message", "confirm", "events"])
+    @pytest.mark.parametrize("route", ["message", "confirm"])
     @pytest.mark.parametrize(
         "who",
         [
@@ -1222,7 +1220,7 @@ class TestChatRoleGate:
         assert response.json() == _FORBIDDEN
         assert agent.run_calls == []
 
-    @pytest.mark.parametrize("route", ["message", "confirm", "events"])
+    @pytest.mark.parametrize("route", ["message", "confirm"])
     @pytest.mark.parametrize("role", ["org_admin", "editor"])
     def test_auth_api_chat_allowed_for_org_admin_and_editor(
         self, db: _FakeDb, route: str, role: str
@@ -1472,11 +1470,12 @@ class _Clock:
 
 
 # Existing per-route rates stay; #149 adds the three auth routes, #152 the three session
-# management routes.
+# management routes. GH-8: "/api/events" is gone with its route; stopping a chat's
+# streamed run has its own per-user bucket.
 _EXPECTED_RATES: dict[str, tuple[float, int]] = {
     "/api/message": (0.5, 5),
     "/api/confirm": (0.5, 5),
-    "/api/events": (0.17, 3),
+    "/api/chats/stop": (1.0, 10),
     # GH-161: the org's matrix, its critical permissions and the members' summary.
     "/api/org/permissions/get": (1.0, 5),
     "/api/org/permissions/patch": (0.2, 2),

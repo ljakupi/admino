@@ -35,7 +35,9 @@ of tests/ and is made of five files:
 GH-176 adds the six persisted chat routes (requests on a chat of the
 caller's own, seeded in the FakeDb; the Super Admin's name org A's Editor's)
 and backs the legacy confirm with a persisted legacy chat and a pending
-confirmation in ``server._chat_runtime``.
+confirmation in ``server._chat_runtime``. GH-8 removes ``GET /api/events`` and
+adds ``POST /api/chats/{chat_id}/stop`` (no body; a request on the caller's own
+idle chat).
 
 Adding a route (each later issue): give it a ``RouteSpec`` row in
 ``ROUTES`` (tests/tenancy_world.py), a well-formed request in ``_REQUESTS``
@@ -452,7 +454,6 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ("POST", "/api/message"): _plain(
         "POST", "/api/message", {"message": "Hello from the tenancy suite", "session_id": _CHAT_ID}
     ),
-    ("GET", "/api/events"): _plain("GET", "/api/events", params={"session_id": _CHAT_ID}),
     ("POST", "/api/confirm/{confirmation_id}"): _confirm,
     # GH-176: persisted chats ({} is a valid create body: no title, "auto").
     ("POST", "/api/chats"): _plain("POST", "/api/chats", {}),
@@ -463,6 +464,8 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ("POST", "/api/chats/{chat_id}/messages"): _own_chat(
         "POST", "/messages", {"message": "Hello from the tenancy suite"}, history=False
     ),
+    # GH-8: no request body; the caller's own idle chat answers 200 {"stopped": false}.
+    ("POST", "/api/chats/{chat_id}/stop"): _own_chat("POST", "/stop"),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _plain("GET", "/api/oauth/google/authorize"),
     ("GET", "/api/oauth/microsoft/authorize"): _plain("GET", "/api/oauth/microsoft/authorize"),

@@ -551,15 +551,15 @@ def _fresh_runtime(monkeypatch: pytest.MonkeyPatch) -> ChatRuntime:
 
 class _WatchedRuntime(ChatRuntime):
     """A ``ChatRuntime`` that records every ``hold()`` call when it is made (before the
-    caller waits for the chat's lock)."""
+    caller waits for the chat's lock; GH-8's ``wait`` keyword is passed through)."""
 
     def __init__(self) -> None:
         super().__init__(max_entries=64, idle_s=900.0)
         self.holds: list[uuid.UUID] = []
 
-    def hold(self, chat_id: uuid.UUID, owner_user_id: uuid.UUID) -> Any:
+    def hold(self, chat_id: uuid.UUID, owner_user_id: uuid.UUID, **kwargs: Any) -> Any:
         self.holds.append(chat_id)
-        return super().hold(chat_id, owner_user_id)
+        return super().hold(chat_id, owner_user_id, **kwargs)
 
 
 def _pending(

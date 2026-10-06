@@ -619,7 +619,6 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     ),
     # --- chat ---
     RouteSpec("POST", "/api/message", "member", Capability.CHAT_SEND, "own_user"),
-    RouteSpec("GET", "/api/events", "member", Capability.CHAT_SEND, "own_user"),
     RouteSpec("POST", "/api/confirm/{confirmation_id}", "member", Capability.CHAT_SEND, "path_id"),
     # GH-176: persisted chats, private to their owner (not even an Org Admin reads them).
     RouteSpec("POST", "/api/chats", "member", Capability.CHAT_SEND, "own_user"),
@@ -628,6 +627,8 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     RouteSpec("PATCH", "/api/chats/{chat_id}", "member", Capability.CHAT_SEND, "path_id"),
     RouteSpec("DELETE", "/api/chats/{chat_id}", "member", Capability.CHAT_SEND, "path_id"),
     RouteSpec("POST", "/api/chats/{chat_id}/messages", "member", Capability.CHAT_SEND, "path_id"),
+    # GH-8: stop the chat's streamed run.
+    RouteSpec("POST", "/api/chats/{chat_id}/stop", "member", Capability.CHAT_SEND, "path_id"),
     # --- own Google/Microsoft connections ---
     RouteSpec("GET", "/api/oauth/google/authorize", "member", Capability.OAUTH_CONNECT, "own_user"),
     RouteSpec(

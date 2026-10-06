@@ -12,12 +12,14 @@ Viewer, plus a Super Admin):
   A control shows the caller reaches its own org's resource, and org B still
   reaches its own.
 - The chat routes of GH-176 (GET/PATCH/DELETE /api/chats/{chat_id} and POST
-  /api/chats/{chat_id}/messages): org B's chat is ``404 {"detail": "Chat not
-  found", "reason": "chat_not_found"}`` like an unknown id; B's row, messages
-  and pending confirmation stay, no ``chat.delete`` row is written, the agent
-  never runs and B's title and content never appear. Chats are private to
-  their owner: a colleague's chat in the caller's own org (an Org Admin's, an
-  Editor's, a Viewer's) is the same 404, for an Org Admin too.
+  /api/chats/{chat_id}/messages) and GH-8's POST /api/chats/{chat_id}/stop:
+  org B's chat is ``404 {"detail": "Chat not found", "reason":
+  "chat_not_found"}`` like an unknown id; B's row, messages and pending
+  confirmation stay, no ``chat.delete`` row is written, the agent never runs
+  and B's title and content never appear. Chats are private to their owner: a
+  colleague's chat in the caller's own org (an Org Admin's, an Editor's, a
+  Viewer's) is the same 404, for an Org Admin too. The stop route answers
+  ``200 {"stopped": false}`` on the caller's own idle chat (the control).
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
   promotions, the permission summary, invitations, the user list and its
@@ -232,18 +234,6 @@ def _seed_pending(
     chat_id = seed_chat(world.db, account, legacy_session_id=session_id)
     seed_pending_confirmation(account, chat_id, confirmation_id)
     return chat_id
-
-
-def _seed_chat(world: World, account: Account, session_id: str, marker: str) -> uuid.UUID:
-    """The account's legacy chat of ``session_id`` (persisted, GH-176), holding a question
-    and an answer that carry ``marker``; the chat's id."""
-    return seed_chat(
-        world.db,
-        account,
-        title=f"{marker} title",
-        messages=(("user", f"{marker} question"), ("assistant", f"{marker} answer")),
-        legacy_session_id=session_id,
-    )
 
 
 def _confirm(
@@ -544,6 +534,11 @@ def _send_chat_message(client: TestClient, caller: Account, ident: str) -> httpx
     )
 
 
+def _stop_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-8: POST /api/chats/{chat_id}/stop, no body (an idle chat answers stopped false)."""
+    return client.post(f"/api/chats/{ident}/stop", headers=caller.cookie)
+
+
 def _chat_case(
     own_status: int, send: Callable[[TestClient, Account, str], httpx.Response]
 ) -> _PathIdCase:
@@ -696,18 +691,21 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
     ("PATCH", "/api/chats/{chat_id}"): _chat_case(200, _rename_chat),
     ("DELETE", "/api/chats/{chat_id}"): _chat_case(204, _trash_chat),
     ("POST", "/api/chats/{chat_id}/messages"): _chat_case(200, _send_chat_message),
+    # GH-8: stopping the chat's streamed run (none here: own chat answers 200 stopped false).
+    ("POST", "/api/chats/{chat_id}/stop"): _chat_case(200, _stop_chat),
 }
 
 _PATH_ID_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]} {route[1]}") for route in _PATH_ID_CASES
 ]
 
-# The chat routes of GH-176 that name a chat in the path.
+# The chat routes of GH-176 (and GH-8's stop route) that name a chat in the path.
 _CHAT_ROUTES: Final[tuple[Route, ...]] = (
     ("GET", "/api/chats/{chat_id}"),
     ("PATCH", "/api/chats/{chat_id}"),
     ("DELETE", "/api/chats/{chat_id}"),
     ("POST", "/api/chats/{chat_id}/messages"),
+    ("POST", "/api/chats/{chat_id}/stop"),
 )
 # Space-free ids, so the RED record (gates.sh cuts node ids at a space) names each case.
 _CHAT_ROUTE_PARAMS: Final = [
@@ -2003,33 +2001,6 @@ class TestOwnUserChatRoutes:
         pending = server._chat_runtime.get_pending(victim_chat)
         assert pending is not None
         assert pending.confirmation_id == "conf-b-163"
-
-    @covers(("GET", "/api/events"))
-    def test_cross_org_events_with_the_other_orgs_chat_id_streams_only_done(
-        self, world: World, client: TestClient
-    ) -> None:
-        """A's stream of B's legacy session id is the empty chat's stream (no "connected"
-        status) and creates no chat for A; B's own stream is live (control)."""
-        _seed_chat(world, world.b["editor"], _SHARED_CHAT, "B-secret-163")
-        caller = world.a["editor"]
-
-        a_stream = client.get(
-            "/api/events", params={"session_id": _SHARED_CHAT}, headers=caller.cookie
-        )
-        empty = client.get(
-            "/api/events", params={"session_id": "never-used-163"}, headers=caller.cookie
-        )
-        b_stream = client.get(
-            "/api/events", params={"session_id": _SHARED_CHAT}, headers=world.b["editor"].cookie
-        )
-
-        assert a_stream.status_code == 200, a_stream.text
-        assert a_stream.text == empty.text
-        assert "event: done" in a_stream.text
-        assert "connected" not in a_stream.text
-        assert "B-secret-163" not in a_stream.text
-        assert world.db.chats_of(caller.user_id) == []
-        assert "connected" in b_stream.text  # control: B's own chat is live
 
 
 # ---------------------------------------------------------------------------

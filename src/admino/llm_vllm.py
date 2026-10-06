@@ -13,17 +13,25 @@ Inputs/outputs:
   ``max_tokens`` (GH-179) lowers the request's ``max_tokens`` to
   ``min(max_tokens, config.max_response_tokens)``; None keeps the configured cap,
   an invalid value is a ``ValueError`` before any request.
+- ``VLLMClient.chat_stream()`` (GH-8) sends ``chat()``'s request body plus
+  ``stream: true`` (configured cap) and yields sanitized ``LLMStreamDelta``
+  pieces, then exactly one final ``LLMResponse`` (content = the joined deltas,
+  capped at 65536 characters; tool calls only in the final response). It reads
+  the stream with the shared OpenAI-compatible reader in ``llm_openai.py``.
+  ``<think>`` blocks are not filtered (as in ``chat()``).
 - ``VLLMClient.close()`` releases the underlying HTTP client.
 
 Errors (provider label "vLLM", GH-242 codes): a missing/empty ``vllm_model``
 does not fail construction; ``chat()`` raises the "No vLLM model is set …"
-error (``missing_model``) instead. Connection failures (``provider_unavailable``)
-and timeouts (``timeout``) carry a "starting or unavailable" message pointing to
-``make start-local``; 404, 429, 5xx and a 400/413 whose input exceeds the
-context map to the shared catalogue in ``llm.py`` (429/5xx with the response's
-Retry-After). vLLM has no key, so every other status (including 401/403) stays
-internal (code None, ``user_facing=False``, "vLLM API returned HTTP <n>"). The
-SDK never retries (``max_retries=0``): retries belong to ``admino.llm_policy``.
+error (``missing_model``) instead (``chat_stream()`` on its first iteration,
+before any request). Connection failures (``provider_unavailable``) and
+timeouts (``timeout``), also mid-stream, carry a "starting or unavailable"
+message pointing to ``make start-local``; 404, 429, 5xx and a 400/413 whose
+input exceeds the context map to the shared catalogue in ``llm.py`` (429/5xx
+with the response's Retry-After). vLLM has no key, so every other status
+(including 401/403) stays internal (code None, ``user_facing=False``, "vLLM API
+returned HTTP <n>"). The SDK never retries (``max_retries=0``): one ``chat()``
+or ``chat_stream()`` is one request; retries belong to ``admino.llm_policy``.
 
 Security notes:
 - Local-only: requests go to ``config.vllm_base_url`` (a local endpoint). No
@@ -35,15 +43,22 @@ Security notes:
 - No end-user or account identifier is sent: no ``user``/``metadata``-style
   body key, and the SDK's env-derived OpenAI organization and project headers
   (OPENAI_ORG_ID / OPENAI_PROJECT_ID) are cleared.
-- LLM output is sanitized by the shared llm.py utilities.
+- LLM output is sanitized by the shared llm.py utilities (control characters
+  and lone surrogates stripped). Streamed tool calls share the OpenAI reader's
+  bounds (128 calls, 256-char names, 65536-char arguments; a call crossing a
+  bound is dropped).
 - Does not import from agent.py, server.py, or tools/.
 """
 
 from __future__ import annotations
 
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, Final
 
+import httpx
+
 from admino.llm import (
+    CappedAnswer,
     LLMError,
     LLMResponse,
     missing_model_error,
@@ -54,16 +69,21 @@ from admino.llm import (
     validate_tools_payload,
 )
 
-# Reuse the OpenAI conversion/parse helpers verbatim — the served endpoint is
-# OpenAI-compatible, so the request/response translation is identical.
+# Reuse the OpenAI conversion/parse helpers and stream reader verbatim — the
+# served endpoint is OpenAI-compatible, so the request/response translation is
+# identical.
 from admino.llm_openai import (
     _convert_messages_to_openai,
     _convert_tools_to_openai,
     _parse_openai_tool_calls,
+    _stream_reply,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from admino.config import LLMConfig
+    from admino.llm import LLMStreamDelta
     from admino.models import LLMMessage
 
 # Provider label shown in user-facing errors.
@@ -81,6 +101,33 @@ _VLLM_UNAVAILABLE_MESSAGE = (
     "The local vLLM model is starting or unavailable. "
     "Check that the vLLM server is running (make start-local)."
 )
+
+
+def _api_error(exc: Exception) -> LLMError:
+    """Map an SDK or transport failure (opening or mid-stream) to the catalogue.
+
+    A status maps through ``sdk_status_error`` without a key (401/403 stay
+    internal); the endpoint's code and message only classify a context-length
+    400. Anything without a status (connection or transport failure, timeout,
+    an error event inside an opened stream) is the "starting or unavailable"
+    message: ``timeout`` for a timeout, else ``provider_unavailable``.
+    """
+    import openai
+
+    if isinstance(exc, openai.APIStatusError):
+        return sdk_status_error(
+            _LABEL,
+            exc.status_code,
+            headers=exc.response.headers,
+            error_code=exc.code,
+            sdk_message=exc.message,
+        )
+    # APITimeoutError is the SDK's wrapper; a raw httpx timeout arrives mid-stream.
+    timed_out = isinstance(exc, openai.APITimeoutError | httpx.TimeoutException)
+    return LLMError(
+        message=_VLLM_UNAVAILABLE_MESSAGE,
+        code="timeout" if timed_out else "provider_unavailable",
+    )
 
 
 class VLLMClient:
@@ -163,47 +210,16 @@ class VLLMClient:
             msg = "Streaming not yet supported for vLLM provider"
             raise ValueError(msg)
         cap = output_token_cap(self._max_tokens, max_tokens)
-        if not self._model:
-            raise missing_model_error(_LABEL)
+        kwargs = self._request(messages, tools, cap)
 
         import openai
 
-        api_messages = _convert_messages_to_openai(messages)
-
-        kwargs: dict[str, Any] = {
-            "model": self._model,
-            "messages": api_messages,
-            "max_tokens": cap,
-        }
-        if tools:
-            try:
-                validate_tools_payload(tools)
-            except ValueError as exc:
-                raise LLMError(message=str(exc), status_code=None) from None
-            kwargs["tools"] = _convert_tools_to_openai(tools)
-
         try:
             response = await self._client.chat.completions.create(**kwargs)
-        except openai.APIConnectionError as exc:
-            # Includes APITimeoutError (a subclass). The local server may still be
-            # loading the model, or be down: a friendly message, raised
+        except (openai.APIConnectionError, openai.APIStatusError) as exc:
+            # The local server may still be loading the model, or be down: raised
             # ``from None`` so the SDK cause/body never travels with the error.
-            timed_out = isinstance(exc, openai.APITimeoutError)
-            raise LLMError(
-                message=_VLLM_UNAVAILABLE_MESSAGE,
-                code="timeout" if timed_out else "provider_unavailable",
-            ) from None
-        except openai.APIStatusError as exc:
-            # exc.code / exc.message are the endpoint's text: they only classify a
-            # context-length 400 and never reach the LLMError. No key_env: vLLM
-            # has no key, so 401/403 stay internal.
-            raise sdk_status_error(
-                _LABEL,
-                exc.status_code,
-                headers=exc.response.headers,
-                error_code=exc.code,
-                sdk_message=exc.message,
-            ) from None
+            raise _api_error(exc) from None
 
         # Extract the first choice
         if not response.choices:
@@ -225,6 +241,70 @@ class VLLMClient:
             model=model_name,
             done=choice.finish_reason != "tool_calls",
         )
+
+    async def chat_stream(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
+        """Stream a reply from vLLM: answer deltas, then exactly one final LLMResponse.
+
+        The request is ``chat()``'s body (configured output cap) plus ``stream:
+        true``. Deltas are sanitized and stop at the content cap; tool calls
+        come only in the final response.
+
+        Args:
+            messages: Conversation messages.
+            tools: Optional tool definitions (admino tool format).
+
+        Yields:
+            ``LLMStreamDelta`` pieces, then the final ``LLMResponse``.
+
+        Raises:
+            LLMError: ``missing_model`` on the first iteration (no request), the
+                ``chat()`` status mapping when opening the stream (before any
+                delta), the "starting or unavailable" ``timeout`` /
+                ``provider_unavailable`` error also mid-stream.
+        """
+        kwargs = self._request(messages, tools, self._max_tokens)
+
+        import openai
+
+        try:
+            stream = await self._client.chat.completions.create(**kwargs, stream=True)
+        except (openai.APIConnectionError, openai.APIStatusError) as exc:
+            raise _api_error(exc) from None
+        reply = _stream_reply(
+            stream, CappedAnswer(), configured_model=self._model, stream_error=_api_error
+        )
+        # aclosing: closing this generator early closes the HTTP stream at once.
+        async with aclosing(reply) as items:
+            async for item in items:
+                yield item
+
+    def _request(
+        self, messages: list[LLMMessage], tools: list[dict[str, Any]] | None, cap: int
+    ) -> dict[str, Any]:
+        """Check the setup and return the request body shared by chat() and chat_stream().
+
+        Raises:
+            LLMError: ``missing_model`` without a model; an internal error for a
+                tools payload over its limits.
+        """
+        if not self._model:
+            raise missing_model_error(_LABEL)
+        kwargs: dict[str, Any] = {
+            "model": self._model,
+            "messages": _convert_messages_to_openai(messages),
+            "max_tokens": cap,
+        }
+        if tools:
+            try:
+                validate_tools_payload(tools)
+            except ValueError as exc:
+                raise LLMError(message=str(exc), status_code=None) from None
+            kwargs["tools"] = _convert_tools_to_openai(tools)
+        return kwargs
 
     async def close(self) -> None:
         """Close the underlying HTTP client."""

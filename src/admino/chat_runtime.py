@@ -4,20 +4,26 @@ Chats and their messages live in PostgreSQL (``admino.chats``, GH-176). What
 must not be stored there lives here, one entry per chat:
 
 - the chat's ``asyncio.Lock``, so two runs of one chat never overlap (the
-  second waits) while different chats run concurrently;
+  second waits, or with ``hold(..., wait=False)`` is refused at once with
+  ``ChatRunActiveError``, GH-8) while different chats run concurrently;
 - the chat's owner, so ``forget_user`` finds a deleted user's state;
 - the chat's pending confirmation (at most one; ``set_pending`` replaces it).
   Memory only: after a restart (``clear``) or an eviction it is gone, and the
   server shows the chat's ``awaiting_confirmation`` message as expired;
 - the last-used time (the injected monotonic clock) and the in-use count (the
-  callers inside or waiting in ``hold``).
+  callers inside or waiting in ``hold``);
+- the stop signal of the chat's streamed run (GH-8): ``stoppable`` registers a
+  fresh ``asyncio.Event`` for the run's duration and ``request_stop`` sets it
+  (``POST /api/chats/{id}/stop``, a client disconnect). It never creates an
+  entry and never waits.
 
 Inputs: chat and user ids (server-generated UUIDs), ``PendingConfirmation``
 models, the current time for ``reap_expired``.
-Outputs: ``hold()`` context managers, stored confirmations, counts, and
-whether a chat has an entry (``chat_id in runtime``, which never creates one).
-Errors: ``ChatRuntimeFullError``, ``ChatRuntimeUserLimitError`` and
-``PendingConfirmationLimitError`` (see below).
+Outputs: ``hold()`` and ``stoppable()`` context managers, stored
+confirmations, counts, whether a stop reached a run, and whether a chat has an
+entry (``chat_id in runtime``, which never creates one).
+Errors: ``ChatRuntimeFullError``, ``ChatRuntimeUserLimitError``,
+``PendingConfirmationLimitError`` and ``ChatRunActiveError`` (see below).
 
 Bound: at most ``max_entries`` entries, and (when ``max_entries_per_user``
 is set) at most that many per owner, so one user can't push everyone else's
@@ -74,7 +80,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Iterator
     from datetime import datetime
     from uuid import UUID
 
@@ -95,6 +101,10 @@ class PendingConfirmationLimitError(RuntimeError):
     """The owner already holds the allowed number of pending confirmations in other chats."""
 
 
+class ChatRunActiveError(RuntimeError):
+    """The chat is busy: a caller is inside or waiting in ``hold()``."""
+
+
 @dataclass(slots=True)
 class _Entry:
     """One chat's runtime state."""
@@ -106,6 +116,8 @@ class _Entry:
     # Callers inside hold() plus those waiting for its lock: while positive the
     # entry is never evicted, so a queued caller keeps the lock it waits on.
     in_use: int = 0
+    # The stop signal of the streamed run inside hold(), while it is registered.
+    stop: asyncio.Event | None = None
 
 
 class ChatRuntime:
@@ -150,14 +162,26 @@ class ChatRuntime:
         return chat_id in self._entries
 
     @contextlib.asynccontextmanager
-    async def hold(self, chat_id: UUID, owner_user_id: UUID) -> AsyncIterator[None]:
+    async def hold(
+        self, chat_id: UUID, owner_user_id: UUID, *, wait: bool = True
+    ) -> AsyncIterator[None]:
         """Serialise the callers of one chat: enter once the chat's earlier callers left.
 
         Creates the chat's entry when it has none (see the module's bound).
         The lock is released and the entry stops being in use however the
         body exits, an exception included.
 
+        Args:
+            chat_id: The chat.
+            owner_user_id: The chat's owner.
+            wait: False refuses a busy chat instead of queueing behind it
+                (GH-8). Busy is the in-use count, not the lock: a caller woken
+                but not yet running holds the chat too. With nobody in use the
+                lock is free, so the caller never waits.
+
         Raises:
+            ChatRunActiveError: ``wait`` is False and a caller is inside or
+                waiting in ``hold`` for this chat; nothing changes.
             ChatRuntimeUserLimitError: The chat has no entry and none of the
                 owner's entries can make room under the per-user bound.
             ChatRuntimeFullError: The chat has no entry and none can be evicted
@@ -166,6 +190,8 @@ class ChatRuntime:
         entry = self._entries.get(chat_id)
         if entry is None:
             entry = self._create(chat_id, owner_user_id)
+        elif not wait and entry.in_use:
+            raise ChatRunActiveError
         entry.in_use += 1
         try:
             async with entry.lock:
@@ -174,6 +200,42 @@ class ChatRuntime:
         finally:
             entry.in_use -= 1
             self._touch(chat_id, entry)
+
+    @contextlib.contextmanager
+    def stoppable(self, chat_id: UUID) -> Iterator[asyncio.Event]:
+        """Register a fresh stop signal for the chat's run for the duration of the block.
+
+        Used inside ``hold`` (the entry exists). The registration goes on exit,
+        however the block exits, so a later ``request_stop`` never reaches a
+        finished run's event.
+
+        Raises:
+            KeyError: The chat has no entry (nothing is registered).
+        """
+        entry = self._entries.get(chat_id)
+        if entry is None:
+            msg = "The chat has no runtime entry."
+            raise KeyError(msg)
+        event = asyncio.Event()
+        entry.stop = event
+        try:
+            yield event
+        finally:
+            if entry.stop is event:
+                entry.stop = None
+
+    def request_stop(self, chat_id: UUID) -> bool:
+        """Set the chat's registered stop signal; whether one was registered.
+
+        Never creates an entry and never waits: False when the chat has no
+        entry or no registered run (nothing running, or a run that can't be
+        stopped).
+        """
+        entry = self._entries.get(chat_id)
+        if entry is None or entry.stop is None:
+            return False
+        entry.stop.set()
+        return True
 
     def set_pending(
         self,

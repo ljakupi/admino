@@ -40,8 +40,8 @@ What is pinned:
   messages; deny persists the denial tool result(s) and the assistant reply;
   exactly one of ``chat_id`` / ``session_id``; another user's or org's chat and
   a wrong confirmation id are 404 with nothing changed.
-- Legacy POST /api/message, POST /api/confirm and GET /api/events are backed by
-  a persisted chat per (user, ``legacy_session_id``).
+- Legacy POST /api/message and POST /api/confirm are backed by a persisted chat
+  per (user, ``legacy_session_id``) (GH-8 removed GET /api/events).
 - The chat route and the legacy route share one per-user ``/api/message``
   bucket; a full ``ChatRuntime`` answers 503 ``chats_busy``; logs name neither
   message content nor legacy session ids.
@@ -49,15 +49,19 @@ What is pinned:
   the LLM is fed; the ``tool.call`` audit row targets the chat's real UUID;
   GH-243's sticky ``external_content`` flag escalates a side-effecting allow
   action after a restart even when the wrapped message is outside the tail.
-- Queued turns (security audit M-1): the flag a run gets is the chat's flag as
-  read under the chat's lock, after the turn ahead of it stored its messages.
-  Turn B, sent while turn A (which reads an email: a wrapped tool result) still
-  holds the lock, runs with ``earlier_external_content=True`` on the chat
-  route, the legacy route and the approve path of POST /api/confirm; with the
-  real agent, B's allowed side effect (memory.store) waits for confirmation
-  although B's loaded tail holds no wrapped content. Both requests run in the
-  test's event loop (``httpx.ASGITransport``); a ``ChatRuntime`` subclass
-  records each ``hold()`` call, so B is known to be queued before A goes on.
+- A second request while the chat runs (security audit M-1, GH-8 decision 5):
+  turn A reads an email (a wrapped tool result, so the chat's
+  ``external_content`` becomes true) and is parked inside the chat's lock. A
+  turn B sent meanwhile, on the chat route or the legacy route, is never queued
+  any more: it answers ``409 {"detail": "A message is already running in this
+  chat.", "reason": "run_active"}`` at once, never runs (with the real agent: no
+  LLM call, no tool, no audit row for it) and stores nothing, while A's messages
+  and flag are stored. An approval B (the approve path of POST /api/confirm)
+  still waits for the running turn and then runs with
+  ``earlier_external_content=True``, the flag read under the lock. Both requests
+  run in the test's event loop (``httpx.ASGITransport``); a ``ChatRuntime``
+  subclass records each ``hold()`` call, so B is known to have reached the chat
+  (refused, or queued) before A goes on.
 - Lone surrogates (security audit L-2): a model-produced tool input holding
   one doesn't break the turn: 200, persisted with U+FFFD in its place.
 - Non-finite numbers (GH-266, re-audit L-4): a run whose tool_use input and
@@ -144,6 +148,11 @@ _CHATS_BUSY: Final = {
     "reason": "chats_busy",
 }
 _CSRF_REFUSED: Final = {"detail": "Cross-origin request refused"}
+# GH-8: a turn sent while the chat's run is going.
+_RUN_ACTIVE: Final = {
+    "detail": "A message is already running in this chat.",
+    "reason": "run_active",
+}
 _DENIED_RESULT: Final = "Tool call denied by the user."
 
 _CONFIRMATION_ID: Final = "confirm-176-kestrel"
@@ -154,8 +163,6 @@ _LONG_AGO: Final = datetime(2026, 1, 1, tzinfo=UTC)
 
 # A statement on either chat table (FakeDb's normalized SQL).
 _CHAT_SQL: Final = re.compile(r"\bchat(?:s|_messages)\b")
-# The event names of an SSE body.
-_SSE_EVENT: Final = re.compile(r"^event: (\S+)$", re.MULTILINE)
 
 _PENDING_CALL: Final = ToolCall(
     tool="memory", action="store", args={"key": "plan", "value": "ship"}, tool_call_id="call-p176"
@@ -498,11 +505,6 @@ def _app_log_text(caplog: pytest.LogCaptureFixture) -> str:
         for record in caplog.records
         if not record.name.startswith(("httpx", "httpcore"))
     )
-
-
-def _events(response: httpx.Response) -> list[str]:
-    """The SSE event names of a GET /api/events body."""
-    return _SSE_EVENT.findall(response.text)
 
 
 # ---------------------------------------------------------------------------
@@ -1176,44 +1178,6 @@ def test_chat_turns_legacy_confirm_finds_the_pending_confirmation_by_session_id(
     ]
 
 
-def test_chat_turns_legacy_events_report_history_from_the_persisted_chat(
-    world: World, client: TestClient
-) -> None:
-    """GET /api/events: a stored legacy chat with a message (nothing in memory) has
-    history (status, then done)."""
-    editor = world.a["editor"]
-    chat_id = world.db.add_chat(editor.user_id, legacy_session_id=_LEGACY_SESSION)
-    _seed(world.db, chat_id, _user("Earlier question"))
-
-    response = client.get(
-        "/api/events", headers=editor.cookie, params={"session_id": _LEGACY_SESSION}
-    )
-
-    assert response.status_code == 200, response.text
-    assert _events(response) == ["status", "done"]
-
-
-def test_chat_turns_legacy_events_without_own_history_send_done_only(
-    world: World, client: TestClient
-) -> None:
-    """An unknown session id and another user's session id: done only; the owner of the
-    stored chat gets status and done."""
-    editor, admin = world.a["editor"], world.a["org_admin"]
-    chat_id = world.db.add_chat(editor.user_id, legacy_session_id=_LEGACY_SESSION)
-    _seed(world.db, chat_id, _user("Earlier question"))
-
-    def events(account: Account, session_id: str) -> list[str]:
-        response = client.get(
-            "/api/events", headers=account.cookie, params={"session_id": session_id}
-        )
-        assert response.status_code == 200, response.text
-        return _events(response)
-
-    assert events(editor, "legacy-176-unknown") == ["done"]
-    assert events(admin, _LEGACY_SESSION) == ["done"]
-    assert events(editor, _LEGACY_SESSION) == ["status", "done"]
-
-
 # ---------------------------------------------------------------------------
 # 7. Rate bucket, runtime capacity, logs
 # ---------------------------------------------------------------------------
@@ -1541,7 +1505,7 @@ def test_chat_turns_chat_without_external_content_runs_an_allowed_side_effect(
 
 
 # ---------------------------------------------------------------------------
-# 9. A queued turn runs with the flag the turn ahead of it stored (audit M-1)
+# 9. A second turn while the chat runs is 409; an approval waits (audit M-1, GH-8)
 # ---------------------------------------------------------------------------
 
 _WAIT_S: Final = 5.0
@@ -1549,7 +1513,8 @@ _WAIT_S: Final = 5.0
 
 def _watched_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
     """Swap in a real ``ChatRuntime`` that records every ``hold()`` call (its chat id) when
-    it is made, i.e. before the caller waits for the chat's lock."""
+    it is made, i.e. before the caller waits for the chat's lock or is refused it (GH-8's
+    ``wait`` keyword is passed through)."""
     from admino.chat_runtime import ChatRuntime
 
     class _Watched(ChatRuntime):
@@ -1557,9 +1522,9 @@ def _watched_runtime(monkeypatch: pytest.MonkeyPatch) -> Any:
             super().__init__(max_entries=64, idle_s=900.0)
             self.holds: list[uuid.UUID] = []
 
-        def hold(self, chat_id: uuid.UUID, owner_user_id: uuid.UUID) -> Any:
+        def hold(self, chat_id: uuid.UUID, owner_user_id: uuid.UUID, **kwargs: Any) -> Any:
             self.holds.append(chat_id)
-            return super().hold(chat_id, owner_user_id)
+            return super().hold(chat_id, owner_user_id, **kwargs)
 
     runtime = _Watched()
     monkeypatch.setattr(server, "_chat_runtime", runtime)
@@ -1582,24 +1547,25 @@ async def _until(condition: Callable[[], bool]) -> None:
     await asyncio.wait_for(poll(), _WAIT_S)
 
 
-async def _queued_behind(
+async def _while_first_runs(
     app: FastAPI,
     runtime: Any,
     gate: tuple[asyncio.Event, asyncio.Event],
     ahead: Callable[[httpx.AsyncClient], Awaitable[httpx.Response]],
-    queued: Callable[[httpx.AsyncClient], Awaitable[httpx.Response]],
+    meanwhile: Callable[[httpx.AsyncClient], Awaitable[httpx.Response]],
 ) -> tuple[httpx.Response, httpx.Response]:
     """Send ``ahead``; once its run is parked inside the chat's lock (``gate``'s first
-    event set), send ``queued`` and wait until it has called ``hold()``; then release the
-    first run (``gate``'s second event). Returns both responses."""
+    event set), send ``meanwhile`` and wait until it has called ``hold()`` (a confirmation
+    then waits for the lock) or has already answered (a turn's refusal is immediate);
+    then release the first run (``gate``'s second event). Returns both responses."""
     parked, release = gate
     async with _async_client(app) as http:
         first = asyncio.create_task(ahead(http))
         try:
             await asyncio.wait_for(parked.wait(), _WAIT_S)
             holds = len(runtime.holds)
-            second = asyncio.create_task(queued(http))
-            await _until(lambda: len(runtime.holds) > holds)
+            second = asyncio.create_task(meanwhile(http))
+            await _until(lambda: len(runtime.holds) > holds or second.done())
         finally:
             release.set()
         responses = await asyncio.wait_for(asyncio.gather(first, second), _WAIT_S)
@@ -1653,20 +1619,22 @@ def _flag_of(db: FakeDb, chat_id: uuid.UUID) -> object:
     return chat["external_content"]
 
 
-async def test_chat_turns_queued_turn_runs_with_the_flag_the_turn_ahead_stored(
+async def test_chat_turns_turn_sent_while_the_chat_runs_gets_409_and_stores_nothing(
     world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Turn B waits on the chat's lock while turn A reads an email (A stores the wrapped
-    result: ``external_content`` true). B runs with ``earlier_external_content=True``,
-    the flag read under the lock, not the false it saw before waiting."""
+    """GH-8: turn B, sent while turn A (reading an email) holds the chat, is refused at
+    once with 409 ``run_active`` instead of queueing behind A: B never runs (so it can't
+    run with a stale flag) and stores nothing; A's messages and the chat's flag are
+    stored."""
     editor = world.a["editor"]
     chat_id = world.db.add_chat(editor.user_id)
     app = make_app(agent)
     runtime = _watched_runtime(monkeypatch)
     gate = _park_next_run(script)
-    script.queue(_Reply(new=_mail_turn(), response="One new email."))
+    mail_turn = _mail_turn()  # one wrapping boundary for the reply and the check
+    script.queue(_Reply(new=mail_turn, response="One new email."))
 
-    first, second = await _queued_behind(
+    first, second = await _while_first_runs(
         app,
         runtime,
         gate,
@@ -1674,25 +1642,29 @@ async def test_chat_turns_queued_turn_runs_with_the_flag_the_turn_ahead_stored(
         lambda http: _post_turn(http, editor, chat_id, "store a note"),
     )
 
-    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
+    assert (first.status_code, first.json()["status"]) == (200, "final"), first.text
+    assert (second.status_code, second.json()) == (409, _RUN_ACTIVE)
+    assert [run.user_message for run in script.runs] == ["read my mail"]
+    assert [run.flag for run in script.runs] == [False]
     assert _flag_of(world.db, chat_id) is True
-    assert [run.user_message for run in script.runs] == ["read my mail", "store a note"]
-    assert [run.flag for run in script.runs] == [False, True]
+    assert _stored(world.db, chat_id) == [_row(_user("read my mail")), *map(_row, mail_turn)]
 
 
-async def test_chat_turns_queued_legacy_turn_runs_with_the_flag_the_turn_ahead_stored(
+async def test_chat_turns_legacy_turn_sent_while_the_chat_runs_gets_409_and_stores_nothing(
     world: World, agent: MagicMock, script: _Script, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The same on POST /api/message: two turns of one legacy session id, the second
-    queued behind the first, which reads an email."""
+    """The same on POST /api/message: two turns of one legacy session id, the second sent
+    while the first (which reads an email) runs. The second is 409 ``run_active``: no run,
+    no second chat, nothing stored; the first is stored in the legacy chat."""
     editor = world.a["editor"]
     chat_id = world.db.add_chat(editor.user_id, legacy_session_id=_LEGACY_SESSION)
     app = make_app(agent)
     runtime = _watched_runtime(monkeypatch)
     gate = _park_next_run(script)
-    script.queue(_Reply(new=_mail_turn(), response="One new email."))
+    mail_turn = _mail_turn()  # one wrapping boundary for the reply and the check
+    script.queue(_Reply(new=mail_turn, response="One new email."))
 
-    first, second = await _queued_behind(
+    first, second = await _while_first_runs(
         app,
         runtime,
         gate,
@@ -1700,11 +1672,12 @@ async def test_chat_turns_queued_legacy_turn_runs_with_the_flag_the_turn_ahead_s
         lambda http: _post_legacy(http, editor, "store a note"),
     )
 
-    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
-    assert [response.json()["chat_id"] for response in (first, second)] == [str(chat_id)] * 2
+    assert (first.status_code, first.json()["chat_id"]) == (200, str(chat_id)), first.text
+    assert (second.status_code, second.json()) == (409, _RUN_ACTIVE)
+    assert [run.user_message for run in script.runs] == ["read my mail"]
+    assert [plain(chat["id"]) for chat in world.db.chats_of(editor.user_id)] == [plain(chat_id)]
     assert _flag_of(world.db, chat_id) is True
-    assert [run.user_message for run in script.runs] == ["read my mail", "store a note"]
-    assert [run.flag for run in script.runs] == [False, True]
+    assert _stored(world.db, chat_id) == [_row(_user("read my mail")), *map(_row, mail_turn)]
 
 
 async def test_chat_turns_queued_approval_runs_with_the_flag_the_turn_ahead_stored(
@@ -1727,7 +1700,7 @@ async def test_chat_turns_queued_approval_runs_with_the_flag_the_turn_ahead_stor
     asks = _awaiting(_PENDING_CALL)
     script.queue(_Reply(**{**asks.__dict__, "new": (*_mail_turn()[:2], *asks.new)}))
 
-    first, second = await _queued_behind(
+    first, second = await _while_first_runs(
         app,
         runtime,
         gate,
@@ -1769,14 +1742,13 @@ class _ParkingLLM(_ScriptLLM):
         return await super().chat(messages, tools, stream=stream)
 
 
-async def test_chat_turns_queued_turn_escalates_an_allowed_side_effect_with_the_real_agent(
+async def test_chat_turns_turn_sent_while_the_chat_runs_never_reaches_the_real_agent(
     world: World, tools: _Tools, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """End to end with the real agent: turn A reads an email; turn B, queued behind it,
-    asks for memory.store (allowed, a side effect) with a stored ``max_context_messages``
-    of 2, so B's loaded tail holds no wrapped content. The chat's flag, read under the
-    lock, still makes B wait for confirmation: nothing is stored, the audit row says
-    escalated."""
+    """End to end with the real agent: turn A reads an email (its LLM call parked); turn B,
+    sent meanwhile, asks for memory.store (allowed, a side effect). B is 409
+    ``run_active``: no LLM call for B, memory.store never runs, the only ``tool.call``
+    audit row is A's gmail.read, and only A's turn is stored, with the chat's flag set."""
     editor = world.a["editor"]
     chat_id = world.db.add_chat(editor.user_id)
     llm = _ParkingLLM("read my mail")
@@ -1785,31 +1757,28 @@ async def test_chat_turns_queued_turn_escalates_an_allowed_side_effect_with_the_
     app = _real_app(llm)
     runtime = _watched_runtime(monkeypatch)
 
-    async def store_a_note(http: httpx.AsyncClient) -> httpx.Response:
-        # A read its platform limits before parking; only B gets the small window.
-        _stored_limits(monkeypatch, max_context_messages=2)
-        return await _post_turn(http, editor, chat_id, "store a note")
-
-    first, second = await _queued_behind(
+    first, second = await _while_first_runs(
         app,
         runtime,
         (llm.parked, llm.release),
         lambda http: _post_turn(http, editor, chat_id, "read my mail"),
-        store_a_note,
+        lambda http: _post_turn(http, editor, chat_id, "store a note"),
     )
 
-    assert (first.status_code, second.status_code) == (200, 200), (first.text, second.text)
-    assert first.json()["status"] == "final"
-    assert _flag_of(world.db, chat_id) is True
-    fed = [message for call in llm.fed("store a note") for message in call]
-    assert fed, "B's turn never reached the LLM"
-    assert not any(untrusted.contains_wrapped(message["content"]) for message in fed)
-    body = second.json()
-    assert body["status"] == "awaiting_confirmation"
-    pending = body["pending_confirmation"]
-    assert (pending["tool"], pending["action"]) == ("memory", "store")
+    assert (first.status_code, first.json()["status"]) == (200, "final"), first.text
+    assert (second.status_code, second.json()) == (409, _RUN_ACTIVE)
+    assert llm.fed("store a note") == []
     assert tools.stored == []
-    assert world.db.audit_rows("tool.call")[-1]["metadata"]["escalated"] is True
+    assert [
+        (row["metadata"]["tool"], row["metadata"]["action"])
+        for row in world.db.audit_rows("tool.call")
+    ] == [("gmail", "read")]
+    stored = world.db.messages_of(chat_id)
+    assert [(m["role"], m["content"]) for m in stored if m["role"] == "user"] == [
+        ("user", "read my mail")
+    ]
+    assert [m["role"] for m in stored] == ["user", "assistant", "tool", "assistant"]
+    assert _flag_of(world.db, chat_id) is True
 
 
 # ---------------------------------------------------------------------------

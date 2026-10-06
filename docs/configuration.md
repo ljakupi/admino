@@ -103,7 +103,8 @@ aren't.
 ### LLM errors and retries
 
 A chat reply that fails has `status: "error"`, and the `POST /api/chats/{id}/messages`,
-`POST /api/message` and `POST /api/confirm/{id}` responses carry its `error_code`:
+`POST /api/message` and `POST /api/confirm/{id}` responses carry its `error_code` (a
+[streamed reply](#streaming-replies) sends it as the `error` event's `code`):
 
 | `error_code` | What happened |
 | --- | --- |
@@ -658,13 +659,14 @@ Viewer's chats from before a role change stay stored, unused.
 | `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. It also carries `pending_confirmation`, `confirmation_status` and `context`, see below. |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
 | `DELETE /api/chats/{id}` | Moves the chat to the trash and answers `204`. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete`, with the chat's ID only. |
-| `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`. Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, and the `chat_id`. |
+| `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`. Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
+| `POST /api/chats/{id}/stop` | Stops the chat's streamed message. It needs no body and answers `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed message running (see [Stopping a reply](#stopping-a-reply)). |
 
 - **Titles** have 1 to 200 characters, spaces at either end removed. Control and
   formatting characters are refused with `422`. Creating, renaming and sending messages
   aren't recorded in the audit log, and titles and messages are never logged.
 - **Automatic titles.** After an untitled chat's first exchange, the server asks the
-  active model for a short title in the background. It sends only your first message and
+  active model for a short title. It sends only your first message and
   the reply as written, each cut to 1,000 characters, with no tools and no account
   identifiers (no user, organization or chat IDs, no account name or email address).
   Names or addresses that the message or the reply contain are sent as they are.
@@ -673,13 +675,15 @@ Viewer's chats from before a role change stay stored, unused.
   "Title:" label, a final period and control characters removed, credentials redacted)
   and is at most 80 characters. When the call fails, when the organization's
   [data residency](#data-residency-and-the-provider) blocks the provider (no call is
-  made), when the answer has nothing usable, or when the turn ended with an error, the
-  title is your first message instead, cut at a word boundary. The same goes when the
+  made), when the answer has nothing usable, or when the turn ended with an error or was
+  [stopped](#stopping-a-reply) (no call is made then either), the title is your first
+  message instead, cut at a word boundary. The same goes when the
   first reply was built from an email, a file or other outside content: no call is made,
   so outside content can't choose the title. A rename always wins, also
-  while the title is being made. The title shows on the next `GET /api/chats` or
-  `GET /api/chats/{id}`, with `title_source: "auto"`. The reply doesn't wait for it, and
-  titles are never logged.
+  while the title is being made. A JSON reply doesn't wait for it: the title is made in
+  the background and shows on the next `GET /api/chats` or `GET /api/chats/{id}`, with
+  `title_source: "auto"`. A [streamed reply](#streaming-replies) waits for it and sends it
+  as a `title` event before the stream ends. Titles are never logged.
 - **Pages and cursors.** Pass a response's `next_cursor` as `cursor` to get the next
   page; `null` means there's nothing more. Cursors are opaque: use them as they come, and
   don't build or change them. A cursor that doesn't decode, or one from the other list,
@@ -687,8 +691,9 @@ Viewer's chats from before a role change stay stored, unused.
 - **Messages** have an `id`, a `role` (`user`, `assistant` or `tool`), the `content`, a
   `tool_call_id` (tool results), `tool_calls`, a `status` and `created_at`. The last
   message of a turn carries the turn's outcome (`complete`, `error`,
-  `awaiting_confirmation` or `limit_reached`) and its tool calls; the others are
-  `complete`. Invisible characters (control and formatting characters such as zero-width
+  `awaiting_confirmation`, `limit_reached` or `stopped`, see
+  [Stopping a reply](#stopping-a-reply)) and its tool calls; the others are `complete`.
+  Invisible characters (control and formatting characters such as zero-width
   spaces, soft hyphens, word joiners and direction marks; tabs and line breaks stay) and
   credential-like text are stripped from the content, like in a live reply and in
   automatic titles. API keys such as `sk-…`, `sk-proj-…` and `sk-ant-…`, Stripe
@@ -773,19 +778,21 @@ Viewer's chats from before a role change stay stored, unused.
   organization answers the same `404` `{"detail": "Chat not found", "reason":
   "chat_not_found"}`, so nobody learns that someone else's chat exists. A chat ID that
   isn't a UUID answers `422`. A message (`POST /api/chats/{id}/messages` or
-  `POST /api/message`) answers `429` `{"detail": "Too many of your chats are active. Try
-  again shortly.", "reason": "rate_limit"}` when your 16 chats in the server's memory
+  `POST /api/message`) answers `409` `{"detail": "A message is already running in this
+  chat.", "reason": "run_active"}` while another message of the chat is running (see
+  "One message at a time" below), `429` `{"detail": "Too many of your chats are active.
+  Try again shortly.", "reason": "rate_limit"}` when your 16 chats in the server's memory
   are all running or waiting for a confirmation (see below), and `503` with `"reason":
   "chats_busy"` when the server is already running as many chats at once as it can hold.
-  Only these two message routes answer this `429` or `503`. In either case your message
-  doesn't run and isn't stored; try again shortly. A new `session_id` on
+  Only these two message routes answer this `409`, `429` or `503`. In each case your
+  message doesn't run and isn't stored; try again shortly. A new `session_id` on
   `POST /api/message` gets its chat only once its first message runs, so a refused
   message leaves no empty chat behind. One thing still happens first: the notes of
   [promoted permissions](permissions.md#promoting-a-critical-permission) that just took
   effect are added to your organization's chats (see below).
 - **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages` and
   `POST /api/message` share one limit, so switching between them doesn't double your
-  rate.
+  rate. `POST /api/chats/{id}/stop` has its own.
 - **Confirmations.** When an action needs your approval, the reply has
   `status: "awaiting_confirmation"` and a `pending_confirmation`. Approve or deny it with
   `POST /api/confirm/{confirmation_id}` and
@@ -808,9 +815,17 @@ Viewer's chats from before a role change stay stored, unused.
   pending. Approve or deny one of them first." Approving, denying or cancelling one of
   your confirmations frees its slot, and so does one that expires. Other users'
   confirmations never count against yours.
+- **One message at a time.** A message never waits for another one. While a message of
+  the chat is running (or an approved action runs, or a denial is being stored), a new
+  message, streamed or not, answers `409` `{"detail": "A message is already running in
+  this chat.", "reason": "run_active"}`. It doesn't run and isn't stored, a pending
+  confirmation of the chat stays pending, and it still counts against your rate limit.
+  Send it again once the reply has ended; with a [streamed reply](#streaming-replies),
+  as soon as you see `message_saved` or `confirm`. A confirmation still waits for a
+  running message of its chat to end, then runs.
 - **Pending confirmations live in memory only.** The chat and its messages are stored,
-  but the pending confirmations and the lock that runs one message at a time per chat are
-  kept in the server's memory, for a limited number of chats; idle ones are dropped. A
+  but the pending confirmations and the lock that allows one message at a time per chat
+  are kept in the server's memory, for a limited number of chats; idle ones are dropped. A
   confirmation expires `confirmation_timeout_s` (a [platform default](#platform-defaults),
   300 seconds by default) after it was asked for. The server checks for expired ones at
   the start of every chat request and every 30 seconds, and an expired one never runs. So
@@ -847,11 +862,113 @@ Viewer's chats from before a role change stay stored, unused.
   sees that message (see
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
 - **The older routes.** `POST /api/message` and `POST /api/confirm/{id}` with a
-  `session_id`, and `GET /api/events?session_id=`, still work until
-  [#177](https://github.com/ljakupi/admino/issues/177) removes them. Each of your session
-  IDs maps to a stored chat of yours, created with its first message and listed with
-  your other chats, so these conversations survive a restart too. Their responses carry
-  that chat's `chat_id` and echo the `session_id`.
+  `session_id` still work until [#177](https://github.com/ljakupi/admino/issues/177)
+  removes them. `POST /api/message` always answers JSON, whatever the `Accept` header
+  says. Each of your session IDs maps to a stored chat of yours, created with its first
+  message and listed with your other chats, so these conversations survive a restart
+  too. Their responses carry that chat's `chat_id` and echo the `session_id`.
+
+### Streaming replies
+
+`POST /api/chats/{id}/messages` and `POST /api/confirm/{id}` stream the reply while it's
+written when the request's `Accept` header lists `text/event-stream` (in any position and
+any case, but not with `q=0`). Any other `Accept` header, or none (`*/*`,
+`application/json`), gets the JSON answer described above. The stream is the body of the
+`POST` response, so it uses your session cookie like any other request. The legacy
+`POST /api/message` always answers JSON.
+
+Everything that's checked before the message runs is refused with the usual JSON error
+and its status, streaming or not (`401`, `403`, `404`, `409`, `422`, `429`, `503`, as
+described above). The stream (`200`, `content-type: text/event-stream`) starts only once
+the message runs.
+
+Each event is an `event: <name>` line and a `data:` line holding a JSON object, followed
+by an empty line. Ignore lines that start with `:`.
+
+| Event | Data | When |
+| --- | --- | --- |
+| `run_started` | `{"chat_id": "..."}` | First, once the message runs. |
+| `delta` | `{"text": "..."}` | The next piece of the reply's text, 1 to 4,096 characters. |
+| `tool_call` | One item of the JSON reply's `tool_calls`: `tool`, `action`, `args` (redacted the same way), `permission`, `success`, `duration_ms`. | An action has run. |
+| `confirm` | The JSON reply's `pending_confirmation`: `confirmation_id`, `tool`, `action`, `args`, `expires_at`. | An action waits for your approval. |
+| `message_saved` | `{"message_id": "...", "status": "..."}`: the ID of the turn's last stored message and its `status` (see Messages above). | The turn is stored. |
+| `error` | `{"code": "...", "message": "..."}` | The message failed (see the codes below). |
+| `title` | `{"title": "..."}` | A first exchange got its automatic title (see Automatic titles above). |
+| `done` | `{}` | Always last. |
+
+`run_started` comes first and `done` always last. In between come the `delta` and
+`tool_call` events, mixed in the order the reply was written and its actions ran, then
+`confirm`, `message_saved`, `error` and `title`, in that order, each only when it
+applies. `confirm`, `message_saved` and everything after them come once the message has
+ended, its turn is stored and the chat is free again: you can send the next message, or
+confirm, as soon as you see `message_saved` or `confirm`.
+
+- **How each message ends.** A complete reply ends with `message_saved` (`complete`). A
+  message that reaches its tool-call limit sends the limit notice as a last `delta`, then
+  `message_saved` (`limit_reached`). An action that needs your approval sends `confirm`,
+  then `message_saved` (`awaiting_confirmation`). When you're already at your pending
+  confirmations limit (see above), there's no `confirm`: `message_saved` (`error`) comes,
+  then `error` with the code `rate_limit` and the "Action … was not run" reply as its
+  `message`. A failed message sends `message_saved` (`error`), then `error`. A stopped
+  one sends `message_saved` (`stopped`), see [Stopping a reply](#stopping-a-reply).
+- **Error codes.** `error.code` is one of the codes in
+  [LLM errors and retries](#llm-errors-and-retries) (`not_configured`, `missing_model`,
+  `provider_unavailable`, `rate_limited`, `timeout`, `context_too_long`,
+  `residency_blocked`, and `rate_limit` for too many pending confirmations), or one of
+  these two:
+  - `internal_error`: the message failed for another reason. When its turn was stored
+    with the generic error reply, `message_saved` comes first. When it failed after the
+    stream started and nothing could be stored (where the JSON route answers `500`),
+    there's no `message_saved` and nothing is stored.
+  - `chat_not_found`: the chat was moved to the trash while the message ran. Nothing is
+    stored and there's no `message_saved`.
+
+  `message` is the English fallback text: for a stored turn, the reply the JSON route
+  returns in `response`.
+- **A model failure in the middle of the reply** is stored like any failed message: the
+  turn's last message is the error reply, with `status: "error"`, not the text that
+  already arrived. The stream ends with `message_saved`, `error` and `done`. A failed
+  model call is [retried](#llm-errors-and-retries) only until the model's first piece of
+  text has arrived.
+- **Text arrives word by word.** The `delta` texts get the same cleanup and credential
+  redaction as the JSON reply (see Messages above), so joined together they equal what
+  `GET /api/chats/{id}` shows for the reply afterwards, and a key is never sent in part.
+  That's why a word is sent only once the space, tab or line break after it has arrived,
+  and a word that reads `Bearer` waits for the word after it. A stopped or failed reply
+  ends at its last complete word: a word the stop or failure cut off is neither streamed
+  nor stored. Text without spaces (a long link, for example) arrives once it ends. A
+  `delta` carries at most 4,096 characters; longer text comes in several.
+- **Confirming with streaming.** Approving streams the rest of the message like a new
+  one, starting with `run_started` and the approved action's `tool_call`; it never sends a
+  `title`. Denying streams `run_started`, one `delta` with "Action … was denied.",
+  `message_saved` (`complete`) and `done`.
+
+### Stopping a reply
+
+`POST /api/chats/{id}/stop` stops the chat's streamed message. It needs no body and
+answers `200` `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed
+message running. Closing the stream (a disconnect) stops the message the same way; the
+turn is still stored and titled as described below, even with nobody reading.
+
+- **What a stop keeps.** The model's stream is closed at once, also while the model is
+  sending nothing, and no further model call is made. An action that's already running
+  is never interrupted: it finishes and is recorded in the audit log, and its
+  `tool_call` is sent. The other actions the model asked for with it don't run. An
+  action you approved always runs. The text written so far, up to its last complete
+  word, is stored as the reply (no reply when there was no complete word yet), and the
+  turn's last message has `status: "stopped"`. The stream ends with `message_saved`
+  (`stopped`), a first exchange's `title`, and `done`.
+- **Titles.** A stopped first exchange makes no title call: the chat gets your first
+  message as its title, sent as the `title` event.
+- **JSON requests can't be stopped.** For a message sent without streaming, stop answers
+  `{"stopped": false}`, and the request answers when the message ends.
+- **Errors** are those of the other chat routes: `404` `{"detail": "Chat not found",
+  "reason": "chat_not_found"}` for a chat that doesn't exist, is in the trash or isn't
+  yours, `422` for an ID that isn't a UUID, and `403` for Viewers and the Super Admin.
+  Stop has its own per-user rate limit, which answers `429`
+  `{"detail": "Rate limit exceeded"}`.
+- A stop isn't recorded in the audit log, like sending a message. Every action that ran
+  stays recorded as `tool.call`.
 
 ## Organizations (Super Admin)
 

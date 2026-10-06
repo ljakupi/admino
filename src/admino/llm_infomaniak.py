@@ -2,9 +2,12 @@
 
 ``InfomaniakClient`` wraps the official ``openai`` SDK pointed at
 ``https://api.infomaniak.com/2/ai/{product_id}/openai/v1`` and serves
-``config.infomaniak_model``. It reuses the OpenAI conversion/parse helpers and
-the shared ``admino.llm`` sanitizers, so requests and responses have the same
-shape as the other OpenAI-compatible backends.
+``config.infomaniak_model``. It reuses the OpenAI conversion/parse helpers, the
+OpenAI-compatible stream reader (``llm_openai._stream_reply``: tool-call
+fragments accumulated per index, at most 128 calls, 256 name and 65536 argument
+characters each, parsed once the stream ended) and the shared ``admino.llm``
+sanitizers, so requests and responses have the same shape as the other
+OpenAI-compatible backends.
 
 Inputs:
 - ``INFOMANIAK_API_TOKEN`` (env, required at chat time): bearer token with the
@@ -50,7 +53,11 @@ default for most models). Reasoning never reaches the answer: the
 never read; ``<think>…</think>`` blocks are removed from the content (also when a
 tag is split across stream chunks); an unclosed ``<think>`` drops the rest of the
 reply; an orphan ``</think>`` (its opening tag was in the prompt template) drops
-everything before it.
+everything before it. A stream's deltas already sent can't be taken back: after an
+orphan ``</think>`` the final content (``chat()``'s rule) is shorter than the
+joined deltas, which total at most 65536 characters whatever the orphan tags (a
+budget that never resets). Without an orphan tag, the final content is the
+joined deltas.
 
 Security notes:
 - The token is read from the environment only; it is sent solely as the
@@ -65,7 +72,11 @@ Security notes:
   ``prompt_cache_key``, ``metadata``; the SDK's env-derived OpenAI organization
   and project headers are cleared).
 - The product id must be ASCII digits before it is placed in a URL.
-- LLM output is sanitized (control/bidi characters stripped, 65536-char cap).
+- LLM output is sanitized (control/bidi characters and lone surrogates
+  stripped, 65536-char cap). A stream's deltas total at most 65536 characters
+  too; orphan ``</think>`` tags never reset that budget.
+- Streamed tool calls share the OpenAI reader's bounds (128 calls, 256-char
+  names, 65536-char arguments; a call crossing a bound is dropped).
 - Does not import from agent.py, server.py, or tools/.
 """
 
@@ -74,18 +85,15 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, Final
 
 import httpx
-from pydantic import ValidationError
 
 from admino.llm import (
     _MAX_CONTENT_LENGTH,
     LLMError,
     LLMResponse,
-    LLMStreamDelta,
-    LLMUsage,
     missing_model_error,
     not_configured_error,
     output_token_cap,
@@ -96,21 +104,23 @@ from admino.llm import (
     validate_tools_payload,
 )
 
-# The endpoint is OpenAI-compatible: reuse the OpenAI translation helpers verbatim.
+# The endpoint is OpenAI-compatible: reuse the OpenAI translation helpers and
+# stream reader verbatim.
 from admino.llm_openai import (
     _convert_messages_to_openai,
     _convert_tools_to_openai,
     _parse_openai_tool_calls,
+    _stream_reply,
+    _usage,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncGenerator
 
     from openai import AsyncOpenAI
-    from openai.types import CompletionUsage
-    from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 
     from admino.config import LLMConfig
+    from admino.llm import LLMStreamDelta
     from admino.models import LLMMessage
 
 logger = logging.getLogger(__name__)
@@ -125,10 +135,6 @@ _KEY_NOUN: Final = "API token"
 _METADATA_TIMEOUT_S: Final = 10.0
 # ASCII digits only — str.isdigit() would also accept e.g. fullwidth digits.
 _PRODUCT_ID_RE: Final = re.compile(r"[0-9]+")
-
-# Bounds on streamed tool-call fragments (untrusted provider data).
-_MAX_STREAM_TOOL_CALLS: Final = 128
-_MAX_TOOL_ARGUMENT_CHARS: Final = 65536
 
 _INVALID_PRODUCT_ID_MESSAGE: Final = (
     "INFOMANIAK_PRODUCT_ID must be the numeric Infomaniak product ID; fix it on the server."
@@ -263,20 +269,6 @@ def _api_error(exc: Exception) -> LLMError:
     )
 
 
-def _usage(usage: CompletionUsage | None) -> LLMUsage | None:
-    """Convert provider token usage; a missing or malformed block yields None."""
-    if usage is None:
-        return None
-    try:
-        return LLMUsage(
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-        )
-    except ValidationError:
-        logger.warning("Ignoring malformed Infomaniak usage block")
-        return None
-
-
 def _held_tag_len(text: str, start: int, *tags: str) -> int:
     """Length of the longest suffix of ``text[start:]`` that may begin one of ``tags``."""
     for size in range(min(len(text) - start, len(_THINK_CLOSE) - 1), 0, -1):
@@ -295,6 +287,12 @@ class _ThinkFilter:
     orphan ``</think>`` discards the answer collected so far. Leading whitespace
     left behind by removed reasoning is trimmed, and the answer is capped at the
     ``LLMResponse`` content limit.
+
+    What ``feed()`` / ``finish()`` return (a stream's deltas) can't be taken back
+    by a later orphan ``</think>``: that text is capped at the content limit in
+    total, a budget no orphan tag resets, so a hostile stream can't send more
+    than 65536 delta characters by repeating orphan tags. Without an orphan tag
+    the returned text is exactly ``answer``.
     """
 
     def __init__(self) -> None:
@@ -303,6 +301,7 @@ class _ThinkFilter:
         self._trim = False
         self._parts: list[str] = []
         self._length = 0
+        self._emitted = 0
 
     @property
     def answer(self) -> str:
@@ -342,12 +341,18 @@ class _ThinkFilter:
                 self._parts.clear()
                 self._length = 0
                 self._trim = True
-        return "".join(visible)
+        return self._emit("".join(visible))
 
     def finish(self) -> str:
         """Flush held-back text at the end; an unclosed block's text is dropped."""
         held, self._held = self._held, ""
-        return "" if self._inside else self._keep(held)
+        return "" if self._inside else self._emit(self._keep(held))
+
+    def _emit(self, text: str) -> str:
+        """Return what of ``text`` fits the stream's delta budget (never reset)."""
+        text = text[: _MAX_CONTENT_LENGTH - self._emitted]
+        self._emitted += len(text)
+        return text
 
     def _keep(self, text: str) -> str:
         """Append visible text to the answer (trim + cap); return what was kept."""
@@ -367,42 +372,6 @@ def _answer_text(raw: str) -> str:
     think.feed(strip_control_chars(raw))
     think.finish()
     return think.answer
-
-
-@dataclass
-class _StreamedFunction:
-    """Function name / JSON-argument fragments of one streamed tool call."""
-
-    name: str = ""
-    arguments: str = ""
-
-
-@dataclass
-class _StreamedToolCall:
-    """One tool call rebuilt from stream deltas (shape read by the OpenAI parser)."""
-
-    id: str | None = None
-    function: _StreamedFunction = field(default_factory=_StreamedFunction)
-
-
-def _accumulate_tool_calls(
-    calls: dict[int, _StreamedToolCall], fragments: list[ChoiceDeltaToolCall]
-) -> None:
-    """Merge streamed tool-call fragments into ``calls``, keyed by their index."""
-    for fragment in fragments:
-        call = calls.get(fragment.index)
-        if call is None:
-            if len(calls) >= _MAX_STREAM_TOOL_CALLS:
-                continue
-            call = calls[fragment.index] = _StreamedToolCall()
-        call.id = call.id or fragment.id
-        function = fragment.function
-        if function is None:
-            continue
-        if function.name:
-            call.function.name += function.name
-        if function.arguments and len(call.function.arguments) < _MAX_TOOL_ARGUMENT_CHARS:
-            call.function.arguments += function.arguments
 
 
 class InfomaniakClient:
@@ -567,7 +536,7 @@ class InfomaniakClient:
         self,
         messages: list[LLMMessage],
         tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[LLMStreamDelta | LLMResponse]:
+    ) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
         """Stream a chat reply: answer deltas, then exactly one final LLMResponse.
 
         Deltas are sanitized with reasoning removed and stop at the content cap.
@@ -594,40 +563,13 @@ class InfomaniakClient:
             )
         except openai.APIError as exc:
             raise _api_error(exc) from None
-
-        think = _ThinkFilter()
-        calls: dict[int, _StreamedToolCall] = {}
-        model = ""
-        usage: LLMUsage | None = None
-        finish_reason: str | None = None
-        async with stream:
-            try:
-                async for chunk in stream:
-                    model = chunk.model or model
-                    if chunk.usage is not None:
-                        usage = _usage(chunk.usage)
-                    if not chunk.choices:
-                        continue
-                    choice = chunk.choices[0]
-                    finish_reason = choice.finish_reason or finish_reason
-                    if choice.delta.tool_calls:
-                        _accumulate_tool_calls(calls, choice.delta.tool_calls)
-                    text = think.feed(strip_control_chars(choice.delta.content or ""))
-                    if text:
-                        yield LLMStreamDelta(content=text)
-            except (openai.APIError, httpx.TransportError) as exc:
-                raise _api_error(exc) from None
-
-        tail = think.finish()
-        if tail:
-            yield LLMStreamDelta(content=tail)
-        yield LLMResponse(
-            content=think.answer,
-            tool_calls=_parse_openai_tool_calls([calls[index] for index in sorted(calls)]),
-            model=strip_control_chars(model or self._model)[:200],
-            done=finish_reason != "tool_calls",
-            usage=usage,
+        reply = _stream_reply(
+            stream, _ThinkFilter(), configured_model=self._model, stream_error=_api_error
         )
+        # aclosing: closing this generator early closes the HTTP stream at once.
+        async with aclosing(reply) as items:
+            async for item in items:
+                yield item
 
     async def list_models(self) -> list[str]:
         """Return the sanitized ids of the served models; ``[]`` on any failure."""
