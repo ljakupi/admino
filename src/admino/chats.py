@@ -840,16 +840,6 @@ async def read_chat_detail(
     )
 
 
-async def count_messages(executor: Executor, tenant: TenantContext, chat_id: UUID) -> int:
-    """Return how many messages the caller's chat holds.
-
-    Raises:
-        ChatNotFoundError: Unless the chat is the caller's and not trashed.
-    """
-    await get_chat(executor, tenant, chat_id)
-    return int(await executor.fetchval(_COUNT_MESSAGES_SQL, chat_id, tenant.org_id))
-
-
 async def append_org_notice(pool: asyncpg.Pool, tenant: TenantContext, content: str) -> int:
     """Append GH-66's promotion notice to every live chat of the caller's org.
 
