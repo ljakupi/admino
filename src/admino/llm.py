@@ -31,9 +31,18 @@ client resolves it with ``output_token_cap``: the cap is
 ``min(max_tokens, configured)``, so a caller can lower it but never raise it;
 a value below 1, a bool or a non-int is a ``ValueError`` before any request.
 
+Streaming (GH-8): ``LLMClient.chat_stream`` yields sanitized, non-empty
+``LLMStreamDelta`` pieces and then exactly one final ``LLMResponse`` whose
+content is the joined deltas. ``CappedAnswer`` keeps a streamed answer within
+the 65536-character content cap (counted after sanitizing); streamed tool-call
+fragments are bounded by ``_MAX_STREAM_TOOL_CALLS`` calls and
+``_MAX_TOOL_ARGUMENT_CHARS`` argument characters per call, and are parsed only
+once the stream ended, never streamed as deltas.
+
 Inputs: provider statuses, response headers, and (for classification only)
-the provider's error code and message, a per-call output cap. Outputs:
-``LLMError`` instances, the cap a request sends.
+the provider's error code and message, a per-call output cap, streamed answer
+text. Outputs: ``LLMError`` instances, the cap a request sends, the capped
+answer text.
 
 Security notes:
 - No credentials are stored or logged by this module.
@@ -66,6 +75,8 @@ from admino.logs import safe_log
 from admino.models import LLMMessage, ToolCall
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from admino.config import LLMConfig
     from admino.models import LLMErrorCode
 
@@ -77,6 +88,12 @@ logger = logging.getLogger(__name__)
 _MAX_CONTENT_LENGTH: int = 65536
 _MAX_TOOLS_COUNT: int = 64
 _MAX_TOOLS_PAYLOAD: int = 65536
+
+# Bounds on streamed tool-call fragments (untrusted provider data): calls past
+# the first 128 are ignored, a call's arguments stop growing at 65536 chars
+# (and then fail JSON parsing).
+_MAX_STREAM_TOOL_CALLS: Final = 128
+_MAX_TOOL_ARGUMENT_CHARS: Final = 65536
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +507,36 @@ def sanitize_content(content: str) -> str:
     return strip_control_chars(content)[:_MAX_CONTENT_LENGTH]
 
 
+class CappedAnswer:
+    """Collect streamed answer text up to the ``LLMResponse`` content cap.
+
+    Callers feed text that is already sanitized, so the cap counts sanitized
+    characters. Text past the cap is dropped; the caller keeps reading its
+    stream so tool calls and the stop reason still arrive.
+    """
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+        self._length = 0
+
+    @property
+    def answer(self) -> str:
+        """The answer collected so far (at most ``_MAX_CONTENT_LENGTH`` characters)."""
+        return "".join(self._parts)
+
+    def feed(self, text: str) -> str:
+        """Keep what fits under the cap of ``text``; return the kept text (maybe "")."""
+        kept = text[: _MAX_CONTENT_LENGTH - self._length]
+        if kept:
+            self._parts.append(kept)
+            self._length += len(kept)
+        return kept
+
+    def finish(self) -> str:
+        """Return the held-back text at the end of the stream: none is ever held."""
+        return ""
+
+
 def check_args_depth(obj: object, limit: int = 4) -> bool:
     """Return True if the object's nesting depth is within the limit."""
     if limit <= 0:
@@ -636,10 +683,10 @@ def validate_tools_payload(tools: list[dict[str, Any]]) -> None:
 class LLMClient(Protocol):
     """Protocol defining the interface all LLM provider backends must implement.
 
-    Each provider (Anthropic, OpenAI) implements this protocol.
-    The agent loop uses this interface exclusively — it is provider-agnostic.
-    ``provider`` names the backend ("infomaniak", "vllm", "anthropic",
-    "openai"): the model policy's residency guard (GH-242) reads it.
+    Each provider (Infomaniak, vLLM, Anthropic, OpenAI) implements this
+    protocol. The agent loop uses this interface exclusively — it is
+    provider-agnostic. ``provider`` names the backend ("infomaniak", "vllm",
+    "anthropic", "openai"): the model policy's residency guard (GH-242) reads it.
     """
 
     @property
@@ -660,7 +707,7 @@ class LLMClient(Protocol):
         Args:
             messages: Conversation messages.
             tools: Optional tool definitions (JSON Schema format).
-            stream: Must be False (streaming not yet unified across providers).
+            stream: Must be False; streaming goes through ``chat_stream()``.
             max_tokens: Per-call output cap (GH-179). None sends the configured
                 ``max_response_tokens``; an int sends ``output_token_cap()``'s
                 ``min(max_tokens, configured)``. Nothing else in the request changes.
@@ -670,6 +717,34 @@ class LLMClient(Protocol):
 
         Raises:
             ValueError: ``max_tokens`` below 1, a bool or not an int (before any request).
+        """
+        ...
+
+    def chat_stream(
+        self,
+        messages: list[LLMMessage],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
+        """Stream a chat reply (GH-8): answer deltas, then exactly one final LLMResponse.
+
+        The request is ``chat()``'s (configured output cap) plus ``stream:
+        true``. Deltas are sanitized and non-empty; the final response's
+        content is their concatenation (capped at 65536 characters, the stream
+        is still read to its end). Tool calls are only in the final response.
+        An async generator, so a caller can close it early (``aclose()``) and
+        the provider's HTTP stream closes with it.
+
+        Args:
+            messages: Conversation messages.
+            tools: Optional tool definitions (JSON Schema format).
+
+        Yields:
+            ``LLMStreamDelta`` pieces, then the final ``LLMResponse``.
+
+        Raises:
+            LLMError: The same catalogue as ``chat()``: setup errors on the
+                first iteration (before any request), HTTP statuses before any
+                delta, a timeout / transport failure possibly after deltas.
         """
         ...
 

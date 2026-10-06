@@ -17,6 +17,9 @@ two rules (GH-242):
   jitter) when there is none; a Retry-After above 10 s means no retry at all.
   The last error is raised unchanged; any other error propagates at once.
   ``chat_stream`` retries only while nothing has reached the caller yet.
+- Streaming (GH-8): ``chat_stream`` drives the client's ``chat_stream`` and
+  closes the client's generator whenever its own is closed early (the agent
+  closes it on a stop), so the provider's HTTP stream closes with it.
 - Per-call output cap (GH-179): ``chat``'s keyword-only ``max_tokens`` is
   passed to ``client.chat`` on every attempt when it is an int (the chat-title
   call); when it is None the keyword is not passed at all, so clients without
@@ -43,12 +46,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import TYPE_CHECKING, Any, Final, Protocol
+from contextlib import aclosing
+from typing import TYPE_CHECKING, Any, Final
 
 from admino.llm import LLMError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from admino.llm import LLMClient, LLMResponse, LLMStreamDelta
     from admino.models import LLMMessage
@@ -69,18 +73,6 @@ _RESIDENCY_BLOCKED_MESSAGE: Final = (
 # Test seams: replaced by tests, looked up at call time.
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
 _random: Callable[[], float] = random.SystemRandom().random
-
-
-class StreamingLLMClient(Protocol):
-    """An LLM client that can stream a reply (``InfomaniakClient`` today)."""
-
-    def chat_stream(
-        self,
-        messages: list[LLMMessage],
-        tools: list[dict[str, Any]] | None = None,
-    ) -> AsyncIterator[LLMStreamDelta | LLMResponse]:
-        """Stream answer deltas, then exactly one final LLMResponse."""
-        ...
 
 
 def residency_blocked_error() -> LLMError:
@@ -192,21 +184,22 @@ async def chat(
 
 
 async def chat_stream(
-    client: StreamingLLMClient,
+    client: LLMClient,
     messages: list[LLMMessage],
     tools: list[dict[str, Any]] | None = None,
     *,
     data_residency: bool,
     max_retries: int,
-) -> AsyncIterator[LLMStreamDelta | LLMResponse]:
+) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
     """Stream one chat reply through the residency guard and the retry policy.
 
     A retryable error is retried like ``chat`` only while nothing has been
     yielded to the caller (also when opening the stream fails); once a delta
-    or the final response went out, any error propagates unchanged.
+    or the final response went out, any error propagates unchanged. Closing
+    this generator early closes the client's generator at once.
 
     Args:
-        client: The running streaming LLM client (every retry uses it again).
+        client: The running LLM client (every retry uses it again).
         messages: The call's messages (the same object on every retry).
         tools: The call's tool definitions (the same object on every retry).
         data_residency: The requesting org's residency policy.
@@ -226,9 +219,11 @@ async def chat_stream(
     while True:
         yielded = False
         try:
-            async for item in client.chat_stream(messages, tools):
-                yielded = True
-                yield item
+            # aclosing: an early close (the agent's stop) closes the provider stream now.
+            async with aclosing(client.chat_stream(messages, tools)) as items:
+                async for item in items:
+                    yielded = True
+                    yield item
             return
         except LLMError as exc:
             if yielded or not await _wait_before_retry(exc, attempt, max_retries):
