@@ -29,6 +29,12 @@ was shown in full (security audit N-1 and I-A). What this file pins:
 - Split inside the body (criterion 2, GH-264 L-2): a key split 40 characters
   into its body by a removed character is joined and redacted whole, now in the
   message view too.
+- A run inside a key joins (Decision 9): when the text before the run and the
+  text after it, joined, form one match of the token-start key rules (``sk-``
+  and the decision 4 rules) that spans the run, the run is not a separator, so
+  ``sk-proj-ab<SHY>sk-<20+>`` gives ``[CREDENTIAL_REDACTED]``, not
+  ``sk-proj-ab[CREDENTIAL_REDACTED]``. A run that no such match spans still
+  separates.
 
 Titles are asserted on the marker and on ``surviving_chunks`` (no 8-character
 chunk of the key's body left): their exact text may differ from the message
@@ -49,7 +55,15 @@ import pytest
 
 from admino import chat_titles, models
 from admino.models import ChatMessageView, ChatResponse, SSEEvent
-from tests.credential_keys import ApiKey, openai_project_key, surviving_chunks
+from tests.credential_keys import (
+    GOOGLE_API,
+    GROQ,
+    HUGGING_FACE,
+    ApiKey,
+    api_key,
+    openai_project_key,
+    surviving_chunks,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -582,3 +596,136 @@ class TestSeparatorBoundaries:
         raw = f"a{SHY}{key.text} and b{ZWSP}{key.text}"
         results = {function: _sanitizer(function)(raw) for function in FUNCTIONS}
         assert results == dict.fromkeys(FUNCTIONS, f"a{REDACTED} and b{REDACTED}")
+
+
+# ===========================================================================
+# 6. A run inside a key joins (Decision 9)
+# ===========================================================================
+
+
+def _split(key: ApiKey, at: int, run: str) -> str:
+    """``key`` with ``run`` inserted ``at`` characters into its body."""
+    return key.prefix + key.body[:at] + run + key.body[at:]
+
+
+# "sk-" and 24 key characters with "_" and "-": a key on its own after the run.
+_SK_TAIL = api_key("sk-", 27, seed=2709)
+# Each joined text is one token-start key match; the run goes right before the
+# inner key prefix, which the run alone would make a separator.
+_PROJECT_SHORT_HEAD = ApiKey("sk-" + "proj-", "ab" + _SK_TAIL.text)
+_PROJECT_TEN_CHARACTER_HEAD = ApiKey("sk-" + "proj-", _alnum_body(10, 7) + _SK_TAIL.text)
+# Joined: "AIza" and 10 + 3 + 25 = 38 Google body characters (minimum 35).
+_GOOGLE_HEAD_BEFORE_SK = ApiKey("AI" + "za", _alnum_body(10, 11) + "sk-" + _alnum_body(25, 13))
+# Joined: "github_pat_" and 20 + 3 + 59 = 82 body characters of [A-Za-z0-9_] (minimum 82).
+_GITHUB_HEAD_BEFORE_HF = ApiKey(
+    "github" + "_pat_", _alnum_body(20, 17) + "hf" + "_" + _alnum_body(59, 19)
+)
+# Two complete sk- keys, the first ending in a letter or digit: joined, one sk- match.
+_TWO_SK_KEYS = ApiKey("sk-", _alnum_body(30, 23) + "sk-" + _alnum_body(30, 29))
+
+_JOINED_KEYS = pytest.mark.parametrize(
+    ("key", "at", "run"),
+    [
+        pytest.param(_PROJECT_SHORT_HEAD, 2, SHY, id="project-key-short-head-soft-hyphen"),
+        pytest.param(_PROJECT_SHORT_HEAD, 2, ZWSP, id="project-key-short-head-zero-width-space"),
+        pytest.param(_PROJECT_SHORT_HEAD, 2, WJ, id="project-key-short-head-word-joiner"),
+        pytest.param(_PROJECT_TEN_CHARACTER_HEAD, 10, SHY, id="project-key-ten-character-head"),
+        pytest.param(_GOOGLE_HEAD_BEFORE_SK, 10, SHY, id="google-key-split-before-sk"),
+        pytest.param(_GITHUB_HEAD_BEFORE_HF, 20, SHY, id="github-fine-grained-split-before-hf"),
+        pytest.param(_TWO_SK_KEYS, 30, ZWSP, id="two-sk-keys-split-only-by-a-run"),
+    ],
+)
+
+
+class TestRunInsideAKeyJoins:
+    """Decision 9: a run that one token-start key match spans joins; any other run separates.
+
+    Criterion 2 (a key split inside its body is redacted whole) wins over
+    criterion 1. The guards that a run after a plain word still separates are
+    already in this file and not repeated here: ``a<SHY>sk-...`` and
+    ``key<ZWSP>sk-...`` give ``a`` / ``key`` and the marker (``TestSeparatorMatrix``),
+    and ``ri<SHY>sk-free-investment-strategy-2026`` gives ``ri`` and the marker
+    (``TestSeparatorRules``, the accepted false positive). The guards below pin
+    that the join needs a real match on the joined text, that spans the run and
+    covers the key after it.
+    """
+
+    @_JOINED_KEYS
+    def test_models_run_inside_a_key_joins_and_the_key_is_redacted_whole_everywhere(
+        self, key: ApiKey, at: int, run: str
+    ) -> None:
+        """Message display text, model titles and fallback titles: one marker, no visible head."""
+        raw = _split(key, at, run)
+        results = {function: _sanitizer(function)(raw) for function in FUNCTIONS}
+        assert results == dict.fromkeys(FUNCTIONS, REDACTED)
+
+    @_JOINED_KEYS
+    def test_models_run_inside_a_key_mid_sentence_joins_everywhere(
+        self, key: ApiKey, at: int, run: str
+    ) -> None:
+        """Short words around the key, so a title's truncation can't hide a leak."""
+        raw = f"Rotate {_split(key, at, run)} today"
+        results = {function: _sanitizer(function)(raw) for function in FUNCTIONS}
+        assert (results, [_redacted_in_full(result, key) for result in results.values()]) == (
+            dict.fromkeys(FUNCTIONS, f"Rotate {REDACTED} today"),
+            [(True, [])] * len(FUNCTIONS),
+        )
+
+    def test_models_run_after_a_head_too_short_to_join_still_separates_everywhere(self) -> None:
+        """``AIza`` + 5 + run + ``sk-`` + 20: joined, 28 body characters is no Google key (35).
+
+        No match spans the run, so it separates: the ``sk-`` key is redacted and
+        the head, which is not a key, stays.
+        """
+        head = "AI" + "za" + _alnum_body(5, 37)
+        raw = head + SHY + "sk-" + _alnum_body(20, 41)
+        results = {
+            function: (_sanitizer(function)(raw), _sanitizer(function)(f"Rotate {raw} today"))
+            for function in FUNCTIONS
+        }
+        assert results == dict.fromkeys(
+            FUNCTIONS, (head + REDACTED, f"Rotate {head}{REDACTED} today")
+        )
+
+    def test_models_key_ending_before_the_run_does_not_join_it_everywhere(self) -> None:
+        """A key earlier in the text doesn't span a later run: the run after ``key`` separates."""
+        first = "sk-" + _alnum_body(30, 43)
+        second = "sk-" + _alnum_body(30, 47)
+        raw = f"Rotate {first} and key{ZWSP}{second}"
+        results = {function: _sanitizer(function)(raw) for function in FUNCTIONS}
+        assert results == dict.fromkeys(FUNCTIONS, f"Rotate {REDACTED} and key{REDACTED}")
+
+    @pytest.mark.parametrize(
+        ("head", "tail"),
+        [
+            pytest.param(
+                HUGGING_FACE.key(),
+                ApiKey("sk-", _alnum_body(20, 53)),
+                id="hugging-face-key-before-an-sk-key",
+            ),
+            pytest.param(GROQ.key(), GOOGLE_API.key(), id="groq-key-before-a-google-key"),
+            pytest.param(
+                HUGGING_FACE.key(),
+                ApiKey("AI" + "za", _alnum_body(35, 59) + "_" + _alnum_body(10, 61)),
+                id="hugging-face-key-before-a-google-key-with-a-late-underscore",
+            ),
+        ],
+    )
+    def test_models_join_never_shows_part_of_the_key_after_the_run_everywhere(
+        self, head: ApiKey, tail: ApiKey
+    ) -> None:
+        """Joined, the head's match stops inside the key after the run.
+
+        The head's body class has no ``-`` (before the ``sk-`` key's body) or no
+        ``_`` (a Google key's body holds one at index 4, or only after its 35-character
+        minimum), so that match spans the run but doesn't cover the whole key after
+        it: joining there would show the rest of that key. Fail closed: both keys
+        are redacted, nothing of either stays.
+        """
+        raw = head.text + SHY + tail.text
+        results = {function: _sanitizer(function)(raw) for function in FUNCTIONS}
+        tolerated = {REDACTED, REDACTED + REDACTED}
+        assert (
+            {function: result in tolerated for function, result in results.items()},
+            [surviving_chunks(result, key) for result in results.values() for key in (head, tail)],
+        ) == (dict.fromkeys(FUNCTIONS, True), [[]] * (2 * len(FUNCTIONS)))

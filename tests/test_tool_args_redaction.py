@@ -10,7 +10,8 @@ full (audit finding I-4). What this file pins, for both models:
   (``models._strip_credentials``): dict values, list items and str dict keys. Only
   the credential rules apply, not the display cleanup: an invisible character in an
   argument is kept. When two keys redact to the same text, the later one wins.
-  Non-str keys inside nested dicts are kept.
+  Inside nested dicts, a bool, int, float or None key is kept and a key of any
+  other type (a tuple) becomes ``"[SANITIZED]"`` (decision 10).
 - A tuple becomes a list. bool, int, float and None are kept as they are. Any other
   type (a set, bytes, an object) becomes ``"[SANITIZED]"``
   (``models._SANITIZED_PLACEHOLDER``).
@@ -256,6 +257,45 @@ class TestValueTypes:
             "thing": PLACEHOLDER,
             "nested": ["kept", PLACEHOLDER],
         }
+
+    @_SITES
+    def test_models_nested_dict_keys_are_redacted_kept_or_replaced_by_type(
+        self, site: Callable[[Any], dict[str, Any]]
+    ) -> None:
+        """Decision 10: a str key is redacted, a bool, int, float or None key kept as it is.
+
+        A key of any other type (a tuple holding a key) becomes the placeholder,
+        like a value of another type (fail closed); its value is still redacted.
+        """
+        args = {
+            "by_key": {
+                ("id", _KEY): f"v {_KEY}",
+                True: "flag",
+                7: "count",
+                2.5: "ratio",
+                None: "none",
+                f"x-{_KEY}": "named",
+            }
+        }
+        result = site(args)["by_key"]
+        assert (result, {(type(key), key) for key in result}) == (
+            {
+                PLACEHOLDER: f"v {REDACTED}",
+                True: "flag",
+                7: "count",
+                2.5: "ratio",
+                None: "none",
+                f"x-{REDACTED}": "named",
+            },
+            {
+                (str, PLACEHOLDER),
+                (bool, True),
+                (int, 7),
+                (float, 2.5),
+                (type(None), None),
+                (str, f"x-{REDACTED}"),
+            },
+        )
 
     @_SITES
     def test_models_invisible_characters_in_args_are_kept(
