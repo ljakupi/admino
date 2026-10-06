@@ -88,6 +88,20 @@ Security notes:
   ``llm_max_retries``, so a transient failure is retried on the same client
   with the same context; the agent never passes a user/org id, email or name
   to the client.
+- Streamed runs and stop (GH-8): with a ``stream`` (an
+  ``admino.streaming.RunStream``) every LLM call goes through
+  ``llm_policy.chat_stream`` instead: each answer text piece is forwarded to
+  ``stream.on_delta`` as it arrives, and each tool-call record to
+  ``stream.on_tool_call`` right after it is recorded. ``stream.stop`` is
+  checked before every LLM call and every LLM-requested dispatch (not before
+  a resumed confirmation's dispatch, which always runs); while an LLM call
+  waits for its next item it races the stop, so a stop closes the provider's
+  stream at once even when nothing arrives. A dispatch in progress is never
+  cancelled: it finishes and is recorded first. A stopped run ends with status
+  "stopped", keeping the interrupted call's forwarded text as its reply. Only
+  a content-free "run stopped" line with the tool-call count is logged.
+  Without a stream the run is exactly the JSON path (``llm_policy.chat``, not
+  stoppable).
 - Exceptions from the LLM client are caught and converted into a safe
   "error" AgentResult carrying the ``LLMError``'s ``code`` as ``error_code``
   (None for an uncoded error and any other exception). An ``LLMError`` with
@@ -117,6 +131,7 @@ Security notes:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -126,7 +141,7 @@ from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
 from admino import llm_policy, prompt_assembly, untrusted
-from admino.llm import LLMError
+from admino.llm import LLMError, LLMResponse
 from admino.models import (
     AgentConfig,
     AgentResult,
@@ -144,9 +159,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from admino.access import Principal
-    from admino.llm import LLMClient
+    from admino.llm import LLMClient, LLMStreamDelta
     from admino.models import LLMErrorCode, ToolPolicy
     from admino.permissions import PermissionState
+    from admino.streaming import RunStream
     from admino.tools.registry import ToolDescription
 
 logger = logging.getLogger(__name__)
@@ -281,6 +297,7 @@ class Agent:
         agent_config: AgentConfig | None = None,
         prompt_context: PromptContext | None = None,
         earlier_external_content: bool = False,
+        stream: RunStream | None = None,
     ) -> AgentResult:
         """Run the agent loop for a single user message.
 
@@ -328,6 +345,11 @@ class Agent:
                 as for a history holding a wrapped tool result. False: only
                 ``history`` and this run's results decide. Applies to this run
                 only.
+            stream: Streams the run (GH-8): every LLM call goes through
+                ``llm_policy.chat_stream``, answer text pieces and tool-call
+                records are reported to it as they happen, and setting its
+                ``stop`` ends the run with status "stopped" (see the module
+                docstring). None: the JSON path, unchanged and not stoppable.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
@@ -348,6 +370,7 @@ class Agent:
                 agent_config=agent_config,
                 prompt_context=prompt_context,
                 earlier_external_content=earlier_external_content,
+                stream=stream,
             )
 
     # ------------------------------------------------------------------
@@ -366,6 +389,7 @@ class Agent:
         agent_config: AgentConfig | None,
         prompt_context: PromptContext | None,
         earlier_external_content: bool,
+        stream: RunStream | None,
     ) -> AgentResult:
         """Run the agent loop inside the run's untrusted-content boundary (see ``run``)."""
         config = self._config if agent_config is None else agent_config
@@ -481,6 +505,7 @@ class Agent:
                 working_history=working_history,
                 tool_records=tool_records,
                 escalate_side_effects=received_untrusted,
+                stream=stream,
             )
             if pre_result is not None:
                 # H-1: the resumed dispatch could not be recorded —
@@ -497,6 +522,9 @@ class Agent:
         # Bounded loop. Each iteration = one LLM round trip, possibly followed
         # by a batch of tool dispatches.
         for _iteration in range(config.max_tool_calls + 1):
+            # GH-8 (a): a stopped run makes no further LLM call.
+            if stream is not None and stream.stop.is_set():
+                return _stopped(working_history, tool_records, "")
             # 1. Call the LLM with the system message + a trimmed context window.
             context = prompt_assembly.assemble(
                 prompt_inputs,
@@ -511,13 +539,23 @@ class Agent:
             try:
                 # GH-242: the model policy (residency guard + bounded retries on
                 # this same client with this same context).
-                response = await llm_policy.chat(
-                    self._llm,
-                    context,
-                    tools_payload,
-                    data_residency=tool_policy.data_residency,
-                    max_retries=config.llm_max_retries,
-                )
+                reply: LLMResponse | str
+                if stream is None:
+                    reply = await llm_policy.chat(
+                        self._llm,
+                        context,
+                        tools_payload,
+                        data_residency=tool_policy.data_residency,
+                        max_retries=config.llm_max_retries,
+                    )
+                else:
+                    reply = await self._stream_reply(
+                        context,
+                        tools_payload,
+                        stream=stream,
+                        data_residency=tool_policy.data_residency,
+                        max_retries=config.llm_max_retries,
+                    )
             except (MemoryError, RecursionError):
                 raise
             except Exception as exc:
@@ -527,7 +565,7 @@ class Agent:
                 # message (e.g. "set INFOMANIAK_API_TOKEN") that becomes the
                 # response (the PWA shows the code's translation instead);
                 # every other failure gets the generic reply.
-                reply = _LLM_ERROR_MESSAGE
+                message = _LLM_ERROR_MESSAGE
                 error_code: LLMErrorCode | None = None
                 if isinstance(exc, LLMError):
                     logger.error(
@@ -537,16 +575,20 @@ class Agent:
                         exc.code,
                     )
                     if exc.user_facing:
-                        reply = exc.message
+                        message = exc.message
                     error_code = exc.code
                 else:
                     logger.error("LLM chat call failed: %s", type(exc).__name__)
                 return self._terminal_error(
                     history=working_history,
                     tool_records=tool_records,
-                    message=reply,
+                    message=message,
                     error_code=error_code,
                 )
+            if isinstance(reply, str):
+                # GH-8 (b): stopped during the call; its forwarded text is the reply.
+                return _stopped(working_history, tool_records, reply)
+            response = reply
 
             # 2. Text-only response → we are done.
             if not response.tool_calls:
@@ -587,6 +629,10 @@ class Agent:
             )
 
             for tool_call in batch:
+                # GH-8 (c): a stop leaves this call and the rest of the batch
+                # undispatched (a dispatch in progress was never interrupted).
+                if stream is not None and stream.stop.is_set():
+                    return _stopped(working_history, tool_records, "")
                 if tool_calls_used >= config.max_tool_calls:
                     # Hard cap reached mid-batch — stop immediately.
                     return self._terminal_limit(
@@ -620,7 +666,8 @@ class Agent:
                 # any real tools.  The conservative choice is correct here.
                 tool_calls_used += 1
 
-                tool_records.append(
+                await _keep_record(
+                    tool_records,
                     ToolCallRecord(
                         tool=_safe_identifier(tool_call.tool),
                         action=_safe_identifier(tool_call.action),
@@ -628,7 +675,8 @@ class Agent:
                         permission=result.permission.allowed,
                         success=result.success,
                         duration_ms=dispatch_duration_ms,
-                    )
+                    ),
+                    stream,
                 )
 
                 # Confirmation required and none carried → short-circuit.
@@ -685,6 +733,65 @@ class Agent:
             history=working_history,
             tool_records=tool_records,
         )
+
+    async def _stream_reply(
+        self,
+        context: list[LLMMessage],
+        tools_payload: list[dict[str, object]],
+        *,
+        stream: RunStream,
+        data_residency: bool,
+        max_retries: int,
+    ) -> LLMResponse | str:
+        """Make one LLM call through ``llm_policy.chat_stream``, reporting its text to ``stream``.
+
+        Each delta's text goes to ``stream.on_delta`` in order as it arrives.
+        The wait for the next item races ``stream.stop``: a stop cancels the
+        pending read at once (also while the provider sends nothing), and a
+        stop set between items ends the call before the next read. The stream
+        is closed however the call ends.
+
+        Returns:
+            The final ``LLMResponse``, used like ``chat()``'s; or, once stopped
+            first, the text forwarded so far (its tool calls are dropped).
+
+        Raises:
+            Whatever the policy stream raises (the caller ends the run as for a
+            failed ``chat()``); deltas already forwarded stay forwarded.
+        """
+        items = llm_policy.chat_stream(
+            self._llm,
+            context,
+            tools_payload,
+            data_residency=data_residency,
+            max_retries=max_retries,
+        )
+        forwarded: list[str] = []
+        stopped = asyncio.ensure_future(stream.stop.wait())
+        read: asyncio.Future[LLMStreamDelta | LLMResponse] | None = None
+        try:
+            while not stream.stop.is_set():
+                read = asyncio.ensure_future(anext(items))
+                await asyncio.wait((read, stopped), return_when=asyncio.FIRST_COMPLETED)
+                if not read.done():
+                    break
+                item = read.result()
+                if isinstance(item, LLMResponse):
+                    return item
+                forwarded.append(item.content)
+                await stream.on_delta(item.content)
+            return "".join(forwarded)
+        finally:
+            stopped.cancel()
+            if read is not None and not read.done():
+                read.cancel()
+                # Let the cancelled read unwind the provider stream before closing
+                # it. What it ended with no longer matters (the call was stopped),
+                # so it is read and dropped rather than logged by asyncio.
+                await asyncio.wait((read,))
+                if not read.cancelled():
+                    read.exception()
+            await items.aclose()
 
     async def _dispatch_one(
         self,
@@ -765,6 +872,7 @@ class Agent:
         working_history: list[LLMMessage],
         tool_records: list[ToolCallRecord],
         escalate_side_effects: bool,
+        stream: RunStream | None,
     ) -> AgentResult | None:
         """Resume an approved pending confirmation by dispatching the tool call.
 
@@ -774,7 +882,7 @@ class Agent:
         with the run's ``escalate_side_effects`` (GH-243: an escalated call
         stays an escalated ``confirm``), appends the resulting
         ``tool_result`` to ``working_history``, and records the call in
-        ``tool_records``.
+        ``tool_records`` (reported to ``stream`` when the run is streamed).
 
         Returns ``None`` on success, or a terminal ``AgentResult`` if the
         dispatch could not be recorded (H-1) — in which case the caller must
@@ -797,7 +905,8 @@ class Agent:
             return _audit_unavailable(working_history, tool_records)
         result, dispatch_duration_ms = dispatched
 
-        tool_records.append(
+        await _keep_record(
+            tool_records,
             ToolCallRecord(
                 tool=_safe_identifier(tool_call.tool),
                 action=_safe_identifier(tool_call.action),
@@ -805,7 +914,8 @@ class Agent:
                 permission=result.permission.allowed,
                 success=result.success,
                 duration_ms=dispatch_duration_ms,
-            )
+            ),
+            stream,
         )
 
         # Append the tool_result so the next LLM call sees a well-formed
@@ -1057,6 +1167,35 @@ def _audit_unavailable(
     return AgentResult(
         status="error",
         response=_AUDIT_UNAVAILABLE_MESSAGE,
+        history=history,
+        tool_calls=tool_records,
+    )
+
+
+async def _keep_record(
+    tool_records: list[ToolCallRecord], record: ToolCallRecord, stream: RunStream | None
+) -> None:
+    """Append a dispatch's record to the run's records, then report it to a streamed run."""
+    tool_records.append(record)
+    if stream is not None:
+        await stream.on_tool_call(record)
+
+
+def _stopped(
+    history: list[LLMMessage], tool_records: list[ToolCallRecord], response: str
+) -> AgentResult:
+    """Build the result of a run the user stopped (GH-8).
+
+    ``response`` is the text the interrupted LLM call forwarded ("" when the
+    stop came between calls or dispatches); when non-empty it also ends the
+    history as a plain assistant message (the call's tool calls are dropped).
+    """
+    if response:
+        history.append(LLMMessage(role="assistant", content=response))
+    logger.info("Agent run stopped (%d tool calls)", len(tool_records))
+    return AgentResult(
+        status="stopped",
+        response=response,
         history=history,
         tool_calls=tool_records,
     )
