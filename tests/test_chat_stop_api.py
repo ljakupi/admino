@@ -43,6 +43,12 @@ What is pinned:
   forwarded text as the assistant message (none without text), the last one
   with status ``stopped``; the concatenated delta frames equal that message
   as GET /api/chats/{id} shows it; the stop writes no audit row.
+- C11 (audit core L-1): the stopped reply and its deltas end at the forwarded
+  text's last ASCII whitespace (the unfinished last word is dropped, also after
+  a disconnect); a stop while the LLM is parked right after a delta ending
+  inside a runtime-built key stores the reply up to the key and puts no 8
+  characters of it in any frame, stored message or GET body, while the word
+  before an earlier ``tool_call`` is still sent whole.
 - Stop during a tool dispatch: the running call finishes after its release,
   is audited (one ``tool.call`` row) and sent as ``tool_call``; the second
   call of the batch is never dispatched; no follow-up LLM call; stored: user,
@@ -92,9 +98,10 @@ from admino import chat_titles, server
 from admino import main as main_module
 from admino.agent import Agent
 from admino.llm import LLMResponse, LLMStreamDelta
-from admino.models import AgentConfig, LLMMessage, ToolCall
+from admino.models import AgentConfig, LLMMessage, ToolCall, sanitize_display_text
 from admino.server import create_app
 from admino.tools import registry
+from tests.credential_keys import GITHUB_FINE_GRAINED, surviving_chunks
 from tests.db_fakes import FakeDb
 from tests.tenancy_world import (
     CHAT_NOT_FOUND,
@@ -853,15 +860,16 @@ async def test_chat_stop_before_the_first_delta_closes_the_parked_stream(
 async def test_chat_stop_after_deltas_stores_the_forwarded_text_as_the_stopped_reply(
     world: World, llm: _StreamLLM, app: FastAPI
 ) -> None:
-    """Three deltas, then the LLM parks: the stored assistant message is their raw
-    concatenation with status stopped, the frames are run_started, deltas,
-    message_saved{stopped}, done (the held-back last word flushed), and the deltas
+    """Four deltas, then the LLM parks: the stored assistant message is their raw
+    concatenation up to its last ASCII whitespace (C11: the unfinished last word "mo" is
+    dropped, the word split across "ans" and "wer " is kept) with status stopped, the
+    frames are run_started, deltas, message_saved{stopped}, done, and the deltas
     concatenate to the message as GET /api/chats/{id} shows it."""
     editor = world.a["editor"]
     db = world.db
     chat_id = seed_chat(db, editor, title="Notes")
     park = _Park()
-    llm.plan("Summarise the notes", ["Partial ", "ans", "wer", park, " never sent"])
+    llm.plan("Summarise the notes", ["Partial ", "ans", "wer ", "and mo", park, "re never sent"])
 
     async with _http(app) as http:
         turn = asyncio.create_task(_stream_turn(http, editor, chat_id, "Summarise the notes"))
@@ -876,7 +884,7 @@ async def test_chat_stop_after_deltas_stores_the_forwarded_text_as_the_stopped_r
     assert call.closed_while_parked
     assert _rows(db, chat_id) == [
         ("user", "Summarise the notes", None, "complete"),
-        ("assistant", "Partial answer", None, "stopped"),
+        ("assistant", "Partial answer and ", None, "stopped"),
     ]
     frames = _frames(streamed.text)
     names = _names(frames)
@@ -884,9 +892,70 @@ async def test_chat_stop_after_deltas_stores_the_forwarded_text_as_the_stopped_r
     assert names[-2:] == ["message_saved", "done"]
     assert set(names[1:-2]) == {"delta"}
     assert frames[-2] == _saved(db, chat_id, "stopped")
-    assert _delta_text(frames) == "Partial answer"
+    assert _delta_text(frames) == "Partial answer and "
     assert detail.status_code == 200, detail.text
     assert detail.json()["messages"][-1]["content"] == _delta_text(frames)
+
+
+async def test_chat_stop_inside_a_key_stores_and_streams_no_part_of_it(
+    world: World, llm: _StreamLLM, tools: _Tools, app: FastAPI
+) -> None:
+    """C11 (audit core L-1): the first LLM call says "Checking the vault" (no whitespace
+    after "vault") and asks for memory.store; the second one streams "Here is the key "
+    and a runtime-built GitHub fine-grained token one character short (which the display
+    redaction doesn't match), split over two deltas, and parks. POST /stop: "vault" was
+    sent before the ``tool_call`` (that answer was complete), the stored reply is "Here is
+    the key " (stopped), its deltas equal it as GET /api/chats/{id} shows it, and no
+    frame, stored message or GET body holds any 8 characters of the token's body."""
+    editor = world.a["editor"]
+    db = world.db
+    chat_id = seed_chat(db, editor, title="Keys")
+    key = GITHUB_FINE_GRAINED.key()
+    cut = key.text[:-1]
+    assert surviving_chunks(sanitize_display_text(cut), key), "fixture: shown when uncut"
+    park = _Park()
+    llm.plan(
+        "Show the deploy key",
+        [
+            "Checking the ",
+            "vault",
+            LLMResponse(content="Checking the vault", tool_calls=[_STORE_A]),
+        ],
+        ["Here is the key ", cut[:30], cut[30:], park, "1 never sent"],
+    )
+
+    async with _http(app) as http:
+        turn = asyncio.create_task(_stream_turn(http, editor, chat_id, "Show the deploy key"))
+        await _parked(park.parked, turn)
+        stop = await _stop(http, editor, chat_id)
+        streamed = await asyncio.wait_for(turn, _WAIT_S)
+        detail = await http.get(f"/api/chats/{chat_id}", headers=editor.cookie)
+
+    assert (stop.status_code, stop.json()) == (200, _STOPPED)
+    assert streamed.status_code == 200, streamed.text
+    assert [call.closed_while_parked for call in llm.streams] == [False, True]
+    assert tools.log == ["start store ship", "done store ship"]
+    assert _rows(db, chat_id) == [
+        ("user", "Show the deploy key", None, "complete"),
+        ("assistant", "Checking the vault", None, "complete"),
+        ("tool", _STORED_A, _STORE_A.tool_call_id, "complete"),
+        ("assistant", "Here is the key ", None, "stopped"),
+    ]
+    (record,) = db.messages_of(chat_id)[-1]["tool_calls"]
+    assert _frames(streamed.text) == [
+        ("run_started", {"chat_id": str(chat_id)}),
+        ("delta", {"text": "Checking the "}),
+        ("delta", {"text": "vault"}),
+        ("tool_call", record),
+        ("delta", {"text": "Here is the key "}),
+        _saved(db, chat_id, "stopped"),
+        ("done", {}),
+    ]
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["messages"][-1]["content"] == "Here is the key "
+    stored = " ".join(str(message["content"]) for message in db.messages_of(chat_id))
+    leaks = [surviving_chunks(text, key) for text in (streamed.text, detail.text, stored)]
+    assert leaks == [[], [], []]
 
 
 async def test_chat_stop_during_a_tool_dispatch_finishes_and_records_it_and_skips_the_rest(
@@ -1207,14 +1276,15 @@ async def test_chat_stop_leaves_another_streamed_chat_of_the_user_running(
 async def test_chat_stop_disconnect_while_the_llm_is_parked_stops_and_stores_the_turn(
     world: World, llm: _StreamLLM, app: FastAPI, spec_version: str, oserror: bool
 ) -> None:
-    """The client goes away while the LLM is parked after two deltas: the stream is
-    closed while still parked, the forwarded text is stored as the stopped reply, and the
-    request coroutine returns."""
+    """The client goes away while the LLM is parked after three deltas: the stream is
+    closed while still parked, the forwarded text is stored as the stopped reply (C11: up
+    to its last ASCII whitespace, the unfinished "ver" dropped), and the request
+    coroutine returns."""
     editor = world.a["editor"]
     db = world.db
     chat_id = seed_chat(db, editor, title="Report")
     park = _Park()
-    llm.plan("Write the report", ["Report ", "draft", park, "never sent"])
+    llm.plan("Write the report", ["Report ", "draft ", "ver", park, "sion never sent"])
 
     wire, request = _start_raw_turn(
         app, editor, chat_id, "Write the report", spec_version, oserror=oserror
@@ -1230,7 +1300,7 @@ async def test_chat_stop_disconnect_while_the_llm_is_parked_stops_and_stores_the
     assert not park.release.is_set()
     assert _rows(db, chat_id) == [
         ("user", "Write the report", None, "complete"),
-        ("assistant", "Report draft", None, "stopped"),
+        ("assistant", "Report draft ", None, "stopped"),
     ]
 
 

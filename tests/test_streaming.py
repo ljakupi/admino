@@ -43,6 +43,16 @@ What is pinned here:
   Unicode spaces are not boundaries, CR, LF and tab are; an empty feed returns
   ``[]``; ``flush()`` on nothing returns ``[]``; ``flush()`` resets (the next
   answer's invariant holds on its own). ``DisplayDeltas`` logs no text.
+- A cut answer (C11, audit core L-1): ``flush(*, complete=True)``, keyword-only;
+  ``complete=True`` is today's ``flush()``. ``complete=False`` drops the text
+  after the answer's last ASCII whitespace and sends a held ``Bearer`` word (no
+  token follows); nothing when the answer has no ASCII whitespace; it resets
+  like ``flush()``. INVARIANT: the answer stopped at EVERY index (fed whole and
+  split), the joined pieces equal ``sanitize_display_text(raw[:b])`` with ``b``
+  just after the last ASCII whitespace; every key format cut at every index
+  inside the key streams no 8-character window of it (the cut answer's display
+  never shows one); the same for Bearer tokens, GH-270 separators and removed
+  characters inside a key (VT, NEL, U+2028, U+001C: no boundary).
 - SSE frames through the existing ``server._make_sse_event(name, payload)``:
   parsed per the SSE spec (CR, LF and CRLF end a line, a blank line ends an
   event), a frame is exactly ONE event of that name whose data ``json.loads``
@@ -406,6 +416,42 @@ def _promptness_problems(feeds: list[str]) -> list[str]:
     if difference is not None:
         problems.append(f"after flush: {difference}")
     return problems
+
+
+def _cut_boundary(raw: str) -> int:
+    """C11's ``b`` of a cut answer: just after its last ASCII whitespace (0 when none)."""
+    return _after_last_ascii_ws(raw, len(raw))
+
+
+def _cut_problems(feeds: list[str], secrets: tuple[str, ...] = ()) -> list[str]:
+    """Every way an answer cut after ``feeds`` (then ``flush(complete=False)``) breaks C11:
+    the joined pieces must be ``sanitize_display_text(raw[:b])``, every piece a non-empty
+    ``str`` of at most 4096 characters, and no piece may hold an 8-character window of a
+    secret that this display text of the cut answer doesn't show."""
+    raw = "".join(feeds)
+    display = sanitize_display_text(raw[: _cut_boundary(raw)])
+    deltas = _streaming().DisplayDeltas()
+    pieces = [piece for text in feeds for piece in deltas.feed(text)]
+    pieces += deltas.flush(complete=False)
+    problems = [
+        f"bad piece {type(piece).__name__} of {len(piece)} chars"
+        for piece in pieces
+        if type(piece) is not str or not piece or len(piece) > _MAX
+    ]
+    difference = _first_difference("".join(map(str, pieces)), display)
+    if difference is not None:
+        problems.append(f"joined pieces != display text of the cut answer: {difference}")
+    for secret in secrets:
+        hidden = {window for window in _windows(secret) if window not in display}
+        leaked = {window for piece in pieces for window in hidden if window in str(piece)}
+        if leaked:
+            problems.append(f"{len(leaked)} windows of a secret streamed")
+    return problems
+
+
+def _cut_feeds(raw: str, seed: int) -> list[list[str]]:
+    """The cut answer fed whole, then in two seeded splits (random cuts, token-sized)."""
+    return [[raw], *_random_splits(raw, seed=seed, count=2)] if raw else [[raw]]
 
 
 def _module_tree() -> ast.Module:
@@ -830,6 +876,190 @@ class TestPromptness:
         splits = [[full], *_two_feed_splits(full), *_random_splits(full, seed=len(full))]
 
         failures = [(_cuts(feeds), p) for feeds in splits if (p := _promptness_problems(feeds))]
+
+        assert not failures, (len(failures), failures[:5])
+
+
+# ===========================================================================
+# 3b. DisplayDeltas: a cut answer (flush(complete=False), C11 / audit core L-1)
+# ===========================================================================
+
+# Answers stopped at every index (C11's invariant); secrets that must never stream in part.
+_CUT_TEXTS: Final[dict[str, tuple[str, tuple[str, ...]]]] = {
+    "prose": (
+        "Hello there!  The plan:\n\n1. Read\tthe invoices.\r\n2. Sum caf"
+        + chr(0xE9)
+        + " "
+        + chr(0x1F600)
+        + " Total:"
+        + NBSP
+        + "12 CHF, ref"
+        + IDEOGRAPHIC_SPACE
+        + "77 done.",
+        (),
+    ),
+    **{
+        f"bearer-{case}": (template.format(t=_bearer_token()), (_bearer_token(),))
+        for case, template in _BEARER_TEMPLATES.items()
+    },
+    **{
+        f"separator-{case}": (build(_OPENAI.text), (_OPENAI.text,))
+        for case, build in _SEPARATOR_TEXTS.items()
+    },
+    **{
+        f"{name}-inside-a-key": (
+            f"Key: {_OPENAI.text[:12]}{char}{_OPENAI.text[12:]} ok",
+            (_OPENAI.text,),
+        )
+        for name, char in (("vt", VT), ("nel", NEL), ("u2028", LINE_SEP), ("u001c", FILE_SEP))
+    },
+}
+
+
+class TestCutAnswer:
+    """``flush(complete=False)`` ends an answer that didn't complete (stopped, or the run
+    ended in an error or exception): the text after its last ASCII whitespace is dropped,
+    the Bearer hold-back no longer applies (nothing follows), then it resets."""
+
+    def test_streaming_flush_complete_is_keyword_only_and_true_is_todays_flush(self) -> None:
+        """``flush(*, complete=True)``: True (the default) is exactly ``flush()``, the
+        unfinished last word and a held Bearer word included."""
+        display_deltas = _streaming().DisplayDeltas
+        parameter = inspect.signature(display_deltas.flush).parameters.get("complete")
+        texts = (
+            "Hello wor",
+            "x Bearer ",
+            "x Bearer tok",
+            f"Here is the key {_OPENAI.text}",
+            "no-ascii-whitespace" + NBSP + "at-all",
+        )
+        mismatches = []
+        for text in texts:
+            for feeds in [[text], *_random_splits(text, seed=len(text), count=4)]:
+                default, explicit = display_deltas(), display_deltas()
+                by_default = [p for t in feeds for p in default.feed(t)] + default.flush()
+                complete = [p for t in feeds for p in explicit.feed(t)]
+                complete += explicit.flush(complete=True)
+                if by_default != complete or "".join(complete) != sanitize_display_text(text):
+                    mismatches.append(_cuts(feeds))
+
+        assert parameter is not None
+        assert (parameter.kind, parameter.default) == (inspect.Parameter.KEYWORD_ONLY, True)
+        assert mismatches == []
+
+    @pytest.mark.parametrize(
+        ("feeds", "sent", "flushed"),
+        [
+            (["Hello wor"], ["Hello "], []),
+            (["Here is the key ", _OPENAI.text[:6], _OPENAI.text[6:10]], ["Here is the key "], []),
+            (["one two\tthr"], ["one two\t"], []),
+            (["line one\r\nnext"], ["line one\r\n"], []),
+            (["x Bearer "], ["x "], ["Bearer "]),
+            (["x Bearer tok"], ["x "], ["Bearer "]),
+            (["Bearer Bearer ", "abc"], [], [f"{_REDACTED} "]),
+        ],
+        ids=[
+            "hello-wor",
+            "key-prefix",
+            "tab",
+            "crlf",
+            "held-bearer",
+            "bearer-and-unfinished-token",
+            "bearer-bearer",
+        ],
+    )
+    def test_streaming_cut_flush_drops_the_unfinished_last_word(
+        self, feeds: list[str], sent: list[str], flushed: list[str]
+    ) -> None:
+        """The contract's examples: ``"x Bearer "`` then ``flush(complete=False)`` sends
+        ``"Bearer "`` (no token follows a cut answer); the text after the last ASCII
+        whitespace (a key's first characters, a half word, a half token) is never sent."""
+        deltas = _streaming().DisplayDeltas()
+
+        pieces = [piece for text in feeds for piece in deltas.feed(text)]
+        rest = deltas.flush(complete=False)
+
+        assert (pieces, rest) == (sent, flushed)
+
+    def test_streaming_cut_flush_without_ascii_whitespace_returns_nothing(self) -> None:
+        """No ASCII whitespace in the whole answer: nothing was sent and the cut sends
+        nothing (NBSP, U+3000, VT, NEL and U+2028 are no boundary); on a fresh instance too."""
+        text = (
+            "Total:"
+            + NBSP
+            + "1'234.50CHF;"
+            + IDEOGRAPHIC_SPACE
+            + "ref="
+            + VT
+            + "INV-2026"
+            + NEL
+            + LINE_SEP
+            + _OPENAI.text[:12]
+        )
+        deltas = _streaming().DisplayDeltas()
+
+        per_feed = [deltas.feed(text[i : i + 5]) for i in range(0, len(text), 5)]
+        rest = deltas.flush(complete=False)
+
+        assert all(batch == [] for batch in per_feed)
+        assert rest == []
+        assert _streaming().DisplayDeltas().flush(complete=False) == []
+
+    def test_streaming_cut_flush_resets_for_the_next_answer(self) -> None:
+        """After a cut the next feeds start a new answer: the dropped half word doesn't
+        join the next text, and a ``Bearer`` sent by the cut doesn't redact the next
+        answer's first word."""
+        deltas = _streaming().DisplayDeltas()
+        token = _bearer_token(seed=7070)
+
+        first = "".join(deltas.feed("first answer unfini")) + "".join(deltas.flush(complete=False))
+        second = "".join(deltas.feed("shed second ")) + "".join(deltas.flush(complete=False))
+        third = "".join(deltas.feed("it ends with Bearer ")) + "".join(deltas.flush(complete=False))
+        fourth = "".join(deltas.feed(f"{token} tail ")) + "".join(deltas.flush())
+
+        assert (first, second, third, fourth) == (
+            "first answer ",
+            "shed second ",
+            "it ends with Bearer ",
+            f"{token} tail ",
+        )
+
+    @pytest.mark.parametrize("case", list(_CUT_TEXTS))
+    def test_streaming_answer_cut_at_every_index_streams_its_display_up_to_the_last_whitespace(
+        self, case: str
+    ) -> None:
+        """INVARIANT (C11): the answer stopped at EVERY index, fed whole or split: the
+        joined pieces are ``sanitize_display_text(raw[:b])``; a Bearer token or a key
+        (split by a removed character that ``str.isspace`` calls whitespace: no boundary)
+        never streams in part."""
+        text, secrets = _CUT_TEXTS[case]
+        for secret in secrets:
+            _assert_fully_redacted(text, (secret,))
+        failures = []
+        for stop in range(len(text) + 1):
+            for feeds in _cut_feeds(text[:stop], seed=stop):
+                problems = _cut_problems(feeds, secrets)
+                if problems:
+                    failures.append((stop, _cuts(feeds), problems))
+
+        assert not failures, (len(failures), failures[:5])
+
+    @pytest.mark.parametrize("key_id", _KEY_IDS)
+    def test_streaming_answer_cut_inside_a_key_streams_no_part_of_it(self, key_id: str) -> None:
+        """Every key format, the answer stopped at every index inside the key (its last
+        character included: a key with nothing after it is unfinished too), fed whole and
+        split: no piece holds an 8-character window of the key unless the cut answer's
+        display text shows it (it never does: the key is the unfinished word)."""
+        key = _KEYS[key_id]
+        head = "Here is the key "
+        text = f"{head}{key} for you."
+        failures = []
+        for stop in range(len(head) + 1, len(head) + len(key) + 1):
+            raw = text[:stop]
+            for feeds in [[head, raw[len(head) :]], *_cut_feeds(raw, seed=stop)]:
+                problems = _cut_problems(feeds, (key,))
+                if problems:
+                    failures.append((stop, _cuts(feeds), problems))
 
         assert not failures, (len(failures), failures[:5])
 

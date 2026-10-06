@@ -56,6 +56,14 @@ What is pinned:
 - Display deltas end to end: keys split across ``on_delta`` calls and a split
   ``Bearer`` token never reach a frame, in full or in part; the deltas equal the
   stored reply as GET /api/chats/{id} shows it.
+- A cut answer (C11, audit core L-1): the end of a ``stopped`` or ``error`` run,
+  an agent that raised and a chat trashed during the run drop the answer's
+  unfinished last word (``flush(complete=False)``), so deltas ending inside a key
+  (a GitHub fine-grained token one character short, which the display rules
+  don't match) put no 8 characters of it in any frame, and a stopped turn's
+  deltas equal its stored reply (the stub returns it cut, as the agent does); a
+  ``final`` or ``limit_reached`` run sends its last word, and text before a
+  ``tool_call`` is sent whole, also in a stopped run (``flush(complete=True)``).
 - Frame injection: blank lines, ``event:`` lines, CRLF and U+2028 in deltas and
   tool arguments: exactly one ``done``, every payload round-trips.
 - One active run per chat (C5.5): while a run of the chat (streamed or JSON)
@@ -93,7 +101,7 @@ import json
 import logging
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
 
@@ -113,6 +121,7 @@ from admino.models import (
 )
 from tests.conftest import default_test_platform_settings
 from tests.credential_keys import (
+    GITHUB_FINE_GRAINED,
     anthropic_api03_key,
     api_key,
     openai_project_key,
@@ -140,6 +149,7 @@ if TYPE_CHECKING:
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
+    from tests.credential_keys import ApiKey
     from tests.tenancy_world import Account, World
 
 # ---------------------------------------------------------------------------
@@ -1478,6 +1488,192 @@ def test_chat_stream_held_text_is_flushed_before_a_tool_call(
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]
+
+
+# ---------------------------------------------------------------------------
+# 6b. A cut answer drops its unfinished last word (C11, audit core L-1)
+# ---------------------------------------------------------------------------
+
+_KEPT: Final = "Here is the key "
+
+
+def _cut(text: str) -> str:
+    """C11: ``text`` up to and including its last ASCII whitespace ("" when none)."""
+    return text[: max(text.rfind(char) for char in " \t\n\r") + 1]
+
+
+def _cut_key() -> tuple[ApiKey, str]:
+    """A GitHub fine-grained token (realistic length == the rule's minimum) and its text
+    one character short: the display redaction doesn't match that, so an answer cut
+    there would show 81 of its 82 body characters if the cut word were sent (L-1)."""
+    key = GITHUB_FINE_GRAINED.key()
+    cut = key.text[:-1]
+    assert surviving_chunks(sanitize_display_text(cut), key), "fixture: shown when uncut"
+    return key, cut
+
+
+def _stopped_reply(*steps: str | ToolCall) -> _Reply:
+    """A run stopped during its last LLM call, as the agent returns it (C11): the text
+    after its last call is cut after its last ASCII whitespace, and stored as the
+    assistant reply only when that leaves text."""
+    played = _reply(*steps, status="stopped")
+    reply = _cut(played.response)
+    kept = (*played.new[:-1], *((_assistant(reply),) if reply else ()))
+    return replace(played, new=kept, response=reply)
+
+
+def _stop_during(script: _Script) -> None:
+    """Set the run's stop signal once its script played (what POST /stop does)."""
+
+    async def stop() -> None:
+        script.runs[-1].stream.stop.set()
+
+    script.during = stop
+
+
+def _trash_during(script: _Script, db: FakeDb, chat_id: uuid.UUID) -> None:
+    """Trash the chat once the run's script played (the chat is gone when it is stored)."""
+
+    async def trash() -> None:
+        db.chats[uuid.UUID(int=chat_id.int)]["deleted_at"] = datetime.now(UTC)
+
+    script.during = trash
+
+
+def test_chat_stream_stopped_run_inside_a_key_streams_and_stores_no_part_of_it(
+    world: World, client: TestClient, script: _Script
+) -> None:
+    """Stopped while the answer's last word is a key one character short (split across
+    deltas): no frame holds any 8 characters of its body; the deltas are the kept text,
+    equal to the stored reply as GET /api/chats/{id} shows it (flush(complete=False))."""
+    editor = world.a["editor"]
+    chat_id = _chat(world.db, editor)
+    key, cut = _cut_key()
+    script.queue(_stopped_reply(_KEPT, cut[:20], cut[20:]))
+    _stop_during(script)
+
+    response = _send(client, editor, chat_id)
+
+    frames = _stream(response)
+    assert frames == [
+        _started(chat_id),
+        _delta(_KEPT),
+        _saved(world.db, chat_id, "stopped"),
+        _DONE,
+    ]
+    assert surviving_chunks(response.text, key) == []
+    shown = _detail(client, editor, chat_id)["messages"][-1]
+    assert (shown["role"], shown["content"]) == ("assistant", "".join(_deltas(frames)))
+
+
+@pytest.mark.parametrize("outcome", ["error", "exception", "chat-trashed"])
+def test_chat_stream_failed_run_after_a_cut_key_streams_no_part_of_it(
+    world: World, client: TestClient, script: _Script, outcome: str
+) -> None:
+    """Deltas ending inside a key, then the run ends ``error``, the agent raises, or the
+    chat is trashed during the run: the unfinished word is dropped
+    (flush(complete=False)); no frame holds any 8 characters of the key's body."""
+    editor = world.a["editor"]
+    db = world.db
+    chat_id = _chat(db, editor)
+    key, cut = _cut_key()
+    steps = (_KEPT, cut[:20], cut[20:])
+    failure = "The model is not available right now."
+    if outcome == "error":
+        script.queue(
+            _reply(*steps, status="error", closing=failure, error_code="provider_unavailable")
+        )
+    elif outcome == "exception":
+        script.queue(_Reply(steps=steps, error=RuntimeError("agent failure 8 heron")))
+    else:
+        script.queue(_reply(*steps))
+        _trash_during(script, db, chat_id)
+
+    response = _send(client, editor, chat_id)
+
+    frames = _stream(response)
+    if outcome == "error":
+        ending = [_saved(db, chat_id, "error"), _error("provider_unavailable", failure)]
+    elif outcome == "exception":
+        ending = [_error("internal_error", "Internal error")]
+    else:
+        ending = [_error("chat_not_found", "Chat not found")]
+    assert frames == [_started(chat_id), _delta(_KEPT), *ending, _DONE]
+    assert surviving_chunks(response.text, key) == []
+
+
+def test_chat_stream_end_of_run_sends_or_drops_the_unfinished_word_by_outcome(
+    world: World, client: TestClient, script: _Script
+) -> None:
+    """The same answer "The answer is forty-two" (no whitespace after its last word)
+    under every outcome, one chat each: a ``final`` and a ``limit_reached`` run are
+    complete, their last word is sent (flush(complete=True)); a ``stopped`` or ``error``
+    run, an agent that raised and a chat trashed during the run cut it."""
+    editor = world.a["editor"]
+    db = world.db
+    answer = ("The answer is ", "forty-two")
+    failure = "The model is not available right now."
+
+    def prepare(outcome: str, chat_id: uuid.UUID) -> None:
+        if outcome == "final":
+            script.queue(_reply(*answer))
+        elif outcome == "limit_reached":
+            script.queue(
+                _reply("Looking ", _CALL_A, *answer, status="limit_reached", closing=_LIMIT_REPLY)
+            )
+        elif outcome == "stopped":
+            script.queue(_stopped_reply(*answer))
+            _stop_during(script)
+        elif outcome == "error":
+            script.queue(_reply(*answer, status="error", closing=failure, error_code="timeout"))
+        elif outcome == "exception":
+            script.queue(_Reply(steps=answer, error=RuntimeError("agent failure 8 heron")))
+        else:
+            script.queue(_reply(*answer))
+            _trash_during(script, db, chat_id)
+
+    sent: dict[str, list[str]] = {}
+    for outcome in ("final", "limit_reached", "stopped", "error", "exception", "chat-trashed"):
+        chat_id = _chat(db, editor)
+        prepare(outcome, chat_id)
+        sent[outcome] = _deltas(_stream(_send(client, editor, chat_id)))
+
+    complete = ["The answer is ", "forty-two"]
+    assert sent == {
+        "final": complete,
+        "limit_reached": ["Looking ", *complete, _LIMIT_REPLY],
+        "stopped": ["The answer is "],
+        "error": ["The answer is "],
+        "exception": ["The answer is "],
+        "chat-trashed": ["The answer is "],
+    }
+
+
+def test_chat_stream_stopped_run_sends_the_word_before_a_tool_call_and_cuts_only_the_last(
+    world: World, client: TestClient, script: _Script
+) -> None:
+    """A stopped run whose first call's text ends without whitespace before a tool call:
+    that word is sent before the ``tool_call`` (flush(complete=True): the call's answer
+    was complete), only the interrupted call's unfinished word is dropped, and the
+    deltas after the ``tool_call`` equal the stored reply."""
+    editor = world.a["editor"]
+    chat_id = _chat(world.db, editor)
+    script.queue(_stopped_reply("Let me look that up", _CALL_A, "Found it and mor"))
+    _stop_during(script)
+
+    frames = _stream(_send(client, editor, chat_id))
+
+    assert frames == [
+        _started(chat_id),
+        _delta("Let me look that "),
+        _delta("up"),
+        _tool_call(_record(_CALL_A)),
+        _delta("Found it and "),
+        _saved(world.db, chat_id, "stopped"),
+        _DONE,
+    ]
+    shown = _detail(client, editor, chat_id)["messages"][-1]
+    assert shown["content"] == "Found it and "
 
 
 # ---------------------------------------------------------------------------

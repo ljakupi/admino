@@ -23,6 +23,13 @@ Pinned here:
   its result appended; (e) the approved call of a resume always runs; (f) a
   stopped result has no error_code and no pending_confirmation; a stop after
   the final response arrived changes nothing.
+- C11 (audit core L-1/L-2): a stopped run's response, and its assistant message,
+  is the interrupted call's forwarded text up to and including its last ASCII
+  whitespace (space, tab, LF, CR; NBSP, U+3000 and U+2003 are no boundary), so a
+  key cut by the stop is dropped with its unfinished word; no message when that
+  leaves ""; capped at 65536 characters when a fake stream forwards more; a lone
+  surrogate in the forwarded text never makes the run raise (no ValidationError
+  carrying answer text). ``on_delta`` still gets every raw piece.
 - No log record carries a delta's text, a tool argument or the user message.
 
 The fake streaming LLM (``StreamLLM``, provider "infomaniak") plays one
@@ -66,6 +73,7 @@ from admino.models import (
 )
 from admino.permissions import PermissionsConfig, ToolPermissions
 from admino.tools.registry import clear_registry, register_tool
+from tests.credential_keys import openai_project_key
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable, Generator
@@ -87,6 +95,10 @@ _GENERIC_REPLY: Final = (
     "I hit an error while processing your request. Please try again in a moment."
 )
 _NOW: Final = datetime(2026, 10, 6, 9, 30, tzinfo=UTC)
+_NBSP: Final = chr(0xA0)
+_IDEOGRAPHIC_SPACE: Final = chr(0x3000)
+_EM_SPACE: Final = chr(0x2003)
+_LONE_SURROGATE: Final = chr(0xD83D)  # the high half of an emoji, without its low half
 _U_UMLAUT: Final = chr(0xFC)
 _LIGATURE_FI: Final = chr(0xFB01)
 _FULLWIDTH_A: Final = chr(0xFF21)
@@ -890,13 +902,15 @@ class TestStop:
     async def test_agent_stream_stop_after_two_deltas_keeps_exactly_the_forwarded_text(
         self, recorder: _Recorder
     ) -> None:
-        """(b) The forwarded text is the response and a plain assistant message; no new call."""
+        """(b) The forwarded text is the response and a plain assistant message; no new call.
+        The text ends with an ASCII whitespace, so the C11 cut keeps all of it (dropping an
+        unfinished last word is pinned in ``TestStopCut``)."""
         park = _Park()
         sink = _Sink()
         stream = _run_stream(sink)
         fake = StreamLLM(
             [
-                [_delta("Hello "), _delta("world"), park, _delta(" never"), _final("x")],
+                [_delta("Hello "), _delta("world "), park, _delta("never"), _final("x")],
                 [_final("never")],
             ]
         )
@@ -907,10 +921,10 @@ class TestStop:
         stream.stop.set()
         result = await _finish(task)
 
-        _assert_stopped(result, response="Hello world", records=[])
-        assert result.history == [_user("hello"), _assistant("Hello world")]
+        _assert_stopped(result, response="Hello world ", records=[])
+        assert result.history == [_user("hello"), _assistant("Hello world ")]
         assert result.history[-1].tool_use_blocks is None
-        assert sink.deltas == ["Hello ", "world"]
+        assert sink.deltas == ["Hello ", "world "]
         assert (len(fake.calls), fake.endings) == (1, {0: "parked"})
 
     async def test_agent_stream_stop_during_a_later_call_keeps_only_that_calls_text(
@@ -1078,6 +1092,176 @@ class TestStop:
         assert (result.status, result.response, result.error_code) == ("final", "Done.", None)
         assert result.history == [_user("hello"), _assistant("Done.")]
         assert sink.deltas == ["Done."]
+
+
+# ===========================================================================
+# 3b. A stopped reply drops its unfinished last word and stays bounded (C11)
+# ===========================================================================
+
+
+async def _stopped_after(
+    recorder: _Recorder, deltas: list[str], sink: _Sink, stream: Any
+) -> tuple[AgentResult | None, str | None]:
+    """Stream ``deltas`` then park; stop once all were forwarded. (result, None) or
+    (None, the exception's type name: never its text, which could hold the answer)."""
+    park = _Park()
+    fake = StreamLLM([[*map(_delta, deltas), park, _delta("never"), _final("never")]])
+    task = _start(_agent(fake, recorder), stream=stream)
+    await _until_set(park.reached, task)
+    await _until(lambda: len(sink.deltas) == len(deltas), task)
+    stream.stop.set()
+    try:
+        return await _finish(task), None
+    except Exception as exc:
+        return None, type(exc).__name__
+
+
+class TestStopCut:
+    """C11 (audit core L-1/L-2): a stopped run's response, and its assistant message, is the
+    interrupted call's forwarded text up to and including its last ASCII whitespace
+    (space, tab, LF, CR), then capped at 65536 characters; no message when that is "".
+    ``on_delta`` still gets every raw piece (the server's display deltas cut them)."""
+
+    async def test_agent_stream_stop_inside_a_key_drops_the_unfinished_word(
+        self, recorder: _Recorder
+    ) -> None:
+        """Deltas "Here is the key " and a key's first characters, parked, then the stop:
+        the response and the stored message end before the key."""
+        partial = openai_project_key().text[:10]
+        sink = _Sink()
+        stream = _run_stream(sink)
+
+        result, error = await _stopped_after(
+            recorder, ["Here is the key ", partial[:6], partial[6:]], sink, stream
+        )
+
+        assert error is None
+        assert result is not None
+        _assert_stopped(result, response="Here is the key ", records=[])
+        assert result.history == [_user("hello"), _assistant("Here is the key ")]
+        assert sink.deltas == ["Here is the key ", partial[:6], partial[6:]]
+
+    @pytest.mark.parametrize(
+        ("separator", "kept"),
+        [
+            (" ", "Kept text alpha "),
+            ("\t", "Kept text alpha\t"),
+            ("\n", "Kept text alpha\n"),
+            ("\r", "Kept text alpha\r"),
+            (_NBSP, "Kept text "),
+            (_IDEOGRAPHIC_SPACE, "Kept text "),
+            (_EM_SPACE, "Kept text "),
+        ],
+        ids=["space", "tab", "lf", "cr", "nbsp", "u3000", "em-space"],
+    )
+    async def test_agent_stream_stop_cuts_after_the_last_ascii_whitespace_only(
+        self, recorder: _Recorder, separator: str, kept: str
+    ) -> None:
+        """A stop set from ``on_delta`` after "alpha<sep>be" + "ta": an ASCII whitespace
+        ends the kept text; a Unicode space (NBSP, U+3000, U+2003) is no boundary, so
+        the whole last word goes."""
+        sink = _Sink()
+        stream = _run_stream(sink)
+        sink.on_delta_hook = lambda text: stream.stop.set() if text == "ta" else None
+        fake = StreamLLM(
+            [
+                [
+                    _delta("Kept text "),
+                    _delta(f"alpha{separator}be"),
+                    _delta("ta"),
+                    _delta("never"),
+                    _final("never"),
+                ],
+                [_final("never")],
+            ]
+        )
+
+        result = await _run(_agent(fake, recorder), stream=stream)
+
+        _assert_stopped(result, response=kept, records=[])
+        assert result.history == [_user("hello"), _assistant(kept)]
+        assert len(fake.calls) == 1
+
+    async def test_agent_stream_stop_with_no_ascii_whitespace_stores_no_reply(
+        self, recorder: _Recorder
+    ) -> None:
+        """Only an unfinished word was forwarded: the response is "" and no assistant
+        message is added."""
+        partial = openai_project_key().text[:14]
+        sink = _Sink()
+        stream = _run_stream(sink)
+
+        result, error = await _stopped_after(
+            recorder, [partial[:5], partial[5:] + _NBSP + "x"], sink, stream
+        )
+
+        assert error is None
+        assert result is not None
+        _assert_stopped(result, response="", records=[])
+        assert result.history == [_user("hello")]
+
+    async def test_agent_stream_stop_after_more_than_65536_characters_caps_the_reply(
+        self, recorder: _Recorder, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A fake stream that bypasses the client cap forwards 80000 characters of
+        16-character words, then the stop: the run ends stopped with the first 65536 of
+        them (no ValidationError), and no log record holds the answer's text."""
+        caplog.set_level(logging.DEBUG)
+        piece = ("CAPMARK-" + "abcdefg" + " ") * 1000
+        sink = _Sink()
+        stream = _run_stream(sink)
+
+        result, error = await _stopped_after(recorder, [piece] * 5, sink, stream)
+
+        assert error is None
+        assert result is not None
+        assert (result.status, result.error_code, len(result.response)) == ("stopped", None, 65536)
+        assert result.response == (piece * 5)[:65536]
+        assert result.history[-1] == _assistant(result.response)
+        assert "CAPMARK" not in _log_texts(caplog.records)
+
+    @pytest.mark.parametrize(
+        ("deltas", "kept"),
+        [
+            (["Kept SURRMARK" + _LONE_SURROGATE + " text ", "tail"], None),
+            (["Kept text ", "SURRMARK" + _LONE_SURROGATE], "Kept text "),
+        ],
+        ids=["in-the-kept-text", "in-the-dropped-word"],
+    )
+    async def test_agent_stream_stop_with_a_lone_surrogate_still_ends_stopped(
+        self,
+        recorder: _Recorder,
+        caplog: pytest.LogCaptureFixture,
+        deltas: list[str],
+        kept: str | None,
+    ) -> None:
+        """A fake delta holding a lone surrogate (the client strips them; a fake can
+        bypass it): the stopped run doesn't raise (no ValidationError carrying answer
+        text), ends ``stopped`` with a reply free of surrogates, and nothing of the answer
+        is logged. In the dropped last word, the cut alone removes it."""
+        caplog.set_level(logging.DEBUG)
+        sink = _Sink()
+        stream = _run_stream(sink)
+
+        result, error = await _stopped_after(recorder, deltas, sink, stream)
+
+        assert error is None
+        assert result is not None
+        assert (result.status, result.error_code, result.pending_confirmation) == (
+            "stopped",
+            None,
+            None,
+        )
+        assert not any(0xD800 <= ord(char) <= 0xDFFF for char in result.response)
+        if kept is None:
+            # The guard may strip or replace the surrogate, or keep no reply (C11/L-2).
+            allowed = {"", "Kept SURRMARK text ", "Kept SURRMARK" + chr(0xFFFD) + " text "}
+            assert result.response in allowed
+        else:
+            assert result.response == kept
+        reply = [_assistant(result.response)] if result.response else []
+        assert result.history == [_user("hello"), *reply]
+        assert "SURRMARK" not in _log_texts(caplog.records)
 
 
 # ===========================================================================
