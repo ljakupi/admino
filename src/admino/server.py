@@ -128,7 +128,9 @@ Routes:
   state, its binding cookie and the initiating session).
 - /                       — Static PWA files (public); a missing client route
   (outside /api and /health, last segment without an extension) gets
-  index.html for the PWA's router.
+  index.html for the PWA's router. Hashed assets (``assets/<name>-<hash>.<ext>``)
+  are ``Cache-Control: public, max-age=31536000, immutable``; everything else
+  the mount serves is ``no-cache`` (GH-244).
 
 Security notes:
 - Authentication is a server-side session (GH-149): the ``admino_session``
@@ -156,7 +158,7 @@ Security notes:
   legacy route, so alternating routes doesn't double the LLM rate. A cursor
   that doesn't decode is a 422 ``invalid_cursor``; no error repeats a title,
   message or cursor. A turn runs on the latest ``max_context_messages``
-  messages (``chats.load_recent_history``) and passes the chat's sticky
+  messages (``chats.load_turn``, with the chat) and passes the chat's sticky
   ``external_content`` flag, read under the chat's lock (an approval that
   waited for a running turn gets what that turn stored), as
   ``earlier_external_content`` (GH-243 covers the whole conversation); its new
@@ -414,13 +416,25 @@ Security notes:
   services) and passes it as ``tool_policy``, so one org's settings never
   reach another org's runs.
 - Prompt context per run (GH-170): every chat run (a message, an approved
-  confirmation) also loads the caller's ``PromptContext``
-  (``scoped_settings.load_prompt_context`` with
+  confirmation) also loads the caller's ``PromptContext`` (with
   ``TenantContext.from_principal``: the org's instructions and default
   response language, the user's response language, timezone and personal
   instructions; no account identifier) and passes it as ``prompt_context``,
   so a change applies to the next message. The instructions are content:
   never logged; a failing load is the generic 500 with no run started.
+- Send-path reads (GH-244): a message to a chat id reads the tool policy,
+  the prompt context and the chat's owner check in one statement
+  (``turn_setup.load_turn_setup``, scoped to the session's org and user; a
+  chat the caller can't reach is the same 404 before the hold), then, under
+  the chat's hold, the chat and its latest messages in one statement. The
+  legacy ``/api/message`` and ``/api/confirm`` keep the separate loaders
+  (``org_permissions.load_tool_policy``,
+  ``scoped_settings.load_prompt_context``).
+- Turn timings (GH-244): ``request_timing.TimingMiddleware`` (pure ASGI,
+  right inside ``RequestIdMiddleware``) logs one content-free line per
+  request on the three turn routes (the request ID, the route label, the
+  status, counts and durations only); a streamed turn's line is written by
+  its run task once the turn is stored and reported, before its title call.
 - Platform defaults apply without a restart (GH-160): the chat routes read
   the stored limits through the settings cache on every request (the message
   length, each agent run's tool-call, context and confirmation timeout
@@ -540,6 +554,7 @@ import functools
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from collections import OrderedDict
@@ -588,9 +603,11 @@ from admino import (
     password_reset,
     passwords,
     platform_users,
+    request_timing,
     scoped_settings,
     session_management,
     sessions,
+    turn_setup,
     untrusted,
 )
 from admino.access import Capability, Principal, can
@@ -918,12 +935,42 @@ def _is_client_route(path: str) -> bool:
     return not segments or (segments[0] not in _SERVER_PATH_PREFIXES and "." not in segments[-1])
 
 
+# Vite's output naming for bundled files (static-src/vite.config.ts: assetFileNames,
+# chunkFileNames, entryFileNames): ``assets/<name>-<8-char content hash>.<ext>``, matched
+# in full against the relative, "/"-separated path. Such a file never changes under its
+# name: a new build writes a new name.
+_HASHED_ASSET_PATH: Final = re.compile(r"assets/[^/]+-[A-Za-z0-9_-]{8}\.[A-Za-z0-9]+")
+_IMMUTABLE_CACHE: Final = "public, max-age=31536000, immutable"
+# Every other file keeps its name across releases (index.html, the service worker and
+# its registration, the manifest, workbox-*.js, fonts, icons): it changes in place, so a
+# browser must revalidate it on every use. StaticFiles' ETag / Last-Modified keep that
+# cheap: an unchanged file is a bodiless 304.
+_REVALIDATE_CACHE: Final = "no-cache"
+
+
+def _cache_control(path: str, status_code: int) -> str:
+    """The ``Cache-Control`` of the static mount's ``status_code`` response for ``path``.
+
+    ``path`` is the relative, normalized path StaticFiles resolves (OS
+    separators). Only a found hashed asset (200, or the 304 of a matching
+    ``If-None-Match``) is immutable; a missing one never is.
+    """
+    hashed = _HASHED_ASSET_PATH.fullmatch(path.replace(os.sep, "/")) is not None
+    return _IMMUTABLE_CACHE if hashed and status_code in (200, 304) else _REVALIDATE_CACHE
+
+
 class _SpaStaticFiles(StaticFiles):
     """StaticFiles that answer a missing client route with ``index.html``.
 
     The PWA routes on the client (history mode), so a first visit to an
     emailed ``/reset-password#token=...`` link or a reload of ``/login`` must
     get ``index.html`` rather than a 404.
+
+    Caching (GH-244): a hashed asset (``_HASHED_ASSET_PATH``) is cached for a
+    year as immutable; every other response of the mount (``index.html``, the
+    client-route fallback, the service worker, the manifest, fonts, icons, a
+    404 of a ``404.html``) gets ``no-cache``. A 404 raised for a missing file
+    is answered by the app's exception handler, without either.
 
     Security notes:
     - The fallback file is resolved by StaticFiles itself (fixed name
@@ -937,15 +984,18 @@ class _SpaStaticFiles(StaticFiles):
     """
 
     async def get_response(self, path: str, scope: Scope) -> Response:
-        """Serve ``path``, or ``index.html`` when it is a missing client route."""
+        """Serve ``path`` (``index.html`` for a missing client route) with its Cache-Control."""
         try:
             response = await super().get_response(path, scope)
         except StarletteHTTPException as exc:
             if exc.status_code != 404 or not _is_client_route(path):
                 raise
-            return await super().get_response("index.html", scope)
-        if response.status_code == 404 and _is_client_route(path):
-            return await super().get_response("index.html", scope)
+            response = await super().get_response("index.html", scope)
+        else:
+            if response.status_code == 404 and _is_client_route(path):
+                response = await super().get_response("index.html", scope)
+        # A client route has no extension, so its fallback never matches the hashed pattern.
+        response.headers["Cache-Control"] = _cache_control(path, response.status_code)
         return response
 
 
@@ -4177,12 +4227,16 @@ async def _streamed_run(
             frames.send("error", _CHAT_GONE_PAYLOAD)
         else:
             _report_stored(frames, stored)
+            # The turn's timing line ends here: the title call isn't part of the turn.
+            request_timing.finish()
             await _send_title(frames, run, result, stored)
     except Exception as exc:
         # A failed store (other than a trashed chat) or title read: the JSON route's 500.
         logger.error("Streamed run failed for chat %s: %s", safe_log(chat_id), type(exc).__name__)
         frames.send("error", _INTERNAL_ERROR_PAYLOAD)
     finally:
+        # Every other ending writes the line here (finish() writes it only once).
+        request_timing.finish()
         frames.end()
 
 
@@ -4198,11 +4252,17 @@ def _start_stream(
     ``POST /api/chats/{id}/stop`` reaches it, and the task takes the hold and
     the registration over (``_streamed_run``). The client leaving sets the
     same signal (``EventStreamResponse``).
+
+    The response ends before the run does, so the request's timing line is
+    detached from it (``request_timing.detach``): the task, which shares the
+    request's timing record, writes it once the turn is stored and reported.
     """
     stop = held.enter_context(_chat_runtime.stoppable(run.chat.id))
     frames = _RunFrames(run.chat.id)
     stream = RunStream(on_delta=frames.on_delta, on_tool_call=frames.on_tool_call, stop=stop)
     event_stream.detach(_streamed_run(held.pop_all(), run, start, stream, frames), stop=stop)
+    # Only once the task holds the run: a failure before that is still the request's line.
+    request_timing.detach()
     return EventStreamResponse(frames.relay(), stop=stop)
 
 
@@ -4217,19 +4277,30 @@ async def _chat_turn(
     """Run one user message in a chat and store the turn (the two turn routes).
 
     The caller spent the ``/api/message`` bucket. Expired confirmations are
-    reaped and the org's due critical permission promotions completed first.
-    The message length and the run's limits are the stored platform limits,
-    and its LLM retry limit the stored ``llm.max_retries`` (GH-242), read on
-    every request (GH-160: a change applies without a restart); so are the
+    reaped and the org's due critical permission promotions completed first
+    (in memory: a statement only for a due one). The message length and the
+    run's limits are the stored platform limits, and its LLM retry limit the
+    stored ``llm.max_retries`` (GH-242), read on every request through the
+    settings cache (GH-160: a change applies without a restart); so are the
     org's tool policy (GH-161, the org's data residency included) and the
-    caller's prompt context (GH-170, ``scoped_settings.load_prompt_context``:
-    the org's instructions and default response language, the user's
-    response language, timezone and personal instructions). A failing load
-    escapes before the run: the generic 500, nothing of it echoed or logged.
+    caller's prompt context (GH-170: the org's instructions and default
+    response language, the user's response language, timezone and personal
+    instructions). A failing load escapes before the run: the generic 500,
+    nothing of it echoed or logged.
 
-    A legacy session id is looked up first (``chats.find_legacy_chat``). A
-    session without a chat gets a server-generated id (uuid4) and its chat
-    is created only once that id's runtime entry is held
+    GH-244: a chat id's turn makes at most 3 statements before its LLM call
+    (the steady state: no session touch due, the settings cache warm, no due
+    promotion): the session lookup, the turn setup
+    (``turn_setup.load_turn_setup``: the policy, the prompt context and the
+    owner check, a chat the caller can't reach being the 404 before the
+    hold) and, under the hold, the chat with its latest messages
+    (``chats.load_turn``).
+
+    A legacy session id keeps its separate reads before the hold
+    (``org_permissions.load_tool_policy``,
+    ``scoped_settings.load_prompt_context``, ``chats.find_legacy_chat``;
+    until #177). A session without a chat gets a server-generated id (uuid4)
+    and its chat is created only once that id's runtime entry is held
     (``chats.get_or_create_legacy_chat``, GH-266): a 429 ``rate_limit`` or a
     503 ``chats_busy`` writes nothing. When a concurrent first message of
     the same session created the chat meanwhile, the turn runs in that chat,
@@ -4239,16 +4310,16 @@ async def _chat_turn(
     is going (a message, an approved confirmation, a denial being stored) the
     message is refused at once (``ChatRunActiveError``, the 409
     ``run_active``), with nothing run or stored and the chat's pending
-    confirmation untouched. Under the hold the chat is read again (a chat
+    confirmation untouched. Under the hold the chat and its latest
+    ``max_context_messages`` messages are read (``chats.load_turn``: a chat
     trashed meanwhile is the 404), a pending confirmation of the chat is
-    cancelled (a message instead of a confirmation), the latest
-    ``max_context_messages`` messages are loaded, a dangling ``tool_use`` gets
-    its synthetic cancelled result, and the agent runs with ``str(chat.id)``
-    as its session id and the chat's sticky ``external_content`` flag
-    (GH-243) as read under the hold. Then the turn is stored
-    (``_finish_run``: a confirmation it asks for is kept within the caller's
-    stored ``max_pending_confirmations``, else refused with ``rate_limit``,
-    GH-24).
+    cancelled (a message instead of a confirmation), a dangling ``tool_use``
+    gets its synthetic cancelled result, and the agent runs with
+    ``str(chat.id)`` as its session id and the chat's sticky
+    ``external_content`` flag (GH-243) as read under the hold. Then the turn
+    is stored (``_finish_run``: a confirmation it asks for is kept within the
+    caller's stored ``max_pending_confirmations``, else refused with
+    ``rate_limit``, GH-24).
 
     A JSON turn runs here and its chat's first exchange (the chat as read
     under the hold is untitled with ``title_source`` "auto", and the loaded
@@ -4256,7 +4327,9 @@ async def _chat_turn(
     is titled after the response is sent (``_title_call``, a background
     task). A streamed turn (GH-8) runs in a detached task that stores it,
     frees the chat, reports it and titles a first exchange before ``done``
-    (``_start_stream``). A chat trashed during the run titles nothing.
+    (``_start_stream``). A chat trashed during the run titles nothing. Either
+    way the title call comes after the request's timing line (GH-244) and
+    never counts in it.
 
     Args:
         principal: The logged-in principal (``chat.send`` checked).
@@ -4303,16 +4376,24 @@ async def _chat_turn(
             detail=f"Message exceeds maximum length of {max_len} characters",
         )
     tenant = TenantContext.from_principal(principal)
-    policy = await org_permissions.load_tool_policy(pool, tenant)
-    prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
     session_id: str | None = None
     # A legacy session id without a chat yet: its chat is created under the hold.
     new_session: str | None = None
-    # Resolves the chat (the 404); its flag may be stale by the time the hold is taken.
+    # Resolves the chat (the 404) before the hold; it is read again under the hold.
     if isinstance(chat_ref, UUID):
-        chat_id = (await chats.get_chat(pool, tenant, chat_ref)).id
+        # One statement for the policy, the prompt context and the owner check: a send
+        # makes at most 3 statements before its LLM call (GH-244).
+        setup = await turn_setup.load_turn_setup(pool, tenant, chat_ref)
+        if not setup.chat_found:
+            raise chats.ChatNotFoundError
+        policy = setup.policy
+        prompt_context = setup.prompt_context
+        chat_id = chat_ref
     else:
+        # The legacy route keeps its separate reads until it is retired (#177).
+        policy = await org_permissions.load_tool_policy(pool, tenant)
+        prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
         session_id = chat_ref
         try:
             chat_id = (await chats.find_legacy_chat(pool, tenant, chat_ref)).id
@@ -4338,17 +4419,18 @@ async def _chat_turn(
                 await held.enter_async_context(
                     _chat_runtime.hold(chat_id, tenant.user_id, wait=False)
                 )
-        # Read again under the hold: an approval that ran in front may have set
-        # external_content (GH-243), and this run must be escalated by it (audit M-1).
-        chat = await chats.get_chat(pool, tenant, chat_id)
+        # The chat and its latest messages, read under the hold in one statement: a chat
+        # trashed meanwhile is the 404, and an approval that ran in front may have set
+        # external_content (GH-243), which must escalate this run (audit M-1).
+        turn = await chats.load_turn(
+            pool, tenant, chat_id, limit=platform.limits.max_context_messages
+        )
+        chat, loaded = turn.chat, turn.history
         if _chat_runtime.pop_pending(chat.id) is not None:
             logger.info(
                 "Chat %s got a new message while a confirmation was pending: cancelled",
                 safe_log(chat.id),
             )
-        loaded = await chats.load_recent_history(
-            pool, tenant, chat.id, limit=platform.limits.max_context_messages
-        )
         logger.info("Processing message for chat %s", safe_log(chat.id))
         # Only an untitled chat's first exchange is titled: a stored reply means it had
         # one (a GH-66 notice is a user message and doesn't count).
@@ -6126,10 +6208,11 @@ def create_app(
 
     # --- Middleware ---
     # Starlette wraps the LAST added middleware outermost. Resulting order for a
-    # request: trusted proxy headers (when configured) -> CORS -> security
-    # headers -> cross-origin protection -> routes. Cross-origin protection
-    # (CSRF) therefore refuses a cross-origin write before authentication, rate
-    # limiting and handlers run, and its 403 still gets the security headers.
+    # request: request IDs -> turn timings -> trusted proxy headers (when
+    # configured) -> CORS -> security headers -> cross-origin protection ->
+    # routes. Cross-origin protection (CSRF) therefore refuses a cross-origin
+    # write before authentication, rate limiting and handlers run, and its 403
+    # still gets the security headers.
     app.add_middleware(CrossOriginProtectionMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
 
@@ -6146,14 +6229,21 @@ def create_app(
         allow_headers=["Content-Type"],
     )
 
-    # --- Trusted proxy headers (outermost) ---
-    # Added last, so CORS, the security headers, the CSRF check, the per-IP rate
+    # --- Trusted proxy headers (outside CORS and every middleware above) ---
+    # Added after them, so CORS, the security headers, the CSRF check, the per-IP rate
     # limits, the audit events and the handlers all see the client address and
     # scheme the trusted reverse proxy reports. Not installed without trusted
     # proxies: X-Forwarded-* headers are then ignored from every peer.
     trusted_proxies = list(config.server.trusted_proxies)
     if trusted_proxies:
         app.add_middleware(TrustedProxyHeadersMiddleware, trusted_proxies=trusted_proxies)
+
+    # --- Turn timings (GH-244) ---
+    # Right inside the request IDs: the timing line carries the request's ID, and
+    # it times every other middleware too, so a turn refused before its route (the
+    # CSRF 403) still logs its one line, and the 500 the request-ID middleware
+    # answers for an escaping exception is recorded as one.
+    app.add_middleware(request_timing.TimingMiddleware)
 
     # --- Request IDs (outermost, GH-158) ---
     # Added last, so every response (the CSRF 403, 404, 422, 429, static files
