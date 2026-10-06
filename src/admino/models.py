@@ -102,9 +102,11 @@ Security notes:
   character but tab, LF and CR, the set a ``ChatTitle`` refuses (GH-270). Tool
   arguments (``ToolCallRecord.args``, ``PendingConfirmationSummary.args``) get
   the credential rules at every depth, dict keys included; a value nested
-  deeper than ``_ARGS_MAX_DEPTH`` (8) becomes ``[SANITIZED]`` unread, and a
-  non-dict is redacted before it is refused, so the validation error holds no
-  key. ``SessionSummary`` strips control and direction-override characters
+  deeper than ``_ARGS_MAX_DEPTH`` (8) becomes ``[SANITIZED]`` unread, so does
+  any value or key that is not a string, None or an exact bool, int or float
+  (a subclass, an ``IntEnum`` member included), and a non-dict is redacted
+  before it is refused, so the validation error holds no key.
+  ``SessionSummary`` strips control and direction-override characters
   from the stored user agent.
 - All user-facing string fields have max_length constraints to prevent abuse.
 - ToolCall.args uses dict[str, Any] because LLM output is untyped JSON;
@@ -122,36 +124,72 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
   never formatting the key into loggable strings.
 - JWT pattern only matches tokens whose first segment starts with ``ey``.
 - Residual limits (GH-270), still not redacted:
-  - a key split by an invisible character outside the removal set (a
-    combining grapheme joiner, a variation selector, a Hangul filler,
-    U+2800): it isn't joined, so it isn't redacted whole, or not at all when
-    the split falls within the rule's minimum length;
-  - a key glued directly to an ASCII letter, digit or ``_`` (``ask-...``,
-    ``xhf_...``): not a token start, by design;
-  - a key whose ``sk`` prefix is split by a removed character with no removed
-    character before it, glued to a preceding letter (``as<SHY>k-proj-...``):
-    once the character is removed it reads ``ask-proj-...``, a key glued
-    directly;
-  - a key of a rule without a token start (``GOCSPX-``, ``rk_live_`` /
-    ``rk_test_``, ``ghp_`` / ``ghs_``, ``xox...``, ``1//``, ``ya29.``) split
-    by a removed character right before a complete key inside its own body
-    (``GOCSPX-ab<SHY>sk-<20 or more>``): the run is a separator, so the inner
-    key is redacted, and the outer key's start stays visible when it alone is
-    shorter than its rule's minimum;
-  - a key split by a removed character right before another key inside its
-    own body when the joined match wouldn't cover that inner key
-    (``github_pat_<50><SHY>AIza<35>-<10>``: the ``github_pat_`` body has no
-    ``-``), or when a word and a run come before the outer key
-    (``x<SHY>sk-proj-ab<ZWSP>sk-...``): the run is a separator, so the inner
-    key is redacted, and the outer key's start stays visible when it is
-    shorter than its rule's minimum;
-  - in tool arguments, a key split by any invisible character: arguments get
-    the credential rules only, not the display cleanup;
-  - key formats with no rule;
-  - a JWT whose last segment starts with a key prefix right after its dot:
-    only that segment is redacted, its header and payload stay visible (the
-    key rules run first);
-  - automatic chat titles stored before #264.
+  - Keys not redacted at all:
+    - key formats with no rule;
+    - a key glued directly to an ASCII letter, digit or ``_`` (``ask-...``,
+      ``xhf_...``, a key in ``_`` emphasis ``_<key>_``): not a token start,
+      by design. Only a model title trims a ``_`` at its start before it
+      redacts again, so there ``_<key>_`` and ``Title: _<key>_`` are
+      redacted (decision 11 (a)); elsewhere in it (``Key: _<key>_``), in a
+      message and in a fallback title the key stays visible;
+    - a key whose ``sk`` prefix is split by a removed character with no
+      removed character before it, glued to a preceding letter
+      (``as<SHY>k-proj-...``): once the character is removed it reads
+      ``ask-proj-...``, a key glued directly;
+    - in a model title, a reasoning block removed between a word and a key
+      (``a<think>...</think>sk-...``): it glues the two, a key glued
+      directly.
+  - Keys redacted only in part:
+    - a key split by an invisible character outside the removal set (a
+      combining grapheme joiner, a variation selector, a Hangul filler,
+      U+2800): it isn't joined, so it isn't redacted whole, or not at all
+      when the split falls within the rule's minimum length;
+    - a key split by whitespace, a line break or any visible character its
+      format doesn't allow (a key hard-wrapped in a pasted log; NBSP and
+      U+3000 become spaces under NFKC): only the piece that starts with the
+      prefix and reaches the rule's minimum is redacted;
+    - a JWT with a key prefix at a token start inside any segment (after its
+      dot, a ``-`` or a removed run): the key rules run first, so only the
+      key is redacted, from the prefix to the end of that segment (or to the
+      first character a narrower key format doesn't allow). The rest of the
+      JWT stays visible: the header, the payload, and the signature too when
+      the prefix is in the payload. The JWT can't be used without the
+      redacted part;
+    - a ``GOCSPX-`` or ``xox...`` credential whose body holds a key prefix
+      right after a ``-`` (``GOCSPX-<4>-sk-<20>``): the key rules run first,
+      so the characters before the prefix stay visible when they are shorter
+      than their rule's minimum (``1//`` and ``ya29.`` run before the key
+      rules and are redacted whole);
+    - a key of a rule without a token start (``GOCSPX-``, ``rk_live_`` /
+      ``rk_test_``, ``ghp_`` / ``ghs_``, ``xox...``, ``1//``, ``ya29.``)
+      split by a removed character right before a complete key inside its
+      own body (``GOCSPX-ab<SHY>sk-<20 or more>``): the run is a separator,
+      so the inner key is redacted, and the outer key's start stays visible
+      when it alone is shorter than its rule's minimum;
+    - a key split by a removed character right before another key inside
+      its own body when the joined match wouldn't cover that inner key
+      (``github_pat_<50><SHY>AIza<35>-<10>``: the ``github_pat_`` body has
+      no ``-``), or when a word and a run come before the outer key
+      (``x<SHY>sk-proj-ab<ZWSP>sk-...``): the run is a separator, so the
+      inner key is redacted, and the outer key's start stays visible when it
+      is shorter than its rule's minimum. That start can hold a complete key
+      joined to it (``github_pat_<6><SHY>hf_<34><ZWSP>AIza<35>-<10>``: the
+      joined ``hf_`` key is not a token start);
+    - a credential of an older bounded rule longer than its bound: the part
+      past the bound stays visible (``GOCSPX-`` and 100 body characters
+      leave the last 20). The bounds, in body characters: ``GOCSPX-`` 80,
+      ``1//`` and ``ya29.`` 512, ``ghp_`` / ``ghs_`` and ``xox<letter>-``
+      255, ``rk_live_`` / ``rk_test_`` 200, ``AKIA`` exactly 16, a Bearer
+      value 2048 and each JWT segment 2048. Only a JWT signature past its
+      bound leaves a tail: a header or payload longer than 2048 fails the
+      JWT rule, so the JWT may not be redacted at all (a later ``ey`` in a
+      long header starts a match there, the header's start stays visible).
+      This predates GH-270; only the token-start key rules
+      (``_TOKEN_START_KEYS``) have no upper bound.
+  - Elsewhere:
+    - in tool arguments, a key split by any invisible character: arguments
+      get the credential rules only, not the display cleanup;
+    - automatic chat titles stored before #264.
 - Primary defence is never placing raw credentials in loggable fields;
   ``_strip_credentials`` is a secondary safety net.
 """
@@ -335,8 +373,9 @@ _CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     # The token-start key rule runs before the JWT and Bearer rules (GH-270
     # decision 3): the Bearer rule stops after 2048 characters and the JWT rule
     # can start at an "ey" inside a key's body, so either would cut a key and
-    # leave the rest visible. A key that is the last segment of a JWT is
-    # redacted alone (a documented residual, see the module docstring).
+    # leave the rest visible. A key prefix at a token start inside a JWT
+    # segment is redacted as a key, and the rest of that JWT stays visible (a
+    # documented residual, see the module docstring).
     _KEY_RULE,
     _JWT_PATTERN,
     # NOTE: Fernet key pattern removed — regex-based redaction is unreliable for
@@ -473,8 +512,10 @@ def _redact_arg(value: object, depth: int) -> object:
     Every string goes through the credential rules only (invisible characters
     are kept): dict keys, dict values and list items. A tuple becomes a list.
     A value deeper than ``_ARGS_MAX_DEPTH`` becomes ``_SANITIZED_PLACEHOLDER``
-    unread, so the recursion stops at depth 9 whatever the nesting (no
-    ``RecursionError``, a cycle included).
+    unread, so the recursion stops at depth 9 whatever the nesting, on a cycle
+    too (no ``RecursionError``). There is no visited set: a wide cyclic or
+    shared structure would cost its width to the 8th power, but args are
+    always decoded JSON, which is acyclic and shares nothing.
     """
     if depth > _ARGS_MAX_DEPTH:
         return _SANITIZED_PLACEHOLDER
@@ -488,14 +529,18 @@ def _redact_arg(value: object, depth: int) -> object:
 
 
 def _redact_leaf(value: object) -> object:
-    """A string redacted, a bool, number or None kept, anything else the placeholder.
+    """A string redacted, None or an exact bool, int or float kept, else the placeholder.
 
     Any other type (bytes, a set, an object, a tuple used as a dict key) could
-    hold a key that no rule reads, so it is never shown (fail closed).
+    hold a key that no rule reads, so it is never shown (fail closed). That
+    includes every subclass of bool, int or float, an ``IntEnum`` member too
+    (GH-270 decision 11 (b)): its own ``__str__`` or ``__repr__`` could print
+    a key into a dump, and pydantic-core writes a non-str dict key with
+    ``str()``.
     """
     if isinstance(value, str):
         return _strip_credentials(value)
-    if value is None or isinstance(value, bool | int | float):
+    if value is None or type(value) in (bool, int, float):
         return value
     return _SANITIZED_PLACEHOLDER
 

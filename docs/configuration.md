@@ -700,34 +700,67 @@ Viewer's chats from before a role change stay stored, unused.
   keys included, and a value nested more than 8 levels deep shows as `[SANITIZED]`. The
   raw arguments the model sent to a tool are never shown.
 - **What redaction still misses.** Redaction is a safety net, not a guarantee. These
-  stay visible in messages and titles:
-  - a key split by an invisible character that isn't removed (a combining grapheme
-    joiner, a variation selector, a Hangul filler, the Braille blank U+2800): the parts
-    aren't joined, so the key isn't redacted whole, or not at all when the split falls
-    within the characters its rule needs at least;
-  - a key glued directly to a letter, digit or `_` (`ask-…`, `xhf_…`): that isn't the
-    start of a key, by design;
-  - a key whose `sk` is split by an invisible character with no invisible character
-    before it, glued to a letter (`as<soft hyphen>k-proj-…`): once the character is
-    removed it reads `ask-proj-…`, a key glued directly;
-  - the start of a Google OAuth secret or token (`GOCSPX-…`, `1//…`, `ya29.…`), a Stripe
-    restricted key (`rk_live_…`, `rk_test_…`), a GitHub `ghp_…`/`ghs_…` token or a Slack
-    token (`xox…`) split by an invisible character right before a complete key inside
-    its own body (`GOCSPX-ab<soft hyphen>sk-…`): the inner key is redacted, and the start
-    stays when it alone is shorter than its format's minimum;
-  - the start of a key split by an invisible character right before another key inside
-    its own body, when the joined key wouldn't cover that inner key
-    (`github_pat_<50 characters><soft hyphen>AIza<35 characters>-<10 characters>`), or
-    when a word and an invisible character come before it
-    (`x<soft hyphen>sk-proj-ab<zero-width space>sk-…`): the inner key is redacted, and
-    the start stays when it's shorter than its format's minimum;
-  - in tool call `args`, a key split by any invisible character: arguments get the
-    credential rules only, invisible characters aren't removed from them;
-  - key formats with no rule;
-  - the header and payload of a JWT whose last part starts with a key prefix: only that
-    part is redacted;
-  - automatic titles stored before
-    [#264](https://github.com/ljakupi/admino/issues/264).
+  stay visible in messages and titles.
+  - Keys that aren't redacted at all:
+    - key formats with no rule;
+    - a key glued directly to a letter, digit or `_` (`ask-…`, `xhf_…`, or a key in `_`
+      emphasis such as `_AIza…_`): that isn't the start of a key, by design. The one
+      exception is a `_` at the very start of a title written by the model (`_AIza…_`,
+      `Title: _AIza…_`): it is trimmed first, so that key is redacted. Elsewhere in such
+      a title (`Key: _AIza…_`), and in a title made from your first message, the key
+      stays;
+    - a key whose `sk` is split by an invisible character with no invisible character
+      before it, glued to a letter (`as<soft hyphen>k-proj-…`): once the character is
+      removed it reads `ask-proj-…`, a key glued directly;
+    - in a title written by the model, a key right after a word and the model's
+      reasoning (`a<think>…</think>sk-…`): the reasoning is removed, which glues the word
+      and the key, a key glued directly.
+  - Keys redacted only in part:
+    - a key split by an invisible character that isn't removed (a combining grapheme
+      joiner, a variation selector, a Hangul filler, the Braille blank U+2800): the
+      parts aren't joined, so the key isn't redacted whole, or not at all when the split
+      falls within the characters its rule needs at least;
+    - a key split by a space, a line break or any visible character the key can't
+      contain, for example a key hard-wrapped in a pasted log (a non-breaking space and
+      the ideographic space U+3000 count as spaces): only the piece that starts with the
+      prefix is redacted, and only when it is at least as long as its format's minimum;
+    - a JWT with a key prefix inside any of its three parts, right after the part's dot,
+      a `-` or an invisible character: only the key is redacted, from its prefix to the
+      end of that part (or to the first character the key's format doesn't allow). The
+      rest of the JWT stays visible: the header, the payload, and the signature too when
+      the prefix is in the payload. The JWT can't be used without the redacted part;
+    - a Google OAuth client secret (`GOCSPX-…`) or a Slack token (`xox…`) whose body
+      holds a key right after a `-` (`GOCSPX-abcd-sk-…`): the key is redacted, and the
+      characters before it stay when they're shorter than their format's minimum;
+    - the start of a Google OAuth secret or token (`GOCSPX-…`, `1//…`, `ya29.…`), a
+      Stripe restricted key (`rk_live_…`, `rk_test_…`), a GitHub `ghp_…`/`ghs_…` token
+      or a Slack token (`xox…`) split by an invisible character right before a complete
+      key inside its own body (`GOCSPX-ab<soft hyphen>sk-…`): the inner key is redacted,
+      and the start stays when it alone is shorter than its format's minimum;
+    - the start of a key split by an invisible character right before another key
+      inside its own body, when the joined key wouldn't cover that inner key
+      (`github_pat_<50 characters><soft hyphen>AIza<35 characters>-<10 characters>`), or
+      when a word and an invisible character come before it
+      (`x<soft hyphen>sk-proj-ab<zero-width space>sk-…`): the inner key is redacted, and
+      the start stays when it's shorter than its format's minimum. That start can hold a
+      complete key joined to it, which then stays too: in
+      `github_pat_<6><soft hyphen>hf_<34><zero-width space>AIza<35>-<10>` (the numbers
+      are character counts), the `hf_` key is glued to the start;
+    - a credential of an older format that is longer than its rule allows: the part past
+      the limit stays visible, so `GOCSPX-` followed by 100 characters leaves the last 20.
+      The limits are 80 characters after `GOCSPX-`, 512 after `1//` and `ya29.`, 255
+      after `ghp_`/`ghs_` and after a Slack `xox…-` prefix, 200 after
+      `rk_live_`/`rk_test_`, exactly 16 after `AKIA` (an AWS key ID), 2048 for a Bearer
+      value, and 2048 for each of a JWT's three parts. For a JWT only a signature past the
+      limit leaves a visible end: when the header or the payload is longer than 2048
+      characters, the JWT may not be redacted at all. This was already the case before
+      [#270](https://github.com/ljakupi/admino/issues/270); only the key formats listed
+      above as redacted in full, whatever their length, have no limit.
+  - Elsewhere:
+    - in tool call `args`, a key split by any invisible character: arguments get the
+      credential rules only, invisible characters aren't removed from them;
+    - automatic titles stored before
+      [#264](https://github.com/ljakupi/admino/issues/264).
 - **Errors** use the usual `{"detail", "reason"}` body and never repeat what you sent. A
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":
