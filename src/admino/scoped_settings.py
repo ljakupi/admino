@@ -30,7 +30,10 @@ owner, and this module is the service behind their routes and the startup:
   same way, and ``load_prompt_context`` (GH-170) a chat run's prompt
   inputs: the org's instructions and default response language and the
   user's response language, timezone and personal instructions, in one
-  read of a live user of the tenant's org.
+  read of a live user of the tenant's org. Their pure row conversions
+  (``switches_from_row``, ``residency_from_value``,
+  ``prompt_context_from_row``) are shared with the send path's
+  one-statement turn setup (``turn_setup.load_turn_setup``, GH-244).
 - ``platform_settings`` (one row, the Super Admin): the LLM provider, one
   model per provider, (GH-242, migration 0022) the active model's
   capabilities (``max_input_tokens``, ``image_input``) and the LLM retry
@@ -863,7 +866,22 @@ async def org_residency(executor: sessions.Executor, tenant: TenantContext) -> b
         (fail closed: the Google and Microsoft tools stay off).
     """
     row: Record | None = await executor.fetchrow(_ORG_RESIDENCY_SQL, tenant.org_id)
-    return True if row is None else row["data_residency"] is not False
+    return residency_from_value(None if row is None else row["data_residency"])
+
+
+def residency_from_value(data_residency: bool | None) -> bool:
+    """Return the residency flag of a stored ``organizations.data_residency`` value.
+
+    Pure: shared by ``org_residency`` and the send path's turn setup (GH-244).
+
+    Args:
+        data_residency: The stored value, or None when the org row is missing.
+
+    Returns:
+        False only for a stored False; True otherwise (fail closed: a missing
+        org row keeps the Google and Microsoft tools off).
+    """
+    return data_residency is not False
 
 
 async def org_tools_enabled(executor: sessions.Executor, tenant: TenantContext) -> dict[str, bool]:
@@ -880,8 +898,31 @@ async def org_tools_enabled(executor: sessions.Executor, tenant: TenantContext) 
         Every tool name mapped to whether the org enabled its service.
     """
     row: Record | None = await executor.fetchrow(_ORG_SQL, tenant.org_id)
-    tools = ToolsSettings() if row is None else ToolsSettings.model_validate(dict(row))
-    return tools.model_dump()
+    return switches_from_row(row)
+
+
+def switches_from_row(row: Record | None) -> dict[str, bool]:
+    """Return an org's tool switches from its org_settings columns (named by tool).
+
+    Pure: shared by ``org_tools_enabled`` and the send path's turn setup
+    (GH-244), whose LEFT JOIN gives a missing row as NULL switch columns.
+
+    Args:
+        row: A row with one column per tool name (other columns are
+            ignored), or None.
+
+    Returns:
+        Every tool name mapped to whether the org enabled its service; every
+        tool on for a missing row (None, or every switch NULL: the columns are
+        NOT NULL, so only a LEFT JOIN without an org_settings row gives that).
+
+    Raises:
+        ValidationError: For any other non-boolean value (``ToolsSettings`` is
+            strict), so a broken row never switches a service on.
+    """
+    if row is None or all(row[tool] is None for tool in _TOOLS):
+        return ToolsSettings().model_dump()
+    return ToolsSettings.model_validate({tool: row[tool] for tool in _TOOLS}).model_dump()
 
 
 async def load_prompt_context(executor: sessions.Executor, tenant: TenantContext) -> PromptContext:
@@ -903,6 +944,25 @@ async def load_prompt_context(executor: sessions.Executor, tenant: TenantContext
         no org instructions.
     """
     row: Record | None = await executor.fetchrow(_PROMPT_CONTEXT_SQL, tenant.user_id, tenant.org_id)
+    return prompt_context_from_row(row)
+
+
+def prompt_context_from_row(row: Record | None) -> PromptContext:
+    """Return a run's ``PromptContext`` from its prompt-input columns.
+
+    Pure: shared by ``load_prompt_context`` and the send path's turn setup
+    (GH-244). Nothing is logged: the instructions are content.
+
+    Args:
+        row: A row with ``org_instructions``, ``personal_instructions``,
+            ``response_language``, ``default_response_language`` and
+            ``timezone`` (other columns are ignored), or None when no live
+            user of the tenant's org matched.
+
+    Returns:
+        The ``PromptContext``; ``PromptContext()`` for None. NULL
+        instructions read as none.
+    """
     if row is None:
         return PromptContext()
     return PromptContext(

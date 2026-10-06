@@ -4,8 +4,9 @@ The repository behind the chat routes and the agent turns: a member creates,
 lists, renames and trashes their own chats and reads one with a page of its
 messages (``read_chat_detail``); every turn appends the run's new messages
 (``append_messages``) and the next run loads the latest ones back
-(``load_recent_history``). The legacy ``session_id`` API keeps one chat per
-(user, session id) through ``chats.legacy_session_id`` until #177
+(``load_recent_history``; GH-244's send path reads the chat and them in one
+statement, S16, with ``load_turn``). The legacy ``session_id`` API keeps one
+chat per (user, session id) through ``chats.legacy_session_id`` until #177
 (``find_legacy_chat``, ``get_or_create_legacy_chat``). GH-66's promotion
 notice reaches every live chat of the org (``append_org_notice``), and the
 Super Admin's org metadata counts the org's chats (``count_org_chats``).
@@ -17,9 +18,9 @@ transactional writes (``trash_chat``, ``append_messages`` and
 (the server-generated id of a legacy chat to create); titles,
 ``LLMMessage``s and ``ToolCallRecord``s; page sizes and opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
-``MessagePage``, its message count and latest message status),
-``LLMMessage`` lists, counts, whether an automatic title was stored and the
-id of a turn's last appended message.
+``MessagePage``, its message count and latest message status), ``ChatTurn``
+(the chat and its history), ``LLMMessage`` lists, counts, whether an
+automatic title was stored and the id of a turn's last appended message.
 Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
 ``system`` message to store), ``audit_events.AuditRecordError`` and the
 driver's errors.
@@ -100,6 +101,7 @@ import contextlib
 import json
 import math
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
@@ -272,6 +274,26 @@ _SET_AUTO_TITLE_SQL: Final = """
         AND title_source = 'auto' AND title = ''
     RETURNING id
 """
+# S16 (GH-244): the caller's live chat with its latest messages (newest first) in ONE
+# statement, because the send path may make at most 3 statements before its LLM call; it
+# stands in for get_chat (S2) plus load_recent_history (S2 again, then S9). The window is
+# counted per chat (LATERAL) and the owner filters sit on the chat, so no row means not
+# found, and a chat without messages gives one row with NULL message columns.
+_TURN_SQL: Final = """
+    SELECT c.id, c.org_id, c.owner_user_id, c.title, c.title_source, c.external_content,
+           c.created_at, c.last_activity_at,
+           m.role, m.content, m.tool_use_blocks, m.tool_call_id
+    FROM chats c
+    LEFT JOIN LATERAL (
+        SELECT seq, role, content, tool_use_blocks, tool_call_id
+        FROM chat_messages
+        WHERE chat_id = c.id AND org_id = c.org_id
+        ORDER BY seq DESC
+        LIMIT $4
+    ) m ON true
+    WHERE c.id = $1 AND c.org_id = $2 AND c.owner_user_id = $3 AND c.deleted_at IS NULL
+    ORDER BY m.seq DESC
+"""
 
 
 class ChatNotFoundError(LookupError):
@@ -359,6 +381,14 @@ class ChatDetail(SealedModel):
     message_count: int
     # None for a chat without messages.
     latest_status: MessageStatus | None
+
+
+@dataclass(frozen=True)
+class ChatTurn:
+    """A chat of the caller and the agent's history of it, read by one statement (S16)."""
+
+    chat: ChatRecord
+    history: list[LLMMessage]
 
 
 def _utc_representable(value: datetime) -> datetime:
@@ -459,6 +489,29 @@ def _message_record(row: Any) -> MessageRecord:
             "tool_calls": _from_json(row["tool_calls"]),
         }
     )
+
+
+# Any: asyncpg returns untyped Records.
+def _history(rows: Sequence[Any]) -> list[LLMMessage]:
+    """The agent's history from a window of message rows read newest first.
+
+    Returns:
+        The messages in chronological order, their ``tool_use_blocks``
+        decoded, without the leading ``tool`` results whose assistant turn
+        fell outside the window.
+    """
+    history = [
+        LLMMessage(
+            role=row["role"],
+            content=row["content"],
+            tool_call_id=row["tool_call_id"],
+            tool_use_blocks=_from_json(row["tool_use_blocks"]),
+        )
+        for row in reversed(rows)
+    ]
+    # An orphan tool result first would break the provider's tool-call pairing.
+    start = next((i for i, message in enumerate(history) if message.role != "tool"), len(history))
+    return history[start:]
 
 
 async def create_chat(
@@ -775,18 +828,39 @@ async def load_recent_history(
     """
     await get_chat(executor, tenant, chat_id)
     rows = await executor.fetch(_LATEST_MESSAGES_SQL, chat_id, tenant.org_id, limit)
-    history = [
-        LLMMessage(
-            role=row["role"],
-            content=row["content"],
-            tool_call_id=row["tool_call_id"],
-            tool_use_blocks=_from_json(row["tool_use_blocks"]),
-        )
-        for row in reversed(rows)
-    ]
-    # An orphan tool result first would break the provider's tool-call pairing.
-    start = next((i for i, message in enumerate(history) if message.role != "tool"), len(history))
-    return history[start:]
+    return _history(rows)
+
+
+async def load_turn(
+    executor: Executor, tenant: TenantContext, chat_id: UUID, *, limit: int
+) -> ChatTurn:
+    """Return the caller's live chat and its latest messages as the agent's history (S16).
+
+    One statement, where ``get_chat`` plus ``load_recent_history`` take three:
+    the send path runs it under the chat's run lock as its last statement
+    before the LLM call (GH-244).
+
+    Args:
+        executor: The pool or a connection.
+        tenant: The caller's org scope.
+        chat_id: The chat.
+        limit: How many of the latest messages to load (the context window).
+
+    Returns:
+        The ``ChatTurn``: the chat as ``get_chat`` returns it and the history
+        as ``load_recent_history`` returns it (chronological, without the
+        leading ``tool`` results whose assistant turn fell outside the window).
+
+    Raises:
+        ChatNotFoundError: Unless the chat is the caller's and not trashed.
+    """
+    rows = await executor.fetch(_TURN_SQL, chat_id, tenant.org_id, tenant.user_id, limit)
+    if not rows:
+        raise ChatNotFoundError
+    chat = _chat_record({column: rows[0][column] for column in ChatRecord.model_fields})
+    # A chat without messages gives one row whose message columns are NULL (role is NOT NULL).
+    messages = [row for row in rows if row["role"] is not None]
+    return ChatTurn(chat=chat, history=_history(messages))
 
 
 async def read_chat_detail(

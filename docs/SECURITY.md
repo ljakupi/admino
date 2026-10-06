@@ -155,6 +155,8 @@ certificate, redirects HTTP to HTTPS and sends HSTS. It gets the same treatment 
 - **No request paths in logs.** Invitation and password reset tokens travel in URL paths.
   Caddy keeps no access log, and its default log leaves out `http.log.error` and the
   reverse proxy's logger, the two loggers that would print a request's path and query string.
+- **Compression skips event streams.** Caddy compresses responses (zstd, else gzip),
+  except chat event streams (`Accept: text/event-stream`), which it passes on unbuffered.
 - **Client IPs can't be spoofed.** Caddy replaces any `X-Forwarded-For` a client sends
   with the client's real address. The agent believes `X-Forwarded-For` and
   `X-Forwarded-Proto` only from Caddy's fixed address (`server.trusted_proxies`, set by
@@ -337,6 +339,11 @@ call, an OAuth connection, a crash) and scans everything the log handler wrote.
   unhandled exception is one line, `Unhandled exception: <ClassName>` with the request
   ID, and the client gets a generic 500 `{"detail": "Internal error"}` with the same
   `X-Request-ID`, so a report can be matched to its log line.
+- **Chat timings.** Each request to a route that sends a chat message or a confirmation
+  logs one `chat timings` line: the request ID, a fixed route label, the status,
+  statement counts and durations. It holds no other ID, no text, no title, tool or model
+  name, no SQL and no error message (see
+  [Configuration → Timing log](configuration.md#timing-log)).
 - **No query strings.** URLs are logged without their query string or fragment (a Gmail
   search puts the search text in `?q=`, the OAuth callback its code in `?code=`).
   uvicorn's access log stays off. The HTTP client and provider SDK loggers (httpx,

@@ -106,6 +106,13 @@ Security notes:
   stopped" line with the tool-call count is logged.
   Without a stream the run is exactly the JSON path (``llm_policy.chat``, not
   stoppable).
+- Timings (GH-244, ``admino.request_timing``): every LLM call of a run (its
+  retries and their waits included) runs inside ``request_timing.llm_call()``,
+  its first item (the JSON response, or a streamed call's first item, before
+  that item is forwarded) is marked by ``request_timing.llm_first_byte()``, and
+  each tool dispatch (not its recording) runs inside
+  ``request_timing.tool_call()``. The hooks see durations only, never the
+  call's messages, arguments or results.
 - Exceptions from the LLM client are caught and converted into a safe
   "error" AgentResult carrying the ``LLMError``'s ``code`` as ``error_code``
   (None for an uncoded error and any other exception). An ``LLMError`` with
@@ -144,7 +151,7 @@ from functools import partial
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
-from admino import llm_policy, prompt_assembly, untrusted
+from admino import llm_policy, prompt_assembly, request_timing, untrusted
 from admino.llm import LLMError, LLMResponse, strip_control_chars
 from admino.models import (
     AgentConfig,
@@ -548,22 +555,24 @@ class Agent:
                 # GH-242: the model policy (residency guard + bounded retries on
                 # this same client with this same context).
                 reply: LLMResponse | str
-                if stream is None:
-                    reply = await llm_policy.chat(
-                        self._llm,
-                        context,
-                        tools_payload,
-                        data_residency=tool_policy.data_residency,
-                        max_retries=config.llm_max_retries,
-                    )
-                else:
-                    reply = await self._stream_reply(
-                        context,
-                        tools_payload,
-                        stream=stream,
-                        data_residency=tool_policy.data_residency,
-                        max_retries=config.llm_max_retries,
-                    )
+                with request_timing.llm_call():
+                    if stream is None:
+                        reply = await llm_policy.chat(
+                            self._llm,
+                            context,
+                            tools_payload,
+                            data_residency=tool_policy.data_residency,
+                            max_retries=config.llm_max_retries,
+                        )
+                        request_timing.llm_first_byte()
+                    else:
+                        reply = await self._stream_reply(
+                            context,
+                            tools_payload,
+                            stream=stream,
+                            data_residency=tool_policy.data_residency,
+                            max_retries=config.llm_max_retries,
+                        )
             except (MemoryError, RecursionError):
                 raise
             except Exception as exc:
@@ -784,6 +793,10 @@ class Agent:
                 if not read.done():
                     break
                 item = read.result()
+                if not forwarded:
+                    # Nothing forwarded yet, so this is the call's first item
+                    # (a delta, or the final response, which returns at once).
+                    request_timing.llm_first_byte()
                 if isinstance(item, LLMResponse):
                     return item
                 forwarded.append(item.content)
@@ -840,16 +853,18 @@ class Agent:
                 permission=PermissionResult(allowed="deny", reason=_NO_ORG_CONTEXT_MESSAGE),
             )
         else:
-            result = await dispatch_tool_call(
-                tool_call,
-                tool_policy.permissions,
-                session_id=session_id,
-                tenant=tenant,
-                pending_confirmation=pending_confirmation,
-                promoted=tool_policy.promoted,
-                enabled_tools=tool_policy.enabled_tools or None,
-                escalate_side_effects=escalate_side_effects,
-            )
+            # The dispatch only: the recorder's write below isn't tool time.
+            with request_timing.tool_call():
+                result = await dispatch_tool_call(
+                    tool_call,
+                    tool_policy.permissions,
+                    session_id=session_id,
+                    tenant=tenant,
+                    pending_confirmation=pending_confirmation,
+                    promoted=tool_policy.promoted,
+                    enabled_tools=tool_policy.enabled_tools or None,
+                    escalate_side_effects=escalate_side_effects,
+                )
         duration_ms = int((time.monotonic() - start) * 1000)
         try:
             await self._record_tool_call(

@@ -20,6 +20,7 @@ admino is configured by two things:
 - [Chats](#chats)
 - [Email (SMTP)](#email-smtp)
 - [Production deployment (TLS reverse proxy)](#production-deployment-tls-reverse-proxy)
+- [Performance](#performance)
 - [Data & storage](#data--storage)
 - [Egress whitelist](#egress-whitelist)
 
@@ -153,7 +154,8 @@ admino talks to Infomaniak's OpenAI-compatible endpoint
 `Qwen/Qwen3.5-122B-A10B-FP8` as the smaller alternative. Both take text and images, accept
 up to 200,000 input tokens and support function calling. As the Super Admin, `GET /api/platform/settings` lists the
 models your product offers (`GET …/openai/v1/models`) and shows whether the token is
-configured.
+configured. Their time to first token is measured with `make ttft`, and a rule based on
+it decides which one is the default: see [Model latency](#model-latency).
 
 **Privacy.** Processing happens in Infomaniak's data centers in Switzerland. Infomaniak
 states that queries are neither recorded nor used to train models or improve its
@@ -1165,6 +1167,9 @@ What the profile sets up:
 - **No request paths in logs.** Caddy keeps no access log, and the loggers that would
   print a request's path or query string are turned off: invitation and reset tokens are
   part of some URLs.
+- **Compressed, never buffered.** Caddy compresses responses with zstd or gzip, except
+  chat event streams, and passes every streamed piece on at once. See
+  [Compression and caching](#compression-and-caching).
 - **No local model, one process.** The profile never starts the `vllm` container, and the
   agent runs as a single uvicorn process in a single container. Pending confirmations, the
   per-chat run locks and the rate-limit counters live in that process's memory, so don't
@@ -1177,6 +1182,245 @@ certificate authority instead of Let's Encrypt. Check it with curl, e.g.
 `http://localhost` addresses to HTTPS, including the laptop profile on
 `http://localhost:8000`. If that happens, delete the `localhost` entry (in Chrome:
 `chrome://net-internals/#hsts`).
+
+## Performance
+
+A chat should feel fast. admino logs where each message's time goes on the server, checks
+the server's share against fixed budgets with `make perf`, and documents how to measure
+the model's share. The budgets:
+
+| Measure | Budget | Checked by |
+| --- | --- | --- |
+| Server overhead before the first LLM call (fake LLM) | p95 ≤ 100 ms | `make perf` |
+| `GET /api/chats` with 500 chats | p95 ≤ 150 ms | `make perf` |
+| SQL statements before the LLM call when you send a message | at most 3 | `make perf`, the timing log |
+| End to end, short prompt, chosen model: time to first token | p50 ≤ 3 s | manually, see [Model latency](#model-latency) |
+
+### Timing log
+
+Each request to the three chat routes that run a message writes one `INFO` line on the
+`admino.request_timing` logger: `POST /api/chats/{id}/messages` (JSON and streamed),
+`POST /api/message` and `POST /api/confirm/{id}`. Every request gets its line, whatever
+the outcome, refusals and errors included. No other route writes one.
+
+```
+chat timings: request_id=<hex> route=<chat_message|message|confirm> status=<int> db_queries=<n> db_queries_before_llm=<n|-> db_ms=<x.x> llm_start_ms=<x.x|-> llm_first_byte_ms=<x.x|-> llm_ms=<x.x> tool_ms=<x.x> total_ms=<x.x>
+```
+
+| Field | Meaning |
+| --- | --- |
+| `request_id` | The request's `X-Request-ID` (the ID every log line of the request carries), or `-`. |
+| `route` | `chat_message`, `message` or `confirm`: a fixed label, never the path (it holds an ID). |
+| `status` | The response's HTTP status. A streamed reply is `200`; a request that failed before it answered is `500`. |
+| `db_queries` | The SQL statements the request ran, the actions' and the audit log's included. |
+| `db_queries_before_llm` | The statements run before the first LLM call. `-` when there was no LLM call. |
+| `db_ms` | The statements' summed duration. |
+| `llm_start_ms` | Time from the request's arrival to its first LLM call: the server's overhead before the model starts. `-` when there was no LLM call. |
+| `llm_first_byte_ms` | Time from the request's arrival to the first thing the provider sent: a streamed reply's first piece, or a JSON reply's first answer. `-` when there was no LLM call. |
+| `llm_ms` | The summed duration of the request's LLM calls, retries and their waits included. |
+| `tool_ms` | The summed duration of the actions that ran, an approved action included. |
+| `total_ms` | Time from the request's arrival to the line. |
+
+- **Times** are milliseconds with one decimal. `llm_start_ms`, `llm_first_byte_ms` and
+  `total_ms` count from the request's arrival; `db_ms`, `llm_ms` and `tool_ms` are sums
+  over the request.
+- **A streamed reply's line** is written once its turn is stored and reported
+  (`message_saved`), not when the stream closes. A JSON reply's line is written when the
+  response has been sent.
+- **Titles don't count.** The automatic title's model call runs after the line is
+  written, so it's in none of the numbers.
+- **What a statement is.** Each `fetch`, `fetchrow`, `fetchval`, `execute` or
+  `executemany` on the app's database pool or one of its connections
+  (`database.TimedPool`). `BEGIN`, `COMMIT` and the pool's connection reset aren't
+  statements.
+- **Content-free.** The line holds the request ID, a fixed route label, the status,
+  counts and durations only: no chat, confirmation, user, organization or session ID, no
+  message or reply text, no title, tool or model name, no SQL and no error message.
+
+### Statements before the LLM call
+
+When you send a message (`POST /api/chats/{id}/messages`, JSON and streamed), the server
+runs exactly 3 SQL statements before its LLM call:
+
+1. the session lookup;
+2. the turn setup, in one statement: the organization's tool policy (data residency, the
+   service switches and the permission matrix), the languages, timezone and instructions
+   the assistant needs, and whether the chat is your own chat, not in the trash;
+3. the chat and its latest `max_context_messages` messages, read once the chat's run lock
+   is held.
+
+Permission promotions are checked in memory, without a statement. Three things add a
+statement, each to one request only:
+
+- a promotion that falls due is written, once;
+- the session's `last_seen_at` is updated, at most once a minute;
+- a message that finds the platform settings not cached yet (at most the first one after
+  a start) reads them once.
+
+`make perf` fails when a send runs more than 3, and in production every send's timing
+line shows its count as `db_queries_before_llm`. The older `POST /api/message` keeps its
+earlier reads until [#177](https://github.com/ljakupi/admino/issues/177) removes it, and
+`POST /api/confirm/{id}` doesn't send a message: neither has this budget, and both still
+write their timing line.
+
+### `make perf`
+
+`make perf` checks the server budgets. It's for development only, needs Docker, and isn't
+part of `make check` or CI.
+
+```bash
+make perf                       # the defaults
+PERF_SENDS=400 make perf        # more sends
+```
+
+What it does:
+
+1. Starts a throwaway `postgres:16` container on `127.0.0.1` (a free port, random
+   passwords), applies the migrations as the owner, and adds one organization, one
+   Editor and the platform settings.
+2. Runs the app in-process, connected as `admino_app`, with a fake LLM that answers
+   after a fixed latency.
+3. Creates a chat and sends messages to `POST /api/chats/{id}/messages`, alternating
+   JSON and streamed (SSE) sends, after a few warm-up sends that don't count. It reads
+   each send's timing line.
+4. Fills the user's chats up to 500 and times `GET /api/chats`.
+5. Prints p50 and p95 of the server overhead (`llm_start_ms`), of `llm_first_byte_ms`
+   and of `GET /api/chats`, and the most statements a send ran before the LLM call, each
+   with its budget and `PASS` or `FAIL`. It removes the container in every case.
+
+It measures the steady state: the per-user rate limits of the two measured routes are
+lifted for the run (or it would measure the throttle), the session is renewed every 45
+seconds so its `last_seen_at` update never falls in a measured send, and the cold
+platform settings cache and the chat's first exchange (its title) fall in the warm-up.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PERF_LLM_LATENCY_MS` | 50 | The fake LLM's latency, in milliseconds. |
+| `PERF_WARMUP` | 5 | Warm-up sends and list requests that don't count. |
+| `PERF_SENDS` | 200 | Measured sends, half JSON and half streamed. |
+| `PERF_LISTS` | 200 | Measured `GET /api/chats` requests. |
+
+It fails (exit status `1`) when the p95 overhead is above 100 ms, the p95 of
+`GET /api/chats` is above 150 ms, a send ran more than 3 statements before its LLM call,
+a send or list request failed, a send wrote no timing line, or the setup failed. The exit
+status is `0` when every budget holds, `2` when Docker isn't available or a `PERF_*`
+value is invalid, and `130` on Ctrl-C.
+
+The passwords are never printed, and nothing beyond the local container is contacted:
+the LLM is a fake and no email is sent. The output holds timings, counts, HTTP statuses
+and error codes only.
+
+### Compression and caching
+
+**Compression (production profile).** Caddy compresses every response with zstd, or
+gzip for a browser without zstd, except chat event streams (requests with
+`Accept: text/event-stream`). A compressor collects bytes before it writes them, which
+would hold back the reply's pieces. Caddy also flushes every write from the agent at once
+(`flush_interval -1`), so a streamed answer reaches the browser piece by piece and is
+never buffered.
+
+`make test-proxy` runs the proxy test: the profile's Caddyfile in the official
+`caddy:2.11.4-alpine` image, in front of a stub upstream, checks that a normal response
+is compressed and that an event stream arrives uncompressed, frame by frame. It needs
+Docker, so it runs on demand; `make check` skips it but always checks the Caddyfile's
+text.
+
+**Caching (every profile).** The app sets `Cache-Control` on the PWA files it serves:
+
+| Files | `Cache-Control` | Why |
+| --- | --- | --- |
+| Hashed assets: files under `assets/` named `<name>-<8-character hash>.<ext>` (the JavaScript, CSS and other files Vite builds) | `public, max-age=31536000, immutable` | A new build gives every changed file a new name, so a file never changes under its name. Browsers keep it for a year without asking again. |
+| Everything else: `index.html` (and the page a client route such as `/chat` gets), the service worker (`service-worker.js`, `registerSW.js`, `workbox-*.js`), `manifest.webmanifest`, fonts and icons | `no-cache` | These keep their names from one release to the next. A browser may keep a copy but checks it with the server before each use, so a new release reaches it at the next load. An unchanged file answers `304` without a body, so the check is cheap. |
+
+A missing file (`404`) never gets `immutable`, and API responses aren't touched.
+
+### Model latency
+
+Past the server's overhead, the wait for the first word is the model's. `make ttft`
+measures it for the two Infomaniak models. The operator runs it by hand, with the
+Infomaniak token in the shell:
+
+```bash
+set -a; source .env; set +a     # INFOMANIAK_API_TOKEN (INFOMANIAK_PRODUCT_ID is optional)
+make ttft                       # TTFT_RUNS=10 make ttft for more runs
+```
+
+- **What it sends.** For `Qwen/Qwen3.5-397B-A17B-FP8` and `Qwen/Qwen3.5-122B-A10B-FP8`,
+  a short prompt and a synthetic 20-page document (about 10,000 words, generated by the
+  tool, standing in for an attachment until attachments come with
+  [#188](https://github.com/ljakupi/admino/issues/188)), `TTFT_RUNS` times each (5 by
+  default, 1 to 50), after one warm-up request per model that doesn't count.
+- **How.** Each request is shaped like a chat turn (admino's system prompt and the tool
+  definitions of a default organization) and goes through admino's own Infomaniak
+  client, streamed, with `reasoning_effort: "none"` and the usual output cap, without
+  retries.
+- **What it measures.** The time to first token (TTFT): seconds from sending the request
+  to the first piece of the answer. Tokens per second: the completion tokens divided by
+  the seconds from the first piece to the end of the answer. When the provider reports
+  no token count, it's estimated as characters / 4 and marked "est.".
+- **What it prints.** The table rows below (the p50 of each model and prompt, with the
+  date) and the outcome of the default-model rule. It never prints the token or any
+  reply text.
+- **Exit status.** `0` when every run succeeded, `1` when a run failed or the rule can't
+  be decided, `2` when `INFOMANIAK_API_TOKEN` is missing or `TTFT_RUNS` is invalid, `130`
+  on Ctrl-C.
+
+**Results.** Replace these rows with `make ttft`'s output, its date line included:
+
+| Model | Prompt | TTFT p50 | Tokens/s p50 | Runs |
+| --- | --- | --- | --- | --- |
+| Qwen/Qwen3.5-397B-A17B-FP8 | short prompt | not measured yet | not measured yet | not measured yet |
+| Qwen/Qwen3.5-397B-A17B-FP8 | 20-page document | not measured yet | not measured yet | not measured yet |
+| Qwen/Qwen3.5-122B-A10B-FP8 | short prompt | not measured yet | not measured yet | not measured yet |
+| Qwen/Qwen3.5-122B-A10B-FP8 | 20-page document | not measured yet | not measured yet | not measured yet |
+
+**The default model.** The beta default is `Qwen/Qwen3.5-397B-A17B-FP8`, unless its p50
+time to first token for the short prompt is above 3 s. In that case
+`Qwen/Qwen3.5-122B-A10B-FP8` becomes the default, and the 397B stays available to the
+Super Admin. `make ttft` prints which one the rule picks; the default
+(`llm.infomaniak_model`) changes only when the operator sets it. Until the table is
+filled in, the default is the 397B.
+
+**End to end.** With the chosen model as the platform's model, the time from sending a
+short message to the first word of the reply has a budget of p50 ≤ 3 s. Measure it in the
+browser:
+
+1. Open admino, signed in as an Admin or Editor, and open DevTools → **Network**.
+2. Send a short message. Select the message request and open its **EventStream** tab.
+3. Note the time from sending to the first `delta` event.
+4. Do it 5 times and take the median (the third value when sorted).
+
+The current PWA sends its messages as JSON, without streaming (the streaming chat comes
+with the new frontend). Until then, send the streamed request from the DevTools
+**Console** of a signed-in admino tab. This prints the time to the first `delta` event of
+5 sends:
+
+```js
+const chat = await (await fetch("/api/chats", {
+  method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+})).json();
+async function firstDelta() {
+  const start = performance.now();
+  const response = await fetch(`/api/chats/${chat.id}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+    body: JSON.stringify({ message: "Suggest three ways to make a weekly team meeting shorter." }),
+  });
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let text = "", first = null;
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    text += value;
+    if (first === null && text.includes("event: delta")) first = performance.now() - start;
+  }
+  return first === null ? `no delta (status ${response.status})` : `${(first / 1000).toFixed(2)} s`;
+}
+for (let i = 0; i < 5; i++) console.log(await firstDelta());
+```
+
+Each send reads its stream to the end, so every turn is stored as usual (in one new
+chat). Take the median of the 5 times.
 
 ## Data & storage
 
