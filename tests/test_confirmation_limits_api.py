@@ -37,7 +37,7 @@ pending-confirmation limit" decision):
   limited by someone else being at the limit.
 - ``ChatResponse.error_code`` accepts ``rate_limit``; ``AgentResult`` and
   ``LLM_ERROR_CODES`` don't have it; the OpenAPI schema lists it beside the
-  seven LLM codes.
+  eight LLM codes (GH-25 adds ``malformed_response``).
 - Logs name no message content, tool argument or confirmation id.
 
 New names (``server._utc_now``) are used lazily, so the file collects before
@@ -99,7 +99,7 @@ if TYPE_CHECKING:
 # Constants
 # ---------------------------------------------------------------------------
 
-# The seven LLM error codes of GH-242 (models.LLMErrorCode), spelled out.
+# The eight LLM error codes of GH-242 and GH-25 (models.LLMErrorCode), spelled out.
 _LLM_CODES: Final = frozenset(
     {
         "not_configured",
@@ -109,6 +109,7 @@ _LLM_CODES: Final = frozenset(
         "timeout",
         "residency_blocked",
         "context_too_long",
+        "malformed_response",
     }
 )
 # The tool result stored for the call whose confirmation was refused (contract section 4).
@@ -1011,7 +1012,7 @@ def test_confirmation_limits_users_and_orgs_never_count_for_each_other(
 
 def test_confirmation_limits_rate_limit_is_a_chat_response_code_only() -> None:
     """``ChatResponse`` accepts and serializes ``error_code="rate_limit"``; it is not an
-    LLM error code: ``AgentResult`` refuses it and ``LLM_ERROR_CODES`` stays the seven."""
+    LLM error code: ``AgentResult`` refuses it and ``LLM_ERROR_CODES`` stays the eight."""
     response = ChatResponse.model_validate(
         {
             "chat_id": str(uuid.UUID(int=24)),
@@ -1029,7 +1030,7 @@ def test_confirmation_limits_rate_limit_is_a_chat_response_code_only() -> None:
 
 
 def test_confirmation_limits_openapi_lists_rate_limit_beside_the_llm_codes() -> None:
-    """The contract clients read: ``ChatResponse.error_code`` admits exactly the seven LLM
+    """The contract clients read: ``ChatResponse.error_code`` admits exactly the eight LLM
     codes and ``rate_limit`` (or null)."""
     schema = make_app(stub_agent()).openapi()
     components = schema["components"]["schemas"]

@@ -64,6 +64,7 @@ def _make_llm_config(
         vllm_base_url=vllm_base_url,
         timeout_s=30,
         max_response_tokens=4096,
+        stream_deadline_s=300.0,
     )
 
 

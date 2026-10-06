@@ -44,6 +44,7 @@ def _make_llm_config(openai_model: str | None = "gpt-4o") -> Any:
         openai_model=openai_model,
         timeout_s=30,
         max_response_tokens=4096,
+        stream_deadline_s=300.0,
     )
 
 
@@ -863,11 +864,11 @@ class TestOpenAIAdversarial:
         assert result[0].args == {}
 
     def test_null_byte_in_json_arguments(self) -> None:
-        """Null bytes in JSON argument values don't cause crashes."""
+        """Null bytes in JSON argument values don't cause crashes and are removed (GH-25 D5)."""
         tc = [_make_openai_tool_call("memory.store", '{"key": "te\\u0000st"}', "call_01")]
         result = _parse_openai_tool_calls(tc)
         assert len(result) == 1
-        assert result[0].args["key"] == "te\x00st"
+        assert result[0].args["key"] == "test"
 
 
 # ---------------------------------------------------------------------------

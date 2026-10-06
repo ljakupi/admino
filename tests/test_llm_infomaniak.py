@@ -520,26 +520,44 @@ class TestInfomaniakChatResponse:
     async def test_infomaniak_chat_hallucinated_tool_name_rejected(
         self, client: Any, fake: FakeInfomaniak
     ) -> None:
-        """A tool name that fails the admino tool/action schema is dropped."""
+        """A tool name that fails the admino tool/action schema rejects the reply.
+
+        GH-25 (D2): the client raises ``malformed_response`` (fixed text naming
+        Infomaniak, raised ``from None``) instead of dropping the call.
+        """
         fake.chat = _reply(
             _completion(
                 "", tool_calls=[_tool_call("FAKE-Tool.hack", "{}")], finish_reason="tool_calls"
             )
         )
-        result = await client.chat(_msgs())
-        assert result.tool_calls == []
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_msgs())
+        error = exc_info.value
+        assert (error.code, error.message, error.__cause__, error.__suppress_context__) == (
+            "malformed_response",
+            "Infomaniak returned a malformed response. Please try again.",
+            None,
+            True,
+        )
 
     async def test_infomaniak_chat_malformed_tool_arguments_rejected(
-        self, client: Any, fake: FakeInfomaniak
+        self, client: Any, fake: FakeInfomaniak, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Malformed JSON tool arguments are dropped, not raised."""
+        """Malformed JSON tool arguments reject the reply as an error, not a crash.
+
+        GH-25 (D2): ``malformed_response`` instead of a dropped call; the arguments
+        never reach the error or any log record.
+        """
+        caplog.set_level(logging.DEBUG)
         fake.chat = _reply(
             _completion(
                 "", tool_calls=[_tool_call(arguments="not-json{")], finish_reason="tool_calls"
             )
         )
-        result = await client.chat(_msgs())
-        assert result.tool_calls == []
+        with pytest.raises(LLMError) as exc_info:
+            await client.chat(_msgs())
+        assert exc_info.value.code == "malformed_response"
+        _assert_not_leaked(exc_info.value, caplog, "not-json{")
 
     @pytest.mark.parametrize(
         ("finish_reason", "done"),

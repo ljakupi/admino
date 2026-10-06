@@ -61,7 +61,8 @@ What is pinned here:
   a CR, a colon-space injection or a space is refused (``ValidationError``
   from ``SSEEvent``). These frame tests pass before GH-8 (the helper exists):
   they are regression guards for the frames the stream now sends.
-- models.py: ``StreamErrorCode`` holds exactly the ten C5.3 codes;
+- models.py: ``StreamErrorCode`` holds exactly the ten C5.3 codes plus GH-25's
+  ``malformed_response`` (eleven);
   ``ChatStopResponse(stopped=...)`` dumps to ``{"stopped": ...}`` and refuses
   extra fields and a missing ``stopped``; ``AgentStatus`` gains ``"stopped"``
   and keeps its four values (``AgentResult`` accepts it).
@@ -153,6 +154,7 @@ _STREAM_ERROR_CODES: Final = frozenset(
         "timeout",
         "residency_blocked",
         "context_too_long",
+        "malformed_response",
         "rate_limit",
         "internal_error",
         "chat_not_found",
@@ -1139,7 +1141,7 @@ class TestSseFrames:
 class TestModels:
     """The stream's error codes, the stop answer and the stopped run status."""
 
-    def test_models_stream_error_code_is_exactly_the_ten_codes(self) -> None:
+    def test_models_stream_error_code_is_exactly_the_eleven_codes(self) -> None:
         values = _literal_values(models.StreamErrorCode)
 
         assert values == _STREAM_ERROR_CODES
