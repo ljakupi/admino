@@ -47,8 +47,17 @@ this file pins:
   is ``_`` is redacted whole in a model title and in a fallback title: alone, at
   the end of a sentence, mid-sentence, in ``**`` emphasis and in double quotes.
   Trimming first would cut the ``_``, leave the key one character short of its
-  rule and show the rest. (A key glued right after a leading ``_`` is the
-  documented "glued to ``_``" residual, so ``_..._`` is not a case here.)
+  rule and show the rest.
+- Model titles redact between their two trims (Decision 11 (a)): a model title
+  trims the leading edge characters, redacts, trims the trailing ones and
+  redacts again. The same key wrapped in ``_`` emphasis (``_<key>_``,
+  ``__<key>__``, ``*_<key>_*``, ``"_<key>_"``, ``Title: _<key>_``) or after a
+  lone leading ``_`` is exactly one marker in a model title: the leading ``_``
+  glues it (no token start) until the leading trim removes it, and the trailing
+  trim would then cut its last ``_``. The ``_..._`` cases cover model titles
+  only: in the message view and in a fallback title a key glued right after a
+  ``_`` stays the documented "glued to ``_``" residual, so neither has a
+  ``_..._`` case here.
 
 Keys are built at runtime by tests/credential_keys.py (a prefix concatenated
 from pieces, a seeded random body); no key literal is written in a test file.
@@ -571,3 +580,43 @@ class TestTitlesRedactBeforeTrimming:
         assert results == _EXPECTED_TITLES[function]
         assert all(REDACTED in result for result in results.values())
         assert surviving_chunks(" ".join(results.values()), key) == []
+
+
+# ===========================================================================
+# 7. Model titles redact between their two trims (Decision 11 (a))
+# ===========================================================================
+
+# A model title whose key sits in ``_`` emphasis: ``{key}`` is replaced by the key.
+_UNDERSCORE_EMPHASIS = {
+    "underscores": "_{key}_",
+    "double-underscores": "__{key}__",
+    "asterisk-and-underscore": "*_{key}_*",
+    "quoted-underscores": '"_{key}_"',
+    "label-then-underscores": "Title: _{key}_",
+    "leading-underscore-only": "_{key}",
+}
+
+
+class TestModelTitlesRedactBetweenTheTrims:
+    """Decision 11 (a): a model title redacts after its leading trim and again after the trailing.
+
+    Glued to a leading ``_``, the key is no token start, so the first redaction
+    misses it. Trimming both edges before the next redaction would also cut the
+    key's own last ``_``: ``minimum - 1`` body characters, no longer a key,
+    shown in full. Model titles only: in the message view and in a fallback
+    title, a key glued right after a ``_`` is the documented "glued to ``_``"
+    residual, so neither has a case here.
+    """
+
+    @pytest.mark.parametrize(
+        "fmt", [GOOGLE_API, GITHUB_FINE_GRAINED], ids=["google-api", "github-fine-grained"]
+    )
+    @pytest.mark.parametrize("placement", list(_UNDERSCORE_EMPHASIS))
+    def test_chat_titles_model_title_key_in_underscore_emphasis_is_redacted_whole(
+        self, placement: str, fmt: KeyFormat
+    ) -> None:
+        key = _ending_in_underscore(fmt)
+        assert (len(key.body), key.body[-1]) == (fmt.minimum, "_")
+        result = chat_titles.sanitize_title(_UNDERSCORE_EMPHASIS[placement].format(key=key.text))
+        assert result == REDACTED
+        assert surviving_chunks(result, key) == []

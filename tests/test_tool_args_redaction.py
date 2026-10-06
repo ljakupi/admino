@@ -15,6 +15,12 @@ full (audit finding I-4). What this file pins, for both models:
 - A tuple becomes a list. bool, int, float and None are kept as they are. Any other
   type (a set, bytes, an object) becomes ``"[SANITIZED]"``
   (``models._SANITIZED_PLACEHOLDER``).
+- Only the exact types are kept (decision 11 (b)): an int or float subclass whose
+  ``__str__`` and ``__repr__`` print a key, and an ``IntEnum`` member, become
+  ``"[SANITIZED]"`` as a top-level value, a list item and a nested dict key, and no
+  part of the key reaches ``repr(model.model_dump())`` or ``model.model_dump_json()``
+  (pydantic-core writes a non-str dict key with ``str()``). A plain ``True``, ``7``
+  and ``2.5`` keep their exact type.
 - Depth: ``args[k]`` is at depth 1 and the items of a container at depth d are at
   depth d + 1. A string at depth 8 is redacted and kept; any value at depth 9 (a
   string, a number, a dict or a list) becomes ``"[SANITIZED]"`` and nothing below it
@@ -44,6 +50,7 @@ import json
 import logging
 import uuid
 from datetime import UTC, datetime
+from enum import IntEnum
 from typing import TYPE_CHECKING, Any, Final
 from unittest.mock import AsyncMock, MagicMock
 
@@ -106,20 +113,28 @@ def _leaks(text: str) -> list[str]:
     return found
 
 
-def _record_args(args: Any) -> dict[str, Any]:
-    """The args a ``ToolCallRecord`` keeps after its sanitizer ran."""
-    record = ToolCallRecord(
+def _record(args: Any) -> ToolCallRecord:
+    """A ``ToolCallRecord`` built with ``args``."""
+    return ToolCallRecord(
         tool="gmail", action="search", args=args, permission="allow", success=True
     )
-    return record.args
+
+
+def _summary(args: Any) -> PendingConfirmationSummary:
+    """A ``PendingConfirmationSummary`` built with ``args``."""
+    return PendingConfirmationSummary(
+        confirmation_id="c1", tool="gmail", action="send", args=args, expires_at=_EXPIRES
+    )
+
+
+def _record_args(args: Any) -> dict[str, Any]:
+    """The args a ``ToolCallRecord`` keeps after its sanitizer ran."""
+    return _record(args).args
 
 
 def _summary_args(args: Any) -> dict[str, Any]:
     """The args a ``PendingConfirmationSummary`` keeps after its sanitizer ran."""
-    summary = PendingConfirmationSummary(
-        confirmation_id="c1", tool="gmail", action="send", args=args, expires_at=_EXPIRES
-    )
-    return summary.args
+    return _summary(args).args
 
 
 _SITES = pytest.mark.parametrize(
@@ -127,6 +142,16 @@ _SITES = pytest.mark.parametrize(
     [_record_args, _summary_args],
     ids=["tool-call-record", "pending-confirmation-summary"],
 )
+# The whole model behind each site, for the checks on its serialised forms.
+_MODEL_OF_SITE: Final[
+    dict[
+        Callable[[Any], dict[str, Any]],
+        Callable[[Any], ToolCallRecord | PendingConfirmationSummary],
+    ]
+] = {
+    _record_args: _record,
+    _summary_args: _summary,
+}
 
 
 def _in_lists(value: Any, depth: int) -> dict[str, Any]:
@@ -220,6 +245,32 @@ class TestNestedKeys:
         assert site(args) == {f"id {REDACTED}": "later"}
 
 
+class _IntPrintingAKey(int):
+    """An int subclass whose text forms hold a key (decision 11 (b))."""
+
+    def __str__(self) -> str:
+        return f"token {_KEY}"
+
+    def __repr__(self) -> str:
+        return f"token {_KEY}"
+
+
+class _FloatPrintingAKey(float):
+    """A float subclass whose text forms hold a key (decision 11 (b))."""
+
+    def __str__(self) -> str:
+        return f"token {_KEY}"
+
+    def __repr__(self) -> str:
+        return f"token {_KEY}"
+
+
+class _Level(IntEnum):
+    """An ``IntEnum``: its members are int subclass instances, not exact ints."""
+
+    HIGH = 3
+
+
 class TestValueTypes:
     """Scalars are kept, a tuple becomes a list, any other type becomes the placeholder."""
 
@@ -307,6 +358,62 @@ class TestValueTypes:
             "nested": [f"a{_SHY}b", {f"k{_ZWSP}": f"c{_DEL}d"}],
         }
         assert site(args) == args
+
+    @_SITES
+    @pytest.mark.parametrize(
+        "subclass", [_IntPrintingAKey, _FloatPrintingAKey], ids=["int-subclass", "float-subclass"]
+    )
+    def test_models_int_and_float_subclasses_become_the_placeholder(
+        self, site: Callable[[Any], dict[str, Any]], subclass: type[float]
+    ) -> None:
+        """Decision 11 (b): only an exact bool, int or float (or None) is kept.
+
+        A subclass kept as it is would print its key through
+        ``repr(model.model_dump())``, and as a dict key through
+        ``model.model_dump_json()`` too (pydantic-core writes a non-str key
+        with ``str()``). As a top-level value, a list item and a nested dict key
+        it becomes the placeholder, and neither serialised form holds any part
+        of the key.
+        """
+        args = {
+            "value": subclass(5),
+            "items": ["kept", subclass(6)],
+            "by_key": {subclass(7): "v"},
+        }
+        model = _MODEL_OF_SITE[site](args)
+        assert model.args == {
+            "value": PLACEHOLDER,
+            "items": ["kept", PLACEHOLDER],
+            "by_key": {PLACEHOLDER: "v"},
+        }
+        assert _leaks(repr(model.model_dump()) + model.model_dump_json()) == []
+
+    @_SITES
+    def test_models_int_enum_member_becomes_the_placeholder_and_exact_scalars_stay(
+        self, site: Callable[[Any], dict[str, Any]]
+    ) -> None:
+        """Decision 11 (b): an ``IntEnum`` member is no exact int, so it becomes the placeholder.
+
+        As a value, a list item and a nested dict key. Plain ``True``, ``7`` and
+        ``2.5`` beside it keep their exact type: the check is on the exact type,
+        and an exact scalar is never converted.
+        """
+        args = {
+            "level": _Level.HIGH,
+            "levels": [_Level.HIGH],
+            "by_level": {_Level.HIGH: "v"},
+            "plain": [True, 7, 2.5],
+        }
+        result = site(args)
+        assert (result, [type(item) for item in result["plain"]]) == (
+            {
+                "level": PLACEHOLDER,
+                "levels": [PLACEHOLDER],
+                "by_level": {PLACEHOLDER: "v"},
+                "plain": [True, 7, 2.5],
+            },
+            [bool, int, float],
+        )
 
 
 # ===========================================================================
