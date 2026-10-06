@@ -96,8 +96,16 @@ Security notes:
   ``admino.sessions`` and ``admino.audit_events`` constants.
 - Models that surface free text to users (ChatResponse, ToolCallRecord,
   PendingConfirmationSummary) strip credential patterns (OAuth tokens, JWTs,
-  Bearer headers) and dangerous Unicode via field validators. ``SessionSummary``
-  strips control and direction-override characters from the stored user agent.
+  Bearer headers, API keys) via field validators. Text shown to users
+  (``sanitize_display_text``: the live reply and a stored message) also
+  removes every control, format, surrogate and line/paragraph separator
+  character but tab, LF and CR, the set a ``ChatTitle`` refuses (GH-270). Tool
+  arguments (``ToolCallRecord.args``, ``PendingConfirmationSummary.args``) get
+  the credential rules at every depth, dict keys included; a value nested
+  deeper than ``_ARGS_MAX_DEPTH`` (8) becomes ``[SANITIZED]`` unread, and a
+  non-dict is redacted before it is refused, so the validation error holds no
+  key. ``SessionSummary`` strips control and direction-override characters
+  from the stored user agent.
 - All user-facing string fields have max_length constraints to prevent abuse.
 - ToolCall.args uses dict[str, Any] because LLM output is untyped JSON;
   individual tools validate args via their own Pydantic models before execution.
@@ -113,6 +121,28 @@ Credential redaction limitations (defence-in-depth, not primary barrier):
 - Fernet keys (44-char base64) removed due to false-positive risk; defended by
   never formatting the key into loggable strings.
 - JWT pattern only matches tokens whose first segment starts with ``ey``.
+- Residual limits (GH-270), still not redacted:
+  - a key split by an invisible character outside the removal set (a
+    combining grapheme joiner, a variation selector, a Hangul filler,
+    U+2800): it isn't joined, so it isn't redacted whole, or not at all when
+    the split falls within the rule's minimum length;
+  - a key glued directly to an ASCII letter, digit or ``_`` (``ask-...``,
+    ``xhf_...``): not a token start, by design;
+  - a key whose ``sk`` prefix is split by a removed character with no removed
+    character before it, glued to a preceding letter (``as<SHY>k-proj-...``):
+    once the character is removed it reads ``ask-proj-...``, a key glued
+    directly;
+  - the head of a key split by a removed character right before a complete
+    key inside its own body (``sk-proj-ab<SHY>sk-<20 or more>``): the run is
+    a separator, so the inner key is redacted, and the head stays visible when
+    it is shorter than its rule's minimum;
+  - in tool arguments, a key split by any invisible character: arguments get
+    the credential rules only, not the display cleanup;
+  - key formats with no rule;
+  - a JWT whose last segment starts with a key prefix right after its dot:
+    only that segment is redacted, its header and payload stay visible (the
+    key rules run first);
+  - automatic chat titles stored before #264.
 - Primary defence is never placing raw credentials in loggable fields;
   ``_strip_credentials`` is a secondary safety net.
 """
@@ -121,6 +151,7 @@ from __future__ import annotations
 
 import functools
 import re
+import sys
 import unicodedata
 import zoneinfo
 from datetime import UTC, datetime
@@ -152,8 +183,9 @@ from admino.permissions import (  # noqa: TC001 — Pydantic resolves field anno
     PermissionsConfig,
 )
 
-# Control characters to strip from free text shown to users (chat responses,
-# tool-call records, confirmation summaries) and from tool output.
+# Control characters to strip from SSE data (SSEEvent), from tool output sent
+# to the model (tools/registry.py) and from a stored user agent
+# (SessionSummary). Text shown to users removes a wider set (_REMOVED_RUN).
 # Keeps tab (0x09), newline (0x0A), carriage return (0x0D) because they are
 # legitimate in content.
 # Strips Unicode direction-override and zero-width characters that could
@@ -188,6 +220,87 @@ _CONTROL_CHAR_TABLE: MappingProxyType[int, None] = MappingProxyType(
     )
 )
 
+# The Unicode categories text shown to users removes (GH-270 decision 1):
+# control (Cc), format (Cf), surrogate (Cs), line separator (Zl) and paragraph
+# separator (Zp) characters, soft hyphens, word joiners and DEL included. Text
+# shown to users keeps tab, LF and CR; a chat title refuses them too
+# (CHAT_TITLE_BANNED_CATEGORIES is this set), so the message view and the
+# titles remove the same characters.
+_INVISIBLE_CATEGORIES: Final = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+_KEPT_CONTROLS: Final = frozenset("\t\n\r")
+
+
+def _removed_class() -> str:
+    """The regex class body of every removed code point, as ranges of ``\\U`` escapes.
+
+    Read once at import from the runtime's Unicode data (about 0.1 s), so the
+    set follows the Unicode version. Ranges (26 in Unicode 15), not 2,282
+    single code points: re matches a short range list about six times faster.
+    """
+    ranges: list[list[int]] = []
+    for code in range(sys.maxunicode + 1):
+        char = chr(code)
+        if char in _KEPT_CONTROLS or unicodedata.category(char) not in _INVISIBLE_CATEGORIES:
+            continue
+        if ranges and ranges[-1][1] == code - 1:
+            ranges[-1][1] = code
+        else:
+            ranges.append([code, code])
+    return "".join(f"\\U{first:08x}-\\U{last:08x}" for first, last in ranges)
+
+
+# One run of removed characters. A character class never backtracks: each
+# pass over the text is linear and runs in C.
+_REMOVED_RUN: Final[re.Pattern[str]] = re.compile(f"[{_removed_class()}]+")
+
+# API keys that start only at a token start: (prefix, body character class, the
+# real format's minimum body length). OpenAI sk-proj-, sk-svcacct-, sk-admin- and
+# plain sk- (about 164 characters, with "_" and "-") and Anthropic
+# sk-ant-<version>- (GH-264); Stripe secret keys, Google API keys, GitHub
+# fine-grained, OAuth, user-to-server and refresh tokens, Hugging Face and Groq
+# keys (GH-270 decision 4). One table builds both the rule and the separator
+# check below, so the two can't drift apart.
+_TOKEN_START_KEYS: Final[tuple[tuple[str, str, int], ...]] = (
+    ("sk-", r"[A-Za-z0-9_\-]", 20),
+    ("sk_(?:live|test)_", "[A-Za-z0-9]", 24),
+    ("AIza", r"[A-Za-z0-9_\-]", 35),
+    ("github_pat_", "[A-Za-z0-9_]", 82),
+    ("gh[our]_", "[A-Za-z0-9]", 36),
+    ("hf_", "[A-Za-z0-9]", 34),
+    ("gsk_", "[A-Za-z0-9]", 52),
+)
+# A key starts only at a token start: not right after an ASCII letter, ASCII
+# digit or "_" (risk-free-..., Ask-..., 2sk-..., xhf_... aren't keys), then at
+# least the minimum body. ASCII on purpose, not \b: Python's \b counts CJK,
+# kana and accented letters as word characters, so a key glued to Chinese,
+# Japanese or accented text would not be redacted at all. No upper bound on
+# purpose: an upper bound would leave the rest of a longer run as a visible
+# tail, so the whole run is redacted whatever its length (fail closed). No
+# trailing \b, so a key's final "-" goes too. Still linear: the lookbehind is
+# fixed-width, each branch is a literal prefix and one greedy class with
+# nothing after it (it never backtracks), and a failed branch reads fewer
+# characters than its prefix and minimum. One pattern, not one per format: a
+# leading lookbehind keeps re from scanning for a literal prefix, so each
+# pattern costs a full pass, and the leftmost key wins whatever its format.
+_KEY_RULE: Final[re.Pattern[str]] = re.compile(
+    "(?<![A-Za-z0-9_])(?:"
+    + "|".join(f"{prefix}{body}{{{minimum},}}" for prefix, body, minimum in _TOKEN_START_KEYS)
+    + ")"
+)
+# Where a run of removed characters separates a word from a key (GH-270
+# decision 2): right after an ASCII letter, digit or "_", a key prefix and its
+# rule's minimum body. Exact counts, no open bound: one check reads at most
+# 93 characters, so a text full of runs stays linear.
+_KEY_AFTER_WORD: Final[re.Pattern[str]] = re.compile(
+    "(?<=[A-Za-z0-9_])(?:"
+    + "|".join(f"{prefix}{body}{{{minimum}}}" for prefix, body, minimum in _TOKEN_START_KEYS)
+    + ")"
+)
+# Marks a separator while the credential rules run, then goes: NUL is in the
+# removal set, so the cleaned text never holds one, and it isn't an ASCII word
+# character, so the key after it starts at a token start.
+_SEPARATOR: Final = "\x00"
+
 # JWTs: three dot-separated base64url segments (header.payload.signature)
 # Upper bound of 2048 per segment covers all real JWTs and caps worst-case scanning.
 # Character class excludes = since RFC 7515 prohibits base64url padding in JWTs.
@@ -203,6 +316,12 @@ _JWT_PATTERN: Final[re.Pattern[str]] = re.compile(
 _CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"1//[A-Za-z0-9_\-]{20,512}"),  # Google OAuth refresh tokens
     re.compile(r"ya29\.[A-Za-z0-9_\-]{20,512}"),  # Google OAuth access tokens (bounded)
+    # The token-start key rule runs before the JWT and Bearer rules (GH-270
+    # decision 3): the Bearer rule stops after 2048 characters and the JWT rule
+    # can start at an "ey" inside a key's body, so either would cut a key and
+    # leave the rest visible. A key that is the last segment of a JWT is
+    # redacted alone (a documented residual, see the module docstring).
+    _KEY_RULE,
     _JWT_PATTERN,
     # NOTE: Fernet key pattern removed — regex-based redaction is unreliable for
     # 44-char base64 strings (false positives on UUIDs/hashes, false negatives when
@@ -210,19 +329,6 @@ _CREDENTIAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     # loggable string; keep it exclusively in memory from the env var.
     re.compile(r"Bearer\s+\S{1,2048}"),  # Bearer token header values (bounded)
     re.compile(r"GOCSPX-[A-Za-z0-9_\-]{20,80}"),  # Google OAuth client secrets
-    # Generic sk- API keys: OpenAI sk-proj-, sk-svcacct-, sk-admin- and plain sk-
-    # (about 164 characters, with "_" and "-") and Anthropic sk-ant-<version>-
-    # (with "_"). "sk-" starts a key only at a token start: not right after an
-    # ASCII letter, ASCII digit or "_" (risk-free-..., Ask-..., 2sk-... aren't
-    # keys), then at least 20 key characters. ASCII on purpose, not \b: Python's
-    # \b counts CJK, kana and accented letters as word characters, so a key glued
-    # to Chinese, Japanese or accented text would not be redacted at all. No upper
-    # bound on purpose: an upper bound would leave the rest of a longer run as a
-    # visible tail, so the whole run is redacted whatever its length (fail
-    # closed). No trailing \b, so a key's final "-" goes too. Still linear: the
-    # lookbehind is fixed-width, one greedy class with nothing after it never
-    # backtracks, and a failed start reads at most 19 characters.
-    re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9_\-]{20,}"),
     re.compile(r"rk_live_[A-Za-z0-9]{20,200}"),  # Stripe restricted keys (live)
     re.compile(r"rk_test_[A-Za-z0-9]{20,200}"),  # Stripe restricted keys (test)
     re.compile(r"gh[ps]_[A-Za-z0-9]{36,255}"),  # GitHub PATs and server tokens
@@ -259,15 +365,86 @@ def _strip_credentials(value: str) -> str:
     return value
 
 
+def _remove_runs(text: str) -> str:
+    """Remove every run of removed characters; one before a key becomes ``_SEPARATOR``.
+
+    Removed, a run between an ASCII letter, digit or ``_`` and a key
+    (``a<SHY>sk-...``) would glue the two together, so the key would no longer
+    start at a token start and would show in full (GH-270 decision 2). The key
+    is looked up in the text with every run removed, so removed characters
+    inside its prefix or body (``a<SHY>s<SHY>k-...``) don't hide it. Any other
+    run just goes, so a credential split by one is joined and redacted whole
+    (GH-264 L-2). Linear: one split, then one bounded check per run.
+    """
+    pieces = _REMOVED_RUN.split(text)
+    if len(pieces) == 1:
+        return text
+    cleaned = "".join(pieces)
+    kept = [pieces[0]]
+    position = len(pieces[0])
+    for piece in pieces[1:]:
+        if _KEY_AFTER_WORD.match(cleaned, position):
+            kept.append(_SEPARATOR)
+        kept.append(piece)
+        position += len(piece)
+    return "".join(kept)
+
+
 def sanitize_display_text(value: str) -> str:
-    """Strip control characters and credential patterns from text shown to users.
+    """Remove invisible characters and redact credentials in text shown to users.
 
     The live chat reply (``ChatResponse.response``) and a stored message
     (``ChatMessageView.content``) go through this same function, so a chat
     reads the same live and reloaded. Public because chat titles
     (``chat_titles``) are redacted and cleaned exactly like a stored message.
+
+    NFKC first, so a fullwidth letter or a fullwidth ``sk-`` counts in the
+    separator check; then every control, format, surrogate and
+    line/paragraph separator character but tab, LF and CR is removed
+    (``_remove_runs``), and the credential rules run. A run of them right
+    before a key leaves nothing: ``a<ZWSP>sk-...`` gives
+    ``a[CREDENTIAL_REDACTED]``.
     """
-    return _strip_credentials(value.translate(_CONTROL_CHAR_TABLE))
+    text = _remove_runs(unicodedata.normalize("NFKC", value))
+    return _strip_credentials(text).replace(_SEPARATOR, "")
+
+
+# The deepest tool-argument value kept (GH-270 decision 5): ``args[k]`` is at
+# depth 1, and the items of a container at depth d are at depth d + 1.
+_ARGS_MAX_DEPTH: Final = 8
+
+
+def _redact_arg(value: object, depth: int) -> object:
+    """Redact one tool-argument value found at ``depth`` (the args object itself is 0).
+
+    Every string goes through the credential rules only (invisible characters
+    are kept): dict keys, dict values and list items. A tuple becomes a list.
+    A value deeper than ``_ARGS_MAX_DEPTH`` becomes ``_SANITIZED_PLACEHOLDER``
+    unread, so the recursion stops at depth 9 whatever the nesting (no
+    ``RecursionError``, a cycle included).
+    """
+    if depth > _ARGS_MAX_DEPTH:
+        return _SANITIZED_PLACEHOLDER
+    if isinstance(value, dict):
+        # A dict's keys sit at its own depth. Two keys that redact to the same
+        # text: the later one wins.
+        return {_redact_leaf(key): _redact_arg(item, depth + 1) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_redact_arg(item, depth + 1) for item in value]
+    return _redact_leaf(value)
+
+
+def _redact_leaf(value: object) -> object:
+    """A string redacted, a bool, number or None kept, anything else the placeholder.
+
+    Any other type (bytes, a set, an object, a tuple used as a dict key) could
+    hold a key that no rule reads, so it is never shown (fail closed).
+    """
+    if isinstance(value, str):
+        return _strip_credentials(value)
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return _SANITIZED_PLACEHOLDER
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +519,9 @@ class ToolCallRecord(BaseModel):
     """Summary of a tool call included in a chat response.
 
     The ``args`` dict is sanitized via ``_sanitize_args`` to strip known
-    credential patterns from string values before the record reaches the
-    API layer or any log sink.
+    credential patterns from every string at every depth (dict keys
+    included, ``_ARGS_MAX_DEPTH`` levels) before the record reaches the API
+    layer or any log sink.
     """
 
     tool: str = Field(
@@ -376,9 +554,9 @@ class ToolCallRecord(BaseModel):
 
     @field_validator("args", mode="before")
     @classmethod
-    def _sanitize_args(cls, v: dict[str, Any]) -> dict[str, Any]:
-        """Strip credential patterns from string values in args."""
-        return {k: _strip_credentials(val) if isinstance(val, str) else val for k, val in v.items()}
+    def _sanitize_args(cls, v: object) -> object:
+        """Redact credentials at every depth; a non-dict is redacted, then refused."""
+        return _redact_arg(v, 0)
 
 
 class PendingConfirmationSummary(BaseModel):
@@ -419,9 +597,9 @@ class PendingConfirmationSummary(BaseModel):
 
     @field_validator("args", mode="before")
     @classmethod
-    def _sanitize_args(cls, v: dict[str, Any]) -> dict[str, Any]:
-        """Strip credential patterns from string values in args."""
-        return {k: _strip_credentials(val) if isinstance(val, str) else val for k, val in v.items()}
+    def _sanitize_args(cls, v: object) -> object:
+        """Redact credentials at every depth; a non-dict is redacted, then refused."""
+        return _redact_arg(v, 0)
 
 
 class ChatResponse(BaseModel):
@@ -2911,9 +3089,11 @@ TitleSource = Literal["auto", "user"]
 
 _CHAT_TITLE_MAX_LENGTH: Final = 200
 # A title is stored and shown in every chat list: the display-name rule plus
-# surrogates (Cs), which can't be stored as UTF-8. Public because an automatic
-# title (chat_titles) drops exactly the characters a ChatTitle refuses.
-CHAT_TITLE_BANNED_CATEGORIES: Final = _NAME_BANNED_CATEGORIES | {"Cs"}
+# surrogates (Cs), which can't be stored as UTF-8. The same object as the set
+# text shown to users removes (sanitize_display_text keeps tab, LF and CR),
+# so the two can't drift apart. Public because an automatic title
+# (chat_titles) drops exactly the characters a ChatTitle refuses.
+CHAT_TITLE_BANNED_CATEGORIES: Final = _INVISIBLE_CATEGORIES
 _CURSOR_MAX_LENGTH: Final = 200
 
 

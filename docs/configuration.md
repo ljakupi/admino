@@ -688,11 +688,38 @@ Viewer's chats from before a role change stay stored, unused.
   `tool_call_id` (tool results), `tool_calls`, a `status` and `created_at`. The last
   message of a turn carries the turn's outcome (`complete`, `error`,
   `awaiting_confirmation` or `limit_reached`) and its tool calls; the others are
-  `complete`. Control characters and credential-like text are stripped from the content,
-  like in a live reply and in automatic titles: API keys such as `sk-…`, `sk-proj-…` and
-  `sk-ant-…` become `[CREDENTIAL_REDACTED]` in full, whatever their length. `tool_calls`
-  is the same summary as in the live reply; the raw arguments the model sent to a tool
-  are never shown.
+  `complete`. Invisible characters (control and formatting characters such as zero-width
+  spaces, soft hyphens, word joiners and direction marks; tabs and line breaks stay) and
+  credential-like text are stripped from the content, like in a live reply and in
+  automatic titles. API keys such as `sk-…`, `sk-proj-…` and `sk-ant-…`, Stripe
+  `sk_live_…` and `sk_test_…`, Google `AIza…`, GitHub `github_pat_…`, `gho_…`, `ghu_…`
+  and `ghr_…`, Hugging Face `hf_…` and Groq `gsk_…` become `[CREDENTIAL_REDACTED]` in
+  full, whatever their length, also when invisible characters split them or sit between
+  them and the word before (`a[CREDENTIAL_REDACTED]`). `tool_calls` is the same summary
+  as in the live reply: credential-like text in its `args` is redacted at every depth,
+  keys included, and a value nested more than 8 levels deep shows as `[SANITIZED]`. The
+  raw arguments the model sent to a tool are never shown.
+- **What redaction still misses.** Redaction is a safety net, not a guarantee. These
+  stay visible in messages and titles:
+  - a key split by an invisible character that isn't removed (a combining grapheme
+    joiner, a variation selector, a Hangul filler, the Braille blank U+2800): the parts
+    aren't joined, so the key isn't redacted whole, or not at all when the split falls
+    within the characters its rule needs at least;
+  - a key glued directly to a letter, digit or `_` (`ask-…`, `xhf_…`): that isn't the
+    start of a key, by design;
+  - a key whose `sk` is split by an invisible character with no invisible character
+    before it, glued to a letter (`as<soft hyphen>k-proj-…`): once the character is
+    removed it reads `ask-proj-…`, a key glued directly;
+  - the start of a key split by an invisible character right before a complete key
+    inside its own body (`sk-proj-ab<soft hyphen>sk-…`): the inner key is redacted, and
+    the start stays when it's shorter than a key;
+  - in tool call `args`, a key split by any invisible character: arguments get the
+    credential rules only, invisible characters aren't removed from them;
+  - key formats with no rule;
+  - the header and payload of a JWT whose last part starts with a key prefix: only that
+    part is redacted;
+  - automatic titles stored before
+    [#264](https://github.com/ljakupi/admino/issues/264).
 - **Errors** use the usual `{"detail", "reason"}` body and never repeat what you sent. A
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":

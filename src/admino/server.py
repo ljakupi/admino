@@ -1258,7 +1258,7 @@ def _summarise_pending(pending: PendingConfirmation) -> PendingConfirmationSumma
 
     Includes sanitized tool arguments so the PWA can display call details
     in the confirmation card. Excludes the internal ``session_id``.
-    Credential patterns in string argument values are stripped by the
+    Credential patterns in the arguments are stripped at every depth by the
     ``PendingConfirmationSummary`` validator.
     """
     return PendingConfirmationSummary(

@@ -37,20 +37,42 @@ Security notes:
   time), so a residency org on a non-Swiss provider makes no request at all
   (``residency_blocked``) and gets the fallback.
 - The reply is untrusted: reasoning blocks, extra lines, markdown headings,
-  ``title:`` labels and surrounding quotes are dropped; the control, format,
-  surrogate and line/paragraph separator characters a ``ChatTitle`` refuses
-  (``models.CHAT_TITLE_BANNED_CATEGORIES``: Cc, Cf, Cs, Zl, Zp; whitespace
-  kept) are removed before the redaction, so a key split anywhere by one
-  (soft hyphen, word joiner, DEL) is joined first and redacted whole
-  (security audit L-2); then credentials are redacted and control characters
-  stripped exactly as for a stored message (``models.sanitize_display_text``,
-  NFKC included; API keys of the current formats, ``sk-proj-`` and ``sk-ant-``
-  among them, are redacted in full whatever their length), the banned
-  characters are removed once more and whitespace is collapsed. Residual
-  limit: a key split by an invisible character a title keeps (a combining
-  grapheme joiner, a variation selector, a Hangul filler) is not joined, so
-  it isn't redacted whole. The length is capped last, so a credential is never
-  cut before it is redacted. The fallback gets the same redaction and cleanup.
+  ``title:`` labels and surrounding quotes are dropped. Credentials are
+  redacted and the control, format, surrogate and line/paragraph separator
+  characters a ``ChatTitle`` refuses (``models.CHAT_TITLE_BANNED_CATEGORIES``:
+  Cc, Cf, Cs, Zl, Zp) removed exactly as for a stored message
+  (``models.sanitize_display_text``, NFKC included): the characters go
+  before the redaction, so a key split anywhere by one (soft hyphen, word
+  joiner, DEL) is joined first and redacted whole (security audit L-2), and
+  a run of them between a word and a key (``a<SHY>sk-...``) separates the
+  two instead of gluing them (GH-270). API keys of the current formats
+  (``sk-``, ``sk-proj-``, ``sk-ant-``, Stripe, Google, GitHub, Hugging Face,
+  Groq) are redacted in full whatever their length. The banned characters
+  are removed once more and whitespace is collapsed. A model title is
+  redacted before its quotes and emphasis are trimmed (a key may end in
+  ``_``) and once more after. The length is capped last, so a credential is
+  never cut before it is redacted. The fallback gets the same redaction and
+  cleanup.
+- Residual limit (GH-270), still not redacted:
+  - a key split by an invisible character outside the removal set (a
+    combining grapheme joiner, a variation selector, a Hangul filler,
+    U+2800): it isn't joined, so it isn't redacted whole, or not at all when
+    the split falls within the rule's minimum length;
+  - a key glued directly to an ASCII letter, digit or ``_`` (``ask-...``,
+    ``xhf_...``): not a token start, by design;
+  - a key whose ``sk`` prefix is split by a removed character with no
+    removed character before it, glued to a preceding letter
+    (``as<SHY>k-proj-...``): once the character is removed it reads
+    ``ask-proj-...``, a key glued directly;
+  - the head of a key split by a removed character right before a complete
+    key inside its own body (``sk-proj-ab<SHY>sk-<20 or more>``), when that
+    head is shorter than its rule's minimum;
+  - in tool arguments (never part of a title), a key split by any invisible
+    character: they get the credential rules only;
+  - key formats with no rule;
+  - the header and payload of a JWT whose last segment starts with a key
+    prefix: only that segment is redacted;
+  - automatic titles stored before #264.
 - A user rename always wins: the store is ``chats.set_auto_title``'s
   compare-and-set on the caller's live, untitled, automatic chat, so a rename
   that lands while the title is being generated is never overwritten.
@@ -178,16 +200,18 @@ def _drop_banned(text: str) -> str:
 
 
 def _redact_and_clean(text: str) -> str:
-    """Drop the banned characters, redact as for a stored message, single-space and strip.
+    """Redact and clean as for a stored message, drop the banned characters, single-space.
 
-    The banned characters go before the redaction: an invisible character that
-    the stored-message cleanup keeps (a soft hyphen, a word joiner, DEL) can
-    split a key anywhere, and removing it only after the redaction would join
-    the key's unredacted tail onto the marker (security audit L-2). They are
-    dropped once more after it, because a title must hold none and NFKC isn't
-    trusted to add none. Linear: three single passes.
+    ``sanitize_display_text`` removes the characters a ``ChatTitle`` refuses
+    (but tab, LF and CR) before it redacts, so a key split anywhere by one is
+    joined first (security audit L-2), and it reads a run of them before a key
+    as a separator (GH-270). Nothing may remove them before it: the run would
+    be gone before the separator check sees it, and the key glued to the word
+    before it. The banned characters are dropped once more after it, because a
+    title must hold none and NFKC isn't trusted to add none. Linear: two single
+    passes and the whitespace collapse.
     """
-    kept = _drop_banned(sanitize_display_text(_drop_banned(text)))
+    kept = _drop_banned(sanitize_display_text(text))
     return _WHITESPACE_RE.sub(" ", kept).strip()
 
 
@@ -196,10 +220,17 @@ def sanitize_title(raw: str) -> str:
 
     In order: reasoning blocks removed (an unclosed ``<think>`` drops the
     rest, an orphan ``</think>`` everything before it); the first line with
-    text kept; a leading heading marker or ``title:`` label (EN/DE/FR) and
-    the surrounding quote and emphasis characters stripped until neither
-    changes the text; banned characters removed and credentials redacted
-    (``_redact_and_clean``); trailing dots removed; truncated.
+    text kept; banned characters removed and credentials redacted
+    (``_redact_and_clean``); a leading heading marker or ``title:`` label
+    (EN/DE/FR) and the surrounding quote and emphasis characters stripped
+    until neither changes the text; redacted once more; trailing dots
+    removed; truncated.
+
+    The redaction comes before the trim (GH-270 decision 7): a key body may
+    end in ``_`` (Google ``AIza...``, GitHub ``github_pat_...``), and trimming
+    it first could leave the key one character short of its rule, shown in
+    full. The second pass fails closed for a key the trim exposed: one glued
+    to a leading ``_`` emphasis is no token start until the ``_`` goes.
 
     Args:
         raw: The model's reply.
@@ -222,7 +253,7 @@ def sanitize_title(raw: str) -> str:
             kept.append(part)
     lines = _LINE_BREAK_RE.split("".join(kept))
     text = next((line for line in lines if line.strip()), "")
-    text = _TRAILING_RE.sub("", _LEADING_RE.sub("", text))
+    text = _TRAILING_RE.sub("", _LEADING_RE.sub("", _redact_and_clean(text)))
     return truncate_title(_redact_and_clean(text).rstrip(". "))
 
 
