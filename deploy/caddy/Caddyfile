@@ -7,6 +7,11 @@
 # agent trusts those headers only from this container's address
 # (ADMINO_TRUSTED_PROXIES in docker-compose.prod.yml).
 #
+# Compression and streaming (GH-244): responses are compressed with zstd, else
+# gzip, except a chat event stream (Accept: text/event-stream), and every write
+# to the agent's stream is flushed at once, so an answer reaches the browser
+# frame by frame instead of being buffered.
+#
 # Logging: the site has no `log` directive, so there is no access log. The
 # loggers that print a request's path and query are excluded from the default
 # log as well: invitation and password reset tokens travel in URL paths
@@ -53,5 +58,13 @@
 		defer
 	}
 
-	reverse_proxy agent:8000
+	# Compression (GH-244): zstd, else gzip, for every response except a chat
+	# event stream (requested with Accept: text/event-stream).
+	@compressible not header Accept *text/event-stream*
+	encode @compressible zstd gzip
+
+	reverse_proxy agent:8000 {
+		# Flush every write at once: a streamed answer is never buffered.
+		flush_interval -1
+	}
 }

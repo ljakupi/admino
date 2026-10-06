@@ -228,6 +228,29 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   any (one new ``seq`` per row, in the chats' scan order). No row: NULL; more
   than one row: CardinalityViolationError; more than one column:
   PostgresSyntaxError.
+- GH-244's send path (contract C3: T1, the turn setup over organizations,
+  org_settings, users, chats and permissions; T2, a chat with its latest
+  messages) adds three reader features. ``ARRAY[a, b, ...]`` builds a list
+  (square brackets nest like parentheses for the reader). ``ARRAY(SELECT
+  <one column> FROM ... WHERE ...)`` goes wherever a value goes: one element
+  per row in the rows' order (a table without ORDER BY: its stored order;
+  ``[]`` when nothing matches, never NULL), correlated like a scalar
+  subquery; elements that are arrays give a list of lists, as asyncpg
+  decodes a two-dimensional array (a NULL or empty one:
+  NullValueNotAllowedError / ArraySubscriptError, and so are arrays of
+  different lengths; more than one column: PostgresSyntaxError). A
+  sub-select in FROM, ``[LEFT] JOIN [LATERAL] (SELECT ...) alias ON ...``
+  (or after a comma, without ON; the alias is required): its select list
+  names its columns (``alias.col``; an unknown one is UndefinedColumnError),
+  a LATERAL one runs once per combination of the items before it and reads
+  their columns (a non-LATERAL one runs once and can't: UndefinedTableError),
+  and a LEFT JOIN without a row keeps the outer row once with every
+  ``alias.*`` NULL; the outer ORDER BY may sort by any of its columns, selected
+  or not (NULLs first descending). Several LEFT JOINs whose ON conditions mix
+  bind parameters, outer columns and ``IS NULL`` work as before. Values come
+  back as asyncpg's (asyncpg UUIDs, inside arrays too; JSONB as the JSON text
+  stored). Both statements name chats, so they run on the reader after the
+  chat-table bind checks (UUID parameters, a bigint ``LIMIT $n``).
 - Helpers: ``add_chat(owner_user_id, *, org_id=None, chat_id=None, title='',
   title_source='auto', legacy_session_id=None, external_content=False,
   created_at=None, last_activity_at=None, deleted_at=None)`` (org_id: the
@@ -3343,6 +3366,8 @@ def _masked(text: str) -> str:
 
     The outermost parentheses stay, so top-level structure (keywords, commas,
     operators) can be found in the masked text and sliced from the original.
+    GH-244: square brackets (an ``ARRAY[a, b]`` constructor) nest like
+    parentheses, so the commas between their elements stay inside.
     """
     out: list[str] = []
     depth = 0
@@ -3354,12 +3379,12 @@ def _masked(text: str) -> str:
         elif char == "'":
             quoted = True
             out.append("'" if depth == 0 else " ")
-        elif char == "(":
-            out.append("(" if depth == 0 else " ")
+        elif char in "([":
+            out.append(char if depth == 0 else " ")
             depth += 1
-        elif char == ")":
+        elif char in ")]":
             depth -= 1
-            out.append(")" if depth == 0 else " ")
+            out.append(char if depth == 0 else " ")
         else:
             out.append(char if depth == 0 else " ")
     assert depth == 0 and not quoted, f"unbalanced SQL: {text}"
@@ -3432,16 +3457,23 @@ def _clauses(text: str, keywords: tuple[str, ...]) -> dict[str, str]:
 
 @dataclass(frozen=True)
 class _Source:
-    """One table of a FROM / JOIN / USING list: its alias, ON condition and join kind."""
+    """One item of a FROM / JOIN / USING list: its alias, ON condition and join kind.
+
+    A table (``table`` names it), or (GH-244) a sub-select ``[LATERAL] (SELECT ...)
+    alias``: ``query`` is its SELECT, ``table`` the key of its output columns in
+    ``_Statement.derived``, and ``lateral`` whether it reads the items before it.
+    """
 
     table: str
     alias: str
     on: str | None
     left: bool
+    query: str | None = None
+    lateral: bool = False
 
 
 def _sources(text: str) -> list[_Source]:
-    """The tables of a FROM (or USING) list, in order."""
+    """The items of a FROM (or USING) list, in order."""
     masked = _masked(text)
     pieces: list[tuple[str, str]] = []
     start = 0
@@ -3456,12 +3488,33 @@ def _sources(text: str) -> list[_Source]:
         assert kind in {"first", "comma", "inner", "left", "left outer"}, (
             f"the fake doesn't do {kind} joins: {text}"
         )
-        match = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(?!on\b)(\w+))?(?: on (.+))?", piece)
-        assert match is not None, f"the fake can't read this FROM item: {piece}"
-        table, alias, on = match.groups()
-        assert table in _COLUMNS, f"the fake's SQL reader doesn't model table {table}: {text}"
-        assert (on is None) == (kind in {"first", "comma"}), f"a join needs ON: {piece}"
-        sources.append(_Source(table, alias or table, on, kind.startswith("left")))
+        piece_masked = _masked(piece)
+        derived = re.fullmatch(
+            r"(lateral )?(\( *\))(?: (?:as )?(?!on\b)(\w+))?(?: on (.+))?", piece_masked
+        )
+        if derived is not None:
+            # GH-244: a sub-select in FROM, e.g. "LEFT JOIN LATERAL (SELECT ...) m ON true".
+            alias, on = derived.group(3), derived.group(4)
+            assert alias is not None, f"the fake needs an alias for a sub-select in FROM: {piece}"
+            query = piece[derived.start(2) + 1 : derived.end(2) - 1].strip()
+            assert query.startswith("select "), f"the fake can't read this FROM item: {piece}"
+            sources.append(
+                _Source(
+                    query,
+                    alias,
+                    None if on is None else piece[derived.start(4) :],
+                    kind.startswith("left"),
+                    query=query,
+                    lateral=derived.group(1) is not None,
+                )
+            )
+        else:
+            match = re.fullmatch(r"(?:only )?(\w+)(?: (?:as )?(?!on\b)(\w+))?(?: on (.+))?", piece)
+            assert match is not None, f"the fake can't read this FROM item: {piece}"
+            table, alias, on = match.groups()
+            assert table in _COLUMNS, f"the fake's SQL reader doesn't model table {table}: {text}"
+            sources.append(_Source(table, alias or table, on, kind.startswith("left")))
+        assert (sources[-1].on is None) == (kind in {"first", "comma"}), f"a join needs ON: {piece}"
     return sources
 
 
@@ -3924,6 +3977,84 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
                     raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
 
 
+def _select_items(text: str) -> list[tuple[str, str, str]]:
+    """A SELECT / RETURNING list as (kind, output name, expression) triples.
+
+    The kind is "aggregate", "predicate" (a comparison or IS [NOT] NULL, a
+    boolean value) or "value"; the name is the alias, else a column's name,
+    else an aggregate's function name, else "?column?".
+    """
+    items = []
+    for item in _top_split(text, ","):
+        masked = _masked(item)
+        alias = None
+        expr = item
+        match = re.fullmatch(r"(.+?) as (\w+)", masked) or re.fullmatch(
+            r"((?:\w+\.)?\w+) (\w+)", masked
+        )
+        if match is not None:
+            expr, alias = item[: match.end(1)], match.group(2)
+        expr = expr.strip()
+        assert expr != "*" and not expr.endswith(".*"), "name the columns (no SELECT *)"
+        if _AGGREGATE_RE.search(_masked_literals(expr)):
+            name = re.match(r"(?:coalesce ?\( ?)?(\w+)", expr)
+            assert name is not None, expr
+            items.append(("aggregate", alias or name.group(1), expr))
+        elif re.fullmatch(r"(?:\w+\.)?\w+", expr) and not re.fullmatch(r"-?\d+|null", expr):
+            items.append(("value", alias or expr.rsplit(".", 1)[-1], expr))
+        elif re.search(r"<>|!=|<=|>=|=|<|>| is (?:not )?null$", _masked(expr)):
+            items.append(("predicate", alias or "?column?", expr))
+        else:
+            items.append(("value", alias or "?column?", expr))
+    return items
+
+
+def _driver_value(value: Any) -> Any:
+    """A value as an asyncpg row carries it: asyncpg UUIDs, arrays (GH-244) as lists."""
+    if isinstance(value, uuid.UUID):
+        return _pg(value)
+    if isinstance(value, list):
+        return [_driver_value(item) for item in value]
+    return value
+
+
+def _assert_evaluable(text: str) -> None:
+    """Fail the test for a WHERE / ON text with a construct the reader doesn't evaluate."""
+    masked = _masked(text)
+    for keyword in ("or", "between", "exists", "like", "ilike", "any", "all", "case"):
+        assert not re.search(rf"(?<![\w.]){keyword}(?!\w)", masked), (
+            f"the fake doesn't evaluate {keyword.upper()}: {text}"
+        )
+
+
+# A simple operand: a qualified column, a bind parameter, a literal or a constant.
+_SIMPLE_OPERAND: Final = (
+    r"(?:[a-z_]\w*\.[a-z_]\w*|\$\d+(?: ?:: ?\w+)?|'[^']*'|-?\d+|true|false|null)"
+)
+
+
+def _early_atoms(where: str, aliases: set[str]) -> list[str]:
+    """The AND-ed WHERE predicates that read only the FROM items ``aliases`` (GH-244).
+
+    Only simple ones: a comparison or IS [NOT] NULL between qualified columns of
+    those items, bind parameters and constants. Every row they reject would be
+    rejected by the WHERE anyway, so ``contexts`` may apply them before a LATERAL
+    sub-select runs (as PostgreSQL's planner does) instead of after.
+    """
+    atoms = []
+    for atom in _top_split(_unwrap(where), r" and "):
+        text = _masked_literals(atom)
+        simple = re.fullmatch(
+            rf"{_SIMPLE_OPERAND} ?{_COMPARISON} ?{_SIMPLE_OPERAND}"
+            rf"|{_SIMPLE_OPERAND} is (?:not )?null",
+            text,
+        )
+        qualifiers = set(re.findall(r"(?<![\w.$'])([a-z_]\w*)\.[a-z_]\w*", text))
+        if simple is not None and qualifiers and qualifiers <= aliases:
+            atoms.append(atom)
+    return atoms
+
+
 _Context = dict[str, tuple[str, dict[str, Any] | None]]
 
 
@@ -3937,6 +4068,9 @@ class _Statement:
         # GH-24: the row contexts of the queries enclosing the scalar subquery being
         # evaluated (innermost last), for its correlated column references.
         self.outer: list[_Context] = []
+        # GH-244: the output columns of each sub-select in a FROM list, keyed by its
+        # SELECT text (the ``table`` of its ``_Source``).
+        self.derived: dict[str, frozenset[str]] = {}
 
     # -- values and predicates ---------------------------------------------------
 
@@ -3951,6 +4085,12 @@ class _Statement:
         expr = _unwrap(expr)
         if parenthesized and expr.startswith("select "):
             return self.scalar(expr, ctx)
+        if re.fullmatch(r"array ?\( *\)", _masked(expr)):
+            return self.array(expr[expr.index("(") + 1 : -1].strip(), ctx)
+        if re.fullmatch(r"array ?\[ *\]", _masked(expr)):
+            # GH-244: an ARRAY[a, b, ...] constructor (a list, as asyncpg decodes it).
+            inner = expr[expr.index("[") + 1 : -1].strip()
+            return [self.value(item, ctx) for item in _top_split(inner, ",")] if inner else []
         if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?)?", expr):
             return self._arg(match.group(1))
         if match := re.fullmatch(r"case when (.+?) then (.+?) else (.+?) end", _masked(expr)):
@@ -4065,9 +4205,11 @@ class _Statement:
             if qualifier is not None:
                 if qualifier not in scope:
                     continue
-                owners = [qualifier] if name in _COLUMNS[scope[qualifier][0]] else []
+                owners = [qualifier] if name in self.columns_of(scope[qualifier][0]) else []
             else:
-                owners = [alias for alias, (table, _) in scope.items() if name in _COLUMNS[table]]
+                owners = [
+                    alias for alias, (table, _) in scope.items() if name in self.columns_of(table)
+                ]
                 if not owners:
                     continue
             if len(owners) > 1:
@@ -4085,6 +4227,49 @@ class _Statement:
         msg = f'column "{name}" does not exist'
         raise asyncpg.exceptions.UndefinedColumnError(msg)
 
+    def columns_of(self, table: str) -> frozenset[str]:
+        """The columns of a modelled table, or of a sub-select in FROM (GH-244)."""
+        return self.derived[table] if table in self.derived else _COLUMNS[table]
+
+    def subquery(self, query: str, ctx: _Context) -> list[dict[str, Any]]:
+        """The rows of a sub-select run for the enclosing row context ``ctx``.
+
+        A correlated reference reads ``ctx`` (then the levels enclosing it), as
+        in ``column``.
+        """
+        self.outer.append(ctx)
+        try:
+            return self.select(query)
+        finally:
+            self.outer.pop()
+
+    def array(self, query: str, ctx: _Context) -> list[Any]:
+        """``ARRAY(SELECT <one column> FROM ...)`` (GH-244), as PostgreSQL runs it.
+
+        Evaluated for the enclosing row context (a correlated reference reads
+        it, as in ``scalar``): one element per row, in the rows' order; no row:
+        ``[]`` (an empty array, not NULL). More than one column:
+        PostgresSyntaxError. Elements that are arrays build a multidimensional
+        array, so they must all be non-NULL arrays of one length
+        (NullValueNotAllowedError, ArraySubscriptError otherwise).
+        """
+        assert query.startswith("select "), f"the fake can't evaluate ARRAY({query})"
+        if len(_top_split(_clauses(query, ("select", "from"))["select"], ",")) != 1:
+            msg = "subquery must return only one column"
+            raise asyncpg.exceptions.PostgresSyntaxError(msg)
+        values = [next(iter(row.values())) for row in self.subquery(query, ctx)]
+        if any(isinstance(value, list) for value in values):
+            if any(value is None for value in values):
+                msg = "cannot accumulate null arrays"
+                raise asyncpg.exceptions.NullValueNotAllowedError(msg)
+            if any(not value for value in values):
+                msg = "cannot accumulate empty arrays"
+                raise asyncpg.exceptions.ArraySubscriptError(msg)
+            if len({len(value) for value in values}) > 1:
+                msg = "cannot accumulate arrays of different dimensionality"
+                raise asyncpg.exceptions.ArraySubscriptError(msg)
+        return values
+
     def scalar(self, query: str, ctx: _Context) -> Any:
         """A scalar subquery ``(SELECT <one column> FROM ...)`` (GH-24), as PostgreSQL runs it.
 
@@ -4098,11 +4283,7 @@ class _Statement:
         if len(_top_split(_clauses(query, ("select", "from"))["select"], ",")) != 1:
             msg = "subquery must return only one column"
             raise asyncpg.exceptions.PostgresSyntaxError(msg)
-        self.outer.append(ctx)
-        try:
-            rows = self.select(query)
-        finally:
-            self.outer.pop()
+        rows = self.subquery(query, ctx)
         if len(rows) > 1:
             msg = "more than one row returned by a subquery used as an expression"
             raise asyncpg.exceptions.CardinalityViolationError(msg)
@@ -4111,11 +4292,7 @@ class _Statement:
     def holds(self, text: str, ctx: _Context) -> bool:
         """True when every AND-ed predicate of a WHERE / ON text holds."""
         text = _unwrap(text)
-        masked = _masked(text)
-        for keyword in ("or", "between", "exists", "like", "ilike", "any", "all", "case"):
-            assert not re.search(rf"(?<![\w.]){keyword}(?!\w)", masked), (
-                f"the fake doesn't evaluate {keyword.upper()}: {text}"
-            )
+        _assert_evaluable(text)
         return all(self.atom(atom, ctx) for atom in _top_split(text, r" and "))
 
     def atom(self, atom: str, ctx: _Context) -> bool:
@@ -4179,15 +4356,45 @@ class _Statement:
 
     # -- row sets ----------------------------------------------------------------
 
-    def contexts(self, sources: list[_Source]) -> list[_Context]:
-        """Every combination of source rows that satisfies the ON conditions."""
+    def contexts(self, sources: list[_Source], where: str | None = None) -> list[_Context]:
+        """Every combination of source rows that satisfies the ON conditions.
+
+        GH-244: a sub-select's rows are its result; a LATERAL one runs once per
+        combination of the items before it (it reads them, as in PostgreSQL),
+        any other once for the whole statement (it can't). A LEFT JOIN without
+        a matching row keeps the combination once, the item's columns NULL.
+        Before a LATERAL sub-select runs, the combinations the statement's
+        ``where`` rejects on those items alone are dropped (``_early_atoms``;
+        the caller still applies the whole WHERE), so it runs for the
+        candidate rows only.
+        """
         contexts: list[_Context] = [{}]
-        for source in sources:
+        for index, source in enumerate(sources):
+            if source.lateral and where is not None:
+                _assert_evaluable(_unwrap(where))
+                early = _early_atoms(where, {item.alias for item in sources[:index]})
+                contexts = [ctx for ctx in contexts if all(self.atom(a, ctx) for a in early)]
+            fixed: list[dict[str, Any]] | None = None
+            if source.query is not None:
+                self.derived[source.table] = frozenset(
+                    name
+                    for _, name, _ in _select_items(
+                        _clauses(source.query, ("select", "from"))["select"]
+                    )
+                )
+                if not source.lateral:
+                    fixed = self.select(source.query)
             joined: list[_Context] = []
             for ctx in contexts:
+                if source.query is None:
+                    rows = self.db.table_rows(source.table)
+                elif fixed is not None:
+                    rows = fixed
+                else:
+                    rows = self.subquery(source.query, ctx)
                 matched = [
                     candidate
-                    for row in self.db.table_rows(source.table)
+                    for row in rows
                     if (candidate := {**ctx, source.alias: (source.table, row)})
                     and (source.on is None or self.holds(source.on, candidate))
                 ]
@@ -4218,28 +4425,7 @@ class _Statement:
 
     def project(self, text: str, contexts: list[_Context]) -> list[dict[str, Any]]:
         """Evaluate a SELECT / RETURNING list over the row contexts (asyncpg-shaped values)."""
-        items = []
-        for item in _top_split(text, ","):
-            masked = _masked(item)
-            alias = None
-            expr = item
-            match = re.fullmatch(r"(.+?) as (\w+)", masked) or re.fullmatch(
-                r"((?:\w+\.)?\w+) (\w+)", masked
-            )
-            if match is not None:
-                expr, alias = item[: match.end(1)], match.group(2)
-            expr = expr.strip()
-            assert expr != "*" and not expr.endswith(".*"), "name the columns (no SELECT *)"
-            if _AGGREGATE_RE.search(_masked_literals(expr)):
-                name = re.match(r"(?:coalesce ?\( ?)?(\w+)", expr)
-                assert name is not None, expr
-                items.append(("aggregate", alias or name.group(1), expr))
-            elif re.fullmatch(r"(?:\w+\.)?\w+", expr) and not re.fullmatch(r"-?\d+|null", expr):
-                items.append(("value", alias or expr.rsplit(".", 1)[-1], expr))
-            elif re.search(r"<>|!=|<=|>=|=|<|>| is (?:not )?null$", _masked(expr)):
-                items.append(("predicate", alias or "?column?", expr))
-            else:
-                items.append(("value", alias or "?column?", expr))
+        items = _select_items(text)
         if any(kind == "aggregate" for kind, _, _ in items):
             # One row over every context (no GROUP BY in the fake).
             assert all(kind == "aggregate" for kind, _, _ in items), "no GROUP BY in the fake"
@@ -4249,7 +4435,7 @@ class _Statement:
             row: dict[str, Any] = {}
             for kind, key, expr in items:
                 value = self.atom(expr, ctx) if kind == "predicate" else self.value(expr, ctx)
-                row[key] = _pg(value) if isinstance(value, uuid.UUID) else value
+                row[key] = _driver_value(value)
             rows.append(row)
         return rows
 
@@ -4321,7 +4507,8 @@ class _Statement:
         ):
             msg = "FOR UPDATE is not allowed with aggregate functions"
             raise asyncpg.exceptions.FeatureNotSupportedError(msg)
-        contexts = self.filtered(self.contexts(_sources(clauses["from"])), clauses.get("where"))
+        sources = _sources(clauses["from"])
+        contexts = self.filtered(self.contexts(sources, clauses.get("where")), clauses.get("where"))
         if "order by" in clauses:
             contexts = self.ordered(contexts, clauses["order by"])
         elif _primary_table(n) in _CHAT_TABLES:

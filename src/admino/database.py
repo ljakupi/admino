@@ -1,7 +1,9 @@
 """PostgreSQL connection pool, migration runner, schema check and health check.
 
 Owns the asyncpg pool lifecycle. All database access in admino goes through
-the pool returned by get_pool(). Migrations are plain numbered SQL files in
+the pool returned by get_pool(): a ``TimedPool`` (GH-244) around the asyncpg
+pool, which times every statement for the request's timing line
+(``admino.request_timing``). Migrations are plain numbered SQL files in
 ``migrations/``, applied in order by ``run_migrations()``; only the one-shot
 migrate step (``admino.migrate``, connected as the owner) calls it.
 
@@ -13,7 +15,8 @@ migration 0018) through ``database_url_from_env()``, and never migrates:
 Inputs: the PG_APP_PASSWORD, PG_HOST, PG_PORT and PG_DATABASE env vars (the
 runtime DSN) and the shipped migration files.
 Outputs: the module-level pool, the runtime DSN, the pending migration
-versions.
+versions, and each statement's count and duration on the current request's
+timing record.
 
 Security notes:
 - The runtime DSN is built from env vars only, never from YAML or config
@@ -22,6 +25,8 @@ Security notes:
   fall back to the superuser. The password is percent-encoded into the DSN
   and never logged.
 - ``pending_migration_versions()`` is read-only: one SELECT, no DDL.
+- ``TimedPool`` sees statements, never logs: only their count and duration
+  reach ``admino.request_timing`` (never SQL, arguments or results).
 - All SQL uses parameterized queries ($1, $2). No string interpolation.
 - Org-content repository functions take a TenantContext (admino.tenancy) as
   their first argument and filter by its org_id; there is no unscoped path.
@@ -35,11 +40,17 @@ from __future__ import annotations
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Any, Final, cast
 from urllib.parse import quote
 
 import asyncpg
+
+from admino import request_timing
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +62,65 @@ RUNTIME_ROLE: Final[str] = "admino_app"
 # ---------------------------------------------------------------------------
 
 _pool: asyncpg.Pool | None = None
+
+
+class _TimedStatements:
+    """Times the statement methods of a pool or connection; the rest passes through.
+
+    ``fetch``, ``fetchrow``, ``fetchval``, ``execute`` and ``executemany`` each
+    run inside ``request_timing.db_statement()`` (one statement, its duration)
+    and return the inner result unchanged; an exception propagates unchanged.
+    Every other attribute (``transaction``, ``close``, ...) is the inner
+    object's, untimed: BEGIN/COMMIT and a connection's reset aren't statements.
+    """
+
+    # Any: the wrapper delegates by shape to an asyncpg pool, an acquired
+    # connection or a test stand-in, with their own signatures; init_pool's
+    # cast gives every caller back the asyncpg.Pool type.
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    async def fetch(self, *args: Any, **kwargs: Any) -> Any:
+        """The inner ``fetch``, timed as one statement."""
+        with request_timing.db_statement():
+            return await self._inner.fetch(*args, **kwargs)
+
+    async def fetchrow(self, *args: Any, **kwargs: Any) -> Any:
+        """The inner ``fetchrow``, timed as one statement."""
+        with request_timing.db_statement():
+            return await self._inner.fetchrow(*args, **kwargs)
+
+    async def fetchval(self, *args: Any, **kwargs: Any) -> Any:
+        """The inner ``fetchval``, timed as one statement."""
+        with request_timing.db_statement():
+            return await self._inner.fetchval(*args, **kwargs)
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:
+        """The inner ``execute``, timed as one statement."""
+        with request_timing.db_statement():
+            return await self._inner.execute(*args, **kwargs)
+
+    async def executemany(self, *args: Any, **kwargs: Any) -> Any:
+        """The inner ``executemany``, timed as one statement."""
+        with request_timing.db_statement():
+            return await self._inner.executemany(*args, **kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        """Every other attribute is the inner object's (untimed)."""
+        return getattr(self._inner, name)
+
+
+class TimedPool(_TimedStatements):
+    """A connection pool whose statements are timed, on itself and on acquired connections."""
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator[_TimedStatements]:
+        """Acquire an inner connection (and release it), yielding it with timed statements.
+
+        The wait for a free connection and the release aren't statements.
+        """
+        async with self._inner.acquire() as conn:
+            yield _TimedStatements(conn)
 
 
 def database_url_from_env() -> str | None:
@@ -92,14 +162,17 @@ async def init_pool(
         max_size: Maximum number of connections in the pool.
 
     Returns:
-        The created connection pool.
+        The created connection pool, wrapped in a ``TimedPool`` (GH-244).
     """
     global _pool
-    _pool = await asyncpg.create_pool(
+    pool = await asyncpg.create_pool(
         database_url,
         min_size=min_size,
         max_size=max_size,
     )
+    # The cast keeps asyncpg.Pool as the type every caller sees: TimedPool
+    # offers the same methods (the statement ones timed, the rest delegated).
+    _pool = cast("asyncpg.Pool", TimedPool(pool))
     logger.info("Database pool created (min=%d, max=%d).", min_size, max_size)
     return _pool
 

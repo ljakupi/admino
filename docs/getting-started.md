@@ -336,6 +336,14 @@ admino is test-first. Before pushing, run the exact gate CI runs:
 make check      # lint + format-check + typecheck + tests (coverage ≥ 90%)
 ```
 
+These run on demand, not in CI (see [Configuration → Performance](configuration.md#performance)):
+
+```bash
+make perf         # server budgets against a throwaway Postgres and a fake LLM (needs Docker)
+make test-proxy   # the production Caddyfile in the caddy image: compression, unbuffered streams (needs Docker)
+make ttft         # time to first token of the Infomaniak models (needs INFOMANIAK_API_TOKEN in the shell)
+```
+
 For frontend changes, from `static-src/`:
 
 ```bash

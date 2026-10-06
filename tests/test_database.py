@@ -64,7 +64,8 @@ class TestInitPool:
         with patch("admino.database.asyncpg.create_pool", new=AsyncMock(return_value=fake_pool)):
             result = await db_mod.init_pool("postgres://user:pass@host/db", min_size=3, max_size=10)
 
-        assert result is fake_pool
+        # GH-244: init_pool installs the statement timing wrapper
+        assert isinstance(result, db_mod.TimedPool)
 
     async def test_init_pool_stores_pool_in_module(self) -> None:
         """init_pool() stores the pool in db_mod._pool."""
@@ -72,7 +73,8 @@ class TestInitPool:
         with patch("admino.database.asyncpg.create_pool", new=AsyncMock(return_value=fake_pool)):
             await db_mod.init_pool("postgres://u:p@h/d")
 
-        assert db_mod._pool is fake_pool
+        # GH-244: init_pool installs the statement timing wrapper
+        assert isinstance(db_mod._pool, db_mod.TimedPool)
 
     async def test_init_pool_passes_min_max_size(self) -> None:
         """init_pool() passes min_size and max_size to asyncpg.create_pool."""
