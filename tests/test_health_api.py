@@ -39,7 +39,13 @@ Security notes:
 - Operator blindness: the diagnostics body carries config metadata and statuses
   only; the public /health tells an anonymous caller nothing but up/degraded.
 - The exception message ``zephyr secret 4481`` is a marker that must never
-  reach a response or any log line.
+  reach a response or any log line. The log checks look, case-insensitively,
+  for the whole message and each of its words that no random value can spell
+  (``zephyr``, ``secret``), plus a traceback. They never look for a fragment
+  such as ``4481`` that a random request id, timestamp or count can also
+  contain (GH-274: about one request id in 2,260 held those digits). They are
+  not exhaustive: a leak of the digits alone, or of a fragment shorter than a
+  whole word (``zeph``), for example, is not seen.
 - No real database, LLM or network: ``check_health``, ``_check_llm_reachable``,
   ``resolve_session``, ``get_pool`` and ``organizations.list_orgs`` are patched.
   The chat route (GH-176: it persists into a chat per user and session id) gets
@@ -50,9 +56,11 @@ from __future__ import annotations
 
 import logging
 import re
+import string
 import uuid
+from contextlib import ExitStack
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -78,6 +86,7 @@ from tests.db_fakes import FakeDb
 from tests.log_capture import CapturedLogs, configured_logging
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -104,7 +113,39 @@ _RATE_LIMITED: Final = {"detail": "Rate limit exceeded"}
 _INTERNAL_ERROR: Final = {"detail": "Internal error"}
 
 _REQUEST_ID: Final = re.compile(r"^[0-9a-f]{32}$")
+# The exception message: ASCII with nothing json.dumps escapes, so a leak shows
+# up verbatim in the JSON log text. Its digit run is hex-like on purpose (a real
+# message can carry one); no leak probe may rely on it.
 _SECRET: Final = "zephyr secret 4481"
+# Not a leak probe: the hex-only part of _SECRET, which a random request id can
+# hold (GH-274). Only the reproduction's preconditions use it.
+_SECRET_DIGITS: Final = re.sub(r"[^0-9]", "", _SECRET)
+# Every character a random value in a log line is made of: a request id or UUID
+# (hex digits, "-"), a timestamp ("2026-10-07T12:34:56.789+00:00", "Z", or
+# "2026-10-07 12:34:56,789"), a count or a duration (digits, ".", "-", "e").
+_RANDOM_VALUE_CHARS: Final = frozenset(string.hexdigits + "-:.,+TZ ")
+# The words of _SECRET that no random value can spell in any case: each holds a
+# character outside _RANDOM_VALUE_CHARS, compared casefolded. That is "zephyr"
+# and "secret"; the digit run is left out.
+_SECRET_WORDS: Final[tuple[str, ...]] = tuple(
+    word
+    for word in _SECRET.split()
+    if not set(word.casefold()) <= {char.casefold() for char in _RANDOM_VALUE_CHARS}
+)
+# What the log leak checks look for, case-insensitively (GH-274): the whole
+# message and each of _SECRET_WORDS in a raw record's message and in the
+# formatted text, plus a traceback in the text. Never a fragment that a random
+# value could spell on its own. Not exhaustive: the digits alone, or a fragment
+# shorter than a whole word ("zeph"), for example, are not seen.
+_MESSAGE_PROBES: Final[tuple[str, ...]] = (_SECRET, *_SECRET_WORDS)
+_TEXT_PROBES: Final[tuple[str, ...]] = (*_MESSAGE_PROBES, "Traceback")
+# Request ids pinned through admino.server.uuid4 (both valid uuid4 values): one
+# whose hex contains _SECRET_DIGITS (the GH-274 flake, made deterministic), and
+# one that shares nothing with _SECRET.
+_COLLIDING_REQUEST_ID: Final = uuid.UUID("0b5e2c7f-9d3a-4481-a6f0-3c1e8d2b7a95")
+_PLAIN_REQUEST_ID: Final = uuid.UUID("5c0f9e2a-7b3d-4e6a-9f1c-2d8b6a0e3f57")
+# The logger a planted leak (the positive control) writes the message to.
+_LEAK_LOGGER: Final = "admino.probe"
 _UNHANDLED_PREFIX: Final = "Unhandled exception"
 # Loops that exhaust a bucket stop here (far above any burst the server uses).
 _MAX_ATTEMPTS: Final = 300
@@ -616,9 +657,79 @@ async def _unhandled_from_probe(endpoint: Any) -> tuple[Response, CapturedLogs]:
     return response, logs
 
 
-async def _unhandled_from_route() -> tuple[Response, CapturedLogs]:
-    """A real route (GET /api/platform/orgs) whose service call raises."""
-    list_orgs = AsyncMock(side_effect=RuntimeError(_SECRET))
+def _log_then_raise(form: str) -> Callable[..., NoReturn]:
+    """A failing collaborator that logs the exception message, then raises (a planted leak).
+
+    ``"bare-message"`` logs ``_SECRET`` as the whole message; ``"str-of-exception"``
+    formats the exception into a sentence (``"%s", exc``); ``"upper-cased"`` logs
+    the message upper-cased; ``"first-word-redacted"`` logs only its tail after a
+    masked first word (``"*** secret 4481"``); ``"truncated-head"`` logs only its
+    first nine characters (``"zephyr se"``). Each line is written on an
+    ``admino.*`` logger while the request runs, through the configured handler.
+    """
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        exc = RuntimeError(_SECRET)
+        message = str(exc)
+        logger = logging.getLogger(_LEAK_LOGGER)
+        if form == "bare-message":
+            logger.error(_SECRET)
+        elif form == "str-of-exception":
+            logger.error("Lookup failed: %s", exc)
+        elif form == "upper-cased":
+            logger.error("Lookup failed: %s", message.upper())
+        elif form == "first-word-redacted":
+            logger.error("Lookup failed: *** %s", message.split(maxsplit=1)[1])
+        elif form == "truncated-head":
+            logger.error("Lookup failed: %s...", message[:9])
+        else:
+            raise AssertionError(f"unknown leak form {form!r}")
+        raise exc
+
+    return fail
+
+
+def _endpoint_calling(
+    fail: Callable[..., NoReturn],
+) -> Callable[[Request], Awaitable[JSONResponse]]:
+    """A probe route handler that fails through ``fail``."""
+
+    async def endpoint(request: Request) -> JSONResponse:
+        fail()
+
+    return endpoint
+
+
+def _message_leaks(logs: CapturedLogs) -> list[tuple[str, str]]:
+    """Where the exception message (or a traceback) reached the logs; ``[]`` for nowhere.
+
+    Each leak is ``(channel, probe)``: channel ``"text"`` is the formatted output
+    an operator sees (checked for ``_TEXT_PROBES``), ``"record"`` a raw record's
+    message (checked for ``_MESSAGE_PROBES``). Both compare casefolded, so an
+    upper- or title-cased message is still found, and a word probe on its own
+    finds a fragment that keeps a whole word (the tail after a redacted first
+    word, a truncated head). Not every leak is found: the digits alone, or a
+    fragment shorter than a whole word, for example, are not. Every probe holds
+    a character that no request id, timestamp or count has in any case, so a
+    random value can't match it (GH-274). A test asserts ``== []`` (nothing
+    leaked) or the exact leaks of a planted message.
+    """
+    text = logs.text.casefold()
+    messages = [record.getMessage().casefold() for record in logs.records]
+    leaks = [("text", probe) for probe in _TEXT_PROBES if probe.casefold() in text]
+    leaks.extend(
+        ("record", probe)
+        for probe in _MESSAGE_PROBES
+        if any(probe.casefold() in message for message in messages)
+    )
+    return leaks
+
+
+async def _unhandled_from_route(
+    fail: Callable[..., NoReturn] | None = None,
+) -> tuple[Response, CapturedLogs]:
+    """A real route (GET /api/platform/orgs) whose service call raises (through ``fail``)."""
+    list_orgs = AsyncMock(side_effect=fail if fail is not None else RuntimeError(_SECRET))
     with (
         configured_logging() as logs,
         patch("admino.organizations.list_orgs", new=list_orgs),
@@ -629,24 +740,51 @@ async def _unhandled_from_route() -> tuple[Response, CapturedLogs]:
     return response, logs
 
 
-async def _unhandled_from_dependency() -> tuple[Response, CapturedLogs]:
-    """The real session dependency, whose session lookup raises."""
+async def _unhandled_from_dependency(
+    fail: Callable[..., NoReturn] | None = None,
+) -> tuple[Response, CapturedLogs]:
+    """The real session dependency, whose session lookup raises (through ``fail``)."""
     with configured_logging() as logs, resolved_session(None) as resolve:
-        resolve.side_effect = RuntimeError(_SECRET)
+        resolve.side_effect = fail if fail is not None else RuntimeError(_SECRET)
         async with _client(_app()) as client:
             response = await client.get("/api/auth/me", headers=session_cookie())
     return response, logs
 
 
-async def _unhandled(source: str) -> tuple[Response, CapturedLogs]:
-    if source == "probe-route":
-        return await _unhandled_from_probe(_raise_runtime_error)
-    if source == "real-route":
-        return await _unhandled_from_route()
-    return await _unhandled_from_dependency()
+async def _unhandled(
+    source: str,
+    *,
+    request_id: uuid.UUID | None = None,
+    fail: Callable[..., NoReturn] | None = None,
+) -> tuple[Response, CapturedLogs]:
+    """Run one unhandled-exception flow; return the response and the logs.
+
+    ``request_id`` pins the UUID the request-ID middleware draws
+    (``admino.server.uuid4``); ``fail`` replaces the failing collaborator (the
+    probe handler, ``list_orgs`` or ``resolve_session``) and must raise.
+    """
+    with ExitStack() as stack:
+        if request_id is not None:
+            stack.enter_context(patch("admino.server.uuid4", return_value=request_id))
+        if source == "probe-route":
+            endpoint = _raise_runtime_error if fail is None else _endpoint_calling(fail)
+            return await _unhandled_from_probe(endpoint)
+        if source == "real-route":
+            return await _unhandled_from_route(fail)
+        return await _unhandled_from_dependency(fail)
 
 
 _SOURCES: Final = ["probe-route", "real-route", "dependency"]
+# The planted leak forms of _log_then_raise and the probes that must report each,
+# exactly: every probe for the whole message in any case, and for a fragment the
+# one whole word it keeps (so each word probe is proven on its own).
+_LEAK_FORMS: Final[dict[str, tuple[str, ...]]] = {
+    "bare-message": _MESSAGE_PROBES,
+    "str-of-exception": _MESSAGE_PROBES,
+    "upper-cased": _MESSAGE_PROBES,
+    "first-word-redacted": ("secret",),
+    "truncated-head": ("zephyr",),
+}
 
 
 class TestUnhandledExceptions:
@@ -713,10 +851,67 @@ class TestUnhandledExceptions:
         _, logs = await _unhandled(source)
 
         assert logs.json_lines(), "nothing was captured"
-        assert "zephyr" not in logs.text
-        assert "4481" not in logs.text
-        assert "Traceback" not in logs.text
-        assert not any("zephyr" in record.getMessage() for record in logs.records)
+        assert _message_leaks(logs) == []
+
+    @pytest.mark.parametrize("source", _SOURCES)
+    async def test_unhandled_exception_request_id_sharing_the_message_digits_is_no_leak(
+        self, source: str
+    ) -> None:
+        """A request id that happens to contain the message's digits is no leak (GH-274).
+
+        ``uuid4().hex`` is random: about one id in 2,260 contains the four digits
+        of ``_SECRET``, and the leak check then failed although nothing leaked.
+        The id is pinned to such a value here, so the case runs every time.
+        """
+        response, logs = await _unhandled(source, request_id=_COLLIDING_REQUEST_ID)
+
+        assert _SECRET_DIGITS in _request_id(response), "the request id wasn't pinned"
+        assert _SECRET_DIGITS in logs.text, "the pinned request id reached no log line"
+        assert _message_leaks(logs) == []
+
+    @pytest.mark.parametrize("form", list(_LEAK_FORMS))
+    @pytest.mark.parametrize("source", _SOURCES)
+    async def test_unhandled_exception_message_logged_during_the_request_is_reported(
+        self, source: str, form: str
+    ) -> None:
+        """Positive control: the leak check reports a message that does reach a log line.
+
+        The failing collaborator logs the message, or a case-changed or partial
+        form of it, right before it raises. Exactly the probes ``_LEAK_FORMS``
+        names report it, in the formatted text and in the raw record: every
+        message probe for the whole message in any case (so no probe is blind,
+        e.g. to a character the JSON formatter escapes), the surviving word alone
+        for a fragment. The request id shares nothing with ``_SECRET``, so only
+        the message can be what is found.
+        """
+        response, logs = await _unhandled(
+            source, request_id=_PLAIN_REQUEST_ID, fail=_log_then_raise(form)
+        )
+
+        planted = [entry for entry in logs.json_lines() if entry.get("logger") == _LEAK_LOGGER]
+        assert response.status_code == 500
+        assert [entry["request_id"] for entry in planted] == [_request_id(response)]
+        assert _message_leaks(logs) == [
+            *(("text", probe) for probe in _LEAK_FORMS[form]),
+            *(("record", probe) for probe in _LEAK_FORMS[form]),
+        ]
+
+    async def test_unhandled_exception_leak_probes_are_never_spelled_by_a_random_value(
+        self,
+    ) -> None:
+        """No random value in a log line can match a leak probe on its own (GH-274).
+
+        A request id, UUID, timestamp, count or duration is made of
+        ``_RANDOM_VALUE_CHARS`` only. The checks compare casefolded, so every
+        probe must hold another character in any case: a probe is rejected when
+        any case of it could be spelled by a random value. The digit run the
+        old probe used is made of those characters only, so the check would have
+        caught it.
+        """
+        random_chars = {char.casefold() for char in _RANDOM_VALUE_CHARS}
+        spellable = [probe for probe in _TEXT_PROBES if set(probe.casefold()) <= random_chars]
+
+        assert (spellable, set(_SECRET_DIGITS) <= random_chars) == ([], True)
 
     async def test_unhandled_exception_names_the_bare_class(self) -> None:
         response, logs = await _unhandled_from_probe(_raise_zephyr_error)
