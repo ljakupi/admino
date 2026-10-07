@@ -51,8 +51,9 @@ from __future__ import annotations
 import logging
 import re
 import uuid
+from contextlib import ExitStack
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -78,6 +79,7 @@ from tests.db_fakes import FakeDb
 from tests.log_capture import CapturedLogs, configured_logging
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
     from fastapi import FastAPI
@@ -105,6 +107,17 @@ _INTERNAL_ERROR: Final = {"detail": "Internal error"}
 
 _REQUEST_ID: Final = re.compile(r"^[0-9a-f]{32}$")
 _SECRET: Final = "zephyr secret 4481"
+# The parts of _SECRET the log leak checks look for: its word, and its digits
+# (the part a random hex request id can share).
+_SECRET_WORD: Final = _SECRET.split()[0]
+_SECRET_DIGITS: Final = re.sub(r"[^0-9]", "", _SECRET)
+# Request ids pinned through admino.server.uuid4 (both valid uuid4 values): one
+# whose hex contains _SECRET_DIGITS (the GH-274 flake, made deterministic), and
+# one that shares nothing with _SECRET.
+_COLLIDING_REQUEST_ID: Final = uuid.UUID("0b5e2c7f-9d3a-4481-a6f0-3c1e8d2b7a95")
+_PLAIN_REQUEST_ID: Final = uuid.UUID("5c0f9e2a-7b3d-4e6a-9f1c-2d8b6a0e3f57")
+# The logger a planted leak (the positive control) writes the message to.
+_LEAK_LOGGER: Final = "admino.probe"
 _UNHANDLED_PREFIX: Final = "Unhandled exception"
 # Loops that exhaust a bucket stop here (far above any burst the server uses).
 _MAX_ATTEMPTS: Final = 300
@@ -616,9 +629,60 @@ async def _unhandled_from_probe(endpoint: Any) -> tuple[Response, CapturedLogs]:
     return response, logs
 
 
-async def _unhandled_from_route() -> tuple[Response, CapturedLogs]:
-    """A real route (GET /api/platform/orgs) whose service call raises."""
-    list_orgs = AsyncMock(side_effect=RuntimeError(_SECRET))
+def _log_then_raise(form: str) -> Callable[..., NoReturn]:
+    """A failing collaborator that logs the exception message, then raises (a planted leak).
+
+    ``"bare-message"`` logs ``_SECRET`` as the whole message; ``"str-of-exception"``
+    formats the exception into a sentence (``"%s", exc``). Either way the line is
+    written on an ``admino.*`` logger while the request runs, through the
+    configured handler.
+    """
+
+    def fail(*_args: object, **_kwargs: object) -> NoReturn:
+        exc = RuntimeError(_SECRET)
+        logger = logging.getLogger(_LEAK_LOGGER)
+        if form == "bare-message":
+            logger.error(_SECRET)
+        else:
+            logger.error("Lookup failed: %s", exc)
+        raise exc
+
+    return fail
+
+
+def _endpoint_calling(
+    fail: Callable[..., NoReturn],
+) -> Callable[[Request], Awaitable[JSONResponse]]:
+    """A probe route handler that fails through ``fail``."""
+
+    async def endpoint(request: Request) -> JSONResponse:
+        fail()
+
+    return endpoint
+
+
+def _message_leaks(logs: CapturedLogs) -> list[tuple[str, str]]:
+    """Where the exception message (or a traceback) reached the logs; ``[]`` for nowhere.
+
+    Each leak is ``(channel, probe)``: channel ``"text"`` is the formatted output
+    an operator sees, ``"record"`` a raw record's message. A test asserts ``== []``
+    (nothing leaked) or that a planted leak is reported.
+    """
+    leaks = [
+        ("text", probe)
+        for probe in (_SECRET_WORD, _SECRET_DIGITS, "Traceback")
+        if probe in logs.text
+    ]
+    if any(_SECRET_WORD in record.getMessage() for record in logs.records):
+        leaks.append(("record", _SECRET_WORD))
+    return leaks
+
+
+async def _unhandled_from_route(
+    fail: Callable[..., NoReturn] | None = None,
+) -> tuple[Response, CapturedLogs]:
+    """A real route (GET /api/platform/orgs) whose service call raises (through ``fail``)."""
+    list_orgs = AsyncMock(side_effect=fail if fail is not None else RuntimeError(_SECRET))
     with (
         configured_logging() as logs,
         patch("admino.organizations.list_orgs", new=list_orgs),
@@ -629,24 +693,42 @@ async def _unhandled_from_route() -> tuple[Response, CapturedLogs]:
     return response, logs
 
 
-async def _unhandled_from_dependency() -> tuple[Response, CapturedLogs]:
-    """The real session dependency, whose session lookup raises."""
+async def _unhandled_from_dependency(
+    fail: Callable[..., NoReturn] | None = None,
+) -> tuple[Response, CapturedLogs]:
+    """The real session dependency, whose session lookup raises (through ``fail``)."""
     with configured_logging() as logs, resolved_session(None) as resolve:
-        resolve.side_effect = RuntimeError(_SECRET)
+        resolve.side_effect = fail if fail is not None else RuntimeError(_SECRET)
         async with _client(_app()) as client:
             response = await client.get("/api/auth/me", headers=session_cookie())
     return response, logs
 
 
-async def _unhandled(source: str) -> tuple[Response, CapturedLogs]:
-    if source == "probe-route":
-        return await _unhandled_from_probe(_raise_runtime_error)
-    if source == "real-route":
-        return await _unhandled_from_route()
-    return await _unhandled_from_dependency()
+async def _unhandled(
+    source: str,
+    *,
+    request_id: uuid.UUID | None = None,
+    fail: Callable[..., NoReturn] | None = None,
+) -> tuple[Response, CapturedLogs]:
+    """Run one unhandled-exception flow; return the response and the logs.
+
+    ``request_id`` pins the UUID the request-ID middleware draws
+    (``admino.server.uuid4``); ``fail`` replaces the failing collaborator (the
+    probe handler, ``list_orgs`` or ``resolve_session``) and must raise.
+    """
+    with ExitStack() as stack:
+        if request_id is not None:
+            stack.enter_context(patch("admino.server.uuid4", return_value=request_id))
+        if source == "probe-route":
+            endpoint = _raise_runtime_error if fail is None else _endpoint_calling(fail)
+            return await _unhandled_from_probe(endpoint)
+        if source == "real-route":
+            return await _unhandled_from_route(fail)
+        return await _unhandled_from_dependency(fail)
 
 
 _SOURCES: Final = ["probe-route", "real-route", "dependency"]
+_LEAK_FORMS: Final = ["bare-message", "str-of-exception"]
 
 
 class TestUnhandledExceptions:
@@ -713,10 +795,43 @@ class TestUnhandledExceptions:
         _, logs = await _unhandled(source)
 
         assert logs.json_lines(), "nothing was captured"
-        assert "zephyr" not in logs.text
-        assert "4481" not in logs.text
-        assert "Traceback" not in logs.text
-        assert not any("zephyr" in record.getMessage() for record in logs.records)
+        assert _message_leaks(logs) == []
+
+    @pytest.mark.parametrize("source", _SOURCES)
+    async def test_unhandled_exception_request_id_sharing_the_message_digits_is_no_leak(
+        self, source: str
+    ) -> None:
+        """A request id that happens to contain the message's digits is no leak (GH-274).
+
+        ``uuid4().hex`` is random: about one id in 2,260 contains the four digits
+        of ``_SECRET``, and the leak check then failed although nothing leaked.
+        The id is pinned to such a value here, so the case runs every time.
+        """
+        response, logs = await _unhandled(source, request_id=_COLLIDING_REQUEST_ID)
+
+        assert _SECRET_DIGITS in _request_id(response), "the request id wasn't pinned"
+        assert _SECRET_DIGITS in logs.text, "the pinned request id reached no log line"
+        assert _message_leaks(logs) == []
+
+    @pytest.mark.parametrize("form", _LEAK_FORMS)
+    @pytest.mark.parametrize("source", _SOURCES)
+    async def test_unhandled_exception_message_logged_during_the_request_is_reported(
+        self, source: str, form: str
+    ) -> None:
+        """Positive control: the leak check reports a message that does reach a log line.
+
+        The failing collaborator logs the message right before it raises; the leak
+        is reported in the formatted text and in the raw record. The request id
+        shares nothing with ``_SECRET``, so only the message can be what is found.
+        """
+        response, logs = await _unhandled(
+            source, request_id=_PLAIN_REQUEST_ID, fail=_log_then_raise(form)
+        )
+
+        planted = [entry for entry in logs.json_lines() if entry.get("logger") == _LEAK_LOGGER]
+        assert response.status_code == 500
+        assert [entry["request_id"] for entry in planted] == [_request_id(response)]
+        assert {channel for channel, _ in _message_leaks(logs)} == {"text", "record"}
 
     async def test_unhandled_exception_names_the_bare_class(self) -> None:
         response, logs = await _unhandled_from_probe(_raise_zephyr_error)
