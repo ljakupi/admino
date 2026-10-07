@@ -356,8 +356,10 @@ conversion in `attachment_processing.py` and `converters/`:
   conversion may leave behind, so they don't pile up as zombies. The agent always kills
   and reaps the child itself, but not the processes the child started: the grandchildren
   of a killed conversion are not killed, they keep running until they exit, and the
-  container's init reaps them when they exit. Each one inherits the child's limits, so
-  its CPU time is bounded by the same 130 seconds (`RLIMIT_CPU`).
+  container's init reaps them when they exit. Each one inherits the child's limits, but
+  the 130-second CPU limit (`RLIMIT_CPU`) applies per process: every process a
+  grandchild starts gets its own 130 seconds, so the tree as a whole has no CPU cap, and
+  its processes are only reaped by the container's init once they exit.
 - **The agent's secrets and code stay out of the child's reach.** The child runs as the
   agent's user, so on Linux the agent makes its own process non-dumpable at startup
   (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's
@@ -575,9 +577,11 @@ We prefer to be transparent about what this does **not** guarantee:
   the agent's process. A killed agent ends its container, which the restart policy starts
   again; a stopped one freezes admino for every organization until you restart it by
   hand (`docker compose restart agent`), as the restart policy acts only on an exit.
-  Closing that takes a real sandbox, and the options for a follow-up are
-  Landlock (Linux 5.13 and later), confining the child to its one file and its output
-  directory, or a separate converter container with its own user and no network. The
+  Closing that takes a real sandbox, and the options for a follow-up are Landlock or a
+  separate converter container with its own user and no network. Landlock's filesystem
+  rules (Linux 5.13 and later) confine the child to its one file and its output
+  directory, but they don't block the stop or kill: only its signal scoping
+  (`LANDLOCK_SCOPE_SIGNAL`, Landlock ABI 6, Linux 6.12 and later) does. The
   parsers are pinned; keep admino up to date, as their security fixes arrive as
   dependency updates.
 - **The deletion window is checked when the deletion is scheduled, not when it's
