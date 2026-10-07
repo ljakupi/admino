@@ -287,7 +287,10 @@ Security notes:
   (``_open_uploads``; one more is the 429 before ``upload_attachment`` runs,
   nothing read); the quota pre-check counts the bytes the org's uploads in
   progress declared, and a body chunk that doesn't come within
-  ``attachments.STALL_TIMEOUT_S`` is the 400 ``content_length_mismatch``. Every
+  ``attachments.STALL_TIMEOUT_S``, or a body not complete within
+  ``attachments.UPLOAD_GRACE_S`` plus the declared length at
+  ``attachments.UPLOAD_MIN_RATE_BYTES_S``, is the 400
+  ``content_length_mismatch``. Every
   refusal is ``{"detail": <fixed text>, "reason": <code>}`` and stores no
   row, file or audit event. A stored file (``file.upload``, content-free) is
   submitted once to the bounded processing pool (``_processing``) after the
@@ -5061,8 +5064,11 @@ async def post_chat_attachment(
         201 with the stored attachment's AttachmentSummary (status
         ``uploaded``). Or a refusal ``{"detail", "reason"}`` with nothing
         stored: 400 ``invalid_filename``, ``empty_file`` or
-        ``content_length_mismatch`` (also when the client leaves mid-body
-        or the body stalls), 411 ``content_length_required``, 413 ``file_too_large`` or
+        ``content_length_mismatch`` (also when the client leaves mid-body,
+        a chunk doesn't come within ``attachments.STALL_TIMEOUT_S``, or the
+        body isn't complete within ``attachments.UPLOAD_GRACE_S`` plus the
+        declared length at ``attachments.UPLOAD_MIN_RATE_BYTES_S``), 411
+        ``content_length_required``, 413 ``file_too_large`` or
         ``storage_quota_exceeded``, 415 ``unsupported_type`` or
         ``legacy_office``, 422 ``password_protected`` or ``corrupted_file``,
         503 ``storage_unavailable``.
