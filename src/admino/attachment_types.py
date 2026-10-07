@@ -20,7 +20,11 @@ Security notes:
   file's ``EncryptedPackage``, the text check), in chunks that overlap, so a
   harmless prefix can't carry a binary payload.
 - ZIP files are read through their central directory only: nothing is
-  decompressed here (the zip-bomb guard is #188's converter work).
+  decompressed here (the zip-bomb guard is #188's converter work). zipfile
+  reads the archive through a wrapper that refuses any read past
+  ``MAX_ZIP_DIRECTORY_BYTES``, so a huge directory is refused before it is
+  read or parsed (its memory and CPU cost stay bounded); whatever zipfile
+  raises while listing, ``MemoryError`` aside, is ``corrupted_file``.
 - A refusal never carries the name, the path or any byte of the file, and
   every lower-level exception is dropped (``from None``) so its message, which
   may hold input, can't reach a log or a response.
@@ -198,7 +202,9 @@ _PNG_MAGIC: Final = b"\x89PNG\r\n\x1a\n"
 _PNG_MIN_SIZE: Final = 33
 _JPEG_MAGIC: Final = b"\xff\xd8\xff"
 _ZIP_MAGIC: Final = b"PK\x03\x04"
-_ZIP_ERRORS: Final = (zipfile.BadZipFile, zipfile.LargeZipFile, EOFError, OSError, ValueError)
+# zipfile reads the whole central directory in one read and builds an object
+# per entry: a larger directory is refused before any of it is read.
+MAX_ZIP_DIRECTORY_BYTES: Final = 2 * 1024 * 1024
 _ZIP_ENCRYPTED_FLAG: Final = 0x1
 _OOXML_CONTENT_TYPES: Final = "[Content_Types].xml"
 _CFB_MAGIC: Final = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
@@ -235,7 +241,7 @@ def detect_kind(path: Path, filename: str) -> AttachmentKind:
                 raise AttachmentRefusedError("corrupted_file")
             return "webp"
         if head[:4] == _ZIP_MAGIC:
-            return _check_ooxml(path)
+            return _check_ooxml(_CappedReader(file, size))
         if head[:8] == _CFB_MAGIC:
             file.seek(0)
             if _contains(file, _CFB_ENCRYPTED_PACKAGE):
@@ -280,12 +286,50 @@ def _check_pdf(file: BinaryIO, size: int) -> AttachmentKind:
     return "pdf"
 
 
-def _check_ooxml(path: Path) -> AttachmentKind:
+class _CappedReader:
+    """A read-only view of an open file whose reads never exceed ``MAX_ZIP_DIRECTORY_BYTES``.
+
+    A read asking for more, or an unsized read that would return more, raises
+    instead of returning fewer bytes: zipfile lists a directory cut short
+    inside its last entry's name or comment without noticing.
+    """
+
+    def __init__(self, file: BinaryIO, size: int) -> None:
+        self._file = file
+        self._size = size
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        """Move to ``offset`` (relative to ``whence``) in the file."""
+        return self._file.seek(offset, whence)
+
+    def tell(self) -> int:
+        """The current position in the file."""
+        return self._file.tell()
+
+    def read(self, size: int | None = -1) -> bytes:
+        """Return ``size`` bytes (all that are left when unsized), refusing more than the cap.
+
+        Raises:
+            zipfile.BadZipFile: The read would hand out more than
+                ``MAX_ZIP_DIRECTORY_BYTES``.
+        """
+        if size is None or size < 0:
+            size = max(0, self._size - self._file.tell())
+        if size > MAX_ZIP_DIRECTORY_BYTES:
+            raise zipfile.BadZipFile("Central directory too large")
+        return self._file.read(size)
+
+
+def _check_ooxml(file: _CappedReader) -> AttachmentKind:
     """Classify a ZIP by its central directory alone: DOCX, XLSX or refused."""
     try:
-        with zipfile.ZipFile(path) as archive:
+        with zipfile.ZipFile(file) as archive:
             entries = archive.infolist()
-    except _ZIP_ERRORS:
+    except MemoryError:
+        raise
+    except Exception:
+        # zipfile's error surface isn't closed (NotImplementedError for an
+        # unsupported "version needed to extract", among others).
         raise AttachmentRefusedError("corrupted_file") from None
     if any(entry.flag_bits & _ZIP_ENCRYPTED_FLAG for entry in entries):
         raise AttachmentRefusedError("password_protected")

@@ -377,7 +377,7 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `limits` | `max_message_length` | from `config.yaml` (4000) | 1–100,000 | every message |
 | `limits` | `max_context_messages` | from `config.yaml` (20) | 1–200 | every message |
 | `files` | `max_file_size_mb` | 50 | 1–500 | every [attachment](#attachments) upload, in MiB (1,048,576 bytes) |
-| `files` | `max_files_per_message` | 10 | 1–50 | the attachments one message carries, and the burst of the upload rate limit |
+| `files` | `max_files_per_message` | 10 | 1–50 | the attachments one message carries, the burst of the upload rate limit, and the uploads one user may have in progress at once |
 | `files` | `max_pages_per_file` | 100 | 1–1000 | attachment processing: a file with more pages fails (pages are counted from [#188](https://github.com/ljakupi/admino/issues/188) on) |
 | `files` | `render_dpi` | 150 | 72–300 | page images (later release) |
 | `retention` | `trash_min_days`, `trash_max_days` | 0, 90 | 0–90, min ≤ max | the bounds of each [organization's trash retention](#organization-settings) |
@@ -1033,15 +1033,22 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
     `.csv` is `csv`, `.md` and `.markdown` are `md`, anything else is `txt`.
   - A PDF without its end marker, a PNG without its header, a WEBP shorter than it says
     and an unreadable ZIP are corrupted; an encrypted PDF, DOCX or XLSX is
-    password-protected.
+    password-protected. A ZIP is read from its central directory (the list of its
+    entries) only, and one whose directory is larger than 2 MiB is corrupted too: a
+    real DOCX or XLSX has a far smaller one.
+  - At most 2 uploads are type-checked at once, across all users; the others wait
+    their turn.
 - **Limits.** The size must be in `Content-Length`; it's checked against
   `max_file_size_mb` (a [platform default](#platform-defaults), 50 MiB by default) and
   against your organization's storage quota (its plan's `storage_quota`, set by the
   Super Admin) before any byte of the file is read. The quota counts every attachment of
-  the organization, those in the trash included. The body must then be exactly
+  the organization, those in the trash included, plus the uploads still in progress:
+  each one reserves its `Content-Length` until it ends (stored or not), so parallel
+  uploads can't fill the disk past the quota. The body must then be exactly
   `Content-Length` bytes: the upload stops as soon as it goes past, and one that ends
-  short is refused too. The quota is checked again when the file is stored, so parallel
-  uploads can't overrun it.
+  short is refused too, as is one that sends nothing for 30 seconds (its partial file is
+  deleted). The quota is checked again when the file is stored, so parallel uploads
+  can't overrun it.
 - **Errors** use the usual `{"detail", "reason"}` body, with a fixed English `detail`
   that never repeats the name or the content. A refused upload keeps nothing: no
   attachment, no file, no audit event. After the session, the role and the rate limit,
@@ -1054,12 +1061,12 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   | `400` | `empty_file` | `Content-Length: 0` |
   | `413` | `file_too_large` | more than `max_file_size_mb` |
   | `404` | `chat_not_found` | the chat doesn't exist, is in the trash or isn't yours (the chat routes' `404`) |
-  | `413` | `storage_quota_exceeded` | the file would take the organization past its storage quota |
-  | `400` | `content_length_mismatch` | the body is longer or shorter than `Content-Length` |
+  | `413` | `storage_quota_exceeded` | the file, with the uploads in progress, would take the organization past its storage quota |
+  | `400` | `content_length_mismatch` | the body is longer or shorter than `Content-Length`, or sends nothing for 30 seconds |
   | `415` | `unsupported_type` | not a supported type (a plain ZIP, a PPTX, a binary file, text that isn't UTF-8) |
   | `415` | `legacy_office` | an old Office file: save it as .docx or .xlsx |
   | `422` | `password_protected` | an encrypted PDF, DOCX or XLSX |
-  | `422` | `corrupted_file` | see the type checks above |
+  | `422` | `corrupted_file` | see the type checks above (a ZIP directory over 2 MiB included) |
   | `503` | `storage_unavailable` | the attachments volume can't be written |
 
 - **Processing.** After the `201`, the file is checked again in the background, on a pool
@@ -1095,7 +1102,10 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   stored as text downloads as `page.html.txt`).
 - **Rate limits** apply per user, each answering `429` `{"detail": "Rate limit
   exceeded"}`: uploads a burst of `max_files_per_message`, then one every 2 seconds;
-  metadata 5 per second (burst 50); downloads 2 per second (burst 30).
+  metadata 5 per second (burst 50); downloads 2 per second (burst 30). A user also has
+  at most `max_files_per_message` uploads in progress at once: one more answers the same
+  `429` before any byte of it is read, and the slot is free again as soon as one of
+  them ends, however it ends.
 - **Trash and deletion.** Moving a chat to the trash moves its attachments there too:
   they can't be read or sent anymore, their files stay on disk and they still count
   against the storage quota until the trash is purged

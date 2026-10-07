@@ -282,7 +282,12 @@ Security notes:
   ``Content-Type`` and the name's extension are ignored; 415
   ``unsupported_type`` / ``legacy_office``, 422 ``password_protected`` /
   ``corrupted_file``), and the commit checks the chat and the quota again
-  under their locks; a disk failure is 503 ``storage_unavailable``. Every
+  under their locks; a disk failure is 503 ``storage_unavailable``. A user
+  has at most the platform ``max_files_per_message`` uploads open at once
+  (``_open_uploads``; one more is the 429 before ``upload_attachment`` runs,
+  nothing read); the quota pre-check counts the bytes the org's uploads in
+  progress declared, and a body chunk that doesn't come within
+  ``attachments.STALL_TIMEOUT_S`` is the 400 ``content_length_mismatch``. Every
   refusal is ``{"detail": <fixed text>, "reason": <code>}`` and stores no
   row, file or audit event. A stored file (``file.upload``, content-free) is
   submitted once to the bounded processing pool (``_processing``) after the
@@ -567,6 +572,8 @@ Security notes:
 
 Deployment note:
 - Chats and their messages live in PostgreSQL. In-memory state: the bounded
+  ``_open_uploads`` (GH-187: each user's uploads in progress, cleared by
+  ``create_app``; ``admino.attachments`` keeps the bytes they reserve),
   ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run
   locks, streamed runs' stop signals (GH-8) and pending confirmations, at
   most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries and
@@ -773,7 +780,7 @@ from admino.streaming import DisplayDeltas, RunStream, display_pieces
 from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 
     import asyncpg
     from pydantic import BaseModel
@@ -1350,6 +1357,9 @@ _DRAIN_TIMEOUT_S: Final = 30.0
 # Replaced by create_app (a restart's state); the upload route and the lifespan read
 # this module global at call time (tests swap it).
 _processing = attachment_processing.ProcessingPool()
+# GH-187: user id -> their uploads in progress (at most the platform
+# max_files_per_message each). Cleared by create_app, like _rate_buckets.
+_open_uploads: dict[UUID, int] = {}
 
 # OAuth state binding (GH-162): the authorize route stores the state with the
 # initiating user and session, and sets this short-lived cookie (HttpOnly,
@@ -4994,6 +5004,28 @@ def _declared_length(value: str | None) -> int:
     return int(value)
 
 
+@contextlib.contextmanager
+def _upload_slot(user_id: UUID, limit: int) -> Iterator[None]:
+    """Hold one of ``user_id``'s at most ``limit`` uploads in progress, released on any exit.
+
+    Raises:
+        HTTPException: 429 when the user already has ``limit`` uploads open.
+    """
+    open_now = _open_uploads.get(user_id, 0)
+    if open_now >= limit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    _open_uploads[user_id] = open_now + 1
+    try:
+        yield
+    finally:
+        # get(): create_app may have cleared the map while this upload ran.
+        left = _open_uploads.get(user_id, 1) - 1
+        if left > 0:
+            _open_uploads[user_id] = left
+        else:
+            _open_uploads.pop(user_id, None)
+
+
 def _attachment_summary(record: attachments.AttachmentRecord) -> AttachmentSummary:
     """The API summary of a stored attachment: metadata only, never its org, owner or path."""
     return AttachmentSummary.model_validate(record, from_attributes=True)
@@ -5010,10 +5042,12 @@ async def post_chat_attachment(
     ``max_files_per_message`` when the caller's bucket is created, then one
     every 2 seconds), the name (the percent-encoded ``X-Attachment-Name``
     header, ``attachment_types.sanitize_filename``), the ``Content-Length``
-    (required: it bounds the stream), then in
-    ``attachments.upload_attachment`` the size against the stored platform
-    ``max_file_size_mb`` (MiB, read on every request), the chat's owner and
-    the org's storage quota. The declared ``Content-Type`` is ignored: the
+    (required: it bounds the stream), the caller's uploads in progress (at
+    most ``max_files_per_message``; the slot is held until this upload
+    ends, however it ends), then in ``attachments.upload_attachment`` the
+    size against the stored platform ``max_file_size_mb`` (MiB, read on
+    every request), the chat's owner and the org's storage quota (stored
+    plus reserved bytes). The declared ``Content-Type`` is ignored: the
     kind comes from the content. A stored file is submitted once to
     ``_processing`` (looked up now) and logged by its ids, size and kind.
 
@@ -5027,14 +5061,15 @@ async def post_chat_attachment(
         201 with the stored attachment's AttachmentSummary (status
         ``uploaded``). Or a refusal ``{"detail", "reason"}`` with nothing
         stored: 400 ``invalid_filename``, ``empty_file`` or
-        ``content_length_mismatch`` (also when the client leaves mid-body),
-        411 ``content_length_required``, 413 ``file_too_large`` or
+        ``content_length_mismatch`` (also when the client leaves mid-body
+        or the body stalls), 411 ``content_length_required``, 413 ``file_too_large`` or
         ``storage_quota_exceeded``, 415 ``unsupported_type`` or
         ``legacy_office``, 422 ``password_protected`` or ``corrupted_file``,
         503 ``storage_unavailable``.
 
     Raises:
-        HTTPException: 429 when rate-limited. A chat the caller can't reach
+        HTTPException: 429 when rate-limited or when the caller already has
+            ``max_files_per_message`` uploads open. A chat the caller can't reach
             (before the body is read, or trashed while it streamed) is the
             404 ``chat_not_found`` (``chats.ChatNotFoundError``).
     """
@@ -5050,17 +5085,18 @@ async def post_chat_attachment(
     try:
         filename = attachment_types.sanitize_filename(request.headers.get("x-attachment-name"))
         declared_length = _declared_length(request.headers.get("content-length"))
-        record = await attachments.upload_attachment(
-            pool,
-            tenant,
-            chat_id,
-            filename=filename,
-            declared_length=declared_length,
-            body=request.stream(),
-            root=root,
-            max_bytes=files.max_file_size_mb * _MIB,
-            ip=request.client.host if request.client is not None else None,
-        )
+        with _upload_slot(principal.user_id, files.max_files_per_message):
+            record = await attachments.upload_attachment(
+                pool,
+                tenant,
+                chat_id,
+                filename=filename,
+                declared_length=declared_length,
+                body=request.stream(),
+                root=root,
+                max_bytes=files.max_file_size_mb * _MIB,
+                ip=request.client.host if request.client is not None else None,
+            )
     except AttachmentRefusedError as exc:
         return _attachment_refusal(exc.reason)
     except ClientDisconnect:
@@ -6595,6 +6631,8 @@ def create_app(
 
     # Rate-limit buckets start empty (fresh process state, test isolation).
     _rate_buckets.clear()
+    # No upload is in progress in a fresh process (GH-187).
+    _open_uploads.clear()
 
     app = FastAPI(
         title="admino",

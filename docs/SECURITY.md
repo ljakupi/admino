@@ -302,13 +302,26 @@ checks and the storage live in `attachment_types.py` and `attachments.py`:
   standard library from its central directory only, nothing decompressed), strict UTF-8
   for text. The name and the declared `Content-Type` never decide it. Unsupported, old
   Office, password-protected and corrupted files are refused before anything is kept.
+  The ZIP check is bounded: zipfile reads the archive through a wrapper that refuses any
+  read over 2 MiB, so a central directory larger than that is `corrupted_file` before
+  it's read or parsed, and so is any archive zipfile can't list. At most 2 files are
+  type-checked at once across all uploads, so crafted archives can't exhaust the
+  agent's memory or CPU for every organization.
   The conversion libraries check the files again when they're processed
   ([#188](https://github.com/ljakupi/admino/issues/188)).
 - **Bounded before a byte is read.** `Content-Length` is required and checked against
   the size limit and the organization's storage quota first, and the upload stops as
-  soon as the body goes past it. The quota is checked again under a lock on the
-  organization's row when the file is stored, so parallel uploads can't overrun it. A
-  refused upload leaves no file, no row and no audit event.
+  soon as the body goes past it. The quota check counts the uploads still in progress:
+  each reserves its `Content-Length` for its organization until it ends, so parallel
+  uploads can't fill the shared attachments volume past the quota. A user has at most
+  `max_files_per_message` uploads in progress (one more is `429` before its body is
+  read), and a body that sends nothing for 30 seconds ends with `400
+  content_length_mismatch`, so held connections can't pin reservations and partial
+  files. The reservations and the open-upload counts live in the agent process (a
+  single worker). The quota is checked again under a lock on the organization's row
+  when the file is stored, so parallel uploads can't overrun it. A refused upload leaves
+  no file, no row and no audit event, and an exception after the commit (a cancelled
+  connection release) never deletes the stored file.
 - **Downloads never render in admino's origin.** Only the chat's owner downloads a
   file, always as `Content-Disposition: attachment` with the detected type's
   `Content-Type`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, so an

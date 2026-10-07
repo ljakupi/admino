@@ -17,13 +17,18 @@ reason code), ``chats.ChatNotFoundError``, ``AttachmentNotFoundError``,
 driver's errors.
 
 Upload order (``upload_attachment``): the size checks, the chat's owner
-check, a quota pre-check (all before the body is read), the body streamed to
-``<id>.part``, type detection in a worker thread, then one transaction: the
-chat row locked ``FOR SHARE`` (it must still be live), the org row locked
-``FOR NO KEY UPDATE`` (the quota checked again, so concurrent uploads can't
-overrun it), the INSERT, the ``file.upload`` event and the rename of
-``<id>.part`` to ``<id>`` before the commit. The lock order (chat, then org)
-is the one user deletion, the org notice and the org purge take.
+check, a quota pre-check that counts the org's stored rows plus the bytes
+reserved by its uploads in progress (all before the body is read), the
+declared length reserved for the org, the body streamed to ``<id>.part``
+(each chunk within ``STALL_TIMEOUT_S``), type detection in a worker thread
+(at most ``DETECT_CONCURRENCY`` at once across uploads), then one
+transaction: the chat row locked ``FOR SHARE`` (it must still be live), the
+org row locked ``FOR NO KEY UPDATE`` (the quota checked again against the
+stored rows, so concurrent uploads can't overrun it), the INSERT, the
+``file.upload`` event and the rename of ``<id>.part`` to ``<id>`` before the
+commit. The reservation is released when the upload ends, however it ends.
+The lock order (chat, then org) is the one user deletion, the org notice and
+the org purge take.
 
 Security notes:
 - Tenancy: every statement binds the caller's org (and, for one member's
@@ -36,9 +41,15 @@ Security notes:
   exclusively and never through a symlink. ``remove_files`` unlinks a
   symlink instead of following it.
 - A refused or failed upload leaves no row, no file and no audit event: the
-  partial (or renamed) file is removed on every failure, cancellation
-  included. A disk error is ``storage_unavailable``, never its message.
-- The body is never read past the declared length.
+  partial (or renamed) file is removed on every failure before the commit,
+  cancellation included. After the commit, a later exception (a cancelled
+  connection release) never removes the stored file.
+  A disk error is ``storage_unavailable``, never its message.
+- The body is never read past the declared length. Uploads in progress
+  can't fill the volume past the org's quota (their declared lengths are
+  reserved in this process, which runs as a single worker), a stalled body
+  can't hold its reservation and partial file open, and type detection (the
+  ZIP directory parse grows with the file) is bounded across uploads.
 - No content in logs: nothing here logs a file name, a path or file bytes;
   ``remove_files`` logs ids and an exception's class name only.
 - Parameterized SQL only (the contract's forms A1-A8), every value a bind
@@ -49,6 +60,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import shutil
@@ -78,6 +90,12 @@ if TYPE_CHECKING:
     from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
+
+# A body chunk that doesn't arrive within this many seconds ends the upload
+# (content_length_mismatch): a held connection can't pin its reservation.
+STALL_TIMEOUT_S: Final = 30.0
+# At most this many detect_kind calls run at once, across all uploads.
+DETECT_CONCURRENCY: Final = 2
 
 _DIRECTORY_MODE: Final = 0o700
 _FILE_MODE: Final = 0o600
@@ -124,6 +142,14 @@ _SENDABLE_SQL: Final = """
     WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4
       AND deleted_at IS NULL
 """
+
+
+# org id -> the declared bytes of its uploads in progress (between the quota
+# pre-check and the upload's end). In-process state: one worker serves all orgs.
+_reserved: dict[UUID, int] = {}
+# The detection semaphore and the event loop it belongs to (a semaphore can't
+# be shared across loops; an app restarted in the same process gets a new one).
+_detect_slots: tuple[asyncio.AbstractEventLoop, asyncio.Semaphore] | None = None
 
 
 class AttachmentRecord(SealedModel):
@@ -189,11 +215,19 @@ async def _receive(file: BinaryIO, body: AsyncIterator[bytes], declared_length: 
 
     Raises:
         AttachmentRefusedError: ``content_length_mismatch`` when the body runs
-            past the declared length (no further chunk is pulled) or ends
-            short; ``storage_unavailable`` on a write error.
+            past the declared length (no further chunk is pulled), ends
+            short, or a chunk doesn't come within ``STALL_TIMEOUT_S``;
+            ``storage_unavailable`` on a write error.
     """
     received = 0
-    async for chunk in body:
+    while True:
+        try:
+            async with asyncio.timeout(STALL_TIMEOUT_S):
+                chunk = await anext(body)
+        except StopAsyncIteration:
+            break
+        except TimeoutError:
+            raise AttachmentRefusedError("content_length_mismatch") from None
         received += len(chunk)
         if received > declared_length:
             raise AttachmentRefusedError("content_length_mismatch")
@@ -203,6 +237,35 @@ async def _receive(file: BinaryIO, body: AsyncIterator[bytes], declared_length: 
         raise AttachmentRefusedError("content_length_mismatch")
     with _disk_errors():
         await asyncio.to_thread(file.close)
+
+
+def _detect_semaphore() -> asyncio.Semaphore:
+    """The running loop's detection semaphore (``DETECT_CONCURRENCY`` slots)."""
+    global _detect_slots
+    loop = asyncio.get_running_loop()
+    if _detect_slots is None or _detect_slots[0] is not loop:
+        _detect_slots = (loop, asyncio.Semaphore(DETECT_CONCURRENCY))
+    return _detect_slots[1]
+
+
+def _free_slot(slots: asyncio.Semaphore, work: asyncio.Future[AttachmentKind]) -> None:
+    """Release a detection slot once its thread ended (its outcome counts as retrieved)."""
+    slots.release()
+    if not work.cancelled():
+        work.exception()
+
+
+async def _detect(part: Path, filename: str) -> AttachmentKind:
+    """``attachment_types.detect_kind`` in a worker thread, at most ``DETECT_CONCURRENCY`` at once.
+
+    The slot is held until the thread ends: a cancelled upload doesn't stop
+    its thread, so releasing on cancellation would let more run at once.
+    """
+    slots = _detect_semaphore()
+    await slots.acquire()
+    work = asyncio.ensure_future(asyncio.to_thread(attachment_types.detect_kind, part, filename))
+    work.add_done_callback(functools.partial(_free_slot, slots))
+    return await asyncio.shield(work)
 
 
 def _discard(file: BinaryIO, *paths: Path) -> None:
@@ -231,6 +294,10 @@ async def upload_attachment(
 ) -> AttachmentRecord:
     """Store an uploaded file in the caller's chat and record ``file.upload``.
 
+    The declared length is reserved for the org from the quota pre-check
+    until the upload ends (stored, refused, failed or cancelled), so uploads
+    in progress count against the quota of the next one.
+
     Args:
         pool: The database pool.
         tenant: The caller's org scope; the caller owns the chat and the file.
@@ -247,8 +314,10 @@ async def upload_attachment(
 
     Raises:
         AttachmentRefusedError: ``empty_file``, ``file_too_large``,
-            ``storage_quota_exceeded``, ``content_length_mismatch``, a
-            detection refusal or ``storage_unavailable``; nothing is stored.
+            ``storage_quota_exceeded`` (stored plus reserved bytes before the
+            body, stored bytes at the commit), ``content_length_mismatch``
+            (also a stalled body), a detection refusal or
+            ``storage_unavailable``; nothing is stored.
         chats.ChatNotFoundError: Unless the chat is the caller's and live,
             before the body is read or at the commit.
         AuditRecordError: If the event can't be recorded; nothing is stored.
@@ -260,9 +329,48 @@ async def upload_attachment(
     await chats.get_chat(pool, tenant, chat_id)
     quota = await pool.fetchval(_QUOTA_SQL, tenant.org_id)
     used = await pool.fetchval(_USED_SQL, tenant.org_id)
-    if int(used) + declared_length > quota:
+    # No await from the check to the reservation: a concurrent upload's
+    # pre-check always sees it.
+    reserved = _reserved.get(tenant.org_id, 0)
+    if int(used) + reserved + declared_length > quota:
         raise AttachmentRefusedError("storage_quota_exceeded")
+    _reserved[tenant.org_id] = reserved + declared_length
+    try:
+        return await _store(
+            pool,
+            tenant,
+            chat_id,
+            filename=filename,
+            declared_length=declared_length,
+            body=body,
+            root=root,
+            ip=ip,
+        )
+    finally:
+        _release(tenant.org_id, declared_length)
 
+
+def _release(org_id: UUID, size: int) -> None:
+    """Return ``size`` reserved bytes of ``org_id``; an org with none left is dropped."""
+    left = _reserved.get(org_id, 0) - size
+    if left > 0:
+        _reserved[org_id] = left
+    else:
+        _reserved.pop(org_id, None)
+
+
+async def _store(
+    pool: asyncpg.Pool,
+    tenant: TenantContext,
+    chat_id: UUID,
+    *,
+    filename: str,
+    declared_length: int,
+    body: AsyncIterator[bytes],
+    root: Path,
+    ip: str | None,
+) -> AttachmentRecord:
+    """Stream, detect and commit one upload whose bytes are reserved (``upload_attachment``)."""
     attachment_id = uuid.uuid4()
     org_dir = root / str(tenant.org_id)
     part = org_dir / f"{attachment_id}.part"
@@ -272,44 +380,52 @@ async def upload_attachment(
     # or rename a file after the cleanup ran.
     with _disk_errors():
         file = _create_part(org_dir, part)
+    committed = False
     try:
         await _receive(file, body, declared_length)
         with _disk_errors():
-            kind = await asyncio.to_thread(attachment_types.detect_kind, part, filename)
-        async with pool.acquire() as conn, conn.transaction():
-            locked = await conn.fetchval(_LOCK_CHAT_SQL, chat_id, tenant.org_id, tenant.user_id)
-            if locked is None:
-                raise chats.ChatNotFoundError
-            quota = await conn.fetchval(_LOCK_QUOTA_SQL, tenant.org_id)
-            used = await conn.fetchval(_USED_SQL, tenant.org_id)
-            if int(used) + declared_length > quota:
-                raise AttachmentRefusedError("storage_quota_exceeded")
-            row = await conn.fetchrow(
-                _INSERT_SQL,
-                attachment_id,
-                tenant.org_id,
-                chat_id,
-                tenant.user_id,
-                filename,
-                kind,
-                declared_length,
-            )
-            await audit_events.record(
-                conn,
-                action=AuditAction.FILE_UPLOAD,
-                actor_kind="member",
-                actor_user_id=tenant.user_id,
-                org_id=tenant.org_id,
-                target_type=TargetType.FILE,
-                target_ids=(attachment_id,),
-                ip=ip,
-                metadata={"size_bytes": declared_length},
-            )
-            # Before the commit: a failed rename rolls the row back.
-            with _disk_errors():
-                os.replace(part, final)
+            kind = await _detect(part, filename)
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                locked = await conn.fetchval(_LOCK_CHAT_SQL, chat_id, tenant.org_id, tenant.user_id)
+                if locked is None:
+                    raise chats.ChatNotFoundError
+                quota = await conn.fetchval(_LOCK_QUOTA_SQL, tenant.org_id)
+                used = await conn.fetchval(_USED_SQL, tenant.org_id)
+                if int(used) + declared_length > quota:
+                    raise AttachmentRefusedError("storage_quota_exceeded")
+                row = await conn.fetchrow(
+                    _INSERT_SQL,
+                    attachment_id,
+                    tenant.org_id,
+                    chat_id,
+                    tenant.user_id,
+                    filename,
+                    kind,
+                    declared_length,
+                )
+                await audit_events.record(
+                    conn,
+                    action=AuditAction.FILE_UPLOAD,
+                    actor_kind="member",
+                    actor_user_id=tenant.user_id,
+                    org_id=tenant.org_id,
+                    target_type=TargetType.FILE,
+                    target_ids=(attachment_id,),
+                    ip=ip,
+                    metadata={"size_bytes": declared_length},
+                )
+                # Before the commit: a failed rename rolls the row back.
+                with _disk_errors():
+                    os.replace(part, final)
+            # The transaction block exited normally: the row is committed, and
+            # its file stays whatever happens next (a cancelled release).
+            committed = True
     except BaseException:
-        _discard(file, part, final)
+        if committed:
+            _discard(file, part)
+        else:
+            _discard(file, part, final)
         raise
     return _record(row)
 
