@@ -39,10 +39,12 @@ Security notes:
 - Operator blindness: the diagnostics body carries config metadata and statuses
   only; the public /health tells an anonymous caller nothing but up/degraded.
 - The exception message ``zephyr secret 4481`` is a marker that must never
-  reach a response or any log line. The log checks look for the whole message
-  and its word ``zephyr`` (plus a traceback), never for a fragment such as
-  ``4481`` that a random request id, timestamp or count can also contain
-  (GH-274: about one request id in 2,260 held those digits).
+  reach a response or any log line. The log checks look, case-insensitively,
+  for the whole message and each of its words that no random value can spell
+  (``zephyr``, ``secret``), plus a traceback. They never look for a fragment
+  such as ``4481`` that a random request id, timestamp or count can also
+  contain (GH-274: about one request id in 2,260 held those digits), so a leak
+  of the digits alone is the one shape they don't see.
 - No real database, LLM or network: ``check_health``, ``_check_llm_reachable``,
   ``resolve_session``, ``get_pool`` and ``organizations.list_orgs`` are patched.
   The chat route (GH-176: it persists into a chat per user and session id) gets
@@ -114,19 +116,27 @@ _REQUEST_ID: Final = re.compile(r"^[0-9a-f]{32}$")
 # up verbatim in the JSON log text. Its digit run is hex-like on purpose (a real
 # message can carry one); no leak probe may rely on it.
 _SECRET: Final = "zephyr secret 4481"
-_SECRET_WORD: Final = _SECRET.split()[0]
 # Not a leak probe: the hex-only part of _SECRET, which a random request id can
 # hold (GH-274). Only the reproduction's preconditions use it.
 _SECRET_DIGITS: Final = re.sub(r"[^0-9]", "", _SECRET)
-# What the log leak checks look for (GH-274): the whole message and its non-hex
-# word in a raw record's message and in the formatted text, plus a traceback in
-# the text. Never a fragment that a random value could spell on its own.
-_MESSAGE_PROBES: Final[tuple[str, ...]] = (_SECRET, _SECRET_WORD)
-_TEXT_PROBES: Final[tuple[str, ...]] = (*_MESSAGE_PROBES, "Traceback")
 # Every character a random value in a log line is made of: a request id or UUID
 # (hex digits, "-"), a timestamp ("2026-10-07T12:34:56.789+00:00", "Z", or
 # "2026-10-07 12:34:56,789"), a count or a duration (digits, ".", "-", "e").
 _RANDOM_VALUE_CHARS: Final = frozenset(string.hexdigits + "-:.,+TZ ")
+# The words of _SECRET that no random value can spell in any case: each holds a
+# character outside _RANDOM_VALUE_CHARS, compared casefolded. That is "zephyr"
+# and "secret"; the digit run is left out.
+_SECRET_WORDS: Final[tuple[str, ...]] = tuple(
+    word
+    for word in _SECRET.split()
+    if not set(word.casefold()) <= {char.casefold() for char in _RANDOM_VALUE_CHARS}
+)
+# What the log leak checks look for, case-insensitively (GH-274): the whole
+# message and each of _SECRET_WORDS in a raw record's message and in the
+# formatted text, plus a traceback in the text. Never a fragment that a random
+# value could spell on its own.
+_MESSAGE_PROBES: Final[tuple[str, ...]] = (_SECRET, *_SECRET_WORDS)
+_TEXT_PROBES: Final[tuple[str, ...]] = (*_MESSAGE_PROBES, "Traceback")
 # Request ids pinned through admino.server.uuid4 (both valid uuid4 values): one
 # whose hex contains _SECRET_DIGITS (the GH-274 flake, made deterministic), and
 # one that shares nothing with _SECRET.
@@ -649,18 +659,29 @@ def _log_then_raise(form: str) -> Callable[..., NoReturn]:
     """A failing collaborator that logs the exception message, then raises (a planted leak).
 
     ``"bare-message"`` logs ``_SECRET`` as the whole message; ``"str-of-exception"``
-    formats the exception into a sentence (``"%s", exc``). Either way the line is
-    written on an ``admino.*`` logger while the request runs, through the
-    configured handler.
+    formats the exception into a sentence (``"%s", exc``); ``"upper-cased"`` logs
+    the message upper-cased; ``"first-word-redacted"`` logs only its tail after a
+    masked first word (``"*** secret 4481"``); ``"truncated-head"`` logs only its
+    first nine characters (``"zephyr se"``). Each line is written on an
+    ``admino.*`` logger while the request runs, through the configured handler.
     """
 
     def fail(*_args: object, **_kwargs: object) -> NoReturn:
         exc = RuntimeError(_SECRET)
+        message = str(exc)
         logger = logging.getLogger(_LEAK_LOGGER)
         if form == "bare-message":
             logger.error(_SECRET)
-        else:
+        elif form == "str-of-exception":
             logger.error("Lookup failed: %s", exc)
+        elif form == "upper-cased":
+            logger.error("Lookup failed: %s", message.upper())
+        elif form == "first-word-redacted":
+            logger.error("Lookup failed: *** %s", message.split(maxsplit=1)[1])
+        elif form == "truncated-head":
+            logger.error("Lookup failed: %s...", message[:9])
+        else:
+            raise AssertionError(f"unknown leak form {form!r}")
         raise exc
 
     return fail
@@ -682,16 +703,20 @@ def _message_leaks(logs: CapturedLogs) -> list[tuple[str, str]]:
 
     Each leak is ``(channel, probe)``: channel ``"text"`` is the formatted output
     an operator sees (checked for ``_TEXT_PROBES``), ``"record"`` a raw record's
-    message (checked for ``_MESSAGE_PROBES``). Every probe holds a character that
-    no request id, timestamp or count has, so a random value can't match it
-    (GH-274). A test asserts ``== []`` (nothing leaked) or that a planted leak is
-    reported.
+    message (checked for ``_MESSAGE_PROBES``). Both compare casefolded, so an
+    upper- or title-cased message is still found, and a word probe on its own
+    finds a fragment (the tail after a redacted first word, a truncated head).
+    Every probe holds a character that no request id, timestamp or count has in
+    any case, so a random value can't match it (GH-274). A test asserts ``== []``
+    (nothing leaked) or the exact leaks of a planted message.
     """
-    leaks = [("text", probe) for probe in _TEXT_PROBES if probe in logs.text]
+    text = logs.text.casefold()
+    messages = [record.getMessage().casefold() for record in logs.records]
+    leaks = [("text", probe) for probe in _TEXT_PROBES if probe.casefold() in text]
     leaks.extend(
         ("record", probe)
         for probe in _MESSAGE_PROBES
-        if any(probe in record.getMessage() for record in logs.records)
+        if any(probe.casefold() in message for message in messages)
     )
     return leaks
 
@@ -746,7 +771,16 @@ async def _unhandled(
 
 
 _SOURCES: Final = ["probe-route", "real-route", "dependency"]
-_LEAK_FORMS: Final = ["bare-message", "str-of-exception"]
+# The planted leak forms of _log_then_raise and the probes that must report each,
+# exactly: every probe for the whole message in any case, and the one word that
+# survives for a fragment (so each word probe is proven on its own).
+_LEAK_FORMS: Final[dict[str, tuple[str, ...]]] = {
+    "bare-message": _MESSAGE_PROBES,
+    "str-of-exception": _MESSAGE_PROBES,
+    "upper-cased": _MESSAGE_PROBES,
+    "first-word-redacted": ("secret",),
+    "truncated-head": ("zephyr",),
+}
 
 
 class TestUnhandledExceptions:
@@ -831,18 +865,20 @@ class TestUnhandledExceptions:
         assert _SECRET_DIGITS in logs.text, "the pinned request id reached no log line"
         assert _message_leaks(logs) == []
 
-    @pytest.mark.parametrize("form", _LEAK_FORMS)
+    @pytest.mark.parametrize("form", list(_LEAK_FORMS))
     @pytest.mark.parametrize("source", _SOURCES)
     async def test_unhandled_exception_message_logged_during_the_request_is_reported(
         self, source: str, form: str
     ) -> None:
         """Positive control: the leak check reports a message that does reach a log line.
 
-        The failing collaborator logs the message right before it raises; every
-        message probe reports it, in the formatted text and in the raw record (so
-        no probe is blind, e.g. to a character the JSON formatter escapes). The
-        request id shares nothing with ``_SECRET``, so only the message can be
-        what is found.
+        The failing collaborator logs the message, or a case-changed or partial
+        form of it, right before it raises. Exactly the probes ``_LEAK_FORMS``
+        names report it, in the formatted text and in the raw record: every
+        message probe for the whole message in any case (so no probe is blind,
+        e.g. to a character the JSON formatter escapes), the surviving word alone
+        for a fragment. The request id shares nothing with ``_SECRET``, so only
+        the message can be what is found.
         """
         response, logs = await _unhandled(
             source, request_id=_PLAIN_REQUEST_ID, fail=_log_then_raise(form)
@@ -852,8 +888,8 @@ class TestUnhandledExceptions:
         assert response.status_code == 500
         assert [entry["request_id"] for entry in planted] == [_request_id(response)]
         assert _message_leaks(logs) == [
-            *(("text", probe) for probe in _MESSAGE_PROBES),
-            *(("record", probe) for probe in _MESSAGE_PROBES),
+            *(("text", probe) for probe in _LEAK_FORMS[form]),
+            *(("record", probe) for probe in _LEAK_FORMS[form]),
         ]
 
     async def test_unhandled_exception_leak_probes_are_never_spelled_by_a_random_value(
@@ -862,13 +898,16 @@ class TestUnhandledExceptions:
         """No random value in a log line can match a leak probe on its own (GH-274).
 
         A request id, UUID, timestamp, count or duration is made of
-        ``_RANDOM_VALUE_CHARS`` only, and every probe holds another character.
-        The digit run the old probe used is made of those characters only, so
-        the check would have caught it.
+        ``_RANDOM_VALUE_CHARS`` only. The checks compare casefolded, so every
+        probe must hold another character in any case: a probe is rejected when
+        any case of it could be spelled by a random value. The digit run the
+        old probe used is made of those characters only, so the check would have
+        caught it.
         """
-        spellable = [probe for probe in _TEXT_PROBES if set(probe) <= _RANDOM_VALUE_CHARS]
+        random_chars = {char.casefold() for char in _RANDOM_VALUE_CHARS}
+        spellable = [probe for probe in _TEXT_PROBES if set(probe.casefold()) <= random_chars]
 
-        assert (spellable, set(_SECRET_DIGITS) <= _RANDOM_VALUE_CHARS) == ([], True)
+        assert (spellable, set(_SECRET_DIGITS) <= random_chars) == ([], True)
 
     async def test_unhandled_exception_names_the_bare_class(self) -> None:
         response, logs = await _unhandled_from_probe(_raise_zephyr_error)
