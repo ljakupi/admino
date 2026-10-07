@@ -2,7 +2,7 @@
 
 Every security-relevant action (logins and lockouts, password resets and
 changes, session revocations and forced logouts, invitations, role and profile
-changes, activations, sharing changes, deletions and restores, exports, Org
+changes, activations, sharing changes, file uploads, deletions and restores, exports, Org
 Admin access to other users' projects, org and platform settings, org tool
 permissions, Super Admin actions, residency policy, break-glass sessions, agent
 tool calls) is
@@ -12,7 +12,8 @@ GH-152's session actions, by migration 0010 for GH-153's invitation.resend
 and invitation.refuse, by migration 0016 for GH-161's
 org.permission_change, org.permission_promote, org.permission_promote_cancel
 and org.permission_demote, by migration 0020 for GH-164's user.profile_change,
-and by migration 0021 for GH-166's password.change).
+by migration 0021 for GH-166's password.change and by migration 0027 for
+GH-187's file.upload).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -124,6 +125,9 @@ class AuditAction(StrEnum):
     PROJECT_RESTORE = "project.restore"
     CHAT_DELETE = "chat.delete"
     CHAT_RESTORE = "chat.restore"
+    # A member's upload of a chat attachment (GH-187); the orphan GC's removal
+    # is a system file.delete
+    FILE_UPLOAD = "file.upload"
     FILE_DELETE = "file.delete"
     FILE_RESTORE = "file.restore"
     # Org Admin access to other users' projects
@@ -203,6 +207,7 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.PROJECT_RESTORE: "org",
         AuditAction.CHAT_DELETE: "org",
         AuditAction.CHAT_RESTORE: "org",
+        AuditAction.FILE_UPLOAD: "org",
         AuditAction.FILE_DELETE: "org",
         AuditAction.FILE_RESTORE: "org",
         AuditAction.PROJECT_ADMIN_ACCESS: "org",

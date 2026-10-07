@@ -44,9 +44,13 @@ and its audit event commit or roll back together.
   users, ``invitations.ensure_free_seat``), then sets the status and queues
   ``account_activated``.
 - Deleting runs the last-admin guard first, ends the sessions, locks the
-  user's chats, then deletes the users row; the foreign keys cascade to its
-  chats (with their messages), OAuth connections, memory, settings, reset
-  token and queued emails. The audit event survives it.
+  user's chats, collects the ids of their attachments (GH-187), then deletes
+  the users row; the foreign keys cascade to its chats (with their messages
+  and attachments), OAuth connections, memory, settings, reset token and
+  queued emails. The audit event survives it. Once the deletion committed,
+  the attachments' files (originals, partial uploads, derived artifacts) are
+  removed from disk (``attachments.remove_files``); a refused or rolled-back
+  deletion removes none.
 - A reset reuses GH-151's link (``password_reset.queue_reset_link``) for an
   active user, with the admin as the event's actor.
 
@@ -69,7 +73,8 @@ Security notes:
   an unknown id (``UserNotInOrgError``, carrying no IDs), never forbidden.
 - Content-free audit and no logs (tracker #139 §5): events carry the actor,
   the org, the target user, the client IP, role tokens, bools and counts;
-  never a name, an email, a token or a link. Nothing is logged.
+  never a name, an email, a token or a link. Nothing is logged here
+  (``attachments.remove_files`` logs a failed removal by class name only).
 - Email uniqueness rests on the case-insensitive unique index: a taken email
   rolls the whole change back and raises ``DuplicateEmailError`` ``from
   None`` (the driver's message repeats the email). The refusal is recorded
@@ -77,6 +82,9 @@ Security notes:
   emails shows in the org's audit log; the server throttles refused changes.
 - The reset token never reaches the admin: it exists only in the queued email.
 - Fail closed: a failed audit write rolls the action back.
+- Files: a deletion removes only the files of the attachment ids its own
+  transaction read (the target's, in the actor's org), by id under the org's
+  directory; never a file name, and nothing before the commit.
 - Parameterized SQL only: values travel as bind parameters. No FastAPI, and
   nothing from the server, agent, LLM, tools or OAuth layers.
 """
@@ -87,7 +95,15 @@ from typing import TYPE_CHECKING, Final
 
 import asyncpg
 
-from admino import accounts, audit_events, email_outbox, invitations, password_reset, sessions
+from admino import (
+    accounts,
+    attachments,
+    audit_events,
+    email_outbox,
+    invitations,
+    password_reset,
+    sessions,
+)
 from admino.access import Capability, can
 from admino.audit_events import AuditAction, TargetType
 from admino.email_templates import (
@@ -154,8 +170,14 @@ _LOCK_CHATS_SQL: Final = """
     ORDER BY id
     FOR UPDATE
 """
-# The foreign keys cascade to the user's chats (with their messages),
-# connections, memory, settings, reset token and queued emails.
+# A11 (GH-187): every attachment of the user in the org (trashed and unsent ones
+# included), read after the chat lock in the deletion's transaction. The cascade removes
+# the rows; their files are removed by these ids once the deletion committed.
+_USER_ATTACHMENTS_SQL: Final = """
+    SELECT id FROM attachments WHERE org_id = $1 AND owner_user_id = $2
+"""
+# The foreign keys cascade to the user's chats (with their messages and
+# attachments), connections, memory, settings, reset token and queued emails.
 _DELETE_SQL: Final = "DELETE FROM users WHERE id = $1 AND org_id = $2"
 # A reset link already sent to the old address stops working.
 _CANCEL_RESET_SQL: Final = "DELETE FROM password_reset_tokens WHERE user_id = $1"
@@ -468,9 +490,11 @@ async def delete_org_user(
 
     The sessions are ended first (their count is the event's metadata), then
     the user's chats in the org are locked in id order (the promotion notice's
-    order, GH-265); the users row's foreign keys cascade to the chats with
-    their messages, the OAuth connections, memory, settings, reset token and
-    queued emails. The email is free again.
+    order, GH-265) and their attachment ids read (GH-187); the users row's
+    foreign keys cascade to the chats with their messages and attachments, the
+    OAuth connections, memory, settings, reset token and queued emails. The
+    email is free again. After the commit, the attachments' files are removed
+    (``attachments.remove_files``: a failure is logged there, never raised).
 
     Args:
         pool: The database pool.
@@ -483,7 +507,8 @@ async def delete_org_user(
         UserNotInOrgError: If the user isn't an active or deactivated member
             of the actor's org; nothing changes.
         LastAdminError: If the user is the org's last active Org Admin.
-        AuditRecordError: If the audit event can't be recorded; nothing is deleted.
+        AuditRecordError: If the audit event can't be recorded; nothing is
+            deleted, no file removed.
     """
     org_id = _authorize(actor, Capability.ORG_USERS_MANAGE)
     async with pool.acquire() as conn, conn.transaction():
@@ -491,6 +516,8 @@ async def delete_org_user(
         await _locked_target(conn, org_id=org_id, user_id=user_id)
         revoked = await sessions.revoke_user_sessions(conn, user_id)
         await conn.fetch(_LOCK_CHATS_SQL, org_id, user_id)
+        owned = await conn.fetch(_USER_ATTACHMENTS_SQL, org_id, user_id)
+        attachment_ids = [row["id"] for row in owned]
         await conn.execute(_DELETE_SQL, user_id, org_id)
         await _record(
             conn,
@@ -501,6 +528,8 @@ async def delete_org_user(
             ip=ip,
             metadata={"sessions_revoked": revoked},
         )
+    # Only after the commit: a rolled-back or refused deletion keeps every file.
+    await attachments.remove_files(attachments.attachments_root(), org_id, attachment_ids)
 
 
 async def trigger_password_reset(

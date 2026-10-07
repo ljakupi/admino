@@ -376,9 +376,9 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `limits` | `confirmation_timeout_s` | from `config.yaml` (300) | 10–3600 | every message |
 | `limits` | `max_message_length` | from `config.yaml` (4000) | 1–100,000 | every message |
 | `limits` | `max_context_messages` | from `config.yaml` (20) | 1–200 | every message |
-| `files` | `max_file_size_mb` | 50 | 1–500 | attachments (later release) |
-| `files` | `max_files_per_message` | 10 | 1–50 | attachments (later release) |
-| `files` | `max_pages_per_file` | 100 | 1–1000 | attachments (later release) |
+| `files` | `max_file_size_mb` | 50 | 1–500 | every [attachment](#attachments) upload, in MiB (1,048,576 bytes) |
+| `files` | `max_files_per_message` | 10 | 1–50 | the attachments one message carries, and the burst of the upload rate limit |
+| `files` | `max_pages_per_file` | 100 | 1–1000 | attachment processing: a file with more pages fails (pages are counted from [#188](https://github.com/ljakupi/admino/issues/188) on) |
 | `files` | `render_dpi` | 150 | 72–300 | page images (later release) |
 | `retention` | `trash_min_days`, `trash_max_days` | 0, 90 | 0–90, min ≤ max | the bounds of each [organization's trash retention](#organization-settings) |
 | `retention` | `audit_months` | 12 | 6–84 | the daily audit purge |
@@ -390,8 +390,8 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `security` | `session_idle_timeout_minutes` | 60 | 15–480 | Super Admin sessions |
 | `security` | `session_max_lifetime_hours` | 12 | 1–72 | Super Admin sessions |
 
-- A change applies without a restart: the next message, login attempt, deletion schedule
-  or audit purge uses the new value.
+- A change applies without a restart: the next message, upload, login attempt, deletion
+  schedule or audit purge uses the new value.
 - `llm.max_input_tokens` and `llm.image_input` come from `config.yaml` again at every start,
   like the provider and the model IDs, so a change here lasts until the next restart; edit
   `config.yaml` to keep it. `llm.max_retries` isn't in `config.yaml`: a stored value is
@@ -609,7 +609,8 @@ routes. Editors, Viewers and the Super Admin get `403`.
 - `POST /api/org/users/{id}/reactivate` needs a free seat (active and invited users take
   one), and emails the user a link to log in.
 - `DELETE /api/org/users/{id}` deletes the account with its sessions, chats, connections,
-  notes and settings. The email address is free again.
+  notes and settings, and its [attachments](#attachments) with their files. The email
+  address is free again.
 - `POST /api/org/users/{id}/password-reset` sends the user the same email as **Forgot your
   password?** above. The admin never sees the link. A deactivated user can't get one.
 
@@ -686,8 +687,8 @@ Viewer's chats from before a role change stay stored, unused.
 | `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
 | `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. It also carries `pending_confirmation`, `confirmation_status` and `context`, see below. |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
-| `DELETE /api/chats/{id}` | Moves the chat to the trash and answers `204`. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete`, with the chat's ID only. |
-| `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`. Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
+| `DELETE /api/chats/{id}` | Moves the chat to the trash, with its [attachments](#attachments), and answers `204`. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete`, with the chat's ID only. |
+| `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`, optionally with the files you uploaded into the chat, `"attachment_ids": [...]` (see [Attachments](#attachments)). Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
 | `POST /api/chats/{id}/stop` | Stops the chat's streamed message. It needs no body and answers `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed message running (see [Stopping a reply](#stopping-a-reply)). |
 
 - **Titles** have 1 to 200 characters, spaces at either end removed. Control and
@@ -1003,6 +1004,115 @@ turn is still stored and titled as described below, even with nobody reading.
 - A stop isn't recorded in the audit log, like sending a message. Every action that ran
   stays recorded as `tool.call`.
 
+### Attachments
+
+You upload files into one of your chats, one file per request, then send them with a
+message. Org Admins and Editors upload; Viewers and the Super Admin get `403` on every
+attachment route. Like a chat, an attachment is private to the chat's owner.
+
+| Route | What it does |
+| --- | --- |
+| `POST /api/chats/{id}/attachments` | Uploads one file into your chat. The request body is the file itself (not a form), with the original name in the `X-Attachment-Name` header and the size in `Content-Length`. Answers `201` with the attachment, `status: "uploaded"`. |
+| `GET /api/attachments/{id}` | The attachment: `id`, `chat_id`, `message_id` (`null` until a message carries it), `filename`, `kind`, `size_bytes`, `status`, `failure_reason`, `page_count` and `created_at`. |
+| `GET /api/attachments/{id}/content` | Downloads the original file, in any status. |
+
+- **The name** travels in the `X-Attachment-Name` header, never in the URL, so it can't
+  end up in an access log. It's percent-encoded UTF-8 (`Q3%20report.pdf`), so the header
+  itself is plain ASCII, at most 4,096 characters. admino decodes it, normalizes it
+  (NFC), keeps only the last path segment, removes control and invisible formatting
+  characters (direction overrides, zero-width characters) and trims spaces and dots at
+  either end. A name longer than 255 characters is cut, keeping a short extension.
+- **The type comes from the content**, never from the name or the `Content-Type` header,
+  which is ignored. Supported: PDF, DOCX, XLSX, CSV, TXT, MD, PNG, JPEG and WEBP (`kind`:
+  `pdf`, `docx`, `xlsx`, `csv`, `txt`, `md`, `png`, `jpeg`, `webp`).
+  - A DOCX or XLSX must have the Office Open XML structure; any other ZIP (PPTX
+    included, which comes with [#210](https://github.com/ljakupi/admino/issues/210)) is
+    refused. Old Office files (.doc, .xls, .ppt, .msg) are refused too.
+  - Text must be UTF-8 (a BOM is allowed) without control characters other than tab,
+    line feed, carriage return and form feed. Only then does the name's extension count:
+    `.csv` is `csv`, `.md` and `.markdown` are `md`, anything else is `txt`.
+  - A PDF without its end marker, a PNG without its header, a WEBP shorter than it says
+    and an unreadable ZIP are corrupted; an encrypted PDF, DOCX or XLSX is
+    password-protected.
+- **Limits.** The size must be in `Content-Length`; it's checked against
+  `max_file_size_mb` (a [platform default](#platform-defaults), 50 MiB by default) and
+  against your organization's storage quota (its plan's `storage_quota`, set by the
+  Super Admin) before any byte of the file is read. The quota counts every attachment of
+  the organization, those in the trash included. The body must then be exactly
+  `Content-Length` bytes: the upload stops as soon as it goes past, and one that ends
+  short is refused too. The quota is checked again when the file is stored, so parallel
+  uploads can't overrun it.
+- **Errors** use the usual `{"detail", "reason"}` body, with a fixed English `detail`
+  that never repeats the name or the content. A refused upload keeps nothing: no
+  attachment, no file, no audit event. After the session, the role and the rate limit,
+  the upload checks, in this order:
+
+  | Status | `reason` | When |
+  | --- | --- | --- |
+  | `400` | `invalid_filename` | the name is missing, isn't ASCII, doesn't decode as UTF-8 or is empty once cleaned |
+  | `411` | `content_length_required` | no `Content-Length`, or one that isn't a number |
+  | `400` | `empty_file` | `Content-Length: 0` |
+  | `413` | `file_too_large` | more than `max_file_size_mb` |
+  | `404` | `chat_not_found` | the chat doesn't exist, is in the trash or isn't yours (the chat routes' `404`) |
+  | `413` | `storage_quota_exceeded` | the file would take the organization past its storage quota |
+  | `400` | `content_length_mismatch` | the body is longer or shorter than `Content-Length` |
+  | `415` | `unsupported_type` | not a supported type (a plain ZIP, a PPTX, a binary file, text that isn't UTF-8) |
+  | `415` | `legacy_office` | an old Office file: save it as .docx or .xlsx |
+  | `422` | `password_protected` | an encrypted PDF, DOCX or XLSX |
+  | `422` | `corrupted_file` | see the type checks above |
+  | `503` | `storage_unavailable` | the attachments volume can't be written |
+
+- **Processing.** After the `201`, the file is checked again in the background, on a pool
+  of 2 workers: `status` goes from `uploaded` to `processing`, then `ready`, or `failed`
+  with a code in `failure_reason` (such as `corrupted_file` or `too_many_pages`). Poll
+  `GET /api/attachments/{id}` to see it. Converting files for the model and counting
+  their pages come with [#188](https://github.com/ljakupi/admino/issues/188); a file with
+  more pages than `max_pages_per_file` then fails with `too_many_pages`. After a restart,
+  files left `processing` go back to `uploaded` and are queued again.
+- **Sending.** `POST /api/chats/{id}/messages` takes the attachments' IDs in
+  `attachment_ids` (no duplicates). They're checked before the message runs, and a
+  refusal runs and stores nothing:
+  - more than `max_files_per_message` (10 by default) answers `422`
+    `{"detail": "Too many files for one message", "reason": "too_many_files"}`;
+  - then the chat's own check (`404` `chat_not_found`);
+  - then each attachment: one that doesn't exist, isn't yours, isn't in this chat or is
+    in the trash answers `404` `{"detail": "Attachment not found", "reason":
+    "attachment_not_found"}`; one already sent with an earlier message answers `409`
+    `{"detail": "Attachment already sent", "reason": "attachment_already_sent"}`.
+
+  The stored message carries them: their `message_id` is its ID. The model doesn't see
+  the files' content yet; that comes with
+  [#189](https://github.com/ljakupi/admino/issues/189). `POST /api/message` takes no
+  attachments.
+- **Downloads** are for the chat's owner only. An attachment that doesn't exist, isn't
+  yours, belongs to another organization or sits in a chat in the trash answers the same
+  `404` `{"detail": "Attachment not found", "reason": "attachment_not_found"}` on both
+  read routes, and so does the download of one whose file is missing on disk. The file
+  always comes as a download, never shown in the browser: `Content-Disposition: attachment;
+  filename*=UTF-8''<the name, percent-encoded>`, the detected type's `Content-Type`,
+  `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. When the name's
+  extension doesn't match the detected type, the type's extension is added (`page.html`
+  stored as text downloads as `page.html.txt`).
+- **Rate limits** apply per user, each answering `429` `{"detail": "Rate limit
+  exceeded"}`: uploads a burst of `max_files_per_message`, then one every 2 seconds;
+  metadata 5 per second (burst 50); downloads 2 per second (burst 30).
+- **Trash and deletion.** Moving a chat to the trash moves its attachments there too:
+  they can't be read or sent anymore, their files stay on disk and they still count
+  against the storage quota until the trash is purged
+  ([#194](https://github.com/ljakupi/admino/issues/194)). Deleting a user deletes their
+  attachments and files. Purging an organization deletes its attachments directory.
+- **Unsent files expire.** A background job (at startup, then every hour) deletes an
+  attachment that no message carried within 24 hours, with its files, recorded as
+  `file.delete` by the system with `{"orphan": true}`. It also removes leftover files
+  older than 24 hours that no attachment owns (an interrupted upload, a failed removal).
+- **Audit and logs.** Each upload is recorded as `file.upload`, with the attachment's ID
+  and size only. Reads and downloads aren't recorded. Names and content never reach the
+  audit log or a log line: IDs, sizes, types and statuses only.
+- There's no route yet to delete one attachment or to list a chat's attachments: the
+  trash comes with [#194](https://github.com/ljakupi/admino/issues/194), a chat's
+  attachment list with [#190](https://github.com/ljakupi/admino/issues/190) and
+  [#191](https://github.com/ljakupi/admino/issues/191).
+
 ## Organizations (Super Admin)
 
 The Super Admin creates organizations, sets their plan limits, deactivates and deletes
@@ -1039,7 +1149,9 @@ a new one to replace it).
   limits, residency policy and deletion dates.
 - **Plan limits**: `PATCH /api/platform/orgs/{id}/limits` with any of `seats`,
   `monthly_budget_chf` and `storage_quota`. Lowering the seats below the seats in use is
-  allowed; it only stops new invitations until seats are free again.
+  allowed; it only stops new invitations until seats are free again. `storage_quota`
+  caps the total size of the organization's [attachments](#attachments); lowering it
+  below what's stored deletes nothing, it only refuses new uploads.
 - **Deactivate and reactivate**: `POST /api/platform/orgs/{id}/deactivate` and
   `POST /api/platform/orgs/{id}/reactivate`. Deactivating logs every member out at once,
   and nobody of that organization can log in or use a link until it's reactivated. Its
@@ -1086,8 +1198,9 @@ log, without names or email addresses.
 - `GET /api/platform/orgs/{id}/metadata` returns the seat usage, `seats: {"used",
   "limit"}` (counted like an invitation: active users and pending invitations), the storage
   used in bytes, the number of the organization's chats that aren't in the trash (a count,
-  never a title), and the number of files. The storage used and the number of files are
-  `0` until attachments arrive in a later release.
+  never a title), and the number of files. The storage used and the number of files
+  count every [attachment](#attachments) of the organization, those in the trash
+  included: a size and a count, never a file name.
 - `POST /api/platform/orgs/{id}/users/{user_id}/deactivate` ends every session of the user
   at once and emails them; their chats, connections, notes and settings are kept.
   `.../reactivate` needs a free seat and emails the user a link to log in; it's refused
@@ -1378,7 +1491,7 @@ make ttft                       # TTFT_RUNS=10 make ttft for more runs
 
 - **What it sends.** For `Qwen/Qwen3.5-397B-A17B-FP8` and `Qwen/Qwen3.5-122B-A10B-FP8`,
   a short prompt and a synthetic 20-page document (about 10,000 words, generated by the
-  tool, standing in for an attachment until attachments come with
+  tool, standing in for an attachment until an attachment's text reaches the model with
   [#188](https://github.com/ljakupi/admino/issues/188)), `TTFT_RUNS` times each (5 by
   default, 1 to 50), after one warm-up request per model that doesn't count.
 - **How.** Each request is shaped like a chat turn (admino's system prompt and the tool
@@ -1457,8 +1570,9 @@ chat). Take the median of the 5 times.
 
 PostgreSQL holds the `platform_settings`, `org_settings` and `user_settings`, each organization's `permissions`,
 each user's `memory` notes and `oauth_tokens` (one row per user and provider), the
-`chats` and their `chat_messages`, the `audit_events` audit trail, and the `email_outbox`
-of queued transactional email.
+`chats` and their `chat_messages`, the `attachments` of the chats (their metadata), the
+`audit_events` audit trail, and the `email_outbox` of queued transactional email. The
+attachments' files live on a Docker volume.
 
 - **Two database roles.** The app connects as `admino_app`, a non-superuser with
   per-table rights (`PG_APP_PASSWORD`). The owner `admino` (`PG_PASSWORD`) applies the
@@ -1479,6 +1593,17 @@ of queued transactional email.
   purging an organization deletes all of its chats. A chat in the trash stays stored, only
   marked with `deleted_at`; restoring and purging the trash come with
   [#194](https://github.com/ljakupi/admino/issues/194).
+- **Attachments** (see [Attachments](#attachments)). The `attachments` table holds each
+  file's chat, owner, the message that carried it, its cleaned original name, type,
+  size and status. The files themselves are on the `admino-attachments` Docker volume,
+  mounted on the agent only, at `/app/data/attachments/<organization ID>/<attachment
+  ID>`: owned by `admino`, mode 0600 in directories with mode 0700 (the image and the
+  entrypoint create the directory). A partial upload is `<attachment ID>.part`; derived
+  files ([#188](https://github.com/ljakupi/admino/issues/188)) go under
+  `<attachment ID>.d/`. The original name is only in the database, never on disk. The
+  files are **not encrypted at rest**: protect the volume like the database (an
+  encrypted disk on the host) and back it up with it. `docker volume rm
+  admino-attachments` deletes every file.
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the chat's ID, the tool, the action, the permission decision, success and
   duration. Arguments, tool output and message text are never stored. Rows are kept for 12

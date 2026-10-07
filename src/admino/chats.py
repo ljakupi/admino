@@ -11,19 +11,24 @@ chat per (user, session id) through ``chats.legacy_session_id`` until #177
 notice reaches every live chat of the org (``append_org_notice``), and the
 Super Admin's org metadata counts the org's chats (``count_org_chats``).
 GH-179's background task stores the automatic title (``set_auto_title``).
+GH-187's attachments follow their chat: a turn links the files its user
+message carried (``append_messages``), and the trash takes them along
+(``trash_chat``). The upload, reads and files are ``admino.attachments``,
+which imports this module (never the reverse).
 
 Inputs: an executor (an asyncpg pool or connection) or, for the three
 transactional writes (``trash_chat``, ``append_messages`` and
 ``append_org_notice``), the pool; the caller's ``TenantContext``; a chat id
 (the server-generated id of a legacy chat to create); titles,
-``LLMMessage``s and ``ToolCallRecord``s; page sizes and opaque cursors.
+``LLMMessage``s, ``ToolCallRecord``s and attachment ids; page sizes and
+opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
 ``MessagePage``, its message count and latest message status), ``ChatTurn``
 (the chat and its history), ``LLMMessage`` lists, counts, whether an
 automatic title was stored and the id of a turn's last appended message.
 Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
-``system`` message to store), ``audit_events.AuditRecordError`` and the
-driver's errors.
+``system`` message to store, attachments without a ``user`` message to
+carry them), ``audit_events.AuditRecordError`` and the driver's errors.
 
 Behaviour:
 - Lists are keyset-paginated: chats by ``(last_activity_at, id)`` descending,
@@ -50,14 +55,17 @@ Behaviour:
   slipped through would raise instead of reaching the database.
 - ``append_messages`` and ``trash_chat`` each run in one transaction:
   ``append_messages`` touches the chat first (no row: nothing is written),
-  then inserts the messages in order; ``trash_chat`` sets ``deleted_at`` and
-  records ``chat.delete`` on the same connection, so a failed audit write
-  rolls the trash back. ``get_or_create_legacy_chat`` uses no transaction of
-  its own: a concurrent first message of the same session loses the INSERT
-  on the partial unique key ``chats_legacy_session_key`` and selects the
-  winner's chat (whose id differs from the one given). Only that key's
-  violation is the race (GH-271): any other unique violation (the given id
-  already taken) propagates as the driver raised it.
+  then inserts the messages in order, linking the given attachments (A9)
+  right after the turn's first ``user`` message, so a later failure unlinks
+  them with the turn; ``trash_chat`` sets ``deleted_at`` on the chat, then
+  on its live attachments (A10; their files stay on disk until #194's
+  purge), and records ``chat.delete`` on the same connection, so a failed
+  audit write rolls the trash back. ``get_or_create_legacy_chat`` uses no
+  transaction of its own: a concurrent first message of the same session
+  loses the INSERT on the partial unique key ``chats_legacy_session_key`` and
+  selects the winner's chat (whose id differs from the one given). Only that
+  key's violation is the race (GH-271): any other unique violation (the given
+  id already taken) propagates as the driver raised it.
 - ``append_org_notice`` (GH-66) skips every chat whose latest message (highest
   seq, any role) is ``awaiting_confirmation``: a user message after the
   pending call's ``tool_use`` would separate it from its result and break the
@@ -72,6 +80,10 @@ Security notes:
   chat, a colleague's chat, a trashed chat and an unknown id raise the same
   ``ChatNotFoundError`` with a fixed text and change nothing. Only the org
   notice and the platform count are org-wide (org id and live chats only).
+- Attachments are linked only when they are the caller's, in this chat, in
+  the caller's org, unsent and live (A9 states all five), and trashed only
+  with their chat after its owner check (A10 binds the trashed chat and the
+  caller's org). Neither reads, writes or names a file.
 - An automatic title never overwrites a user's: ``set_auto_title`` is a
   compare-and-set on ``title_source = 'auto' AND title = ''`` (plus the
   owner, org and ``deleted_at IS NULL`` filters) and returns False instead of
@@ -83,7 +95,9 @@ Security notes:
   a reset in the database too).
 - The runtime role may update only ``title``, ``title_source``,
   ``last_activity_at``, ``external_content`` and ``deleted_at`` of a chat
-  (migration 0025): every UPDATE here stays within them.
+  (migration 0025), and only ``message_id``, ``updated_at`` and
+  ``deleted_at`` (among others) of an attachment (migration 0027): every
+  UPDATE here stays within them.
 - System prompts and instructions are never stored: a ``system`` message is
   refused before any statement.
 - No content in logs or errors: nothing is logged here, and no error carries
@@ -91,7 +105,7 @@ Security notes:
   the failing row) propagate untouched and must never be logged by text.
 - Parameterized SQL only: every statement is a constant, every value a bind
   parameter. Imports nothing from the server, agent, LLM, tools or OAuth
-  layers.
+  layers, nor ``admino.attachments`` (which imports this module).
 """
 
 from __future__ import annotations
@@ -196,6 +210,12 @@ _TRASH_SQL: Final = """
     WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
     RETURNING id
 """
+# A10 (GH-187): the trashed chat's live attachments go to the trash with it; their files
+# stay on disk until #194's purge. Bound to the chat S6 just trashed and the caller's org.
+_TRASH_ATTACHMENTS_SQL: Final = """
+    UPDATE attachments SET deleted_at = now()
+    WHERE chat_id = $1 AND org_id = $2 AND deleted_at IS NULL
+"""
 # S7: a turn's activity, and GH-243's sticky flag when a tool result held
 # wrapped external content (never reset).
 _TOUCH_SQL: Final = """
@@ -214,6 +234,15 @@ _INSERT_MESSAGE_SQL: Final = """
         (chat_id, org_id, role, content, tool_use_blocks, tool_call_id, tool_calls, status)
     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
     RETURNING id
+"""
+# A9 (GH-187): the caller's unsent, live attachments of this chat go with the user message
+# that carried them. An id that no longer matches (another chat's, another owner's or org's,
+# trashed, already sent, unknown) is simply not linked: the send route checked them (A8)
+# before the run, and anything that changed since must not fail the stored turn.
+_LINK_ATTACHMENTS_SQL: Final = """
+    UPDATE attachments SET message_id = $1, updated_at = now()
+    WHERE id = ANY($2::uuid[]) AND chat_id = $3 AND org_id = $4 AND owner_user_id = $5
+        AND message_id IS NULL AND deleted_at IS NULL
 """
 # S9: a chat's latest messages (newest first) ...
 _LATEST_MESSAGES_SQL: Final = """
@@ -695,7 +724,12 @@ async def set_auto_title(
 async def trash_chat(
     pool: asyncpg.Pool, tenant: TenantContext, chat_id: UUID, *, ip: str | None
 ) -> None:
-    """Move the caller's chat to the trash and record ``chat.delete``, atomically.
+    """Move the caller's chat and its attachments to the trash and record ``chat.delete``.
+
+    One transaction: the chat's ``deleted_at``, then the same stamp on each of
+    its attachments that isn't trashed yet (GH-187, A10; one trashed earlier
+    keeps its stamp), then the audit event. The attachments' files stay on
+    disk (#194 restores and purges).
 
     Args:
         pool: The database pool.
@@ -706,12 +740,14 @@ async def trash_chat(
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed;
             nothing is written.
-        AuditRecordError: If the event can't be recorded; the trash is rolled back.
+        AuditRecordError: If the event can't be recorded; the chat and its
+            attachments are rolled back.
     """
     async with pool.acquire() as conn, conn.transaction():
         trashed = await conn.fetchval(_TRASH_SQL, chat_id, tenant.org_id, tenant.user_id)
         if trashed is None:
             raise ChatNotFoundError
+        await conn.execute(_TRASH_ATTACHMENTS_SQL, chat_id, tenant.org_id)
         await audit_events.record(
             conn,
             action=AuditAction.CHAT_DELETE,
@@ -732,6 +768,7 @@ async def append_messages(
     *,
     final_status: MessageStatus = "complete",
     tool_calls: Sequence[ToolCallRecord] | None = None,
+    attachment_ids: Sequence[UUID] = (),
 ) -> UUID | None:
     """Append a run's new messages to the caller's chat, in one transaction.
 
@@ -744,24 +781,45 @@ async def append_messages(
     surrogate is stored as U+FFFD and each non-finite number (NaN, an
     infinity, an overflowing literal as parsed) as null, at any depth.
 
+    With ``attachment_ids`` (GH-187), right after the turn's first ``user``
+    message is inserted, the caller's unsent, live attachments of this chat
+    among them are linked to it (A9), in the same transaction. That message
+    isn't always the turn's first: a turn sent while a ``tool_use`` dangled
+    stores its synthetic cancelled result before it. An id that no longer
+    matches (deleted, trashed or sent meanwhile, another chat's, owner's or
+    org's) is left as it is, without an error.
+
     Args:
         pool: The database pool.
         tenant: The caller's org scope.
         chat_id: The chat.
         messages: The new user, assistant and tool messages, in order; an
-            empty sequence runs no statement.
+            empty sequence without attachments runs no statement.
         final_status: The stored status of the run's last message.
         tool_calls: The run's tool-call summaries, stored on the last message.
+        attachment_ids: The attachments the user message carried (checked by
+            the caller with ``attachments.check_sendable``); empty, the
+            default, adds no statement.
 
     Returns:
         The id of the last appended message (GH-8: a streamed turn's
         ``message_saved`` names it); None for an empty sequence.
 
     Raises:
-        ValueError: If a ``system`` message is passed; nothing is written.
+        ValueError: If a ``system`` message is passed, or attachments without
+            a ``user`` message to carry them; nothing is written.
         ChatNotFoundError: Unless the chat is the caller's and not trashed;
             nothing is written.
     """
+    # The index of the message the attachments go with; None links nothing.
+    carrier: int | None = None
+    if attachment_ids:
+        carrier = next(
+            (index for index, message in enumerate(messages) if message.role == "user"), None
+        )
+        if carrier is None:
+            msg = "Attachments need a user message to carry them."
+            raise ValueError(msg)
     if not messages:
         return None
     if any(message.role == "system" for message in messages):
@@ -793,7 +851,7 @@ async def append_messages(
         if touched is None:
             raise ChatNotFoundError
         message_id: UUID | None = None
-        for role, content, blocks, call_id, stored_calls, status in rows:
+        for index, (role, content, blocks, call_id, stored_calls, status) in enumerate(rows):
             message_id = await conn.fetchval(
                 _INSERT_MESSAGE_SQL,
                 chat_id,
@@ -805,6 +863,15 @@ async def append_messages(
                 stored_calls,
                 status,
             )
+            if index == carrier:
+                await conn.execute(
+                    _LINK_ATTACHMENTS_SQL,
+                    message_id,
+                    list(attachment_ids),
+                    chat_id,
+                    tenant.org_id,
+                    tenant.user_id,
+                )
     return message_id
 
 

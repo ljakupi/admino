@@ -215,10 +215,17 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   reads a chat, not even an Org Admin; Viewers and the Super Admin get `403` on every chat
   route. A tool call's `tool.call` audit row names the chat's ID as its target, never its
   title or a message.
+- **Attachments are private to their chat's owner** too. The data layer
+  (`attachments.py`) reads an attachment only within the caller's organization and as
+  its owner, and `chats.py` links one to a message or trashes it only with its own chat.
+  Another user's, another organization's, a trashed chat's and an unknown attachment all
+  answer the same `404` `{"detail": "Attachment not found", "reason":
+  "attachment_not_found"}`; Viewers and the Super Admin get `403`. See
+  [Attachments](#attachments).
 - **Operator blindness.** The Super Admin reaches only the platform routes and their own
   account. Platform responses carry metadata and counts, never content, titles or file
   names. Of an organization's chats, the Super Admin sees only how many aren't in the
-  trash.
+  trash, and of its attachments, how many there are and their total size.
 - **No impersonation.** The Super Admin can deactivate or reactivate an organization's
   user, send them a password reset link and re-invite an organization's first Org Admin,
   each recorded in that organization's audit log. They can't set a password, see a reset
@@ -279,10 +286,48 @@ What this doesn't cover:
   suggested (a search query, for example). Today these only reach the user's own
   accounts. It matters for the planned web search, where a query leaves for a third
   party.
-- **Attachments aren't wrapped yet.** Chat attachments aren't implemented; they'll be
-  wrapped when they ship.
+- **Attachments aren't wrapped yet.** Chat attachments can be uploaded now, but their
+  content doesn't reach the model in this release; it will be wrapped when it does
+  ([#189](https://github.com/ljakupi/admino/issues/189)).
 - **The answer can still be misled.** Wrapping stops silent side effects, not injected
   text shaping what the model tells you. Read summaries of unexpected mail with care.
+
+## Attachments
+
+Files uploaded into chats are untrusted input, and they hold content. The upload, the
+checks and the storage live in `attachment_types.py` and `attachments.py`:
+
+- **The type comes from the content, checked in code.** admino decides the type from
+  the file's bytes: magic bytes, the Office Open XML structure of a ZIP (read with the
+  standard library from its central directory only, nothing decompressed), strict UTF-8
+  for text. The name and the declared `Content-Type` never decide it. Unsupported, old
+  Office, password-protected and corrupted files are refused before anything is kept.
+  The conversion libraries check the files again when they're processed
+  ([#188](https://github.com/ljakupi/admino/issues/188)).
+- **Bounded before a byte is read.** `Content-Length` is required and checked against
+  the size limit and the organization's storage quota first, and the upload stops as
+  soon as the body goes past it. The quota is checked again under a lock on the
+  organization's row when the file is stored, so parallel uploads can't overrun it. A
+  refused upload leaves no file, no row and no audit event.
+- **Downloads never render in admino's origin.** Only the chat's owner downloads a
+  file, always as `Content-Disposition: attachment` with the detected type's
+  `Content-Type`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, so an
+  uploaded HTML or SVG file never opens as a page of admino.
+- **Names stay in the database.** The original name comes in a header, never in the URL
+  (so not in an access log). It's cleaned (its last path segment only, without control
+  or invisible formatting characters, at most 255 characters) and stored only in the
+  `attachments` table; on disk a file is named by its organization's ID and its own.
+  Names, header values and file content never reach a log line or the audit log: IDs,
+  sizes, types, statuses and reason codes only.
+- **Unencrypted at rest.** The files are on the `admino-attachments` volume, mounted on
+  the agent only and owned by `admino` (files 0600, directories 0700), but they **aren't
+  encrypted at rest**: whoever can read the Docker host's volumes can read them. Use an
+  encrypted disk on the host, and back the volume up with the database (see
+  [Configuration → Data & storage](configuration.md#data--storage)).
+- **No tool reaches them.** No agent tool reads, lists or downloads an attachment: the
+  agent, the LLM clients, the tools and the permission engine don't import the
+  attachment modules. In this release a file's content doesn't reach the model either
+  ([#189](https://github.com/ljakupi/admino/issues/189) adds that).
 
 ## The LLM provider and data residency
 
@@ -397,6 +442,10 @@ We prefer to be transparent about what this does **not** guarantee:
 - **The owner password lives in `.env`.** The database roles protect the audit log from
   a compromised app, not from someone who can read `.env` on the server: `PG_PASSWORD`
   is the database superuser's password.
+- **Attachments aren't encrypted at rest.** Uploaded files sit on the
+  `admino-attachments` volume as they were sent: admino doesn't encrypt them, like the
+  content in the database. Whoever can read the Docker host's volumes reads them;
+  encrypt the host's disk.
 - **The deletion window is checked when the deletion is scheduled, not when it's
   committed.** A compromised app that keeps one database transaction open for the whole
   grace period could commit a deletion that is already due, so the organization would

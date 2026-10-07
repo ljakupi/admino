@@ -69,6 +69,11 @@ Security notes:
   sanitized ``ToolCallRecord``s only, never the raw tool inputs.
   ``ConfirmRequest`` names exactly one of ``chat_id`` and the legacy
   ``session_id``.
+- Attachments (GH-187): ``AttachmentSummary`` carries a stored file's
+  metadata only (never its org, owner or path); its bounds are migration
+  0027's CHECKs. ``ChatMessageCreate.attachment_ids`` holds at most 50 ids,
+  each once; the duplicate refusal names no id. ``ChatRequest`` (the legacy
+  route) takes no attachments.
 - Streamed chat turns (GH-8): ``AgentStatus`` gains ``stopped`` (a streamed
   run the user stopped; ``ChatResponse.status`` never carries it, a JSON run
   can't be stopped). The SSE event payloads (``RunStartedPayload`` to
@@ -2815,9 +2820,10 @@ class OrgMetadata(BaseModel):
     """GET /api/platform/orgs/{org_id}/metadata response: counts and sizes only.
 
     ``seats`` follows the invitation seat rule (``OrgSeats``).
-    ``chat_count`` is the org's chats that aren't trashed (GH-176); the
-    storage and file counts are 0 until attachments exist (#187). Never a
-    title, a name or any other org content.
+    ``chat_count`` is the org's chats that aren't trashed (GH-176);
+    ``file_count`` and ``storage_used_bytes`` are the number of the org's
+    attachments and the bytes they use, trashed ones included (GH-187).
+    Never a title, a name or any other org content.
     """
 
     seats: OrgSeats
@@ -3276,15 +3282,62 @@ class ChatUpdateRequest(BaseModel):
     title: ChatTitle
 
 
+AttachmentKind = Literal["pdf", "docx", "xlsx", "csv", "txt", "md", "png", "jpeg", "webp"]
+"""An attachment's type, detected from its content (admino.attachment_types)."""
+
+AttachmentStatus = Literal["uploaded", "processing", "ready", "failed"]
+"""An attachment's processing state: uploaded -> processing -> ready | failed."""
+
+# Migration 0027's CHECKs: the name length, 500 MiB (the platform maximum of
+# max_file_size_mb) and the reason code.
+_ATTACHMENT_FILENAME_MAX_LENGTH: Final = 255
+_ATTACHMENT_MAX_BYTES: Final = 524_288_000
+_ATTACHMENT_REASON_PATTERN: Final = r"^[a-z][a-z0-9_]{0,63}$"
+_ATTACHMENTS_PER_MESSAGE_MAX: Final = 50
+
+
+class AttachmentSummary(BaseModel):
+    """One stored attachment as the API shows it: metadata only.
+
+    ``filename`` is the sanitized name, ``kind`` the detected type and
+    ``failure_reason`` a code (set when ``status`` is ``failed``).
+    """
+
+    id: UUID
+    chat_id: UUID
+    message_id: UUID | None
+    filename: str = Field(min_length=1, max_length=_ATTACHMENT_FILENAME_MAX_LENGTH)
+    kind: AttachmentKind
+    size_bytes: int = Field(ge=1, le=_ATTACHMENT_MAX_BYTES)
+    status: AttachmentStatus
+    failure_reason: str | None = Field(pattern=_ATTACHMENT_REASON_PATTERN)
+    page_count: int | None = Field(ge=0)
+    created_at: datetime
+
+
 class ChatMessageCreate(BaseModel):
     """POST /api/chats/{chat_id}/messages request body: one user message.
 
     The chat comes from the path, the org and the owner from the session.
+    ``attachment_ids`` are the caller's unsent uploads in that chat, each
+    at most once.
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     message: str = Field(min_length=1, max_length=32768)
+    attachment_ids: list[UUID] = Field(
+        default_factory=list, max_length=_ATTACHMENTS_PER_MESSAGE_MAX
+    )
+
+    @field_validator("attachment_ids")
+    @classmethod
+    def _refuse_duplicates(cls, value: list[UUID]) -> list[UUID]:
+        """Refuse an id given twice (compared as UUIDs); the message names no id."""
+        if len(set(value)) != len(value):
+            msg = "Each attachment can be sent only once per message."
+            raise ValueError(msg)
+        return value
 
 
 class ChatSummary(BaseModel):

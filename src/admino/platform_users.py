@@ -26,8 +26,10 @@ The reads work in any org status and write nothing, so they aren't audited.
 ``seats.used`` is the invitation seat rule (``invitations._SEATS_TAKEN_SQL``,
 #153): the org's active and invited users, expired invitations included; it
 may exceed ``seats.limit``. ``chat_count`` is the org's chats that aren't
-trashed, of every member (``chats.count_org_chats``, GH-176). The storage
-and file counts are 0 until attachments exist (#187).
+trashed, of every member (``chats.count_org_chats``, GH-176).
+``file_count`` and ``storage_used_bytes`` are the org's attachments and the
+bytes their originals use, trashed ones included (``attachments.org_storage``,
+GH-187): the figure the storage quota is checked against.
 
 A target is a users row of the org that isn't deleted, whatever its status.
 Each action runs in one transaction on one connection: the checks, the
@@ -108,6 +110,7 @@ from typing import TYPE_CHECKING, Final
 
 from admino import (
     accounts,
+    attachments,
     audit_events,
     chats,
     email_outbox,
@@ -271,7 +274,9 @@ async def org_metadata(pool: asyncpg.Pool, *, actor: Principal, org_id: UUID) ->
         The org's seats (``limit``) and its active and invited users that
         aren't deleted (``used``, which may exceed ``limit``); the number of
         the org's chats that aren't trashed (``chat_count``, a count only);
-        the storage and file counts, 0 until #187.
+        the number of the org's attachments (``file_count``) and the bytes
+        they use (``storage_used_bytes``), trashed ones included, never a
+        file name; another org's files never count.
 
     Raises:
         PermissionError: Without ``Capability.PLATFORM_ORG_METADATA_VIEW``; no
@@ -281,11 +286,12 @@ async def org_metadata(pool: asyncpg.Pool, *, actor: Principal, org_id: UUID) ->
     _authorize(actor, Capability.PLATFORM_ORG_METADATA_VIEW)
     org = await _org(pool, org_id)
     used = await pool.fetchval(invitations._SEATS_TAKEN_SQL, org_id)
+    file_count, storage_used_bytes = await attachments.org_storage(pool, org_id)
     return OrgMetadata(
         seats=OrgSeats(used=used, limit=org["seats"]),
-        storage_used_bytes=0,
+        storage_used_bytes=storage_used_bytes,
         chat_count=await chats.count_org_chats(pool, org_id),
-        file_count=0,
+        file_count=file_count,
     )
 
 
