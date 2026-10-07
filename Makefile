@@ -73,12 +73,14 @@ perf:
 	python -m tests.perf.chat_budgets
 
 # ttft: manual time-to-first-token and tokens/s measurement against Infomaniak.
-#   Needs INFOMANIAK_API_TOKEN in the shell: set -a; source .env; set +a
+#   Reads INFOMANIAK_API_TOKEN from the environment or, if unset, from .env
+#   (that one line only; no other secret of .env is loaded).
 ttft:
 	python -m tests.perf.ttft
 
 # test-proxy: the Docker test of the production Caddyfile (compression, unbuffered
-#   event streams) in the official caddy image. On demand: skipped without Docker.
+#   event streams) in the official caddy image. On demand, needs Docker: without the docker CLI
+#   or a running daemon the tests fail (`make check` skips them).
 test-proxy:
 	ADMINO_DOCKER_TESTS=1 python -m pytest $(TESTS_DIR)/test_proxy_profile.py -v --no-cov
 

@@ -1,9 +1,14 @@
 """``make ttft``: time to first token and tokens/s of the Infomaniak models (manual, GH-244).
 
-Usage (the operator, with the token in the shell, never in a file the tool reads)::
+Usage (the operator; the token comes from the repository's ``.env``)::
 
-    set -a; source .env; set +a
     python -m tests.perf.ttft      # what ``make ttft`` runs
+
+The token: ``INFOMANIAK_API_TOKEN`` from the environment when it is set and not
+blank; otherwise the tool reads that one line from the repository's ``.env``
+(``_ENV_FILE``, resolved from this file's path, not the working directory). The
+file is parsed as text, never run by a shell, and no other key of it is read
+or set: the other secrets in ``.env`` never reach this process's environment.
 
 Dev only, manual, needs the network and the operator's Infomaniak token. Not a
 pytest file (no ``test_`` prefix, never collected); the pipeline's agents
@@ -35,21 +40,24 @@ Measures, per run:
   the provider reports it, else the answer's characters / 4, marked "est.")
   divided by the seconds from the first delta to the end of the stream.
 
-Inputs (environment): ``INFOMANIAK_API_TOKEN`` (required),
-``INFOMANIAK_PRODUCT_ID`` (optional; discovered otherwise), ``TTFT_RUNS``
-(default 5, 1 to 50).
+Inputs (environment): ``INFOMANIAK_API_TOKEN`` (required, here or in ``.env``),
+``INFOMANIAK_PRODUCT_ID`` (optional, environment only; discovered otherwise),
+``TTFT_RUNS`` (default 5, 1 to 50).
 
 Outputs: progress on stderr; on stdout the Markdown table for
 docs/configuration.md (the p50 per model and prompt) and the outcome of the
 default-model rule: "default: 397B", unless the 397B's short-prompt p50 TTFT is
 above 3.0 s, then "default: 122B (397B stays available to the Super Admin)".
 Exit status 0 when every run succeeded; 1 when a run failed or the rule can't
-be decided; 2 when ``INFOMANIAK_API_TOKEN`` is missing or ``TTFT_RUNS`` is
-invalid.
+be decided; 2 when ``INFOMANIAK_API_TOKEN`` is missing (from the environment and
+``.env``) or ``TTFT_RUNS`` is invalid.
 
 Security notes:
-- The token is read from the environment by admino's client only; this module
-  checks that it is set and never prints, logs or stores it.
+- The token reaches admino's client through this process's environment only
+  (never the operator's shell); this module never prints, logs or writes it,
+  and its error messages name the file and the variable, never a value.
+- No other key of ``.env`` is read or set: the file is parsed as text, never
+  sourced by a shell, so its other secrets stay out of this process.
 - No reply text is printed or kept: only its length is counted. A failed run
   is reported by its error code (admino's fixed catalogue) or exception type,
   never a message or a provider response.
@@ -72,6 +80,7 @@ import time
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from admino.llm import LLMError, LLMResponse, LLMStreamDelta
@@ -103,6 +112,12 @@ _RULE_397B: Final = "default: 397B"
 _RULE_122B: Final = "default: 122B (397B stays available to the Super Admin)"
 
 _TOKEN_ENV: Final = "INFOMANIAK_API_TOKEN"
+# The repository's .env (tests/perf/ttft.py -> the repository root), not the working
+# directory's. Not Final: main() looks it up at call time, so a check can point it elsewhere.
+_ENV_FILE: Path = Path(__file__).resolve().parents[2] / ".env"
+# The token's .env line (fullmatch): an optional "export ", spaces around the key and the
+# "=". The key must be exact, so INFOMANIAK_API_TOKEN_OLD or a "#" comment never matches.
+_TOKEN_LINE: Final = re.compile(rf"\s*(?:export\s+)?{re.escape(_TOKEN_ENV)}\s*=(.*)")
 _RUNS_VALUE: Final = re.compile(r"[0-9]{1,3}")
 _CODE: Final = re.compile(r"[a-z_]{1,40}")
 _PINNED_LOGGERS: Final = ("httpx", "httpcore", "openai", "urllib3")
@@ -459,6 +474,49 @@ def runs_from_env() -> int:
     return int(raw)
 
 
+def _env_value(raw: str) -> str:
+    """A .env value: one pair of matching quotes removed, else everything before `` #``.
+
+    A quoted value is kept whole (a `` #`` inside it is part of the token);
+    only an unquoted one has a comment, as in a shell or docker compose.
+    """
+    value = raw.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    comment = value.find(" #")
+    return (value if comment == -1 else value[:comment]).strip()
+
+
+def token_from_env_file(path: Path) -> str | None:
+    """The ``INFOMANIAK_API_TOKEN`` value of the .env file at ``path``, or None.
+
+    Only a line whose key is exactly ``INFOMANIAK_API_TOKEN`` counts (optional
+    ``export `` prefix, spaces around the key and the ``=``); the last one wins.
+    Its value loses one pair of matching quotes; unquoted, `` #`` starts a
+    comment. Comment lines and every other key are ignored. The file is parsed
+    as text, never run by a shell (no expansion), and nothing is set.
+
+    Args:
+        path: The .env file (``_ENV_FILE`` in ``main()``).
+
+    Returns:
+        The value, or None when the file is missing, has no such line, or the
+        value is empty or blank.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    value: str | None = None
+    for line in text.splitlines():
+        match = _TOKEN_LINE.fullmatch(line)
+        if match is not None:
+            value = _env_value(match.group(1))
+    if value is None or not value.strip():
+        return None
+    return value
+
+
 def _configure_logging() -> None:
     """Warnings and errors on stderr (admino's formatter); third-party loggers at WARNING."""
     from admino.logs import RequestIdFilter, TextFormatter
@@ -474,12 +532,16 @@ def _configure_logging() -> None:
 def main() -> int:
     """Measure and print; see the module docstring for the exit statuses."""
     if not os.environ.get(_TOKEN_ENV, "").strip():
-        print(
-            f"make ttft needs {_TOKEN_ENV} in the environment (set -a; source .env; set +a), "
-            "then run it again.",
-            file=sys.stderr,
-        )
-        return 2
+        token = token_from_env_file(_ENV_FILE)
+        if token is None:
+            print(
+                f"make ttft needs {_TOKEN_ENV}: set it in the repository's .env "
+                "(or in the environment), then run it again.",
+                file=sys.stderr,
+            )
+            return 2
+        # This process only (admino's client reads it); no other .env key is set.
+        os.environ[_TOKEN_ENV] = token
     try:
         runs = runs_from_env()
     except SettingsError as exc:

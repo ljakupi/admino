@@ -341,7 +341,7 @@ These run on demand, not in CI (see [Configuration → Performance](configuratio
 ```bash
 make perf         # server budgets against a throwaway Postgres and a fake LLM (needs Docker)
 make test-proxy   # the production Caddyfile in the caddy image: compression, unbuffered streams (needs Docker)
-make ttft         # time to first token of the Infomaniak models (needs INFOMANIAK_API_TOKEN in the shell)
+make ttft         # time to first token of the Infomaniak models (reads INFOMANIAK_API_TOKEN from .env)
 ```
 
 For frontend changes, from `static-src/`:

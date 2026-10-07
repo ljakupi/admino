@@ -114,12 +114,19 @@ class TimedPool(_TimedStatements):
     """A connection pool whose statements are timed, on itself and on acquired connections."""
 
     @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[_TimedStatements]:
+    async def acquire(self, *, timeout: float | None = None) -> AsyncIterator[_TimedStatements]:
         """Acquire an inner connection (and release it), yielding it with timed statements.
 
-        The wait for a free connection and the release aren't statements.
+        Used as ``async with pool.acquire(...) as conn`` only (asyncpg's
+        await/release form isn't supported). The wait for a free connection and
+        the release aren't statements.
+
+        Args:
+            timeout: Passed to the inner pool's ``acquire`` as ``timeout=``, like
+                asyncpg's ``Pool.acquire`` (None, its default, waits without a bound).
+                A ``TimeoutError`` of the wait reaches the caller unchanged.
         """
-        async with self._inner.acquire() as conn:
+        async with self._inner.acquire(timeout=timeout) as conn:
             yield _TimedStatements(conn)
 
 
