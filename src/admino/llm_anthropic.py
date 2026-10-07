@@ -37,12 +37,17 @@ characters (never cut at a word); tool arguments bounded, then cleaned with
 ``sanitize_tool_args``; ``LLMResponse.truncated`` for ``stop_reason ==
 "max_tokens"`` or text past the cap.
 
-History (GH-25 D11): Anthropic rejects an empty text turn, and a cut answer can
-be empty or whitespace-only, so ``_convert_messages_to_anthropic`` leaves out an
-``assistant`` message whose content is blank (``content.strip() == ""``) and
-that has no ``tool_use_blocks``; the user messages around it then merge like any
-same-role neighbours. The stored history is unchanged, and the other providers
-still send such a message.
+History (GH-25 D11, GH-278): Anthropic rejects an empty text turn and a
+whitespace-only text block, and a cut answer can be empty or whitespace-only
+(``content.strip() == ""``, Unicode spaces included). So
+``_convert_messages_to_anthropic`` sends an ``assistant`` message's text block
+only when its content isn't blank (its ``tool_use`` blocks are sent in their
+order), and leaves out an ``assistant`` message left with no block at all (blank
+content, and no ``tool_use`` block with an id); the messages around it then merge
+like any same-role neighbours. When a string merges with a block list, a blank
+string is dropped instead of becoming a text block. Text that isn't blank is sent
+as stored, never stripped. The stored history is unchanged, and the other
+providers still send such messages.
 
 Output cap: ``chat()``'s keyword-only ``max_tokens`` (GH-179) lowers the
 request's ``max_tokens`` to ``min(max_tokens, config.max_response_tokens)``;
@@ -201,8 +206,12 @@ def _convert_messages_to_anthropic(
     Anthropic requires the system prompt as a separate parameter, not
     in the messages array. Also, Anthropic requires alternating
     user/assistant turns — consecutive same-role messages are merged.
-    An assistant message with blank content and no tool_use blocks is left
-    out (GH-25 D11), so the messages around it merge.
+    No whitespace-only text block is ever built (Anthropic rejects one;
+    ``text.strip() == ""``): an assistant message's blank text is dropped
+    before its tool_use blocks (GH-278), an assistant message left with no
+    block is left out (GH-25 D11), so the messages around it merge, and a
+    blank string merging with a block list is dropped. Text that isn't blank
+    is sent as stored.
 
     Args:
         messages: Conversation messages (never changed).
@@ -245,7 +254,8 @@ def _convert_messages_to_anthropic(
             # The agent stores these in tool_use_blocks using dot notation;
             # we encode them here to Anthropic's double-underscore format.
             blocks: list[dict[str, Any]] = []
-            if msg.content:
+            if msg.content.strip():
+                # A cut answer before a tool call can be whitespace-only (GH-278).
                 blocks.append({"type": "text", "text": msg.content})
             for tb in msg.tool_use_blocks:
                 if not tb.get("id"):
@@ -258,6 +268,9 @@ def _convert_messages_to_anthropic(
                         "input": tb.get("input", {}),
                     }
                 )
+            if not blocks:
+                # Nothing left to send: left out like a blank answer (GH-25 D11).
+                continue
             content = blocks
         else:
             content = msg.content
@@ -269,12 +282,11 @@ def _convert_messages_to_anthropic(
                 api_messages[-1]["content"] = prev_content + "\n" + content
             elif isinstance(prev_content, list) and isinstance(content, list):
                 api_messages[-1]["content"] = prev_content + content
+            # A whitespace-only string never becomes a text block (GH-278).
             elif isinstance(prev_content, str) and isinstance(content, list):
-                api_messages[-1]["content"] = [
-                    {"type": "text", "text": prev_content},
-                    *content,
-                ]
-            elif isinstance(prev_content, list) and isinstance(content, str):
+                head = [{"type": "text", "text": prev_content}] if prev_content.strip() else []
+                api_messages[-1]["content"] = [*head, *content]
+            elif isinstance(prev_content, list) and isinstance(content, str) and content.strip():
                 api_messages[-1]["content"] = [
                     *prev_content,
                     {"type": "text", "text": content},

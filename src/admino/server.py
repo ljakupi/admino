@@ -139,7 +139,8 @@ Routes:
   (outside /api and /health, last segment without an extension) gets
   index.html for the PWA's router. Hashed assets (``assets/<name>-<hash>.<ext>``)
   are ``Cache-Control: public, max-age=31536000, immutable``; everything else
-  the mount serves is ``no-cache`` (GH-244).
+  the mount serves is ``no-cache`` (GH-244), except its answers to ``/api``
+  paths (a 404 or 405), which are ``no-store`` like every API answer (GH-278).
 
 Security notes:
 - Authentication is a server-side session (GH-149): the ``admino_session``
@@ -547,6 +548,14 @@ Security notes:
   the response start and passes ``receive`` and every body message through,
   so a stream reaches the client frame by frame and its disconnect reaches
   the route.
+- No caching of API answers (GH-278): every response to a path that is
+  ``/api`` or starts with ``/api/`` (case-sensitive) carries one
+  ``Cache-Control: no-store``, whatever its status or type, replacing any
+  value a route or the static mount set: route JSON, every error (the CSRF
+  403, 404 of an unknown path, 405, 422, 429, the request-ID middleware's
+  500 ...), the attachment download and the event streams (which keep
+  ``X-Accel-Buffering: no``). The static mount's own values and ``/health``
+  (no ``Cache-Control``) are unchanged.
 - Request IDs and unhandled errors (GH-158): ``RequestIdMiddleware`` (pure
   ASGI, outermost) gives every HTTP request a fresh ``uuid4().hex`` in
   ``logs.request_id_var``, so every log line of the request carries it, and
@@ -809,8 +818,8 @@ logger = logging.getLogger(__name__)
 # Security headers middleware
 # ---------------------------------------------------------------------------
 
-# Sent on every response: by SecurityHeadersMiddleware, and by
-# RequestIdMiddleware on the 500 it answers for an unhandled exception.
+# Sent on every response (``_API_HEADERS`` under /api): by SecurityHeadersMiddleware,
+# and by RequestIdMiddleware on the 500 it answers for an unhandled exception.
 _SECURITY_HEADERS: Final[dict[str, str]] = {
     "Content-Security-Policy": (
         "default-src 'self'; script-src 'self'; style-src 'self'; "
@@ -823,6 +832,17 @@ _SECURITY_HEADERS: Final[dict[str, str]] = {
     "Referrer-Policy": "no-referrer",
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
 }
+# An API answer holds per-user data, so no browser or proxy may keep a copy (GH-278).
+_API_HEADERS: Final[dict[str, str]] = {**_SECURITY_HEADERS, "Cache-Control": "no-store"}
+
+
+def _response_headers(path: str) -> dict[str, str]:
+    """The headers set on every response to ``path`` (``_API_HEADERS`` under ``/api``).
+
+    ``path`` is the ASGI scope's path; the match is case-sensitive like the
+    routes and stops at a segment boundary (``/apiary`` is a client route).
+    """
+    return _API_HEADERS if path == "/api" or path.startswith("/api/") else _SECURITY_HEADERS
 
 
 class SecurityHeadersMiddleware:
@@ -831,7 +851,9 @@ class SecurityHeadersMiddleware:
     Mitigates XSS (CSP), clickjacking (X-Frame-Options), MIME-sniffing
     (X-Content-Type-Options), and information leakage (Referrer-Policy,
     Permissions-Policy). Applied even for local-only deployments because
-    the PWA runs in a browser that respects these headers.
+    the PWA runs in a browser that respects these headers. Every response to
+    an ``/api`` path also gets ``Cache-Control: no-store`` (GH-278), whatever
+    its status or type, replacing any value a route or the static mount set.
 
     A pure ASGI middleware (GH-8): it sets the headers on the response start
     and passes ``receive`` and every body message through untouched, so a
@@ -852,9 +874,11 @@ class SecurityHeadersMiddleware:
             await self._app(scope, receive, send)
             return
 
+        headers = _response_headers(scope["path"])
+
         async def send_with_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
-                MutableHeaders(scope=message).update(_SECURITY_HEADERS)
+                MutableHeaders(scope=message).update(headers)
             await send(message)
 
         await self._app(scope, receive, send_with_headers)
@@ -949,7 +973,8 @@ class RequestIdMiddleware:
     An exception that escapes the app is logged once at ERROR as
     ``"Unhandled exception: <ClassName>"`` (no exc_info, no message) and
     answered 500 ``{"detail": "Internal error"}`` (with the security headers,
-    since SecurityHeadersMiddleware sits inside and never sees it) when the
+    plus ``Cache-Control: no-store`` on an ``/api`` path, since
+    SecurityHeadersMiddleware sits inside and never sees it) when the
     response hasn't started. It is never re-raised, so neither Starlette nor uvicorn logs a
     traceback. HTTPExceptions are answered inside the app and never get here.
     """
@@ -982,7 +1007,7 @@ class RequestIdMiddleware:
                 response = JSONResponse(
                     status_code=500,
                     content={"detail": _INTERNAL_ERROR_DETAIL},
-                    headers=_SECURITY_HEADERS,
+                    headers=_response_headers(scope["path"]),
                 )
                 await response(scope, receive, send_with_request_id)
         finally:
@@ -1043,7 +1068,8 @@ class _SpaStaticFiles(StaticFiles):
     year as immutable; every other response of the mount (``index.html``, the
     client-route fallback, the service worker, the manifest, fonts, icons, a
     404 of a ``404.html``) gets ``no-cache``. A 404 raised for a missing file
-    is answered by the app's exception handler, without either.
+    is answered by the app's exception handler, without either. Under ``/api``
+    SecurityHeadersMiddleware replaces the value with ``no-store`` (GH-278).
 
     Security notes:
     - The fallback file is resolved by StaticFiles itself (fixed name
