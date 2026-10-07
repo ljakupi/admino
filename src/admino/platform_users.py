@@ -28,8 +28,9 @@ The reads work in any org status and write nothing, so they aren't audited.
 may exceed ``seats.limit``. ``chat_count`` is the org's chats that aren't
 trashed, of every member (``chats.count_org_chats``, GH-176).
 ``file_count`` and ``storage_used_bytes`` are the org's attachments and the
-bytes their originals use, trashed ones included (``attachments.org_storage``,
-GH-187): the figure the storage quota is checked against.
+bytes their originals and derived files use, trashed ones included
+(``attachments.org_storage``, GH-187/GH-188): the figure the storage quota
+is checked against.
 
 A target is a users row of the org that isn't deleted, whatever its status.
 Each action runs in one transaction on one connection: the checks, the

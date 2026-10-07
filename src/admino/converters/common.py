@@ -13,7 +13,10 @@ one of the ``CONVERSION_FAILURES`` codes.
 Security notes:
 - The limits are module constants that callers read at call time as
   ``common.<NAME>``; they bound the work a hostile file can cause (pixels,
-  rendered pages, text, tables, OOXML archive sizes).
+  rendered pages, text, tables, OOXML archive sizes, derived bytes).
+- ``PartWriter`` counts the bytes of every part it writes (text as UTF-8):
+  a part that would take one file's parts past ``MAX_DERIVED_BYTES`` is
+  refused (``output_too_large``) before anything of it is written.
 - ``ConversionError``'s message is its reason code only: never a path, a name
   or a library's text.
 - Part files are created exclusively with mode 0600 and ``O_NOFOLLOW``: an
@@ -53,6 +56,7 @@ MAX_OOXML_ENTRIES: Final = 10_000
 MAX_OOXML_ENTRY_BYTES: Final = 64 * 1024 * 1024
 MAX_OOXML_TOTAL_BYTES: Final = 256 * 1024 * 1024
 MANIFEST_NAME: Final = "manifest.json"
+MAX_DERIVED_BYTES: Final = 256 * 1024 * 1024
 
 ConversionFailure = Literal[
     "corrupted_file",
@@ -61,6 +65,7 @@ ConversionFailure = Literal[
     "archive_too_large",
     "image_too_large",
     "text_too_large",
+    "output_too_large",
     "conversion_timeout",
     "processing_error",
 ]
@@ -200,12 +205,14 @@ class PartWriter:
     Parts are named ``part-NNNN.<ext>`` with ``NNNN`` the 1-based index in
     order of addition; each is created exclusively (mode 0600, never through
     a symlink). ``parts`` lists them in order, ``token_estimate`` is their sum.
+    All parts together hold at most ``MAX_DERIVED_BYTES`` bytes.
     """
 
     def __init__(self, out_dir: Path) -> None:
         self._out_dir = out_dir
         self._parts: list[TextPart | ImagePart] = []
         self._chars = 0
+        self._bytes = 0
 
     @property
     def parts(self) -> list[TextPart | ImagePart]:
@@ -222,7 +229,9 @@ class PartWriter:
 
         Raises:
             ConversionError: ``text_too_large`` when the characters written so
-                far plus ``text`` would pass ``MAX_TEXT_CHARS`` (nothing written).
+                far plus ``text`` would pass ``MAX_TEXT_CHARS``;
+                ``output_too_large`` when its UTF-8 bytes would take the parts
+                past ``MAX_DERIVED_BYTES`` (nothing written either way).
             OSError: The part file exists already (or can't be written).
         """
         if not text:
@@ -250,6 +259,8 @@ class PartWriter:
         Its tokens are the image's estimate plus the label's text estimate.
 
         Raises:
+            ConversionError: ``output_too_large`` when ``data`` would take the
+                parts past ``MAX_DERIVED_BYTES`` (nothing written).
             OSError: The part file exists already (or can't be written).
         """
         name = self._write("jpg" if media_type == "image/jpeg" else "png", data)
@@ -270,8 +281,16 @@ class PartWriter:
         )
 
     def _write(self, extension: str, data: bytes) -> str:
-        """Create the next part file exclusively and write ``data``; returns its name."""
+        """Create the next part file exclusively and write ``data``; returns its name.
+
+        Raises:
+            ConversionError: ``output_too_large`` when ``data`` would take the
+                parts past ``MAX_DERIVED_BYTES`` (no file created).
+        """
+        if self._bytes + len(data) > MAX_DERIVED_BYTES:
+            raise ConversionError("output_too_large")
         name = f"part-{len(self._parts) + 1:04d}.{extension}"
         with os.fdopen(os.open(self._out_dir / name, _PART_FLAGS, _PART_MODE), "wb") as file:
             file.write(data)
+        self._bytes += len(data)
         return name

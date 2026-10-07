@@ -14,6 +14,13 @@ nothing on stdout, for a malformed job or an unexpected error.
 Security notes:
 - On Linux the child first makes itself the OOM killer's first choice, so a
   file that exhausts memory costs this child, never the server.
+- Before it reads the job, the child caps its own CPU time
+  (``CPU_LIMIT_S``, above the runner's timeout, so the kernel ends it, and
+  any process it started, even when nobody kills it: a server that was
+  itself killed) and its address space (``ADDRESS_SPACE_BYTES``; a
+  ``MemoryError`` then ends it with status 1, ``processing_error``). A hard
+  limit that is already lower is kept; macOS doesn't enforce the address
+  space limit.
 - Only fixed codes reach stdout: an exception's message (a path, a file name)
   never does. The runner discards stderr and kills the child after its
   timeout.
@@ -24,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import resource
 import sys
 from pathlib import Path
 from typing import BinaryIO, Final
@@ -38,6 +46,11 @@ OOM_SCORE_ADJ_PATH: Final = Path("/proc/self/oom_score_adj")
 
 # The highest score: this child is killed first when memory runs out.
 _OOM_SCORE: Final = "1000"
+
+# Above the runner's 120 s timeout: the kernel ends a child that outlives it
+# (limits are inherited by anything the child starts).
+CPU_LIMIT_S: Final = 130
+ADDRESS_SPACE_BYTES: Final = 2 * 1024**3
 
 
 class _Job(BaseModel):
@@ -65,6 +78,7 @@ def main(stdin: BinaryIO, stdout: BinaryIO) -> int:
         1, with nothing written, for a malformed job or an unexpected error.
     """
     _raise_oom_score()
+    _limit_self()
     try:
         job = _Job.model_validate_json(stdin.read())
     except ValidationError:
@@ -96,6 +110,23 @@ def _raise_oom_score() -> None:
     """
     with contextlib.suppress(OSError):
         OOM_SCORE_ADJ_PATH.write_text(_OOM_SCORE, encoding="ascii")
+
+
+def _limit_self() -> None:
+    """Cap this process's CPU time and address space (``CPU_LIMIT_S``, ``ADDRESS_SPACE_BYTES``).
+
+    Each limit is set (soft and hard) only when the current hard limit allows
+    it: a lower one is never raised. An error of either call is ignored and
+    the other limit is still tried: the conversion runs anyway.
+    """
+    for which, value in (
+        (resource.RLIMIT_CPU, CPU_LIMIT_S),
+        (resource.RLIMIT_AS, ADDRESS_SPACE_BYTES),
+    ):
+        with contextlib.suppress(ValueError, OSError):
+            _, hard = resource.getrlimit(which)
+            if hard == resource.RLIM_INFINITY or hard >= value:
+                resource.setrlimit(which, (value, value))
 
 
 def _write(stdout: BinaryIO, result: dict[str, object]) -> None:

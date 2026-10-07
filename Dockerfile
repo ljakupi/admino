@@ -67,22 +67,26 @@ RUN groupadd --gid 1000 admino \
 # Copy installed Python packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy application source
+# Copy application source. Root-owned on purpose (no --chown): the document
+# conversion child (GH-188) runs as admino, and a compromised parser must not be
+# able to plant /app/admino or rewrite code the server imports on its next start.
 WORKDIR /app
-COPY --chown=admino:admino src/ src/
+COPY src/ src/
 
 # Copy PWA static files built by the frontend-builder stage. server.py
 # resolves the static directory from /app/static when running inside the
-# image (see server.py create_app).
-COPY --from=frontend-builder --chown=admino:admino /build/static/ /app/static/
+# image (see server.py create_app). Root-owned (no --chown) so the conversion
+# child cannot rewrite the JS served to every user.
+COPY --from=frontend-builder /build/static/ /app/static/
 
 # Create the config directory; it is volume-mounted at runtime but must exist
 # in the image so the container starts cleanly if the volume is empty.
 # /app/data/attachments is the mount point of the admino-attachments named
 # volume (GH-187): a fresh named volume copies this directory's ownership, so
 # creating it here (then chown -R below) gives admino a writable volume.
+# Only /app/data is admino's: /app and /app/config stay root-owned.
 RUN mkdir -p /app/config /app/data/attachments \
-    && chown -R admino:admino /app
+    && chown -R admino:admino /app/data
 
 # Copy and enable the entrypoint script. Root-owned and execute-only for
 # non-root (0555): the app process (admino, after the gosu drop) can execute it
@@ -110,4 +114,6 @@ ENTRYPOINT ["/entrypoint.sh"]
 # NOTE: main.py calls uvicorn.run() internally after wiring all dependencies.
 # PYTHONPATH is not needed because the package is installed into /usr/local by the builder stage.
 # config.yaml's server.host applies to non-Docker deployments only.
-CMD ["python", "-m", "admino.main"]
+# -P keeps the working directory (/app) off sys.path, so nothing planted there
+# can shadow the installed admino package.
+CMD ["python", "-P", "-m", "admino.main"]

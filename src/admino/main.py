@@ -4,8 +4,10 @@ Startup sequence:
 1. Load and validate config.yaml (with env var overrides).
 2. Configure Python logging from config.log_level and config.log_format
    (text, or structured JSON lines with a per-request ID).
-3. Load the bundled common-password list (the password policy's list check).
-4. Initialise the database as the least-privilege runtime role
+3. Make the server process non-dumpable on Linux (``process_hardening``,
+   GH-188): one WARNING when that fails there, and startup goes on.
+4. Load the bundled common-password list (the password policy's list check).
+5. Initialise the database as the least-privilege runtime role
    ``admino_app`` (GH-220): connect with PG_APP_PASSWORD, check health, and
    refuse to start while a shipped migration is not applied (startup never
    migrates: the one-shot migrate step, ``python -m admino.migrate``, does
@@ -14,19 +16,19 @@ Startup sequence:
    matrix of every org that has none (``org_permissions.seed_missing_orgs``),
    and overlay the stored platform LLM and limits onto the config. No
    organization is created: a fresh install starts with none.
-5. Create the LLM client, warn if the provider's API host is not in the egress
+6. Create the LLM client, warn if the provider's API host is not in the egress
    whitelist, and (Infomaniak only) check the token and resolve the product ID.
    These checks only log: a missing key, model or product ID never stops startup
    — chat replies report the setup problem by error code (GH-242).
-6. Import tool modules to trigger @register_tool decorators, then freeze the registry.
-7. Build the AgentConfig from the validated limits.
-8. Instantiate the Agent with all dependencies, including the tool-call
+7. Import tool modules to trigger @register_tool decorators, then freeze the registry.
+8. Build the AgentConfig from the validated limits.
+9. Instantiate the Agent with all dependencies, including the tool-call
    recorder that writes one ``tool.call`` audit event per dispatch. The agent
    holds no permission state: the server loads the requesting org's tool
    policy for every run (GH-161). Nor is a system prompt built at startup:
    each run assembles its own (``admino.prompt_assembly``, GH-170).
-9. Create the FastAPI app via server.create_app().
-10. Start uvicorn with single-worker constraint.
+10. Create the FastAPI app via server.create_app().
+11. Start uvicorn with single-worker constraint.
 
 The module refuses to start on any configuration or validation error,
 printing a clear message and exiting with code 1. Internal paths and
@@ -44,6 +46,10 @@ Security notes:
   (GH-176). A principal without one (a Super Admin), a run id that isn't a
   chat UUID or a failed write raises, so the agent aborts the run (H-1).
 - Registry is frozen after tool imports to block dynamic registration.
+- The server is non-dumpable on Linux (GH-188): the document conversion child
+  runs as the same user, and without this it could read the server's
+  environment (every secret), fds and memory through ``/proc``. A failure is
+  logged without its errno text and doesn't stop startup.
 - Single-worker uvicorn prevents split-brain session state.
 - HSTS is not set here: the Caddy proxy of the production profile
   (docker-compose.prod.yml) terminates TLS and sends it.
@@ -77,7 +83,7 @@ from typing import TYPE_CHECKING, Final, TextIO
 import asyncpg
 import uvicorn
 
-from admino import passwords
+from admino import passwords, process_hardening
 from admino.config import load_app_config
 from admino.llm import LLMError
 from admino.logs import JsonFormatter, RequestIdFilter, TextFormatter, safe_log
@@ -396,7 +402,19 @@ def main(
     logger.info("Configuration loaded successfully.")
 
     # ------------------------------------------------------------------
-    # 3. Load the bundled common-password list (once, cached)
+    # 3. Make the server process non-dumpable (Linux)
+    # ------------------------------------------------------------------
+    # Before any conversion child exists: a same-uid child must not read this
+    # process's environment, fds or memory through /proc. Off Linux there is
+    # nothing to do; the errno is never logged.
+    if not process_hardening.make_non_dumpable() and sys.platform == "linux":
+        logger.warning(
+            "Could not make the server process non-dumpable: a compromised document "
+            "conversion process could read the server's environment through /proc."
+        )
+
+    # ------------------------------------------------------------------
+    # 4. Load the bundled common-password list (once, cached)
     # ------------------------------------------------------------------
     # A missing or unreadable list stops startup instead of silently
     # disabling the password policy's list check. The error names no path.
@@ -410,7 +428,7 @@ def main(
         sys.exit(1)
 
     # ------------------------------------------------------------------
-    # 4. Initialize the database (runtime role), check the schema, seed and load
+    # 5. Initialize the database (runtime role), check the schema, seed and load
     # ------------------------------------------------------------------
     try:
         config = asyncio.run(_async_startup(config))
@@ -427,7 +445,7 @@ def main(
     logger.info("Database initialized, config loaded from DB.")
 
     # ------------------------------------------------------------------
-    # 5. Create the LLM client, then run the provider setup checks
+    # 6. Create the LLM client, then run the provider setup checks
     # ------------------------------------------------------------------
     # The factory never raises for a missing key or model; these checks only
     # log (warnings/errors) so the app always boots and chat explains the fix.
@@ -445,7 +463,7 @@ def main(
             asyncio.run(_check_infomaniak_startup(llm_client))
 
     # ------------------------------------------------------------------
-    # 6. Import tool modules, then freeze the registry
+    # 7. Import tool modules, then freeze the registry
     # ------------------------------------------------------------------
     # Importing a tool module runs its @register_tool decorators; freezing
     # afterwards blocks any late or dynamic registration.
@@ -456,7 +474,7 @@ def main(
     logger.info("Tool registry frozen.")
 
     # ------------------------------------------------------------------
-    # 7. Build AgentConfig from the validated application config
+    # 8. Build AgentConfig from the validated application config
     # ------------------------------------------------------------------
     agent_config = AgentConfig(
         max_tool_calls=config.limits.max_tool_calls_per_message,
@@ -465,7 +483,7 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 8. Instantiate the Agent
+    # 9. Instantiate the Agent
     # ------------------------------------------------------------------
     # GH-161: the Agent holds no permission state; the server passes the
     # requesting org's ToolPolicy to every run. GH-170: nor a system prompt;
@@ -489,14 +507,14 @@ def main(
     )
 
     # ------------------------------------------------------------------
-    # 9. Create the FastAPI app
+    # 10. Create the FastAPI app
     # ------------------------------------------------------------------
     from admino.server import create_app
 
     app = create_app(agent=agent, config=config)
 
     # ------------------------------------------------------------------
-    # 10. Start uvicorn (single worker — required for in-memory session state)
+    # 11. Start uvicorn (single worker — required for in-memory session state)
     # ------------------------------------------------------------------
     logger.info(
         "Starting uvicorn on %s:%d (single worker)",
