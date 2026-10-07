@@ -17,13 +17,27 @@ Pinned here:
   travels on stdin, none of it in argv. ``env`` is exactly ``{"PYTHONPATH": <the
   server's>}``, or ``{}`` when the server has none: no API token, password or DSN.
 - Outcomes: ``ok: true`` -> ``ConversionResult``, out_dir kept; ``ok: false`` with one of
-  the eight codes -> ``ConversionError`` with that code; a timeout -> ``conversion_timeout``
-  (a real sleeping child is killed and reaped, and the call returns long before its
-  sleep ends); a non-zero exit status (even with a valid line), stdout that isn't exactly
-  one valid result line, an unknown reason or a negative estimate -> ``processing_error``.
-  out_dir is removed after every failure, and nothing is logged.
+  the nine codes (``output_too_large`` included, contract §12) -> ``ConversionError`` with
+  that code; a timeout -> ``conversion_timeout`` (a real sleeping child is killed and
+  reaped, and the call returns long before its sleep ends); a non-zero exit status (even
+  with a valid line), stdout that isn't exactly one valid result line, an unknown reason,
+  a negative estimate or a page count / estimate above 2**31 - 1 (INTEGER; 2**31 - 1
+  itself passes) -> ``processing_error``. out_dir is removed after every failure, and
+  nothing is logged.
+- Derived bytes (contract §12.4, process M-3): ``ConversionResult(page_count,
+  token_estimate, derived_bytes)``; after a successful child the PARENT measures
+  ``derived_bytes`` = the sum of the sizes of the regular files directly in out_dir (a
+  real child that writes files of known sizes and reports its own numbers: the sizes on
+  disk win). A symlink (its outside target is neither followed nor touched), a
+  subdirectory or a FIFO in out_dir -> ``processing_error``; more than
+  ``common.MAX_DERIVED_BYTES`` (read at call time) -> ``output_too_large``, exactly the
+  cap passes; out_dir removed on both failures. A child that replaces out_dir itself
+  with a symlink (to another org's directory) or a plain file, then reports success ->
+  ``processing_error``; the entry is unlinked without following it (the other org's
+  files are neither measured nor touched).
 - Real runs with the default argv (PYTHONPATH of the tree under test): a txt and a two-page
-  text PDF convert end to end, out_dir keeps the manifest and the parts.
+  text PDF convert end to end, out_dir keeps the manifest and the parts, and
+  ``derived_bytes`` is their size on disk.
 
 ``subprocess.run`` is replaced by a recorder for everything but the real runs. New modules
 are imported inside the tests, so the file collects before GH-188 exists.
@@ -49,6 +63,7 @@ import pytest
 import admino
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from types import ModuleType
 
 # The tree under test, for the real child runs.
@@ -61,9 +76,13 @@ _REASONS: Final = (
     "archive_too_large",
     "image_too_large",
     "text_too_large",
+    "output_too_large",
     "conversion_timeout",
     "processing_error",
 )
+
+# The largest PostgreSQL INTEGER (page_count, token_estimate).
+_INT32_MAX: Final = 2_147_483_647
 
 _ATTACHMENT_ID: Final = "3c9a2f4e-8b71-4d0a-9e65-1f2b3c4d5e6f"
 _FILENAME: Final = "Lohnabrechnung März — vertraulich.pdf"
@@ -103,12 +122,17 @@ class _Call:
 
 @dataclass
 class _FakeRun:
-    """A subprocess.run stand-in returning a canned CompletedProcess (or raising)."""
+    """A subprocess.run stand-in returning a canned CompletedProcess (or raising).
+
+    ``child`` (if given) runs after the call is recorded, with out_dir: what the child
+    would have written there before it exited.
+    """
 
     out_dir: Path
     returncode: int = 0
     stdout: bytes = _OK_LINE
     raises: BaseException | None = None
+    child: Callable[[Path], None] | None = None
     calls: list[_Call] = field(default_factory=list)
 
     def __call__(self, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
@@ -124,9 +148,26 @@ class _FakeRun:
                 out_dir_entries=sorted(os.listdir(self.out_dir)) if is_dir else [],
             )
         )
+        if self.child is not None:
+            self.child(self.out_dir)
         if self.raises is not None:
             raise self.raises
         return subprocess.CompletedProcess(argv, self.returncode, stdout=self.stdout)
+
+
+def _writes(sizes: dict[str, int]) -> Callable[[Path], None]:
+    """A child that writes one regular file of each given size into out_dir."""
+
+    def child(out_dir: Path) -> None:
+        for name, size in sizes.items():
+            (out_dir / name).write_bytes(b"x" * size)
+
+    return child
+
+
+def _disk_bytes(directory: Path) -> int:
+    """The sizes of the regular files directly in ``directory``, measured here."""
+    return sum(entry.stat().st_size for entry in directory.iterdir() if entry.is_file())
 
 
 def _patch_run(monkeypatch: pytest.MonkeyPatch, fake: _FakeRun) -> _FakeRun:
@@ -174,11 +215,15 @@ def test_converters_runner_constants_pinned() -> None:
 
 
 def test_converters_runner_conversion_result_is_a_frozen_dataclass() -> None:
-    """ConversionResult(page_count, token_estimate), frozen."""
+    """ConversionResult(page_count, token_estimate, derived_bytes), frozen."""
     runner = _runner()
-    result = runner.ConversionResult(page_count=None, token_estimate=7)
+    result = runner.ConversionResult(page_count=None, token_estimate=7, derived_bytes=0)
 
-    assert [item.name for item in dataclasses.fields(result)] == ["page_count", "token_estimate"]
+    assert [item.name for item in dataclasses.fields(result)] == [
+        "page_count",
+        "token_estimate",
+        "derived_bytes",
+    ]
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.token_estimate = 8  # type: ignore[misc]
 
@@ -324,8 +369,12 @@ def test_converters_runner_out_dir_reset_to_an_empty_0700_directory(
     [
         (_OK_LINE, (2, 40)),
         (b'{"ok": true, "page_count": null, "token_estimate": 0}\n', (None, 0)),
+        (
+            b'{"ok": true, "page_count": 2147483647, "token_estimate": 2147483647}\n',
+            (_INT32_MAX, _INT32_MAX),
+        ),
     ],
-    ids=["with-pages", "without-pages"],
+    ids=["with-pages", "without-pages", "int32-maximum"],
 )
 def test_converters_runner_ok_line_returns_the_result_and_keeps_out_dir(
     monkeypatch: pytest.MonkeyPatch,
@@ -334,14 +383,15 @@ def test_converters_runner_ok_line_returns_the_result_and_keeps_out_dir(
     stdout: bytes,
     expected: tuple[int | None, int],
 ) -> None:
-    """ok true -> ConversionResult(page_count, token_estimate); out_dir stays."""
+    """ok true -> ConversionResult(page_count, token_estimate, derived_bytes); out_dir
+    stays (empty here: derived_bytes 0). 2**31 - 1 is still a valid count."""
     runner = _runner()
     _patch_run(monkeypatch, _FakeRun(out_dir, stdout=stdout))
 
     result = runner.run_conversion(stored, "pdf", out_dir, _options())
 
     assert type(result) is runner.ConversionResult
-    assert (result.page_count, result.token_estimate) == expected
+    assert (result.page_count, result.token_estimate, result.derived_bytes) == (*expected, 0)
     assert out_dir.is_dir()
 
 
@@ -349,7 +399,7 @@ def test_converters_runner_ok_line_returns_the_result_and_keeps_out_dir(
 def test_converters_runner_known_reason_raises_that_conversion_error(
     monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path, reason: str
 ) -> None:
-    """ok false with one of the eight codes -> ConversionError(code); out_dir removed."""
+    """ok false with one of the nine codes -> ConversionError(code); out_dir removed."""
     line = json.dumps({"ok": False, "reason": reason}).encode() + b"\n"
     _patch_run(monkeypatch, _FakeRun(out_dir, stdout=line))
 
@@ -374,6 +424,8 @@ def test_converters_runner_known_reason_raises_that_conversion_error(
         (0, b'{"ok": true, "page_count": 1}\n'),
         (0, b'{"ok": false, "reason": "disk_on_fire"}\n'),
         (0, b'{"ok": true, "page_count": 1, "token_estimate": -1}\n'),
+        (0, b'{"ok": true, "page_count": 2147483648, "token_estimate": 3}\n'),
+        (0, b'{"ok": true, "page_count": null, "token_estimate": 2147483648}\n'),
     ],
     ids=[
         "exit-1",
@@ -387,6 +439,8 @@ def test_converters_runner_known_reason_raises_that_conversion_error(
         "missing-key",
         "unknown-reason",
         "negative-estimate",
+        "page-count-over-int32",
+        "estimate-over-int32",
     ],
 )
 def test_converters_runner_bad_exit_or_output_is_processing_error(
@@ -396,8 +450,9 @@ def test_converters_runner_bad_exit_or_output_is_processing_error(
     returncode: int,
     stdout: bytes,
 ) -> None:
-    """A non-zero exit, or stdout that isn't exactly one valid result line ->
-    ConversionError("processing_error"); out_dir removed."""
+    """A non-zero exit, or stdout that isn't exactly one valid result line (a count above
+    PostgreSQL's INTEGER included) -> ConversionError("processing_error"); out_dir
+    removed."""
     _patch_run(monkeypatch, _FakeRun(out_dir, returncode=returncode, stdout=stdout))
 
     with pytest.raises(_common().ConversionError) as excinfo:
@@ -470,6 +525,170 @@ def test_converters_runner_failures_log_nothing(
 
 
 # ---------------------------------------------------------------------------
+# Derived bytes: measured by the parent, capped (contract §12.4, process M-3)
+# ---------------------------------------------------------------------------
+
+# A worker stand-in that writes three files of known sizes into the job's out_dir (its
+# manifest claims a tiny size) and reports its own numbers: 1 page, 7 tokens.
+_SIZED_CHILD: Final = (
+    "import json, pathlib, sys\n"
+    "job = json.loads(sys.stdin.buffer.read())\n"
+    "out = pathlib.Path(job['out_dir'])\n"
+    "(out / 'part-0001.txt').write_bytes(b't' * 1500)\n"
+    "(out / 'part-0002.jpg').write_bytes(b'j' * 70000)\n"
+    "(out / 'manifest.json').write_bytes(b'{\"derived_bytes\": 1}'.ljust(100))\n"
+    "sys.stdout.write(json.dumps({'ok': True, 'page_count': 1, 'token_estimate': 7}) + '\\n')\n"
+)
+
+
+def _outcome(run: Callable[[], Any]) -> tuple[str, object]:
+    """("result", derived_bytes) or ("error", the ConversionError's reason)."""
+    try:
+        result = run()
+    except _common().ConversionError as exc:
+        return ("error", exc.reason)
+    return ("result", result.derived_bytes)
+
+
+def test_converters_runner_derived_bytes_are_the_sizes_on_disk_not_the_childs_claim(
+    monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
+) -> None:
+    """A real child writes 1500 + 70000 + 100 bytes (its manifest claims 1): the parent
+    measures out_dir itself, so derived_bytes is 71600; the child's page count and
+    estimate pass through and out_dir keeps the files."""
+    runner = _runner()
+    monkeypatch.setattr(runner, "WORKER_ARGV", (sys.executable, "-c", _SIZED_CHILD))
+
+    result = runner.run_conversion(stored, "pdf", out_dir, _options())
+
+    assert result == runner.ConversionResult(page_count=1, token_estimate=7, derived_bytes=71600)
+    assert (type(result.derived_bytes), _disk_bytes(out_dir)) == (int, 71600)
+
+
+def _plant_odd_entry(case: str, out_dir: Path, outside: Path) -> None:
+    """Something that isn't a regular file, next to a regular part."""
+    (out_dir / "part-0001.txt").write_bytes(b"page one")
+    if case == "symlink-to-a-large-file":
+        (out_dir / "part-0002.jpg").symlink_to(outside / "large.bin")
+    elif case == "subdirectory":
+        (out_dir / "nested").mkdir()
+        (out_dir / "nested" / "part-0009.txt").write_bytes(b"hidden part")
+    elif case == "fifo":
+        os.mkfifo(out_dir / "part-0002.txt")
+
+
+@pytest.mark.parametrize("case", ["symlink-to-a-large-file", "subdirectory", "fifo"])
+def test_converters_runner_non_regular_entry_in_out_dir_is_processing_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stored: Path, out_dir: Path, case: str
+) -> None:
+    """After an ok line, a symlink, a subdirectory or a FIFO in out_dir ->
+    processing_error, out_dir removed; the symlink's outside target is never followed
+    (it would add 1 MiB) and survives untouched."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    large = outside / "large.bin"
+    large.write_bytes(b"L" * (1024 * 1024))
+    _patch_run(
+        monkeypatch,
+        _FakeRun(out_dir, child=lambda directory: _plant_odd_entry(case, directory, outside)),
+    )
+
+    outcome = _outcome(lambda: _runner().run_conversion(stored, "pdf", out_dir, _options()))
+
+    assert (outcome, os.path.lexists(out_dir)) == (("error", "processing_error"), False)
+    assert (sorted(os.listdir(outside)), large.stat().st_size) == (["large.bin"], 1024 * 1024)
+
+
+@pytest.mark.parametrize(
+    ("manifest_size", "expected", "kept"),
+    [
+        (400, ("result", 1000), True),
+        (401, ("error", "output_too_large"), False),
+    ],
+    ids=["exactly-the-cap", "one-byte-over"],
+)
+def test_converters_runner_derived_bytes_held_against_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+    stored: Path,
+    out_dir: Path,
+    manifest_size: int,
+    expected: tuple[str, object],
+    kept: bool,
+) -> None:
+    """common.MAX_DERIVED_BYTES (read at call time, 1000 here): 600 + 400 bytes pass with
+    derived_bytes 1000; 600 + 401 -> output_too_large and out_dir removed."""
+    monkeypatch.setattr(_common(), "MAX_DERIVED_BYTES", 1000)
+    sizes = {"part-0001.txt": 600, "manifest.json": manifest_size}
+    _patch_run(monkeypatch, _FakeRun(out_dir, child=_writes(sizes)))
+
+    outcome = _outcome(lambda: _runner().run_conversion(stored, "pdf", out_dir, _options()))
+
+    assert (outcome, os.path.lexists(out_dir)) == (expected, kept)
+
+
+# A worker stand-in that "converts" (one part in out_dir), then replaces out_dir ITSELF:
+# with a symlink to the directory named in argv[2] ("symlink") or with a plain file
+# ("file"), and reports success with a valid ok line.
+_SWAPPING_CHILD: Final = (
+    "import json, os, pathlib, shutil, sys\n"
+    "job = json.loads(sys.stdin.buffer.read())\n"
+    "out = pathlib.Path(job['out_dir'])\n"
+    "(out / 'part-0001.txt').write_bytes(b'converted')\n"
+    "shutil.rmtree(out)\n"
+    "if sys.argv[1] == 'symlink':\n"
+    "    os.symlink(sys.argv[2], out, target_is_directory=True)\n"
+    "else:\n"
+    "    out.write_bytes(b'f' * 4096)\n"
+    "sys.stdout.write(json.dumps({'ok': True, 'page_count': 1, 'token_estimate': 7}) + '\\n')\n"
+)
+
+
+def _files_of(directory: Path) -> dict[str, bytes]:
+    """The regular files directly in ``directory`` with their bytes."""
+    return {entry.name: entry.read_bytes() for entry in sorted(directory.iterdir())}
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["symlink", "file"],
+    ids=["symlink-to-another-orgs-directory", "plain-file"],
+)
+def test_converters_runner_out_dir_replaced_by_the_child_is_processing_error_and_unlinked(
+    monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path, case: str
+) -> None:
+    """Contract §12.4 addendum (a): a real child replaces out_dir itself with a symlink to
+    another org's directory (regular files only, so following the link would measure them
+    and succeed) or with a plain file, then prints a valid ok line -> processing_error. The
+    entry at out_dir is unlinked without following it: afterwards nothing is at out_dir,
+    the other org's directory still holds exactly its files with their bytes, and the
+    stored original is unchanged."""
+    runner = _runner()
+    other_org = stored.parent.parent / "9d4c2b1a-6e5f-4a3b-8c7d-0e1f2a3b4c5d"
+    other_org.mkdir()
+    (other_org / "6f1e2d3c-4b5a-4987-a6b5-c4d3e2f1a0b9").write_bytes(b"O" * 300_000)
+    (other_org / "part-0001.txt").write_bytes("[Vertrag.pdf — page 1]\nother org".encode())
+    before = _files_of(other_org)
+    monkeypatch.setattr(
+        runner, "WORKER_ARGV", (sys.executable, "-c", _SWAPPING_CHILD, case, str(other_org))
+    )
+
+    try:
+        runner.run_conversion(stored, "pdf", out_dir, _options())
+    except _common().ConversionError as exc:
+        outcome: object = ("error", exc.reason)
+    else:
+        outcome = ("returned", None)
+
+    assert (outcome, os.path.lexists(out_dir)) == (("error", "processing_error"), False)
+    assert (other_org.is_dir(), other_org.is_symlink(), _files_of(other_org)) == (
+        True,
+        False,
+        before,
+    )
+    assert stored.read_bytes() == b"%PDF-1.7 stored bytes"
+
+
+# ---------------------------------------------------------------------------
 # Real runs with the default worker
 # ---------------------------------------------------------------------------
 
@@ -513,8 +732,8 @@ def _text_pdf(pages: list[str]) -> bytes:
 def test_converters_runner_real_worker_converts_a_txt(
     monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
 ) -> None:
-    """The default worker converts a txt: ConversionResult(None, the text's estimate), the
-    part and a manifest that agrees with the result."""
+    """The default worker converts a txt: ConversionResult(None, the text's estimate, the
+    bytes on disk), the part and a manifest that agrees with the result."""
     runner = _runner()
     common = _common()
     tokens = importlib.import_module("admino.tokens")
@@ -525,7 +744,9 @@ def test_converters_runner_real_worker_converts_a_txt(
     result = runner.run_conversion(stored, "txt", out_dir, _options("Agenda.txt"))
 
     assert result == runner.ConversionResult(
-        page_count=None, token_estimate=tokens.estimate_text_tokens(text)
+        page_count=None,
+        token_estimate=tokens.estimate_text_tokens(text),
+        derived_bytes=_disk_bytes(out_dir),
     )
     assert sorted(os.listdir(out_dir)) == ["manifest.json", "part-0001.txt"]
     assert (out_dir / "part-0001.txt").read_bytes() == text.encode("utf-8")
@@ -537,7 +758,7 @@ def test_converters_runner_real_worker_converts_a_two_page_text_pdf(
     monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
 ) -> None:
     """The default worker converts a two-page text PDF: page_count 2, the manifest's
-    estimate, one marked text part per page."""
+    estimate, the bytes on disk, one marked text part per page."""
     runner = _runner()
     common = _common()
     monkeypatch.setenv("PYTHONPATH", _SRC)
@@ -548,7 +769,9 @@ def test_converters_runner_real_worker_converts_a_two_page_text_pdf(
     result = runner.run_conversion(stored, "pdf", out_dir, _options("Quarterly report.pdf"))
 
     manifest = common.Manifest.model_validate_json((out_dir / "manifest.json").read_bytes())
-    assert result == runner.ConversionResult(page_count=2, token_estimate=manifest.token_estimate)
+    assert result == runner.ConversionResult(
+        page_count=2, token_estimate=manifest.token_estimate, derived_bytes=_disk_bytes(out_dir)
+    )
     assert result.token_estimate > 0
     assert [(part.type, part.page) for part in manifest.parts] == [("text", 1), ("text", 2)]
     assert sorted(os.listdir(out_dir)) == ["manifest.json", "part-0001.txt", "part-0002.txt"]

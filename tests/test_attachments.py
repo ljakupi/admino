@@ -15,7 +15,11 @@ What these tests pin down:
     owner check (``chats.get_chat``), before the quota lookup;
   - ``storage_quota_exceeded`` at the pre-check (A1 then A4: org-wide, trashed files
     included, other orgs excluded, the NUMERIC sum compared exactly: used + size ==
-    quota is accepted, one byte more refused);
+    quota is accepted, one byte more refused). GH-188 (contract 12.4, audit fix M-3):
+    "used" is A4' = the originals AND the stored derived bytes (``size_bytes +
+    coalesce(derived_bytes, 0)``, so a NULL counts 0): an org whose derived files fill
+    the quota refuses an upload that would fit on originals alone, exactly at the
+    boundary;
   all of these before the body is pulled once;
   - ``content_length_mismatch`` when the body runs past the declared length (it stops
     pulling right after the chunk that passed it) or ends short; a body that raises
@@ -24,7 +28,8 @@ What these tests pin down:
     legacy_office) propagate;
   - at commit: a chat trashed while the body streamed is ``ChatNotFoundError``, and
     another upload that filled the quota meanwhile is ``storage_quota_exceeded``
-    (the quota is checked again under the org row lock);
+    (the quota is checked again under the org row lock); so are derived bytes a
+    conversion stored meanwhile (GH-188: the commit check is A4' too);
   - an audit write failure is ``AuditRecordError`` with the row rolled back;
   - a disk failure (the root or the org directory is a regular file, a symlink
     planted at the partial file's name, a failing rename) is
@@ -45,6 +50,8 @@ What these tests pin down:
   identical message carrying no id.
 - ``org_storage`` (A7) returns ``(file_count, used_bytes)`` as ints: every row of the
   org (trashed included, colleagues' too), no other org's; ``(0, 0)`` for none.
+  GH-188 (contract 12.4): A7' = used_bytes counts the originals plus the derived bytes
+  (NULL derived bytes count 0).
 - ``check_sendable`` (A8): no statement for no ids; None when every id is the
   caller's live, unsent attachment of this chat; any id that isn't (another chat,
   another org, a colleague's, trashed, unknown) is ``AttachmentNotFoundError``,
@@ -116,11 +123,13 @@ _FORMS: Final[dict[str, str]] = {
     "A2": "SELECT id FROM chats WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 "
     "AND deleted_at IS NULL FOR SHARE",
     "A3": "SELECT storage_quota_bytes FROM organizations WHERE id = $1 FOR NO KEY UPDATE",
-    "A4": "SELECT coalesce(sum(size_bytes), 0) FROM attachments WHERE org_id = $1",
+    # GH-188 (contract 12.4): A4' and A7' count the derived files too.
+    "A4": "SELECT coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0) FROM attachments "
+    "WHERE org_id = $1",
     "A5": _A5_HEAD + _R,
     "A6": _SELECT + _R + _A6_TAIL,
-    "A7": "SELECT count(*) AS file_count, coalesce(sum(size_bytes), 0) AS used_bytes "
-    "FROM attachments WHERE org_id = $1",
+    "A7": "SELECT count(*) AS file_count, coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), "
+    "0) AS used_bytes FROM attachments WHERE org_id = $1",
     "A8": "SELECT id, message_id FROM attachments WHERE id = ANY($1::uuid[]) AND chat_id = $2 "
     "AND org_id = $3 AND owner_user_id = $4 AND deleted_at IS NULL",
 }
@@ -611,6 +620,40 @@ class TestAttachmentsUploadRefusedEarly:
         )
         assert _stored(world) == ([str(existing)], 0, [])
 
+    async def test_attachments_upload_quota_precheck_counts_stored_derived_bytes(
+        self, att: ModuleType, at: ModuleType, world: _World
+    ) -> None:
+        """GH-188 (contract 12.4): quota 100, a file of 10 bytes with no derived bytes yet
+        (NULL counts 0) and a ready one of 5 bytes with 54 derived bytes: used is 69.
+        32 bytes are refused at the pre-check (nothing pulled), though the originals
+        alone (15) leave room; exactly 31 is accepted and stored."""
+        db = world.db
+        db.add_org(ORG_ID, storage_quota_bytes=100)
+        db.add_attachment(world.chat, filename="a.txt", kind="txt", size_bytes=10)
+        db.add_attachment(
+            world.chat,
+            filename="b.txt",
+            kind="txt",
+            size_bytes=5,
+            status="ready",
+            page_count=1,
+            token_estimate=2,
+            derived_bytes=54,
+        )
+        outcomes: dict[int, Any] = {}
+        for declared in (32, 31):
+            body = _Body([b"x" * declared])
+            db.calls.clear()
+            try:
+                await _upload(att, world, body, filename="c.txt", declared=declared)
+            except at.AttachmentRefusedError as exc:
+                outcomes[declared] = (exc.reason, _labels(db), body.pulls)
+            else:
+                outcomes[declared] = "stored"
+
+        assert outcomes == {32: ("storage_quota_exceeded", _PRE_CHECK, 0), 31: "stored"}
+        assert len(db.attachments) == 3
+
 
 # ---------------------------------------------------------------------------
 # 4. Refusals while or after streaming
@@ -725,6 +768,34 @@ class TestAttachmentsUploadRefusedLate:
         assert caught.value.reason == "storage_quota_exceeded"
         assert [label for label, in_tx in _labels(db) if in_tx] == ["A2", "A3", "A4"]
         assert _stored(world) == ([str(others[0])], 0, [])
+
+    async def test_attachments_upload_derived_bytes_stored_while_streaming_are_refused(
+        self, att: ModuleType, at: ModuleType, world: _World
+    ) -> None:
+        """GH-188 (contract 12.4): quota 100, a 10-byte file being converted. A 40-byte
+        upload passes the pre-check (50); while it streams the conversion finishes and
+        stores 55 derived bytes. The check under the org lock (A4') counts them:
+        10 + 55 + 40 > 100 is storage_quota_exceeded, rolled back, nothing stored."""
+        db = world.db
+        db.add_org(ORG_ID, storage_quota_bytes=100)
+        converting = db.add_attachment(
+            world.chat, filename="p.pdf", kind="pdf", size_bytes=10, status="processing"
+        )
+
+        def conversion_done() -> None:
+            db.attachments[converting].update(
+                status="ready", page_count=1, token_estimate=3, derived_bytes=55
+            )
+
+        body = _Body([b"a" * 20, b"b" * 20], hooks={2: conversion_done})
+
+        with pytest.raises(at.AttachmentRefusedError) as caught:
+            await _upload(att, world, body, filename="a.txt", declared=40)
+
+        assert caught.value.reason == "storage_quota_exceeded"
+        assert _labels(db) == [*_PRE_CHECK, ("A2", True), ("A3", True), ("A4", True)]
+        assert [outcome for _, outcome in db.transactions] == ["rollback:AttachmentRefusedError"]
+        assert _stored(world) == ([str(converting)], 0, [])
 
     async def test_attachments_upload_audit_failure_rolls_back_and_cleans_up(
         self, att: ModuleType, world: _World
@@ -971,6 +1042,31 @@ class TestAttachmentsOrgStorage:
         result = await att.org_storage(db.pool, ORG_ID)
 
         assert (result, [type(value) for value in result]) == ((3, 35), [int, int])
+        assert [(_label(call), call.args) for call in db.calls] == [("A7", (ORG_ID,))]
+
+    async def test_attachments_org_storage_counts_derived_bytes_null_as_zero(
+        self, att: ModuleType, world: _World
+    ) -> None:
+        """GH-188 (contract 12.4, A7'): used_bytes is the originals plus the derived bytes
+        of every file of the org (a NULL counts 0, the row's size still counts; trashed
+        and colleagues' files too); another org's derived bytes don't count."""
+        db = world.db
+        db.add_attachment(world.chat, size_bytes=10)
+        db.add_attachment(
+            world.chat,
+            size_bytes=20,
+            status="ready",
+            page_count=2,
+            token_estimate=9,
+            derived_bytes=300,
+        )
+        db.add_attachment(world.chat, size_bytes=5, derived_bytes=7, deleted_at=_NOW)
+        db.add_attachment(db.add_chat(world.colleague), size_bytes=1, derived_bytes=0)
+        db.add_attachment(db.add_chat(world.outsider), size_bytes=1000, derived_bytes=5000)
+
+        result = await att.org_storage(db.pool, ORG_ID)
+
+        assert (result, [type(value) for value in result]) == ((4, 343), [int, int])
         assert [(_label(call), call.args) for call in db.calls] == [("A7", (ORG_ID,))]
 
     async def test_attachments_org_storage_is_zero_without_files(

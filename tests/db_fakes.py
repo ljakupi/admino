@@ -281,16 +281,19 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   ``FAILURE_REASON_RE``: no trailing newline), ``page_count`` (INTEGER, NULL
   or >= 0), ``created_at`` and ``updated_at`` (NOT NULL, default now()),
   ``deleted_at`` (NULL: live; set: trashed) and (GH-188, migration 0028's
-  ALTER TABLE ... ADD COLUMN, so it comes last in the column order and in the
-  "Failing row contains" detail) ``token_estimate`` (INTEGER, NULL until the
-  file is ready; ``attachments_token_estimate_check``: NULL or >= 0).
+  ALTER TABLE ... ADD COLUMN statements, so they come last in the column order
+  and in the "Failing row contains" detail) ``token_estimate`` (INTEGER, NULL
+  until the file is ready; ``attachments_token_estimate_check``: NULL or >= 0)
+  and ``derived_bytes`` (BIGINT, the bytes of the file's derived files, NULL
+  until the file is ready; ``attachments_derived_bytes_check``: NULL or >= 0;
+  contract §12.4).
 - Checked like the chat tables, with asyncpg's exception classes and in
   PostgreSQL's order: the bind values through asyncpg's encoders (DataError: a
-  non-int size_bytes, page_count or token_estimate, one outside int64 / int32, a
-  str that isn't a UUID, a naive datetime, ...), TEXT's U+0000
+  non-int size_bytes, page_count, token_estimate or derived_bytes, one outside
+  int64 / int32, a str that isn't a UUID, a naive datetime, ...), TEXT's U+0000
   (CharacterNotInRepertoireError), NOT NULL in column order, the CHECKs in
-  alphabetical order of their names (failure_reason, filename, kind,
-  page_count, size_bytes, status, token_estimate; verified on postgres:16)
+  alphabetical order of their names (derived_bytes, failure_reason, filename,
+  kind, page_count, size_bytes, status, token_estimate; verified on postgres:16)
   with the "Failing row contains (...)" detail (the filename in it, as the
   driver's), the primary key (UniqueViolationError), then the
   foreign keys in creation order: ``attachments_org_id_fkey``,
@@ -308,7 +311,8 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   snapshots and restores the table.
 - Grants (admino_app, migrations 0027 and 0028): SELECT, INSERT and DELETE; an
   UPDATE may SET only ``ATTACHMENT_UPDATE_COLUMNS`` (message_id, status,
-  failure_reason, page_count, token_estimate (0028), updated_at, deleted_at).
+  failure_reason, page_count, token_estimate and derived_bytes (0028),
+  updated_at, deleted_at).
   Naming id, org_id, chat_id, owner_user_id, filename, kind, size_bytes or
   created_at (also in a row-constructor piece) is InsufficientPrivilegeError
   "permission denied for table attachments", raised before the statement runs
@@ -326,10 +330,13 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
     KEY UPDATE`` (A3): recorded, no effect (the fake has no row locks); any of
     them with an aggregate is FeatureNotSupportedError.
   - ``sum(col)``: NULL over no rows. As on postgres:16, the sum of a BIGINT
-    column (size_bytes, chat_messages.seq, organizations.storage_quota_bytes)
-    is NUMERIC, so asyncpg returns a ``decimal.Decimal``; ``coalesce(sum(
-    size_bytes), 0)`` (A4, A7) is ``Decimal(0)`` over no rows and the Decimal
-    total otherwise (equal to the int, but not an int: callers convert). Any
+    column (size_bytes, derived_bytes, chat_messages.seq,
+    organizations.storage_quota_bytes) is NUMERIC, so asyncpg returns a
+    ``decimal.Decimal``; ``coalesce(sum(size_bytes), 0)`` (A4, A7) is
+    ``Decimal(0)`` over no rows and the Decimal total otherwise (equal to the
+    int, but not an int: callers convert). So is the sum of a BIGINT
+    expression (GH-188's A4' / A7' ``sum(size_bytes + coalesce(derived_bytes,
+    0))``: bigint + bigint is a bigint; a NULL derived_bytes counts 0). Any
     other sum is an int. ``count(*)`` is an int.
   - An unaliased ``coalesce(<aggregate>, ...)`` select item is named
     "coalesce", as in PostgreSQL.
@@ -339,9 +346,11 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
     GH-188's P1' ``RETURNING kind, filename``), ``DELETE ... RETURNING`` the
     deleted rows (G2); ``now()`` in SET is the statement's clock. An UPDATE's
     status is "UPDATE <n>" (GH-188's P2' sets ``page_count = $3,
-    token_estimate = $4`` and answers "UPDATE 0" when no row matched).
-  - GH-188 (contract §6, §7): P1' and P2' above, and A5 / A6 with the R list
-    ``id, chat_id, message_id, filename, kind, size_bytes, status,
+    token_estimate = $4``, its P2'' also ``derived_bytes = $5``, and both
+    answer "UPDATE 0" when no row matched).
+  - GH-188 (contract §6, §7, §12.4): P1', P2' and P2'' above, A4' / A7'
+    above, the ready transaction's A3 (like the upload's), and A5 / A6 with the
+    R list ``id, chat_id, message_id, filename, kind, size_bytes, status,
     failure_reason, page_count, token_estimate, created_at``.
   - A1 and A3 run on the reader like every SELECT whose main table is
     organizations (so ``after_org_lookup`` fires for them too). ``add_org``
@@ -354,8 +363,9 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   key; ``add_audit`` seeds any action.
 - Helpers: ``add_attachment(chat_id, *, attachment_id=None, filename='a.pdf',
   kind='pdf', size_bytes=1, status='uploaded', failure_reason=None,
-  page_count=None, token_estimate=None, message_id=None, created_at=None,
-  updated_at=None, deleted_at=None)`` stores a row checked like an INSERT
+  page_count=None, token_estimate=None, derived_bytes=None, message_id=None,
+  created_at=None, updated_at=None, deleted_at=None)`` stores a row checked
+  like an INSERT
   (org_id and owner_user_id: the chat's, an unknown chat is
   ForeignKeyViolationError ``ATTACHMENT_CHAT_FKEY``; attachment_id: a new
   uuid4; created_at: now; updated_at: created_at) and returns its id (a plain
@@ -958,16 +968,25 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
         "created_at": "timestamptz",
         "updated_at": "timestamptz",
         "deleted_at": "timestamptz",
-        # GH-188 (migration 0028): ALTER TABLE ... ADD COLUMN appends it after
-        # deleted_at; an INTEGER like page_count.
+        # GH-188 (migration 0028): ALTER TABLE ... ADD COLUMN appends them after
+        # deleted_at; token_estimate an INTEGER like page_count, derived_bytes a
+        # BIGINT like size_bytes (contract §12.4).
         "token_estimate": "int4",
+        "derived_bytes": "int8",
     },
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
     "chats": frozenset({"legacy_session_id", "deleted_at"}),
     "chat_messages": frozenset({"tool_use_blocks", "tool_call_id", "tool_calls"}),
     "attachments": frozenset(
-        {"message_id", "failure_reason", "page_count", "deleted_at", "token_estimate"}
+        {
+            "message_id",
+            "failure_reason",
+            "page_count",
+            "deleted_at",
+            "token_estimate",
+            "derived_bytes",
+        }
     ),
 }
 # The tables of the chat family: chats, chat_messages and (GH-187) attachments.
@@ -998,7 +1017,7 @@ CHAT_EXTERNAL_CONTENT_RESET: Final = "chats.external_content can't be reset"
 CHAT_OWNER_FKEY: Final = "chats_owner_org_fkey"
 # GH-187 (migration 0027): the attachments CHECKs, the composite foreign key to the
 # chat (and its owner and org), and the only columns admino_app may UPDATE (GH-188,
-# migration 0028: plus token_estimate).
+# migration 0028: plus token_estimate and derived_bytes).
 ATTACHMENT_KINDS: Final = frozenset(
     {"pdf", "docx", "xlsx", "csv", "txt", "md", "png", "jpeg", "webp"}
 )
@@ -1018,6 +1037,7 @@ ATTACHMENT_UPDATE_COLUMNS: Final = frozenset(
         "failure_reason",
         "page_count",
         "token_estimate",
+        "derived_bytes",
         "updated_at",
         "deleted_at",
     }
@@ -1030,7 +1050,7 @@ _UPDATE_GRANTS: Final[dict[str, frozenset[str]]] = {
 }
 _GRANTED_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?(chats|attachments)\b")
 # The BIGINT columns the fake models: sum() of one is NUMERIC (a Decimal from asyncpg).
-_BIGINT_COLUMNS: Final = frozenset({"size_bytes", "seq", "storage_quota_bytes"})
+_BIGINT_COLUMNS: Final = frozenset({"size_bytes", "derived_bytes", "seq", "storage_quota_bytes"})
 # What a ``$n::<type>`` cast tells about a bind parameter's type.
 _CAST_TYPES: Final[dict[str, str]] = {
     "uuid": "uuid",
@@ -1955,6 +1975,7 @@ class FakeDb:
         failure_reason: str | None = None,
         page_count: int | None = None,
         token_estimate: int | None = None,
+        derived_bytes: int | None = None,
         message_id: uuid.UUID | None = None,
         created_at: datetime | None = None,
         updated_at: datetime | None = None,
@@ -2000,6 +2021,7 @@ class FakeDb:
             "updated_at": updated_at if updated_at is not None else created,
             "deleted_at": deleted_at,
             "token_estimate": token_estimate,
+            "derived_bytes": derived_bytes,
         }
         row = self.build_chat_row("attachments", given, now)
         self.store_chat_row("attachments", row)
@@ -2716,8 +2738,9 @@ class FakeDb:
         as the driver's does).
 
         attachments (GH-187, migration 0027): its six CHECKs plus (GH-188,
-        migration 0028) ``attachments_token_estimate_check`` (alphabetical, as
-        PostgreSQL runs them), the primary key, then ``attachments_org_id_fkey``,
+        migration 0028) ``attachments_derived_bytes_check`` and
+        ``attachments_token_estimate_check`` (alphabetical, as PostgreSQL runs
+        them), the primary key, then ``attachments_org_id_fkey``,
         ``attachments_message_id_fkey`` and ``ATTACHMENT_CHAT_FKEY`` (chat_id,
         org_id, owner_user_id) -> chats (id, org_id, owner_user_id).
 
@@ -2760,7 +2783,13 @@ class FakeDb:
             filename = row["filename"]
             page_count = row["page_count"]
             token_estimate = row["token_estimate"]
+            derived_bytes = row["derived_bytes"]
             rules = [
+                # GH-188 (migration 0028, contract §12.4).
+                (
+                    "attachments_derived_bytes_check",
+                    derived_bytes is None or derived_bytes >= 0,
+                ),
                 (
                     "attachments_failure_reason_check",
                     (row["status"] == "failed") == (reason is not None)
@@ -4451,9 +4480,30 @@ def _driver_value(value: Any) -> Any:
 
 
 def _numeric_sum(expr: str) -> bool:
-    """True for ``sum(<a BIGINT column>)``: PostgreSQL's sum(bigint) is NUMERIC (GH-187)."""
-    match = re.fullmatch(r"sum ?\( ?(?:\w+\.)?(\w+) ?\)", _unwrap(expr))
-    return match is not None and match.group(1) in _BIGINT_COLUMNS
+    """True for ``sum(<a BIGINT expression>)``: PostgreSQL's sum(bigint) is NUMERIC.
+
+    GH-187: a BIGINT column; GH-188 (A4' / A7'): also an expression whose type is
+    BIGINT, e.g. ``size_bytes + coalesce(derived_bytes, 0)``.
+    """
+    match = re.fullmatch(r"sum ?\((.+)\)", _unwrap(expr))
+    return match is not None and _bigint_expr(match.group(1))
+
+
+def _bigint_expr(expr: str) -> bool:
+    """True when PostgreSQL types an expression BIGINT (GH-188).
+
+    A BIGINT column (``_BIGINT_COLUMNS``, optionally qualified); ``a + b`` / ``a - b``
+    with a BIGINT operand (integer + bigint is bigint); ``coalesce(...)`` with a
+    BIGINT argument (an integer constant beside it resolves to bigint).
+    """
+    expr = _unwrap(expr)
+    if re.fullmatch(r"(?:\w+\.)?\w+", expr):
+        return expr.rsplit(".", 1)[-1] in _BIGINT_COLUMNS
+    if (binary := _binary_split(expr)) is not None:
+        return _bigint_expr(binary[0]) or _bigint_expr(binary[2])
+    if match := re.fullmatch(r"coalesce ?\((.+)\)", expr):
+        return any(_bigint_expr(item) for item in _top_split(match.group(1), ","))
+    return False
 
 
 def _assert_evaluable(text: str) -> None:

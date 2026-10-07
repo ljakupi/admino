@@ -34,7 +34,10 @@ What these tests pin down (the GH-167 contract):
   another org's; a count, no statement reads a title); ``storage_used_bytes``
   and ``file_count`` are 0; the JSON keys are exactly ``seats`` (``used``,
   ``limit``), ``storage_used_bytes``, ``chat_count`` and ``file_count``. Any org
-  status; read-only.
+  status; read-only. (GH-187 counts the org's attachments; GH-188, contract 12.4:
+  ``storage_used_bytes`` is their originals plus their derived files, a NULL
+  ``derived_bytes`` counting 0, never another org's, and no statement reads a file
+  name or token estimate.)
 - ``deactivate_user``: the last-admin guard applies to the Super Admin too
   (``accounts.LastAdminError``); then status ``deactivated``, every session of
   the user deleted through ``sessions.revoke_user_sessions`` (nobody else's),
@@ -175,6 +178,9 @@ _SA_NAME: Final = "Rita Rootmarker"
 _ADMIN_EMAIL: Final = "admin.marker@example.test"
 _ADMIN_NAME: Final = "Ada Adminmarker"
 _CHAT_TITLE: Final = "Marker chat title Okapi"
+# GH-188: a file name and a token estimate org metadata must never carry.
+_FILE_NAME_MARKER: Final = "Marker file name Quokka.pdf"
+_TOKEN_ESTIMATE_MARKER: Final = 918_273
 
 
 # ---------------------------------------------------------------------------
@@ -1152,6 +1158,60 @@ class TestOrgMetadata:
         result = await _metadata(pu, db, OTHER_ORG_ID)
 
         assert (result.chat_count, type(result.chat_count)) == (2, int)
+
+    async def test_platform_users_metadata_storage_counts_the_orgs_derived_bytes(
+        self, pu: ModuleType, db: FakeDb
+    ) -> None:
+        """GH-188 (contract 12.4, A7'): storage_used_bytes is the originals plus the
+        derived files of every file of the org (NULL derived bytes count 0, trashed
+        files too); another org's derived bytes count only for that org. Counts only: no
+        file name or token estimate in the result, and no statement reads either."""
+        ids = _mixed_org(db)
+        other_admin = next(
+            user_id
+            for user_id, row in db.users.items()
+            if row["org_id"] == OTHER_ORG_ID and row["role"] == "org_admin"
+        )
+        chat = db.add_chat(ids["editor"], title=_CHAT_TITLE)
+        db.add_attachment(chat, filename=_FILE_NAME_MARKER, size_bytes=10)
+        db.add_attachment(
+            chat,
+            filename=_FILE_NAME_MARKER,
+            size_bytes=20,
+            status="ready",
+            page_count=3,
+            token_estimate=_TOKEN_ESTIMATE_MARKER,
+            derived_bytes=300,
+        )
+        db.add_attachment(chat, size_bytes=5, derived_bytes=7, deleted_at=_CREATED)
+        db.add_attachment(db.add_chat(other_admin), size_bytes=1000, derived_bytes=5000)
+        db.calls.clear()
+
+        own = (await _metadata(pu, db)).model_dump(mode="json")
+        other = (await _metadata(pu, db, OTHER_ORG_ID)).model_dump(mode="json")
+
+        assert (own, other) == (
+            {
+                "seats": {"used": 5, "limit": _SEATS},
+                "storage_used_bytes": 342,
+                "chat_count": 1,
+                "file_count": 3,
+            },
+            {
+                "seats": {"used": 2, "limit": 3},
+                "storage_used_bytes": 6000,
+                "chat_count": 1,
+                "file_count": 1,
+            },
+        )
+        text = json.dumps([own, other])
+        assert _FILE_NAME_MARKER not in text
+        assert str(_TOKEN_ESTIMATE_MARKER) not in text
+        assert [
+            call.normalized
+            for call in db.calls
+            if "filename" in call.normalized or "token_estimate" in call.normalized
+        ] == []
 
     async def test_platform_users_metadata_reads_are_bound_to_the_org(
         self, pu: ModuleType, db: FakeDb

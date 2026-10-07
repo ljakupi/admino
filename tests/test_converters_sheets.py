@@ -38,6 +38,26 @@ What these tests pin down:
   rules and notes, no heading; a field over the csv module's limit and bytes
   that aren't UTF-8 -> ``corrupted_file``; empty content (no bytes, a BOM
   alone, only empty rows) -> no part.
+- Bounded work (contract 12.3, audit L-2/L-3; Decision 15 "tables stop at the
+  text cap while being built; CSV sniffing reads 8 KiB; XLSX reads at most
+  1,048,576 rows per sheet"):
+  - ``table_text`` counts the characters of the cells it keeps (after
+    ``clean_cell``, so an escaped pipe counts twice; cells beyond the column
+    cap don't count) and raises ``text_too_large`` as soon as the total
+    passes ``MAX_TEXT_CHARS`` (monkeypatched small): exactly the cap passes,
+    and a row generator shows it stops at the crossing row. XLSX and CSV stop
+    reading rows there too (rows pulled from openpyxl / ``csv.reader``
+    counted), nothing written.
+  - CSV sniffing gets the first 8 KiB of the decoded text (``csv.Sniffer
+    .sniff`` spied) and still finds the delimiter; the auditor's hostile 64 KiB
+    sample (``'; "a'`` repeated, quadratic in the sniffer's regexes) converts
+    in under 3 seconds.
+  - XLSX iterates at most ``MAX_SHEET_ROW_INDEX`` = 1_048_576 rows per sheet
+    (the constant may live in ``sheets`` or ``common``; it is read at call
+    time): with it monkeypatched to 1000, a row at ``r="1000"`` is kept and
+    one at ``r="1001"`` is never reached (openpyxl pads missing row indexes
+    with empty rows); at the real limit a row at ``r="1000000000000"`` stops
+    after 1,048,576 rows in well under the timeout.
 
 The converter modules are imported inside fixtures, so this file collects
 before they exist and every test fails on its own.
@@ -45,12 +65,16 @@ before they exist and every test fails on its own.
 
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import gc
 import os
+import signal
 import sys
+import time
 import uuid
 import zipfile
+from contextlib import contextmanager, suppress
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -59,6 +83,7 @@ import pytest
 from openpyxl.chart import BarChart, Reference
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
     from types import ModuleType
 
@@ -709,3 +734,220 @@ def test_sheets_csv_without_content_writes_no_part(
 ) -> None:
     result, writer = _run(common, sheets.convert_csv, _csv(tmp_path, data), out_dir, "e.csv")
     assert (result, list(out_dir.iterdir()), writer.parts) == (None, [], [])
+
+
+# --- bounded work: the text cap while building, the CSV sample, the XLSX row index -------
+
+
+class _RanPastLimitError(BaseException):
+    """Raised when more rows are pulled than allowed (not an Exception, so the
+    converter's error mapping can't swallow it)."""
+
+
+class _TooSlowError(BaseException):
+    """Raised by the deadline below."""
+
+
+@contextmanager
+def _deadline(seconds: float) -> Iterator[None]:
+    """Interrupt the code under test after ``seconds`` (SIGALRM, main thread)."""
+
+    def expired(signum: int, frame: object) -> None:
+        raise _TooSlowError(f"still running after {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _count_xlsx_rows(
+    monkeypatch: pytest.MonkeyPatch, *, stop_after: int | None = None
+) -> list[int]:
+    """Count the rows openpyxl's read-only worksheets produce (padding rows included)."""
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    real = ReadOnlyWorksheet._cells_by_row
+    pulled = [0]
+
+    def counted(self: Any, *args: Any, **kwargs: Any) -> Iterator[Any]:
+        for row in real(self, *args, **kwargs):
+            pulled[0] += 1
+            if stop_after is not None and pulled[0] > stop_after:
+                raise _RanPastLimitError(pulled[0])
+            yield row
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "_cells_by_row", counted)
+    return pulled
+
+
+def _count_csv_rows(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Count the rows ``csv.reader`` produces."""
+    real = csv.reader
+    pulled = [0]
+
+    def counted(*args: Any, **kwargs: Any) -> Iterator[list[str]]:
+        for row in real(*args, **kwargs):
+            pulled[0] += 1
+            yield row
+
+    monkeypatch.setattr(csv, "reader", counted)
+    return pulled
+
+
+def test_sheets_table_text_raises_text_too_large_as_soon_as_kept_cells_pass_the_cap(
+    common: ModuleType, sheets: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(common, "MAX_TEXT_CHARS", 100)
+    monkeypatch.setattr(common, "MAX_TABLE_COLUMNS", 2)
+    # Exactly 100 kept characters: the "y" cell is beyond the column cap and doesn't count.
+    at_cap = sheets.table_text([["x" * 25, "x" * 25], ["x" * 25, "x" * 25, "y" * 30]])
+    pulled = 0
+
+    def rows() -> Iterator[list[str]]:
+        nonlocal pulled
+        for _ in range(1000):
+            pulled += 1
+            yield ["|" * 15]  # 30 kept characters once every pipe is escaped
+
+    with pytest.raises(common.ConversionError) as caught:
+        sheets.table_text(rows())
+
+    x25 = "x" * 25
+    assert (at_cap, caught.value.reason, pulled) == (
+        f"| {x25} | {x25} |\n| --- | --- |\n| {x25} | {x25} |\n\n"
+        "[Only the first 2 columns are included.]",
+        "text_too_large",
+        4,
+    )
+
+
+@pytest.mark.parametrize("kind", ["xlsx", "csv"])
+def test_sheets_conversion_stops_reading_rows_once_the_text_cap_is_passed(
+    common: ModuleType,
+    sheets: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    out_dir: Path,
+    kind: str,
+) -> None:
+    rows: list[list[object]] = [["x" * 100] for _ in range(1000)]
+    if kind == "xlsx":
+        path = _workbook(tmp_path, [("S", rows)])
+        pulled = _count_xlsx_rows(monkeypatch)
+        convert = sheets.convert_xlsx
+    else:
+        path = _csv(tmp_path, "".join(f"{row[0]}\n" for row in rows).encode())
+        pulled = _count_csv_rows(monkeypatch)
+        convert = sheets.convert_csv
+    monkeypatch.setattr(common, "MAX_TEXT_CHARS", 1000)  # passed by the 11th row
+
+    with pytest.raises(common.ConversionError) as caught:
+        _run(common, convert, path, out_dir, f"data.{kind}")
+
+    assert (caught.value.reason, pulled[0] <= 12, list(out_dir.iterdir())) == (
+        "text_too_large",
+        True,
+        [],
+    )
+
+
+def test_sheets_csv_sniffs_only_the_first_8_kib(
+    common: ModuleType,
+    sheets: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    out_dir: Path,
+) -> None:
+    text = "name;city\n" + "".join(f"person{i};town{i}\n" for i in range(2000))
+    assert len(text) > 4 * 8192
+    samples: list[str] = []
+    real = csv.Sniffer.sniff
+
+    def sniff(self: csv.Sniffer, sample: str, delimiters: str | None = None) -> Any:
+        samples.append(sample)
+        return real(self, sample, delimiters)
+
+    monkeypatch.setattr(csv.Sniffer, "sniff", sniff)
+
+    first_line = _csv_text(common, sheets, _csv(tmp_path, text.encode()), out_dir).split("\n")[0]
+
+    assert (
+        [len(sample) for sample in samples],
+        all(text.startswith(sample) for sample in samples),
+        first_line,
+    ) == ([8192], True, "| name | city |")
+
+
+def test_sheets_csv_hostile_sniffer_sample_converts_quickly(
+    common: ModuleType, sheets: ModuleType, tmp_path: Path, out_dir: Path
+) -> None:
+    # The auditor's L-3 probe: csv.Sniffer's regexes are quadratic on this
+    # pattern (about 15 s on a 64 KiB sample, about 0.25 s on 8 KiB).
+    pattern = '; "a'
+    path = _csv(tmp_path, (pattern * (64 * 1024 // len(pattern))).encode())
+
+    start = time.perf_counter()
+    with suppress(common.ConversionError):
+        _run(common, sheets.convert_csv, path, out_dir, "hostile.csv")
+
+    assert time.perf_counter() - start < 3.0
+
+
+def _row_limit_modules(common: ModuleType, sheets: ModuleType) -> list[ModuleType]:
+    """Where ``MAX_SHEET_ROW_INDEX`` is defined (sheets or common)."""
+    return [module for module in (sheets, common) if hasattr(module, "MAX_SHEET_ROW_INDEX")]
+
+
+def _far_row_workbook(tmp_path: Path, index: int) -> Path:
+    """A sheet with ``head`` in row 1 and ``tail`` in row ``index`` (nothing between)."""
+    rows = (
+        '<row r="1">'
+        + _inline("A1", "head")
+        + f'</row><row r="{index}">'
+        + _inline(f"A{index}", "tail")
+        + "</row>"
+    )
+    return _xlsx_by_hand(tmp_path, [("S", _sheet_xml(rows))])
+
+
+def test_sheets_xlsx_reads_at_most_max_sheet_row_index_rows(
+    common: ModuleType, sheets: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    modules = _row_limit_modules(common, sheets)
+    values = {module.MAX_SHEET_ROW_INDEX for module in modules}
+    for module in modules:
+        monkeypatch.setattr(module, "MAX_SHEET_ROW_INDEX", 1000)
+    texts = []
+    for index in (1000, 1001):
+        out = tmp_path / f"out-{index}"
+        out.mkdir()
+        texts.append(_xlsx_text(common, sheets, _far_row_workbook(tmp_path, index), out))
+
+    assert (values, texts) == (
+        {1_048_576},
+        ["## S\n\n| head |\n| --- |\n| tail |", "## S\n\n| head |\n| --- |"],
+    )
+
+
+def test_sheets_xlsx_huge_row_index_stops_after_the_last_excel_row(
+    common: ModuleType,
+    sheets: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    out_dir: Path,
+) -> None:
+    # The auditor's L-3 probe: openpyxl yields one empty row per missing index,
+    # so r="1000000000000" would otherwise run until the conversion timeout.
+    path = _far_row_workbook(tmp_path, 10**12)
+    pulled = _count_xlsx_rows(monkeypatch, stop_after=1_048_576)
+
+    start = time.perf_counter()
+    with _deadline(60):
+        text = _xlsx_text(common, sheets, path, out_dir)
+    seconds = time.perf_counter() - start
+
+    assert (text, pulled[0], seconds < 20) == ("## S\n\n| head |\n| --- |", 1_048_576, True)

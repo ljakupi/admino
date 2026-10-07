@@ -7,9 +7,11 @@ What these tests pin down:
 - Constants: the contract table exactly (image edge 2048, 64 MP Pillow limit,
   25 MP render bound, JPEG quality 85, 20 usable text characters, 10 M text
   characters, 50 sheets, 1000 rows, 50 columns, 1000 characters per cell, the
-  OOXML entry count and declared sizes, ``manifest.json``).
-- ``CONVERSION_FAILURES`` is a frozenset of exactly the eight codes and equals
-  the ``ConversionFailure`` literal; ``ConversionError(reason)`` keeps the
+  OOXML entry count and declared sizes, ``manifest.json``) plus the 256 MiB
+  ``MAX_DERIVED_BYTES`` of contract 12.4.
+- ``CONVERSION_FAILURES`` is a frozenset of exactly the nine codes (contract
+  12: ``output_too_large`` joins the eight of section 3) and equals the
+  ``ConversionFailure`` literal; ``ConversionError(reason)`` keeps the
   reason and its message is the code only; ``ConversionOptions`` is a frozen
   dataclass of ``filename``, ``render_dpi``, ``max_pages``.
 - ``clean_text``: CRLF and CR to LF, VT and FF to LF, C0 (but TAB/LF), DEL, C1
@@ -32,6 +34,12 @@ What these tests pin down:
   ``MAX_TEXT_CHARS`` (equal passes, characters not bytes, limit read at call
   time, nothing written), per-part tokens (an image's label counts as text),
   ``parts`` and ``token_estimate``.
+- ``PartWriter`` output cap (contract 12.4, audit M-3; Decision 15 "one file's
+  derived files are capped at 256 MiB"): the bytes of every part (text as
+  UTF-8 bytes, not characters; images as given) are counted; a text or an
+  image part that would take the total past ``MAX_DERIVED_BYTES``
+  (monkeypatched small, read at call time) -> ``output_too_large`` with
+  nothing written for it; a total of exactly the cap passes.
 - Manifest models: extra keys refused, frozen, parts discriminated by
   ``type`` (an unknown tag is ``union_tag_invalid``), ``version`` 1 only, the
   JSON field names and a JSON round trip, negative tokens, a zero image edge,
@@ -87,6 +95,7 @@ _CONSTANTS: dict[str, object] = {
     "MAX_OOXML_ENTRY_BYTES": 67_108_864,
     "MAX_OOXML_TOTAL_BYTES": 268_435_456,
     "MANIFEST_NAME": "manifest.json",
+    "MAX_DERIVED_BYTES": 268_435_456,
 }
 _FAILURES = frozenset(
     {
@@ -96,6 +105,7 @@ _FAILURES = frozenset(
         "archive_too_large",
         "image_too_large",
         "text_too_large",
+        "output_too_large",
         "conversion_timeout",
         "processing_error",
     }
@@ -129,7 +139,7 @@ def test_common_constants_have_the_contract_values(common: ModuleType) -> None:
     assert {name: getattr(common, name, None) for name in _CONSTANTS} == _CONSTANTS
 
 
-def test_common_conversion_failures_are_exactly_the_eight_codes(common: ModuleType) -> None:
+def test_common_conversion_failures_are_exactly_the_nine_codes(common: ModuleType) -> None:
     literal = frozenset(typing.get_args(common.ConversionFailure))
     assert (type(common.CONVERSION_FAILURES), common.CONVERSION_FAILURES, literal) == (
         frozenset,
@@ -427,6 +437,43 @@ def test_common_part_writer_text_over_the_limit_writes_nothing(
         "text_too_large",
         [],
         [],
+    )
+
+
+@pytest.mark.parametrize("over", ["text", "image"])
+def test_common_part_writer_output_bytes_may_reach_the_cap_but_not_pass_it(
+    common: ModuleType, monkeypatch: pytest.MonkeyPatch, out_dir: Path, over: str
+) -> None:
+    monkeypatch.setattr(common, "MAX_DERIVED_BYTES", 10)
+    writer = common.PartWriter(out_dir)
+    writer.add_text("é" * 3)  # 3 characters, 6 bytes
+    writer.add_image(b"\xff\xd8\xff\xd9", media_type="image/jpeg", width=1, height=1)
+    # 10 bytes written: exactly the cap. One more byte of either kind passes it.
+    with pytest.raises(common.ConversionError) as caught:
+        if over == "text":
+            writer.add_text("z")
+        else:
+            writer.add_image(b"z", media_type="image/png", width=1, height=1)
+    assert (caught.value.reason, sorted(_files(out_dir)), [p.file for p in writer.parts]) == (
+        "output_too_large",
+        ["part-0001.txt", "part-0002.jpg"],
+        ["part-0001.txt", "part-0002.jpg"],
+    )
+
+
+def test_common_part_writer_counts_a_text_part_in_utf8_bytes(
+    common: ModuleType, monkeypatch: pytest.MonkeyPatch, out_dir: Path
+) -> None:
+    monkeypatch.setattr(common, "MAX_DERIVED_BYTES", 10)
+    writer = common.PartWriter(out_dir)
+    writer.add_image(b"\xff\xd8\xff\xd9", media_type="image/jpeg", width=1, height=1)
+    # 4 characters would fit in the 6 bytes left; their 8 UTF-8 bytes don't.
+    with pytest.raises(common.ConversionError) as caught:
+        writer.add_text("é" * 4)
+    assert (caught.value.reason, sorted(_files(out_dir)), [p.file for p in writer.parts]) == (
+        "output_too_large",
+        ["part-0001.jpg"],
+        ["part-0001.jpg"],
     )
 
 

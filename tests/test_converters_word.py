@@ -35,6 +35,20 @@ and the part file is read back. What these tests pin down:
 - XML entities in ``document.xml`` are never resolved: a ``file://`` external
   entity's secret never reaches the output; an entity-expansion bomb doesn't
   expand (``corrupted_file`` or a small text).
+- Merged cells (contract 12.2, audit PM-2; Decision 15 "DOCX table spans are
+  expanded only up to the column cap; vertically merged continuation cells
+  are empty"): rows are built from the row's ``w:tc`` elements, never
+  ``_Row.cells`` or ``Table._cells`` (both patched to fail): a ``w:gridSpan``
+  within the cap repeats the cell's text; a span of 300000 or 10**12 gives at
+  most ``MAX_TABLE_COLUMNS + 1`` cells per row (table_text's input), so the
+  table has 50 columns plus the columns note, in under a second; a
+  non-numeric, zero or negative span counts as 1. A ``w:vMerge`` continuation
+  (``<w:vMerge/>`` and ``w:val="continue"``) is ``""``; the restart cell keeps
+  its text.
+- Text cap while building (contract 12.3, audit L-2): a table whose kept cells
+  pass ``MAX_TEXT_CHARS`` (monkeypatched small) fails with ``text_too_large``
+  from the table builder itself, not ``corrupted_file``; the writer is never
+  asked to write it.
 
 The converter modules are imported inside the helpers, so this file collects
 before they exist.
@@ -42,14 +56,17 @@ before they exist.
 
 from __future__ import annotations
 
+import signal
+import time
 import zipfile
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
 import docx
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from docx.document import Document as DocxDocument
@@ -346,6 +363,172 @@ def test_word_all_empty_table_adds_no_block(tmp_path: Path) -> None:
     document.add_paragraph("After")
 
     assert _text(tmp_path, document) == "Before\n\nAfter"
+
+
+# --- merged cells (gridSpan, vMerge) --------------------------------------------------
+
+
+class _ExpandedSpanError(BaseException):
+    """Raised when python-docx's span-expanding cell views are used (not an
+    Exception, so the converter's error mapping can't swallow it)."""
+
+
+class _TooSlowError(BaseException):
+    """Raised by the deadline below (a hostile span must not run long)."""
+
+
+@contextmanager
+def _deadline(seconds: float) -> Iterator[None]:
+    """Interrupt the code under test after ``seconds`` (SIGALRM, main thread)."""
+
+    def expired(signum: int, frame: object) -> None:
+        raise _TooSlowError(f"still running after {seconds} s")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _forbid_span_expansion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_Row.cells`` and ``Table._cells`` repeat a cell once per spanned grid column."""
+    import docx.table
+
+    def expanded(self: object) -> Any:
+        raise _ExpandedSpanError(type(self).__name__)
+
+    monkeypatch.setattr(docx.table._Row, "cells", property(expanded))
+    monkeypatch.setattr(docx.table.Table, "_cells", property(expanded))
+
+
+def _table_text_row_widths(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Record how many cells each row handed to ``table_text`` has."""
+    from admino.converters import sheets, word
+
+    real = sheets.table_text
+    widths: list[int] = []
+
+    def recorded(rows: Iterable[Iterable[object]]) -> str:
+        materialized = [list(row) for row in rows]
+        widths.extend(len(row) for row in materialized)
+        return real(materialized)
+
+    for module in (word, sheets):
+        if getattr(module, "table_text", None) is real:
+            monkeypatch.setattr(module, "table_text", recorded)
+    return widths
+
+
+def _set_span(cell: Any, value: str) -> None:
+    """Write ``value`` raw into the cell's ``w:gridSpan`` (no validation)."""
+    from docx.oxml.ns import qn
+
+    cell._tc.tcPr.find(qn("w:gridSpan")).set(qn("w:val"), value)
+
+
+def _row(cells: Sequence[str]) -> str:
+    return "| " + " | ".join(cells) + " |"
+
+
+_SPANNED_TO_CAP = "\n".join(
+    [_row(["Wide"] * 50), _row(["---"] * 50), _row(["a", "b", *[""] * 48])]
+) + ("\n\n[Only the first 50 columns are included.]")
+_SPAN_OF_ONE = "| Wide |  |\n| --- | --- |\n| a | b |"
+
+
+@pytest.mark.parametrize(
+    ("span", "expected"),
+    [
+        ("300000", _SPANNED_TO_CAP),
+        ("1000000000000", _SPANNED_TO_CAP),
+        ("wide", _SPAN_OF_ONE),
+        ("0", _SPAN_OF_ONE),
+        ("-5", _SPAN_OF_ONE),
+    ],
+    ids=["300000", "10e12", "non-numeric", "zero", "negative"],
+)
+def test_word_grid_span_never_expands_past_the_column_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, span: str, expected: str
+) -> None:
+    document = docx.Document()
+    table = _table(document, [["Wide", ""], ["a", "b"]])
+    table.cell(0, 0).merge(table.cell(0, 1))  # one w:tc with w:gridSpan="2"
+    _set_span(table.cell(0, 0), span)
+    path = _save(tmp_path, document)
+    _forbid_span_expansion(monkeypatch)
+    widths = _table_text_row_widths(monkeypatch)
+
+    start = time.perf_counter()
+    with _deadline(10):
+        _, _, out_dir = _run(tmp_path, path)
+    seconds = time.perf_counter() - start
+
+    assert (
+        (out_dir / "part-0001.txt").read_text(encoding="utf-8"),
+        max(widths) <= 51,
+        seconds < 1.0,
+    ) == (expected, True, True)
+
+
+def test_word_merged_cells_repeat_spans_and_leave_vertical_continuations_empty(
+    tmp_path: Path,
+) -> None:
+    from docx.oxml.ns import qn
+    from docx.text.paragraph import Paragraph as DocxParagraph
+
+    document = docx.Document()
+    table = _table(
+        document, [["Team", "Q1", "Q2"], ["Block", "", "10"], ["", "", "20"], ["", "", "30"]]
+    )
+    # A 3x2 block: row 1 restarts it (w:gridSpan="2", w:vMerge="restart"); rows 2
+    # and 3 continue it, once as <w:vMerge/> and once as w:val="continue". Each
+    # continuation also holds stale text of its own, which is never shown.
+    table.cell(1, 0).merge(table.cell(3, 1))
+    table.rows[3]._tr.tc_lst[0].tcPr.find(qn("w:vMerge")).set(qn("w:val"), "continue")
+    for index in (2, 3):
+        continuation = table.rows[index]._tr.tc_lst[0]
+        DocxParagraph(continuation.p_lst[0], table).add_run(f"stale {index}")
+    path = _save(tmp_path, document)
+
+    _, _, out_dir = _run(tmp_path, path)
+
+    assert (out_dir / "part-0001.txt").read_text(encoding="utf-8") == (
+        "| Team | Q1 | Q2 |\n| --- | --- | --- |\n"
+        "| Block | Block | 10 |\n|  |  | 20 |\n|  |  | 30 |"
+    )
+
+
+# --- text cap while building a table --------------------------------------------------
+
+
+def test_word_table_over_the_text_cap_fails_while_being_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from admino.converters import common, word
+
+    monkeypatch.setattr(common, "MAX_TEXT_CHARS", 100)
+    document = docx.Document()
+    _table(document, [["x" * 30] for _ in range(10)])  # 30 kept characters per row
+    path = _save(tmp_path, document)
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    writer = common.PartWriter(out_dir)
+    asked: list[int] = []
+    real_add_text = writer.add_text
+
+    def add_text(text: str, *, page: int | None = None) -> None:
+        asked.append(len(text))
+        real_add_text(text, page=page)
+
+    writer.add_text = add_text  # type: ignore[method-assign]
+
+    with pytest.raises(common.ConversionError) as caught:
+        word.convert_docx(path, writer, _options())
+
+    assert (caught.value.reason, asked, list(out_dir.iterdir())) == ("text_too_large", [], [])
 
 
 # --- output part ----------------------------------------------------------------------

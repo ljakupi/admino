@@ -15,7 +15,8 @@ file doesn't end ``ready``.
 What these tests pin down:
 
 - Names: ``MAX_WORKERS == 2``; ``ProcessedFile`` a frozen dataclass whose
-  ``page_count`` and ``token_estimate`` default to None; ``ProcessingJob`` a
+  ``page_count``, ``token_estimate`` and ``derived_bytes`` (GH-188 §12.4) default to
+  None; ``ProcessingJob`` a
   frozen dataclass ``(filename, render_dpi, max_pages)``;
   ``ProcessingFailedError(reason)`` keeps its ``reason``; ``convert_stored_file``
   is the default processor of ``process_attachment`` and of ``ProcessingPool``
@@ -31,8 +32,9 @@ What these tests pin down:
     ``render_dpi`` / ``max_pages`` come from the STORED platform settings
     (``files.render_dpi``, ``files.max_pages_per_file``), read exactly once and
     before the processor runs; the row is ``processing`` meanwhile.
-  - Success: P2', ``ready`` with the processor's ``page_count`` and
-    ``token_estimate`` (None stays NULL, 0 stays 0). ``ProcessingFailedError(code)``:
+  - Success: P2'', ``ready`` with the processor's ``page_count``,
+    ``token_estimate`` and ``derived_bytes`` (None stays NULL, 0 stays 0).
+    ``ProcessingFailedError(code)``:
     P3 with that code. Any other exception: P3 ``processing_error``, logged at
     WARNING or above by class name only (the exception's message, holding a file
     name and a path, reaches no record, no traceback). A page count above the
@@ -43,15 +45,27 @@ What these tests pin down:
     (the row was deleted while the processor ran), ``<id>.d`` is gone and the
     stored ``<id>`` is kept; a stored ``ready`` keeps ``<id>.d``.
   - A row deleted while the processor runs: no error, nothing re-created.
-  - The exact statements: [P1', P2'] or [P1', P3] with their bind values; the
+  - The exact statements: [P1', P2''] or [P1', P3] with their bind values; the
     return value is the final status.
+  - The ready outcome and the storage quota (GH-188 §12.4, process M-3, Decision
+    15): a processor that reports ``derived_bytes`` gets one transaction on one
+    connection, A3 (the org row ``FOR NO KEY UPDATE``), A4' (originals plus derived
+    files of the org), then P2'' with the derived bytes; when ``used + derived_bytes
+    > quota`` P3 ``storage_quota_exceeded`` instead and ``<id>.d`` is removed (other
+    orgs' files don't count; exactly the quota passes). ``derived_bytes`` None skips
+    A3/A4' (just P2'' with NULL, even under a zero quota). The too_many_pages
+    post-check comes first (no quota statement then). A row deleted meanwhile
+    (P2'' matches no row) loses its ``<id>.d`` on this path too. An org deleted
+    meanwhile (A3 finds no row): nothing runs after A3, ``<id>.d`` is removed, the
+    stored ``<id>`` is untouched and the result is ``ready``.
 - ``convert_stored_file(path, kind, job)``: ``verify_stored_file`` first (a
   missing, corrupted or password-protected stored file fails with its code and
   ``runner.run_conversion`` is never called, so no worker starts); then
   ``runner.run_conversion(path, kind, <path>.d, ConversionOptions(filename,
   render_dpi, max_pages))`` with the job's values; ``ConversionError(code)``
-  becomes ``ProcessingFailedError(code)`` for each of the eight codes; the
-  ``ConversionResult`` becomes ``ProcessedFile(page_count, token_estimate)``.
+  becomes ``ProcessingFailedError(code)`` for each of the nine codes; the
+  ``ConversionResult`` becomes ``ProcessedFile(page_count, token_estimate,
+  derived_bytes)``.
 - ``verify_stored_file(path, kind)``: a missing file fails with
   ``file_missing``; a stored file ``detect_kind`` refuses fails with that
   refusal's reason (a stored ``txt`` holding the C1 control NEL U+0085 is
@@ -61,7 +75,13 @@ What these tests pin down:
   extension picks among the text kinds (csv, md, txt).
 - ``ProcessingPool``: ``submit`` returns None at once without running anything
   and never raises (a broken pool object included, the pool keeps working);
-  at most ``workers`` processor calls run at once (default 2); ``join()`` waits
+  at most ``workers`` processor calls run at once (default 2, jobs of five
+  orgs); per-org fairness (GH-188 §12.5, process M-4): at most one job per org
+  runs at a time, even with free workers, in submission order; org A's ten
+  queued jobs never delay org B's one job (it starts while A's first runs and
+  before A's second); the per-org state is dropped when an org goes idle (many
+  orgs, failing jobs included, leave no state behind) and doesn't survive a new
+  event loop (a job left running on a dead loop doesn't block its org); ``join()`` waits
   for every submitted job and also returns when called in the loop turn in which
   the last job ended; ``close()`` cancels pending and running jobs (no
   pending job's processor runs afterwards, a cancelled running job writes no
@@ -85,6 +105,7 @@ released in ``finally``.
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
 import inspect
 import io
@@ -121,7 +142,7 @@ _GATE_S: Final = 10.0
 _LEAK_NAME: Final = "Quarterly-salaries-2026.xlsx"
 _LEAK_DIR: Final = "/srv/private-share-marker"
 
-# The eight conversion failure codes (GH-188 contract §3, Decision 12).
+# The nine conversion failure codes (GH-188 contract §3 and §12, Decision 12).
 _CONVERSION_FAILURES: Final = (
     "corrupted_file",
     "password_protected",
@@ -129,11 +150,12 @@ _CONVERSION_FAILURES: Final = (
     "archive_too_large",
     "image_too_large",
     "text_too_large",
+    "output_too_large",
     "conversion_timeout",
     "processing_error",
 )
 
-# --- Contract forms (GH-187 §2; P1' and P2' from GH-188 §6) ------------------------
+# --- Contract forms (GH-187 §2; P1' from GH-188 §6; P2'', A3, A4' from GH-188 §12.4) --
 
 _P1: Final = norm(
     "UPDATE attachments SET status = 'processing', updated_at = now() "
@@ -141,7 +163,13 @@ _P1: Final = norm(
 )
 _P2: Final = norm(
     "UPDATE attachments SET status = 'ready', page_count = $3, token_estimate = $4, "
-    "updated_at = now() WHERE id = $1 AND org_id = $2 AND status = 'processing'"
+    "derived_bytes = $5, updated_at = now() "
+    "WHERE id = $1 AND org_id = $2 AND status = 'processing'"
+)
+_A3: Final = norm("SELECT storage_quota_bytes FROM organizations WHERE id = $1 FOR NO KEY UPDATE")
+_A4: Final = norm(
+    "SELECT coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0) "
+    "FROM attachments WHERE org_id = $1"
 )
 _P3: Final = norm(
     "UPDATE attachments SET status = 'failed', failure_reason = $3, updated_at = now() "
@@ -322,6 +350,13 @@ def _estimate(db: FakeDb, attachment_id: uuid.UUID) -> Any:
     return row["token_estimate"]
 
 
+def _derived_bytes(db: FakeDb, attachment_id: uuid.UUID) -> Any:
+    """The stored row's derived_bytes (GH-188 §12.4, migration 0028)."""
+    row = db.attachment_row(attachment_id)
+    assert row is not None
+    return row["derived_bytes"]
+
+
 def _derived_dir(db: FakeDb, root: Path, attachment_id: uuid.UUID) -> Path:
     """Where the derived artifacts live (GH-188 Decision 3): <root>/<org_id>/<id>.d."""
     return _path_of(db, root, attachment_id).with_name(f"{attachment_id}.d")
@@ -346,6 +381,22 @@ def _attachment_calls(db: FakeDb) -> list[tuple[str, tuple[Any, ...]]]:
         for call in db.calls
         if re.search(r"\battachments\b", call.normalized)
     ]
+
+
+def _outcome_calls(db: FakeDb) -> list[tuple[str, tuple[Any, ...]]]:
+    """Like ``_attachment_calls``, also with the statements naming organizations (A3)."""
+    return [
+        (call.normalized, tuple(_canonical(arg) for arg in call.args))
+        for call in db.calls
+        if re.search(r"\b(attachments|organizations)\b", call.normalized)
+    ]
+
+
+def _org_chat(db: FakeDb) -> tuple[uuid.UUID, uuid.UUID]:
+    """A new org with a member and a chat: (org_id, chat_id)."""
+    org_id = uuid.uuid4()
+    user_id = db.add_account(org_id=org_id)
+    return org_id, db.add_chat(user_id)
 
 
 class _Processor:
@@ -376,15 +427,19 @@ class _Processor:
 
 
 class _GatedProcessor:
-    """A processor that blocks on a threading.Event; counts active, peak and total calls.
+    """A processor that blocks on a threading.Event; counts active, peak and total calls,
+    overall and per org (the stored path's parent directory is the org id), and records
+    the paths in the order the calls started. ``delay`` (seconds) is slept after the
+    gate opens, so calls overlap.
 
     Built on the event loop's thread: a call made on that thread (a processor run on
     the loop instead of in a worker thread) returns at once instead of blocking the
     loop, so such an implementation fails these tests quickly rather than hanging.
     """
 
-    def __init__(self, result: Any) -> None:
+    def __init__(self, result: Any, *, delay: float = 0.0) -> None:
         self.result = result
+        self.delay = delay
         self.gate = threading.Event()
         self._lock = threading.Lock()
         self._loop_thread = threading.get_ident()
@@ -392,19 +447,26 @@ class _GatedProcessor:
         self.peak = 0
         self.calls = 0
         self.paths: list[Path] = []
+        self.org_active: dict[str, int] = {}
+        self.org_peak: dict[str, int] = {}
 
     def __call__(self, path: Path, kind: str, job: Any) -> Any:
+        org = Path(path).parent.name
         with self._lock:
             self.active += 1
             self.calls += 1
             self.peak = max(self.peak, self.active)
             self.paths.append(Path(path))
+            self.org_active[org] = self.org_active.get(org, 0) + 1
+            self.org_peak[org] = max(self.org_peak.get(org, 0), self.org_active[org])
         try:
             if threading.get_ident() != self._loop_thread:
                 self.gate.wait(timeout=_GATE_S)
+                time.sleep(self.delay)
         finally:
             with self._lock:
                 self.active -= 1
+                self.org_active[org] -= 1
         return self.result
 
 
@@ -472,11 +534,13 @@ def _patch_run_conversion(monkeypatch: pytest.MonkeyPatch, recorder: _RunConvers
     monkeypatch.setattr(runner, "run_conversion", recorder)
 
 
-def _conversion_result(page_count: int | None, token_estimate: int) -> Any:
+def _conversion_result(page_count: int | None, token_estimate: int, derived_bytes: int = 0) -> Any:
     """A ``runner.ConversionResult`` (imported lazily: it doesn't exist before GH-188)."""
     from admino.converters import runner
 
-    return runner.ConversionResult(page_count=page_count, token_estimate=token_estimate)
+    return runner.ConversionResult(
+        page_count=page_count, token_estimate=token_estimate, derived_bytes=derived_bytes
+    )
 
 
 class _ProcessorCrashError(Exception):
@@ -495,6 +559,7 @@ class TestNames:
     def test_attachment_processing_processed_file_is_frozen_with_no_pages_or_estimate_by_default(
         self, ap: ModuleType
     ) -> None:
+        """GH-188 §12.4: derived_bytes joins page_count and token_estimate (None too)."""
         processed = ap.ProcessedFile()
         with pytest.raises(dataclasses.FrozenInstanceError):
             processed.token_estimate = 3  # type: ignore[misc]
@@ -504,7 +569,8 @@ class TestNames:
             [field.name for field in dataclasses.fields(processed)],
             processed.page_count,
             processed.token_estimate,
-        ) == (True, ["page_count", "token_estimate"], None, None)
+            processed.derived_bytes,
+        ) == (True, ["page_count", "token_estimate", "derived_bytes"], None, None, None)
 
     def test_attachment_processing_processing_job_is_frozen_with_its_three_fields(
         self, ap: ModuleType
@@ -919,14 +985,17 @@ class TestDerivedArtifacts:
         "outcome",
         [
             pytest.param("returns", id="ready-matched-no-row"),
+            pytest.param("returns-derived", id="ready-after-quota-check-matched-no-row"),
             pytest.param("raises", id="failed-matched-no-row"),
         ],
     )
     async def test_attachment_processing_row_deleted_while_processing_removes_derived(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path, outcome: str
     ) -> None:
-        """The row goes while the processor runs: P2' (or P3) matches nothing, the
-        <id>.d tree is removed, nothing is re-created and <id> is left to its deleter."""
+        """The row goes while the processor runs: P2'' (or P3) matches nothing, the
+        <id>.d tree is removed, nothing is re-created and <id> is left to its deleter;
+        also when the processor reported derived bytes (the quota transaction ran)."""
+        db.add_org(ORG_ID, storage_quota_bytes=10**9)
         attachment_id = _store(db, root, world.chat_id)
         derived = _derived_dir(db, root, attachment_id)
         _plant_derived(derived)
@@ -934,8 +1003,9 @@ class TestDerivedArtifacts:
         def delete_row() -> None:
             del db.attachments[attachment_id]
 
+        derived_bytes = 64 if outcome == "returns-derived" else None
         processor = _Processor(
-            ap.ProcessedFile(page_count=2, token_estimate=5),
+            ap.ProcessedFile(page_count=2, token_estimate=5, derived_bytes=derived_bytes),
             raises=ap.ProcessingFailedError("x_code") if outcome == "raises" else None,
             on_call=delete_row,
         )
@@ -975,10 +1045,12 @@ class TestStatements:
     async def test_attachment_processing_success_issues_p1_then_p2(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
     ) -> None:
+        """A processor that reports no derived_bytes: P1' then P2'' with NULL, no quota
+        statement (A3/A4'), and ready although the org's quota (0 here) has no room."""
         attachment_id = _store(db, root, world.chat_id)
         db.calls.clear()
 
-        await ap.process_attachment(
+        result = await ap.process_attachment(
             db.pool,
             root,
             attachment_id,
@@ -986,10 +1058,10 @@ class TestStatements:
             processor=_Processor(ap.ProcessedFile(page_count=7, token_estimate=99)),
         )
 
-        assert _attachment_calls(db) == [
-            (_P1, (attachment_id, ORG_ID)),
-            (_P2, (attachment_id, ORG_ID, 7, 99)),
-        ]
+        assert (result, _outcome_calls(db)) == (
+            "ready",
+            [(_P1, (attachment_id, ORG_ID)), (_P2, (attachment_id, ORG_ID, 7, 99, None))],
+        )
 
     async def test_attachment_processing_failure_issues_p1_then_p3(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
@@ -1019,9 +1091,11 @@ class TestStatements:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Without a processor (convert_stored_file): a valid stored PNG is converted
-        (into <id>.d) and ready with the conversion's estimate; a PNG recorded as pdf
-        fails verification (corrupted_file) and is never converted."""
-        recorder = _RunConversion(_conversion_result(None, 12))
+        (into <id>.d) and ready with the conversion's estimate and derived bytes (the
+        org has room for them); a PNG recorded as pdf fails verification
+        (corrupted_file) and is never converted."""
+        db.add_org(ORG_ID, storage_quota_bytes=10**6)
+        recorder = _RunConversion(_conversion_result(None, 12, 640))
         _patch_run_conversion(monkeypatch, recorder)
         good = _store(db, root, world.chat_id, _png(), kind="png", filename="photo.png")
         bad = _store(db, root, world.chat_id, _png(), kind="pdf")
@@ -1031,15 +1105,202 @@ class TestStatements:
             await ap.process_attachment(db.pool, root, bad, ORG_ID),
         ]
 
-        assert (results, _state(db, good), _estimate(db, good), _state(db, bad)) == (
+        assert (
+            results,
+            _state(db, good),
+            _estimate(db, good),
+            _derived_bytes(db, good),
+            _state(db, bad),
+        ) == (
             ["ready", "failed"],
             ("ready", None, None),
             12,
+            640,
             ("failed", "corrupted_file", None),
         )
         assert [(path, kind, out_dir) for path, kind, out_dir, _ in recorder.calls] == [
             (_path_of(db, root, good), "png", _derived_dir(db, root, good))
         ]
+
+
+class TestReadyTransaction:
+    """GH-188 §12.4: derived files count toward the org's storage quota."""
+
+    async def test_attachment_processing_ready_runs_a3_a4_then_p2_in_one_transaction(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    ) -> None:
+        """Derived bytes reported: after P1', A3 (the org row) and A4' (the org's
+        originals and derived files), then P2'' with the derived bytes, in that order,
+        on one connection in one transaction (not on the pool)."""
+        db.add_org(ORG_ID, storage_quota_bytes=10_000)
+        attachment_id = _store(db, root, world.chat_id)
+        db.calls.clear()
+
+        result = await ap.process_attachment(
+            db.pool,
+            root,
+            attachment_id,
+            ORG_ID,
+            processor=_Processor(
+                ap.ProcessedFile(page_count=2, token_estimate=40, derived_bytes=500)
+            ),
+        )
+
+        calls = [
+            call
+            for call in db.calls
+            if re.search(r"\b(attachments|organizations)\b", call.normalized)
+        ]
+        assert _outcome_calls(db) == [
+            (_P1, (attachment_id, ORG_ID)),
+            (_A3, (ORG_ID,)),
+            (_A4, (ORG_ID,)),
+            (_P2, (attachment_id, ORG_ID, 2, 40, 500)),
+        ]
+        assert (
+            len({(call.via, call.tx) for call in calls[1:]}),
+            calls[1].via != "pool",
+            calls[1].tx is not None,
+        ) == (1, True, True)
+        assert (
+            result,
+            _state(db, attachment_id),
+            _estimate(db, attachment_id),
+            _derived_bytes(db, attachment_id),
+        ) == ("ready", ("ready", None, 2), 40, 500)
+
+    @pytest.mark.parametrize(
+        ("spare", "expected"),
+        [
+            pytest.param(0, ("ready", ("ready", None, 1), 9, 4096, False), id="exactly-the-quota"),
+            pytest.param(
+                -1,
+                ("failed", ("failed", "storage_quota_exceeded", None), None, None, True),
+                id="one-byte-over",
+            ),
+        ],
+    )
+    async def test_attachment_processing_derived_bytes_held_against_the_org_quota(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        spare: int,
+        expected: tuple[Any, ...],
+    ) -> None:
+        """used = this org's originals plus their derived files (another ready file's
+        300 derived bytes count; the other org's 100 kB don't). used + 4096 equal to the
+        quota: ready with derived_bytes 4096 and <id>.d kept; one byte over: P3
+        storage_quota_exceeded, nothing else stored, <id>.d removed, <id> kept."""
+        db.add_attachment(
+            world.chat_id, size_bytes=700, status="ready", token_estimate=3, derived_bytes=300
+        )
+        db.add_attachment(
+            world.other_chat_id, size_bytes=50_000, status="ready", derived_bytes=50_000
+        )
+        attachment_id = _store(db, root, world.chat_id)
+        db.add_org(ORG_ID, storage_quota_bytes=700 + 300 + len(_PDF) + 4096 + spare)
+        derived = _derived_dir(db, root, attachment_id)
+        _plant_derived(derived)
+        db.calls.clear()
+
+        result = await ap.process_attachment(
+            db.pool,
+            root,
+            attachment_id,
+            ORG_ID,
+            processor=_Processor(
+                ap.ProcessedFile(page_count=1, token_estimate=9, derived_bytes=4096)
+            ),
+        )
+
+        last = (
+            (_P2, (attachment_id, ORG_ID, 1, 9, 4096))
+            if spare == 0
+            else (_P3, (attachment_id, ORG_ID, "storage_quota_exceeded"))
+        )
+        assert (
+            result,
+            _state(db, attachment_id),
+            _estimate(db, attachment_id),
+            _derived_bytes(db, attachment_id),
+            _gone(derived),
+        ) == expected
+        assert _outcome_calls(db) == [
+            (_P1, (attachment_id, ORG_ID)),
+            (_A3, (ORG_ID,)),
+            (_A4, (ORG_ID,)),
+            last,
+        ]
+        assert _path_of(db, root, attachment_id).read_bytes() == _PDF
+
+    async def test_attachment_processing_too_many_pages_checked_before_the_quota(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A page count over the limit fails too_many_pages before any quota statement
+        (the org's zero quota would refuse the derived bytes too)."""
+        _platform_pages_limit(monkeypatch, db, 3)
+        attachment_id = _store(db, root, world.chat_id)
+        db.calls.clear()
+
+        result = await ap.process_attachment(
+            db.pool,
+            root,
+            attachment_id,
+            ORG_ID,
+            processor=_Processor(
+                ap.ProcessedFile(page_count=4, token_estimate=9, derived_bytes=10)
+            ),
+        )
+
+        assert (result, _outcome_calls(db)) == (
+            "failed",
+            [
+                (_P1, (attachment_id, ORG_ID)),
+                (_P3, (attachment_id, ORG_ID, "too_many_pages")),
+            ],
+        )
+
+    async def test_attachment_processing_org_deleted_during_conversion_stops_after_a3(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    ) -> None:
+        """Contract §12.4 addendum (b): the org is deleted while the processor runs (its
+        attachment rows go with it, ON DELETE CASCADE). A3 finds no org row, so nothing
+        else runs in the transaction (no A4', no P2'', no P3) and the transaction is
+        closed; <id>.d is removed after it, the stored <id> is left to the org's purge,
+        and the result is ready, like a P2'' that matched no row; no exception escapes."""
+        db.add_org(ORG_ID, storage_quota_bytes=10**9)
+        attachment_id = _store(db, root, world.chat_id)
+        derived = _derived_dir(db, root, attachment_id)
+        _plant_derived(derived)
+
+        def delete_org() -> None:
+            db.delete_row("organizations", db.orgs[ORG_ID])
+
+        processor = _Processor(
+            ap.ProcessedFile(page_count=2, token_estimate=5, derived_bytes=64),
+            on_call=delete_org,
+        )
+        db.calls.clear()
+
+        result = await ap.process_attachment(
+            db.pool, root, attachment_id, ORG_ID, processor=processor
+        )
+
+        assert _outcome_calls(db) == [(_P1, (attachment_id, ORG_ID)), (_A3, (ORG_ID,))]
+        assert (
+            result,
+            db.open_transactions,
+            db.attachment_row(attachment_id),
+            _gone(derived),
+            _path_of_id(root, ORG_ID, attachment_id).read_bytes(),
+        ) == ("ready", 0, None, True, _PDF)
 
 
 # ---------------------------------------------------------------------------
@@ -1102,10 +1363,10 @@ class TestConvertStoredFile:
         ]
 
     @pytest.mark.parametrize(
-        ("data", "kind", "page_count", "token_estimate"),
+        ("data", "kind", "page_count", "token_estimate", "derived_bytes"),
         [
-            pytest.param(_PDF, "pdf", 3, 1234, id="pdf-with-pages"),
-            pytest.param(_TXT, "txt", None, 0, id="text-without-pages"),
+            pytest.param(_PDF, "pdf", 3, 1234, 52_000, id="pdf-with-pages"),
+            pytest.param(_TXT, "txt", None, 0, 0, id="text-without-pages"),
         ],
     )
     def test_attachment_processing_convert_maps_the_result_to_processed_file(
@@ -1117,15 +1378,21 @@ class TestConvertStoredFile:
         kind: str,
         page_count: int | None,
         token_estimate: int,
+        derived_bytes: int,
     ) -> None:
+        """The ConversionResult's three numbers, derived_bytes included (0 stays 0)."""
         _patch_run_conversion(
-            monkeypatch, _RunConversion(_conversion_result(page_count, token_estimate))
+            monkeypatch,
+            _RunConversion(_conversion_result(page_count, token_estimate, derived_bytes)),
         )
         job = ap.ProcessingJob(filename="a", render_dpi=150, max_pages=100)
 
         processed = ap.convert_stored_file(_stored_file(tmp_path, data), kind, job)
 
-        assert processed == ap.ProcessedFile(page_count=page_count, token_estimate=token_estimate)
+        assert processed == ap.ProcessedFile(
+            page_count=page_count, token_estimate=token_estimate, derived_bytes=derived_bytes
+        )
+        assert type(processed.derived_bytes) is int
 
     @pytest.mark.parametrize("reason", _CONVERSION_FAILURES)
     def test_attachment_processing_convert_maps_conversion_error_to_its_code(
@@ -1221,6 +1488,32 @@ class TestVerifyStoredFile:
 # ---------------------------------------------------------------------------
 
 
+def _in_thread(loop: asyncio.AbstractEventLoop, coroutine: Any) -> None:
+    """Run ``coroutine`` to completion on ``loop`` in another thread (this thread's loop
+    is running), waiting at most ``_WAIT_S`` for it."""
+    thread = threading.Thread(target=loop.run_until_complete, args=(coroutine,), daemon=True)
+    thread.start()
+    thread.join(_WAIT_S)
+
+
+def _sized_state(processing: Any, skip: object) -> dict[str, int]:
+    """The length of every container the pool holds, one level into plain helper
+    objects (the event loop and ``skip``, the test's processor, aside)."""
+    sizes: dict[str, int] = {}
+
+    def visit(prefix: str, owner: object) -> None:
+        for name, value in vars(owner).items():
+            if value is skip or isinstance(value, str | bytes | asyncio.AbstractEventLoop):
+                continue
+            if isinstance(value, dict | list | set | frozenset | tuple | collections.deque):
+                sizes[prefix + name] = len(value)
+            elif not prefix and hasattr(value, "__dict__") and not callable(value):
+                visit(f"{name}.", value)
+
+    visit("", processing)
+    return sizes
+
+
 class TestProcessingPool:
     async def test_attachment_processing_submit_returns_at_once_and_runs_later(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
@@ -1261,12 +1554,17 @@ class TestProcessingPool:
         self,
         ap: ModuleType,
         db: FakeDb,
-        world: _World,
         root: Path,
         workers: int | None,
         expected: int,
     ) -> None:
-        ids = [_store(db, root, world.chat_id) for _ in range(5)]
+        """Five jobs of five orgs (GH-188 §12.5: one org runs one job at a time, so the
+        global bound shows across orgs): at most ``workers`` run at once."""
+        jobs = []
+        for _ in range(5):
+            org_id, chat_id = _org_chat(db)
+            jobs.append((_store(db, root, chat_id), org_id))
+        ids = [attachment_id for attachment_id, _ in jobs]
         processor = _GatedProcessor(ap.ProcessedFile())
         processing = (
             ap.ProcessingPool(processor=processor)
@@ -1274,8 +1572,8 @@ class TestProcessingPool:
             else ap.ProcessingPool(workers=workers, processor=processor)
         )
         try:
-            for attachment_id in ids:
-                processing.submit(db.pool, root, attachment_id, ORG_ID)
+            for attachment_id, org_id in jobs:
+                processing.submit(db.pool, root, attachment_id, org_id)
             await _until(lambda: processor.active >= expected, f"{expected} running calls")
             # Time for any call beyond the bound to start.
             await _REAL_SLEEP(0.2)
@@ -1286,6 +1584,118 @@ class TestProcessingPool:
 
         assert (peak_while_blocked, processor.peak, processor.calls) == (expected, expected, 5)
         assert [_state(db, attachment_id)[0] for attachment_id in ids] == ["ready"] * 5
+
+    async def test_attachment_processing_pool_other_orgs_job_starts_before_the_busy_orgs_second(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    ) -> None:
+        """Process M-4: org A queues ten jobs, then org B one. With the two default
+        workers, B's job starts while A's first still runs and before A's second (A's
+        queue never takes the second worker)."""
+        busy = [_store(db, root, world.chat_id) for _ in range(10)]
+        other = _store(db, root, world.other_chat_id)
+        processor = _GatedProcessor(ap.ProcessedFile())
+        processing = ap.ProcessingPool(processor=processor)
+        try:
+            for attachment_id in busy:
+                processing.submit(db.pool, root, attachment_id, ORG_ID)
+            processing.submit(db.pool, root, other, OTHER_ORG_ID)
+            await _until(lambda: processor.calls >= 2, "two running calls")
+            # Time for any further call to start.
+            await _REAL_SLEEP(0.2)
+            started_while_blocked = sorted(path.name for path in processor.paths)
+        finally:
+            processor.gate.set()
+        await asyncio.wait_for(processing.join(), _WAIT_S)
+
+        assert started_while_blocked == sorted([str(busy[0]), str(other)])
+        assert [_state(db, attachment_id)[0] for attachment_id in [*busy, other]] == ["ready"] * 11
+
+    async def test_attachment_processing_pool_runs_one_job_per_org_in_submission_order(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    ) -> None:
+        """Three workers, three jobs of one org: one runs, the others wait although
+        workers are free; they then run one by one in submission order."""
+        ids = [_store(db, root, world.chat_id) for _ in range(3)]
+        processor = _GatedProcessor(ap.ProcessedFile())
+        processing = ap.ProcessingPool(workers=3, processor=processor)
+        try:
+            for attachment_id in ids:
+                processing.submit(db.pool, root, attachment_id, ORG_ID)
+            await _until(lambda: processor.calls >= 1, "a running call")
+            await _REAL_SLEEP(0.2)
+            while_blocked = (processor.calls, processor.peak)
+        finally:
+            processor.gate.set()
+        await asyncio.wait_for(processing.join(), _WAIT_S)
+
+        assert (while_blocked, processor.peak) == ((1, 1), 1)
+        assert [path.name for path in processor.paths] == [str(i) for i in ids]
+
+    async def test_attachment_processing_pool_many_orgs_one_job_each_and_no_state_left(
+        self, ap: ModuleType, db: FakeDb, root: Path
+    ) -> None:
+        """Thirty orgs with two jobs each on four workers (every third org's jobs fail at
+        once on a broken pool object): no org ever runs two jobs at once, and once all
+        have ended the pool holds no per-org state (no container in it grew)."""
+        processor = _GatedProcessor(ap.ProcessedFile(), delay=0.01)
+        processor.gate.set()
+        processing = ap.ProcessingPool(workers=4, processor=processor)
+        before = _sized_state(processing, processor)
+        jobs: list[tuple[Any, uuid.UUID, uuid.UUID]] = []
+        for index in range(30):
+            org_id, chat_id = _org_chat(db)
+            broken = index % 3 == 2
+            for _ in range(2):
+                attachment_id = _store(db, root, chat_id)
+                jobs.append((object() if broken else db.pool, attachment_id, org_id))
+
+        for pool, attachment_id, org_id in jobs:
+            processing.submit(pool, root, attachment_id, org_id)
+        await asyncio.wait_for(processing.join(), _WAIT_S * 2)
+
+        after = _sized_state(processing, processor)
+        assert (processor.calls, set(processor.org_peak.values())) == (40, {1})
+        assert {name: size for name, size in after.items() if size != before.get(name, 0)} == {}
+
+    async def test_attachment_processing_pool_new_loop_ignores_the_dead_loops_org_slot(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    ) -> None:
+        """A loop stops while one of the org's jobs still runs (an app stopped without
+        close()); on the next loop the pool starts afresh: a new job of that org runs
+        instead of waiting for a slot nobody will release."""
+        first = _store(db, root, world.chat_id)
+        second = _store(db, root, world.chat_id)
+        processor = _GatedProcessor(ap.ProcessedFile())
+        processing = ap.ProcessingPool(processor=processor)
+        dead_loop = asyncio.new_event_loop()
+
+        async def occupy() -> None:
+            processing.submit(db.pool, root, first, ORG_ID)
+            deadline = time.monotonic() + _WAIT_S
+            while processor.calls < 1 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+
+        async def drain() -> None:
+            """Cleanup: end the stopped loop's leftover job and its worker thread."""
+            leftovers = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+            for task in leftovers:
+                task.cancel()
+            await asyncio.gather(*leftovers, return_exceptions=True)
+            await asyncio.get_running_loop().shutdown_default_executor()
+
+        _in_thread(dead_loop, occupy())
+        try:
+            processing.submit(db.pool, root, second, ORG_ID)
+            await _until(lambda: processor.calls >= 2, "the job on the new loop")
+            started = sorted(path.name for path in processor.paths)
+        finally:
+            processor.gate.set()
+            _in_thread(dead_loop, drain())
+            dead_loop.close()
+        await asyncio.wait_for(processing.join(), _WAIT_S)
+
+        assert started == sorted([str(first), str(second)])
+        assert _state(db, second)[0] == "ready"
 
     async def test_attachment_processing_join_waits_for_every_job(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
@@ -1388,7 +1798,8 @@ class TestProcessingPool:
     ) -> None:
         """ProcessingPool() converts with convert_stored_file: a valid WEBP is ready with
         the conversion's estimate, a WEBP recorded as png fails verification unconverted."""
-        recorder = _RunConversion(_conversion_result(None, 21))
+        db.add_org(ORG_ID, storage_quota_bytes=10**6)
+        recorder = _RunConversion(_conversion_result(None, 21, 128))
         _patch_run_conversion(monkeypatch, recorder)
         good = _store(db, root, world.chat_id, _webp(), kind="webp")
         bad = _store(db, root, world.chat_id, _webp(), kind="png")

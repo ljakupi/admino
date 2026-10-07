@@ -42,6 +42,15 @@ What these tests pin down:
 - A scanned page is rendered at the stored platform ``render_dpi``: 72 and 144 dpi
   give images within 1 px of the page size at those resolutions, and the JPEG on
   disk has the manifest's size.
+- Derived bytes and the quota (contract §12.4, process M-3, Decision 15): a real
+  conversion stores ``derived_bytes`` equal to the bytes on disk in ``<id>.d``; an
+  org whose quota holds the original but not its derived files ends
+  ``failed(storage_quota_exceeded)`` with no ``<id>.d`` and no estimate; derived
+  files over ``common.MAX_DERIVED_BYTES`` (lowered in this server process, measured
+  by the runner) end ``failed(output_too_large)`` with no ``<id>.d``.
+
+The org gets a 1 GiB storage quota (FakeDb's orgs start at 0, and derived files now
+count toward it), except where a test sets its own.
 
 Fixtures are built in memory (hand-written PDF bytes, python-docx, openpyxl,
 Pillow); no binary in the repo. The new modules are imported lazily, so the file
@@ -234,6 +243,8 @@ def flow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Flow:
     monkeypatch.setenv("PYTHONPATH", str(Path(admino.__file__).resolve().parents[1]))
     db = FakeDb()
     user_id = db.add_account(org_id=ORG_ID)
+    # Room for the originals and their derived files (GH-188 §12.4).
+    db.add_org(ORG_ID, storage_quota_bytes=1024**3)
     return _Flow(db=db, root=root, chat_id=db.add_chat(user_id))
 
 
@@ -265,6 +276,13 @@ def _row(flow: _Flow, attachment_id: uuid.UUID) -> tuple[Any, Any, Any, Any]:
     row = flow.db.attachment_row(attachment_id)
     assert row is not None
     return row["status"], row["failure_reason"], row["page_count"], row["token_estimate"]
+
+
+def _derived_bytes(flow: _Flow, attachment_id: uuid.UUID) -> Any:
+    """The stored row's derived_bytes (GH-188 §12.4)."""
+    row = flow.db.attachment_row(attachment_id)
+    assert row is not None
+    return row["derived_bytes"]
 
 
 def _manifest(flow: _Flow, attachment_id: uuid.UUID) -> dict[str, Any]:
@@ -464,6 +482,68 @@ async def test_attachment_conversion_flow_each_type_ends_ready_with_its_estimate
         [(p["type"], p["file"]) for p in parts],
         sorted(os.listdir(_derived(flow, attachment_id))),
     ) == ([(part_type, part_file)], sorted(["manifest.json", part_file]))
+
+
+# ---------------------------------------------------------------------------
+# Derived bytes, the storage quota and the derived cap (GH-188 §12.4)
+# ---------------------------------------------------------------------------
+
+
+async def test_attachment_conversion_flow_ready_stores_the_derived_bytes_on_disk(
+    ap: ModuleType, flow: _Flow
+) -> None:
+    """A real mixed PDF (two text parts, one JPEG, the manifest): derived_bytes is the
+    sum of the sizes of the files in <id>.d."""
+    attachment_id = _store(flow, _mixed_pdf(), kind="pdf", filename="mixed.pdf")
+
+    result = await _process(ap, flow, attachment_id)
+
+    derived = _derived(flow, attachment_id)
+    on_disk = sum(entry.stat().st_size for entry in derived.iterdir())
+    assert (result, len(os.listdir(derived)), on_disk > 0) == ("ready", 4, True)
+    assert _derived_bytes(flow, attachment_id) == on_disk
+
+
+async def test_attachment_conversion_flow_no_room_for_derived_files_fails_storage_quota(
+    ap: ModuleType, flow: _Flow
+) -> None:
+    """The org's quota holds the original exactly, so its derived files don't fit:
+    failed(storage_quota_exceeded), no <id>.d, no estimate or derived bytes stored, the
+    original kept."""
+    flow.db.add_org(ORG_ID, storage_quota_bytes=len(_TXT))
+    attachment_id = _store(flow, _TXT, kind="txt", filename="notes.txt")
+
+    result = await _process(ap, flow, attachment_id)
+
+    assert (
+        result,
+        _row(flow, attachment_id),
+        _derived_bytes(flow, attachment_id),
+        _gone(_derived(flow, attachment_id)),
+        _original(flow, attachment_id).read_bytes() == _TXT,
+    ) == ("failed", ("failed", "storage_quota_exceeded", None, None), None, True, True)
+
+
+async def test_attachment_conversion_flow_derived_files_over_the_cap_fail_output_too_large(
+    ap: ModuleType, flow: _Flow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MAX_DERIVED_BYTES lowered to 16 in this (server) process: the child converts with
+    its own cap, the runner measures the part and the manifest over 16 bytes:
+    failed(output_too_large), no <id>.d, the original kept."""
+    from admino.converters import common
+
+    monkeypatch.setattr(common, "MAX_DERIVED_BYTES", 16)
+    attachment_id = _store(flow, _TXT, kind="txt", filename="notes.txt")
+
+    result = await _process(ap, flow, attachment_id)
+
+    assert (
+        result,
+        _row(flow, attachment_id),
+        _derived_bytes(flow, attachment_id),
+        _gone(_derived(flow, attachment_id)),
+        _original(flow, attachment_id).read_bytes() == _TXT,
+    ) == ("failed", ("failed", "output_too_large", None, None), None, True, True)
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ process started by the runner. Pinned here, in process with ``BytesIO`` streams:
 - Success: exactly one JSON object + ``"\\n"`` on stdout, ``{"ok": true, "page_count",
   "token_estimate"}`` from the manifest; returns 0.
 - ``ConversionError(r)``: ``{"ok": false, "reason": r}`` + ``"\\n"``; returns 0 (each of
-  the eight codes, and a real corrupted txt).
+  the nine codes, ``output_too_large`` included, and a real corrupted txt).
 - A malformed job (bad JSON, empty input, not an object, a missing or extra key, an unknown
   kind, a non-integer dpi) or any other exception (``MemoryError`` included): nothing on
   stdout, returns 1; dispatch never runs for a malformed job; an exception's message (a
@@ -22,8 +22,19 @@ process started by the runner. Pinned here, in process with ``BytesIO`` streams:
   the tree under test): a txt job converts end to end with exit status 0, and a malformed
   job exits with status 1 and writes nothing (``sys.exit(main(...))``).
 
-Every in-process test points ``OOM_SCORE_ADJ_PATH`` at a tmp file, so no test touches the
-real ``/proc`` entry of the test runner. New modules are imported inside the tests.
+- Self-limits (contract §12.6, process L-3): right after the OOM-score write and before the
+  job is read, ``resource.setrlimit(RLIMIT_CPU, (CPU_LIMIT_S, CPU_LIMIT_S))`` and
+  ``resource.setrlimit(RLIMIT_AS, (ADDRESS_SPACE_BYTES, ADDRESS_SPACE_BYTES))``
+  (``CPU_LIMIT_S == 130``, ``ADDRESS_SPACE_BYTES == 2 GiB``), for a valid and a malformed
+  job alike; each only when the current hard limit allows it (an unlimited or an equal
+  hard limit does; a lower one is never raised: that limit is skipped, the other still
+  set); a ValueError / OSError of either call is ignored and the job converts. A real
+  child (``main`` with a malformed job) ends with ``RLIMIT_CPU == (130, 130)``.
+
+Every in-process test points ``OOM_SCORE_ADJ_PATH`` at a tmp file and replaces
+``resource.getrlimit`` / ``resource.setrlimit`` with a recorder, so no test touches the
+real ``/proc`` entry or the limits of the test runner. New modules are imported inside
+the tests.
 """
 
 from __future__ import annotations
@@ -34,8 +45,10 @@ import inspect
 import io
 import json
 import os
+import resource
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -57,9 +70,13 @@ _REASONS: Final = (
     "archive_too_large",
     "image_too_large",
     "text_too_large",
+    "output_too_large",
     "conversion_timeout",
     "processing_error",
 )
+
+_CPU_LIMIT_S: Final = 130
+_ADDRESS_SPACE_BYTES: Final = 2 * 1024**3
 
 # A path and a file name an unexpected error message might carry.
 _SECRET_PATH: Final = "/srv/admino/attachments/7f1e/Gehaltsliste-Vertraulich-2026.xlsx"
@@ -149,9 +166,55 @@ def oom_path(tmp_path: Path) -> Path:
     return path
 
 
+@dataclass
+class _Limits:
+    """Stands in for resource.getrlimit / resource.setrlimit: the limits are never applied
+    to the test runner. ``hard`` is what getrlimit reports per resource (unlimited when
+    absent); ``raises`` makes the named call raise. Each setrlimit call is recorded with
+    what the OOM file held and whether the job had been read at that moment."""
+
+    oom_path: Path
+    hard: dict[int, int] = field(default_factory=dict)
+    raises: dict[str, BaseException] = field(default_factory=dict)
+    stdin_read: bool = False
+    lookups: list[int] = field(default_factory=list)
+    calls: list[tuple[int, tuple[int, int]]] = field(default_factory=list)
+    moments: list[tuple[str, bool]] = field(default_factory=list)
+
+    def getrlimit(self, which: int) -> tuple[int, int]:
+        self.lookups.append(which)
+        if "getrlimit" in self.raises:
+            raise self.raises["getrlimit"]
+        hard = self.hard.get(which, resource.RLIM_INFINITY)
+        return (hard, hard)
+
+    def setrlimit(self, which: int, limits: tuple[int, int]) -> None:
+        self.calls.append((which, tuple(limits)))  # type: ignore[arg-type]
+        self.moments.append((self.oom_path.read_text(encoding="ascii"), self.stdin_read))
+        if "setrlimit" in self.raises:
+            raise self.raises["setrlimit"]
+
+
 @pytest.fixture
-def worker(monkeypatch: pytest.MonkeyPatch, oom_path: Path) -> ModuleType:
-    """The worker module with OOM_SCORE_ADJ_PATH pointed at the tmp stand-in."""
+def limits(monkeypatch: pytest.MonkeyPatch, oom_path: Path) -> _Limits:
+    """The rlimit recorder, installed on ``resource`` and on any reference the worker
+    module holds to the two functions."""
+    recorder = _Limits(oom_path=oom_path)
+    module = _worker()
+    originals = {"getrlimit": resource.getrlimit, "setrlimit": resource.setrlimit}
+    for name, original in originals.items():
+        monkeypatch.setattr(resource, name, getattr(recorder, name))
+        for attribute, value in list(vars(module).items()):
+            if value is original:
+                monkeypatch.setattr(module, attribute, getattr(recorder, name))
+    return recorder
+
+
+@pytest.fixture
+def worker(monkeypatch: pytest.MonkeyPatch, oom_path: Path, limits: _Limits) -> ModuleType:
+    """The worker module with OOM_SCORE_ADJ_PATH pointed at the tmp stand-in and the
+    rlimit calls recorded instead of applied (GH-188 §12.6: main limits its own
+    process, which in process is the test runner)."""
     module = _worker()
     monkeypatch.setattr(module, "OOM_SCORE_ADJ_PATH", oom_path)
     return module
@@ -217,7 +280,8 @@ def test_converters_worker_job_fields_reach_dispatch_and_manifest_numbers_are_re
 def test_converters_worker_conversion_error_reported_as_its_reason(
     worker: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reason: str
 ) -> None:
-    """ConversionError(r) -> {"ok": false, "reason": r} on one line, exit 0."""
+    """ConversionError(r) -> {"ok": false, "reason": r} on one line, exit 0 (each of the
+    nine codes)."""
     common = _common()
 
     def failing(*args: object, **kwargs: object) -> Any:
@@ -379,6 +443,188 @@ def test_converters_worker_unusable_oom_path_is_ignored(
     assert _one_line(output) == {"ok": True, "page_count": None, "token_estimate": 5}
     if case == "read-only-file":
         assert target.read_text(encoding="ascii") == "0"
+
+
+# ---------------------------------------------------------------------------
+# Self-limits: CPU time and address space (contract §12.6)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStdin(io.BytesIO):
+    """The job stream; marks the recorder the first time the job is read."""
+
+    def __init__(self, data: bytes, limits: _Limits) -> None:
+        super().__init__(data)
+        self._limits = limits
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        self._limits.stdin_read = True
+        return super().read(size)
+
+    def read1(self, size: int = -1, /) -> bytes:
+        self._limits.stdin_read = True
+        return super().read1(size)
+
+    def readline(self, size: int | None = -1, /) -> bytes:
+        self._limits.stdin_read = True
+        return super().readline(size)
+
+
+def test_converters_worker_limit_constants_pinned() -> None:
+    """CPU_LIMIT_S is 130 (s, above the runner's 120 s timeout); ADDRESS_SPACE_BYTES is
+    2 GiB."""
+    worker = _worker()
+
+    assert (
+        (type(worker.CPU_LIMIT_S), worker.CPU_LIMIT_S),
+        (type(worker.ADDRESS_SPACE_BYTES), worker.ADDRESS_SPACE_BYTES),
+    ) == ((int, _CPU_LIMIT_S), (int, _ADDRESS_SPACE_BYTES))
+
+
+@pytest.mark.parametrize("job", ["valid", "malformed"])
+def test_converters_worker_limits_set_after_the_oom_write_before_the_job_is_read(
+    worker: ModuleType,
+    limits: _Limits,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    job: str,
+) -> None:
+    """With unlimited hard limits: RLIMIT_CPU (130, 130) and RLIMIT_AS (2 GiB, 2 GiB), each
+    set once, when the OOM file already holds 1000 and the job hasn't been read yet (a
+    malformed job is limited too)."""
+    _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest())
+    stdin = _encode(_job(tmp_path)) if job == "valid" else b"{"
+
+    code = worker.main(_RecordingStdin(stdin, limits), io.BytesIO())
+
+    assert code == (0 if job == "valid" else 1)
+    assert sorted(limits.calls) == sorted(
+        [
+            (resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S)),
+            (resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES)),
+        ]
+    )
+    assert [(oom.strip(), read) for oom, read in limits.moments] == [("1000", False)] * 2
+
+
+@pytest.mark.parametrize(
+    ("hard", "expected"),
+    [
+        pytest.param(
+            {resource.RLIMIT_CPU: 60},
+            [(resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES))],
+            id="lower-cpu-hard-limit-kept",
+        ),
+        pytest.param(
+            {resource.RLIMIT_AS: 1024**3},
+            [(resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S))],
+            id="lower-address-space-hard-limit-kept",
+        ),
+        pytest.param(
+            {resource.RLIMIT_CPU: _CPU_LIMIT_S, resource.RLIMIT_AS: _ADDRESS_SPACE_BYTES},
+            [
+                (resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S)),
+                (resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES)),
+            ],
+            id="equal-hard-limits-set",
+        ),
+    ],
+)
+def test_converters_worker_limit_set_only_when_the_hard_limit_allows_it(
+    worker: ModuleType,
+    limits: _Limits,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    hard: dict[int, int],
+    expected: list[tuple[int, tuple[int, int]]],
+) -> None:
+    """A hard limit lower than ours is never raised: that setrlimit is skipped, the other
+    one still made; a hard limit equal to ours allows it. The job converts either way."""
+    limits.hard.update(hard)
+    _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest(None, 5))
+
+    code, output = _run(worker, _encode(_job(tmp_path)))
+
+    assert sorted(limits.calls) == sorted(expected)
+    assert (code, _one_line(output)) == (
+        0,
+        {"ok": True, "page_count": None, "token_estimate": 5},
+    )
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ValueError("current limit exceeds maximum limit"), id="value-error"),
+        pytest.param(OSError(1, "Operation not permitted"), id="os-error"),
+    ],
+)
+def test_converters_worker_setrlimit_errors_are_ignored(
+    worker: ModuleType,
+    limits: _Limits,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: BaseException,
+) -> None:
+    """A ValueError (macOS refuses RLIMIT_AS) or an OSError from setrlimit is ignored: the
+    job still converts, and the failing call doesn't stop the other one being tried."""
+    limits.raises["setrlimit"] = error
+    _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest(None, 5))
+
+    code, output = _run(worker, _encode(_job(tmp_path)))
+
+    assert sorted(which for which, _ in limits.calls) == sorted(
+        [resource.RLIMIT_CPU, resource.RLIMIT_AS]
+    )
+    assert (code, _one_line(output)) == (
+        0,
+        {"ok": True, "page_count": None, "token_estimate": 5},
+    )
+
+
+def test_converters_worker_getrlimit_error_is_ignored(
+    worker: ModuleType, limits: _Limits, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An OSError from getrlimit is ignored: the job still converts (and the limits were
+    looked up: this isn't a worker that never asks)."""
+    limits.raises["getrlimit"] = OSError(22, "Invalid argument")
+    _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest(None, 5))
+
+    code, output = _run(worker, _encode(_job(tmp_path)))
+
+    assert (code, _one_line(output), limits.lookups != []) == (
+        0,
+        {"ok": True, "page_count": None, "token_estimate": 5},
+        True,
+    )
+
+
+# A real child runs main() with a malformed job, then reports its exit code and the CPU
+# limit it ended with (the limit is set before the job is read).
+_LIMITS_PROBE: Final = (
+    "import io, json, resource\n"
+    "from admino.converters import worker\n"
+    "code = worker.main(io.BytesIO(b'{'), io.BytesIO())\n"
+    "print(json.dumps([code, list(resource.getrlimit(resource.RLIMIT_CPU))]))\n"
+)
+
+
+def test_converters_worker_real_child_ends_with_the_cpu_limit() -> None:
+    """In a real process (not the test runner), main() leaves RLIMIT_CPU at (130, 130),
+    even for a malformed job."""
+    # A fixed argv (this interpreter, a constant probe); no shell.
+    completed = subprocess.run(  # noqa: S603
+        [sys.executable, "-P", "-s", "-c", _LIMITS_PROBE],
+        capture_output=True,
+        env={"PYTHONPATH": _SRC},
+        timeout=120,
+        check=False,
+    )
+
+    assert (completed.returncode, json.loads(completed.stdout)) == (
+        0,
+        [1, [_CPU_LIMIT_S, _CPU_LIMIT_S]],
+    )
 
 
 # ---------------------------------------------------------------------------
