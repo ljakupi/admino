@@ -29,7 +29,7 @@ What is pinned:
   ChatResponse otherwise (no header, ``*/*``, ``application/json``,
   ``text/html``, ``q=0``). The legacy POST /api/message stays JSON. The stream
   is a 200 with ``text/event-stream; charset=utf-8``, ``cache-control:
-  no-cache`` and ``x-accel-buffering: no``.
+  no-store`` (GH-278) and ``x-accel-buffering: no``.
 - The agent call (C3): a JSON request passes exactly today's keywords (no
   ``stream``); a streamed turn or approval passes an ``admino.streaming.RunStream``
   whose ``stop`` is not set.
@@ -967,7 +967,7 @@ def test_chat_stream_response_headers_on_both_routes(
     world: World, client: TestClient, script: _Script
 ) -> None:
     """A streamed turn and a streamed approval: 200, ``text/event-stream; charset=utf-8``,
-    ``cache-control: no-cache``, ``x-accel-buffering: no``."""
+    ``cache-control: no-store`` (GH-278), ``x-accel-buffering: no``."""
     editor = world.a["editor"]
     chat_id = _chat(world.db, editor)
     script.queue(_reply(ask=_PENDING_CALL))
@@ -982,7 +982,7 @@ def test_chat_stream_response_headers_on_both_routes(
             headers.get("content-type"),
             headers.get("cache-control"),
             headers.get("x-accel-buffering"),
-        ) == ("text/event-stream; charset=utf-8", "no-cache", "no")
+        ) == ("text/event-stream; charset=utf-8", "no-store", "no")
 
 
 # ---------------------------------------------------------------------------

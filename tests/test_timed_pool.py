@@ -23,6 +23,13 @@ Pinned here:
   ``asyncpg.create_pool`` made (still called with exactly ``(url,
   min_size=..., max_size=...)``), ``get_pool()`` returns it and
   ``close_pool()`` closes the inner pool.
+- GH-278 Decision 4: ``acquire(*, timeout=None)`` passes ``timeout=timeout``
+  to the inner pool's ``acquire`` like asyncpg's ``Pool.acquire`` (``None``
+  included: given explicitly or left out, the inner pool gets ``None``); it is
+  still used as ``async with pool.acquire(...) as conn`` and the connection's
+  statements are still timed; a ``TimeoutError`` from the inner acquire
+  propagates unchanged and counts no statement; over the FakeDb pool (whose
+  ``acquire`` takes the same keyword) ``acquire(timeout=1.0)`` works.
 
 The record is opened the production way: ``request_timing.TimingMiddleware``
 around a tiny ASGI app on ``POST /api/message`` that runs the statements before
@@ -72,6 +79,9 @@ _FAKE_DB_STATEMENTS: Final[dict[str, tuple[str, tuple[Any, ...]]]] = {
 _CANARY_SQL: Final = "SELECT 'sqlcanary4410' AS marker WHERE $1 = $2"
 _CANARY_ARG: Final = "argcanary7302"
 _CANARY_RESULT: Final = "resultcanary1185"
+# What _StubPool.acquire records when no ``timeout`` keyword reached it (GH-278 D4: the
+# wrapper always passes one, None included, so this must never be recorded).
+_NOT_PASSED: Final = "<timeout not passed>"
 
 
 # ---------------------------------------------------------------------------
@@ -153,17 +163,30 @@ class _StubConnection(_StubTarget):
 
 
 class _StubPool(_StubTarget):
-    """A pool: acquiring waits 30 ms and the release (connection reset) takes 30 ms."""
+    """A pool: acquiring waits 30 ms and the release (connection reset) takes 30 ms.
+
+    ``acquire`` takes asyncpg's keyword-only ``timeout`` and records what it got in
+    ``acquire_timeouts`` (``_NOT_PASSED`` when the keyword was left out, so an
+    explicit ``None`` is told apart); ``acquire_error``, when set, is raised after
+    the wait, before any connection is handed out (asyncpg's acquire timing out).
+    """
 
     def __init__(self, clock: _Clock) -> None:
         super().__init__(clock)
         self.conn = _StubConnection(clock)
         self.closed = 0
         self.terminated = 0
+        self.acquire_timeouts: list[object] = []
+        self.acquire_error: BaseException | None = None
 
     @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[_StubConnection]:
+    async def acquire(
+        self, *, timeout: float | None | str = _NOT_PASSED
+    ) -> AsyncIterator[_StubConnection]:
+        self.acquire_timeouts.append(timeout)
         self.clock.advance(30)  # waiting for a free connection
+        if self.acquire_error is not None:
+            raise self.acquire_error
         yield self.conn
         self.clock.advance(30)  # asyncpg's reset on release
 
@@ -594,3 +617,99 @@ async def test_close_pool_closes_the_inner_pool_of_the_timed_pool(
     assert stub.closed == 1
     with pytest.raises(RuntimeError, match="not initialised"):
         database.get_pool()
+
+
+# ===========================================================================
+# 5. acquire(timeout=...) (GH-278 Decision 4)
+# ===========================================================================
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "inner_got"),
+    [
+        pytest.param({"timeout": 2.5}, 2.5, id="timeout-2.5"),
+        pytest.param({"timeout": None}, None, id="explicit-none"),
+        pytest.param({}, None, id="omitted"),
+    ],
+)
+async def test_timed_pool_acquire_passes_the_timeout_to_the_inner_pool(
+    rt: Any,
+    stub: _StubPool,
+    caplog: pytest.LogCaptureFixture,
+    kwargs: dict[str, Any],
+    inner_got: float | None,
+) -> None:
+    """Like asyncpg's ``Pool.acquire``: the inner acquire gets ``timeout=`` (None when the
+    caller gives none); the connection's statement is still timed (acquire 30 ms, one
+    5 ms statement, release 30 ms: 1 statement, 5 ms)."""
+    stub.conn.durations_ms["fetchval"] = 5.0
+    timed = _timed(stub)
+    got: list[Any] = []
+
+    async def body() -> None:
+        async with timed.acquire(**kwargs) as conn:
+            got.append(await conn.fetchval("SELECT 1"))
+
+    await _in_record(rt, body)
+
+    assert stub.acquire_timeouts == [inner_got]
+    assert (stub.conn.calls, got[0] is stub.conn.results["fetchval"]) == (
+        [("fetchval", ("SELECT 1",), {})],
+        True,
+    )
+    assert _db_fields(caplog) == [("1", "5.0")]
+
+
+async def test_timed_pool_acquire_timeout_error_propagates_unchanged_and_counts_no_statement(
+    rt: Any, stub: _StubPool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The inner acquire times out: the very same ``TimeoutError`` reaches the caller, the
+    body never runs, and the wait is no statement."""
+    error = TimeoutError()
+    stub.acquire_error = error
+    timed = _timed(stub)
+    raised: list[BaseException] = []
+    entered: list[bool] = []
+
+    async def body() -> None:
+        try:
+            async with timed.acquire(timeout=0.5) as conn:
+                entered.append(True)
+                await conn.fetchval("SELECT 1")
+        except TimeoutError as exc:
+            raised.append(exc)
+
+    await _in_record(rt, body)
+
+    assert stub.acquire_timeouts == [0.5]
+    assert (len(raised), raised[0] is error if raised else None, entered) == (1, True, [])
+    assert stub.conn.calls == []
+    assert _db_fields(caplog) == [("0", "0.0")]
+
+
+async def test_timed_pool_fake_db_acquire_with_a_timeout_times_the_connection(
+    rt: Any, fake_db: _TimedFakeDb, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Over the FakeDb pool (its ``acquire`` takes the same keyword): ``acquire(timeout=1.0)``
+    yields a connection whose statement runs on it and is timed (7 ms)."""
+    db = fake_db.db
+    org_id = next(iter(db.orgs))
+    timed = _timed(db.pool)
+    got: list[Any] = []
+
+    async def body() -> None:
+        async with timed.acquire(timeout=1.0) as conn:
+            got.append(await conn.fetchval(_SELECT_NAME, org_id))
+
+    await _in_record(rt, body)
+
+    call = db.calls[-1]
+    assert (len(db.calls), call.method, call.sql, call.args) == (
+        1,
+        "fetchval",
+        _SELECT_NAME,
+        (org_id,),
+    )
+    assert call.via.startswith("conn-")
+    assert got[0] is fake_db.returned[0]
+    assert _db_fields(caplog) == [("1", "7.0")]

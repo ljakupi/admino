@@ -5374,7 +5374,12 @@ class FakeConnection:
 
 
 class FakePool:
-    """The pool: statements run outside any transaction; acquire() yields a connection."""
+    """The pool: statements run outside any transaction; acquire() yields a connection.
+
+    ``acquire`` takes the keyword-only ``timeout`` of asyncpg's ``Pool.acquire``
+    (GH-278 Decision 4: ``database.TimedPool.acquire`` always passes it, ``None``
+    included); the fake never waits for a free connection, so it is ignored.
+    """
 
     def __init__(self, db: FakeDb) -> None:
         self._db = db
@@ -5392,5 +5397,5 @@ class FakePool:
         return self._db.handle("fetch", sql, args, "pool", None)
 
     @asynccontextmanager
-    async def acquire(self) -> AsyncIterator[FakeConnection]:
+    async def acquire(self, *, timeout: float | None = None) -> AsyncIterator[FakeConnection]:
         yield self._db.new_connection()
