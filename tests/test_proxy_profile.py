@@ -26,8 +26,11 @@ Caddy's internal CA) in front of a stub upstream with the network alias ``agent`
   encoded, keeps its content type, and its frames, written 1.5 s apart, arrive one
   by one in order. Its first frame is larger than Caddy's 512-byte minimum length,
   so an unguarded ``encode`` would compress it.
-Without Docker the part is skipped with its reason (decision 6: the proxy test
-needs Docker, so it runs on demand).
+Without ``ADMINO_DOCKER_TESTS=1`` (``make check``, CI) the part is skipped with
+its reason (decision 6: the proxy test needs Docker, so it runs on demand). With
+it, a missing docker CLI or a daemon that doesn't answer ``docker info`` fails
+the part with a message saying ``make test-proxy`` needs Docker (GH-278
+decision 7), so ``make test-proxy`` never passes on skips.
 
 Security notes:
 - Every Docker object is named ``admino-gh244-proxy-<random>`` and removed in the
@@ -234,6 +237,8 @@ def test_proxy_profile_caddyfile_hardening_kept(guard: str) -> None:
 # ---------------------------------------------------------------------------
 
 _DOCKER_ENV = "ADMINO_DOCKER_TESTS"
+# How long `docker info` may take before the daemon counts as not answering.
+_DOCKER_INFO_TIMEOUT_S = 60
 _CADDY_IMAGE = "caddy:2.11.4-alpine"
 _PYTHON_IMAGE = "python:3.12.8-slim"
 _NAME_PREFIX = "admino-gh244-proxy-"
@@ -378,21 +383,39 @@ def _docker_quiet(*args: str) -> None:
     )
 
 
-def _docker_skip_reason() -> str | None:
-    """Why the Docker part can't run here, or None when it can."""
+def _require_docker() -> None:
+    """Skip the Docker part unless it was asked for; once asked for, fail without Docker.
+
+    Without ``ADMINO_DOCKER_TESTS=1`` (``make check``, CI) the tests skip with the
+    on-demand reason, and Docker isn't probed. With it (``make test-proxy``), a
+    missing docker CLI or a daemon that doesn't answer ``docker info`` fails the
+    test, so ``make test-proxy`` exits non-zero instead of passing with skips.
+    """
     if os.environ.get(_DOCKER_ENV) != "1":
-        return f"Docker proxy test runs on demand: set {_DOCKER_ENV}=1 (make test-proxy)"
+        pytest.skip(f"Docker proxy test runs on demand: set {_DOCKER_ENV}=1 (make test-proxy)")
+    # pytrace=False: the operator sees what is missing, not this function's traceback.
     if shutil.which("docker") is None:
-        return "Docker proxy test needs the docker CLI"
-    info = subprocess.run(  # noqa: S603
-        ["docker", "info"],  # noqa: S607
-        capture_output=True,
-        timeout=60,
-        check=False,
-    )
+        pytest.fail("make test-proxy needs Docker: the docker CLI isn't on PATH", pytrace=False)
+    try:
+        info = subprocess.run(  # noqa: S603
+            ["docker", "info"],  # noqa: S607
+            capture_output=True,
+            timeout=_DOCKER_INFO_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail(
+            "make test-proxy needs Docker: the daemon didn't answer docker info "
+            f"in {_DOCKER_INFO_TIMEOUT_S} s",
+            pytrace=False,
+        )
     if info.returncode != 0:
-        return "Docker proxy test needs a running Docker daemon (docker info failed)"
-    return None
+        # Its output (host details, contexts, paths) isn't echoed; the status says it failed.
+        pytest.fail(
+            f"make test-proxy needs Docker: docker info exited with status {info.returncode} "
+            "(no running daemon this user can reach)",
+            pytrace=False,
+        )
 
 
 def _free_port() -> int:
@@ -438,9 +461,7 @@ def _wait_ready(base_url: str, names: list[str]) -> None:
 @pytest.fixture(scope="module")
 def proxy(tmp_path_factory: pytest.TempPathFactory) -> Iterator[_Proxy]:
     """Caddy (the repo's Caddyfile) in front of the stub upstream, removed afterwards."""
-    reason = _docker_skip_reason()
-    if reason is not None:
-        pytest.skip(reason)
+    _require_docker()
 
     srv = tmp_path_factory.mktemp("gh244-proxy-upstream").resolve()
     (srv / "upstream.py").write_text(_UPSTREAM_PY, encoding="utf-8")
