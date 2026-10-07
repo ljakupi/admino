@@ -11,8 +11,10 @@ filter returns rows it must not.
 What these tests pin down (contract §2; GH-266 contract §2):
 - Surface: the thirteen coroutine functions with the contract's keyword-only
   parameters (``get_or_create_legacy_chat``'s ``chat_id`` required, no
-  default); ``list_messages`` and ``latest_message_status`` no longer exist
-  (GH-266: their only caller was the detail route); ``ChatNotFoundError`` is a
+  default; GH-187: ``append_messages`` takes ``attachment_ids``, specified in
+  tests/test_chats_attachments.py); ``list_messages`` and
+  ``latest_message_status`` no longer exist (GH-266: their only caller was the
+  detail route); ``ChatNotFoundError`` is a
   ``LookupError``, ``InvalidCursorError`` a ``ValueError``; ``ChatRecord`` /
   ``MessageRecord`` / ``ChatDetail`` carry exactly the contract's fields and
   are frozen; every ``json.dumps`` in the module passes ``allow_nan=False``
@@ -214,7 +216,7 @@ _SIGNATURES: Final[dict[str, tuple[int, set[str]]]] = {
     "list_chats": (2, {"limit", "cursor"}),
     "rename_chat": (4, set()),
     "trash_chat": (3, {"ip"}),
-    "append_messages": (4, {"final_status", "tool_calls"}),
+    "append_messages": (4, {"final_status", "tool_calls", "attachment_ids"}),
     "load_recent_history": (3, {"limit"}),
     "read_chat_detail": (3, {"limit", "cursor"}),
     "append_org_notice": (3, set()),

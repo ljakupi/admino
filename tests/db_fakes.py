@@ -1,9 +1,9 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-176).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-187).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
 platform_settings, org_settings, user_settings, permissions, oauth_tokens,
-memory, chats and chat_messages tables behind a pool-shaped
+memory, chats, chat_messages and attachments tables behind a pool-shaped
 object (``FakeDb.pool``). The real ``admino.auth``, ``admino.sessions``,
 ``admino.session_management``, ``admino.password_reset``,
 ``admino.invitations``, ``admino.organizations``, ``admino.email_outbox``,
@@ -264,6 +264,95 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   ``messages_of(chat_id)`` (by seq, the JSONB columns as Python values) read
   copies back. ``add_account(user_id=...)`` gives an account a fixed id.
 
+Attachments (GH-187, migration 0027):
+- ``attachments`` (``attachments``, keyed by id, insertion order): ``id`` (UUID
+  primary key, NO default: the app generates it, so an INSERT without it is a
+  NotNullViolationError), ``org_id`` (UUID NOT NULL, references organizations
+  ON DELETE CASCADE), ``chat_id`` and ``owner_user_id`` (UUID NOT NULL),
+  ``message_id`` (UUID; NULL: not sent yet; references chat_messages (id) ON
+  DELETE CASCADE), ``filename`` (TEXT NOT NULL; ``attachments_filename_check``:
+  1 to ``ATTACHMENT_FILENAME_MAX`` characters and none of U+0000 to U+001F,
+  U+007F to U+009F, ``/`` or ``\\``, which is ``!~ '[[:cntrl:]/\\\\]'`` on
+  postgres:16-alpine's en_US.utf8, verified: U+2028 / U+2029 / U+200B pass),
+  ``kind`` (TEXT NOT NULL, one of ``ATTACHMENT_KINDS``), ``size_bytes``
+  (BIGINT NOT NULL, 1 to ``ATTACHMENT_SIZE_MAX``), ``status`` (TEXT NOT NULL,
+  default 'uploaded', one of ``ATTACHMENT_STATUSES``), ``failure_reason``
+  (TEXT; set exactly when status is 'failed', and then fully matching
+  ``FAILURE_REASON_RE``: no trailing newline), ``page_count`` (INTEGER, NULL
+  or >= 0), ``created_at`` and ``updated_at`` (NOT NULL, default now()) and
+  ``deleted_at`` (NULL: live; set: trashed).
+- Checked like the chat tables, with asyncpg's exception classes and in
+  PostgreSQL's order: the bind values through asyncpg's encoders (DataError: a
+  non-int size_bytes or page_count, one outside int64 / int32, a str that isn't
+  a UUID, a naive datetime, ...), TEXT's U+0000 (CharacterNotInRepertoireError),
+  NOT NULL in column order, the CHECKs in alphabetical order of their names
+  (failure_reason, filename, kind, page_count, size_bytes, status; verified on
+  postgres:16) with the "Failing row contains (...)" detail (the filename in
+  it, as the driver's), the primary key (UniqueViolationError), then the
+  foreign keys in creation order: ``attachments_org_id_fkey``,
+  ``attachments_message_id_fkey`` (NULL passes) and ``ATTACHMENT_CHAT_FKEY``,
+  the composite (chat_id, org_id, owner_user_id) -> chats (id, org_id,
+  owner_user_id) of migration 0027's ``chats_id_org_owner_key``: another org's
+  chat, another owner's chat and an unknown chat are ForeignKeyViolationError
+  (the detail names the parent table, no key values); a trashed chat still
+  matches.
+- Cascades: deleting a users row (its chats), a chats row or an organizations
+  row (the reader's DELETE and the ``purge_org_audit_events`` emulation)
+  deletes the attachments of those chats and of that org; deleting a
+  chat_messages row (only through its chat or org: admino_app can't DELETE
+  chat_messages) deletes the attachments naming it. ``conn.transaction()``
+  snapshots and restores the table.
+- Grants (admino_app, migration 0027): SELECT, INSERT and DELETE; an UPDATE may
+  SET only ``ATTACHMENT_UPDATE_COLUMNS`` (message_id, status, failure_reason,
+  page_count, updated_at, deleted_at). Naming id, org_id, chat_id,
+  owner_user_id, filename, kind, size_bytes or created_at (also in a
+  row-constructor piece) is InsufficientPrivilegeError "permission denied for
+  table attachments", raised before the statement runs (nothing changes).
+- Every statement naming attachments runs on the SQL reader after the
+  chat-table bind checks (argument count, ``$n`` gaps, encoders, U+0000,
+  grants). Reader features for the contract §2 forms (A1 to A11, P1 to P5, G1
+  to G3):
+  - ``col = ANY($n::uuid[])`` (and ``<>``) in a WHERE: the parameter goes
+    through asyncpg's array encoder (a list, tuple or other sized iterable,
+    not a str, bytes or mapping, each element a UUID, a UUID str or None;
+    DataError otherwise). An empty array matches nothing; a NULL element or a
+    NULL left side never matches.
+  - ``FOR SHARE`` and ``FOR KEY SHARE`` (A2), like ``FOR UPDATE`` and ``FOR NO
+    KEY UPDATE`` (A3): recorded, no effect (the fake has no row locks); any of
+    them with an aggregate is FeatureNotSupportedError.
+  - ``sum(col)``: NULL over no rows. As on postgres:16, the sum of a BIGINT
+    column (size_bytes, chat_messages.seq, organizations.storage_quota_bytes)
+    is NUMERIC, so asyncpg returns a ``decimal.Decimal``; ``coalesce(sum(
+    size_bytes), 0)`` (A4, A7) is ``Decimal(0)`` over no rows and the Decimal
+    total otherwise (equal to the int, but not an int: callers convert). Any
+    other sum is an int. ``count(*)`` is an int.
+  - An unaliased ``coalesce(<aggregate>, ...)`` select item is named
+    "coalesce", as in PostgreSQL.
+  - A SELECT on attachments without ORDER BY answers newest-first, like the
+    chat tables (PostgreSQL promises no order); ``ORDER BY created_at, id``
+    (P5, G1) sorts by both. ``UPDATE ... RETURNING`` gives the new values (P1),
+    ``DELETE ... RETURNING`` the deleted rows (G2); ``now()`` in SET is the
+    statement's clock.
+  - A1 and A3 run on the reader like every SELECT whose main table is
+    organizations (so ``after_org_lookup`` fires for them too). ``add_org``
+    creates an org with ``storage_quota_bytes`` 0: under the contract's
+    ``used + size > quota`` every upload is refused until a test sets a quota
+    (``add_org(org_id, storage_quota_bytes=...)``).
+- The audit action catalog (``audit_events_action_check``, migration 0027): an
+  INSERT INTO audit_events whose action isn't in ``AUDIT_ACTIONS`` (migration
+  0021's catalog plus file.upload) is CheckViolationError, before the foreign
+  key; ``add_audit`` seeds any action.
+- Helpers: ``add_attachment(chat_id, *, attachment_id=None, filename='a.pdf',
+  kind='pdf', size_bytes=1, status='uploaded', failure_reason=None,
+  page_count=None, message_id=None, created_at=None, updated_at=None,
+  deleted_at=None)`` stores a row checked like an INSERT (org_id and
+  owner_user_id: the chat's, an unknown chat is ForeignKeyViolationError
+  ``ATTACHMENT_CHAT_FKEY``; attachment_id: a new uuid4; created_at: now;
+  updated_at: created_at) and returns its id (a plain uuid.UUID);
+  ``attachment_row(attachment_id)`` reads a copy back (None when there is
+  none) and ``attachments_of(chat_id)`` copies of a chat's rows, trashed ones
+  included, by created_at then id.
+
 The login throttle (GH-157):
 - ``throttle`` holds the login_throttle rows of migration 0012 (scope,
   subject, failures, window_started_at, locked_until, expires_at), one dict
@@ -459,6 +548,7 @@ import json
 import re
 import secrets
 import uuid
+from collections.abc import Iterable, Mapping, Sized
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -840,14 +930,34 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
         "status": "text",
         "created_at": "timestamptz",
     },
+    # GH-187 (migration 0027): size_bytes is a BIGINT, page_count an INTEGER (their
+    # encoders refuse values outside int64 / int32).
+    "attachments": {
+        "id": "uuid",
+        "org_id": "uuid",
+        "chat_id": "uuid",
+        "owner_user_id": "uuid",
+        "message_id": "uuid",
+        "filename": "text",
+        "kind": "text",
+        "size_bytes": "int8",
+        "status": "text",
+        "failure_reason": "text",
+        "page_count": "int4",
+        "created_at": "timestamptz",
+        "updated_at": "timestamptz",
+        "deleted_at": "timestamptz",
+    },
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
     "chats": frozenset({"legacy_session_id", "deleted_at"}),
     "chat_messages": frozenset({"tool_use_blocks", "tool_call_id", "tool_calls"}),
+    "attachments": frozenset({"message_id", "failure_reason", "page_count", "deleted_at"}),
 }
+# The tables of the chat family: chats, chat_messages and (GH-187) attachments.
 _CHAT_TABLES: Final = frozenset(_CHAT_TYPES)
-# A statement that names either chat table (on the SQL with its literals blanked).
-_CHAT_TABLE_RE: Final = re.compile(r"\b(?:chats|chat_messages)\b")
+# A statement that names a chat-family table (on the SQL with its literals blanked).
+_CHAT_TABLE_RE: Final = re.compile(r"\b(?:chats|chat_messages|attachments)\b")
 CHAT_TITLE_MAX: Final = 200
 CHAT_CONTENT_MAX: Final = 65536
 CHAT_TOOL_CALLS_MAX: Final = 50
@@ -870,8 +980,32 @@ CHAT_EXTERNAL_CONTENT_RESET: Final = "chats.external_content can't be reset"
 # users (id, org_id) that ties a chat's owner to the chat's org (the only chats ->
 # users key: it replaced 0024's chats_owner_user_id_fkey).
 CHAT_OWNER_FKEY: Final = "chats_owner_org_fkey"
-# An UPDATE of chats (normalized SQL), whose SET 0025's column grant limits.
-_CHATS_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?chats\b")
+# GH-187 (migration 0027): the attachments CHECKs, the composite foreign key to the
+# chat (and its owner and org), and the only columns admino_app may UPDATE.
+ATTACHMENT_KINDS: Final = frozenset(
+    {"pdf", "docx", "xlsx", "csv", "txt", "md", "png", "jpeg", "webp"}
+)
+ATTACHMENT_STATUSES: Final = frozenset({"uploaded", "processing", "ready", "failed"})
+ATTACHMENT_FILENAME_MAX: Final = 255
+ATTACHMENT_SIZE_MAX: Final = 524_288_000
+# failure_reason ~ '^[a-z][a-z0-9_]{0,63}$', read the way PostgreSQL reads it (fullmatch).
+FAILURE_REASON_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
+# filename !~ '[[:cntrl:]/\\]' on postgres:16-alpine (en_US.utf8): C0, DEL and C1
+# controls, '/' and '\' (U+2028, U+2029, U+200B and U+00AD are not cntrl there).
+_FILENAME_REFUSED_RE: Final = re.compile(r"[\x00-\x1f\x7f-\x9f/\\]")
+ATTACHMENT_CHAT_FKEY: Final = "attachments_chat_fkey"
+ATTACHMENT_UPDATE_COLUMNS: Final = frozenset(
+    {"message_id", "status", "failure_reason", "page_count", "updated_at", "deleted_at"}
+)
+# The column grants an UPDATE of a chat-family table is limited to (migrations 0025
+# and 0027), and the UPDATE statements they apply to (normalized SQL).
+_UPDATE_GRANTS: Final[dict[str, frozenset[str]]] = {
+    "chats": CHAT_UPDATE_COLUMNS,
+    "attachments": ATTACHMENT_UPDATE_COLUMNS,
+}
+_GRANTED_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?(chats|attachments)\b")
+# The BIGINT columns the fake models: sum() of one is NUMERIC (a Decimal from asyncpg).
+_BIGINT_COLUMNS: Final = frozenset({"size_bytes", "seq", "storage_quota_bytes"})
 # What a ``$n::<type>`` cast tells about a bind parameter's type.
 _CAST_TYPES: Final[dict[str, str]] = {
     "uuid": "uuid",
@@ -906,6 +1040,7 @@ _COLUMNS: Final[dict[str, frozenset[str]]] = {
     "memory": _MEMORY_COLUMNS,
     "chats": frozenset(_CHAT_TYPES["chats"]),
     "chat_messages": frozenset(_CHAT_TYPES["chat_messages"]),
+    "attachments": frozenset(_CHAT_TYPES["attachments"]),
 }
 # The tables the SQL reader writes (INSERT, UPDATE, DELETE).
 _WRITABLE: Final = frozenset(
@@ -930,6 +1065,75 @@ _PURGE_ORG_AUDIT_RE: Final = re.compile(
 # DML the append-only trigger of audit_events refuses (everything but the purges).
 _AUDIT_REWRITE_RE: Final = re.compile(
     r"(?<![\w.])(?:delete from|update|truncate(?: table)?)(?: only)? (?:public\.)?audit_events\b"
+)
+# GH-187: audit_events_action_check as migration 0027 leaves it (0021's catalog plus
+# file.upload).
+AUDIT_ACTIONS: Final = frozenset(
+    {
+        "login.success",
+        "login.failure",
+        "login.lockout",
+        "password_reset.request",
+        "password_reset.complete",
+        "password.change",
+        "session.revoke",
+        "session.force_logout",
+        "invitation.create",
+        "invitation.revoke",
+        "invitation.accept",
+        "invitation.resend",
+        "invitation.refuse",
+        "user.role_change",
+        "user.activate",
+        "user.deactivate",
+        "user.delete",
+        "user.profile_change",
+        "project.share",
+        "project.unshare",
+        "project.member_role_change",
+        "project.transfer",
+        "project.delete",
+        "project.restore",
+        "chat.delete",
+        "chat.restore",
+        "file.upload",
+        "file.delete",
+        "file.restore",
+        "project.admin_access",
+        "export.create",
+        "org.settings_change",
+        "org.create",
+        "org.limits_change",
+        "org.deactivate",
+        "org.reactivate",
+        "org.deletion_schedule",
+        "org.deletion_cancel",
+        "org.purge",
+        "org.residency_change",
+        "platform.settings_change",
+        "model.registry_change",
+        "breakglass.start",
+        "breakglass.end",
+        "tool.call",
+        "audit.purge",
+        "org.permission_change",
+        "org.permission_promote",
+        "org.permission_promote_cancel",
+        "org.permission_demote",
+    }
+)
+# The audit_events columns in the migration's order (a CHECK error's failing row).
+_AUDIT_ROW_ORDER: Final = (
+    "id",
+    "occurred_at",
+    "org_id",
+    "actor_user_id",
+    "actor_kind",
+    "action",
+    "target_type",
+    "target_ids",
+    "ip",
+    "metadata",
 )
 
 
@@ -1095,6 +1299,8 @@ class FakeDb:
         self.chats: dict[uuid.UUID, dict[str, Any]] = {}
         self.chat_messages: dict[uuid.UUID, dict[str, Any]] = {}
         self.chat_seq = 0
+        # GH-187: the chats' attachments (migration 0027), keyed by id (insertion order).
+        self.attachments: dict[uuid.UUID, dict[str, Any]] = {}
         self.calls: list[Call] = []
         self.transactions: list[tuple[int, str]] = []
         self.open_transactions = 0
@@ -1712,6 +1918,77 @@ class FakeDb:
             for row in rows
         ]
 
+    def add_attachment(
+        self,
+        chat_id: uuid.UUID,
+        *,
+        attachment_id: uuid.UUID | None = None,
+        filename: str = "a.pdf",
+        kind: str = "pdf",
+        size_bytes: int = 1,
+        status: str = "uploaded",
+        failure_reason: str | None = None,
+        page_count: int | None = None,
+        message_id: uuid.UUID | None = None,
+        created_at: datetime | None = None,
+        updated_at: datetime | None = None,
+        deleted_at: datetime | None = None,
+    ) -> uuid.UUID:
+        """Store an attachments row (GH-187) as migration 0027 allows it; return its id.
+
+        ``org_id`` and ``owner_user_id`` are the chat's (a chat that doesn't
+        exist is a ForeignKeyViolationError on ``ATTACHMENT_CHAT_FKEY``).
+        ``attachment_id`` defaults to a new uuid4, ``created_at`` to now and
+        ``updated_at`` to ``created_at``. Every value is checked like an INSERT
+        (DataError, CharacterNotInRepertoireError, NotNull, the CHECKs, the
+        primary key, the foreign keys: ``message_id`` must name a stored
+        chat_messages row). Returns a plain uuid.UUID.
+        """
+        chat = (
+            self.chats.get(uuid.UUID(int=chat_id.int)) if isinstance(chat_id, uuid.UUID) else None
+        )
+        if chat is None:
+            raise _pg_error(
+                asyncpg.exceptions.ForeignKeyViolationError,
+                'insert or update on table "attachments" violates foreign key constraint'
+                f' "{ATTACHMENT_CHAT_FKEY}"',
+                table="attachments",
+                constraint=ATTACHMENT_CHAT_FKEY,
+                detail='Key is not present in table "chats".',
+            )
+        now = datetime.now(UTC)
+        created = created_at if created_at is not None else now
+        given: dict[str, Any] = {
+            "id": attachment_id if attachment_id is not None else uuid.uuid4(),
+            "org_id": chat["org_id"],
+            "chat_id": chat_id,
+            "owner_user_id": chat["owner_user_id"],
+            "message_id": message_id,
+            "filename": filename,
+            "kind": kind,
+            "size_bytes": size_bytes,
+            "status": status,
+            "failure_reason": failure_reason,
+            "page_count": page_count,
+            "created_at": created,
+            "updated_at": updated_at if updated_at is not None else created,
+            "deleted_at": deleted_at,
+        }
+        row = self.build_chat_row("attachments", given, now)
+        self.store_chat_row("attachments", row)
+        return uuid.UUID(int=row["id"].int)
+
+    def attachment_row(self, attachment_id: uuid.UUID) -> dict[str, Any] | None:
+        """A copy of a stored attachments row (GH-187), None when there is none."""
+        row = self.attachments.get(uuid.UUID(int=attachment_id.int))
+        return dict(row) if row is not None else None
+
+    def attachments_of(self, chat_id: uuid.UUID) -> list[dict[str, Any]]:
+        """Copies of a chat's attachments rows, trashed ones included, by created_at then id."""
+        wanted = uuid.UUID(int=chat_id.int)
+        rows = [dict(row) for row in self.attachments.values() if row["chat_id"] == wanted]
+        return sorted(rows, key=lambda row: (row["created_at"], row["id"]))
+
     def platform_row(self) -> dict[str, Any] | None:
         """The platform_settings row, if there is one."""
         return self.platform_settings[0] if self.platform_settings else None
@@ -1844,6 +2121,7 @@ class FakeDb:
                 "memory": self.memory,
                 "chats": self.chats,
                 "chat_messages": self.chat_messages,
+                "attachments": self.attachments,
             }
         )
 
@@ -1865,6 +2143,7 @@ class FakeDb:
         self.memory = state["memory"]
         self.chats = state["chats"]
         self.chat_messages = state["chat_messages"]
+        self.attachments = state["attachments"]
 
     def new_connection(self) -> FakeConnection:
         """A new connection on this database."""
@@ -2018,6 +2297,8 @@ class FakeDb:
             return list(self.chats.values())
         if table == "chat_messages":
             return list(self.chat_messages.values())
+        if table == "attachments":
+            return list(self.attachments.values())
         msg = f"the fake's SQL reader doesn't model table {table}"
         raise AssertionError(msg)
 
@@ -2339,13 +2620,14 @@ class FakeDb:
         *,
         pending: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """A new, checked chats / chat_messages row (an INSERT), not stored yet.
+        """A new, checked chats / chat_messages / attachments row (an INSERT), not stored yet.
 
         The given values go through asyncpg's encoders and the server's input
         functions first; then the column defaults fill the rest (chat_messages
         takes the next ``seq``, consumed even when a later check fails, as an
-        identity column's is); then every constraint runs. ``pending`` are the
-        rows the same statement adds before this one (their keys count).
+        identity column's is; attachments.id has no default, GH-187); then
+        every constraint runs. ``pending`` are the rows the same statement adds
+        before this one (their keys count).
         """
         if "seq" in given:
             raise _pg_error(
@@ -2365,6 +2647,9 @@ class FakeDb:
                 created_at=now,
                 last_activity_at=now,
             )
+        elif table == "attachments":
+            # GH-187 (migration 0027): no id default (the app names the file with it).
+            row.update(status="uploaded", created_at=now, updated_at=now)
         else:
             self.chat_seq += 1
             row.update(id=uuid.uuid4(), seq=self.chat_seq, status="complete", created_at=now)
@@ -2374,8 +2659,12 @@ class FakeDb:
 
     def store_chat_row(self, table: str, row: dict[str, Any]) -> None:
         """Store a new row built by ``build_chat_row``."""
-        target = self.chats if table == "chats" else self.chat_messages
-        target[row["id"]] = row
+        targets = {
+            "chats": self.chats,
+            "chat_messages": self.chat_messages,
+            "attachments": self.attachments,
+        }
+        targets[table][row["id"]] = row
 
     def check_chat_row(
         self,
@@ -2398,6 +2687,11 @@ class FakeDb:
         Each error carries the table, column or constraint name, and the
         CHECK / NOT NULL ones the "Failing row contains" detail (with content,
         as the driver's does).
+
+        attachments (GH-187, migration 0027): its six CHECKs (alphabetical, as
+        PostgreSQL runs them), the primary key, then ``attachments_org_id_fkey``,
+        ``attachments_message_id_fkey`` and ``ATTACHMENT_CHAT_FKEY`` (chat_id,
+        org_id, owner_user_id) -> chats (id, org_id, owner_user_id).
 
         Before all of these, on an UPDATE of chats, migration 0025's BEFORE
         UPDATE row trigger (GH-266): turning external_content from true to false
@@ -2432,6 +2726,26 @@ class FakeDb:
                 ),
                 ("chats_title_check", len(row["title"]) <= CHAT_TITLE_MAX),
                 ("chats_title_source_check", row["title_source"] in CHAT_TITLE_SOURCES),
+            ]
+        elif table == "attachments":
+            reason = row["failure_reason"]
+            filename = row["filename"]
+            page_count = row["page_count"]
+            rules = [
+                (
+                    "attachments_failure_reason_check",
+                    (row["status"] == "failed") == (reason is not None)
+                    and (reason is None or FAILURE_REASON_RE.fullmatch(reason) is not None),
+                ),
+                (
+                    "attachments_filename_check",
+                    1 <= len(filename) <= ATTACHMENT_FILENAME_MAX
+                    and _FILENAME_REFUSED_RE.search(filename) is None,
+                ),
+                ("attachments_kind_check", row["kind"] in ATTACHMENT_KINDS),
+                ("attachments_page_count_check", page_count is None or page_count >= 0),
+                ("attachments_size_bytes_check", 1 <= row["size_bytes"] <= ATTACHMENT_SIZE_MAX),
+                ("attachments_status_check", row["status"] in ATTACHMENT_STATUSES),
             ]
         else:
             blocks = row["tool_use_blocks"]
@@ -2511,6 +2825,28 @@ class FakeDb:
             foreign.append(
                 (CHAT_OWNER_FKEY, "users", owner is not None and owner["org_id"] == row["org_id"])
             )
+        elif table == "attachments":
+            # GH-187 (migration 0027): the column constraints first (creation order),
+            # then the composite key to the chat, its org and its owner (MATCH SIMPLE;
+            # every column is NOT NULL). A trashed chat is still a chats row.
+            message_id = row["message_id"]
+            chat = self.chats.get(row["chat_id"])
+            foreign.append(
+                (
+                    "attachments_message_id_fkey",
+                    "chat_messages",
+                    message_id is None or message_id in self.chat_messages,
+                )
+            )
+            foreign.append(
+                (
+                    ATTACHMENT_CHAT_FKEY,
+                    "chats",
+                    chat is not None
+                    and (chat["org_id"], chat["owner_user_id"])
+                    == (row["org_id"], row["owner_user_id"]),
+                )
+            )
         else:
             parent = self.chats.get(row["chat_id"])
             foreign.append(
@@ -2548,10 +2884,23 @@ class FakeDb:
             )
 
     def drop_chats(self, doomed: set[uuid.UUID]) -> None:
-        """Delete chats rows and, ON DELETE CASCADE, their messages."""
+        """Delete chats rows and, ON DELETE CASCADE, their messages and attachments."""
         self.chats = {key: row for key, row in self.chats.items() if key not in doomed}
+        self.drop_messages(
+            {key for key, row in self.chat_messages.items() if row["chat_id"] in doomed}
+        )
+        # GH-187: attachments_chat_fkey (chat_id, org_id, owner_user_id) cascades.
+        self.attachments = {
+            key: row for key, row in self.attachments.items() if row["chat_id"] not in doomed
+        }
+
+    def drop_messages(self, doomed: set[uuid.UUID]) -> None:
+        """Delete chat_messages rows and (GH-187) the attachments naming them (CASCADE)."""
         self.chat_messages = {
-            key: row for key, row in self.chat_messages.items() if row["chat_id"] not in doomed
+            key: row for key, row in self.chat_messages.items() if key not in doomed
+        }
+        self.attachments = {
+            key: row for key, row in self.attachments.items() if row["message_id"] not in doomed
         }
 
     def _check_throttle(
@@ -2758,9 +3107,10 @@ class FakeDb:
             raise asyncpg.exceptions.ForeignKeyViolationError(msg)
 
     def delete_row(self, table: str, row: dict[str, Any]) -> None:
-        """Delete one users, invitations, organizations, login_throttle, settings or chat
-        row; a user's rows (chats and their messages included) and an org's rows
-        cascade (ON DELETE CASCADE). Call ``check_delete`` first."""
+        """Delete one users, invitations, organizations, login_throttle, settings or
+        chat-family row; a user's rows (chats with their messages and attachments
+        included), an org's rows and a chat's or message's rows cascade (ON DELETE
+        CASCADE). Call ``check_delete`` first."""
         if table == "login_throttle":
             self.throttle = [other for other in self.throttle if other is not row]
             return
@@ -2788,9 +3138,13 @@ class FakeDb:
             self.drop_chats(
                 {key for key, chat in self.chats.items() if chat["org_id"] == row["id"]}
             )
-            self.chat_messages = {
+            self.drop_messages(
+                {key for key, value in self.chat_messages.items() if value["org_id"] == row["id"]}
+            )
+            # GH-187: attachments.org_id cascades too.
+            self.attachments = {
                 key: value
-                for key, value in self.chat_messages.items()
+                for key, value in self.attachments.items()
                 if value["org_id"] != row["id"]
             }
             return
@@ -2798,7 +3152,10 @@ class FakeDb:
             self.drop_chats({row["id"]})
             return
         if table == "chat_messages":
-            del self.chat_messages[row["id"]]
+            self.drop_messages({row["id"]})
+            return
+        if table == "attachments":
+            del self.attachments[row["id"]]
             return
         if table == "platform_settings":
             self.platform_settings = [other for other in self.platform_settings if other is not row]
@@ -2854,6 +3211,17 @@ class FakeDb:
         row["ip"] = None if row["ip"] is None else str(row["ip"])
         if self.fail_audit_when is not None and self.fail_audit_when(row):
             raise AuditWriteError("the audit write was refused")
+        if row.get("action") not in AUDIT_ACTIONS:
+            # GH-187: audit_events_action_check (migration 0027), before the foreign key.
+            failing = ", ".join(_pg_text(row.get(column)) for column in _AUDIT_ROW_ORDER)
+            raise _pg_error(
+                asyncpg.exceptions.CheckViolationError,
+                'new row for relation "audit_events" violates check constraint'
+                ' "audit_events_action_check"',
+                table="audit_events",
+                constraint="audit_events_action_check",
+                detail=f"Failing row contains ({failing}).",
+            )
         org_id = row.get("org_id")
         if org_id is not None and _canonical(org_id) not in self.orgs:
             msg = 'insert or update on table "audit_events" violates foreign key constraint'
@@ -3706,13 +4074,28 @@ def _encode_chat_value(kind: str, position: str, value: Any) -> Any:
     a non-str for a text or jsonb, a naive datetime, a str that isn't a UUID, a
     str that can't be UTF-8 encoded: a lone surrogate) is a DataError whose text
     repeats the value's repr (at most 40 characters), as asyncpg's does.
+
+    GH-187: ``int4`` / ``int8`` also refuse an int outside int32 / int64 ("value
+    out of int32 range"); an array kind (``uuid[]``) takes a sized iterable that
+    isn't a str, bytes or mapping (a list, tuple, set ...), each element through
+    the element kind's encoder (None allowed), and returns a list.
     """
     if value is None:
         return None
     valid = True
     reason = f"{kind} expected"
     stored = value
-    if kind == "uuid":
+    if kind.endswith("[]"):
+        valid = (
+            isinstance(value, Sized)
+            and isinstance(value, Iterable)
+            and not isinstance(value, str | bytes | bytearray | memoryview | Mapping)
+        )
+        if not valid:
+            reason = f"a sized iterable container expected (got type {type(value).__name__!r})"
+        else:
+            return [_encode_chat_value(kind[:-2], position, item) for item in value]
+    elif kind == "uuid":
         if isinstance(value, uuid.UUID):
             stored = _canonical(value)
         elif isinstance(value, str):
@@ -3733,6 +4116,11 @@ def _encode_chat_value(kind: str, position: str, value: Any) -> Any:
         valid = type(value) is bool
     elif kind == "int":
         valid = type(value) is int
+    elif kind in {"int4", "int8"}:
+        bits = 32 if kind == "int4" else 64
+        valid = type(value) is int
+        if valid and not -(2 ** (bits - 1)) <= value < 2 ** (bits - 1):
+            valid, reason = False, f"value out of int{bits} range"
     else:
         assert kind == "timestamptz", kind
         valid = isinstance(value, datetime) and value.tzinfo is not None
@@ -3875,15 +4263,18 @@ def _chat_param_types(n: str) -> dict[int, str]:
             columns.update(types)
     found: dict[int, str] = {}
 
-    def note(number: str, column: str | None, cast: str | None = None) -> None:
+    def note(
+        number: str, column: str | None, cast: str | None = None, *, array: bool = False
+    ) -> None:
         kind = _CAST_TYPES.get(cast) if cast else None
         if kind is None and column is not None:
             kind = columns.get(column)
         if kind is not None:
-            found.setdefault(int(number), kind)
+            found.setdefault(int(number), kind + "[]" if array else kind)
 
-    for match in re.finditer(r"\$(\d+) ?:: ?(\w+)", masked):
-        note(match.group(1), None, match.group(2))
+    # GH-187: an array cast (``$n::uuid[]``) types the parameter as an array.
+    for match in re.finditer(r"\$(\d+) ?:: ?(\w+)( ?\[ ?\])?", masked):
+        note(match.group(1), None, match.group(2), array=match.group(3) is not None)
     for match in re.finditer(rf"(?<![\w.$])(?:\w+\.)?(\w+) ?{_COMPARISON} ?\$(\d+)", masked):
         note(match.group(2), match.group(1))
     for match in re.finditer(rf"\$(\d+)(?: ?:: ?\w+)? ?{_COMPARISON} ?(?:\w+\.)?(\w+)", masked):
@@ -3929,7 +4320,10 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     a column chats doesn't have is left to the reader's UndefinedColumnError,
     which PostgreSQL raises first). GH-271: every column of a row-constructor
     piece ``(a, b, ...) = ...`` (a row, ``ROW(...)`` or a sub-select) is
-    checked too, as PostgreSQL does.
+    checked too, as PostgreSQL does. GH-187 (migration 0027): an UPDATE of
+    attachments may SET only the ``ATTACHMENT_UPDATE_COLUMNS``, checked the
+    same way ("permission denied for table attachments"); INSERT, SELECT and
+    DELETE on attachments are granted.
     """
     masked = _masked_literals(n)
     numbers = {int(number) for number in re.findall(r"\$(\d+)", masked)}
@@ -3960,7 +4354,9 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     if denied is not None:
         msg = f"permission denied for table {denied.group(1) or denied.group(2)}"
         raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
-    if _CHATS_UPDATE_RE.match(n) is not None:
+    if (granted := _GRANTED_UPDATE_RE.match(n)) is not None:
+        # GH-187: attachments has a column grant too (migration 0027).
+        table = granted.group(1)
         clauses = _clauses(n, ("update", "set", "from", "where", "returning"))
         for piece in _top_split(clauses["set"], ","):
             # GH-271: a row-constructor piece ``(a, b, ...) = ...`` (a row, ROW(...) or a
@@ -3972,8 +4368,8 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
                 target = re.match(r"(?:\w+\.)?(\w+) ?=", piece)
                 columns = [target.group(1)] if target is not None else []
             for column in columns:
-                if column in _CHAT_TYPES["chats"] and column not in CHAT_UPDATE_COLUMNS:
-                    msg = "permission denied for table chats"
+                if column in _CHAT_TYPES[table] and column not in _UPDATE_GRANTS[table]:
+                    msg = f"permission denied for table {table}"
                     raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
 
 
@@ -3997,7 +4393,9 @@ def _select_items(text: str) -> list[tuple[str, str, str]]:
         expr = expr.strip()
         assert expr != "*" and not expr.endswith(".*"), "name the columns (no SELECT *)"
         if _AGGREGATE_RE.search(_masked_literals(expr)):
-            name = re.match(r"(?:coalesce ?\( ?)?(\w+)", expr)
+            # PostgreSQL names an unaliased item after its outermost function
+            # (GH-187: "coalesce" for coalesce(sum(x), 0)).
+            name = re.match(r"(\w+)", expr)
             assert name is not None, expr
             items.append(("aggregate", alias or name.group(1), expr))
         elif re.fullmatch(r"(?:\w+\.)?\w+", expr) and not re.fullmatch(r"-?\d+|null", expr):
@@ -4018,9 +4416,18 @@ def _driver_value(value: Any) -> Any:
     return value
 
 
+def _numeric_sum(expr: str) -> bool:
+    """True for ``sum(<a BIGINT column>)``: PostgreSQL's sum(bigint) is NUMERIC (GH-187)."""
+    match = re.fullmatch(r"sum ?\( ?(?:\w+\.)?(\w+) ?\)", _unwrap(expr))
+    return match is not None and match.group(1) in _BIGINT_COLUMNS
+
+
 def _assert_evaluable(text: str) -> None:
-    """Fail the test for a WHERE / ON text with a construct the reader doesn't evaluate."""
-    masked = _masked(text)
+    """Fail the test for a WHERE / ON text with a construct the reader doesn't evaluate.
+
+    GH-187: ``<expr> = ANY(<array>)`` (or ``<>``) is evaluated; any other ANY isn't.
+    """
+    masked = re.sub(r"(?:=|<>|!=) ?any ?\(", "= (", _masked(text))
     for keyword in ("or", "between", "exists", "like", "ilike", "any", "all", "case"):
         assert not re.search(rf"(?<![\w.]){keyword}(?!\w)", masked), (
             f"the fake doesn't evaluate {keyword.upper()}: {text}"
@@ -4091,7 +4498,8 @@ class _Statement:
             # GH-244: an ARRAY[a, b, ...] constructor (a list, as asyncpg decodes it).
             inner = expr[expr.index("[") + 1 : -1].strip()
             return [self.value(item, ctx) for item in _top_split(inner, ",")] if inner else []
-        if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?)?", expr):
+        if match := re.fullmatch(r"\$(\d+)(?: ?:: ?\w+(?: \w+)?(?: ?\[ ?\])?)?", expr):
+            # GH-187: ``$n::uuid[]`` too (the bound sequence, already encoded-checked).
             return self._arg(match.group(1))
         if match := re.fullmatch(r"case when (.+?) then (.+?) else (.+?) end", _masked(expr)):
             # GH-166: one WHEN branch; the condition is a boolean bind parameter or a
@@ -4335,6 +4743,20 @@ class _Statement:
             found = any(_compare("=", left, value) for value in values)
             return left is not None and (found != bool(match.group(2)))
         assert not re.match(r"not ", masked), f"the fake doesn't evaluate NOT: {atom}"
+        if match := re.fullmatch(r"(.+?) ?(=|<>|!=) ?any ?(\( *\))", masked):
+            # GH-187: ``col = ANY($n::uuid[])``. A NULL array or left side, or no
+            # matching element (NULL elements never match), is not true.
+            left = self.value(atom[: match.end(1)], ctx)
+            inner = atom[match.start(3) + 1 : -1].strip()
+            assert not inner.startswith("select "), f"the fake doesn't do ANY(SELECT): {atom}"
+            elements = self.value(inner, ctx)
+            if left is None or elements is None:
+                return False
+            assert isinstance(elements, Iterable) and not isinstance(elements, str), atom
+            return any(
+                element is not None and _compare(match.group(2), left, element)
+                for element in elements
+            )
         if match := re.fullmatch(r"(\( *\)) ?(<>|!=|<=|>=|=|<|>) ?(\( *\))", masked):
             # GH-176: a row comparison, e.g. the keyset "(last_activity_at, id) < ($3, $4)".
             lefts = _top_split(atom[1 : match.end(1) - 1], ",")
@@ -4444,12 +4866,32 @@ class _Statement:
 
         ``count(*)`` / ``count(1)`` / ``count(col)``; ``bool_and`` / ``every`` /
         ``bool_or`` (NULL over no non-NULL input); ``coalesce(...)`` of aggregates
-        and constants; an optional trailing cast is ignored.
+        and constants; an optional trailing cast is ignored, except that an
+        integer cast turns a NUMERIC value into an int.
+
+        GH-187: ``sum(col)`` is NULL over no non-NULL input; over a BIGINT column
+        (``_BIGINT_COLUMNS``) it is NUMERIC, a ``Decimal`` as asyncpg decodes it,
+        and so is a ``coalesce`` holding such a sum (its constant included), as on
+        postgres:16.
         """
         expr = _unwrap(expr)
-        cast = re.fullmatch(r"(.+?) ?:: ?\w+", _masked(expr))
+        cast = re.fullmatch(r"(.+?) ?:: ?(\w+)", _masked(expr))
         if cast is not None:
-            return self.aggregate(expr[: cast.end(1)], contexts)
+            value = self.aggregate(expr[: cast.end(1)], contexts)
+            if isinstance(value, Decimal) and _CAST_TYPES.get(cast.group(2)) == "int":
+                return int(value.to_integral_value(rounding=ROUND_HALF_UP))
+            return value
+        if match := re.fullmatch(r"sum ?\((.+)\)", expr):
+            inner = match.group(1).strip()
+            present = [value for ctx in contexts if (value := self.value(inner, ctx)) is not None]
+            assert all(
+                isinstance(value, int | Decimal) and not isinstance(value, bool)
+                for value in present
+            ), f"sum of non-numbers: {expr!r}"
+            if not present:
+                return None
+            total = sum(present)
+            return Decimal(total) if _numeric_sum(expr) else total
         if match := re.fullmatch(r"count ?\((\*|1|.+)\)", expr):
             inner = match.group(1).strip()
             if inner in {"*", "1"}:
@@ -4463,9 +4905,13 @@ class _Statement:
                 return None
             return any(present) if match.group(1) == "bool_or" else all(present)
         if match := re.fullmatch(r"coalesce ?\((.+)\)", expr):
-            for item in _top_split(match.group(1), ","):
+            items = _top_split(match.group(1), ",")
+            numeric = any(_numeric_sum(item) for item in items)
+            for item in items:
                 value = self.aggregate(item, contexts)
                 if value is not None:
+                    if numeric and type(value) is int:
+                        return Decimal(value)
                     return value
             return None
         assert not _AGGREGATE_RE.search(_masked_literals(expr)), f"the fake can't read {expr!r}"
@@ -4495,17 +4941,22 @@ class _Statement:
                 "for key share",
             ),
         )
-        unsupported = {"group by", "having", "offset", "for share", "for key share"}
+        unsupported = {"group by", "having", "offset"}
         assert not unsupported & clauses.keys(), f"the fake can't read this SELECT: {n}"
         if "from" not in clauses:
             # GH-157: a FROM-less SELECT (a computed digest) is one row of values.
             assert set(clauses) == {"select"}, f"a SELECT without FROM: {n}"
             return self.project(clauses["select"], [{}])
         assert not clauses["select"].startswith("distinct"), "no DISTINCT in the fake"
-        if ("for update" in clauses or "for no key update" in clauses) and _AGGREGATE_RE.search(
-            _masked_literals(clauses["select"])
-        ):
-            msg = "FOR UPDATE is not allowed with aggregate functions"
+        # Every row-lock strength is recorded with no effect (GH-187: FOR SHARE on chats,
+        # FOR NO KEY UPDATE on organizations); none is allowed with an aggregate.
+        locks = [
+            lock
+            for lock in ("for update", "for no key update", "for share", "for key share")
+            if lock in clauses
+        ]
+        if locks and _AGGREGATE_RE.search(_masked_literals(clauses["select"])):
+            msg = f"{locks[0].upper()} is not allowed with aggregate functions"
             raise asyncpg.exceptions.FeatureNotSupportedError(msg)
         sources = _sources(clauses["from"])
         contexts = self.filtered(self.contexts(sources, clauses.get("where")), clauses.get("where"))
@@ -4575,7 +5026,7 @@ class _Statement:
         return returned, 1
 
     def insert_chat(self, n: str) -> tuple[list[dict[str, Any]], int]:
-        """An INSERT into chats or chat_messages (GH-176, see the module docstring).
+        """An INSERT into chats, chat_messages or (GH-187) attachments (see the module docstring).
 
         ``INSERT INTO t (cols) VALUES (exprs) [RETURNING ...]`` (one row) or
         ``INSERT INTO t (cols) SELECT exprs FROM ... [WHERE ...]`` (one row per

@@ -20,17 +20,27 @@ confirmation in ``server._chat_runtime``; the Super Admin, who can own no chat,
 is pointed at org A's Org Admin's. The legacy confirm acts on the caller's
 legacy chat (``chats.legacy_session_id``) and its pending confirmation. GH-8:
 the stop route acts on the caller's own idle chat (no run to stop: ``200
-{"stopped": false}``) and never touches the chat runtime.
+{"stopped": false}``) and never touches the chat runtime. GH-187: the upload
+sends a short text file (raw body, ``X-Attachment-Name``) into a chat of the
+caller's own (a Viewer's too); the attachment reads name an attachment of a
+chat of the caller's own, its file under a per-test attachments root; orgs A
+and B have a storage quota. The Super Admin's requests name org A's Org
+Admin's chat and attachment.
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
   gets exactly ``403 {"detail": "Forbidden"}`` and nothing happens: no table
-  changes (chats and chat messages included), no write statement (a
-  session's ``last_seen_at`` refresh aside), no audit row, no change in the
-  chat runtime (entries, pending confirmations), OAuth states or promotions,
-  and the agent never runs;
+  changes (chats, chat messages and attachments included), no write
+  statement (a session's ``last_seen_at`` refresh aside), no audit row, no
+  file under the attachments root (GH-187), no change in the chat runtime
+  (entries, pending confirmations), OAuth states or promotions, and the agent
+  never runs;
 - a role inside it gets the route's documented success status
   (``_SETUPS[...].status``) for the same request.
+- GH-187: the three attachment rows are gated by their own capability, not
+  just by its roles (``file.upload`` and ``chat.send`` have the same roles):
+  with ``access.can`` refusing only the row's capability, the Editor's valid
+  request is a 403 that changes nothing.
 
 Completeness: a new non-public ``ROUTES`` row fails
 ``test_tenancy_roles_every_non_public_route_has_a_setup`` until it gets a
@@ -49,6 +59,7 @@ from __future__ import annotations
 
 import copy
 import re
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, Final
@@ -57,7 +68,7 @@ from unittest.mock import AsyncMock
 import pytest
 from cryptography.fernet import Fernet
 
-from admino import org_permissions, server
+from admino import access, org_permissions, server
 from admino.access import Capability
 from admino.oauth import encrypt_refresh_token
 from tests.db_fakes import FakeDb
@@ -70,19 +81,24 @@ from tests.tenancy_world import (
     ROLES,
     ROUTES,
     SERVICE_CAPABILITIES,
+    UPLOAD_BODY,
     Account,
     Role,
     RouteSpec,
     World,
     allowed_roles,
+    attachment_files,
     build_world,
     chat_runtime_state,
     make_app,
     make_client,
     route_id,
+    seed_attachment,
     seed_chat,
     seed_pending_confirmation,
     stub_agent,
+    upload_headers,
+    use_attachment_storage,
     use_fake_database,
     use_fast_passwords,
     use_roomy_rate_limits,
@@ -90,6 +106,9 @@ from tests.tenancy_world import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+    from pathlib import Path
+
+    from admino.access import Principal
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -97,13 +116,17 @@ if TYPE_CHECKING:
 
 
 @pytest.fixture()
-def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B with an Org Admin, an Editor and a Viewer each, plus a Super Admin."""
+def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
+    """Orgs A and B with an Org Admin, an Editor and a Viewer each, plus a Super Admin.
+
+    GH-187: attachments live under ``tmp_path``; both orgs have a storage quota.
+    """
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
     use_fast_passwords(monkeypatch)
     use_roomy_rate_limits(monkeypatch)
+    use_attachment_storage(monkeypatch, built, tmp_path / "attachments")
     return built
 
 
@@ -153,12 +176,15 @@ _FIRST_ADMIN_EMAIL: Final = "roles-first-admin-167@example.ch"
 
 @dataclass(frozen=True)
 class _Request:
-    """One valid request: method, concrete URL, query and JSON body."""
+    """One valid request: method, concrete URL, query and JSON body, and (GH-187's upload)
+    a raw body with its request headers."""
 
     method: str
     url: str
     params: dict[str, str] = field(default_factory=dict)
     json: dict[str, Any] | None = None
+    content: bytes | None = None
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -314,6 +340,30 @@ def _own_chat(
         )
         seed_pending_confirmation(owner, chat_id, _CONFIRMATION_ID)
         return _Request(method, f"/api/chats/{chat_id}{suffix}", json=json)
+
+    return prepare
+
+
+def _upload_attachment(world: World, caller: Account) -> _Request:
+    """GH-187: a short text file into a chat of the caller's own (a Viewer owns one from
+    before a demotion; the Super Admin's request names org A's Org Admin's chat)."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 187")
+    return _Request(
+        "POST",
+        f"/api/chats/{chat_id}/attachments",
+        content=UPLOAD_BODY,
+        headers=upload_headers(),
+    )
+
+
+def _own_attachment(suffix: str) -> Callable[[World, Account], _Request]:
+    """GH-187: the metadata (``suffix`` "") or the download ("/content") of an attachment
+    of a chat of the caller's own, its file under the attachments root."""
+
+    def prepare(world: World, caller: Account) -> _Request:
+        chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 187")
+        attachment_id = seed_attachment(world.db, chat_id, filename="rollen-187.txt")
+        return _Request("GET", f"/api/attachments/{attachment_id}{suffix}")
 
     return prepare
 
@@ -477,6 +527,11 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     ),
     # GH-8: stop the caller's own idle chat (no streamed run: 200 {"stopped": false}).
     ("POST", "/api/chats/{chat_id}/stop"): _Setup(_own_chat("POST", "/stop"), 200),
+    # GH-187: upload into the caller's own chat (201, status "uploaded"); its metadata and
+    # download (200).
+    ("POST", "/api/chats/{chat_id}/attachments"): _Setup(_upload_attachment, 201),
+    ("GET", "/api/attachments/{attachment_id}"): _Setup(_own_attachment(""), 200),
+    ("GET", "/api/attachments/{attachment_id}/content"): _Setup(_own_attachment("/content"), 200),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _Setup(
         _plain("GET", "/api/oauth/google/authorize"), 200
@@ -628,7 +683,8 @@ class TestForbiddenRoles:
             request.url,
             params=request.params,
             json=request.json,
-            headers=caller.cookie,
+            content=request.content,
+            headers={**request.headers, **caller.cookie},
         )
 
         assert (response.status_code, response.json()) == (403, FORBIDDEN)
@@ -637,7 +693,8 @@ class TestForbiddenRoles:
     def test_tenancy_roles_forbidden_role_changes_nothing(
         self, world: World, spec: RouteSpec, role: Role
     ) -> None:
-        """No table, audit row, write statement or in-memory state changes; no agent run."""
+        """No table, audit row, write statement, file under the attachments root (GH-187)
+        or in-memory state changes; no agent run."""
         agent = stub_agent()
         app = make_app(agent)
         caller = world.by_role(role)
@@ -645,6 +702,7 @@ class TestForbiddenRoles:
         tables = _tables(world.db)
         audit = copy.deepcopy(world.db.audit_rows())
         memory = _memory_state(world.db)
+        files = attachment_files()
         start = len(world.db.calls)
 
         response = make_client(app).request(
@@ -652,7 +710,8 @@ class TestForbiddenRoles:
             request.url,
             params=request.params,
             json=request.json,
-            headers=caller.cookie,
+            content=request.content,
+            headers={**request.headers, **caller.cookie},
         )
 
         assert response.status_code == 403
@@ -660,6 +719,7 @@ class TestForbiddenRoles:
         assert _writes_since(world.db, start) == []
         assert _tables(world.db) == tables
         assert _memory_state(world.db) == memory
+        assert attachment_files() == files
         agent.run.assert_not_awaited()
 
 
@@ -681,10 +741,82 @@ class TestAllowedRoles:
             request.url,
             params=request.params,
             json=request.json,
-            headers=caller.cookie,
+            content=request.content,
+            headers={**request.headers, **caller.cookie},
         )
 
         assert response.status_code == setup.status, response.text[:200]
+
+
+# ---------------------------------------------------------------------------
+# GH-187: each attachment route checks its own row's capability
+# ---------------------------------------------------------------------------
+
+_ATTACHMENT_ROUTES: Final[tuple[tuple[str, str], ...]] = (
+    ("POST", "/api/chats/{chat_id}/attachments"),
+    ("GET", "/api/attachments/{attachment_id}"),
+    ("GET", "/api/attachments/{attachment_id}/content"),
+)
+
+
+def _refuse_only(monkeypatch: pytest.MonkeyPatch, refused: Capability) -> None:
+    """Make ``access.can`` refuse ``refused`` to everyone and answer as before otherwise,
+    wherever a module of the app holds a reference to it (``server.can`` included)."""
+    real_can = access.can
+
+    def spy(principal: Principal, capability: Capability) -> bool:
+        return capability != refused and real_can(principal, capability)
+
+    for name, module in list(sys.modules.items()):
+        if (name == "admino" or name.startswith("admino.")) and getattr(
+            module, "can", None
+        ) is real_can:
+            monkeypatch.setattr(module, "can", spy)
+
+
+class TestAttachmentRouteCapabilities:
+    """``file.upload`` and ``chat.send`` have the same roles (Org Admin, Editor), so the
+    role cases can't tell which one a route checks: refusing only the row's own
+    capability does."""
+
+    @pytest.mark.parametrize(
+        "route", [pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _ATTACHMENT_ROUTES]
+    )
+    def test_tenancy_roles_attachment_route_checks_its_rows_own_capability(
+        self, world: World, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str]
+    ) -> None:
+        """With ``can`` refusing only the row's capability (``file.upload`` for the upload,
+        ``chat.send`` for the reads), org A's Editor's valid request is 403 Forbidden and
+        changes nothing (no table, audit row or file). Control: before the refusal, the
+        same request succeeds with the route's documented status."""
+        spec = next(spec for spec in ROUTES if (spec.method, spec.path) == route)
+        assert spec.capability is not None
+        setup = _SETUPS[route]
+        caller = world.a["editor"]
+        client = make_client(make_app())
+        control = setup.prepare(world, caller)
+        allowed = client.request(
+            control.method,
+            control.url,
+            content=control.content,
+            headers={**control.headers, **caller.cookie},
+        )
+        _refuse_only(monkeypatch, spec.capability)
+        request = setup.prepare(world, caller)
+        tables = _tables(world.db)
+        files = attachment_files()
+
+        response = client.request(
+            request.method,
+            request.url,
+            content=request.content,
+            headers={**request.headers, **caller.cookie},
+        )
+
+        assert allowed.status_code == setup.status, allowed.text[:200]
+        assert (response.status_code, response.json()) == (403, FORBIDDEN)
+        assert _tables(world.db) == tables
+        assert attachment_files() == files
 
 
 # ---------------------------------------------------------------------------

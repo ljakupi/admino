@@ -24,9 +24,10 @@ What these tests pin down:
 - ``audit_events_action_check`` is dropped, then added again with a list that is
   0020's 48 actions plus ``password.change`` (49 actions, each once): a user
   changing their own password is an audit event (the profile edits are not).
-- The exact sync of the SQL action list with the live Python catalog lives here
-  now: it equals ``{a.value for a in AuditAction}`` (moved from
-  tests/test_migration_0020.py, which keeps a subset check).
+- The exact sync of the SQL action list with the live Python catalog moved on to
+  tests/test_migration_0027.py (GH-187's ``file.upload``): here 0021's list is a
+  subset of the live catalog and still lists its own 49 actions (it came here from
+  tests/test_migration_0020.py, which keeps a subset check too).
 - Nothing else: only ``users`` and ``audit_events`` are altered; no existing
   column is changed, no other constraint is dropped or added; no CREATE of any
   kind (no table, so no new grant is owed to the runtime role: 0018's
@@ -703,16 +704,24 @@ class TestMigration0021ActionCatalog:
         """The literal byte for byte (lowercase, dotted)."""
         assert _NEW_ACTION in _added_actions()
 
-    def test_migration_0021_action_check_matches_audit_action(self) -> None:
-        """The live catalog sync (moved here from test_migration_0020.py): the SQL action
-        list equals AuditAction's values exactly."""
-        assert set(_added_actions()) == _live_actions()
+    def test_migration_0021_action_check_is_still_in_audit_action(self) -> None:
+        """Every action 0021 allows is still an AuditAction (none was dropped).
 
-    def test_migration_0021_live_action_catalog_has_the_contract_size(self) -> None:
+        A shipped migration never changes, so 0021's list stays its 49 actions. The
+        catalog grows by replacing the audit_events_action_check constraint in a later
+        migration (0027 for GH-187's file.upload), so the exact sync with the live
+        AuditAction lives in that migration's tests (tests/test_migration_0027.py).
+        """
+        assert set(_added_actions()) <= _live_actions()
+
+    def test_migration_0021_action_check_still_lists_its_own_49_actions(self) -> None:
+        """0021's list is its own 49 actions, whatever the live catalog has grown to."""
+        listed = set(_added_actions())
         live = _live_actions()
 
+        assert len(listed) == _ACTION_CATALOG_SIZE
         assert _NEW_ACTION in live
-        assert len(live) == _ACTION_CATALOG_SIZE
+        assert len(live) >= _ACTION_CATALOG_SIZE
 
 
 # ---------------------------------------------------------------------------
