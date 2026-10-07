@@ -19,6 +19,8 @@ Security notes:
 - The whole file is scanned where it matters (a PDF's ``/Encrypt``, an OLE
   file's ``EncryptedPackage``, the text check), in chunks that overlap, so a
   harmless prefix can't carry a binary payload.
+- Text is strict UTF-8 without any C0 or C1 control character other than
+  tab, line feed, carriage return and form feed (checked on the decoded text).
 - ZIP files are read through their central directory only: nothing is
   decompressed here (the zip-bomb guard is #188's converter work). zipfile
   reads the archive through a wrapper that refuses any read past
@@ -210,7 +212,9 @@ _OOXML_CONTENT_TYPES: Final = "[Content_Types].xml"
 _CFB_MAGIC: Final = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 _CFB_ENCRYPTED_PACKAGE: Final = "EncryptedPackage".encode("utf-16-le")
 _UTF8_BOM: Final = b"\xef\xbb\xbf"
-_TEXT_CONTROL_RE: Final = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f]")
+# Every C0 and C1 control except TAB, LF, FF and CR: C1 (e.g. NEL U+0085, CSI
+# U+009B) is valid UTF-8 but can still move lines or drive a terminal.
+_TEXT_CONTROL_RE: Final = re.compile(r"[\x00-\x08\x0b\x0e-\x1f\x7f-\x9f]")
 
 
 def detect_kind(path: Path, filename: str) -> AttachmentKind:
@@ -345,7 +349,9 @@ def _check_ooxml(file: _CappedReader) -> AttachmentKind:
 def _check_text(file: BinaryIO) -> None:
     """Refuse a file that isn't strict UTF-8 text without control characters.
 
-    TAB, LF, FF and CR are allowed; an optional leading BOM is skipped.
+    Checked on the decoded text: U+0000..U+0008, U+000B, U+000E..U+001F and
+    U+007F..U+009F (C0, DEL and C1) are refused; TAB, LF, FF and CR are
+    allowed. An optional leading BOM is skipped.
     """
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     if file.read(len(_UTF8_BOM)) != _UTF8_BOM:
