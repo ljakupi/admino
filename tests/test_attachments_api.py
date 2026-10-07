@@ -13,7 +13,8 @@ and ``admino.audit_events`` run; ``server._processing`` is replaced (after
 
 What these tests pin down:
 - Upload success, for each of the nine kinds: 201 with exactly an
-  ``AttachmentSummary`` (status ``uploaded``, the kind detected from the bytes,
+  ``AttachmentSummary`` (status ``uploaded``, ``token_estimate`` null (GH-188), the
+  kind detected from the bytes,
   never from the lying ``Content-Type`` sent, the sanitized filename: path
   traversal, NFD, zero-width, CR/LF and bidi overrides in the header), the row
   of the caller's org and owner, the file at ``<root>/<org_id>/<id>`` (bytes
@@ -49,7 +50,8 @@ What these tests pin down:
   (refill 0.5/s), the GET routes have ``/api/attachments/get`` (5.0, 50) and
   ``/api/attachments/content/get`` (2.0, 30); the routes declare their response
   models.
-- Metadata and download: the owner's live attachment only; another org's, a
+- Metadata and download: the owner's live attachment only (GH-188: a ready row
+  answers its ``token_estimate``, a failed one null); another org's, a
   colleague's (an Org Admin included), a trashed and an unknown attachment, and
   a row whose file is gone (or is a directory, not a regular file: regression
   guard), are one 404 ``attachment_not_found``; a non-UUID id
@@ -171,6 +173,7 @@ _SUMMARY_KEYS: Final = frozenset(
         "status",
         "failure_reason",
         "page_count",
+        "token_estimate",
         "created_at",
     }
 )
@@ -475,6 +478,7 @@ def _seed(
     status: str = "uploaded",
     failure_reason: str | None = None,
     page_count: int | None = None,
+    token_estimate: int | None = None,
     trashed: bool = False,
     write: bool = True,
 ) -> uuid.UUID:
@@ -490,6 +494,7 @@ def _seed(
         status=status,
         failure_reason=failure_reason,
         page_count=page_count,
+        token_estimate=token_estimate,
         deleted_at=deleted_at,
     )
     if write:
@@ -524,6 +529,7 @@ def _assert_stored_upload(
         "status": "uploaded",
         "failure_reason": None,
         "page_count": None,
+        "token_estimate": None,
     }
     row = env.world.db.attachment_row(attachment_id)
     assert row is not None
@@ -1394,10 +1400,18 @@ class TestAttachmentsRead:
     """The owner's live attachment only; one 404 for everything else."""
 
     def test_attachments_api_metadata_reflects_the_stored_row(self, env: _Env) -> None:
-        """A ``ready`` row with a page count and a ``failed`` row with its reason."""
+        """A ``ready`` row with a page count and a token estimate (GH-188), and a
+        ``failed`` row with its reason (and no estimate)."""
         caller = env.world.a["editor"]
         ready = _seed(
-            env, caller, _pdf(), filename="Bericht.pdf", kind="pdf", status="ready", page_count=7
+            env,
+            caller,
+            _pdf(),
+            filename="Bericht.pdf",
+            kind="pdf",
+            status="ready",
+            page_count=7,
+            token_estimate=4195,
         )
         failed = _seed(
             env,
@@ -1427,16 +1441,21 @@ class TestAttachmentsRead:
                 "status": row["status"],
                 "failure_reason": row["failure_reason"],
                 "page_count": row["page_count"],
+                "token_estimate": row["token_estimate"],
                 "created_at": body["created_at"],
             }
             assert _ts(body["created_at"]) == row["created_at"]
         assert [responses[key].json()["status"] for key in (ready, failed)] == ["ready", "failed"]
         assert (
             responses[ready].json()["page_count"],
+            responses[ready].json()["token_estimate"],
             responses[failed].json()["failure_reason"],
+            responses[failed].json()["token_estimate"],
         ) == (
             7,
+            4195,
             "corrupted_file",
+            None,
         )
 
     @pytest.mark.parametrize("case", _NOT_THE_CALLERS)

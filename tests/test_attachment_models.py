@@ -11,8 +11,9 @@ What these tests pin down:
   ``models.AttachmentStatus`` the four statuses (uploaded, processing, ready,
   failed).
 - ``AttachmentSummary``: JSON keys exactly id, chat_id, message_id, filename,
-  kind, size_bytes, status, failure_reason, page_count, created_at (never an
-  org, an owner or a path); one example's JSON shape; ``kind`` and ``status``
+  kind, size_bytes, status, failure_reason, page_count, token_estimate (GH-188),
+  created_at (never an org, an owner or a path); one example's JSON shape and a
+  ready file's; ``kind`` and ``status``
   refuse anything outside their Literal (``jpg``, ``PDF``, ``pptx``,
   ``deleted``...); ``filename`` 1 to 255 characters (code points);
   ``size_bytes`` 1 to 524288000 (500 MiB, the DB CHECK); ``failure_reason``
@@ -20,6 +21,10 @@ What these tests pin down:
   digit or underscore, no space, dash or trailing newline, at most 64);
   ``page_count`` None or >= 0; ``message_id`` None or a UUID; ``id`` and
   ``chat_id`` UUIDs.
+- GH-188 (contract section 9): ``token_estimate`` is ``int | None`` with ge=0
+  (None until the file is ready, then the estimated tokens of its text and
+  images), required (no default: the response always carries it), the field
+  right after ``page_count``.
 
 Security notes:
 - The summary is what a client sees of a stored file: the filename is the
@@ -57,6 +62,7 @@ _SUMMARY_KEYS = frozenset(
         "status",
         "failure_reason",
         "page_count",
+        "token_estimate",
         "created_at",
     }
 )
@@ -98,6 +104,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "status": "uploaded",
         "failure_reason": None,
         "page_count": None,
+        "token_estimate": None,
         "created_at": _TIMESTAMP,
     }
     payload.update(overrides)
@@ -157,8 +164,22 @@ class TestAttachmentSummary:
             "status": "failed",
             "failure_reason": "corrupted_file",
             "page_count": 0,
+            "token_estimate": None,
             "created_at": "2026-10-07T09:30:00Z",
         }
+
+    def test_attachment_models_summary_json_of_a_ready_file_carries_its_token_estimate(
+        self,
+    ) -> None:
+        summary = _model("AttachmentSummary").model_validate(
+            _payload(status="ready", page_count=12, token_estimate=4195)
+        )
+
+        assert {
+            key: value
+            for key, value in json.loads(summary.model_dump_json()).items()
+            if key in ("status", "page_count", "token_estimate")
+        } == {"status": "ready", "page_count": 12, "token_estimate": 4195}
 
     def test_attachment_models_summary_json_keys_are_exactly_the_contract(self) -> None:
         """No org, owner, path or deletion field ever reaches a client."""
@@ -260,6 +281,40 @@ class TestAttachmentSummary:
         outcomes = {value: _outcome(page_count=value) for value in (None, 0, 7, -1)}
 
         assert outcomes == {None: "accepted", 0: "accepted", 7: "accepted", -1: [("page_count",)]}
+
+    def test_attachment_models_summary_token_estimate_is_none_or_not_negative(self) -> None:
+        outcomes = {value: _outcome(token_estimate=value) for value in (None, 0, 4195, -1)}
+
+        assert outcomes == {
+            None: "accepted",
+            0: "accepted",
+            4195: "accepted",
+            -1: [("token_estimate",)],
+        }
+
+    def test_attachment_models_summary_token_estimate_is_required(self) -> None:
+        """No default: a summary built without it is refused, so every response
+        carries the key (null until the file is ready)."""
+        payload = _payload()
+        del payload["token_estimate"]
+
+        try:
+            _model("AttachmentSummary").model_validate(payload)
+        except ValidationError as exc:
+            errors = [
+                (tuple(error["loc"]), error["type"])
+                for error in exc.errors(include_url=False, include_input=False)
+            ]
+        else:
+            errors = []
+
+        assert errors == [(("token_estimate",), "missing")]
+
+    def test_attachment_models_summary_token_estimate_follows_page_count(self) -> None:
+        fields = list(_model("AttachmentSummary").model_fields)
+
+        assert "token_estimate" in fields
+        assert fields[fields.index("page_count") + 1] == "token_estimate"
 
     def test_attachment_models_summary_ids_are_uuids(self) -> None:
         outcomes = {

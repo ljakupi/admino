@@ -39,7 +39,7 @@ docker compose up
             • allow each approved host on :443 (HTTPS)
             • allow SMTP_HOST on SMTP_PORT only (465/587, TLS), if set
             • block ALL IPv6 egress (fail-closed)
-       └─ drops to the unprivileged 'admino' user:  gosu admino python -m admino.main
+       └─ drops to the unprivileged 'admino' user:  gosu admino python -P -m admino.main
   └─ app runs as 'admino', behind the firewall it can no longer change
 ```
 
@@ -295,7 +295,8 @@ What this doesn't cover:
 ## Attachments
 
 Files uploaded into chats are untrusted input, and they hold content. The upload, the
-checks and the storage live in `attachment_types.py` and `attachments.py`:
+checks and the storage live in `attachment_types.py` and `attachments.py`, the
+conversion in `attachment_processing.py` and `converters/`:
 
 - **The type comes from the content, checked in code.** admino decides the type from
   the file's bytes: magic bytes, the Office Open XML structure of a ZIP (read with the
@@ -306,14 +307,14 @@ checks and the storage live in `attachment_types.py` and `attachments.py`:
   read over 2 MiB, so a central directory larger than that is `corrupted_file` before
   it's read or parsed, and so is any archive zipfile can't list. At most 2 files are
   type-checked at once across all uploads, so crafted archives can't exhaust the
-  agent's memory or CPU for every organization.
-  The conversion libraries check the files again when they're processed
-  ([#188](https://github.com/ljakupi/admino/issues/188)).
+  agent's memory or CPU for every organization. After the upload, the stored file
+  passes the same check again before it's converted.
 - **Bounded before a byte is read.** `Content-Length` is required and checked against
-  the size limit and the organization's storage quota first, and the upload stops as
-  soon as the body goes past it. The quota check counts the uploads still in progress:
-  each reserves its `Content-Length` for its organization until it ends, so parallel
-  uploads can't fill the shared attachments volume past the quota. A user has at most
+  the size limit and the organization's storage quota first (the quota counts the
+  stored files with their converted parts), and the upload stops as soon as the body
+  goes past it. The quota check counts the uploads still in progress: each reserves its
+  `Content-Length` for its organization until it ends, so parallel uploads can't fill
+  the shared attachments volume past the quota. A user has at most
   `max_files_per_message` uploads in progress (one more is `429` before its body is
   read). A body has two deadlines, and missing either ends the upload with `400
   content_length_mismatch`: it must send something at least every 30 seconds, and all
@@ -329,25 +330,103 @@ checks and the storage live in `attachment_types.py` and `attachments.py`:
   when admino can't know whether the database applied it: a file left without its row
   is removed by the hourly cleanup once it is 24 hours old, while a row left without
   its file would stay broken.
+- **Parsed in a separate, short-lived process.** The parsers (PDFium through pypdfium2,
+  python-docx, openpyxl, Pillow) read hostile files, so the agent's process never loads
+  them. Each file is converted by its own child process (`python -m
+  admino.converters.worker`), at most 2 at once and one per organization at a time, so
+  one organization's queue (say, files built to run until the timeout) never delays
+  another organization's files. The job (the stored file's path, its type, its name and
+  the limits) reaches the child on its standard input, never on its command line. Its
+  environment holds only `PYTHONPATH`: no database password, API token, encryption key
+  or SMTP credential. Its error output is discarded unread. It's killed after 120
+  seconds (`conversion_timeout`), and on Linux it raises its own OOM score, so when
+  memory runs out the kernel kills the child first, not the agent. Before it reads the
+  job, it also limits itself to 130 seconds of CPU time and, on Linux, 2 GiB of address
+  space, so a parser that goes past either ends the child. On Linux it also turns off
+  its core dumps (a core size of 0), so a parser that crashes can't leave a memory image
+  of the child, holding the document, on the host. A crash, an exit without a valid
+  answer or an answer with an unknown code fails the file with `processing_error`, and
+  whatever the child wrote is removed. A failure is a fixed code in `failure_reason`: a
+  library's message, the file name and paths never reach the database, a response or a
+  log line.
+- **The agent's secrets and code stay out of the child's reach.** The child runs as the
+  agent's user, so on Linux the agent makes its own process non-dumpable at startup
+  (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's
+  environment, where the secrets are, its open files or its memory through `/proc`. If
+  that call fails, the agent logs a warning and starts anyway. The image's code
+  (`/app/src` and the installed package) and the PWA's files (`/app/static`) are owned
+  by root, so the child can't change what the agent imports or serves; only `/app/data`,
+  where the attachments live, belongs to `admino`. The agent starts with `python -P`,
+  which keeps the working directory off its import path.
+- **Bounded parsing.** DOCX and XLSX are ZIP archives, so a small file can unpack into
+  gigabytes (a zip bomb). Before a parser opens one, the child checks the archive in two
+  steps. First its directory, decompressing nothing: more than 10,000 entries, one entry
+  declaring more than 64 MiB uncompressed, or more than 256 MiB declared in total fails
+  the file with `archive_too_large`. Only stored and deflate entries are accepted (the
+  only methods Office Open XML allows; BZIP2 or LZMA would inflate without bound), so
+  any other method is `corrupted_file` and an encrypted entry `password_protected`. Then
+  every entry is decompressed once, in chunks of at most 64 KiB that are counted and
+  dropped, never more than one byte past the entry limit: a real size over 64 MiB for
+  one entry or 256 MiB in total is `archive_too_large`, and a real size or checksum that
+  differs from the declared one is `corrupted_file`. The parsers' own reads are then
+  bounded by the declared sizes, because zipfile never returns more than an entry
+  declares (its CRC check fails instead). An image over 64 megapixels is
+  `image_too_large` before it's decoded (Pillow's own decompression-bomb check gives the
+  same code). A PDF with more pages than `max_pages_per_file` fails with
+  `too_many_pages` before any page is converted, and a rendered page never exceeds 25
+  megapixels. A file's converted text stops at 10 million characters (`text_too_large`),
+  counted while a table is being built, a table at 1,000 rows, 50 columns and 1,000
+  characters per cell, a workbook at 50 sheets. A DOCX cell spanning columns is repeated
+  only up to the column limit, however wide a span it declares; an XLSX sheet is read
+  only up to row 1,048,576 (Excel's last row), whatever row numbers the file uses, and
+  only 51 columns wide, whatever columns its cells name (the columns note appears when
+  the 51st column has content; content further right with that column empty isn't
+  read); empty rows are skipped before any work on their cells, and a long value
+  repeated across cells is cleaned once; and a CSV's delimiter is detected from its
+  first 8 KiB.
+- **Image metadata is stripped.** Converted images are written fresh, without their
+  metadata: no EXIF (GPS location, camera, dates), ICC profile, XMP, comments or PNG
+  text chunks, so where a photo was taken doesn't travel with it to the model. Rendered
+  PDF pages carry none either. The original file keeps its metadata and downloads as it
+  was uploaded.
 - **Downloads never render in admino's origin.** Only the chat's owner downloads a
   file, always as `Content-Disposition: attachment` with the detected type's
   `Content-Type`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, so an
   uploaded HTML or SVG file never opens as a page of admino.
 - **Names stay in the database.** The original name comes in a header, never in the URL
   (so not in an access log). It's cleaned (its last path segment only, without control
-  or invisible formatting characters, at most 255 characters) and stored only in the
+  or invisible formatting characters, at most 255 characters) and stored in the
   `attachments` table; on disk a file is named by its organization's ID and its own.
+  The name reaches the disk only inside a converted PDF's page labels
+  (`[<name> — page N]`), next to the content they label; the conversion process gets
+  it for them.
   Names, header values and file content never reach a log line or the audit log: IDs,
   sizes, types, statuses and reason codes only.
-- **Unencrypted at rest.** The files are on the `admino-attachments` volume, mounted on
-  the agent only and owned by `admino` (files 0600, directories 0700), but they **aren't
+- **Unencrypted at rest.** The files and their converted parts (`<attachment ID>.d/`:
+  text, images and a manifest) are on the `admino-attachments` volume, mounted on the
+  agent only and owned by `admino` (files 0600, directories 0700), but they **aren't
   encrypted at rest**: whoever can read the Docker host's volumes can read them. Use an
   encrypted disk on the host, and back the volume up with the database (see
-  [Configuration → Data & storage](configuration.md#data--storage)).
+  [Configuration → Data & storage](configuration.md#data--storage)). The converted parts
+  are removed with the original, when the conversion fails, and when the attachment was
+  deleted during its conversion.
+- **Converted parts are capped and counted.** A small file can convert into far more
+  bytes than it holds (a crafted 28 KB PDF of 100 pages renders to more than a gigabyte
+  of page images), and the volume is shared by every organization and, at Docker's
+  default location, sits on the database's disk. So one file's converted parts are
+  capped at 256 MiB (`output_too_large`): the child refuses a part that would pass the
+  cap, and after it exits the agent measures the output directory itself (regular files
+  only, never following a link; anything else there fails the file with
+  `processing_error`). The measured size is stored with the file and counts toward the
+  organization's storage quota, with the original: under a lock on the organization's
+  row, a conversion whose parts would put the organization's stored files over its quota
+  fails with `storage_quota_exceeded`, and its parts are removed. The uploads' quota
+  check and the platform's `storage_used_bytes` count the same originals plus converted
+  parts.
 - **No tool reaches them.** No agent tool reads, lists or downloads an attachment: the
   agent, the LLM clients, the tools and the permission engine don't import the
-  attachment modules. In this release a file's content doesn't reach the model either
-  ([#189](https://github.com/ljakupi/admino/issues/189) adds that).
+  attachment or conversion modules. In this release a file's content doesn't reach the
+  model either ([#189](https://github.com/ljakupi/admino/issues/189) adds that).
 
 ## The LLM provider and data residency
 
@@ -463,9 +542,23 @@ We prefer to be transparent about what this does **not** guarantee:
   a compromised app, not from someone who can read `.env` on the server: `PG_PASSWORD`
   is the database superuser's password.
 - **Attachments aren't encrypted at rest.** Uploaded files sit on the
-  `admino-attachments` volume as they were sent: admino doesn't encrypt them, like the
-  content in the database. Whoever can read the Docker host's volumes reads them;
-  encrypt the host's disk.
+  `admino-attachments` volume as they were sent, their converted text and images next to
+  them: admino doesn't encrypt them, like the content in the database. Whoever can read
+  the Docker host's volumes reads them; encrypt the host's disk.
+- **The conversion process isn't a sandbox.** It contains a parser's crashes, hangs, CPU
+  and memory use, not code execution: it runs as the agent's user, in the agent's
+  container, with the same egress rules. The agent's code and web files are out of its
+  reach, and so are, on Linux, the agent's environment and memory (see
+  [Attachments](#attachments)). But a file that exploits a parser bug (in PDFium, Pillow
+  or libxml2) can still read and write every organization's files on the shared
+  attachments volume, originals and converted parts; reach the internal network (the
+  database, the vLLM container, the agent's own port) and the approved hosts; send DNS
+  queries to any resolver (see *DNS egress is broad* above); and signal the agent's
+  process. Closing that takes a real sandbox, and the options for a follow-up are
+  Landlock (Linux 5.13 and later), confining the child to its one file and its output
+  directory, or a separate converter container with its own user and no network. The
+  parsers are pinned; keep admino up to date, as their security fixes arrive as
+  dependency updates.
 - **The deletion window is checked when the deletion is scheduled, not when it's
   committed.** A compromised app that keeps one database transaction open for the whole
   grace period could commit a deletion that is already due, so the organization would

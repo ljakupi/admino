@@ -65,6 +65,9 @@ covering:
   yet) to exit 1, logged by type only, with a hint that names PG_APP_PASSWORD and
   never the owner variables. main.py never mentions PG_PASSWORD or PG_USER, and
   never references ``run_migrations``.
+- GH-188: main() calls ``process_hardening.make_non_dumpable()`` once before
+  uvicorn.run; ``mock_deps`` patches it (when the module exists) so main() never
+  makes the pytest process itself non-dumpable on Linux.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -75,6 +78,7 @@ Security notes:
 from __future__ import annotations
 
 import ast
+import importlib.util
 import inspect
 import logging
 import re
@@ -182,6 +186,14 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     monkeypatch.setattr("admino.tools.registry.freeze_registry", mock_freeze)
     monkeypatch.setattr("admino.main.uvicorn", MagicMock(run=mock_uvicorn_run))
 
+    # GH-188: on Linux the real make_non_dumpable() would make this pytest process
+    # non-dumpable for good. Patched only once admino.process_hardening exists, so the
+    # fixture keeps working on a tree without it (the key then holds None).
+    mock_make_non_dumpable: MagicMock | None = None
+    if importlib.util.find_spec("admino.process_hardening") is not None:
+        mock_make_non_dumpable = MagicMock(return_value=True)
+        monkeypatch.setattr("admino.process_hardening.make_non_dumpable", mock_make_non_dumpable)
+
     return {
         "config": mock_config,
         "llm_client": mock_llm_client,
@@ -195,6 +207,7 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "uvicorn_run": mock_uvicorn_run,
         "import_tool_modules": mock_import_tools,
         "asyncio": mock_asyncio,
+        "make_non_dumpable": mock_make_non_dumpable,
     }
 
 
@@ -276,6 +289,21 @@ class TestMainHappyPath:
             "tool_call_recorder",
             "agent_config",
         }
+
+    def test_main_makes_the_process_non_dumpable_once_before_uvicorn(
+        self, mock_deps: dict[str, Any]
+    ) -> None:
+        """GH-188: main() calls process_hardening.make_non_dumpable() exactly once, with
+        no arguments, before uvicorn.run serves (the fixture's mock stands in for it)."""
+        harden = mock_deps["make_non_dumpable"]
+        assert harden is not None, "admino.process_hardening does not exist"
+        events: list[str] = []
+        harden.side_effect = lambda: events.append("non_dumpable") or True
+        mock_deps["uvicorn_run"].side_effect = lambda *_a, **_k: events.append("uvicorn")
+
+        main(config_path=Path("c.yaml"))
+
+        assert (harden.call_args_list, events) == ([call()], ["non_dumpable", "uvicorn"])
 
 
 # ---------------------------------------------------------------------------

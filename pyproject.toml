@@ -23,6 +23,13 @@ dependencies = [
     # OpenAI SDK: used by the default Infomaniak provider (OpenAI-compatible API)
     # as well as the vLLM and OpenAI providers.
     "openai>=1.50.0,<2",
+    # Document conversion pipeline (GH-188, approved in the issue): pypdfium2 = PDF
+    # text extraction and page rendering, python-docx = DOCX, openpyxl = XLSX
+    # (read-only mode), Pillow = image decoding/re-encoding.
+    "pypdfium2==5.14.0",
+    "python-docx==1.2.0",
+    "openpyxl==3.1.5",
+    "Pillow==12.3.0",
 ]
 
 [project.optional-dependencies]
@@ -78,6 +85,12 @@ warn_unused_ignores = true
 no_implicit_reexport = true
 strict_equality = true
 extra_checks = true
+
+[[tool.mypy.overrides]]
+# GH-188: pypdfium2 and openpyxl ship no py.typed marker (python-docx and Pillow do);
+# stub packages are not approved, so their imports are treated as untyped.
+module = ["pypdfium2", "pypdfium2.*", "openpyxl", "openpyxl.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

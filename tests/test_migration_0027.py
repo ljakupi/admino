@@ -39,20 +39,24 @@ What is pinned (contract section 1):
 - Five plain btree indexes on attachments: (org_id) INCLUDE (size_bytes); (chat_id,
   org_id, owner_user_id); (message_id) WHERE message_id IS NOT NULL; (created_at)
   WHERE message_id IS NULL; (created_at) WHERE status IN ('uploaded', 'processing').
-- Privileges after every shipped migration: admino_app holds SELECT, INSERT and
+- Privileges after every migration up to 0027: admino_app holds SELECT, INSERT and
   DELETE on attachments and UPDATE on exactly message_id, status, failure_reason,
   page_count, updated_at and deleted_at (never id, org_id, chat_id, owner_user_id,
   filename, kind, size_bytes or created_at; no table-wide UPDATE, no grant option);
   PUBLIC holds nothing; no other table's privileges change. 0027's GRANTs (nested
-  bodies and literals included) all target attachments for admino_app.
+  bodies and literals included) all target attachments for admino_app. (GH-188:
+  migration 0028 adds token_estimate to the UPDATE grant; the cumulative set after
+  every shipped migration is pinned in tests/test_migration_0028.py.)
 - ``audit_events_action_check`` is dropped (no CASCADE), then added again with
   migration 0021's list plus ``file.upload`` (50 actions, each once), equal to the
   live ``AuditAction`` (the exact sync moved here from tests/test_migration_0021.py,
   which keeps a subset check).
 - Nothing else: every statement is one of the above; no DO block, function,
   trigger, role, data write, REVOKE, TRUNCATE or DROP TABLE (nested ones included).
-- tests/db_fakes.py mirrors 0027: its action catalog, update grant, composite key
-  name, kinds, statuses and bounds equal the shipped ones; an UPDATE naming a
+- tests/db_fakes.py mirrors 0027: its action catalog, its update grant on 0027's
+  columns (the fake's cumulative grant, token_estimate included, is pinned against
+  every shipped migration in tests/test_migration_0028.py), composite key name,
+  kinds, statuses and bounds equal the shipped ones; an UPDATE naming a
   column outside the grant is "permission denied for table attachments" and changes
   nothing; an INSERT for another org's, a colleague's or an unknown chat is
   ForeignKeyViolationError on the composite key and stores nothing.
@@ -1038,11 +1042,15 @@ class TestMigration0027FakeDb:
     """The FakeDb holds what 0027 ships."""
 
     def test_migration_0027_fake_constants_are_the_shipped_ones(self) -> None:
-        """Catalog, update grant, composite key name, kinds, statuses and bounds."""
+        """Catalog, update grant, composite key name, kinds, statuses and bounds.
+
+        The update grant is compared on 0027's own columns: what 0027 grants of them.
+        Columns later migrations add (0028's token_estimate) are pinned, with the
+        cumulative grant, by their own migration's test."""
         composite = [r.name for r in _foreign_keys() if r.table == "chats"]
         fake = {
             "actions": frozenset(db_fakes.AUDIT_ACTIONS),
-            "update columns": frozenset(db_fakes.ATTACHMENT_UPDATE_COLUMNS),
+            "update columns": frozenset(db_fakes.ATTACHMENT_UPDATE_COLUMNS) & frozenset(_COLUMNS),
             "chat fkey": [db_fakes.ATTACHMENT_CHAT_FKEY],
             "kinds": frozenset(db_fakes.ATTACHMENT_KINDS),
             "statuses": frozenset(db_fakes.ATTACHMENT_STATUSES),

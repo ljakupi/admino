@@ -378,8 +378,8 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `limits` | `max_context_messages` | from `config.yaml` (20) | 1–200 | every message |
 | `files` | `max_file_size_mb` | 50 | 1–500 | every [attachment](#attachments) upload, in MiB (1,048,576 bytes) |
 | `files` | `max_files_per_message` | 10 | 1–50 | the attachments one message carries, the burst of the upload rate limit, and the uploads one user may have in progress at once |
-| `files` | `max_pages_per_file` | 100 | 1–1000 | attachment processing: a file with more pages fails (pages are counted from [#188](https://github.com/ljakupi/admino/issues/188) on) |
-| `files` | `render_dpi` | 150 | 72–300 | page images (later release) |
+| `files` | `max_pages_per_file` | 100 | 1–1000 | [attachment conversion](#file-conversion): a PDF with more pages fails with `too_many_pages` |
+| `files` | `render_dpi` | 150 | 72–300 | [attachment conversion](#file-conversion): the resolution of the images of scanned PDF pages (at most 25 megapixels a page) |
 | `retention` | `trash_min_days`, `trash_max_days` | 0, 90 | 0–90, min ≤ max | the bounds of each [organization's trash retention](#organization-settings) |
 | `retention` | `audit_months` | 12 | 6–84 | the daily audit purge |
 | `retention` | `org_deletion_grace_days` | 30 | 7–90 | the next organization deletion you schedule |
@@ -1013,7 +1013,7 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
 | Route | What it does |
 | --- | --- |
 | `POST /api/chats/{id}/attachments` | Uploads one file into your chat. The request body is the file itself (not a form), with the original name in the `X-Attachment-Name` header and the size in `Content-Length`. Answers `201` with the attachment, `status: "uploaded"`. |
-| `GET /api/attachments/{id}` | The attachment: `id`, `chat_id`, `message_id` (`null` until a message carries it), `filename`, `kind`, `size_bytes`, `status`, `failure_reason`, `page_count` and `created_at`. |
+| `GET /api/attachments/{id}` | The attachment: `id`, `chat_id`, `message_id` (`null` until a message carries it), `filename`, `kind`, `size_bytes`, `status`, `failure_reason`, `page_count`, `token_estimate` and `created_at` (see [File conversion](#file-conversion)). |
 | `GET /api/attachments/{id}/content` | Downloads the original file, in any status. |
 
 - **The name** travels in the `X-Attachment-Name` header, never in the URL, so it can't
@@ -1042,12 +1042,13 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   `max_file_size_mb` (a [platform default](#platform-defaults), 50 MiB by default) and
   against your organization's storage quota (its plan's `storage_quota`, set by the
   Super Admin) before any byte of the file is read. The quota counts every attachment of
-  the organization, those in the trash included, plus the uploads still in progress:
-  each one reserves its `Content-Length` until it ends (stored or not), so parallel
-  uploads can't fill the disk past the quota. The body must then be exactly
-  `Content-Length` bytes: the upload stops as soon as it goes past, and one that ends
-  short is refused too. Two deadlines bound the body, and missing either refuses the
-  upload and deletes its partial file: it must send something at least every 30
+  the organization, its original file and its converted parts (see
+  [File conversion](#file-conversion)), those in the trash included, plus the uploads
+  still in progress: each one reserves its `Content-Length` until it ends (stored or
+  not), so parallel uploads can't fill the disk past the quota. The body must then be
+  exactly `Content-Length` bytes: the upload stops as soon as it goes past, and one that
+  ends short is refused too. Two deadlines bound the body, and missing either refuses
+  the upload and deletes its partial file: it must send something at least every 30
   seconds, and all of it must arrive within 120 seconds plus its `Content-Length` at
   32 KiB/s (about 29 minutes for a 50 MiB file, 2.5 minutes for 1 MiB). The quota is
   checked again when the file is stored, so parallel uploads can't overrun it.
@@ -1071,13 +1072,15 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   | `422` | `corrupted_file` | see the type checks above (a ZIP directory over 2 MiB included) |
   | `503` | `storage_unavailable` | the attachments volume can't be written |
 
-- **Processing.** After the `201`, the file is checked again in the background, on a pool
-  of 2 workers: `status` goes from `uploaded` to `processing`, then `ready`, or `failed`
-  with a code in `failure_reason` (such as `corrupted_file` or `too_many_pages`). Poll
-  `GET /api/attachments/{id}` to see it. Converting files for the model and counting
-  their pages come with [#188](https://github.com/ljakupi/admino/issues/188); a file with
-  more pages than `max_pages_per_file` then fails with `too_many_pages`. After a restart,
-  files left `processing` go back to `uploaded` and are queued again.
+- **Processing.** After the `201`, the file is checked again and converted in the
+  background, on a pool of 2 workers shared by all organizations, at most one of them
+  per organization at a time, so one organization's queue never delays another's files:
+  `status` goes from `uploaded` to `processing`, then `ready`, or `failed` with a code in
+  `failure_reason` (such as `corrupted_file` or `too_many_pages`). Poll
+  `GET /api/attachments/{id}` to see it. A `ready` file has its `token_estimate` and, for
+  a PDF, its `page_count`. How each type is converted, the limits and every failure code
+  are under [File conversion](#file-conversion). After a restart, files left
+  `processing` go back to `uploaded` and are queued again.
 - **Sending.** `POST /api/chats/{id}/messages` takes the attachments' IDs in
   `attachment_ids` (no duplicates). They're checked before the message runs, and a
   refusal runs and stores nothing:
@@ -1118,12 +1121,112 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   `file.delete` by the system with `{"orphan": true}`. It also removes leftover files
   older than 24 hours that no attachment owns (an interrupted upload, a failed removal).
 - **Audit and logs.** Each upload is recorded as `file.upload`, with the attachment's ID
-  and size only. Reads and downloads aren't recorded. Names and content never reach the
-  audit log or a log line: IDs, sizes, types and statuses only.
+  and size only. Reads, downloads and the conversion (a system step) aren't recorded.
+  Names and content never reach the audit log or a log line: IDs, sizes, types, statuses
+  and failure codes only.
 - There's no route yet to delete one attachment or to list a chat's attachments: the
   trash comes with [#194](https://github.com/ljakupi/admino/issues/194), a chat's
   attachment list with [#190](https://github.com/ljakupi/admino/issues/190) and
   [#191](https://github.com/ljakupi/admino/issues/191).
+
+#### File conversion
+
+Processing turns each file into parts a model can read: text, with page markers for PDFs,
+and images. The parts don't reach the model in this release; that comes with
+[#189](https://github.com/ljakupi/admino/issues/189).
+
+- **PDF**, page by page. A page whose text layer has at least 20 characters other than
+  whitespace becomes text: a `[<file name> — page N]` line, then the page's text without
+  control characters. Any other page (a scanned or blank one) is rendered as a JPEG on a
+  white background at `render_dpi` (a [platform default](#platform-defaults), 150 by
+  default) and labeled `[<file name> — page N]`. A page that would be larger than 25
+  megapixels at that resolution is rendered at the lower resolution that fits. A mixed
+  PDF gets text for some pages and images for others. The pages are counted first: a PDF
+  with more pages than `max_pages_per_file` fails with `too_many_pages` before any page
+  is converted.
+- **DOCX** becomes Markdown-like text, in the document's order. `Title` becomes a `#`
+  heading and `Heading 1` to `Heading 6` become `#` to `######` headings (`Heading 7` to
+  `Heading 9` stay at `######`). `List Bullet` paragraphs and other paragraphs with list
+  numbering become `- ` items, `List Number` paragraphs `1. ` items, indented by two
+  spaces per level. Tables become Markdown tables with their first row as the header. A
+  cell merged across columns repeats its text in each of them (up to the table's column
+  cap); a cell merged across rows shows its text in its first row only. Headers,
+  footers, footnotes, comments and text boxes aren't converted.
+- **XLSX** becomes one `## <sheet name>` section per worksheet, with a Markdown table
+  (its first row as the header) or `(empty sheet)`; chart sheets are skipped. Cells hold
+  the values saved in the file, so a formula without a saved value is empty, and dates
+  read `2026-10-07` (`2026-10-07 14:30:00` with a time). A worksheet is read only up to
+  row 1,048,576, Excel's last row, and only 51 columns wide: the `[Only the first 50
+  columns are included.]` note appears when a kept row has content in its 51st column,
+  and content further right in a row whose 51st column is empty is neither read nor
+  noted. **CSV** becomes one table without a heading, its delimiter detected from its
+  first 8 KiB among comma, semicolon, tab and `|`. Empty rows are dropped, and a table
+  keeps its first 1,000 non-empty rows, its first 50 columns and 1,000 characters per
+  cell (a longer cell ends with `…`); a workbook keeps its first 50 sheets. Each cut
+  adds a note line, such as `[Only the first 1000 rows are included.]`. An empty row is
+  skipped before any work on its cells, and a long value repeated across cells (one
+  shared string in every cell, say) is cleaned and cut once, not once per cell.
+- **TXT and MD** stay as they are, without a leading BOM.
+- **Images** (PNG, JPEG, WEBP): the EXIF orientation is applied, an animation keeps its
+  first frame, and an image larger than 2,048 pixels on its longest edge is downscaled
+  to fit, keeping its aspect ratio (a smaller one is never enlarged). A JPEG stays a
+  JPEG (quality 85); PNG and WEBP become PNG, with their transparency. The metadata is
+  stripped: EXIF (the GPS location included), ICC profile, XMP, comments and text
+  chunks.
+- **`token_estimate`** is the file's estimated size for the model, in tokens, summed over
+  its parts: text counts one token per ASCII digit (models split numbers into single
+  digits) plus one per 4 bytes of the rest in UTF-8, rounded up; an image counts one
+  token per 750 pixels (a 2,048 × 1,536 image is 4,195 tokens), and a rendered page's
+  label counts as text. It's rough and errs high for German and French text. It's
+  `null` until the file is `ready`, and stays `null` when it fails. Budgeting messages
+  with it comes with [#190](https://github.com/ljakupi/admino/issues/190).
+- **Converted parts** are stored next to the original, in `<attachment ID>.d/` (see
+  [Data & storage](#data--storage)): `part-0001.txt`, `part-0002.jpg` and so on in
+  order, and a `manifest.json` listing each part's file, type, page, label, image size
+  and token count, with the file's page count and token estimate. One file's converted
+  parts are capped at 256 MiB in total: a conversion that would write more fails with
+  `output_too_large`. The converted parts count toward the organization's storage quota,
+  with the original: their size is measured once the conversion is done and stored with
+  the file (`size_bytes` stays the original's size), and a conversion whose parts would
+  put the organization's stored files over its quota fails with
+  `storage_quota_exceeded`. That check comes after the conversion, so the volume briefly
+  holds up to 256 MiB per running conversion beyond the quotas. The parts are deleted
+  with the original, when the conversion fails, and when the attachment was deleted
+  during its conversion. Like the originals, they aren't encrypted at rest.
+- **One process per file.** Each file is converted by its own short-lived Python process
+  (`python -m admino.converters.worker`, started by the agent), at most 2 at once and
+  one per organization. The parsing libraries (pypdfium2, python-docx, openpyxl, Pillow)
+  load only there, never in the agent's own process, so a parser that crashes or runs out
+  of memory fails only its file, with `processing_error`, and the agent keeps running. A
+  conversion still running after 120 seconds is killed and fails with
+  `conversion_timeout`. The process also limits itself to 130 seconds of CPU time and,
+  on Linux, 2 GiB of memory (address space): a parser that goes past either ends it, and
+  the file fails with `processing_error`. On Linux it also turns off its core dumps
+  (a core size of 0), so a parser that crashes leaves no memory image holding the
+  document on the host. The process gets no secret, and on Linux it can't read the
+  agent's either (see [Security Model → Attachments](SECURITY.md#attachments)).
+- **Failure codes.** A failed file has one of these codes in `failure_reason`. Nothing
+  else of the failure (no library message, file name or path) reaches a response, the
+  database or a log line.
+
+  | `failure_reason` | When |
+  | --- | --- |
+  | `file_missing` | the stored file is gone from the volume |
+  | `unsupported_type` | the stored file no longer passes the upload's type check (which can also answer `legacy_office`, `password_protected` or `corrupted_file`, as on upload) |
+  | `password_protected` | a PDF that needs a password or uses an unsupported encryption, a DOCX or XLSX with an encrypted entry |
+  | `corrupted_file` | the file can't be read as its type: a PDF or one of its pages doesn't load, a DOCX or XLSX isn't a readable archive or document (an entry compressed with another method than stored or deflate, or whose real size or checksum differs from what the archive declares, included), a CSV or text file isn't valid UTF-8, an image doesn't decode or is of another type |
+  | `too_many_pages` | a PDF with more pages than `max_pages_per_file` |
+  | `archive_too_large` | a DOCX or XLSX with more than 10,000 entries, one entry over 64 MiB uncompressed, or more than 256 MiB uncompressed in total (a zip bomb): checked from the archive's directory first, then by decompressing each entry once in small chunks, counting its real size and stopping at the limit, before the document is parsed |
+  | `image_too_large` | an image larger than 64 megapixels |
+  | `text_too_large` | more than 10 million characters of converted text (a table stops being built as soon as it passes the limit) |
+  | `output_too_large` | the file's converted parts would take more than 256 MiB |
+  | `storage_quota_exceeded` | with the file's converted parts, the organization's stored files would be over its storage quota |
+  | `conversion_timeout` | the conversion took longer than 120 seconds |
+  | `processing_error` | the conversion process crashed, ran out of memory, went past its CPU or memory limit or gave no valid answer, or another unexpected error |
+
+- **Upgrading.** Files that were `ready` before this release have no converted parts:
+  the upgrade's migration puts them back to `uploaded`, and the agent converts them when
+  it starts.
 
 ## Organizations (Super Admin)
 
@@ -1162,8 +1265,9 @@ a new one to replace it).
 - **Plan limits**: `PATCH /api/platform/orgs/{id}/limits` with any of `seats`,
   `monthly_budget_chf` and `storage_quota`. Lowering the seats below the seats in use is
   allowed; it only stops new invitations until seats are free again. `storage_quota`
-  caps the total size of the organization's [attachments](#attachments); lowering it
-  below what's stored deletes nothing, it only refuses new uploads.
+  caps the total size of the organization's [attachments](#attachments), their original
+  files and converted parts; lowering it below what's stored deletes nothing, it only
+  refuses new uploads and fails new conversions with `storage_quota_exceeded`.
 - **Deactivate and reactivate**: `POST /api/platform/orgs/{id}/deactivate` and
   `POST /api/platform/orgs/{id}/reactivate`. Deactivating logs every member out at once,
   and nobody of that organization can log in or use a link until it's reactivated. Its
@@ -1209,10 +1313,11 @@ log, without names or email addresses.
   details only, never what the users store.
 - `GET /api/platform/orgs/{id}/metadata` returns the seat usage, `seats: {"used",
   "limit"}` (counted like an invitation: active users and pending invitations), the storage
-  used in bytes, the number of the organization's chats that aren't in the trash (a count,
-  never a title), and the number of files. The storage used and the number of files
-  count every [attachment](#attachments) of the organization, those in the trash
-  included: a size and a count, never a file name.
+  used in bytes (`storage_used_bytes`), the number of the organization's chats that
+  aren't in the trash (a count, never a title), and the number of files (`file_count`).
+  Both count every [attachment](#attachments) of the organization, those in the trash
+  included, and the storage used is what the quota counts: the original files plus
+  their converted parts. A size and a count, never a file name.
 - `POST /api/platform/orgs/{id}/users/{user_id}/deactivate` ends every session of the user
   at once and emails them; their chats, connections, notes and settings are kept.
   `.../reactivate` needs a free seat and emails the user a link to log in; it's refused
@@ -1504,7 +1609,7 @@ make ttft                       # TTFT_RUNS=10 make ttft for more runs
 - **What it sends.** For `Qwen/Qwen3.5-397B-A17B-FP8` and `Qwen/Qwen3.5-122B-A10B-FP8`,
   a short prompt and a synthetic 20-page document (about 10,000 words, generated by the
   tool, standing in for an attachment until an attachment's text reaches the model with
-  [#188](https://github.com/ljakupi/admino/issues/188)), `TTFT_RUNS` times each (5 by
+  [#189](https://github.com/ljakupi/admino/issues/189)), `TTFT_RUNS` times each (5 by
   default, 1 to 50), after one warm-up request per model that doesn't count.
 - **How.** Each request is shaped like a chat turn (admino's system prompt and the tool
   definitions of a default organization) and goes through admino's own Infomaniak
@@ -1607,15 +1712,17 @@ attachments' files live on a Docker volume.
   [#194](https://github.com/ljakupi/admino/issues/194).
 - **Attachments** (see [Attachments](#attachments)). The `attachments` table holds each
   file's chat, owner, the message that carried it, its cleaned original name, type,
-  size and status. The files themselves are on the `admino-attachments` Docker volume,
-  mounted on the agent only, at `/app/data/attachments/<organization ID>/<attachment
-  ID>`: owned by `admino`, mode 0600 in directories with mode 0700 (the image and the
-  entrypoint create the directory). A partial upload is `<attachment ID>.part`; derived
-  files ([#188](https://github.com/ljakupi/admino/issues/188)) go under
-  `<attachment ID>.d/`. The original name is only in the database, never on disk. The
-  files are **not encrypted at rest**: protect the volume like the database (an
-  encrypted disk on the host) and back it up with it. `docker volume rm
-  admino-attachments` deletes every file.
+  size, the size of its converted parts, status, page count and token estimate. The
+  files themselves are on the `admino-attachments` Docker volume, mounted on the agent
+  only, at `/app/data/attachments/<organization ID>/<attachment ID>`: owned by `admino`,
+  mode 0600 in directories with mode 0700 (the image and the entrypoint create the
+  directory). A partial upload is `<attachment ID>.part`; a file's converted parts (see
+  [File conversion](#file-conversion)) are in `<attachment ID>.d/`, with the same modes,
+  and count toward the storage quota with the original. The original name is in the
+  database; on disk it appears only inside a converted PDF's page labels
+  (`[<file name> — page N]`), never in a path. The files are **not encrypted at rest**:
+  protect the volume like the database (an encrypted disk on the host) and back it up
+  with it. `docker volume rm admino-attachments` deletes every file.
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the chat's ID, the tool, the action, the permission decision, success and
   duration. Arguments, tool output and message text are never stored. Rows are kept for 12

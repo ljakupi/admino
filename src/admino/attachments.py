@@ -4,22 +4,29 @@ A member uploads a file into one of their chats; it is stored on the
 attachments volume as ``<root>/<org_id>/<attachment_id>`` and described by an
 ``attachments`` row. The row is linked to the user message that sends it
 (``chats.append_messages``) and processed in the background
-(``attachment_processing``).
+(``attachment_processing``), whose conversion writes the derived artifacts
+into ``<root>/<org_id>/<attachment_id>.d/`` (``derived_path``, GH-188) and
+stores the file's token estimate and derived bytes (migration 0028). The
+org's storage quota counts the originals and their derived files.
 
 Inputs: the pool or an executor, the caller's ``TenantContext``, a chat id,
 the already sanitized file name, the declared ``Content-Length``, the request
 body as an async iterator of chunks, the attachments root, the platform's
 maximum file size and the client IP (for the audit event).
-Outputs: ``AttachmentRecord``s, ``(file_count, used_bytes)`` of an org, the
-number of disk entries removed. Errors: ``AttachmentRefusedError`` (with a
+Outputs: ``AttachmentRecord``s, ``(file_count, used_bytes)`` of an org, its
+``(quota_bytes, used_bytes)`` under its row lock (``lock_org_storage``, for
+the upload's commit check and the processing step's ready outcome), the
+number of disk entries removed (``remove_files``; ``remove_derived`` removes
+one attachment's ``<id>.d`` only). Errors: ``AttachmentRefusedError`` (with a
 reason code), ``chats.ChatNotFoundError``, ``AttachmentNotFoundError``,
 ``AttachmentAlreadySentError``, ``audit_events.AuditRecordError`` and the
 driver's errors.
 
 Upload order (``upload_attachment``): the size checks, the chat's owner
-check, a quota pre-check that counts the org's stored rows plus the bytes
-reserved by its uploads in progress (all before the body is read), the
-declared length reserved for the org, the body streamed to ``<id>.part``
+check, a quota pre-check that counts the org's stored rows (originals and
+derived files) plus the bytes reserved by its uploads in progress (all
+before the body is read), the declared length reserved for the org, the
+body streamed to ``<id>.part``
 (each chunk within ``STALL_TIMEOUT_S``, the whole body within
 ``UPLOAD_GRACE_S`` plus the declared length at ``UPLOAD_MIN_RATE_BYTES_S``),
 type detection in a worker thread (at most ``DETECT_CONCURRENCY`` at once
@@ -39,8 +46,8 @@ Security notes:
   someone else's chat impossible in the database too.
 - The file is named by its id only; the original name lives in the row.
   Directories are created 0700, files 0600; the partial file is created
-  exclusively and never through a symlink. ``remove_files`` unlinks a
-  symlink instead of following it.
+  exclusively and never through a symlink. ``remove_files`` and
+  ``remove_derived`` unlink a symlink instead of following it.
 - A refused or failed upload leaves no row, no file and no audit event: the
   partial (or renamed) file is removed on every failure before the commit,
   cancellation included, and on a COMMIT the server refuses. After the
@@ -57,7 +64,8 @@ Security notes:
   per-chunk and a total deadline), and type detection (the
   ZIP directory parse grows with the file) is bounded across uploads.
 - No content in logs: nothing here logs a file name, a path or file bytes;
-  ``remove_files`` logs ids and an exception's class name only.
+  ``remove_files`` and ``remove_derived`` log ids and an exception's class
+  name only.
 - Parameterized SQL only (the contract's forms A1-A8), every value a bind
   parameter. Imports nothing from the server, agent, LLM or tools layers.
 """
@@ -138,25 +146,31 @@ _LOCK_CHAT_SQL: Final = """
 _LOCK_QUOTA_SQL: Final = (
     "SELECT storage_quota_bytes FROM organizations WHERE id = $1 FOR NO KEY UPDATE"
 )
-# A4: the org's used storage, trashed files included (numeric: int() it).
-_USED_SQL: Final = "SELECT coalesce(sum(size_bytes), 0) FROM attachments WHERE org_id = $1"
-# A5: the new row (status, reason, page count and timestamps by default).
+# A4': the org's used storage: the originals and their derived files (a NULL
+# derived_bytes counts 0), trashed files included (numeric: int() it).
+_USED_SQL: Final = (
+    "SELECT coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0)"
+    " FROM attachments WHERE org_id = $1"
+)
+# A5: the new row (status, reason, page count, estimate and timestamps by default).
 _INSERT_SQL: Final = """
     INSERT INTO attachments (id, org_id, chat_id, owner_user_id, filename, kind, size_bytes)
     VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
-              page_count, created_at
+              page_count, token_estimate, created_at
 """
 # A6: the caller's live attachment.
 _GET_SQL: Final = """
     SELECT id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
-           page_count, created_at
+           page_count, token_estimate, created_at
     FROM attachments
     WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
 """
-# A7: the org's file count and used bytes (numeric: int() it).
+# A7': the org's file count and used bytes, derived files included as in A4'
+# (numeric: int() it).
 _STORAGE_SQL: Final = """
-    SELECT count(*) AS file_count, coalesce(sum(size_bytes), 0) AS used_bytes
+    SELECT count(*) AS file_count,
+           coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0) AS used_bytes
     FROM attachments WHERE org_id = $1
 """
 # A8: which of the given ids are the caller's live attachments of the chat.
@@ -187,6 +201,7 @@ class AttachmentRecord(SealedModel):
     status: AttachmentStatus
     failure_reason: str | None
     page_count: int | None
+    token_estimate: int | None
     created_at: datetime
 
 
@@ -216,6 +231,11 @@ def attachments_root() -> Path:
 def attachment_path(root: Path, org_id: UUID, attachment_id: UUID) -> Path:
     """Where an attachment's file lives: ``root/<org_id>/<attachment_id>``."""
     return root / str(org_id) / str(attachment_id)
+
+
+def derived_path(root: Path, org_id: UUID, attachment_id: UUID) -> Path:
+    """Where an attachment's derived artifacts live: ``root/<org_id>/<attachment_id>.d``."""
+    return root / str(org_id) / f"{attachment_id}.d"
 
 
 @contextlib.contextmanager
@@ -421,9 +441,8 @@ async def _store(
                 locked = await conn.fetchval(_LOCK_CHAT_SQL, chat_id, tenant.org_id, tenant.user_id)
                 if locked is None:
                     raise chats.ChatNotFoundError
-                quota = await conn.fetchval(_LOCK_QUOTA_SQL, tenant.org_id)
-                used = await conn.fetchval(_USED_SQL, tenant.org_id)
-                if int(used) + declared_length > quota:
+                storage = await lock_org_storage(conn, tenant.org_id)
+                if storage is None or storage[1] + declared_length > storage[0]:
                     raise AttachmentRefusedError("storage_quota_exceeded")
                 row = await conn.fetchrow(
                     _INSERT_SQL,
@@ -485,8 +504,29 @@ async def get_attachment(
     return _record(row)
 
 
+async def lock_org_storage(conn: Executor, org_id: UUID) -> tuple[int, int] | None:
+    """Lock the org's row and return its ``(quota_bytes, used_bytes)`` (A3, then A4').
+
+    Runs inside the caller's transaction: the org row stays locked ``FOR NO
+    KEY UPDATE`` until it ends, so the org's uploads and conversions check
+    the quota one after the other. ``used_bytes`` counts the originals and
+    their derived files, trashed ones included.
+
+    Returns:
+        The quota and the used bytes; None when the org doesn't exist (any
+        more): nothing else is read then.
+    """
+    quota = await conn.fetchval(_LOCK_QUOTA_SQL, org_id)
+    if quota is None:
+        return None
+    return int(quota), int(await conn.fetchval(_USED_SQL, org_id))
+
+
 async def org_storage(executor: Executor, org_id: UUID) -> tuple[int, int]:
-    """Return the org's ``(file_count, used_bytes)``: every row of the org, trashed included."""
+    """Return the org's ``(file_count, used_bytes)``: every row of the org, trashed included.
+
+    ``used_bytes`` counts the originals and their derived files (A7').
+    """
     row = await executor.fetchrow(_STORAGE_SQL, org_id)
     return int(row["file_count"]), int(row["used_bytes"])
 
@@ -516,29 +556,38 @@ async def check_sendable(
         raise AttachmentAlreadySentError
 
 
+def _remove_entry(path: Path, attachment_id: UUID) -> bool:
+    """Remove one disk entry of ``attachment_id``; True when something was removed.
+
+    A missing entry is False; an ``OSError`` is logged with its class name and
+    the id only (its message holds the path) and is False too.
+    """
+    try:
+        # lstat: a symlink is unlinked itself, never followed; rmtree never
+        # follows a link inside the tree either.
+        if stat.S_ISDIR(os.lstat(path).st_mode):
+            shutil.rmtree(path)
+        else:
+            os.unlink(path)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Attachment file %s couldn't be removed (%s).",
+            safe_log(attachment_id),
+            type(exc).__name__,
+        )
+        return False
+    return True
+
+
 def _remove_entries(org_dir: Path, attachment_ids: list[UUID]) -> int:
     """Remove ``<id>``, ``<id>.part`` and the ``<id>.d`` tree of each id; count them."""
     removed = 0
     for attachment_id in attachment_ids:
         for name in (str(attachment_id), f"{attachment_id}.part", f"{attachment_id}.d"):
-            path = org_dir / name
-            try:
-                # lstat: a symlink is unlinked itself, never followed; rmtree
-                # never follows a link inside the tree either.
-                if stat.S_ISDIR(os.lstat(path).st_mode):
-                    shutil.rmtree(path)
-                else:
-                    os.unlink(path)
-            except FileNotFoundError:
-                continue
-            except OSError as exc:
-                logger.warning(
-                    "Attachment file %s couldn't be removed (%s).",
-                    safe_log(attachment_id),
-                    type(exc).__name__,
-                )
-                continue
-            removed += 1
+            if _remove_entry(org_dir / name, attachment_id):
+                removed += 1
     return removed
 
 
@@ -553,3 +602,14 @@ async def remove_files(root: Path, org_id: UUID, attachment_ids: Iterable[UUID])
         How many entries were removed (a tree counts once).
     """
     return await asyncio.to_thread(_remove_entries, root / str(org_id), list(attachment_ids))
+
+
+async def remove_derived(root: Path, org_id: UUID, attachment_id: UUID) -> None:
+    """Remove the attachment's derived artifacts (``<id>.d``), in a worker thread.
+
+    A directory goes as a tree; a symlink or a file at that name is unlinked,
+    never followed. A missing entry is fine. The original ``<id>`` is never
+    touched. Never raises: an ``OSError`` is logged with its class name and
+    the id only.
+    """
+    await asyncio.to_thread(_remove_entry, derived_path(root, org_id, attachment_id), attachment_id)
