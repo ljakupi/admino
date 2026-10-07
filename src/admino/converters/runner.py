@@ -28,8 +28,9 @@ Security notes:
   the child is killed and reaped at once (``processing_error``), so a child
   flooding its stdout can't fill the server's memory.
 - However the call ends (an error, the deadline, a KeyboardInterrupt), the
-  child is killed if still running and reaped: no process outlives the call.
-  Its own children are the container init's (``init: true``) to reap.
+  child is killed if still running and reaped. Its own children are not
+  killed here: they run until they exit, and the container's init
+  (``init: true``) reaps them then.
 - The argv is fixed (``WORKER_ARGV``, ``subprocess.Popen`` without a shell);
   the job (the path and the file name) travels on stdin, never in the argv
   a process listing shows.

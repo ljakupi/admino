@@ -121,11 +121,13 @@ make run
 environment. See [Database roles](SECURITY.md#database-roles).
 
 `make run` keeps uploaded files under `data/attachments` in your checkout (the `data`
-folder is git-ignored). It creates the folder, readable by you only, and passes it to
-the app as `ADMINO_ATTACHMENTS_ROOT`. To keep the files somewhere else, export an
-absolute path before `make run`, for example
+folder is git-ignored). It creates the folder if it's missing, sets its mode to 0700
+(readable by you only) and passes it to the app as `ADMINO_ATTACHMENTS_ROOT`. To keep
+the files somewhere else, export an absolute path to a folder used by admino only
+before `make run`, for example
 `export ADMINO_ATTACHMENTS_ROOT="$HOME/admino-attachments"`: an exported value wins. A
-relative path stops the app at startup. See
+relative path stops the app at startup. Changing the folder later doesn't move the
+files already stored: stop the app and move the folder yourself. See
 [Data & storage](configuration.md#data--storage).
 
 The API comes up on **http://localhost:8000**. Continue to

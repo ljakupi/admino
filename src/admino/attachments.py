@@ -45,7 +45,8 @@ Security notes:
   text. The composite foreign key of migration 0027 makes an attachment of
   someone else's chat impossible in the database too.
 - The file is named by its id only; the original name lives in the row.
-  Directories are created 0700, files 0600; the partial file is created
+  Directories are created 0700 (a missing root too; an existing root's
+  mode is left alone), files 0600; the partial file is created
   exclusively and never through a symlink. ``remove_files`` and
   ``remove_derived`` unlink a symlink instead of following it.
 - A refused or failed upload leaves no row, no file and no audit event: the
@@ -253,8 +254,13 @@ def _disk_errors() -> Iterator[None]:
 
 
 def _create_part(org_dir: Path, part: Path) -> BinaryIO:
-    """Create the org's directory (0700) if needed and ``part`` exclusively (0600)."""
-    org_dir.mkdir(parents=True, exist_ok=True, mode=_DIRECTORY_MODE)
+    """Create the root and the org's directory (0700) if needed and ``part`` exclusively (0600).
+
+    Only a missing root gets 0700 (its parents keep the default mode); an
+    existing root's mode is the operator's and is left alone.
+    """
+    org_dir.parent.mkdir(parents=True, exist_ok=True, mode=_DIRECTORY_MODE)
+    org_dir.mkdir(exist_ok=True, mode=_DIRECTORY_MODE)
     return os.fdopen(os.open(part, _PART_FLAGS, _FILE_MODE), "wb")
 
 

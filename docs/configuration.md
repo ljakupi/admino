@@ -1106,12 +1106,13 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   extension doesn't match the detected type, the type's extension is added (`page.html`
   stored as text downloads as `page.html.txt`). Downloads accept a `Range` header: a
   valid one answers `206` with the bytes asked for (several ranges come as
-  `multipart/byteranges`). A `Range` that is malformed, or starts at or past the end of
-  the file, answers `416` `{"detail": "Range not satisfiable", "reason":
-  "range_not_satisfiable"}` with `Content-Range: bytes */<file size>`. A `Range` sent with
-  an `If-Range` that no longer matches the file's `ETag` or `Last-Modified` is ignored:
-  the whole file comes back with `200`. The owner check comes first, so an attachment
-  that isn't yours is the `404` whatever its `Range`.
+  `multipart/byteranges`). A `Range` that is malformed, starts at or past the end of the
+  file, is longer than 1,024 characters or asks for more than 16 parts (ranges that
+  overlap or touch count as one part) answers `416` `{"detail": "Range not
+  satisfiable", "reason": "range_not_satisfiable"}` with `Content-Range: bytes */<file
+  size>`. A `Range` sent with an `If-Range` that no longer matches the file's `ETag` or
+  `Last-Modified` is ignored: the whole file comes back with `200`. The owner check comes
+  first, so an attachment that isn't yours is the `404` whatever its `Range`.
 - **Rate limits** apply per user, each answering `429` `{"detail": "Rate limit
   exceeded"}`: uploads a burst of `max_files_per_message`, then one every 2 seconds;
   metadata 5 per second (burst 50); downloads 2 per second (burst 30). A user also has
@@ -1751,7 +1752,15 @@ attachments' files live on a Docker volume.
   it to `/app/data/attachments` for the agent, so a value in `.env` meant for a native
   run never moves the container's files off the volume. `make run` sets it to
   `data/attachments` in your checkout (see
-  [Getting started](getting-started.md#3-run-locally-with-uv)).
+  [Getting started](getting-started.md#3-run-locally-with-uv)). A root that doesn't exist
+  yet is created with mode 0700; an existing one keeps its permissions.
+
+  The root must be a dedicated directory, used by admino only: the cleanup of unsent
+  files treats every directory under it whose name is a UUID as an organization's and
+  deletes the entries in it that admino doesn't know. Changing the setting doesn't move
+  the existing files. Files left under the old root are no longer downloaded, deleted
+  with their user or organization, or cleaned up. To change it, stop admino, move the
+  whole folder (keeping its permissions) to the new path by hand, then start admino again.
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the chat's ID, the tool, the action, the permission decision, success and
   duration. Arguments, tool output and message text are never stored. Rows are kept for 12

@@ -353,7 +353,11 @@ conversion in `attachment_processing.py` and `converters/`:
   in `failure_reason`: a library's message, the file name and paths never reach the
   database, a response or a log line. The agent's container runs under an init process
   (`init: true` in every Compose profile), which reaps the orphaned processes a killed
-  conversion may leave behind, so they don't pile up as zombies.
+  conversion may leave behind, so they don't pile up as zombies. The agent always kills
+  and reaps the child itself, but not the processes the child started: the grandchildren
+  of a killed conversion are not killed, they keep running until they exit, and the
+  container's init reaps them when they exit. Each one inherits the child's limits, so
+  its CPU time is bounded by the same 130 seconds (`RLIMIT_CPU`).
 - **The agent's secrets and code stay out of the child's reach.** The child runs as the
   agent's user, so on Linux the agent makes its own process non-dumpable at startup
   (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's
@@ -401,7 +405,10 @@ conversion in `attachment_processing.py` and `converters/`:
   uploaded HTML or SVG file never opens as a page of admino. A malformed or
   unsatisfiable `Range` header answers `416` with the fixed code `range_not_satisfiable`
   (never the header's text), and only after the owner check and the file lookup, so a
-  `Range` never reveals whether someone else's file exists or how large it is.
+  `Range` never reveals whether someone else's file exists or how large it is. So does a
+  `Range` longer than 1,024 characters or asking for more than 16 parts (ranges that
+  overlap or touch count as one), so a request for thousands of one-byte parts can't
+  hold the server's single worker busy for every organization.
 - **Names stay in the database.** The original name comes in a header, never in the URL
   (so not in an access log). It's cleaned (its last path segment only, without control
   or invisible formatting characters, at most 255 characters) and stored in the
@@ -563,7 +570,12 @@ We prefer to be transparent about what this does **not** guarantee:
   attachments volume, originals and converted parts; reach the internal network (the
   database, the vLLM container, the agent's own port) and the approved hosts; send DNS
   queries to any resolver (see *DNS egress is broad* above); and signal the agent's
-  process. Closing that takes a real sandbox, and the options for a follow-up are
+  process. Under `init: true` the agent is no longer the container's PID 1, which the
+  kernel shields from those signals, so a compromised conversion child can stop or kill
+  the agent's process. A killed agent ends its container, which the restart policy starts
+  again; a stopped one freezes admino for every organization until you restart it by
+  hand (`docker compose restart agent`), as the restart policy acts only on an exit.
+  Closing that takes a real sandbox, and the options for a follow-up are
   Landlock (Linux 5.13 and later), confining the child to its one file and its output
   directory, or a separate converter container with its own user and no network. The
   parsers are pinned; keep admino up to date, as their security fixes arrive as
