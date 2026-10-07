@@ -28,7 +28,9 @@ What these tests pin down:
   ``<uuid>.part`` or ``<uuid>.d``: a ``.part`` is always removed; ``<uuid>`` and
   ``<uuid>.d`` are removed unless G3 (scoped to that org) finds the row, trashed
   rows included (their files wait for #194). Kept: younger entries, other names
-  (``notes.txt``, ``<uuid>.tmp``), anything under a non-UUID directory, a plain file
+  (``notes.txt``, ``<uuid>.tmp``; a UUID that isn't in the canonical lower-case
+  form, e.g. upper-case or braced: regression guard), anything under a non-UUID
+  directory, a plain file
   under ``root``, an org directory that is a symlink (never followed). A symlink in
   an org directory is unlinked; its target (a file or a directory) is untouched.
   The mtime cutoff comes from ``now``. A directory that can't be read doesn't stop
@@ -619,6 +621,22 @@ class TestStrayEntries:
             _entry(root, ORG_ID, f"{uuid.uuid4()}.tmp", now, age=_OLD),
             _entry(root, ORG_ID, "not-a-uuid.part", now, age=_OLD),
         ]
+
+        result = await gc.collect_garbage(db.pool, root, now=now)
+
+        assert (result, _present(paths)) == (0, [True, True, True])
+
+    async def test_attachment_gc_non_canonical_uuid_names_are_kept(
+        self, gc: ModuleType, db: FakeDb, world: _World, root: Path, now: datetime
+    ) -> None:
+        """Regression guard: only the canonical lower-case form the app writes is a
+        candidate. Old entries named with an upper-case or a braced form of a UUID
+        that has no row (an upper-case ``.part`` too) aren't the app's and stay."""
+        # Fixed ids holding letters, so the upper-case form always differs.
+        upper = "5F0C2A9E-7B1D-4C3E-9A8F-0D6E1B2C3A4F"
+        braced = "{c7d2e4f1-3a5b-4c6d-8e9f-a1b2c3d4e5f6}"
+        upper_part = "E3B0C442-98FC-4C14-9AFB-F4C8996FB924.part"
+        paths = [_entry(root, ORG_ID, name, now, age=_OLD) for name in (upper, braced, upper_part)]
 
         result = await gc.collect_garbage(db.pool, root, now=now)
 

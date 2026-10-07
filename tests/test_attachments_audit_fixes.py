@@ -35,15 +35,18 @@ F2, the ZIP central directory (core M-1):
   Detecting a ZIP with a 24 MiB directory never allocates near its size
   (tracemalloc peak below 8 MiB; listing it uncapped takes about 48 MiB).
 - ``attachments.DETECT_CONCURRENCY`` is 2: five concurrent uploads never run
-  more than two ``detect_kind`` calls at once, and all five are stored.
+  more than two ``detect_kind`` calls at once, and all five are stored. A
+  cancelled upload keeps its detection slot until its detection thread ends
+  (regression guard): a waiting upload's detection starts only then.
 F3, zipfile errors (core L-1): an entry whose "version needed to extract" is
 unsupported (zipfile raises ``NotImplementedError``) and any other exception
 from zipfile are ``corrupted_file`` (over HTTP 422, never a 500); a
 ``MemoryError`` propagates.
 F4, after the commit (core L-2): an exception after the transaction committed
 (a cancellation while the connection is released) leaves the row, the
-``file.upload`` event and the file ``<id>``; a commit that fails still removes
-``<id>`` and ``<id>.part`` (regression guard).
+``file.upload`` event and the file ``<id>``; so does an error that says nothing
+about the commit (a RuntimeError from the release, regression guard); a commit
+that fails still removes ``<id>`` and ``<id>.part`` (regression guard).
 
 The new names are only looked up inside the tests (monkeypatched with
 ``raising=False``), so the file collects against the code before the fixes and
@@ -286,6 +289,29 @@ class _GatedDetection:
                 self.running -= 1
 
 
+class _PerCallGatedDetection:
+    """Stands in for ``detect_kind``: the n-th call (in the order the calls enter)
+    waits in its worker thread until ``gates[n]`` is set, then runs the real
+    detection. ``entered`` counts the calls that started."""
+
+    def __init__(self, real: Callable[[Path, str], Any], calls: int = 8) -> None:
+        self.real = real
+        self.gates = [threading.Event() for _ in range(calls)]
+        self.entered = 0
+        self._lock = threading.Lock()
+
+    def __call__(self, path: Path, filename: str) -> Any:
+        with self._lock:
+            index = self.entered
+            self.entered += 1
+        self.gates[index].wait(timeout=_WAIT_S + 2)
+        return self.real(path, filename)
+
+    def release_all(self) -> None:
+        for gate in self.gates:
+            gate.set()
+
+
 # ---------------------------------------------------------------------------
 # The upload service (admino.attachments) against the FakeDb
 # ---------------------------------------------------------------------------
@@ -331,6 +357,11 @@ class _ClientGoneError(Exception):
 
 class _CommitFailedError(Exception):
     """What the wrapped transaction raises in place of a successful COMMIT."""
+
+
+class _ReleaseFailedError(RuntimeError):
+    """What releasing the connection raises after a successful COMMIT: neither a
+    cancellation nor a connection or socket error (the commit's outcome is known)."""
 
 
 @dataclass
@@ -714,6 +745,49 @@ class TestAttachmentsDetectConcurrency:
         assert (peak_while_held, detection.peak) == (2, 2)
         assert ([outcome[0] for outcome in outcomes], detection.calls) == (["stored"] * 5, 5)
 
+    async def test_attachments_cancelled_upload_keeps_its_detection_slot_until_its_thread_ends(
+        self, att: ModuleType, at: ModuleType, world: _World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard (Decision 18: at most 2 files type-checked at once): two
+        uploads hold both detection slots and a third waits. Cancelling the first
+        doesn't stop its detection thread, so the third's detection doesn't start
+        (none within 0.3 s) until that thread is released; then it does, and the
+        second and third are stored."""
+        detection = _PerCallGatedDetection(at.detect_kind)
+        _patch_both(monkeypatch, att, at, "detect_kind", detection)
+
+        def start() -> asyncio.Task[tuple[str, Any]]:
+            body = _Body([b"t" * 10]).stream()
+            return asyncio.create_task(_try_upload(att, at, world, body, declared=10))
+
+        first = start()
+        others: list[asyncio.Task[tuple[str, Any]]] = []
+        try:
+            assert await _until(lambda: detection.entered >= 1), "no detection started"
+            others.append(start())
+            assert await _until(lambda: detection.entered >= 2), "no second detection"
+            others.append(start())
+            await asyncio.sleep(0.1)
+            entered_before_cancel = detection.entered
+            first.cancel()
+            await asyncio.wait([first], timeout=_WAIT_S)
+            first_cancelled = first.cancelled()
+            await asyncio.sleep(0.3)
+            entered_while_its_thread_runs = detection.entered
+            detection.gates[0].set()
+            started_once_it_ended = await _until(lambda: detection.entered >= 3)
+        finally:
+            detection.release_all()
+        outcomes = await asyncio.gather(*others)
+
+        assert (
+            entered_before_cancel,
+            first_cancelled,
+            entered_while_its_thread_runs,
+            started_once_it_ended,
+        ) == (2, True, 2, True)
+        assert [outcome[0] for outcome in outcomes] == ["stored", "stored"]
+
 
 class TestAttachmentsAfterCommit:
     """F4: only an upload that didn't commit removes its files."""
@@ -738,6 +812,36 @@ class TestAttachmentsAfterCommit:
         data = b"Protokoll der Sitzung vom Montag.\n"
 
         with pytest.raises(asyncio.CancelledError):
+            await _upload(att, world, _Body([data]).stream(), declared=len(data))
+        ids = list(db.attachments)
+        stored = world.root / str(ORG_ID) / str(ids[0]) if ids else None
+        content = stored.read_bytes() if stored is not None and stored.exists() else None
+
+        assert [outcome for _, outcome in db.transactions] == ["commit"]
+        assert (len(ids), len(db.audit_rows("file.upload"))) == (1, 1)
+        assert (_left_on_disk(world.root), content) == ([f"{ORG_ID}/{ids[0]}"], data)
+
+    async def test_attachments_other_error_after_the_commit_keeps_the_row_and_the_file(
+        self, att: ModuleType, world: _World, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: the transaction commits, then releasing the connection
+        raises a RuntimeError (not an unknown-commit-outcome error): it propagates, and
+        the row, its file.upload event and the file <id> (with the bytes) stay; no
+        .part. A committed upload never removes its file, whatever fails next."""
+        db = world.db
+        real_acquire = db.pool.acquire
+
+        @contextlib.asynccontextmanager
+        async def acquire() -> AsyncIterator[Any]:
+            async with real_acquire() as conn:
+                yield conn
+            if db.transactions and db.transactions[-1][1] == "commit":
+                raise _ReleaseFailedError
+
+        monkeypatch.setattr(db.pool, "acquire", acquire)
+        data = b"Protokoll der Sitzung vom Dienstag.\n"
+
+        with pytest.raises(_ReleaseFailedError):
             await _upload(att, world, _Body([data]).stream(), declared=len(data))
         ids = list(db.attachments)
         stored = world.root / str(ORG_ID) / str(ids[0]) if ids else None

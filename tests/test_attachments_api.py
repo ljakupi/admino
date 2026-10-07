@@ -51,7 +51,8 @@ What these tests pin down:
   models.
 - Metadata and download: the owner's live attachment only; another org's, a
   colleague's (an Org Admin included), a trashed and an unknown attachment, and
-  a row whose file is gone, are one 404 ``attachment_not_found``; a non-UUID id
+  a row whose file is gone (or is a directory, not a regular file: regression
+  guard), are one 404 ``attachment_not_found``; a non-UUID id
   is 422 like the chat routes. Downloads: the stored bytes, ``Content-Type`` per
   kind (text kinds with ``charset=utf-8``), ``Content-Disposition`` exactly
   ``attachment; filename*=UTF-8''`` plus the percent-encoded download name (the
@@ -1551,6 +1552,22 @@ class TestAttachmentsRead:
     def test_attachments_api_download_of_a_row_whose_file_is_gone_is_404(self, env: _Env) -> None:
         caller = env.world.a["editor"]
         attachment = _seed(env, caller, write=False)
+
+        response = _content(env.client, caller, attachment)
+
+        assert _outcome(response) == (404, _ATTACHMENT_NOT_FOUND)
+
+    def test_attachments_api_download_of_a_non_regular_entry_is_404(self, env: _Env) -> None:
+        """Regression guard: a directory at <root>/<org>/<id> (where the stored file
+        belongs) is never served and is no 500: the same 404 as a missing file."""
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller, write=False)
+        assert caller.org_id is not None
+        org_dir = env.root / str(caller.org_id)
+        org_dir.mkdir(mode=0o700, exist_ok=True)
+        entry = org_dir / str(attachment)
+        entry.mkdir(mode=0o700)
+        (entry / "page-1.png").write_bytes(b"derived")
 
         response = _content(env.client, caller, attachment)
 

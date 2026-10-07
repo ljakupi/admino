@@ -37,7 +37,10 @@ pure module before anything is stored. What these tests pin down:
   stream -> protected, else ``legacy_office``; text as strict UTF-8 over the
   whole file (a BOM allowed, a multi-byte character across a read boundary
   fine, a truncated sequence at EOF refused) without U+0000..U+0008, U+000B,
-  U+000E..U+001F or U+007F (TAB, LF, FF, CR allowed).
+  U+000E..U+001F, U+007F or a C1 control U+0080..U+009F (TAB, LF, FF, CR
+  allowed; checked on the decoded text, so also after a BOM and when the
+  character's two bytes straddle a read boundary; U+00A0 and U+00A9, just
+  above C1, are text).
 - Spoofs: content wins over the name (PNG named ``.pdf`` is png), an
   executable named ``.pdf``/``.txt``/``.png`` is unsupported, HTML and SVG are
   plain text.
@@ -715,14 +718,47 @@ class TestDetectKindText:
     """Strict UTF-8 over the whole file, no control characters but TAB/LF/FF/CR."""
 
     @pytest.mark.parametrize(
-        "code", [0x00, 0x08, 0x0B, 0x0E, 0x1F, 0x7F], ids=lambda code: f"u{code:04x}"
+        "code",
+        # C0 and DEL, then C1 (U+0080..U+009F: NEL U+0085, CSI U+009B), whose
+        # UTF-8 form is two bytes (0xC2 then the code).
+        [0x00, 0x08, 0x0B, 0x0E, 0x1F, 0x7F, 0x80, 0x85, 0x9B, 0x9F],
+        ids=lambda code: f"u{code:04x}",
     )
     def test_attachment_types_detect_kind_text_with_a_control_character_is_unsupported(
         self, tmp_path: Path, at: ModuleType, code: int
     ) -> None:
-        data = b"name,amount\nAlpha," + bytes([code]) + b"12\n"
+        data = b"name,amount\nAlpha," + chr(code).encode("utf-8") + b"12\n"
 
         assert _detect(at, _write(tmp_path, data), "amounts.csv") == "unsupported_type"
+
+    @pytest.mark.parametrize("code", [0xA0, 0xA9], ids=lambda code: f"u{code:04x}")
+    def test_attachment_types_detect_kind_text_just_above_c1_is_text(
+        self, tmp_path: Path, at: ModuleType, code: int
+    ) -> None:
+        """Regression guard: the refused range ends at U+009F; NO-BREAK SPACE and the
+        COPYRIGHT SIGN (0xC2 0xA0, 0xC2 0xA9) are ordinary text."""
+        data = b"name,amount\nAlpha," + chr(code).encode("utf-8") + b"12\n"
+
+        assert _detect(at, _write(tmp_path, data), "amounts.csv") == "csv"
+
+    def test_attachment_types_detect_kind_bom_then_c1_control_is_unsupported(
+        self, tmp_path: Path, at: ModuleType
+    ) -> None:
+        """The BOM is skipped, the check isn't: a CSI right after it is refused."""
+        data = b"\xef\xbb\xbf" + chr(0x9B).encode("utf-8") + b"31m red\n"
+
+        assert _detect(at, _write(tmp_path, data), "notes.md") == "unsupported_type"
+
+    def test_attachment_types_detect_kind_c1_control_across_a_read_chunk_is_unsupported(
+        self, tmp_path: Path, at: ModuleType
+    ) -> None:
+        """A NEL whose two bytes straddle the 4 MiB offset (past the first read chunk)
+        is still found: the check runs on the decoded text, not on each chunk's bytes."""
+        nel = chr(0x85).encode("utf-8")
+        data = b"a" * (_BOUNDARY - 1) + nel + b"tail\n"
+        assert data[_BOUNDARY - 1 : _BOUNDARY + 1] == nel
+
+        assert _detect(at, _write(tmp_path, data), "notes.txt") == "unsupported_type"
 
     def test_attachment_types_detect_kind_text_allows_tab_lf_ff_and_cr(
         self, tmp_path: Path, at: ModuleType

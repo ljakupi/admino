@@ -32,7 +32,8 @@ What these tests pin down:
     return value is the final status.
 - ``verify_stored_file(path, kind)``: a missing file fails with
   ``file_missing``; a stored file ``detect_kind`` refuses fails with that
-  refusal's reason; bytes of another kind fail with ``corrupted_file``; every
+  refusal's reason (a stored ``txt`` holding the C1 control NEL U+0085 is
+  ``unsupported_type``); bytes of another kind fail with ``corrupted_file``; every
   kind's valid bytes pass with ``ProcessedFile(page_count=None)``. The stored
   file has no extension (it is named by its id): the recorded kind's canonical
   extension picks among the text kinds (csv, md, txt).
@@ -130,6 +131,8 @@ _EXECUTABLE: Final = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff" + b"\
 _CSV: Final = b"name,amount\nalpha,1\nbeta,2\n"
 _MD: Final = b"# Notes\n\n- one\n- two\n"
 _TXT: Final = b"plain text, nothing else\n"
+# Text with a C1 control: NEL (U+0085, UTF-8 0xC2 0x85) between two lines.
+_TXT_NEL: Final = b"line one" + chr(0x85).encode("utf-8") + b"line two\n"
 
 
 def _png() -> bytes:
@@ -724,6 +727,7 @@ class TestVerifyStoredFile:
             pytest.param(_PDF_ENCRYPTED, "pdf", "password_protected", id="encrypted-pdf"),
             pytest.param(_PDF_TRUNCATED, "pdf", "corrupted_file", id="truncated-pdf"),
             pytest.param(_EXECUTABLE, "txt", "unsupported_type", id="binary-as-txt"),
+            pytest.param(_TXT_NEL, "txt", "unsupported_type", id="c1-control-as-txt"),
             pytest.param(_CFB, "docx", "legacy_office", id="legacy-office-as-docx"),
         ],
     )
