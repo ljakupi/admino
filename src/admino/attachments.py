@@ -20,15 +20,16 @@ Upload order (``upload_attachment``): the size checks, the chat's owner
 check, a quota pre-check that counts the org's stored rows plus the bytes
 reserved by its uploads in progress (all before the body is read), the
 declared length reserved for the org, the body streamed to ``<id>.part``
-(each chunk within ``STALL_TIMEOUT_S``), type detection in a worker thread
-(at most ``DETECT_CONCURRENCY`` at once across uploads), then one
-transaction: the chat row locked ``FOR SHARE`` (it must still be live), the
-org row locked ``FOR NO KEY UPDATE`` (the quota checked again against the
-stored rows, so concurrent uploads can't overrun it), the INSERT, the
-``file.upload`` event and the rename of ``<id>.part`` to ``<id>`` before the
-commit. The reservation is released when the upload ends, however it ends.
-The lock order (chat, then org) is the one user deletion, the org notice and
-the org purge take.
+(each chunk within ``STALL_TIMEOUT_S``, the whole body within
+``UPLOAD_GRACE_S`` plus the declared length at ``UPLOAD_MIN_RATE_BYTES_S``),
+type detection in a worker thread (at most ``DETECT_CONCURRENCY`` at once
+across uploads), then one transaction: the chat row locked ``FOR SHARE``
+(it must still be live), the org row locked ``FOR NO KEY UPDATE`` (the
+quota checked again against the stored rows, so concurrent uploads can't
+overrun it), the INSERT, the ``file.upload`` event and the rename of
+``<id>.part`` to ``<id>`` before the commit. The reservation is released
+when the upload ends, however it ends. The lock order (chat, then org) is
+the one user deletion, the org notice and the org purge take.
 
 Security notes:
 - Tenancy: every statement binds the caller's org (and, for one member's
@@ -42,13 +43,18 @@ Security notes:
   symlink instead of following it.
 - A refused or failed upload leaves no row, no file and no audit event: the
   partial (or renamed) file is removed on every failure before the commit,
-  cancellation included. After the commit, a later exception (a cancelled
-  connection release) never removes the stored file.
+  cancellation included, and on a COMMIT the server refuses. After the
+  commit, a later exception (a cancelled connection release) never removes
+  the stored file; neither does a cancellation, a lost connection or a
+  socket error during the COMMIT itself, whose outcome is unknown (a file
+  left without a row is removed by the GC's stray-file sweep, a row left
+  without its file would stay broken).
   A disk error is ``storage_unavailable``, never its message.
 - The body is never read past the declared length. Uploads in progress
   can't fill the volume past the org's quota (their declared lengths are
-  reserved in this process, which runs as a single worker), a stalled body
-  can't hold its reservation and partial file open, and type detection (the
+  reserved in this process, which runs as a single worker), a stalled or
+  trickled body can't hold its reservation and partial file open (a
+  per-chunk and a total deadline), and type detection (the
   ZIP directory parse grows with the file) is bounded across uploads.
 - No content in logs: nothing here logs a file name, a path or file bytes;
   ``remove_files`` logs ids and an exception's class name only.
@@ -69,6 +75,8 @@ import uuid
 from datetime import datetime  # noqa: TC003 — Pydantic resolves field annotations at runtime
 from typing import TYPE_CHECKING, Any, BinaryIO, Final
 
+import asyncpg
+
 from admino import attachment_types, audit_events, chats, organizations
 from admino.access import PlainUUID, SealedModel
 from admino.attachment_types import AttachmentRefusedError
@@ -84,18 +92,33 @@ if TYPE_CHECKING:
     from pathlib import Path
     from uuid import UUID
 
-    import asyncpg
-
     from admino.chats import Executor
     from admino.tenancy import TenantContext
 
 logger = logging.getLogger(__name__)
 
 # A body chunk that doesn't arrive within this many seconds ends the upload
-# (content_length_mismatch): a held connection can't pin its reservation.
+# (content_length_mismatch).
 STALL_TIMEOUT_S: Final = 30.0
+# The whole body must arrive within UPLOAD_GRACE_S + declared_length /
+# UPLOAD_MIN_RATE_BYTES_S (else content_length_mismatch): a trickled body
+# that never stalls can't pin its reservation, upload slot, fd and socket.
+UPLOAD_GRACE_S: Final = 120.0
+UPLOAD_MIN_RATE_BYTES_S: Final = 32 * 1024
 # At most this many detect_kind calls run at once, across all uploads.
 DETECT_CONCURRENCY: Final = 2
+
+# The errors that can interrupt a COMMIT the server may already have applied
+# (its answer is lost): the cancellation, the connection's loss (asyncpg's own
+# ConnectionDoesNotExistError is a PostgresConnectionError) and a socket error,
+# TimeoutError included. The stored file is kept then: a file without a row is
+# removed by the stray-file sweep, a row without its file would never heal.
+_UNKNOWN_COMMIT_OUTCOME: Final = (
+    asyncio.CancelledError,
+    OSError,
+    asyncpg.InterfaceError,
+    asyncpg.exceptions.PostgresConnectionError,
+)
 
 _DIRECTORY_MODE: Final = 0o700
 _FILE_MODE: Final = 0o600
@@ -213,16 +236,23 @@ def _create_part(org_dir: Path, part: Path) -> BinaryIO:
 async def _receive(file: BinaryIO, body: AsyncIterator[bytes], declared_length: int) -> None:
     """Write ``body`` to ``file`` and close it; never read past ``declared_length``.
 
+    Each wait for a chunk ends at the earlier of ``STALL_TIMEOUT_S`` from now
+    and the upload's total deadline (``UPLOAD_GRACE_S`` plus the declared
+    length at ``UPLOAD_MIN_RATE_BYTES_S``, from the first wait).
+
     Raises:
         AttachmentRefusedError: ``content_length_mismatch`` when the body runs
             past the declared length (no further chunk is pulled), ends
-            short, or a chunk doesn't come within ``STALL_TIMEOUT_S``;
+            short, a chunk doesn't come within ``STALL_TIMEOUT_S`` or the
+            body isn't complete by the total deadline;
             ``storage_unavailable`` on a write error.
     """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + UPLOAD_GRACE_S + declared_length / UPLOAD_MIN_RATE_BYTES_S
     received = 0
     while True:
         try:
-            async with asyncio.timeout(STALL_TIMEOUT_S):
+            async with asyncio.timeout_at(min(loop.time() + STALL_TIMEOUT_S, deadline)):
                 chunk = await anext(body)
         except StopAsyncIteration:
             break
@@ -316,8 +346,8 @@ async def upload_attachment(
         AttachmentRefusedError: ``empty_file``, ``file_too_large``,
             ``storage_quota_exceeded`` (stored plus reserved bytes before the
             body, stored bytes at the commit), ``content_length_mismatch``
-            (also a stalled body), a detection refusal or
-            ``storage_unavailable``; nothing is stored.
+            (also a stalled body or one past the total deadline), a
+            detection refusal or ``storage_unavailable``; nothing is stored.
         chats.ChatNotFoundError: Unless the chat is the caller's and live,
             before the body is read or at the commit.
         AuditRecordError: If the event can't be recorded; nothing is stored.
@@ -381,6 +411,7 @@ async def _store(
     with _disk_errors():
         file = _create_part(org_dir, part)
     committed = False
+    commit_pending = False
     try:
         await _receive(file, body, declared_length)
         with _disk_errors():
@@ -418,11 +449,14 @@ async def _store(
                 # Before the commit: a failed rename rolls the row back.
                 with _disk_errors():
                     os.replace(part, final)
+                # The last statement of the block: what fails from here on
+                # failed at the COMMIT itself.
+                commit_pending = True
             # The transaction block exited normally: the row is committed, and
             # its file stays whatever happens next (a cancelled release).
             committed = True
-    except BaseException:
-        if committed:
+    except BaseException as exc:
+        if committed or (commit_pending and isinstance(exc, _UNKNOWN_COMMIT_OUTCOME)):
             _discard(file, part)
         else:
             _discard(file, part, final)

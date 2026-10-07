@@ -315,13 +315,20 @@ checks and the storage live in `attachment_types.py` and `attachments.py`:
   each reserves its `Content-Length` for its organization until it ends, so parallel
   uploads can't fill the shared attachments volume past the quota. A user has at most
   `max_files_per_message` uploads in progress (one more is `429` before its body is
-  read), and a body that sends nothing for 30 seconds ends with `400
-  content_length_mismatch`, so held connections can't pin reservations and partial
-  files. The reservations and the open-upload counts live in the agent process (a
-  single worker). The quota is checked again under a lock on the organization's row
-  when the file is stored, so parallel uploads can't overrun it. A refused upload leaves
-  no file, no row and no audit event, and an exception after the commit (a cancelled
-  connection release) never deletes the stored file.
+  read). A body has two deadlines, and missing either ends the upload with `400
+  content_length_mismatch`: it must send something at least every 30 seconds, and all
+  of it must arrive within 120 seconds plus its `Content-Length` at 32 KiB/s (about 29
+  minutes for a 50 MiB file). A body that keeps trickling a byte at a time hits the
+  second one, so a slow or held connection pins a reservation, an upload slot and a
+  partial file for a bounded time only. The reservations and the open-upload counts
+  live in the agent process (a single worker). The quota is checked again under a lock
+  on the organization's row when the file is stored, so parallel uploads can't overrun
+  it. A refused upload leaves no file, no row and no audit event. An exception after
+  the commit (a cancelled connection release) never deletes the stored file, and
+  neither does a cancellation or a lost database connection during the commit itself,
+  when admino can't know whether the database applied it: a file left without its row
+  is removed by the hourly cleanup once it is 24 hours old, while a row left without
+  its file would stay broken.
 - **Downloads never render in admino's origin.** Only the chat's owner downloads a
   file, always as `Content-Disposition: attachment` with the detected type's
   `Content-Type`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, so an

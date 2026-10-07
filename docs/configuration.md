@@ -1046,9 +1046,11 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   each one reserves its `Content-Length` until it ends (stored or not), so parallel
   uploads can't fill the disk past the quota. The body must then be exactly
   `Content-Length` bytes: the upload stops as soon as it goes past, and one that ends
-  short is refused too, as is one that sends nothing for 30 seconds (its partial file is
-  deleted). The quota is checked again when the file is stored, so parallel uploads
-  can't overrun it.
+  short is refused too. Two deadlines bound the body, and missing either refuses the
+  upload and deletes its partial file: it must send something at least every 30
+  seconds, and all of it must arrive within 120 seconds plus its `Content-Length` at
+  32 KiB/s (about 29 minutes for a 50 MiB file, 2.5 minutes for 1 MiB). The quota is
+  checked again when the file is stored, so parallel uploads can't overrun it.
 - **Errors** use the usual `{"detail", "reason"}` body, with a fixed English `detail`
   that never repeats the name or the content. A refused upload keeps nothing: no
   attachment, no file, no audit event. After the session, the role and the rate limit,
@@ -1062,7 +1064,7 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   | `413` | `file_too_large` | more than `max_file_size_mb` |
   | `404` | `chat_not_found` | the chat doesn't exist, is in the trash or isn't yours (the chat routes' `404`) |
   | `413` | `storage_quota_exceeded` | the file, with the uploads in progress, would take the organization past its storage quota |
-  | `400` | `content_length_mismatch` | the body is longer or shorter than `Content-Length`, or sends nothing for 30 seconds |
+  | `400` | `content_length_mismatch` | the body is longer or shorter than `Content-Length`, sends nothing for 30 seconds, or isn't complete within 120 seconds plus `Content-Length` at 32 KiB/s |
   | `415` | `unsupported_type` | not a supported type (a plain ZIP, a PPTX, a binary file, text that isn't UTF-8) |
   | `415` | `legacy_office` | an old Office file: save it as .docx or .xlsx |
   | `422` | `password_protected` | an encrypted PDF, DOCX or XLSX |
