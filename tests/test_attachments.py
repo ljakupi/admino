@@ -4,7 +4,8 @@ repository, its disk storage and the upload service, against the FakeDb and tmp_
 What these tests pin down:
 - ``attachments_root()`` is ``organizations.ATTACHMENTS_ROOT`` read at call time;
   ``attachment_path(root, org, id)`` is ``root/<org>/<id>``; ``AttachmentRecord`` has
-  exactly the contract's R columns.
+  exactly the contract's R columns (GH-188 contract section 7: ``token_estimate``
+  after ``page_count``; A5's RETURNING and A6's SELECT list them).
 - ``upload_attachment`` refuses, with the exact ``AttachmentRefusedError.reason`` (or
   ``chats.ChatNotFoundError``) and NOTHING stored (no row, no file or ``.part`` under
   the root, no ``file.upload`` event):
@@ -31,14 +32,15 @@ What these tests pin down:
     rename stores no row.
 - A stored upload: the returned record (status uploaded, kind detected from the
   content, never from the name; size; the sanitized filename as given; no message,
-  reason or page count); the statements, in order: the owner check, A1, A4 outside a
+  reason, page count or token estimate); the statements, in order: the owner check, A1, A4 outside a
   transaction, then A2 (chat FOR SHARE, first), A3 (org FOR NO KEY UPDATE), A4, A5
   and the audit insert in one committed transaction on one connection; one
   ``file.upload`` event (member actor, the org, target the file, the ip, metadata
   exactly ``{"size_bytes": n}``); the file ``root/<org>/<id>`` holds exactly the
   bytes, mode 0600, its directory 0700, no ``.part`` left; detection ran in a worker
   thread on the complete ``<id>.part`` with the filename.
-- ``get_attachment`` (A6) returns the caller's live attachment; another org's, a
+- ``get_attachment`` (A6) returns the caller's live attachment (a ready one with its
+  page count and token estimate, GH-188); another org's, a
   colleague's, a trashed and an unknown one are ``AttachmentNotFoundError`` with one
   identical message carrying no id.
 - ``org_storage`` (A7) returns ``(file_count, used_bytes)`` as ints: every row of the
@@ -97,7 +99,7 @@ _FIXED_ID: Final = uuid.UUID("187a0c2e-1b2c-4d3e-8f40-5a6b7c8d9e02")
 
 _R: Final = (
     "id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason, "
-    "page_count, created_at"
+    "page_count, token_estimate, created_at"
 )
 _R_COLUMNS: Final = tuple(column.strip() for column in _R.split(","))
 # Literal pieces joined with the R column list (no SQL is built from input).
@@ -403,6 +405,7 @@ class TestAttachmentsUploadStored:
             "status": "uploaded",
             "failure_reason": None,
             "page_count": None,
+            "token_estimate": None,
             "created_at": row["created_at"],
         }
         assert (row["org_id"], row["owner_user_id"], row["deleted_at"]) == (
@@ -889,6 +892,25 @@ class TestAttachmentsGet:
         assert [(_label(call), call.args) for call in db.calls] == [
             ("A6", (attachment, ORG_ID, world.member))
         ]
+
+    async def test_attachments_get_returns_a_ready_files_page_count_and_token_estimate(
+        self, att: ModuleType, world: _World
+    ) -> None:
+        """GH-188: a converted file's estimate (and page count) come back with it."""
+        db = world.db
+        attachment = db.add_attachment(
+            world.chat,
+            filename="Bericht.pdf",
+            kind="pdf",
+            size_bytes=4096,
+            status="ready",
+            page_count=3,
+            token_estimate=4195,
+        )
+
+        record = await att.get_attachment(db.pool, world.tenant, attachment)
+
+        assert (record.status, record.page_count, record.token_estimate) == ("ready", 3, 4195)
 
     @staticmethod
     def _foreign(world: _World, kind: str) -> uuid.UUID:

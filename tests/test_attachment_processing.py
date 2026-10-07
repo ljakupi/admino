@@ -1,35 +1,57 @@
-"""Tests for ``admino.attachment_processing`` (GH-187 contract §2 P1 to P5, §3.7).
+"""Tests for ``admino.attachment_processing`` (GH-187 contract §2 P1 to P5, §3.7;
+GH-188 contract §6).
 
 Issue #187, "Processing": status ``uploaded -> processing -> ready | failed(reason)``,
 processed asynchronously on a bounded worker pool (Decision 7: 2 workers, after the
 upload answered 201; at startup, files a restart left ``processing`` go back to
 ``uploaded`` and are queued again). Decision 6: a processor that reports more pages
 than the platform's ``files.max_pages_per_file`` fails the file with
-``too_many_pages``; #187's own processor only re-checks the stored file.
+``too_many_pages``. Issue #188 ("Token estimate & storage", "From #187 — Page
+limit", Decisions 2, 3, 11, 12): the default processor converts the stored file in
+a worker process (``convert_stored_file``), the estimated token count is stored
+with the ``ready`` outcome, and the derived artifacts (``<id>.d``) go whenever the
+file doesn't end ``ready``.
 
 What these tests pin down:
 
 - Names: ``MAX_WORKERS == 2``; ``ProcessedFile`` a frozen dataclass whose
-  ``page_count`` defaults to None; ``ProcessingFailedError(reason)`` keeps its
-  ``reason``; ``verify_stored_file`` is the default processor of
-  ``process_attachment`` and of ``ProcessingPool`` (whose ``workers`` defaults to
-  ``MAX_WORKERS``).
+  ``page_count`` and ``token_estimate`` default to None; ``ProcessingJob`` a
+  frozen dataclass ``(filename, render_dpi, max_pages)``;
+  ``ProcessingFailedError(reason)`` keeps its ``reason``; ``convert_stored_file``
+  is the default processor of ``process_attachment`` and of ``ProcessingPool``
+  (whose ``workers`` defaults to ``MAX_WORKERS``).
 - ``process_attachment(pool, root, attachment_id, org_id, *, processor)``:
-  - P1 is a compare-and-set: a row that isn't ``uploaded`` (processing, ready,
-    failed), another org's id and a row that is gone return None after P1 alone;
-    the processor never runs and the row is unchanged.
+  - P1' is a compare-and-set (``RETURNING kind, filename``): a row that isn't
+    ``uploaded`` (processing, ready, failed), another org's id and a row that is
+    gone return None after P1' alone; the processor never runs, the platform
+    settings aren't read and the row is unchanged.
   - The processor runs in a worker thread (not the event loop's thread) with
-    ``<root>/<org_id>/<attachment_id>`` and the kind P1 returned; the row is
-    ``processing`` meanwhile.
-  - Success: P2, ``ready`` with the processor's ``page_count`` (None stays NULL).
-    ``ProcessingFailedError(code)``: P3 with that code. Any other exception: P3
-    ``processing_error``, logged at WARNING or above by class name only (the
-    exception's message, holding a file name and a path, reaches no record, no
-    traceback). A page count above the platform limit (read from the platform
-    settings, not a constant): P3 ``too_many_pages``; equal to it: ready.
+    ``<root>/<org_id>/<attachment_id>``, the kind P1' returned and a
+    ``ProcessingJob`` whose filename is the one P1' returned and whose
+    ``render_dpi`` / ``max_pages`` come from the STORED platform settings
+    (``files.render_dpi``, ``files.max_pages_per_file``), read exactly once and
+    before the processor runs; the row is ``processing`` meanwhile.
+  - Success: P2', ``ready`` with the processor's ``page_count`` and
+    ``token_estimate`` (None stays NULL, 0 stays 0). ``ProcessingFailedError(code)``:
+    P3 with that code. Any other exception: P3 ``processing_error``, logged at
+    WARNING or above by class name only (the exception's message, holding a file
+    name and a path, reaches no record, no traceback). A page count above the
+    platform limit (the same settings read): P3 ``too_many_pages``; equal to it:
+    ready.
+  - Derived artifacts: after every P3 (a ProcessingFailedError, another
+    exception, the too_many_pages post-check) and after a P2' that matched no row
+    (the row was deleted while the processor ran), ``<id>.d`` is gone and the
+    stored ``<id>`` is kept; a stored ``ready`` keeps ``<id>.d``.
   - A row deleted while the processor runs: no error, nothing re-created.
-  - The exact statements: [P1, P2] or [P1, P3] with their bind values; the
+  - The exact statements: [P1', P2'] or [P1', P3] with their bind values; the
     return value is the final status.
+- ``convert_stored_file(path, kind, job)``: ``verify_stored_file`` first (a
+  missing, corrupted or password-protected stored file fails with its code and
+  ``runner.run_conversion`` is never called, so no worker starts); then
+  ``runner.run_conversion(path, kind, <path>.d, ConversionOptions(filename,
+  render_dpi, max_pages))`` with the job's values; ``ConversionError(code)``
+  becomes ``ProcessingFailedError(code)`` for each of the eight codes; the
+  ``ConversionResult`` becomes ``ProcessedFile(page_count, token_estimate)``.
 - ``verify_stored_file(path, kind)``: a missing file fails with
   ``file_missing``; a stored file ``detect_kind`` refuses fails with that
   refusal's reason (a stored ``txt`` holding the C1 control NEL U+0085 is
@@ -43,14 +65,18 @@ What these tests pin down:
   for every submitted job and also returns when called in the loop turn in which
   the last job ended; ``close()`` cancels pending and running jobs (no
   pending job's processor runs afterwards, a cancelled running job writes no
-  outcome); the given processor is the one used.
+  outcome); the given processor is the one used; without one, the pool converts
+  the stored file.
 - ``recover(pool, processing, root)``: P4 then P5, then one ``submit(pool, root,
   id, org_id)`` per ``uploaded`` row in ``created_at, id`` order (any org);
   returns the count; ``ready`` and ``failed`` rows are untouched; a row left
   ``processing`` is processed again.
 
 The module is imported lazily (fixture ``ap``), so this file collects before it
-exists and every test fails on its own. Fixture files are built in ``tmp_path``
+exists and every test fails on its own; ``admino.converters`` (common, runner) is
+imported inside the tests too. ``runner.run_conversion`` is replaced by a recorder
+here (no worker process starts in this file; the real worker runs in
+tests/test_attachment_conversion_flow.py). Fixture files are built in ``tmp_path``
 with the stdlib only (struct, zlib, zipfile): no binary in the repo. Threads that
 block in a processor wait on a ``threading.Event`` with a timeout and are always
 released in ``finally``.
@@ -63,6 +89,7 @@ import dataclasses
 import inspect
 import io
 import logging
+import os
 import re
 import struct
 import threading
@@ -94,15 +121,27 @@ _GATE_S: Final = 10.0
 _LEAK_NAME: Final = "Quarterly-salaries-2026.xlsx"
 _LEAK_DIR: Final = "/srv/private-share-marker"
 
-# --- Contract §2 forms -----------------------------------------------------------
+# The eight conversion failure codes (GH-188 contract §3, Decision 12).
+_CONVERSION_FAILURES: Final = (
+    "corrupted_file",
+    "password_protected",
+    "too_many_pages",
+    "archive_too_large",
+    "image_too_large",
+    "text_too_large",
+    "conversion_timeout",
+    "processing_error",
+)
+
+# --- Contract forms (GH-187 §2; P1' and P2' from GH-188 §6) ------------------------
 
 _P1: Final = norm(
     "UPDATE attachments SET status = 'processing', updated_at = now() "
-    "WHERE id = $1 AND org_id = $2 AND status = 'uploaded' RETURNING kind"
+    "WHERE id = $1 AND org_id = $2 AND status = 'uploaded' RETURNING kind, filename"
 )
 _P2: Final = norm(
-    "UPDATE attachments SET status = 'ready', page_count = $3, updated_at = now() "
-    "WHERE id = $1 AND org_id = $2 AND status = 'processing'"
+    "UPDATE attachments SET status = 'ready', page_count = $3, token_estimate = $4, "
+    "updated_at = now() WHERE id = $1 AND org_id = $2 AND status = 'processing'"
 )
 _P3: Final = norm(
     "UPDATE attachments SET status = 'failed', failure_reason = $3, updated_at = now() "
@@ -225,6 +264,7 @@ def _store(
     data: bytes = _PDF,
     *,
     kind: str = "pdf",
+    filename: str = "a.pdf",
     status: str = "uploaded",
     failure_reason: str | None = None,
     page_count: int | None = None,
@@ -237,6 +277,7 @@ def _store(
     attachment_id = db.add_attachment(
         chat_id,
         attachment_id=attachment_id,
+        filename=filename,
         kind=kind,
         size_bytes=max(len(data), 1),
         status=status,
@@ -259,7 +300,12 @@ def _org_of(db: FakeDb, attachment_id: uuid.UUID) -> uuid.UUID:
 
 def _path_of(db: FakeDb, root: Path, attachment_id: uuid.UUID) -> Path:
     """Where the contract stores an attachment: <root>/<org_id>/<attachment_id>."""
-    return root / str(_org_of(db, attachment_id)) / str(attachment_id)
+    return _path_of_id(root, _org_of(db, attachment_id), attachment_id)
+
+
+def _path_of_id(root: Path, org_id: uuid.UUID, attachment_id: uuid.UUID) -> Path:
+    """The same path without a row to read the org from (a deleted row)."""
+    return root / str(org_id) / str(attachment_id)
 
 
 def _state(db: FakeDb, attachment_id: uuid.UUID) -> tuple[Any, Any, Any]:
@@ -267,6 +313,30 @@ def _state(db: FakeDb, attachment_id: uuid.UUID) -> tuple[Any, Any, Any]:
     row = db.attachment_row(attachment_id)
     assert row is not None
     return row["status"], row["failure_reason"], row["page_count"]
+
+
+def _estimate(db: FakeDb, attachment_id: uuid.UUID) -> Any:
+    """The stored row's token_estimate (GH-188, migration 0028)."""
+    row = db.attachment_row(attachment_id)
+    assert row is not None
+    return row["token_estimate"]
+
+
+def _derived_dir(db: FakeDb, root: Path, attachment_id: uuid.UUID) -> Path:
+    """Where the derived artifacts live (GH-188 Decision 3): <root>/<org_id>/<id>.d."""
+    return _path_of(db, root, attachment_id).with_name(f"{attachment_id}.d")
+
+
+def _plant_derived(directory: Path) -> None:
+    """A derived-artifacts directory as a conversion leaves it: one part and a manifest."""
+    directory.mkdir()
+    (directory / "part-0001.txt").write_text("[a.pdf — page 1]\nplanted", encoding="utf-8")
+    (directory / "manifest.json").write_text("{}", encoding="utf-8")
+
+
+def _gone(path: Path) -> bool:
+    """True when nothing (no file, directory or symlink) is left at ``path``."""
+    return not path.exists() and not path.is_symlink()
 
 
 def _attachment_calls(db: FakeDb) -> list[tuple[str, tuple[Any, ...]]]:
@@ -279,7 +349,8 @@ def _attachment_calls(db: FakeDb) -> list[tuple[str, tuple[Any, ...]]]:
 
 
 class _Processor:
-    """A sync processor that records each call (path, kind, thread) and returns or raises."""
+    """A sync processor that records each call (path, kind, job, thread) and returns or
+    raises. GH-188: a processor takes ``(path, kind, job)``."""
 
     def __init__(
         self,
@@ -291,11 +362,11 @@ class _Processor:
         self.result = result
         self.raises = raises
         self.on_call = on_call
-        self.calls: list[tuple[Path, str]] = []
+        self.calls: list[tuple[Path, str, Any]] = []
         self.threads: list[int] = []
 
-    def __call__(self, path: Path, kind: str) -> Any:
-        self.calls.append((Path(path), kind))
+    def __call__(self, path: Path, kind: str, job: Any) -> Any:
+        self.calls.append((Path(path), kind, job))
         self.threads.append(threading.get_ident())
         if self.on_call is not None:
             self.on_call()
@@ -322,7 +393,7 @@ class _GatedProcessor:
         self.calls = 0
         self.paths: list[Path] = []
 
-    def __call__(self, path: Path, kind: str) -> Any:
+    def __call__(self, path: Path, kind: str, job: Any) -> Any:
         with self._lock:
             self.active += 1
             self.calls += 1
@@ -354,8 +425,58 @@ def _log_text(caplog: pytest.LogCaptureFixture) -> str:
 
 def _platform_pages_limit(monkeypatch: pytest.MonkeyPatch, db: FakeDb, limit: int) -> None:
     """Seed the platform row with this pages limit; empty the cache so it is read."""
-    db.add_platform_settings(max_pages_per_file=limit)
+    _platform_settings(monkeypatch, db, max_pages_per_file=limit)
+
+
+def _platform_settings(monkeypatch: pytest.MonkeyPatch, db: FakeDb, **columns: Any) -> None:
+    """Seed the platform row with these columns; empty the cache so it is read."""
+    db.add_platform_settings(**columns)
     monkeypatch.setattr(scoped_settings, "_platform_cache", None)
+
+
+class _SettingsReads:
+    """Wraps ``scoped_settings.current_platform_settings`` (the contract's one read):
+    counts the calls and answers like the original."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.count = 0
+        original = scoped_settings.current_platform_settings
+
+        async def counted(executor: Any) -> Any:
+            self.count += 1
+            return await original(executor)
+
+        monkeypatch.setattr(scoped_settings, "current_platform_settings", counted)
+
+
+class _RunConversion:
+    """Stands in for ``runner.run_conversion(path, kind, out_dir, options)``: records each
+    call, then returns ``result`` or raises ``raises``. No worker process starts."""
+
+    def __init__(self, result: Any = None, *, raises: BaseException | None = None) -> None:
+        self.result = result
+        self.raises = raises
+        self.calls: list[tuple[Path, str, Path, Any]] = []
+
+    def __call__(self, path: Path, kind: str, out_dir: Path, options: Any) -> Any:
+        self.calls.append((Path(path), kind, Path(out_dir), options))
+        if self.raises is not None:
+            raise self.raises
+        return self.result
+
+
+def _patch_run_conversion(monkeypatch: pytest.MonkeyPatch, recorder: _RunConversion) -> None:
+    """Replace ``admino.converters.runner.run_conversion`` (looked up at call time)."""
+    from admino.converters import runner
+
+    monkeypatch.setattr(runner, "run_conversion", recorder)
+
+
+def _conversion_result(page_count: int | None, token_estimate: int) -> Any:
+    """A ``runner.ConversionResult`` (imported lazily: it doesn't exist before GH-188)."""
+    from admino.converters import runner
+
+    return runner.ConversionResult(page_count=page_count, token_estimate=token_estimate)
 
 
 class _ProcessorCrashError(Exception):
@@ -371,21 +492,38 @@ class TestNames:
     def test_attachment_processing_max_workers_is_two(self, ap: ModuleType) -> None:
         assert ap.MAX_WORKERS == 2
 
-    def test_attachment_processing_processed_file_is_frozen_with_no_pages_by_default(
+    def test_attachment_processing_processed_file_is_frozen_with_no_pages_or_estimate_by_default(
         self, ap: ModuleType
     ) -> None:
         processed = ap.ProcessedFile()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            processed.page_count = 3  # type: ignore[misc]
+            processed.token_estimate = 3  # type: ignore[misc]
 
-        assert (dataclasses.is_dataclass(processed), processed.page_count) == (True, None)
+        assert (
+            dataclasses.is_dataclass(processed),
+            [field.name for field in dataclasses.fields(processed)],
+            processed.page_count,
+            processed.token_estimate,
+        ) == (True, ["page_count", "token_estimate"], None, None)
+
+    def test_attachment_processing_processing_job_is_frozen_with_its_three_fields(
+        self, ap: ModuleType
+    ) -> None:
+        job = ap.ProcessingJob(filename="a.pdf", render_dpi=150, max_pages=100)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            job.render_dpi = 72  # type: ignore[misc]
+
+        assert (
+            [field.name for field in dataclasses.fields(job)],
+            (job.filename, job.render_dpi, job.max_pages),
+        ) == (["filename", "render_dpi", "max_pages"], ("a.pdf", 150, 100))
 
     def test_attachment_processing_failed_error_keeps_its_reason(self, ap: ModuleType) -> None:
         error = ap.ProcessingFailedError("x_code")
 
         assert (isinstance(error, Exception), error.reason) == (True, "x_code")
 
-    def test_attachment_processing_defaults_use_verify_stored_file(self, ap: ModuleType) -> None:
+    def test_attachment_processing_defaults_use_convert_stored_file(self, ap: ModuleType) -> None:
         process = inspect.signature(ap.process_attachment).parameters
         pool = inspect.signature(ap.ProcessingPool).parameters
 
@@ -397,10 +535,10 @@ class TestNames:
             pool["processor"].default,
         ) == (
             inspect.Parameter.KEYWORD_ONLY,
-            ap.verify_stored_file,
+            ap.convert_stored_file,
             inspect.Parameter.KEYWORD_ONLY,
             ap.MAX_WORKERS,
-            ap.verify_stored_file,
+            ap.convert_stored_file,
         )
 
 
@@ -508,15 +646,110 @@ class TestProcess:
     async def test_attachment_processing_processor_gets_stored_path_and_kind_in_a_thread(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
     ) -> None:
-        """The path is <root>/<org>/<id>, the kind is the row's (P1 RETURNING kind), and
-        the call runs in a worker thread, not on the event loop's thread."""
-        attachment_id = _store(db, root, world.chat_id, _CSV, kind="csv")
+        """The path is <root>/<org>/<id>, the kind is the row's (P1' RETURNING kind), the
+        job carries the row's filename and the (default) platform settings, and the call
+        runs in a worker thread, not on the event loop's thread."""
+        attachment_id = _store(db, root, world.chat_id, _CSV, kind="csv", filename="ledger.csv")
         processor = _Processor(ap.ProcessedFile())
 
         await ap.process_attachment(db.pool, root, attachment_id, ORG_ID, processor=processor)
 
-        assert processor.calls == [(root / str(ORG_ID) / str(attachment_id), "csv")]
+        assert processor.calls == [
+            (
+                root / str(ORG_ID) / str(attachment_id),
+                "csv",
+                ap.ProcessingJob(filename="ledger.csv", render_dpi=150, max_pages=100),
+            )
+        ]
         assert processor.threads[0] != threading.get_ident()
+
+    async def test_attachment_processing_job_comes_from_p1_filename_and_stored_platform_settings(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The stored platform row (not a constant, not the defaults) gives render_dpi
+        and max_pages; the filename is the row's, as P1' returned it."""
+        _platform_settings(monkeypatch, db, render_dpi=217, max_pages_per_file=37)
+        filename = "Bilanz 2026 — Entwurf (v2) é.pdf"
+        attachment_id = _store(db, root, world.chat_id, filename=filename)
+        processor = _Processor(ap.ProcessedFile())
+
+        await ap.process_attachment(db.pool, root, attachment_id, ORG_ID, processor=processor)
+
+        assert [job for _, _, job in processor.calls] == [
+            ap.ProcessingJob(filename=filename, render_dpi=217, max_pages=37)
+        ]
+
+    async def test_attachment_processing_platform_settings_read_once_before_the_processor(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A row P1' doesn't claim reads no settings. A claimed row: exactly one read,
+        made before the processor runs; the page check after it reuses that read (a
+        page count over the limit doesn't read again)."""
+        _platform_pages_limit(monkeypatch, db, 3)
+        reads = _SettingsReads(monkeypatch)
+        not_uploaded = _store(db, root, world.chat_id, status="ready")
+        attachment_id = _store(db, root, world.chat_id)
+        seen: list[int] = []
+        processor = _Processor(
+            ap.ProcessedFile(page_count=4, token_estimate=1),
+            on_call=lambda: seen.append(reads.count),
+        )
+
+        await ap.process_attachment(db.pool, root, not_uploaded, ORG_ID, processor=processor)
+        after_not_uploaded = reads.count
+        result = await ap.process_attachment(
+            db.pool, root, attachment_id, ORG_ID, processor=processor
+        )
+
+        assert (after_not_uploaded, seen, reads.count, result, _state(db, attachment_id)) == (
+            0,
+            [1],
+            1,
+            "failed",
+            ("failed", "too_many_pages", None),
+        )
+
+    @pytest.mark.parametrize(
+        ("processed", "expected"),
+        [
+            pytest.param({"page_count": 7, "token_estimate": 1234}, (7, 1234), id="both"),
+            pytest.param({"token_estimate": 0}, (None, 0), id="zero-estimate-stays-zero"),
+            pytest.param({}, (None, None), id="none-stays-null"),
+        ],
+    )
+    async def test_attachment_processing_token_estimate_is_stored_with_ready(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        processed: dict[str, int],
+        expected: tuple[Any, Any],
+    ) -> None:
+        attachment_id = _store(db, root, world.chat_id)
+
+        result = await ap.process_attachment(
+            db.pool,
+            root,
+            attachment_id,
+            ORG_ID,
+            processor=_Processor(ap.ProcessedFile(**processed)),
+        )
+
+        assert (result, _state(db, attachment_id)[2], _estimate(db, attachment_id)) == (
+            "ready",
+            *expected,
+        )
 
     async def test_attachment_processing_row_is_processing_while_the_processor_runs(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
@@ -634,6 +867,110 @@ class TestProcess:
         assert db.attachment_row(attachment_id) is None
 
 
+# ---------------------------------------------------------------------------
+# 3b. process_attachment: the derived artifacts (<id>.d, GH-188 Decision 3)
+# ---------------------------------------------------------------------------
+
+
+class TestDerivedArtifacts:
+    @pytest.mark.parametrize(
+        ("outcome", "reason"),
+        [
+            pytest.param("failed-error", "corrupted_file", id="processing-failed-error"),
+            pytest.param("unexpected-error", "processing_error", id="other-exception"),
+            pytest.param("too-many-pages", "too_many_pages", id="page-count-post-check"),
+        ],
+    )
+    async def test_attachment_processing_failure_removes_derived_and_keeps_the_original(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+        reason: str,
+    ) -> None:
+        """Every P3 path: the <id>.d tree the conversion left is removed, the stored
+        <id> file stays as it was, and no estimate is stored."""
+        _platform_pages_limit(monkeypatch, db, 3)
+        attachment_id = _store(db, root, world.chat_id)
+        derived = _derived_dir(db, root, attachment_id)
+        _plant_derived(derived)
+        processor = {
+            "failed-error": _Processor(raises=ap.ProcessingFailedError("corrupted_file")),
+            "unexpected-error": _Processor(raises=_ProcessorCrashError("boom")),
+            "too-many-pages": _Processor(ap.ProcessedFile(page_count=4, token_estimate=9)),
+        }[outcome]
+
+        result = await ap.process_attachment(
+            db.pool, root, attachment_id, ORG_ID, processor=processor
+        )
+
+        assert (
+            result,
+            _state(db, attachment_id)[:2],
+            _estimate(db, attachment_id),
+            _gone(derived),
+            _path_of(db, root, attachment_id).read_bytes(),
+        ) == ("failed", ("failed", reason), None, True, _PDF)
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [
+            pytest.param("returns", id="ready-matched-no-row"),
+            pytest.param("raises", id="failed-matched-no-row"),
+        ],
+    )
+    async def test_attachment_processing_row_deleted_while_processing_removes_derived(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path, outcome: str
+    ) -> None:
+        """The row goes while the processor runs: P2' (or P3) matches nothing, the
+        <id>.d tree is removed, nothing is re-created and <id> is left to its deleter."""
+        attachment_id = _store(db, root, world.chat_id)
+        derived = _derived_dir(db, root, attachment_id)
+        _plant_derived(derived)
+
+        def delete_row() -> None:
+            del db.attachments[attachment_id]
+
+        processor = _Processor(
+            ap.ProcessedFile(page_count=2, token_estimate=5),
+            raises=ap.ProcessingFailedError("x_code") if outcome == "raises" else None,
+            on_call=delete_row,
+        )
+
+        await ap.process_attachment(db.pool, root, attachment_id, ORG_ID, processor=processor)
+
+        assert (
+            db.attachment_row(attachment_id),
+            _gone(derived),
+            _path_of_id(root, ORG_ID, attachment_id).exists(),
+        ) == (None, True, True)
+
+    async def test_attachment_processing_ready_keeps_derived(
+        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    ) -> None:
+        attachment_id = _store(db, root, world.chat_id)
+        derived = _derived_dir(db, root, attachment_id)
+        _plant_derived(derived)
+
+        result = await ap.process_attachment(
+            db.pool,
+            root,
+            attachment_id,
+            ORG_ID,
+            processor=_Processor(ap.ProcessedFile(page_count=2, token_estimate=40)),
+        )
+
+        assert (
+            result,
+            _state(db, attachment_id),
+            _estimate(db, attachment_id),
+            sorted(os.listdir(derived)),
+        ) == ("ready", ("ready", None, 2), 40, ["manifest.json", "part-0001.txt"])
+
+
 class TestStatements:
     async def test_attachment_processing_success_issues_p1_then_p2(
         self, ap: ModuleType, db: FakeDb, world: _World, root: Path
@@ -646,12 +983,12 @@ class TestStatements:
             root,
             attachment_id,
             ORG_ID,
-            processor=_Processor(ap.ProcessedFile(page_count=7)),
+            processor=_Processor(ap.ProcessedFile(page_count=7, token_estimate=99)),
         )
 
         assert _attachment_calls(db) == [
             (_P1, (attachment_id, ORG_ID)),
-            (_P2, (attachment_id, ORG_ID, 7)),
+            (_P2, (attachment_id, ORG_ID, 7, 99)),
         ]
 
     async def test_attachment_processing_failure_issues_p1_then_p3(
@@ -673,11 +1010,20 @@ class TestStatements:
             (_P3, (attachment_id, ORG_ID, "x_code")),
         ]
 
-    async def test_attachment_processing_default_processor_verifies_the_stored_file(
-        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    async def test_attachment_processing_default_processor_verifies_then_converts_the_stored_file(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Without a processor: a valid stored PNG is ready, a PNG recorded as pdf failed."""
-        good = _store(db, root, world.chat_id, _png(), kind="png")
+        """Without a processor (convert_stored_file): a valid stored PNG is converted
+        (into <id>.d) and ready with the conversion's estimate; a PNG recorded as pdf
+        fails verification (corrupted_file) and is never converted."""
+        recorder = _RunConversion(_conversion_result(None, 12))
+        _patch_run_conversion(monkeypatch, recorder)
+        good = _store(db, root, world.chat_id, _png(), kind="png", filename="photo.png")
         bad = _store(db, root, world.chat_id, _png(), kind="pdf")
 
         results = [
@@ -685,15 +1031,119 @@ class TestStatements:
             await ap.process_attachment(db.pool, root, bad, ORG_ID),
         ]
 
-        assert (results, _state(db, good), _state(db, bad)) == (
+        assert (results, _state(db, good), _estimate(db, good), _state(db, bad)) == (
             ["ready", "failed"],
             ("ready", None, None),
+            12,
             ("failed", "corrupted_file", None),
         )
+        assert [(path, kind, out_dir) for path, kind, out_dir, _ in recorder.calls] == [
+            (_path_of(db, root, good), "png", _derived_dir(db, root, good))
+        ]
 
 
 # ---------------------------------------------------------------------------
-# 4. verify_stored_file (#187's processor)
+# 4. convert_stored_file (GH-188's default processor)
+# ---------------------------------------------------------------------------
+
+
+class TestConvertStoredFile:
+    @pytest.mark.parametrize(
+        ("data", "kind", "reason"),
+        [
+            pytest.param(None, "pdf", "file_missing", id="missing-file"),
+            pytest.param(_png(), "pdf", "corrupted_file", id="other-kind"),
+            pytest.param(_PDF_ENCRYPTED, "pdf", "password_protected", id="encrypted-pdf"),
+        ],
+    )
+    def test_attachment_processing_convert_verifies_before_any_conversion(
+        self,
+        ap: ModuleType,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        data: bytes | None,
+        kind: str,
+        reason: str,
+    ) -> None:
+        """The stored file is re-checked first: a refusal fails with its code and
+        run_conversion (the worker process) is never started."""
+        recorder = _RunConversion(_conversion_result(None, 1))
+        _patch_run_conversion(monkeypatch, recorder)
+        path = tmp_path / str(uuid.uuid4()) if data is None else _stored_file(tmp_path, data)
+        job = ap.ProcessingJob(filename="a.pdf", render_dpi=150, max_pages=100)
+
+        with pytest.raises(ap.ProcessingFailedError) as caught:
+            ap.convert_stored_file(path, kind, job)
+
+        assert (caught.value.reason, recorder.calls) == (reason, [])
+
+    def test_attachment_processing_convert_runs_the_conversion_with_the_jobs_values(
+        self, ap: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """run_conversion(path, kind, <path>.d, ConversionOptions(filename, render_dpi,
+        max_pages)), the options carrying the job's values."""
+        from admino.converters import common
+
+        recorder = _RunConversion(_conversion_result(None, 6))
+        _patch_run_conversion(monkeypatch, recorder)
+        path = _stored_file(tmp_path, _TXT)
+        filename = "Notizen — Entwurf (v2).txt"
+        job = ap.ProcessingJob(filename=filename, render_dpi=217, max_pages=33)
+
+        ap.convert_stored_file(path, "txt", job)
+
+        assert recorder.calls == [
+            (
+                path,
+                "txt",
+                tmp_path / f"{path.name}.d",
+                common.ConversionOptions(filename=filename, render_dpi=217, max_pages=33),
+            )
+        ]
+
+    @pytest.mark.parametrize(
+        ("data", "kind", "page_count", "token_estimate"),
+        [
+            pytest.param(_PDF, "pdf", 3, 1234, id="pdf-with-pages"),
+            pytest.param(_TXT, "txt", None, 0, id="text-without-pages"),
+        ],
+    )
+    def test_attachment_processing_convert_maps_the_result_to_processed_file(
+        self,
+        ap: ModuleType,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        data: bytes,
+        kind: str,
+        page_count: int | None,
+        token_estimate: int,
+    ) -> None:
+        _patch_run_conversion(
+            monkeypatch, _RunConversion(_conversion_result(page_count, token_estimate))
+        )
+        job = ap.ProcessingJob(filename="a", render_dpi=150, max_pages=100)
+
+        processed = ap.convert_stored_file(_stored_file(tmp_path, data), kind, job)
+
+        assert processed == ap.ProcessedFile(page_count=page_count, token_estimate=token_estimate)
+
+    @pytest.mark.parametrize("reason", _CONVERSION_FAILURES)
+    def test_attachment_processing_convert_maps_conversion_error_to_its_code(
+        self, ap: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reason: str
+    ) -> None:
+        from admino.converters import common
+
+        _patch_run_conversion(monkeypatch, _RunConversion(raises=common.ConversionError(reason)))
+        job = ap.ProcessingJob(filename="a.txt", render_dpi=150, max_pages=100)
+
+        with pytest.raises(ap.ProcessingFailedError) as caught:
+            ap.convert_stored_file(_stored_file(tmp_path, _TXT), "txt", job)
+
+        assert caught.value.reason == reason
+
+
+# ---------------------------------------------------------------------------
+# 4b. verify_stored_file (#187's processor, now convert_stored_file's first step)
 # ---------------------------------------------------------------------------
 
 
@@ -923,14 +1373,23 @@ class TestProcessingPool:
         processing.submit(db.pool, root, second, OTHER_ORG_ID)
         await asyncio.wait_for(processing.join(), _WAIT_S)
 
-        assert sorted(path for path, _ in processor.calls) == sorted(
+        assert sorted(path for path, _, _ in processor.calls) == sorted(
             [root / str(ORG_ID) / str(first), root / str(OTHER_ORG_ID) / str(second)]
         )
         assert (_state(db, first), _state(db, second)) == (("ready", None, 1),) * 2
 
-    async def test_attachment_processing_pool_default_processor_verifies_stored_file(
-        self, ap: ModuleType, db: FakeDb, world: _World, root: Path
+    async def test_attachment_processing_pool_default_processor_converts_the_stored_file(
+        self,
+        ap: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """ProcessingPool() converts with convert_stored_file: a valid WEBP is ready with
+        the conversion's estimate, a WEBP recorded as png fails verification unconverted."""
+        recorder = _RunConversion(_conversion_result(None, 21))
+        _patch_run_conversion(monkeypatch, recorder)
         good = _store(db, root, world.chat_id, _webp(), kind="webp")
         bad = _store(db, root, world.chat_id, _webp(), kind="png")
         processing = ap.ProcessingPool()
@@ -939,10 +1398,14 @@ class TestProcessingPool:
         processing.submit(db.pool, root, bad, ORG_ID)
         await asyncio.wait_for(processing.join(), _WAIT_S)
 
-        assert (_state(db, good), _state(db, bad)) == (
+        assert (_state(db, good), _estimate(db, good), _state(db, bad)) == (
             ("ready", None, None),
+            21,
             ("failed", "corrupted_file", None),
         )
+        assert [(path, kind) for path, kind, _, _ in recorder.calls] == [
+            (_path_of(db, root, good), "webp")
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1071,6 +1534,6 @@ class TestRecover:
         await asyncio.wait_for(processing.join(), _WAIT_S)
 
         assert _state(db, left_processing) == ("ready", None, None)
-        assert sorted(path.name for path, _ in processor.calls) == sorted(
+        assert sorted(path.name for path, _, _ in processor.calls) == sorted(
             str(attachment_id) for attachment_id, _ in rows.expected_order
         )

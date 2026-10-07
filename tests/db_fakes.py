@@ -264,7 +264,7 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   ``messages_of(chat_id)`` (by seq, the JSONB columns as Python values) read
   copies back. ``add_account(user_id=...)`` gives an account a fixed id.
 
-Attachments (GH-187, migration 0027):
+Attachments (GH-187, migration 0027; GH-188, migration 0028):
 - ``attachments`` (``attachments``, keyed by id, insertion order): ``id`` (UUID
   primary key, NO default: the app generates it, so an INSERT without it is a
   NotNullViolationError), ``org_id`` (UUID NOT NULL, references organizations
@@ -279,16 +279,20 @@ Attachments (GH-187, migration 0027):
   default 'uploaded', one of ``ATTACHMENT_STATUSES``), ``failure_reason``
   (TEXT; set exactly when status is 'failed', and then fully matching
   ``FAILURE_REASON_RE``: no trailing newline), ``page_count`` (INTEGER, NULL
-  or >= 0), ``created_at`` and ``updated_at`` (NOT NULL, default now()) and
-  ``deleted_at`` (NULL: live; set: trashed).
+  or >= 0), ``created_at`` and ``updated_at`` (NOT NULL, default now()),
+  ``deleted_at`` (NULL: live; set: trashed) and (GH-188, migration 0028's
+  ALTER TABLE ... ADD COLUMN, so it comes last in the column order and in the
+  "Failing row contains" detail) ``token_estimate`` (INTEGER, NULL until the
+  file is ready; ``attachments_token_estimate_check``: NULL or >= 0).
 - Checked like the chat tables, with asyncpg's exception classes and in
   PostgreSQL's order: the bind values through asyncpg's encoders (DataError: a
-  non-int size_bytes or page_count, one outside int64 / int32, a str that isn't
-  a UUID, a naive datetime, ...), TEXT's U+0000 (CharacterNotInRepertoireError),
-  NOT NULL in column order, the CHECKs in alphabetical order of their names
-  (failure_reason, filename, kind, page_count, size_bytes, status; verified on
-  postgres:16) with the "Failing row contains (...)" detail (the filename in
-  it, as the driver's), the primary key (UniqueViolationError), then the
+  non-int size_bytes, page_count or token_estimate, one outside int64 / int32, a
+  str that isn't a UUID, a naive datetime, ...), TEXT's U+0000
+  (CharacterNotInRepertoireError), NOT NULL in column order, the CHECKs in
+  alphabetical order of their names (failure_reason, filename, kind,
+  page_count, size_bytes, status, token_estimate; verified on postgres:16)
+  with the "Failing row contains (...)" detail (the filename in it, as the
+  driver's), the primary key (UniqueViolationError), then the
   foreign keys in creation order: ``attachments_org_id_fkey``,
   ``attachments_message_id_fkey`` (NULL passes) and ``ATTACHMENT_CHAT_FKEY``,
   the composite (chat_id, org_id, owner_user_id) -> chats (id, org_id,
@@ -302,12 +306,13 @@ Attachments (GH-187, migration 0027):
   chat_messages row (only through its chat or org: admino_app can't DELETE
   chat_messages) deletes the attachments naming it. ``conn.transaction()``
   snapshots and restores the table.
-- Grants (admino_app, migration 0027): SELECT, INSERT and DELETE; an UPDATE may
-  SET only ``ATTACHMENT_UPDATE_COLUMNS`` (message_id, status, failure_reason,
-  page_count, updated_at, deleted_at). Naming id, org_id, chat_id,
-  owner_user_id, filename, kind, size_bytes or created_at (also in a
-  row-constructor piece) is InsufficientPrivilegeError "permission denied for
-  table attachments", raised before the statement runs (nothing changes).
+- Grants (admino_app, migrations 0027 and 0028): SELECT, INSERT and DELETE; an
+  UPDATE may SET only ``ATTACHMENT_UPDATE_COLUMNS`` (message_id, status,
+  failure_reason, page_count, token_estimate (0028), updated_at, deleted_at).
+  Naming id, org_id, chat_id, owner_user_id, filename, kind, size_bytes or
+  created_at (also in a row-constructor piece) is InsufficientPrivilegeError
+  "permission denied for table attachments", raised before the statement runs
+  (nothing changes).
 - Every statement naming attachments runs on the SQL reader after the
   chat-table bind checks (argument count, ``$n`` gaps, encoders, U+0000,
   grants). Reader features for the contract §2 forms (A1 to A11, P1 to P5, G1
@@ -330,9 +335,14 @@ Attachments (GH-187, migration 0027):
     "coalesce", as in PostgreSQL.
   - A SELECT on attachments without ORDER BY answers newest-first, like the
     chat tables (PostgreSQL promises no order); ``ORDER BY created_at, id``
-    (P5, G1) sorts by both. ``UPDATE ... RETURNING`` gives the new values (P1),
-    ``DELETE ... RETURNING`` the deleted rows (G2); ``now()`` in SET is the
-    statement's clock.
+    (P5, G1) sorts by both. ``UPDATE ... RETURNING`` gives the new values (P1;
+    GH-188's P1' ``RETURNING kind, filename``), ``DELETE ... RETURNING`` the
+    deleted rows (G2); ``now()`` in SET is the statement's clock. An UPDATE's
+    status is "UPDATE <n>" (GH-188's P2' sets ``page_count = $3,
+    token_estimate = $4`` and answers "UPDATE 0" when no row matched).
+  - GH-188 (contract §6, §7): P1' and P2' above, and A5 / A6 with the R list
+    ``id, chat_id, message_id, filename, kind, size_bytes, status,
+    failure_reason, page_count, token_estimate, created_at``.
   - A1 and A3 run on the reader like every SELECT whose main table is
     organizations (so ``after_org_lookup`` fires for them too). ``add_org``
     creates an org with ``storage_quota_bytes`` 0: under the contract's
@@ -344,11 +354,12 @@ Attachments (GH-187, migration 0027):
   key; ``add_audit`` seeds any action.
 - Helpers: ``add_attachment(chat_id, *, attachment_id=None, filename='a.pdf',
   kind='pdf', size_bytes=1, status='uploaded', failure_reason=None,
-  page_count=None, message_id=None, created_at=None, updated_at=None,
-  deleted_at=None)`` stores a row checked like an INSERT (org_id and
-  owner_user_id: the chat's, an unknown chat is ForeignKeyViolationError
-  ``ATTACHMENT_CHAT_FKEY``; attachment_id: a new uuid4; created_at: now;
-  updated_at: created_at) and returns its id (a plain uuid.UUID);
+  page_count=None, token_estimate=None, message_id=None, created_at=None,
+  updated_at=None, deleted_at=None)`` stores a row checked like an INSERT
+  (org_id and owner_user_id: the chat's, an unknown chat is
+  ForeignKeyViolationError ``ATTACHMENT_CHAT_FKEY``; attachment_id: a new
+  uuid4; created_at: now; updated_at: created_at) and returns its id (a plain
+  uuid.UUID);
   ``attachment_row(attachment_id)`` reads a copy back (None when there is
   none) and ``attachments_of(chat_id)`` copies of a chat's rows, trashed ones
   included, by created_at then id.
@@ -947,12 +958,17 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
         "created_at": "timestamptz",
         "updated_at": "timestamptz",
         "deleted_at": "timestamptz",
+        # GH-188 (migration 0028): ALTER TABLE ... ADD COLUMN appends it after
+        # deleted_at; an INTEGER like page_count.
+        "token_estimate": "int4",
     },
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
     "chats": frozenset({"legacy_session_id", "deleted_at"}),
     "chat_messages": frozenset({"tool_use_blocks", "tool_call_id", "tool_calls"}),
-    "attachments": frozenset({"message_id", "failure_reason", "page_count", "deleted_at"}),
+    "attachments": frozenset(
+        {"message_id", "failure_reason", "page_count", "deleted_at", "token_estimate"}
+    ),
 }
 # The tables of the chat family: chats, chat_messages and (GH-187) attachments.
 _CHAT_TABLES: Final = frozenset(_CHAT_TYPES)
@@ -981,7 +997,8 @@ CHAT_EXTERNAL_CONTENT_RESET: Final = "chats.external_content can't be reset"
 # users key: it replaced 0024's chats_owner_user_id_fkey).
 CHAT_OWNER_FKEY: Final = "chats_owner_org_fkey"
 # GH-187 (migration 0027): the attachments CHECKs, the composite foreign key to the
-# chat (and its owner and org), and the only columns admino_app may UPDATE.
+# chat (and its owner and org), and the only columns admino_app may UPDATE (GH-188,
+# migration 0028: plus token_estimate).
 ATTACHMENT_KINDS: Final = frozenset(
     {"pdf", "docx", "xlsx", "csv", "txt", "md", "png", "jpeg", "webp"}
 )
@@ -995,10 +1012,18 @@ FAILURE_REASON_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _FILENAME_REFUSED_RE: Final = re.compile(r"[\x00-\x1f\x7f-\x9f/\\]")
 ATTACHMENT_CHAT_FKEY: Final = "attachments_chat_fkey"
 ATTACHMENT_UPDATE_COLUMNS: Final = frozenset(
-    {"message_id", "status", "failure_reason", "page_count", "updated_at", "deleted_at"}
+    {
+        "message_id",
+        "status",
+        "failure_reason",
+        "page_count",
+        "token_estimate",
+        "updated_at",
+        "deleted_at",
+    }
 )
-# The column grants an UPDATE of a chat-family table is limited to (migrations 0025
-# and 0027), and the UPDATE statements they apply to (normalized SQL).
+# The column grants an UPDATE of a chat-family table is limited to (migrations 0025,
+# 0027 and 0028), and the UPDATE statements they apply to (normalized SQL).
 _UPDATE_GRANTS: Final[dict[str, frozenset[str]]] = {
     "chats": CHAT_UPDATE_COLUMNS,
     "attachments": ATTACHMENT_UPDATE_COLUMNS,
@@ -1929,12 +1954,13 @@ class FakeDb:
         status: str = "uploaded",
         failure_reason: str | None = None,
         page_count: int | None = None,
+        token_estimate: int | None = None,
         message_id: uuid.UUID | None = None,
         created_at: datetime | None = None,
         updated_at: datetime | None = None,
         deleted_at: datetime | None = None,
     ) -> uuid.UUID:
-        """Store an attachments row (GH-187) as migration 0027 allows it; return its id.
+        """Store an attachments row (GH-187) as migrations 0027 and 0028 allow it; return its id.
 
         ``org_id`` and ``owner_user_id`` are the chat's (a chat that doesn't
         exist is a ForeignKeyViolationError on ``ATTACHMENT_CHAT_FKEY``).
@@ -1973,6 +1999,7 @@ class FakeDb:
             "created_at": created,
             "updated_at": updated_at if updated_at is not None else created,
             "deleted_at": deleted_at,
+            "token_estimate": token_estimate,
         }
         row = self.build_chat_row("attachments", given, now)
         self.store_chat_row("attachments", row)
@@ -2688,7 +2715,8 @@ class FakeDb:
         CHECK / NOT NULL ones the "Failing row contains" detail (with content,
         as the driver's does).
 
-        attachments (GH-187, migration 0027): its six CHECKs (alphabetical, as
+        attachments (GH-187, migration 0027): its six CHECKs plus (GH-188,
+        migration 0028) ``attachments_token_estimate_check`` (alphabetical, as
         PostgreSQL runs them), the primary key, then ``attachments_org_id_fkey``,
         ``attachments_message_id_fkey`` and ``ATTACHMENT_CHAT_FKEY`` (chat_id,
         org_id, owner_user_id) -> chats (id, org_id, owner_user_id).
@@ -2731,6 +2759,7 @@ class FakeDb:
             reason = row["failure_reason"]
             filename = row["filename"]
             page_count = row["page_count"]
+            token_estimate = row["token_estimate"]
             rules = [
                 (
                     "attachments_failure_reason_check",
@@ -2746,6 +2775,11 @@ class FakeDb:
                 ("attachments_page_count_check", page_count is None or page_count >= 0),
                 ("attachments_size_bytes_check", 1 <= row["size_bytes"] <= ATTACHMENT_SIZE_MAX),
                 ("attachments_status_check", row["status"] in ATTACHMENT_STATUSES),
+                # GH-188 (migration 0028).
+                (
+                    "attachments_token_estimate_check",
+                    token_estimate is None or token_estimate >= 0,
+                ),
             ]
         else:
             blocks = row["tool_use_blocks"]
