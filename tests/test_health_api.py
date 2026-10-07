@@ -43,8 +43,9 @@ Security notes:
   for the whole message and each of its words that no random value can spell
   (``zephyr``, ``secret``), plus a traceback. They never look for a fragment
   such as ``4481`` that a random request id, timestamp or count can also
-  contain (GH-274: about one request id in 2,260 held those digits), so a leak
-  of the digits alone is the one shape they don't see.
+  contain (GH-274: about one request id in 2,260 held those digits). They are
+  not exhaustive: a leak of the digits alone, or of a fragment shorter than a
+  whole word (``zeph``), for example, is not seen.
 - No real database, LLM or network: ``check_health``, ``_check_llm_reachable``,
   ``resolve_session``, ``get_pool`` and ``organizations.list_orgs`` are patched.
   The chat route (GH-176: it persists into a chat per user and session id) gets
@@ -134,7 +135,8 @@ _SECRET_WORDS: Final[tuple[str, ...]] = tuple(
 # What the log leak checks look for, case-insensitively (GH-274): the whole
 # message and each of _SECRET_WORDS in a raw record's message and in the
 # formatted text, plus a traceback in the text. Never a fragment that a random
-# value could spell on its own.
+# value could spell on its own. Not exhaustive: the digits alone, or a fragment
+# shorter than a whole word ("zeph"), for example, are not seen.
 _MESSAGE_PROBES: Final[tuple[str, ...]] = (_SECRET, *_SECRET_WORDS)
 _TEXT_PROBES: Final[tuple[str, ...]] = (*_MESSAGE_PROBES, "Traceback")
 # Request ids pinned through admino.server.uuid4 (both valid uuid4 values): one
@@ -705,10 +707,12 @@ def _message_leaks(logs: CapturedLogs) -> list[tuple[str, str]]:
     an operator sees (checked for ``_TEXT_PROBES``), ``"record"`` a raw record's
     message (checked for ``_MESSAGE_PROBES``). Both compare casefolded, so an
     upper- or title-cased message is still found, and a word probe on its own
-    finds a fragment (the tail after a redacted first word, a truncated head).
-    Every probe holds a character that no request id, timestamp or count has in
-    any case, so a random value can't match it (GH-274). A test asserts ``== []``
-    (nothing leaked) or the exact leaks of a planted message.
+    finds a fragment that keeps a whole word (the tail after a redacted first
+    word, a truncated head). Not every leak is found: the digits alone, or a
+    fragment shorter than a whole word, for example, are not. Every probe holds
+    a character that no request id, timestamp or count has in any case, so a
+    random value can't match it (GH-274). A test asserts ``== []`` (nothing
+    leaked) or the exact leaks of a planted message.
     """
     text = logs.text.casefold()
     messages = [record.getMessage().casefold() for record in logs.records]
@@ -772,8 +776,8 @@ async def _unhandled(
 
 _SOURCES: Final = ["probe-route", "real-route", "dependency"]
 # The planted leak forms of _log_then_raise and the probes that must report each,
-# exactly: every probe for the whole message in any case, and the one word that
-# survives for a fragment (so each word probe is proven on its own).
+# exactly: every probe for the whole message in any case, and for a fragment the
+# one whole word it keeps (so each word probe is proven on its own).
 _LEAK_FORMS: Final[dict[str, tuple[str, ...]]] = {
     "bare-message": _MESSAGE_PROBES,
     "str-of-exception": _MESSAGE_PROBES,
