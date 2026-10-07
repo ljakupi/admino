@@ -20,6 +20,12 @@ What these tests pin down:
   from validation errors: a refused value never appears in the error text or
   in ``errors(include_input=False)``.
 - ``ChatMessageCreate.message``: 1 to 32768 characters, required.
+- ``ChatMessageCreate.attachment_ids`` (GH-187 contract section 3.1): the
+  model's fields are exactly ``message`` and ``attachment_ids``; a list of
+  UUIDs, empty when absent, at most 50; duplicates refused (also the same UUID
+  written in another case), a non-UUID refused at its index, neither echoed in
+  the error. The legacy ``ChatRequest`` (``/api/message``) still refuses the
+  key (extra="forbid"): attachments go through the chat route only.
 - ``ChatSummary`` (id, title <= 200, title_source auto/user, created_at,
   last_activity_at), ``ChatListResponse`` (chats <= 100, next_cursor default
   None), ``ChatMessageView`` (id, role user/assistant/tool, content <= 65536
@@ -47,12 +53,14 @@ from __future__ import annotations
 import json
 import typing
 from typing import Any
+from uuid import UUID
 
 import pytest
 from pydantic import BaseModel, ValidationError
 
 import admino.models as models_module
 from admino.models import (
+    ChatRequest,
     ChatResponse,
     PendingConfirmationSummary,
     PlatformLimits,
@@ -444,6 +452,76 @@ class TestChatMessageCreate:
         exc = _rejects(_model("ChatMessageCreate"), payload)
 
         assert _MARKER not in _error_text(exc)
+
+
+class TestChatMessageCreateAttachments:
+    """GH-187: the files a message carries, by attachment id."""
+
+    def test_chat_models_message_create_fields_are_message_and_attachment_ids(self) -> None:
+        assert frozenset(_model("ChatMessageCreate").model_fields) == {"message", "attachment_ids"}
+
+    def test_chat_models_message_create_attachment_ids_default_to_an_empty_list(self) -> None:
+        model = _model("ChatMessageCreate")
+
+        assert model.model_validate({"message": "hi"}).attachment_ids == []  # type: ignore[attr-defined]
+        assert model.model_validate({"message": "hi", "attachment_ids": []}).attachment_ids == []  # type: ignore[attr-defined]
+
+    def test_chat_models_message_create_attachment_ids_are_uuids(self) -> None:
+        request = _model("ChatMessageCreate").model_validate(
+            {"message": "hi", "attachment_ids": [_UUID, _OTHER_UUID]}
+        )
+
+        assert request.attachment_ids == [UUID(_UUID), UUID(_OTHER_UUID)]  # type: ignore[attr-defined]
+
+    def test_chat_models_message_create_holds_at_most_50_attachment_ids(self) -> None:
+        model = _model("ChatMessageCreate")
+        ids = [str(UUID(int=index + 1)) for index in range(51)]
+
+        accepted = model.model_validate({"message": "hi", "attachment_ids": ids[:50]})
+        assert len(accepted.attachment_ids) == 50  # type: ignore[attr-defined]
+        exc = _rejects(model, {"message": "hi", "attachment_ids": ids})
+        assert _locs(exc) == [("attachment_ids",)]
+
+    @pytest.mark.parametrize(
+        "ids",
+        [[_UUID, _OTHER_UUID, _UUID], [_UUID, _UUID.upper()]],
+        ids=["repeated", "same-uuid-other-case"],
+    )
+    def test_chat_models_message_create_refuses_duplicate_attachment_ids(
+        self, ids: list[str]
+    ) -> None:
+        """Each file once per message; the refused ids are not echoed."""
+        model = _model("ChatMessageCreate")
+
+        assert _accepts(model, {"message": "hi", "attachment_ids": [_UUID, _OTHER_UUID]})
+        exc = _rejects(model, {"message": "hi", "attachment_ids": ids})
+        assert _locs(exc) == [("attachment_ids",)]
+        text = _error_text(exc).lower()
+        assert _UUID not in text
+        assert _UUID.replace("-", "") not in text
+
+    def test_chat_models_message_create_refuses_a_non_uuid_attachment_id(self) -> None:
+        exc = _rejects(
+            _model("ChatMessageCreate"),
+            {"message": "hi", "attachment_ids": [_UUID, _MARKER]},
+        )
+
+        assert _locs(exc) == [("attachment_ids", 1)]
+        assert _MARKER not in _error_text(exc)
+
+
+class TestLegacyChatRequest:
+    """``/api/message`` (ChatRequest) takes no attachments (GH-187)."""
+
+    def test_chat_models_legacy_chat_request_refuses_attachment_ids(self) -> None:
+        exc = _rejects(
+            ChatRequest, {"message": "hi", "session_id": "s1", "attachment_ids": [_UUID]}
+        )
+
+        errors = exc.errors(include_url=False, include_input=False)
+        assert [(tuple(error["loc"]), error["type"]) for error in errors] == [
+            (("attachment_ids",), "extra_forbidden")
+        ]
 
 
 # ---------------------------------------------------------------------------

@@ -311,7 +311,9 @@ class TestModuleSurface:
 
     def test_org_users_imports_only_the_allowed_admino_modules(self) -> None:
         """The contract's list: accounts, audit_events, email_outbox, invitations,
-        password_reset, sessions, access, models, email_templates."""
+        password_reset, sessions, access, models, email_templates, and (GH-187)
+        attachments: deleting a user removes their files with
+        ``attachments.remove_files``."""
         allowed = {
             "accounts",
             "audit_events",
@@ -322,6 +324,7 @@ class TestModuleSurface:
             "access",
             "models",
             "email_templates",
+            "attachments",
         }
         admino_modules = {
             module.split(".")[1]

@@ -20,6 +20,15 @@ Viewer, plus a Super Admin):
   colleague's chat in the caller's own org (an Org Admin's, an Editor's, a
   Viewer's) is the same 404, for an Org Admin too. The stop route answers
   ``200 {"stopped": false}`` on the caller's own idle chat (the control).
+- GH-187's attachment routes: an upload (``POST /api/chats/{chat_id}/attachments``,
+  a raw body) into org B's chat, a colleague's chat or an unknown id is the
+  chat routes' ``chat_not_found`` 404 and stores nothing (no row, audit event
+  or file under the attachments root, which ``_state`` includes). The
+  metadata and download routes (``GET /api/attachments/{attachment_id}`` and
+  ``.../content``) answer ``404 {"detail": "Attachment not found", "reason":
+  "attachment_not_found"}`` for org B's attachment, a colleague's (for an Org
+  Admin too: downloads are the chat owner's only) and an unknown id, never
+  showing the file's name or bytes; the owner still reads it (the control).
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
   promotions, the permission summary, invitations, the user list and its
@@ -85,18 +94,24 @@ from admino import oauth, org_permissions, server
 from admino.oauth import encrypt_refresh_token
 from tests.db_fakes import ORG_NAME, FakeDb
 from tests.tenancy_world import (
+    ATTACHMENT_NOT_FOUND,
     CHAT_NOT_FOUND,
     PASSWORD,
     ROUTES,
+    UPLOAD_BODY,
     Account,
     World,
+    attachment_files,
     build_world,
     chat_runtime_state,
     make_app,
     make_client,
+    seed_attachment,
     seed_chat,
     seed_pending_confirmation,
     stub_agent,
+    upload_headers,
+    use_attachment_storage,
     use_fake_database,
     use_fast_passwords,
     use_roomy_rate_limits,
@@ -104,6 +119,7 @@ from tests.tenancy_world import (
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
     from unittest.mock import MagicMock
 
     import httpx
@@ -150,13 +166,17 @@ def covers[F: Callable[..., object]](*routes: Route) -> Callable[[F], F]:
 
 
 @pytest.fixture()
-def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (residency off) with their members and a Super Admin, in a FakeDb."""
+def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
+    """Orgs A and B (residency off) with their members and a Super Admin, in a FakeDb.
+
+    GH-187: attachments live under ``tmp_path``; both orgs have a storage quota.
+    """
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
     use_fast_passwords(monkeypatch)
     use_roomy_rate_limits(monkeypatch)
+    use_attachment_storage(monkeypatch, built, tmp_path / "attachments")
     return built
 
 
@@ -200,10 +220,11 @@ def _plain(value: Any) -> uuid.UUID:
 def _state(db: FakeDb) -> dict[str, Any]:
     """Everything a refused cross-org request must leave as it was.
 
-    Every table (``chats`` and ``chat_messages`` included), the sessions as
-    token hash -> (user, session id) (any request may refresh the caller's
-    ``last_seen_at``), plus the chat runtime (its entries and every stored
-    chat's pending confirmation), OAuth states and pending critical promotions.
+    Every table (``chats``, ``chat_messages`` and ``attachments`` included), the
+    sessions as token hash -> (user, session id) (any request may refresh the
+    caller's ``last_seen_at``), plus the chat runtime (its entries and every
+    stored chat's pending confirmation), OAuth states, pending critical
+    promotions and (GH-187) every file under the attachments root.
     """
     tables = db.snapshot()
     sessions = tables.pop("sessions")
@@ -214,6 +235,7 @@ def _state(db: FakeDb) -> dict[str, Any]:
     tables["chat_runtime"] = chat_runtime_state(db)
     tables["oauth_states"] = dict(server._oauth_pending_states)
     tables["promotions"] = dict(org_permissions._pending)
+    tables["attachment_files"] = attachment_files()
     return tables
 
 
@@ -539,6 +561,58 @@ def _stop_chat(client: TestClient, caller: Account, ident: str) -> httpx.Respons
     return client.post(f"/api/chats/{ident}/stop", headers=caller.cookie)
 
 
+def _upload_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-187: upload a short text file (raw body, name in X-Attachment-Name) into a chat."""
+    return client.post(
+        f"/api/chats/{ident}/attachments",
+        content=UPLOAD_BODY,
+        headers={**upload_headers(), **caller.cookie},
+    )
+
+
+# GH-187: the attachment of a marked chat carries the marker in its name and its bytes.
+def _marked_attachment(world: World, owner: Account, marker: str) -> uuid.UUID:
+    """An attachment named and filled with ``marker``, in a marked chat of ``owner``."""
+    chat_id = _marked_chat(world, owner, marker)
+    return seed_attachment(
+        world.db,
+        chat_id,
+        filename=f"{marker} Vertrag.txt",
+        data=f"{marker} Vertragsinhalt\n".encode(),
+    )
+
+
+def _b_attachment(world: World, _client: TestClient) -> str:
+    return str(_marked_attachment(world, world.b["editor"], _B_MARKER))
+
+
+def _a_attachment(world: World, _client: TestClient) -> str:
+    return str(_marked_attachment(world, world.a["editor"], _A_MARKER))
+
+
+def _get_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.get(f"/api/attachments/{ident}", headers=caller.cookie)
+
+
+def _download_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    return client.get(f"/api/attachments/{ident}/content", headers=caller.cookie)
+
+
+def _attachment_case(send: Callable[[TestClient, Account, str], httpx.Response]) -> _PathIdCase:
+    """A GH-187 attachment read: org A's Editor, the attachment_not_found 404, B's / A's
+    marked attachment (its file on disk)."""
+    return _PathIdCase(
+        caller="editor",
+        detail="Attachment not found",
+        own_status=200,
+        seed_foreign=_b_attachment,
+        seed_own=_a_attachment,
+        send=send,
+        unknown_id=_uuid_id,
+        reason="attachment_not_found",
+    )
+
+
 def _chat_case(
     own_status: int, send: Callable[[TestClient, Account, str], httpx.Response]
 ) -> _PathIdCase:
@@ -693,19 +767,25 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
     ("POST", "/api/chats/{chat_id}/messages"): _chat_case(200, _send_chat_message),
     # GH-8: stopping the chat's streamed run (none here: own chat answers 200 stopped false).
     ("POST", "/api/chats/{chat_id}/stop"): _chat_case(200, _stop_chat),
+    # GH-187: only the chat's owner uploads (201 into the own chat); only the owner reads.
+    ("POST", "/api/chats/{chat_id}/attachments"): _chat_case(201, _upload_attachment),
+    ("GET", "/api/attachments/{attachment_id}"): _attachment_case(_get_attachment),
+    ("GET", "/api/attachments/{attachment_id}/content"): _attachment_case(_download_attachment),
 }
 
 _PATH_ID_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]} {route[1]}") for route in _PATH_ID_CASES
 ]
 
-# The chat routes of GH-176 (and GH-8's stop route) that name a chat in the path.
+# The chat routes of GH-176 (and GH-8's stop route, GH-187's upload) that name a chat
+# in the path.
 _CHAT_ROUTES: Final[tuple[Route, ...]] = (
     ("GET", "/api/chats/{chat_id}"),
     ("PATCH", "/api/chats/{chat_id}"),
     ("DELETE", "/api/chats/{chat_id}"),
     ("POST", "/api/chats/{chat_id}/messages"),
     ("POST", "/api/chats/{chat_id}/stop"),
+    ("POST", "/api/chats/{chat_id}/attachments"),
 )
 # Space-free ids, so the RED record (gates.sh cuts node ids at a space) names each case.
 _CHAT_ROUTE_PARAMS: Final = [
@@ -716,6 +796,15 @@ _COLLEAGUE_PAIRS: Final = [
     pytest.param("editor", "org_admin", id="editor-on-org-admins-chat"),
     pytest.param("org_admin", "editor", id="org-admin-on-editors-chat"),
     pytest.param("org_admin", "viewer", id="org-admin-on-viewers-chat"),
+]
+
+# GH-187: the attachment reads (metadata and download) that name an attachment.
+_ATTACHMENT_ROUTES: Final[tuple[Route, ...]] = (
+    ("GET", "/api/attachments/{attachment_id}"),
+    ("GET", "/api/attachments/{attachment_id}/content"),
+)
+_ATTACHMENT_ROUTE_PARAMS: Final = [
+    pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _ATTACHMENT_ROUTES
 ]
 
 # The org user routes of GH-164 that name a user in the path.
@@ -1167,6 +1256,62 @@ class TestChatPathRoutes:
         assert "A-colleague-176" not in colleague.text
         assert str(chat_id) not in colleague.text
         agent.run.assert_not_awaited()
+
+
+class TestAttachmentPathRoutes:
+    """GH-187: an attachment is its chat owner's alone; any other caller gets
+    attachment_not_found and never sees the file's name or bytes."""
+
+    @covers(*_ATTACHMENT_ROUTES)
+    @pytest.mark.parametrize("route", _ATTACHMENT_ROUTE_PARAMS)
+    def test_cross_org_attachment_route_keeps_the_other_orgs_file_and_never_shows_it(
+        self, world: World, client: TestClient, route: Route
+    ) -> None:
+        """Org B's attachment, asked for by org A's Org Admin (who manages users but reads
+        no member's file): 404 attachment_not_found, no Content-Disposition, B's name and
+        bytes in neither the body nor a header; B's row and file stay as they were."""
+        attachment_id = _marked_attachment(world, world.b["editor"], _B_MARKER)
+        row_before = world.db.attachment_row(attachment_id)
+        files_before = attachment_files()
+
+        response = _PATH_ID_CASES[route].send(client, world.a["org_admin"], str(attachment_id))
+
+        assert (response.status_code, response.json()) == (404, ATTACHMENT_NOT_FOUND)
+        assert "content-disposition" not in response.headers
+        assert _B_MARKER not in response.text
+        assert all(_B_MARKER not in value for value in response.headers.values())
+        assert world.db.attachment_row(attachment_id) == row_before
+        assert attachment_files() == files_before
+        assert len(files_before) == 1
+
+    @covers(*_ATTACHMENT_ROUTES)
+    @pytest.mark.parametrize(("caller_role", "owner_role"), _COLLEAGUE_PAIRS)
+    @pytest.mark.parametrize("route", _ATTACHMENT_ROUTE_PARAMS)
+    def test_cross_org_attachment_route_on_a_colleagues_file_is_404_like_an_unknown_id(
+        self,
+        world: World,
+        client: TestClient,
+        route: Route,
+        caller_role: MemberRole,
+        owner_role: MemberRole,
+    ) -> None:
+        """A colleague's attachment in the caller's own org (an Org Admin's, an Editor's, a
+        Viewer's) is the same 404 as an unknown id, for an Org Admin too (the chat's owner
+        only, V1); nothing changes and the name and bytes never appear."""
+        case = _PATH_ID_CASES[route]
+        attachment_id = _marked_attachment(world, world.a[owner_role], "A-colleague-187")
+        caller = world.a[caller_role]
+        before = _state(world.db)
+
+        colleague = case.send(client, caller, str(attachment_id))
+        unknown = case.send(client, caller, _uuid_id())
+
+        assert (colleague.status_code, colleague.json()) == (404, ATTACHMENT_NOT_FOUND)
+        assert (unknown.status_code, unknown.json()) == (404, ATTACHMENT_NOT_FOUND)
+        assert colleague.headers.get("content-type") == unknown.headers.get("content-type")
+        assert _state(world.db) == before
+        assert "A-colleague-187" not in colleague.text
+        assert str(attachment_id) not in colleague.text
 
 
 # ---------------------------------------------------------------------------
@@ -2259,6 +2404,7 @@ _CASE_CLASSES: Final = (
     TestPathIdRoutes,
     TestPathIdSideEffects,
     TestChatPathRoutes,
+    TestAttachmentPathRoutes,
     TestOwnOrgRoutes,
     TestOwnUserAccountRoutes,
     TestOwnUserOAuthRoutes,

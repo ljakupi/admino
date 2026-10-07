@@ -81,9 +81,18 @@ Routes:
   or, with ``Accept: text/event-stream``, streams the run as server-sent
   events (GH-8). The first exchange of an untitled chat titles it after the
   response (GH-179; a streamed one before its ``done``). 409 ``run_active``
-  while a run of the chat is going.
+  while a run of the chat is going. GH-187: ``attachment_ids`` sends the
+  caller's unsent uploads of the chat with the message (linked to the stored
+  user message).
 - POST /api/chats/{chat_id}/stop — Stops the chat's streamed run
   (``{"stopped": bool}``, GH-8).
+- POST /api/chats/{chat_id}/attachments — Stores one file (the raw request
+  body, its name in ``X-Attachment-Name``) in a chat of the caller (201
+  AttachmentSummary, GH-187); audited.
+- GET  /api/attachments/{attachment_id} — An attachment's metadata and
+  processing status (the chat's owner only).
+- GET  /api/attachments/{attachment_id}/content — Downloads the stored
+  original (the chat's owner only).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created by its first run, until #177: a refused first
   message creates none); returns ChatResponse, always JSON. Titles the chat
@@ -254,6 +263,51 @@ Security notes:
   (every tool call still is, as ``tool.call``); at most an INFO line names
   the chat id. No message, delta, title, tool argument or legacy session id
   is ever logged.
+- Attachments (GH-187, ``admino.attachments``, ``admino.attachment_types``):
+  the upload needs ``Capability.FILE_UPLOAD`` (Org Admin, Editor; 403 for a
+  Viewer or a Super Admin before any database work or bucket), the reads
+  ``Capability.CHAT_SEND``. Every check of the upload comes before a body
+  byte is read, in this order: the per-user bucket (its burst is the
+  platform ``max_files_per_message``, read when the bucket is created), the
+  ``X-Attachment-Name`` header (``sanitize_filename``: percent-encoded ASCII
+  of at most 4096 characters, else 400 ``invalid_filename``), a
+  ``Content-Length`` of 1 to 18 digits (else 411 ``content_length_required``),
+  then in ``attachments.upload_attachment`` the size (400 ``empty_file``, 413
+  ``file_too_large`` above the platform ``max_file_size_mb`` MiB, read on
+  every request), the chat's owner (the chat routes' 404 ``chat_not_found``)
+  and the org's storage quota (413 ``storage_quota_exceeded``). The body
+  (``request.stream()``) is then never read past its ``Content-Length`` (400
+  ``content_length_mismatch`` either way; a client that leaves mid-body gets
+  the same), the type comes from the content only (the declared
+  ``Content-Type`` and the name's extension are ignored; 415
+  ``unsupported_type`` / ``legacy_office``, 422 ``password_protected`` /
+  ``corrupted_file``), and the commit checks the chat and the quota again
+  under their locks; a disk failure is 503 ``storage_unavailable``. A user
+  has at most the platform ``max_files_per_message`` uploads open at once
+  (``_open_uploads``; one more is the 429 before ``upload_attachment`` runs,
+  nothing read); the quota pre-check counts the bytes the org's uploads in
+  progress declared, and a body chunk that doesn't come within
+  ``attachments.STALL_TIMEOUT_S``, or a body not complete within
+  ``attachments.UPLOAD_GRACE_S`` plus the declared length at
+  ``attachments.UPLOAD_MIN_RATE_BYTES_S``, is the 400
+  ``content_length_mismatch``. Every
+  refusal is ``{"detail": <fixed text>, "reason": <code>}`` and stores no
+  row, file or audit event. A stored file (``file.upload``, content-free) is
+  submitted once to the bounded processing pool (``_processing``) after the
+  commit. The reads answer the caller's own live attachment only: another
+  org's, a colleague's (an Org Admin's request included), a trashed, an
+  unknown one and a row whose file is gone are one 404
+  ``attachment_not_found``. A download is the stored bytes with the kind's
+  ``Content-Type``, ``Content-Disposition: attachment; filename*=UTF-8''...``
+  (the percent-encoded download name, never a raw header value) and
+  ``Cache-Control: no-store``; ``nosniff`` comes with every response. A
+  message's ``attachment_ids`` above the platform ``max_files_per_message``
+  is a 422 ``too_many_files`` before any attachment statement; after the
+  chat's owner check, an id that isn't the caller's live file of the chat is
+  the 404 ``attachment_not_found`` and a sent one the 409
+  ``attachment_already_sent``, all before the run with nothing stored. Log
+  lines carry ids, sizes and kinds only: never a file name, a header value or
+  file bytes.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -521,6 +575,8 @@ Security notes:
 
 Deployment note:
 - Chats and their messages live in PostgreSQL. In-memory state: the bounded
+  ``_open_uploads`` (GH-187: each user's uploads in progress, cleared by
+  ``create_app``; ``admino.attachments`` keeps the bytes they reserve),
   ``_chat_runtime`` (``admino.chat_runtime.ChatRuntime``: per-chat run
   locks, streamed runs' stop signals (GH-8) and pending confirmations, at
   most ``_MAX_CHAT_RUNTIME_ENTRIES`` entries and
@@ -534,7 +590,9 @@ Deployment note:
   confirmation, never another user's; 503 ``chats_busy`` when nothing can
   go; cleared by ``create_app``, so a restart turns a pending confirmation
   into ``expired``), ``_rate_buckets``, ``_oauth_pending_states`` and
-  the detached streamed runs (``event_stream.detach``);
+  the detached streamed runs (``event_stream.detach``) and the attachment
+  processing queue (``_processing``, GH-187: replaced by ``create_app``; files
+  a restart left unprocessed are queued again at startup);
   ``admino.org_permissions`` keeps the pending promotions in memory (as
   ``admino.oauth`` does the access-token cache).
   This requires a **single-worker** ASGI deployment. Running multiple
@@ -562,6 +620,7 @@ import logging
 import os
 import re
 import secrets
+import stat
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -586,15 +645,20 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import ValidationError
 from starlette.background import BackgroundTask
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.requests import ClientDisconnect
 from starlette.staticfiles import StaticFiles
 
 from admino import (
     accounts,
+    attachment_gc,
+    attachment_processing,
+    attachment_types,
+    attachments,
     auth,
     chat_titles,
     chats,
@@ -617,6 +681,7 @@ from admino import (
     untrusted,
 )
 from admino.access import Capability, Principal, can
+from admino.attachment_types import AttachmentRefusedError
 from admino.chat_runtime import (
     ChatRunActiveError,
     ChatRuntime,
@@ -630,6 +695,7 @@ from admino.models import (
     PROVIDER_TOOLS,
     AgentConfig,
     AgentResult,
+    AttachmentSummary,
     ChatContext,
     ChatCreateRequest,
     ChatDetailResponse,
@@ -717,13 +783,14 @@ from admino.streaming import DisplayDeltas, RunStream, display_pieces
 from admino.tenancy import TenantContext
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 
     import asyncpg
     from pydantic import BaseModel
     from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
     from admino.agent import Agent
+    from admino.attachment_types import RefusalReason
     from admino.config import AppConfig
     from admino.llm import LLMClient
     from admino.models import (
@@ -1065,6 +1132,12 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/chats/delete": (0.5, 5),
     # GH-8: stopping a chat's streamed run, per user.
     "/api/chats/stop": (1.0, 10),
+    # GH-187: chat attachments, per user. The upload refills one token every 2
+    # seconds. Its burst below (10) is never used: the bucket's burst is the
+    # platform max_files_per_message, passed when the caller's bucket is created.
+    "/api/chats/attachments/create": (0.5, 10),
+    "/api/attachments/get": (5.0, 50),
+    "/api/attachments/content/get": (2.0, 30),
     # GH-159: the settings scopes, per user.
     "/api/me/settings/get": (1.0, 10),
     "/api/me/settings/patch": (0.5, 5),
@@ -1182,7 +1255,7 @@ def _evict_idle_buckets(now: float) -> None:
         del _rate_buckets[oldest_key]
 
 
-def _check_rate_limit(route: str, caller: str) -> None:
+def _check_rate_limit(route: str, caller: str, *, burst: int | None = None) -> None:
     """Consume one token from ``caller``'s bucket for ``route``; 429 when empty.
 
     Each (route, caller) pair has its own bucket, so one user (or IP)
@@ -1193,28 +1266,31 @@ def _check_rate_limit(route: str, caller: str) -> None:
     Args:
         route: The route key (e.g. ``"/api/message"``).
         caller: ``"user:<user_id>"`` or ``"ip:<client host>"``.
+        burst: The burst of a bucket created now, instead of the route's own
+            (GH-187: the upload's is a platform setting).
 
     Raises:
         HTTPException: 429 if the caller's bucket is empty.
     """
     now = time.monotonic()
-    if not _bucket_for(route, caller, now).allow(now):
+    if not _bucket_for(route, caller, now, burst=burst).allow(now):
         raise HTTPException(status_code=429, detail="Rate limit exceeded")
 
 
-def _bucket_for(route: str, caller: str, now: float) -> _TokenBucket:
+def _bucket_for(route: str, caller: str, now: float, *, burst: int | None = None) -> _TokenBucket:
     """Return (creating it if needed) the bucket of ``(route, caller)``, marked most recent.
 
+    A bucket created now gets ``burst`` when given, else the route's own.
     Evicts idle buckets first, and keeps the map within ``_MAX_RATE_BUCKETS``.
     """
     _evict_idle_buckets(now)
     key = (route, caller)
     bucket = _rate_buckets.get(key)
     if bucket is None:
-        rate, burst = _RATE_LIMITS.get(route, _DEFAULT_RATE_LIMIT)
+        rate, route_burst = _RATE_LIMITS.get(route, _DEFAULT_RATE_LIMIT)
         while _rate_buckets and len(_rate_buckets) >= _MAX_RATE_BUCKETS:
             _rate_buckets.popitem(last=False)
-        bucket = _TokenBucket(rate, burst, now)
+        bucket = _TokenBucket(rate, route_burst if burst is None else burst, now)
         _rate_buckets[key] = bucket
     else:
         _rate_buckets.move_to_end(key)
@@ -1280,6 +1356,13 @@ _CONFIRMATION_REAP_INTERVAL_S: Final = 30.0
 # one tool call's time plus the store. The container's stop grace period must be
 # longer, or the process is killed first. Read by the lifespan at shutdown.
 _DRAIN_TIMEOUT_S: Final = 30.0
+# GH-187: the bounded pool that processes stored attachments after their upload's 201.
+# Replaced by create_app (a restart's state); the upload route and the lifespan read
+# this module global at call time (tests swap it).
+_processing = attachment_processing.ProcessingPool()
+# GH-187: user id -> their uploads in progress (at most the platform
+# max_files_per_message each). Cleared by create_app, like _rate_buckets.
+_open_uploads: dict[UUID, int] = {}
 
 # OAuth state binding (GH-162): the authorize route stores the state with the
 # initiating user and session, and sets this short-lived cookie (HttpOnly,
@@ -1397,6 +1480,19 @@ _USER_CHATS_BUSY_BODY: Final = {
 _RUN_ACTIVE_BODY: Final = {
     "detail": "A message is already running in this chat.",
     "reason": "run_active",
+}
+# GH-187: the documented error bodies of the attachment routes and of a message's files.
+_ATTACHMENT_NOT_FOUND_BODY: Final = {
+    "detail": "Attachment not found",
+    "reason": "attachment_not_found",
+}
+_ATTACHMENT_ALREADY_SENT_BODY: Final = {
+    "detail": "Attachment already sent",
+    "reason": "attachment_already_sent",
+}
+_TOO_MANY_FILES_BODY: Final = {
+    "detail": "Too many files for one message",
+    "reason": "too_many_files",
 }
 
 # The stored status of a run's last message: a run's ``final`` is ``complete``.
@@ -1571,6 +1667,22 @@ async def require_chat_sender(principal: _PrincipalDep) -> Principal:
 
 # A logged-in principal with chat.send (401 without a session, 403 without the role).
 _ChatSenderDep = Annotated[Principal, Depends(require_chat_sender)]
+
+
+async def require_file_uploader(principal: _PrincipalDep) -> Principal:
+    """FastAPI dependency: a logged-in principal allowed to upload files (GH-187).
+
+    Raises:
+        HTTPException: 403 ``Forbidden`` unless the principal has
+            ``Capability.FILE_UPLOAD`` (a Viewer or a Super Admin has not).
+    """
+    if not can(principal, Capability.FILE_UPLOAD):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return principal
+
+
+# A logged-in principal with file.upload (401 without a session, 403 without the role).
+_FileUploaderDep = Annotated[Principal, Depends(require_file_uploader)]
 
 
 # ---------------------------------------------------------------------------
@@ -3346,8 +3458,8 @@ async def get_platform_org_metadata(principal: _PrincipalDep, org_id: UUID) -> O
 
     Returns:
         OrgMetadata: the seats used (active and invited users) and the limit,
-        the storage used and the chat and file counts (0 until chats and
-        attachments exist); counts and sizes only.
+        the chats that aren't trashed, and the org's attachments (file count
+        and bytes used, trashed ones included); counts and sizes only.
 
     Raises:
         HTTPException: 403 without ``Capability.PLATFORM_ORG_METADATA_VIEW``;
@@ -3845,6 +3957,8 @@ class _HeldRun:
     policy: ToolPolicy
     # The user message of an untitled chat's first exchange (GH-179); None: no title.
     title_message: str | None = None
+    # The files the turn's user message sends (GH-187, checked before the hold).
+    attachment_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -3936,6 +4050,9 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
             new_messages,
             final_status=_STORED_STATUS[status],
             tool_calls=result.tool_calls,
+            # GH-187: linked to the turn's user message in its transaction; none (the
+            # default) adds no statement.
+            attachment_ids=run.attachment_ids,
         )
     except BaseException:
         # Whatever stopped the store (a chat trashed meanwhile, a database error, a
@@ -4283,6 +4400,7 @@ async def _chat_turn(
     chat_ref: UUID | str,
     background_tasks: BackgroundTasks,
     *,
+    attachment_ids: Sequence[UUID] = (),
     streamed: bool = False,
 ) -> ChatResponse | EventStreamResponse:
     """Run one user message in a chat and store the turn (the two turn routes).
@@ -4306,6 +4424,11 @@ async def _chat_turn(
     owner check, a chat the caller can't reach being the 404 before the
     hold) and, under the hold, the chat with its latest messages
     (``chats.load_turn``).
+
+    GH-187: a message with files has them checked right after the owner check
+    (``attachments.check_sendable``, one statement; none without files), before
+    the hold and the run, and the stored turn links them to its user message
+    (``_finish_run``).
 
     A legacy session id keeps its separate reads before the hold
     (``org_permissions.load_tool_policy``,
@@ -4348,6 +4471,8 @@ async def _chat_turn(
         chat_ref: The chat's id, or a legacy session id (the caller's chat of
             it, created by its first run, until #177).
         background_tasks: The request's background tasks (a JSON turn's title).
+        attachment_ids: The files the message sends (a chat id's turn only;
+            their number already checked against the platform limit).
         streamed: Answer with the run's event stream (the chat route with
             ``Accept: text/event-stream``) instead of the JSON ChatResponse.
 
@@ -4360,6 +4485,10 @@ async def _chat_turn(
             of a JSON turn fails (nothing stored).
         chats.ChatNotFoundError: The chat isn't the caller's, or was trashed
             during a JSON turn's run (404 ``chat_not_found``, nothing stored).
+        attachments.AttachmentNotFoundError: A file isn't the caller's live
+            one of the chat (404 ``attachment_not_found``; no run).
+        attachments.AttachmentAlreadySentError: A file was already sent (409
+            ``attachment_already_sent``; no run).
         ChatRunActiveError: A run of the chat is going (409 ``run_active``,
             GH-8; no run, nothing stored).
         ChatRuntimeUserLimitError: The chat has no runtime entry and the
@@ -4398,6 +4527,7 @@ async def _chat_turn(
         setup = await turn_setup.load_turn_setup(pool, tenant, chat_ref)
         if not setup.chat_found:
             raise chats.ChatNotFoundError
+        await attachments.check_sendable(pool, tenant, chat_ref, attachment_ids)
         policy = setup.policy
         prompt_context = setup.prompt_context
         chat_id = chat_ref
@@ -4458,6 +4588,7 @@ async def _chat_turn(
             platform=platform,
             policy=policy,
             title_message=message if first_exchange else None,
+            attachment_ids=tuple(attachment_ids),
         )
         start = functools.partial(
             _agent.run,
@@ -4493,7 +4624,7 @@ async def post_chat_message(
     chat_id: UUID,
     body: ChatMessageCreate,
     background_tasks: BackgroundTasks,
-) -> ChatResponse | EventStreamResponse:
+) -> ChatResponse | EventStreamResponse | JSONResponse:
     """Handle POST /api/chats/{chat_id}/messages — run a turn in a chat of the caller.
 
     Spends the per-user ``/api/message`` bucket (shared with the legacy
@@ -4503,11 +4634,17 @@ async def post_chat_message(
     error either way. A JSON turn's first exchange titles an untitled chat
     after the response is sent (GH-179); a streamed one before ``done``.
 
+    GH-187: ``attachment_ids`` above the stored platform
+    ``max_files_per_message`` (read on every request) are the 422
+    ``too_many_files``, before any attachment statement; the files are then
+    checked after the chat's owner check and linked to the stored user
+    message. A message without files makes the statements it made before.
+
     Args:
         request: The incoming request (its ``Accept`` header).
         principal: The logged-in principal (needs ``chat.send``).
         chat_id: The chat (a UUID; anything else is a 422).
-        body: Validated ChatMessageCreate (the message).
+        body: Validated ChatMessageCreate (the message and the files it sends).
         background_tasks: The request's background tasks (the title task).
 
     Returns:
@@ -4516,22 +4653,32 @@ async def post_chat_message(
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
         ``max_pending_confirmations`` in other chats; None otherwise. Or the
-        streamed run's EventStreamResponse.
+        streamed run's EventStreamResponse. Or the 422 ``too_many_files``.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
             length, 500 when a JSON turn's agent fails. A chat the caller
-            can't reach is the 404 ``chat_not_found``; a chat whose run is
-            going the 409 ``run_active`` (GH-8); the caller at their
-            chat-runtime bound the 429 ``rate_limit`` (GH-24); a full chat
-            runtime with nothing to evict the 503 ``chats_busy``.
+            can't reach is the 404 ``chat_not_found``; a file that isn't the
+            caller's live one of the chat the 404 ``attachment_not_found``
+            and a file already sent the 409 ``attachment_already_sent``
+            (GH-187); a chat whose run is going the 409 ``run_active``
+            (GH-8); the caller at their chat-runtime bound the 429
+            ``rate_limit`` (GH-24); a full chat runtime with nothing to evict
+            the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
+    # Only a message with files reads the limit here (from the settings cache), so a
+    # message without makes the statements it made before (GH-244).
+    if body.attachment_ids:
+        files = (await _platform_run_settings()).files
+        if len(body.attachment_ids) > files.max_files_per_message:
+            return JSONResponse(status_code=422, content=_TOO_MANY_FILES_BODY)
     return await _chat_turn(
         principal,
         body.message,
         chat_id,
         background_tasks,
+        attachment_ids=body.attachment_ids,
         streamed=_wants_event_stream(request),
     )
 
@@ -4812,6 +4959,236 @@ async def post_confirm(
             raise HTTPException(status_code=500, detail="Internal error") from None
         stored = await _finish_run(run, result)
     return _chat_response(chat.id, body.session_id, result, stored)
+
+
+# ---------------------------------------------------------------------------
+# Attachments (GH-187): the upload, the metadata and the download
+# ---------------------------------------------------------------------------
+
+_UPLOAD_RATE_ROUTE: Final = "/api/chats/attachments/create"
+# The platform's max_file_size_mb counts MiB.
+_MIB: Final = 1_048_576
+# A usable Content-Length: 1 to 18 ASCII digits (no sign, space or other digit; more
+# digits are far past every size limit).
+_CONTENT_LENGTH_RE: Final = re.compile(r"[0-9]{1,18}")
+# The status of each upload refusal; its body is the reason's fixed text and code.
+_REFUSAL_STATUS: Final[dict[RefusalReason, int]] = {
+    "invalid_filename": 400,
+    "content_length_required": 411,
+    "empty_file": 400,
+    "content_length_mismatch": 400,
+    "file_too_large": 413,
+    "storage_quota_exceeded": 413,
+    "unsupported_type": 415,
+    "legacy_office": 415,
+    "password_protected": 422,
+    "corrupted_file": 422,
+    "storage_unavailable": 503,
+}
+
+
+def _attachment_refusal(reason: RefusalReason) -> JSONResponse:
+    """An upload's refusal: its status and ``{"detail", "reason"}`` (fixed text, never input)."""
+    return JSONResponse(
+        status_code=_REFUSAL_STATUS[reason],
+        content={"detail": attachment_types.REFUSAL_DETAILS[reason], "reason": reason},
+    )
+
+
+def _declared_length(value: str | None) -> int:
+    """The upload's ``Content-Length`` header as a number.
+
+    Raises:
+        AttachmentRefusedError: ``content_length_required`` without the
+            header, or unless it is 1 to 18 ASCII digits.
+    """
+    if value is None or _CONTENT_LENGTH_RE.fullmatch(value) is None:
+        raise AttachmentRefusedError("content_length_required")
+    return int(value)
+
+
+@contextlib.contextmanager
+def _upload_slot(user_id: UUID, limit: int) -> Iterator[None]:
+    """Hold one of ``user_id``'s at most ``limit`` uploads in progress, released on any exit.
+
+    Raises:
+        HTTPException: 429 when the user already has ``limit`` uploads open.
+    """
+    open_now = _open_uploads.get(user_id, 0)
+    if open_now >= limit:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    _open_uploads[user_id] = open_now + 1
+    try:
+        yield
+    finally:
+        # get(): create_app may have cleared the map while this upload ran.
+        left = _open_uploads.get(user_id, 1) - 1
+        if left > 0:
+            _open_uploads[user_id] = left
+        else:
+            _open_uploads.pop(user_id, None)
+
+
+def _attachment_summary(record: attachments.AttachmentRecord) -> AttachmentSummary:
+    """The API summary of a stored attachment: metadata only, never its org, owner or path."""
+    return AttachmentSummary.model_validate(record, from_attributes=True)
+
+
+async def post_chat_attachment(
+    request: Request, principal: _FileUploaderDep, chat_id: UUID
+) -> AttachmentSummary | JSONResponse:
+    """Handle POST /api/chats/{chat_id}/attachments — store one file in a chat of the caller.
+
+    The request body is the file itself, read with ``request.stream()`` only
+    once every check that needs none of it passed, in this order: the
+    per-user bucket (its burst is the stored platform
+    ``max_files_per_message`` when the caller's bucket is created, then one
+    every 2 seconds), the name (the percent-encoded ``X-Attachment-Name``
+    header, ``attachment_types.sanitize_filename``), the ``Content-Length``
+    (required: it bounds the stream), the caller's uploads in progress (at
+    most ``max_files_per_message``; the slot is held until this upload
+    ends, however it ends), then in ``attachments.upload_attachment`` the
+    size against the stored platform ``max_file_size_mb`` (MiB, read on
+    every request), the chat's owner and the org's storage quota (stored
+    plus reserved bytes). The declared ``Content-Type`` is ignored: the
+    kind comes from the content. A stored file is submitted once to
+    ``_processing`` (looked up now) and logged by its ids, size and kind.
+
+    Args:
+        request: The incoming request (the name and length headers, the
+            body, the client IP for the audit event).
+        principal: The logged-in principal (needs ``file.upload``).
+        chat_id: The chat (a UUID; anything else is a 422).
+
+    Returns:
+        201 with the stored attachment's AttachmentSummary (status
+        ``uploaded``). Or a refusal ``{"detail", "reason"}`` with nothing
+        stored: 400 ``invalid_filename``, ``empty_file`` or
+        ``content_length_mismatch`` (also when the client leaves mid-body,
+        a chunk doesn't come within ``attachments.STALL_TIMEOUT_S``, or the
+        body isn't complete within ``attachments.UPLOAD_GRACE_S`` plus the
+        declared length at ``attachments.UPLOAD_MIN_RATE_BYTES_S``), 411
+        ``content_length_required``, 413 ``file_too_large`` or
+        ``storage_quota_exceeded``, 415 ``unsupported_type`` or
+        ``legacy_office``, 422 ``password_protected`` or ``corrupted_file``,
+        503 ``storage_unavailable``.
+
+    Raises:
+        HTTPException: 429 when rate-limited or when the caller already has
+            ``max_files_per_message`` uploads open. A chat the caller can't reach
+            (before the body is read, or trashed while it streamed) is the
+            404 ``chat_not_found`` (``chats.ChatNotFoundError``).
+    """
+    from admino.database import get_pool
+
+    pool = get_pool()
+    files = (await scoped_settings.current_platform_settings(pool)).files
+    _check_rate_limit(
+        _UPLOAD_RATE_ROUTE, _user_caller(principal), burst=files.max_files_per_message
+    )
+    tenant = TenantContext.from_principal(principal)
+    root = attachments.attachments_root()
+    try:
+        filename = attachment_types.sanitize_filename(request.headers.get("x-attachment-name"))
+        declared_length = _declared_length(request.headers.get("content-length"))
+        with _upload_slot(principal.user_id, files.max_files_per_message):
+            record = await attachments.upload_attachment(
+                pool,
+                tenant,
+                chat_id,
+                filename=filename,
+                declared_length=declared_length,
+                body=request.stream(),
+                root=root,
+                max_bytes=files.max_file_size_mb * _MIB,
+                ip=request.client.host if request.client is not None else None,
+            )
+    except AttachmentRefusedError as exc:
+        return _attachment_refusal(exc.reason)
+    except ClientDisconnect:
+        # The client left mid-body: nothing is stored, and no one reads this answer.
+        return _attachment_refusal("content_length_mismatch")
+    _processing.submit(pool, root, record.id, tenant.org_id)
+    logger.info(
+        "Attachment %s stored in chat %s: %d bytes, %s",
+        safe_log(record.id),
+        safe_log(record.chat_id),
+        record.size_bytes,
+        record.kind,
+    )
+    return _attachment_summary(record)
+
+
+async def get_attachment_metadata(
+    principal: _ChatSenderDep, attachment_id: UUID
+) -> AttachmentSummary:
+    """Handle GET /api/attachments/{attachment_id} — an attachment of the caller.
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        attachment_id: The attachment (a UUID; anything else is a 422).
+
+    Returns:
+        The attachment's AttachmentSummary: its metadata and processing
+        status (any status), never its bytes.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            live attachment (another org's, a colleague's, a trashed or an
+            unknown one) is the 404 ``attachment_not_found``.
+    """
+    _check_rate_limit("/api/attachments/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    tenant = TenantContext.from_principal(principal)
+    return _attachment_summary(await attachments.get_attachment(get_pool(), tenant, attachment_id))
+
+
+async def get_attachment_content(principal: _ChatSenderDep, attachment_id: UUID) -> FileResponse:
+    """Handle GET /api/attachments/{attachment_id}/content — download an attachment of the caller.
+
+    Any status downloads (the stored original, not a processed artifact).
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        attachment_id: The attachment (a UUID; anything else is a 422).
+
+    Returns:
+        The stored bytes with the kind's ``Content-Type``, ``Content-Disposition:
+        attachment`` naming the percent-encoded download name (the kind's
+        extension added when the stored name's doesn't fit, so a ``.html``
+        name never downloads as HTML) and ``Cache-Control: no-store``.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            live attachment, and a row whose file is gone, is the 404
+            ``attachment_not_found``.
+    """
+    _check_rate_limit("/api/attachments/content/get", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    tenant = TenantContext.from_principal(principal)
+    record = await attachments.get_attachment(get_pool(), tenant, attachment_id)
+    path = attachments.attachment_path(attachments.attachments_root(), tenant.org_id, record.id)
+    try:
+        file_stat = await asyncio.to_thread(path.stat)
+    except FileNotFoundError:
+        raise attachments.AttachmentNotFoundError from None
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise attachments.AttachmentNotFoundError
+    return FileResponse(
+        path,
+        stat_result=file_stat,
+        media_type=attachment_types.MEDIA_TYPES[record.kind],
+        headers={
+            "Content-Disposition": attachment_types.content_disposition(
+                attachment_types.download_name(record.filename, record.kind)
+            ),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6064,19 +6441,55 @@ async def _run_active_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=409, content=_RUN_ACTIVE_BODY)
 
 
+async def _attachment_not_found_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``attachments.AttachmentNotFoundError``: the 404 ``attachment_not_found`` (GH-187).
+
+    One body for an unknown id, another org's or another user's attachment, a
+    trashed one and one whose file is gone, so a 404 never tells whether a file
+    exists.
+    """
+    return JSONResponse(status_code=404, content=_ATTACHMENT_NOT_FOUND_BODY)
+
+
+async def _attachment_already_sent_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``attachments.AttachmentAlreadySentError``: the 409 ``attachment_already_sent``.
+
+    GH-187: a message listing a file another message carried; refused before
+    the run, with nothing stored.
+    """
+    return JSONResponse(status_code=409, content=_ATTACHMENT_ALREADY_SENT_BODY)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
+
+
+async def _recover_attachments() -> None:
+    """Queue again the attachments a restart left unprocessed (GH-187), once at startup.
+
+    ``attachment_processing.recover`` with the pool, ``_processing`` and the
+    attachments root, all looked up now. A failure is logged by its class name
+    only (its message may name a path) and never stops the app.
+    """
+    from admino.database import get_pool
+
+    try:
+        await attachment_processing.recover(get_pool(), _processing, attachments.attachments_root())
+    except Exception as exc:
+        # Startup goes on: the files stay queued in the database for the next start.
+        logger.warning("Attachment recovery failed: %s", type(exc).__name__)
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
     expired-session purge, the organization purge, the expired login-throttle
-    purge, the expired-confirmation reaper and, when SMTP is configured, the
-    email outbox sender on startup; on shutdown, stop the detached streamed
-    runs and wait for them (at most ``_DRAIN_TIMEOUT_S``, GH-8), then stop the
-    background tasks, then close the pool.
+    purge, the expired-confirmation reaper, the attachment orphan GC and the
+    one-shot attachment recovery and, when SMTP is configured, the email
+    outbox sender on startup; on shutdown, stop the detached streamed runs and
+    wait for them (at most ``_DRAIN_TIMEOUT_S``, GH-8), then stop the
+    background tasks and the attachment processing pool, then close the pool.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -6142,6 +6555,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # closes.
     confirmation_reaper_task = asyncio.create_task(_run_confirmation_reaper())
 
+    # GH-187: attachments never sent within 24 hours and stray files are removed now
+    # and then hourly; files a restart left uploaded or processing are queued again
+    # once (the startup doesn't wait for it). Looked up at call time, like the
+    # session purge; cancelled before the pool closes.
+    attachment_gc_task = asyncio.create_task(attachment_gc.run_gc_job(get_pool()))
+    attachment_recovery_task = asyncio.create_task(_recover_attachments())
+
     # GH-161: no tools gate or promoted permissions are loaded into the agent:
     # every chat run loads its own org's tool policy.
 
@@ -6153,6 +6573,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     unfinished = await event_stream.drain(_DRAIN_TIMEOUT_S)
     if unfinished:
         logger.warning("Shutdown: %d streamed chat runs still running", unfinished)
+    # GH-187: no recovery, GC pass or processing job outlives the pool. The recovery
+    # stops first, so it queues nothing into the closed processing pool.
+    attachment_recovery_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await attachment_recovery_task
+    attachment_gc_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await attachment_gc_task
+    await _processing.close()
     confirmation_reaper_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await confirmation_reaper_task
@@ -6192,7 +6621,7 @@ def create_app(
     Returns:
         A configured FastAPI application ready to serve.
     """
-    global _agent, _config
+    global _agent, _config, _processing
     _agent = agent
     _config = config
 
@@ -6203,9 +6632,13 @@ def create_app(
     _oauth_pending_states.clear()
     # Pending critical permission promotions start empty, like a restart (GH-161).
     org_permissions.clear_pending()
+    # A fresh attachment processing pool (GH-187): no job of an earlier app carries over.
+    _processing = attachment_processing.ProcessingPool()
 
     # Rate-limit buckets start empty (fresh process state, test isolation).
     _rate_buckets.clear()
+    # No upload is in progress in a fresh process (GH-187).
+    _open_uploads.clear()
 
     app = FastAPI(
         title="admino",
@@ -6275,6 +6708,11 @@ def create_app(
     app.add_exception_handler(ChatRuntimeUserLimitError, _user_chats_busy_handler)
     # GH-8: one run per chat at a time.
     app.add_exception_handler(ChatRunActiveError, _run_active_handler)
+    # GH-187: the attachment reads' and a message's files' documented errors.
+    app.add_exception_handler(attachments.AttachmentNotFoundError, _attachment_not_found_handler)
+    app.add_exception_handler(
+        attachments.AttachmentAlreadySentError, _attachment_already_sent_handler
+    )
 
     # --- Routes ---
     # Public: health check, login, password reset, the invitation link routes
@@ -6387,6 +6825,13 @@ def create_app(
         responses=_EVENT_STREAM_RESPONSES,
     )(post_chat_message)
     app.post("/api/chats/{chat_id}/stop", response_model=ChatStopResponse)(post_chat_stop)
+    app.post("/api/chats/{chat_id}/attachments", status_code=201, response_model=AttachmentSummary)(
+        post_chat_attachment
+    )
+    app.get("/api/attachments/{attachment_id}", response_model=AttachmentSummary)(
+        get_attachment_metadata
+    )
+    app.get("/api/attachments/{attachment_id}/content", response_model=None)(get_attachment_content)
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.post(
         "/api/confirm/{confirmation_id}",

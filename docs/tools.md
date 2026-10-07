@@ -11,10 +11,10 @@ destructive actions are **denied by design**. Every call is checked by the
 | --- | --- | --- | --- |
 | **Gmail** | read · list · search | Google OAuth | `send` / `delete` denied by design. |
 | **Google Calendar** | read · list · create | Google OAuth | `create` asks to confirm. `update` / `delete` denied. |
-| **Google Drive** | read · list · search | Google OAuth | `delete` denied. `download` is unavailable until chat attachments ship. |
+| **Google Drive** | read · list · search | Google OAuth | `delete` denied. `download` is unavailable until it saves into chat attachments ([#192](https://github.com/ljakupi/admino/issues/192)). |
 | **Outlook mail** | read · list · search | Microsoft OAuth | `send` / `delete` denied by design. |
 | **Outlook Calendar** | read · list · create | Microsoft OAuth | `create` asks to confirm. `update` / `delete` denied. |
-| **OneDrive** | read · list · search | Microsoft OAuth | `delete` denied. `download` is unavailable until chat attachments ship. |
+| **OneDrive** | read · list · search | Microsoft OAuth | `delete` denied. `download` is unavailable until it saves into chat attachments ([#192](https://github.com/ljakupi/admino/issues/192)). |
 | **Memory** | store · recall · list | none (PostgreSQL) | Persistent notes, one set per user. `delete` denied. |
 
 ## Authentication
@@ -112,8 +112,11 @@ An action added without a declaration counts as a side effect.
 
 These are planned and **not** in this release — don't expect them to work yet:
 
-- **Chat attachments** — attach files to a chat. Google Drive and OneDrive `download` come
-  back here: the downloaded file becomes an attachment of the current chat.
+- **Drive and OneDrive downloads into attachments**
+  ([#192](https://github.com/ljakupi/admino/issues/192)) — `download` saves the file as an
+  attachment of the current chat. You can already upload attachments yourself (see
+  [Configuration → Attachments](configuration.md#attachments)); no tool reads them, and
+  their content reaches the model with [#189](https://github.com/ljakupi/admino/issues/189).
 - **`documents`** — a document store (store / classify / search / query).
 - **`search`** — web search.
 

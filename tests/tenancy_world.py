@@ -48,6 +48,22 @@ account, with messages), ``seed_pending_confirmation`` (a live pending
 confirmation of a chat in the runtime) and ``chat_runtime_state`` (what the
 runtime holds for the stored chats, for "nothing changed" snapshots).
 
+GH-187 (attachments): ``POST /api/chats/{chat_id}/attachments`` is a member row
+gated by ``file.upload`` (moved out of ``PENDING_CAPABILITIES``): one file as
+the raw request body, its name percent-encoded in ``X-Attachment-Name``; only
+the chat's owner uploads, so another org's, a colleague's and an unknown chat
+answer ``CHAT_NOT_FOUND``. ``GET /api/attachments/{attachment_id}`` (metadata)
+and ``GET /api/attachments/{attachment_id}/content`` (download) are member rows
+gated by ``chat.send``: only the chat's owner reads, anything else answers
+``ATTACHMENT_NOT_FOUND``. Helpers: ``use_attachment_storage`` points
+``organizations.ATTACHMENTS_ROOT`` (read at call time through
+``attachments.attachments_root()``) at a test directory and gives orgs A and B
+a storage quota (``add_org`` leaves 0: every upload refused);
+``upload_headers`` / ``UPLOAD_BODY`` are a valid upload (a short UTF-8 text
+file); ``seed_attachment`` stores an attachment row of a chat and its file
+under the root; ``attachment_files`` maps every file under the root to its
+bytes, for "nothing changed on disk" checks.
+
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
 - The expected role matrix is spelled out here on purpose: deriving it from
@@ -56,16 +72,18 @@ Security notes:
 
 from __future__ import annotations
 
+import urllib.parse
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, cast
 from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
-from admino import server
+from admino import organizations, server
 from admino.access import Capability
 from admino.config import AppConfig
 from admino.models import AgentResult, LLMMessage, PendingConfirmation, ToolCall
@@ -97,6 +115,14 @@ FORBIDDEN: Final = {"detail": "Forbidden"}
 UNAUTHORIZED: Final = {"detail": "Unauthorized"}
 # GH-176: unknown, another org's, another user's (and a trashed) chat: one answer.
 CHAT_NOT_FOUND: Final = {"detail": "Chat not found", "reason": "chat_not_found"}
+# GH-187: anything but the caller's own live attachment (another org's, a colleague's,
+# a trashed chat's, an unknown id, a row whose file is missing): one answer.
+ATTACHMENT_NOT_FOUND: Final = {"detail": "Attachment not found", "reason": "attachment_not_found"}
+# GH-187: the storage quota use_attachment_storage gives orgs A and B (64 MiB).
+ATTACHMENT_QUOTA: Final = 64 * 1024 * 1024
+# GH-187: a valid upload, a short UTF-8 text file (detected as txt from its content).
+UPLOAD_NAME: Final = "tenancy-notes-187.txt"
+UPLOAD_BODY: Final = b"Tenancy upload 187: notes of the meeting.\n"
 
 
 @dataclass(frozen=True)
@@ -249,6 +275,71 @@ def chat_runtime_state(db: FakeDb) -> dict[str, Any] | None:
         found = runtime.get_pending(uuid.UUID(str(chat_id)))
         pending[str(chat_id)] = None if found is None else found.model_dump(mode="json")
     return {"entries": len(runtime), "pending": pending}
+
+
+# ---------------------------------------------------------------------------
+# Attachments (GH-187): the storage root, a valid upload, seeded files
+# ---------------------------------------------------------------------------
+
+
+def use_attachment_storage(monkeypatch: pytest.MonkeyPatch, world: World, root: Path) -> Path:
+    """Point ``organizations.ATTACHMENTS_ROOT`` at ``root`` (created, empty) and give
+    orgs A and B a storage quota of ``ATTACHMENT_QUOTA``; return ``root``."""
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(organizations, "ATTACHMENTS_ROOT", root)
+    for org_id in (world.org_a, world.org_b):
+        world.db.add_org(org_id, storage_quota_bytes=ATTACHMENT_QUOTA)
+    return root
+
+
+def upload_headers(name: str = UPLOAD_NAME) -> dict[str, str]:
+    """The upload's ``X-Attachment-Name`` header: ``name`` percent-encoded (UTF-8).
+
+    The client adds ``Content-Length`` for a bytes body; the declared
+    ``Content-Type`` is ignored by the route.
+    """
+    return {"X-Attachment-Name": urllib.parse.quote(name, safe="")}
+
+
+def seed_attachment(
+    db: FakeDb,
+    chat_id: uuid.UUID,
+    *,
+    filename: str = "tenancy-file-187.txt",
+    data: bytes = b"Tenancy attachment 187\n",
+    kind: str = "txt",
+    **fields: Any,
+) -> uuid.UUID:
+    """Store an attachments row of ``chat_id`` (its owner's and org's) with ``filename``,
+    ``kind`` and ``size_bytes = len(data)``, and write ``data`` to its file
+    ``<ATTACHMENTS_ROOT>/<org_id>/<attachment_id>``; return the attachment's id.
+
+    ``fields`` go to ``db.add_attachment`` (status, failure_reason, message_id,
+    deleted_at, ...). The root is read at call time: call ``use_attachment_storage``
+    first.
+    """
+    attachment_id = db.add_attachment(
+        chat_id, filename=filename, kind=kind, size_bytes=len(data), **fields
+    )
+    chat = db.chat_row(chat_id)
+    assert chat is not None
+    directory = Path(organizations.ATTACHMENTS_ROOT) / str(chat["org_id"])
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / str(attachment_id)).write_bytes(data)
+    return attachment_id
+
+
+def attachment_files() -> dict[str, bytes]:
+    """Every file under ``organizations.ATTACHMENTS_ROOT`` (read at call time): its path
+    relative to the root (POSIX) -> its bytes. Empty when the root doesn't exist."""
+    root = Path(organizations.ATTACHMENTS_ROOT)
+    if not root.is_dir():
+        return {}
+    return {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +518,6 @@ PENDING_CAPABILITIES: Final[MappingProxyType[Capability, str]] = MappingProxyTyp
         Capability.PROJECT_OPEN_ANY: "#185",
         Capability.PROJECT_CREATE: "#185",
         Capability.PROJECT_PERSONAL_DEFAULT: "#185",
-        Capability.FILE_UPLOAD: "#187",
         Capability.TEMPLATE_PERSONAL_MANAGE: "#205",
         Capability.PROJECT_READ_SHARED: "#197",
         Capability.EXPORT_CREATE: "#206",
@@ -629,6 +719,19 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     RouteSpec("POST", "/api/chats/{chat_id}/messages", "member", Capability.CHAT_SEND, "path_id"),
     # GH-8: stop the chat's streamed run.
     RouteSpec("POST", "/api/chats/{chat_id}/stop", "member", Capability.CHAT_SEND, "path_id"),
+    # GH-187: upload a file into a chat of the caller's own; read an attachment's metadata
+    # and download it (the chat's owner only).
+    RouteSpec(
+        "POST", "/api/chats/{chat_id}/attachments", "member", Capability.FILE_UPLOAD, "path_id"
+    ),
+    RouteSpec("GET", "/api/attachments/{attachment_id}", "member", Capability.CHAT_SEND, "path_id"),
+    RouteSpec(
+        "GET",
+        "/api/attachments/{attachment_id}/content",
+        "member",
+        Capability.CHAT_SEND,
+        "path_id",
+    ),
     # --- own Google/Microsoft connections ---
     RouteSpec("GET", "/api/oauth/google/authorize", "member", Capability.OAUTH_CONNECT, "own_user"),
     RouteSpec(

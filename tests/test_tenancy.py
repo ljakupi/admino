@@ -37,7 +37,12 @@ caller's own, seeded in the FakeDb; the Super Admin's name org A's Editor's)
 and backs the legacy confirm with a persisted legacy chat and a pending
 confirmation in ``server._chat_runtime``. GH-8 removes ``GET /api/events`` and
 adds ``POST /api/chats/{chat_id}/stop`` (no body; a request on the caller's own
-idle chat).
+idle chat). GH-187 adds the upload ``POST /api/chats/{chat_id}/attachments`` (a
+raw body: a short text file, its name in ``X-Attachment-Name``, into a chat of
+the caller's own) and the attachment reads ``GET /api/attachments/{attachment_id}``
+and ``.../content`` (an attachment of the caller's own chat, its file on disk
+under a per-test attachments root); orgs A and B get a storage quota. Its
+section 6 pins the upload's cross-site refusal (403, nothing stored).
 
 Adding a route (each later issue): give it a ``RouteSpec`` row in
 ``ROUTES`` (tests/tenancy_world.py), a well-formed request in ``_REQUESTS``
@@ -88,25 +93,31 @@ from tests.tenancy_world import (
     ROUTES,
     SERVICE_CAPABILITIES,
     UNAUTHORIZED,
+    UPLOAD_BODY,
     Account,
     Role,
     RouteSpec,
     World,
     allowed_roles,
+    attachment_files,
     build_world,
     chat_runtime_state,
     make_app,
     make_client,
     route_id,
+    seed_attachment,
     seed_chat,
     seed_pending_confirmation,
     stub_agent,
+    upload_headers,
+    use_attachment_storage,
     use_fake_database,
     use_fast_passwords,
     use_roomy_rate_limits,
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from unittest.mock import MagicMock
 
     import httpx
@@ -125,19 +136,21 @@ _SMUGGLED_FIELDS: Final = ("org_id", "user_id")
 
 
 @pytest.fixture()
-def world(monkeypatch: pytest.MonkeyPatch) -> World:
+def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
     """Orgs A and B with an Org Admin, an Editor and a Viewer each, plus a Super Admin.
 
     The FakeDb backs ``admino.database.get_pool()``; passwords hash fast; every
     rate bucket is roomy (the rate-limit tests read the bucket keys, not the
     limits). OAuth has fake client credentials, and the diagnostics probes
     (database health, LLM reachability) are patched so nothing leaves the host.
+    GH-187: attachments live under ``tmp_path`` and both orgs have a storage quota.
     """
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
     use_fast_passwords(monkeypatch)
     use_roomy_rate_limits(monkeypatch)
+    use_attachment_storage(monkeypatch, built, tmp_path / "attachments")
     monkeypatch.setenv("OAUTH_ENCRYPTION_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("GOOGLE_CLIENT_ID", "fake-google-client-id-gh163")
     monkeypatch.setenv("GOOGLE_CLIENT_SECRET", "fake-google-client-secret-gh163")
@@ -174,12 +187,15 @@ def client(app: FastAPI) -> TestClient:
 
 @dataclass(frozen=True)
 class _Request:
-    """A request to send: method, concrete URL, JSON body and query parameters."""
+    """A request to send: method, concrete URL, JSON body and query parameters, and
+    (GH-187's upload) a raw body with its request headers."""
 
     method: str
     url: str
     json: dict[str, Any] | None = None
     params: dict[str, str] | None = None
+    content: bytes | None = None
+    headers: dict[str, str] | None = None
 
 
 # (world, caller, client) -> the request. A builder may seed what the request
@@ -326,6 +342,28 @@ def _own_chat(
     return build
 
 
+def _own_chat_upload(world: World, caller: Account, _client: TestClient) -> _Request:
+    """GH-187: upload a short text file into a chat of the caller's own."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 187")
+    return _Request(
+        "POST",
+        f"/api/chats/{chat_id}/attachments",
+        content=UPLOAD_BODY,
+        headers=upload_headers(),
+    )
+
+
+def _own_attachment(suffix: str) -> _Builder:
+    """GH-187: read (``suffix`` "") or download ("/content") an attachment of a chat of
+    the caller's own, its file stored under the attachments root."""
+
+    def build(world: World, caller: Account, _client: TestClient) -> _Request:
+        chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 187")
+        return _Request("GET", f"/api/attachments/{seed_attachment(world.db, chat_id)}{suffix}")
+
+    return build
+
+
 def _platform_org(method: str, suffix: str, json: dict[str, Any] | None = None) -> _Builder:
     """A platform request on org A's path."""
 
@@ -466,6 +504,10 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ),
     # GH-8: no request body; the caller's own idle chat answers 200 {"stopped": false}.
     ("POST", "/api/chats/{chat_id}/stop"): _own_chat("POST", "/stop"),
+    # GH-187: a raw-body upload (no JSON body) and the two attachment reads.
+    ("POST", "/api/chats/{chat_id}/attachments"): _own_chat_upload,
+    ("GET", "/api/attachments/{attachment_id}"): _own_attachment(""),
+    ("GET", "/api/attachments/{attachment_id}/content"): _own_attachment("/content"),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _plain("GET", "/api/oauth/google/authorize"),
     ("GET", "/api/oauth/microsoft/authorize"): _plain("GET", "/api/oauth/microsoft/authorize"),
@@ -568,13 +610,14 @@ def _build(world: World, spec: RouteSpec, caller: Account, client: TestClient) -
 def _send(
     client: TestClient, request: _Request, headers: dict[str, str] | None = None
 ) -> httpx.Response:
-    """Send ``request`` with ``headers`` (a session cookie, or none)."""
+    """Send ``request`` with its own headers plus ``headers`` (a session cookie, or none)."""
     return client.request(
         request.method,
         request.url,
         json=request.json,
         params=request.params,
-        headers=headers or {},
+        content=request.content,
+        headers={**(request.headers or {}), **(headers or {})},
     )
 
 
@@ -1166,3 +1209,38 @@ class TestRateLimitKeys:
         assert response.status_code not in {422, 429}, response.text
         assert [key for key in keys if key[1] == f"ip:{CLIENT_IP}"] != [], keys
         assert [key for key in keys if key[1] != f"ip:{CLIENT_IP}"] == []
+
+
+# ---------------------------------------------------------------------------
+# 6. The upload refuses a cross-site request (GH-187, #139 §5 CSRF)
+# ---------------------------------------------------------------------------
+
+
+class TestAttachmentUploadCsrf:
+    """POST /api/chats/{chat_id}/attachments changes state: a cross-site request is refused."""
+
+    def test_tenancy_attachment_upload_refuses_a_cross_site_request_and_stores_nothing(
+        self, world: World, client: TestClient, agent: MagicMock
+    ) -> None:
+        """A cross-site upload (``Sec-Fetch-Site: cross-site``) by the chat's owner is 403
+        ``Cross-origin request refused``: no row, no audit event, no file under the
+        attachments root. Control: the same request from the same origin is the 201."""
+        caller = world.a["editor"]
+        request = _own_chat_upload(world, caller, client)
+        audit_before = len(world.db.audit_rows())
+
+        refused = _send(client, request, {**caller.cookie, "Sec-Fetch-Site": "cross-site"})
+        stored_after_refusal = (
+            len(world.db.attachments),
+            len(world.db.audit_rows()) - audit_before,
+            attachment_files(),
+        )
+        accepted = _send(client, request, {**caller.cookie, "Sec-Fetch-Site": "same-origin"})
+
+        assert (refused.status_code, refused.json()) == (
+            403,
+            {"detail": "Cross-origin request refused"},
+        )
+        assert stored_after_refusal == (0, 0, {})
+        assert accepted.status_code == 201, accepted.text
+        agent.run.assert_not_awaited()

@@ -222,6 +222,11 @@ services:
       # PostgreSQL, not on disk.
       # Config is read-only — the agent reads but must never write config files
       - ./config:/app/config:ro
+      # Chat attachment originals (GH-187): <org_id>/<attachment_id> files under
+      # /app/data/attachments. Named volume, read-write, mounted on the agent
+      # only (never a proxy or another service). entrypoint.sh keeps it
+      # admino-owned, mode 0700.
+      - attachments:/app/data/attachments
 
     networks:
       # Internal bridge: communicates with postgres and the vllm service
@@ -386,9 +391,16 @@ networks:
 # `vllm-models`: named Docker volume for the HuggingFace model cache.
 #   Populated once by `make vllm-pull`; survives `down`/`up` cycles.
 #   Reset with `docker volume rm admino-vllm-models` (forces re-download).
+#
+# `attachments`: named Docker volume for uploaded chat attachment originals
+#   (GH-187), mounted read-write on the agent only at /app/data/attachments.
+#   Owned by admino, mode 0700 (set by entrypoint.sh). Content-bearing: back it
+#   up with the database. Reset with `docker volume rm admino-attachments`.
 # --------------------------------------------------------------------------
 volumes:
   pgdata:
     name: admino-pgdata
   vllm-models:
     name: admino-vllm-models
+  attachments:
+    name: admino-attachments

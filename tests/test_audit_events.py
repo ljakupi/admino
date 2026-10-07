@@ -1,5 +1,5 @@
 """Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153,
-GH-161, GH-164, GH-166).
+GH-161, GH-164, GH-166, GH-187).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
@@ -59,6 +59,12 @@ What these tests pin down:
   only: the password, the hash and the email are never in the row (free text
   is refused by the existing content validator). Self-service profile edits
   (name, languages, timezone, personal instructions) are not audited.
+- GH-187: one more org-scoped action, ``file.upload`` (50 in all): a member
+  uploaded an attachment. The target is the file; the metadata is
+  ``{"size_bytes": int}`` only (never the file name, which the content
+  validator refuses anyway). The orphan GC deletes an attachment never sent
+  within 24 h as a ``file.delete`` by the system, with ``{"orphan": True}``.
+  Downloads are not audited.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -118,6 +124,7 @@ from admino.permissions import DEFAULT_PERMISSIONS, HARDCODED_DENIALS, PROMOTABL
 from admino.server import _lifespan, create_app
 from tests.conftest import default_test_platform_settings
 from tests.lifespan_stubs import (
+    patch_attachment_jobs,
     patch_login_throttle_purge_job,
     patch_org_purge_job,
 )
@@ -211,6 +218,8 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         # GH-164: an Org Admin changes a user's name or email (or the change is refused
         # because the email is taken).
         "user.profile_change",
+        # GH-187: a member uploads an attachment (metadata: size_bytes).
+        "file.upload",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -269,6 +278,7 @@ _ISSUE_CATEGORIES: list[Any] = [
         id="deletions",
     ),
     pytest.param({"project.restore", "chat.restore", "file.restore"}, id="restores"),
+    pytest.param({"file.upload"}, id="file-uploads"),
     pytest.param({"export.create"}, id="exports"),
     pytest.param({"project.admin_access"}, id="org-admin-access-to-other-users-projects"),
     pytest.param({"org.settings_change"}, id="org-settings-changes"),
@@ -671,13 +681,13 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 49 actions of the spec (GH-146's 39, GH-152's
+        """The catalog has exactly the 50 actions of the spec (GH-146's 39, GH-152's
         session.revoke and session.force_logout, GH-153's invitation.resend and
         invitation.refuse, GH-161's four org.permission_* actions, GH-164's
-        user.profile_change, GH-166's password.change): nothing missing, nothing
-        extra."""
+        user.profile_change, GH-166's password.change, GH-187's file.upload): nothing
+        missing, nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 49
+        assert len(AuditAction) == 50
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:
@@ -1527,6 +1537,76 @@ class TestRecordInsert:
         assert json.loads(row["target_ids"]) == [str(_ORG)]
 
 
+class TestFileEvents:
+    """GH-187: an upload is a member's file.upload with the size only; the orphan GC's
+    removal is the system's file.delete with {"orphan": True}."""
+
+    async def test_audit_events_record_file_upload_by_a_member(self, conn: MagicMock) -> None:
+        """file.upload by a member of the org, on the file, with {"size_bytes": int}: one
+        row with exactly those values (the largest allowed file, 500 MiB, fits)."""
+        await _record(
+            conn,
+            action=AuditAction("file.upload"),
+            actor_kind="member",
+            actor_user_id=_USER,
+            org_id=_ORG,
+            target_type=TargetType.FILE,
+            target_ids=[_FILE],
+            ip=_IP,
+            metadata={"size_bytes": 524_288_000},
+        )
+
+        row = _inserted_row(conn)
+        assert (row["action"], row["actor_kind"], row["actor_user_id"], row["org_id"]) == (
+            "file.upload",
+            "member",
+            _USER,
+            _ORG,
+        )
+        assert (row["target_type"], json.loads(row["target_ids"])) == ("file", [str(_FILE)])
+        assert json.loads(row["metadata"]) == {"size_bytes": 524_288_000}
+
+    def test_audit_events_file_upload_with_a_file_name_is_refused(self) -> None:
+        """A file name in the metadata is content: the event is refused."""
+        action = AuditAction("file.upload")
+
+        with pytest.raises(ValidationError):
+            _event(
+                action=action,
+                target_type=TargetType.FILE,
+                target_ids=(_FILE,),
+                metadata={"size_bytes": 1024, "filename": "salaries-2026.xlsx"},
+            )
+
+    async def test_audit_events_record_orphan_file_delete_by_the_system(
+        self, conn: MagicMock
+    ) -> None:
+        """The orphan GC's event: file.delete by the system (no user), in the file's org,
+        with {"orphan": True} (a bool, not 1)."""
+        await _record(
+            conn,
+            action=AuditAction.FILE_DELETE,
+            actor_kind="system",
+            actor_user_id=None,
+            org_id=_ORG,
+            target_type=TargetType.FILE,
+            target_ids=[_FILE],
+            ip=None,
+            metadata={"orphan": True},
+        )
+
+        row = _inserted_row(conn)
+        assert (row["action"], row["actor_kind"], row["actor_user_id"], row["org_id"]) == (
+            "file.delete",
+            "system",
+            None,
+            _ORG,
+        )
+        assert json.loads(row["target_ids"]) == [str(_FILE)]
+        assert json.loads(row["metadata"]) == {"orphan": True}
+        assert json.loads(row["metadata"])["orphan"] is True
+
+
 class TestRecordSignature:
     """Callers must decide the org scope and actor explicitly: no defaults."""
 
@@ -2305,7 +2385,8 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
     only start after the pool exists. GH-152's session purge job and GH-154's org
     purge job are stubbed with their own probes, so no real purge runs against the
     MagicMock pool (``create=True``: the jobs are new, and these tests don't depend
-    on them).
+    on them). GH-187's attachment GC job and one-shot recovery are stubbed too
+    (tests/lifespan_stubs.py), so neither queries the MagicMock pool.
     """
     state: dict[str, Any] = {"pool": None}
     session_purge = _JobProbe()
@@ -2335,6 +2416,8 @@ def _patched_lifespan(probe: _JobProbe) -> Iterator[None]:
         patch_org_purge_job(org_purge.job),
         # GH-157: the login throttle purge never runs against the MagicMock pool.
         patch_login_throttle_purge_job(AsyncMock()),
+        # GH-187: nor do the attachment GC and the processing recovery.
+        patch_attachment_jobs(),
     ):
         yield
 

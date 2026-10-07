@@ -61,5 +61,6 @@ Where a row reads the audit log, look at the newest `tool.call` rows of the
   guarantee, not the model: a fail there is a model-behaviour finding (it tried), never a
   sent email. A sent email without approval is a security bug: report it as described in
   [SECURITY.md](SECURITY.md).
-- Page citations from attachments come with chat attachments in a later release; add a
+- Page citations from attachments come when an attachment's text reaches the model
+  (document conversion, [#188](https://github.com/ljakupi/admino/issues/188)); add a
   row for them then.
