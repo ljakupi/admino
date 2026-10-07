@@ -2,7 +2,7 @@
 
 The processing pool calls ``run_conversion`` in a worker thread. It resets the
 derived directory, starts ``python -m admino.converters.worker`` with the job on
-stdin and reads the child's single result line.
+stdin and reads the child's single result line (at most ``MAX_RESULT_BYTES``).
 
 Inputs: the stored file, its kind, the derived directory (``<id>.d``) and the
 ``ConversionOptions``.
@@ -11,18 +11,28 @@ the derived directory then holds the parts and the manifest the child wrote,
 and ``derived_bytes`` is their size as measured here (never the child's
 claim).
 Errors: ``ConversionError`` with a contract code: ``conversion_timeout`` after
-``CONVERSION_TIMEOUT_S``, ``processing_error`` for a crash, a malformed
-result (a count beyond PostgreSQL's INTEGER included) or a derived directory
-that holds anything but regular files, ``output_too_large`` past
+``CONVERSION_TIMEOUT_S``, ``processing_error`` for a crash, more than
+``MAX_RESULT_BYTES`` of stdout, a malformed result (a count beyond
+PostgreSQL's INTEGER included) or a derived directory that holds anything
+but regular files, ``output_too_large`` past
 ``common.MAX_DERIVED_BYTES``, else the child's own code. ``OSError`` when the
 directory can't be reset or the child can't be started.
 
 Security notes:
 - The parsers load only in the child: a crafted file that crashes, hangs or
-  exhausts memory takes the child down, never the server, and the child is
-  killed (and reaped) once the timeout passes.
-- The argv is fixed (``WORKER_ARGV``, no shell); the job (the path and the
-  file name) travels on stdin, never in the argv a process listing shows.
+  exhausts memory takes the child down, never the server. One deadline
+  (``CONVERSION_TIMEOUT_S``) covers writing the job, reading the result and
+  the child's exit; once it passes the child is killed (SIGKILL) and reaped.
+- The child's stdout is read incrementally and never buffered past
+  ``MAX_RESULT_BYTES`` + 1 bytes: as soon as more than the cap has arrived,
+  the child is killed and reaped at once (``processing_error``), so a child
+  flooding its stdout can't fill the server's memory.
+- However the call ends (an error, the deadline, a KeyboardInterrupt), the
+  child is killed if still running and reaped: no process outlives the call.
+  Its own children are the container init's (``init: true``) to reap.
+- The argv is fixed (``WORKER_ARGV``, ``subprocess.Popen`` without a shell);
+  the job (the path and the file name) travels on stdin, never in the argv
+  a process listing shows.
 - The child's environment holds only the server's ``PYTHONPATH``: no API
   token, database password or DSN reaches the code that parses untrusted
   files.
@@ -41,12 +51,15 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import select
+import selectors
 import shutil
 import stat
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, TypeGuard
+from typing import IO, TYPE_CHECKING, Final, TypeGuard, cast
 
 from admino.converters import common
 from admino.converters.common import ConversionError
@@ -58,6 +71,8 @@ if TYPE_CHECKING:
     from admino.models import AttachmentKind
 
 CONVERSION_TIMEOUT_S: Final = 120.0
+# The most stdout bytes a child may write: a valid result line is under 100.
+MAX_RESULT_BYTES: Final = 4096
 WORKER_ARGV: Final[tuple[str, ...]] = (
     sys.executable,
     "-P",
@@ -154,30 +169,88 @@ def _run_worker(
     ).encode("utf-8")
     pythonpath = os.environ.get("PYTHONPATH")
     env = {} if pythonpath is None else {"PYTHONPATH": pythonpath}
-    try:
-        # A fixed argv (this interpreter and the worker module), no shell; the
-        # job travels on stdin.
-        completed = subprocess.run(  # noqa: S603
-            list(WORKER_ARGV),
-            input=job,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            timeout=CONVERSION_TIMEOUT_S,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        # subprocess.run has already killed and reaped the child.
-        raise ConversionError("conversion_timeout") from None
-    if completed.returncode != 0:
+    deadline = time.monotonic() + CONVERSION_TIMEOUT_S
+    # A fixed argv (this interpreter and the worker module), no shell; the job
+    # travels on stdin.
+    with subprocess.Popen(  # noqa: S603
+        list(WORKER_ARGV),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        env=env,
+    ) as child:
+        try:
+            stdout = _exchange(child, job, deadline)
+            returncode = child.wait(timeout=max(deadline - time.monotonic(), 0.0))
+        except subprocess.TimeoutExpired:
+            raise ConversionError("conversion_timeout") from None
+        finally:
+            # However the call ends (the cap, the deadline, a KeyboardInterrupt),
+            # a child still running is SIGKILLed and the child is reaped here:
+            # Popen's own exit waits only briefly after an interrupt. kill()
+            # polls first, so it never signals a pid that was already reaped.
+            child.kill()
+            child.wait()
+    if returncode != 0:
         raise ConversionError("processing_error")
-    page_count, token_estimate = _parse_result(completed.stdout)
+    page_count, token_estimate = _parse_result(stdout)
     derived_bytes = _measure(out_dir)
     if derived_bytes > common.MAX_DERIVED_BYTES:
         raise ConversionError("output_too_large")
     return ConversionResult(
         page_count=page_count, token_estimate=token_estimate, derived_bytes=derived_bytes
     )
+
+
+def _exchange(child: subprocess.Popen[bytes], job: bytes, deadline: float) -> bytes:
+    """Write ``job`` to the child's stdin (then close it) and read its stdout to EOF.
+
+    One loop does both before ``deadline``, so neither a child that never
+    reads its job nor one that writes before reading it can block the other
+    side. Each read asks for at most what still fits under
+    ``MAX_RESULT_BYTES`` (read at call time) plus one byte: no more than the
+    cap + 1 bytes are ever held.
+
+    Returns:
+        The child's stdout, at most ``MAX_RESULT_BYTES`` bytes.
+
+    Raises:
+        ConversionError: ``processing_error`` as soon as more than the cap
+            has arrived (the caller kills the child, without waiting for EOF);
+            ``conversion_timeout`` once the deadline passes.
+    """
+    cap = MAX_RESULT_BYTES
+    # Both were requested as pipes when the child started: never None.
+    stdin, stdout = cast("IO[bytes]", child.stdin), cast("IO[bytes]", child.stdout)
+    unsent = memoryview(job)
+    held = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(stdin, selectors.EVENT_WRITE)
+        selector.register(stdout, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConversionError("conversion_timeout")
+            for key, _ in selector.select(remaining):
+                if key.fileobj is stdin:
+                    try:
+                        # A writable pipe takes PIPE_BUF bytes without blocking.
+                        unsent = unsent[os.write(key.fd, unsent[: select.PIPE_BUF]) :]
+                    except BrokenPipeError:
+                        # The child closed its stdin unread: its stdout and exit
+                        # status decide the outcome.
+                        unsent = unsent[:0]
+                    if not unsent:
+                        selector.unregister(stdin)
+                        stdin.close()
+                    continue
+                chunk = os.read(key.fd, cap + 1 - len(held))
+                if not chunk:
+                    selector.unregister(stdout)
+                held += chunk
+                if len(held) > cap:
+                    raise ConversionError("processing_error")
+    return bytes(held)
 
 
 def _measure(out_dir: Path) -> int:

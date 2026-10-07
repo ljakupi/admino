@@ -1104,7 +1104,14 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
   filename*=UTF-8''<the name, percent-encoded>`, the detected type's `Content-Type`,
   `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. When the name's
   extension doesn't match the detected type, the type's extension is added (`page.html`
-  stored as text downloads as `page.html.txt`).
+  stored as text downloads as `page.html.txt`). Downloads accept a `Range` header: a
+  valid one answers `206` with the bytes asked for (several ranges come as
+  `multipart/byteranges`). A `Range` that is malformed, or starts at or past the end of
+  the file, answers `416` `{"detail": "Range not satisfiable", "reason":
+  "range_not_satisfiable"}` with `Content-Range: bytes */<file size>`. A `Range` sent with
+  an `If-Range` that no longer matches the file's `ETag` or `Last-Modified` is ignored:
+  the whole file comes back with `200`. The owner check comes first, so an attachment
+  that isn't yours is the `404` whatever its `Range`.
 - **Rate limits** apply per user, each answering `429` `{"detail": "Rate limit
   exceeded"}`: uploads a burst of `max_files_per_message`, then one every 2 seconds;
   metadata 5 per second (burst 50); downloads 2 per second (burst 30). A user also has
@@ -1158,8 +1165,12 @@ and images. The parts don't reach the model in this release; that comes with
   read `2026-10-07` (`2026-10-07 14:30:00` with a time). A worksheet is read only up to
   row 1,048,576, Excel's last row, and only 51 columns wide: the `[Only the first 50
   columns are included.]` note appears when a kept row has content in its 51st column,
-  and content further right in a row whose 51st column is empty is neither read nor
-  noted. **CSV** becomes one table without a heading, its delimiter detected from its
+  or when the sheet's declared size (its dimension, which Excel saves) reaches column 52
+  or further. Content right of column 51 is never read, but the dimension still notes
+  it, even in rows past the row limit; a sheet without a dimension has only the
+  column-51 rule. A table whose kept rows hold nothing in their first 50 columns while
+  a note applies is the notes alone, without an empty table (for CSV and DOCX tables
+  too). **CSV** becomes one table without a heading, its delimiter detected from its
   first 8 KiB among comma, semicolon, tab and `|`. Empty rows are dropped, and a table
   keeps its first 1,000 non-empty rows, its first 50 columns and 1,000 characters per
   cell (a longer cell ends with `…`); a workbook keeps its first 50 sheets. Each cut
@@ -1169,10 +1180,14 @@ and images. The parts don't reach the model in this release; that comes with
 - **TXT and MD** stay as they are, without a leading BOM.
 - **Images** (PNG, JPEG, WEBP): the EXIF orientation is applied, an animation keeps its
   first frame, and an image larger than 2,048 pixels on its longest edge is downscaled
-  to fit, keeping its aspect ratio (a smaller one is never enlarged). A JPEG stays a
-  JPEG (quality 85); PNG and WEBP become PNG, with their transparency. The metadata is
-  stripped: EXIF (the GPS location included), ICC profile, XMP, comments and text
-  chunks.
+  to fit, keeping its aspect ratio (a smaller one is never enlarged). A photo whose EXIF
+  block is malformed converts as it's stored, without orientation correction, rather
+  than failing: malformed metadata isn't trusted, not even its orientation. A large
+  JPEG is decoded at a reduced scale (1/2, 1/4 or 1/8, the smallest reduction that still
+  covers the target size) before it's resized, which saves memory and time; the output
+  has the same size either way. A JPEG stays a JPEG (quality 85); PNG and WEBP become
+  PNG, with their transparency. The metadata is stripped: EXIF (the GPS location
+  included), ICC profile, XMP, comments and text chunks.
 - **`token_estimate`** is the file's estimated size for the model, in tokens, summed over
   its parts: text counts one token per ASCII digit (models split numbers into single
   digits) plus one per 4 bytes of the rest in UTF-8, rounded up; an image counts one
@@ -1199,11 +1214,14 @@ and images. The parts don't reach the model in this release; that comes with
   load only there, never in the agent's own process, so a parser that crashes or runs out
   of memory fails only its file, with `processing_error`, and the agent keeps running. A
   conversion still running after 120 seconds is killed and fails with
-  `conversion_timeout`. The process also limits itself to 130 seconds of CPU time and,
-  on Linux, 2 GiB of memory (address space): a parser that goes past either ends it, and
-  the file fails with `processing_error`. On Linux it also turns off its core dumps
-  (a core size of 0), so a parser that crashes leaves no memory image holding the
-  document on the host. The process gets no secret, and on Linux it can't read the
+  `conversion_timeout`. The process's answer on its standard output is capped at 4 KiB:
+  one that writes more is killed at once and the file fails with `processing_error`. In
+  Docker the agent runs under an init process (`init: true`), which reaps whatever a
+  killed conversion leaves behind. The process also limits itself to 130 seconds of CPU
+  time and, on Linux, 2 GiB of memory (address space): a parser that goes past either
+  ends it, and the file fails with `processing_error`. On Linux it also turns off its
+  core dumps (a core size of 0), so a parser that crashes leaves no memory image holding
+  the document on the host. The process gets no secret, and on Linux it can't read the
   agent's either (see [Security Model → Attachments](SECURITY.md#attachments)).
 - **Failure codes.** A failed file has one of these codes in `failure_reason`. Nothing
   else of the failure (no library message, file name or path) reaches a response, the
@@ -1723,6 +1741,17 @@ attachments' files live on a Docker volume.
   (`[<file name> — page N]`), never in a path. The files are **not encrypted at rest**:
   protect the volume like the database (an encrypted disk on the host) and back it up
   with it. `docker volume rm admino-attachments` deletes every file.
+
+  The folder that holds the files, the attachments root, is set by
+  `ADMINO_ATTACHMENTS_ROOT`. Unset or empty, it's `/app/data/attachments`, the volume's
+  mount point. It must be an absolute path: any other value (a relative path such as
+  `data/attachments`) stops admino at startup with `ERROR: ADMINO_ATTACHMENTS_ROOT must
+  be an absolute path.` Uploads, downloads, the conversion, the cleanup of unsent files,
+  user deletion and the organization purge all use this one folder. Docker Compose sets
+  it to `/app/data/attachments` for the agent, so a value in `.env` meant for a native
+  run never moves the container's files off the volume. `make run` sets it to
+  `data/attachments` in your checkout (see
+  [Getting started](getting-started.md#3-run-locally-with-uv)).
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the chat's ID, the tool, the action, the permission decision, success and
   duration. Arguments, tool output and message text are never stored. Rows are kept for 12

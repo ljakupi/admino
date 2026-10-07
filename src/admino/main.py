@@ -1,7 +1,11 @@
 """Entry point for admino — load config, validate, wire dependencies, start uvicorn.
 
 Startup sequence:
-1. Load and validate config.yaml (with env var overrides).
+1. Load and validate config.yaml (with env var overrides), then set the
+   attachments root from ``ADMINO_ATTACHMENTS_ROOT``
+   (``organizations.ATTACHMENTS_ROOT``, GH-281): unset or empty means
+   ``organizations.DEFAULT_ATTACHMENTS_ROOT``, and a path that isn't
+   absolute stops startup.
 2. Configure Python logging from config.log_level and config.log_format
    (text, or structured JSON lines with a per-request ID).
 3. Make the server process non-dumpable on Linux (``process_hardening``,
@@ -83,7 +87,7 @@ from typing import TYPE_CHECKING, Final, TextIO
 import asyncpg
 import uvicorn
 
-from admino import passwords, process_hardening
+from admino import organizations, passwords, process_hardening
 from admino.config import load_app_config
 from admino.llm import LLMError
 from admino.logs import JsonFormatter, RequestIdFilter, TextFormatter, safe_log
@@ -393,6 +397,17 @@ def main(
         config = load_app_config(config_path)
     except (ValueError, OSError) as exc:
         print(f"ERROR: Failed to load config: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Before the database startup and before anything reads it: every consumer
+    # (uploads, downloads, conversion, GC, user deletion, org purge) reads this one
+    # setting at call time. The message never holds the value.
+    try:
+        organizations.ATTACHMENTS_ROOT = organizations.resolve_attachments_root(
+            os.environ.get("ADMINO_ATTACHMENTS_ROOT")
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
 
     # ------------------------------------------------------------------
