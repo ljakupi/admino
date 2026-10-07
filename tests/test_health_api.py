@@ -39,7 +39,10 @@ Security notes:
 - Operator blindness: the diagnostics body carries config metadata and statuses
   only; the public /health tells an anonymous caller nothing but up/degraded.
 - The exception message ``zephyr secret 4481`` is a marker that must never
-  reach a response or any log line.
+  reach a response or any log line. The log checks look for the whole message
+  and its word ``zephyr`` (plus a traceback), never for a fragment such as
+  ``4481`` that a random request id, timestamp or count can also contain
+  (GH-274: about one request id in 2,260 held those digits).
 - No real database, LLM or network: ``check_health``, ``_check_llm_reachable``,
   ``resolve_session``, ``get_pool`` and ``organizations.list_orgs`` are patched.
   The chat route (GH-176: it persists into a chat per user and session id) gets
@@ -50,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import re
+import string
 import uuid
 from contextlib import ExitStack
 from types import MappingProxyType
@@ -106,11 +110,23 @@ _RATE_LIMITED: Final = {"detail": "Rate limit exceeded"}
 _INTERNAL_ERROR: Final = {"detail": "Internal error"}
 
 _REQUEST_ID: Final = re.compile(r"^[0-9a-f]{32}$")
+# The exception message: ASCII with nothing json.dumps escapes, so a leak shows
+# up verbatim in the JSON log text. Its digit run is hex-like on purpose (a real
+# message can carry one); no leak probe may rely on it.
 _SECRET: Final = "zephyr secret 4481"
-# The parts of _SECRET the log leak checks look for: its word, and its digits
-# (the part a random hex request id can share).
 _SECRET_WORD: Final = _SECRET.split()[0]
+# Not a leak probe: the hex-only part of _SECRET, which a random request id can
+# hold (GH-274). Only the reproduction's preconditions use it.
 _SECRET_DIGITS: Final = re.sub(r"[^0-9]", "", _SECRET)
+# What the log leak checks look for (GH-274): the whole message and its non-hex
+# word in a raw record's message and in the formatted text, plus a traceback in
+# the text. Never a fragment that a random value could spell on its own.
+_MESSAGE_PROBES: Final[tuple[str, ...]] = (_SECRET, _SECRET_WORD)
+_TEXT_PROBES: Final[tuple[str, ...]] = (*_MESSAGE_PROBES, "Traceback")
+# Every character a random value in a log line is made of: a request id or UUID
+# (hex digits, "-"), a timestamp ("2026-10-07T12:34:56.789+00:00", "Z", or
+# "2026-10-07 12:34:56,789"), a count or a duration (digits, ".", "-", "e").
+_RANDOM_VALUE_CHARS: Final = frozenset(string.hexdigits + "-:.,+TZ ")
 # Request ids pinned through admino.server.uuid4 (both valid uuid4 values): one
 # whose hex contains _SECRET_DIGITS (the GH-274 flake, made deterministic), and
 # one that shares nothing with _SECRET.
@@ -665,16 +681,18 @@ def _message_leaks(logs: CapturedLogs) -> list[tuple[str, str]]:
     """Where the exception message (or a traceback) reached the logs; ``[]`` for nowhere.
 
     Each leak is ``(channel, probe)``: channel ``"text"`` is the formatted output
-    an operator sees, ``"record"`` a raw record's message. A test asserts ``== []``
-    (nothing leaked) or that a planted leak is reported.
+    an operator sees (checked for ``_TEXT_PROBES``), ``"record"`` a raw record's
+    message (checked for ``_MESSAGE_PROBES``). Every probe holds a character that
+    no request id, timestamp or count has, so a random value can't match it
+    (GH-274). A test asserts ``== []`` (nothing leaked) or that a planted leak is
+    reported.
     """
-    leaks = [
-        ("text", probe)
-        for probe in (_SECRET_WORD, _SECRET_DIGITS, "Traceback")
-        if probe in logs.text
-    ]
-    if any(_SECRET_WORD in record.getMessage() for record in logs.records):
-        leaks.append(("record", _SECRET_WORD))
+    leaks = [("text", probe) for probe in _TEXT_PROBES if probe in logs.text]
+    leaks.extend(
+        ("record", probe)
+        for probe in _MESSAGE_PROBES
+        if any(probe in record.getMessage() for record in logs.records)
+    )
     return leaks
 
 
@@ -820,9 +838,11 @@ class TestUnhandledExceptions:
     ) -> None:
         """Positive control: the leak check reports a message that does reach a log line.
 
-        The failing collaborator logs the message right before it raises; the leak
-        is reported in the formatted text and in the raw record. The request id
-        shares nothing with ``_SECRET``, so only the message can be what is found.
+        The failing collaborator logs the message right before it raises; every
+        message probe reports it, in the formatted text and in the raw record (so
+        no probe is blind, e.g. to a character the JSON formatter escapes). The
+        request id shares nothing with ``_SECRET``, so only the message can be
+        what is found.
         """
         response, logs = await _unhandled(
             source, request_id=_PLAIN_REQUEST_ID, fail=_log_then_raise(form)
@@ -831,7 +851,24 @@ class TestUnhandledExceptions:
         planted = [entry for entry in logs.json_lines() if entry.get("logger") == _LEAK_LOGGER]
         assert response.status_code == 500
         assert [entry["request_id"] for entry in planted] == [_request_id(response)]
-        assert {channel for channel, _ in _message_leaks(logs)} == {"text", "record"}
+        assert _message_leaks(logs) == [
+            *(("text", probe) for probe in _MESSAGE_PROBES),
+            *(("record", probe) for probe in _MESSAGE_PROBES),
+        ]
+
+    async def test_unhandled_exception_leak_probes_are_never_spelled_by_a_random_value(
+        self,
+    ) -> None:
+        """No random value in a log line can match a leak probe on its own (GH-274).
+
+        A request id, UUID, timestamp, count or duration is made of
+        ``_RANDOM_VALUE_CHARS`` only, and every probe holds another character.
+        The digit run the old probe used is made of those characters only, so
+        the check would have caught it.
+        """
+        spellable = [probe for probe in _TEXT_PROBES if set(probe) <= _RANDOM_VALUE_CHARS]
+
+        assert (spellable, set(_SECRET_DIGITS) <= _RANDOM_VALUE_CHARS) == ([], True)
 
     async def test_unhandled_exception_names_the_bare_class(self) -> None:
         response, logs = await _unhandled_from_probe(_raise_zephyr_error)
