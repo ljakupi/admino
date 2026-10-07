@@ -30,6 +30,13 @@ process started by the runner. Pinned here, in process with ``BytesIO`` streams:
   hard limit does; a lower one is never raised: that limit is skipped, the other still
   set); a ValueError / OSError of either call is ignored and the job converts. A real
   child (``main`` with a malformed job) ends with ``RLIMIT_CPU == (130, 130)``.
+- No core dumps (contract §13.1, process re-audit L-1: a crashed parser's core image would
+  carry the document to the host, outside the attachment and org lifecycle): alongside
+  the two limits, at the same moment (after the OOM write, before the job is read),
+  ``resource.setrlimit(RLIMIT_CORE, (0, 0))``, under the same rule (a hard limit of 0
+  allows it: lowering is always allowed) and with its errors ignored like the others'
+  (every one of the three is still tried and the job converts). A real child ends with
+  ``RLIMIT_CORE == (0, 0)``.
 
 Every in-process test points ``OOM_SCORE_ADJ_PATH`` at a tmp file and replaces
 ``resource.getrlimit`` / ``resource.setrlimit`` with a recorder, so no test touches the
@@ -489,9 +496,9 @@ def test_converters_worker_limits_set_after_the_oom_write_before_the_job_is_read
     tmp_path: Path,
     job: str,
 ) -> None:
-    """With unlimited hard limits: RLIMIT_CPU (130, 130) and RLIMIT_AS (2 GiB, 2 GiB), each
-    set once, when the OOM file already holds 1000 and the job hasn't been read yet (a
-    malformed job is limited too)."""
+    """With unlimited hard limits: RLIMIT_CPU (130, 130), RLIMIT_AS (2 GiB, 2 GiB) and
+    RLIMIT_CORE (0, 0) (§13.1), each set once, when the OOM file already holds 1000 and the
+    job hasn't been read yet (a malformed job is limited too)."""
     _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest())
     stdin = _encode(_job(tmp_path)) if job == "valid" else b"{"
 
@@ -502,9 +509,10 @@ def test_converters_worker_limits_set_after_the_oom_write_before_the_job_is_read
         [
             (resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S)),
             (resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES)),
+            (resource.RLIMIT_CORE, (0, 0)),
         ]
     )
-    assert [(oom.strip(), read) for oom, read in limits.moments] == [("1000", False)] * 2
+    assert [(oom.strip(), read) for oom, read in limits.moments] == [("1000", False)] * 3
 
 
 @pytest.mark.parametrize(
@@ -512,19 +520,30 @@ def test_converters_worker_limits_set_after_the_oom_write_before_the_job_is_read
     [
         pytest.param(
             {resource.RLIMIT_CPU: 60},
-            [(resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES))],
+            [
+                (resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES)),
+                (resource.RLIMIT_CORE, (0, 0)),
+            ],
             id="lower-cpu-hard-limit-kept",
         ),
         pytest.param(
             {resource.RLIMIT_AS: 1024**3},
-            [(resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S))],
+            [
+                (resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S)),
+                (resource.RLIMIT_CORE, (0, 0)),
+            ],
             id="lower-address-space-hard-limit-kept",
         ),
         pytest.param(
-            {resource.RLIMIT_CPU: _CPU_LIMIT_S, resource.RLIMIT_AS: _ADDRESS_SPACE_BYTES},
+            {
+                resource.RLIMIT_CPU: _CPU_LIMIT_S,
+                resource.RLIMIT_AS: _ADDRESS_SPACE_BYTES,
+                resource.RLIMIT_CORE: 0,
+            },
             [
                 (resource.RLIMIT_CPU, (_CPU_LIMIT_S, _CPU_LIMIT_S)),
                 (resource.RLIMIT_AS, (_ADDRESS_SPACE_BYTES, _ADDRESS_SPACE_BYTES)),
+                (resource.RLIMIT_CORE, (0, 0)),
             ],
             id="equal-hard-limits-set",
         ),
@@ -538,8 +557,9 @@ def test_converters_worker_limit_set_only_when_the_hard_limit_allows_it(
     hard: dict[int, int],
     expected: list[tuple[int, tuple[int, int]]],
 ) -> None:
-    """A hard limit lower than ours is never raised: that setrlimit is skipped, the other
-    one still made; a hard limit equal to ours allows it. The job converts either way."""
+    """A hard limit lower than ours is never raised: that setrlimit is skipped, the others
+    still made; a hard limit equal to ours allows it (RLIMIT_CORE's 0 is never above a hard
+    limit, so (0, 0) is always set, §13.1). The job converts either way."""
     limits.hard.update(hard)
     _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest(None, 5))
 
@@ -567,14 +587,15 @@ def test_converters_worker_setrlimit_errors_are_ignored(
     error: BaseException,
 ) -> None:
     """A ValueError (macOS refuses RLIMIT_AS) or an OSError from setrlimit is ignored: the
-    job still converts, and the failing call doesn't stop the other one being tried."""
+    job still converts, and a failing call doesn't stop the others being tried (RLIMIT_CORE
+    included, §13.1)."""
     limits.raises["setrlimit"] = error
     _patch_convert(monkeypatch, lambda *args, **kwargs: _manifest(None, 5))
 
     code, output = _run(worker, _encode(_job(tmp_path)))
 
     assert sorted(which for which, _ in limits.calls) == sorted(
-        [resource.RLIMIT_CPU, resource.RLIMIT_AS]
+        [resource.RLIMIT_CPU, resource.RLIMIT_AS, resource.RLIMIT_CORE]
     )
     assert (code, _one_line(output)) == (
         0,
@@ -625,6 +646,31 @@ def test_converters_worker_real_child_ends_with_the_cpu_limit() -> None:
         0,
         [1, [_CPU_LIMIT_S, _CPU_LIMIT_S]],
     )
+
+
+# The same probe for the core-dump limit (§13.1).
+_CORE_PROBE: Final = (
+    "import io, json, resource\n"
+    "from admino.converters import worker\n"
+    "code = worker.main(io.BytesIO(b'{'), io.BytesIO())\n"
+    "print(json.dumps([code, list(resource.getrlimit(resource.RLIMIT_CORE))]))\n"
+)
+
+
+def test_converters_worker_real_child_ends_with_core_dumps_disabled() -> None:
+    """In a real process, main() leaves RLIMIT_CORE at (0, 0) (soft and hard: the child
+    can't raise it again), even for a malformed job: a crashed parser leaves no core image
+    of the document on the host (process re-audit L-1)."""
+    # A fixed argv (this interpreter, a constant probe); no shell.
+    completed = subprocess.run(  # noqa: S603
+        [sys.executable, "-P", "-s", "-c", _CORE_PROBE],
+        capture_output=True,
+        env={"PYTHONPATH": _SRC},
+        timeout=120,
+        check=False,
+    )
+
+    assert (completed.returncode, json.loads(completed.stdout)) == (0, [1, [0, 0]])
 
 
 # ---------------------------------------------------------------------------
