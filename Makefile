@@ -135,6 +135,7 @@ migrate:
 
 run: migrate
 	mkdir -p -m 0700 "$(ADMINO_ATTACHMENTS_ROOT)"
+	chmod 700 "$(ADMINO_ATTACHMENTS_ROOT)"
 	ADMINO_ATTACHMENTS_ROOT="$(ADMINO_ATTACHMENTS_ROOT)" env -u PG_PASSWORD python -m $(PACKAGE).main
 
 clean:
