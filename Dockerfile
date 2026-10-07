@@ -77,8 +77,11 @@ COPY --chown=admino:admino src/ src/
 COPY --from=frontend-builder --chown=admino:admino /build/static/ /app/static/
 
 # Create the config directory; it is volume-mounted at runtime but must exist
-# in the image so the container starts cleanly if the volume is empty
-RUN mkdir -p /app/config \
+# in the image so the container starts cleanly if the volume is empty.
+# /app/data/attachments is the mount point of the admino-attachments named
+# volume (GH-187): a fresh named volume copies this directory's ownership, so
+# creating it here (then chown -R below) gives admino a writable volume.
+RUN mkdir -p /app/config /app/data/attachments \
     && chown -R admino:admino /app
 
 # Copy and enable the entrypoint script. Root-owned and execute-only for

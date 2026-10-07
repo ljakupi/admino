@@ -289,6 +289,19 @@ apply_iptables() {
 
 apply_iptables
 
+# Chat attachment originals (GH-187): create /app/data/attachments when missing
+# and keep it admino-owned, mode 0700. Done AS admino (gosu) on purpose: the
+# agent service runs with cap_drop ALL plus only NET_ADMIN/SETUID/SETGID, so a
+# root chown/chmod on a directory root does not own would fail with EPERM
+# (fatal under set -e), and granting CHOWN/FOWNER would widen the capability
+# set for nothing. A fresh named volume is initialised from the image directory
+# (already admino-owned, see Dockerfile), and admino may chmod what it owns, so
+# install -d is idempotent and does not abort when the directory is correct.
+# Skipped when not root: the same user then runs the app and owns the files.
+if [ "$(id -u)" = "0" ]; then
+    gosu admino install -d -m 0700 /app/data/attachments
+fi
+
 # Drop root privileges before running the application. The entrypoint runs as
 # root so it can apply the iptables egress whitelist above; the app itself must
 # not. gosu does a clean setuid to admino and exec's the command with no extra
