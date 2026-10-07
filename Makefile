@@ -126,8 +126,10 @@ dev-db-down:
 #   database owner (PG_USER/PG_PASSWORD; PG_APP_PASSWORD for admino_app).
 # run: migrate, then start the app as the runtime role admino_app
 #   (PG_APP_PASSWORD), with the owner password removed from its environment.
-#   It also sets ADMINO_ATTACHMENTS_ROOT (default: ./data/attachments, git-ignored,
-#   created mode 0700; an exported value wins) so uploads work natively (GH-281).
+#   It also sets ADMINO_ATTACHMENTS_ROOT (default: ./data/attachments, git-ignored;
+#   an exported value wins) so uploads work natively (GH-281). The root is created
+#   with mode 0700 and an existing one is chmod'ed to 0700 too (following a
+#   symlinked root); on a directory you don't own, `make run` stops.
 # In Docker the one-shot `migrate` service does the same before the agent starts.
 # --------------------------------------------------------------------------
 ADMINO_ATTACHMENTS_ROOT ?= $(CURDIR)/data/attachments
