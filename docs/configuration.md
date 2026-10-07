@@ -1156,12 +1156,16 @@ and images. The parts don't reach the model in this release; that comes with
   (its first row as the header) or `(empty sheet)`; chart sheets are skipped. Cells hold
   the values saved in the file, so a formula without a saved value is empty, and dates
   read `2026-10-07` (`2026-10-07 14:30:00` with a time). A worksheet is read only up to
-  row 1,048,576, Excel's last row. **CSV** becomes one table without a heading, its
-  delimiter detected from its first 8 KiB among comma, semicolon, tab and `|`. Empty
-  rows are dropped, and a table keeps its first 1,000 non-empty rows, its first 50
-  columns and 1,000 characters per cell (a longer cell ends with `…`); a workbook keeps
-  its first 50 sheets. Each cut adds a note line, such as `[Only the first 1000 rows are
-  included.]`.
+  row 1,048,576, Excel's last row, and only 51 columns wide: the `[Only the first 50
+  columns are included.]` note appears when a kept row has content in its 51st column,
+  and content further right in a row whose 51st column is empty is neither read nor
+  noted. **CSV** becomes one table without a heading, its delimiter detected from its
+  first 8 KiB among comma, semicolon, tab and `|`. Empty rows are dropped, and a table
+  keeps its first 1,000 non-empty rows, its first 50 columns and 1,000 characters per
+  cell (a longer cell ends with `…`); a workbook keeps its first 50 sheets. Each cut
+  adds a note line, such as `[Only the first 1000 rows are included.]`. An empty row is
+  skipped before any work on its cells, and a long value repeated across cells (one
+  shared string in every cell, say) is cleaned and cut once, not once per cell.
 - **TXT and MD** stay as they are, without a leading BOM.
 - **Images** (PNG, JPEG, WEBP): the EXIF orientation is applied, an animation keeps its
   first frame, and an image larger than 2,048 pixels on its longest edge is downscaled
@@ -1197,9 +1201,10 @@ and images. The parts don't reach the model in this release; that comes with
   conversion still running after 120 seconds is killed and fails with
   `conversion_timeout`. The process also limits itself to 130 seconds of CPU time and,
   on Linux, 2 GiB of memory (address space): a parser that goes past either ends it, and
-  the file fails with `processing_error`. The process gets no secret, and on Linux it
-  can't read the agent's either (see
-  [Security Model → Attachments](SECURITY.md#attachments)).
+  the file fails with `processing_error`. On Linux it also turns off its core dumps
+  (a core size of 0), so a parser that crashes leaves no memory image holding the
+  document on the host. The process gets no secret, and on Linux it can't read the
+  agent's either (see [Security Model → Attachments](SECURITY.md#attachments)).
 - **Failure codes.** A failed file has one of these codes in `failure_reason`. Nothing
   else of the failure (no library message, file name or path) reaches a response, the
   database or a log line.

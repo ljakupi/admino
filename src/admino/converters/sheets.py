@@ -23,9 +23,20 @@ Security notes:
   ``MAX_SHEET_ROW_INDEX`` rows (Excel's maximum) are read per worksheet:
   openpyxl yields an empty row for every missing index, so a single
   ``<row r="1000000000000">`` would otherwise loop until the timeout.
-- The worksheet's declared dimension is ignored: rows are as wide as their
-  cells, so a lying ``<dimension>`` neither pads every row to 16,384 columns
-  nor cuts real cells off.
+- Per-row and per-cell work is bounded by the caps, not by what a few bytes
+  of XML claim. XLSX rows are read ``MAX_TABLE_COLUMNS + 1`` columns wide:
+  openpyxl otherwise pads every row out to its last cell's column (up to
+  18,278), so ``<row><c r="ZZZ1"/></row>`` would cost thousands of cells.
+  A row whose values are all None or ``""`` is skipped before any cell is
+  formatted. Within one table, a ``str`` longer than ``MAX_CELL_CHARS`` is
+  cleaned once per distinct value (an LRU of ``_LONG_VALUE_MEMO_SIZE``
+  values; ``str`` caches its hash), so one huge shared string referenced by
+  every cell is cleaned once, not once per cell.
+- Trade-off of the XLSX width: the columns note fires when a kept row has
+  content in column ``MAX_TABLE_COLUMNS + 1`` (51); content further right
+  with that column empty is neither read nor noted.
+- The worksheet's declared dimension is ignored, so a lying ``<dimension>``
+  can't cut real rows off.
 - Any openpyxl, XML, ZIP or CSV error (while loading or while reading rows)
   is ``corrupted_file``; the library's message is dropped (``from None``).
 """
@@ -34,6 +45,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import functools
 import itertools
 from typing import TYPE_CHECKING, Final
 
@@ -44,7 +56,7 @@ from admino.converters.common import ConversionError, clean_cell, markdown_table
 from admino.converters.ooxml import check_archive
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Sequence
     from pathlib import Path
     from typing import BinaryIO
 
@@ -56,6 +68,9 @@ MAX_SHEET_ROW_INDEX: Final = 1_048_576
 _CSV_SAMPLE_CHARS: Final = 8 * 1024
 _CSV_DELIMITERS: Final = ",;\t|"
 _EMPTY_SHEET: Final = "(empty sheet)"
+# Distinct long values whose cleaned form one table remembers: enough for a
+# sheet's repeated shared strings, bounded whatever the file holds.
+_LONG_VALUE_MEMO_SIZE: Final = 1024
 _SECTION_SEPARATOR: Final = "\n\n"
 # Below this magnitude a float's integral value prints exactly as an int.
 _EXACT_INTEGRAL_FLOAT: Final = 1e15
@@ -86,15 +101,19 @@ def format_cell(value: object) -> str:
     return str(value)
 
 
-def table_text(rows: Iterable[Iterable[object]]) -> str:
+def table_text(rows: Iterable[Sequence[object]]) -> str:
     """Build a capped Markdown table from raw rows, with its notes; ``""`` when empty.
 
-    Cells are formatted (``format_cell``) and cleaned (``clean_cell``); rows whose
-    cells are all empty are dropped; the first ``MAX_TABLE_ROWS`` non-empty rows
-    are kept, each cut to ``MAX_TABLE_COLUMNS`` cells, then the table is trimmed
-    to its rightmost non-empty column. Notes follow after a blank line, one per
-    line: the rows note when another non-empty row follows the kept ones, the
-    columns note when a kept row has content beyond the column cap.
+    A row whose values are all None or ``""`` is skipped unformatted. In the
+    other rows a None is an empty cell and every other value is formatted
+    (``format_cell``) and cleaned (``clean_cell``), a ``str`` longer than
+    ``MAX_CELL_CHARS`` once per distinct value in this call (at most
+    ``_LONG_VALUE_MEMO_SIZE`` remembered); rows whose cells are all empty
+    are dropped; the first ``MAX_TABLE_ROWS`` non-empty rows are
+    kept, each cut to ``MAX_TABLE_COLUMNS`` cells, then the table is trimmed
+    to its rightmost non-empty column. Notes follow after a blank line, one
+    per line: the rows note when another non-empty row follows the kept ones,
+    the columns note when a kept row has content beyond the column cap.
 
     Raises:
         ConversionError: ``text_too_large`` as soon as the kept cells hold more
@@ -103,11 +122,29 @@ def table_text(rows: Iterable[Iterable[object]]) -> str:
     max_rows = common.MAX_TABLE_ROWS
     max_columns = common.MAX_TABLE_COLUMNS
     max_chars = common.MAX_TEXT_CHARS
+    max_cell_chars = common.MAX_CELL_CHARS
+    # Per call: a long value's cleaning costs its length (a 9M-character
+    # shared string about 11 ms), and one value can fill every cell.
+    clean_long = functools.lru_cache(maxsize=_LONG_VALUE_MEMO_SIZE)(_cell_text)
     kept: list[list[str]] = []
     chars = 0
     rows_cut = columns_cut = False
     for row in rows:
-        cells = [clean_cell(format_cell(value)) for value in row]
+        # Both counts run in C. None first: padded rows are all None, and
+        # comparing a None with "" is the slow comparison.
+        nones = row.count(None)
+        if nones == len(row) or nones + row.count("") == len(row):
+            continue
+        # A None is "" unformatted: a sparse row costs its values, not its width.
+        # (Formatting the 50 Nones of a one-cell row cost about 6 µs a row.)
+        cells = [
+            ""
+            if value is None
+            else clean_long(value)
+            if isinstance(value, str) and len(value) > max_cell_chars
+            else _cell_text(value)
+            for value in row
+        ]
         if not any(cells):
             continue
         if len(kept) == max_rows:
@@ -129,6 +166,11 @@ def table_text(rows: Iterable[Iterable[object]]) -> str:
     if columns_cut:
         notes.append(f"[Only the first {max_columns} columns are included.]")
     return table + "\n\n" + "\n".join(notes) if notes else table
+
+
+def _cell_text(value: object) -> str:
+    """One raw value as a table cell: formatted, then cleaned."""
+    return clean_cell(format_cell(value))
 
 
 def _used_width(cells: list[str]) -> int:
@@ -175,7 +217,8 @@ def _workbook_text(file: BinaryIO) -> str:
         length = -len(_SECTION_SEPARATOR)
         for sheet in worksheets[:max_sheets]:
             sheet.reset_dimensions()
-            rows = sheet.iter_rows(values_only=True)
+            # One column past the cap: enough for the columns note.
+            rows = sheet.iter_rows(values_only=True, max_col=common.MAX_TABLE_COLUMNS + 1)
             table = table_text(itertools.islice(rows, MAX_SHEET_ROW_INDEX))
             section = f"## {clean_cell(sheet.title)}\n\n{table or _EMPTY_SHEET}"
             length += len(_SECTION_SEPARATOR) + len(section)

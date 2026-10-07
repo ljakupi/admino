@@ -18,7 +18,10 @@ Security notes:
   (``CPU_LIMIT_S``, above the runner's timeout, so the kernel ends it, and
   any process it started, even when nobody kills it: a server that was
   itself killed) and its address space (``ADDRESS_SPACE_BYTES``; a
-  ``MemoryError`` then ends it with status 1, ``processing_error``). A hard
+  ``MemoryError`` then ends it with status 1, ``processing_error``), and it
+  turns off its core dumps (``RLIMIT_CORE`` 0, soft and hard): a parser
+  that crashes leaves no image of its memory, the document's content, on
+  the host, outside the attachment's and the org's lifecycle. A hard
   limit that is already lower is kept; macOS doesn't enforce the address
   space limit.
 - Only fixed codes reach stdout: an exception's message (a path, a file name)
@@ -113,15 +116,17 @@ def _raise_oom_score() -> None:
 
 
 def _limit_self() -> None:
-    """Cap this process's CPU time and address space (``CPU_LIMIT_S``, ``ADDRESS_SPACE_BYTES``).
+    """Cap this process's CPU time and address space and turn off its core dumps.
 
-    Each limit is set (soft and hard) only when the current hard limit allows
-    it: a lower one is never raised. An error of either call is ignored and
-    the other limit is still tried: the conversion runs anyway.
+    ``CPU_LIMIT_S``, ``ADDRESS_SPACE_BYTES`` and a core size of 0. Each limit
+    is set (soft and hard) only when the current hard limit allows it: a
+    lower one is never raised (0 is always allowed). An error of any call is
+    ignored and the other limits are still tried: the conversion runs anyway.
     """
     for which, value in (
         (resource.RLIMIT_CPU, CPU_LIMIT_S),
         (resource.RLIMIT_AS, ADDRESS_SPACE_BYTES),
+        (resource.RLIMIT_CORE, 0),
     ):
         with contextlib.suppress(ValueError, OSError):
             _, hard = resource.getrlimit(which)

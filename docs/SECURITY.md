@@ -342,11 +342,13 @@ conversion in `attachment_processing.py` and `converters/`:
   seconds (`conversion_timeout`), and on Linux it raises its own OOM score, so when
   memory runs out the kernel kills the child first, not the agent. Before it reads the
   job, it also limits itself to 130 seconds of CPU time and, on Linux, 2 GiB of address
-  space, so a parser that goes past either ends the child. A crash, an exit without a
-  valid answer or an answer with an unknown code fails the file with
-  `processing_error`, and whatever the child wrote is removed. A failure is a fixed code
-  in `failure_reason`: a library's message, the file name and paths never reach the
-  database, a response or a log line.
+  space, so a parser that goes past either ends the child. On Linux it also turns off
+  its core dumps (a core size of 0), so a parser that crashes can't leave a memory image
+  of the child, holding the document, on the host. A crash, an exit without a valid
+  answer or an answer with an unknown code fails the file with `processing_error`, and
+  whatever the child wrote is removed. A failure is a fixed code in `failure_reason`: a
+  library's message, the file name and paths never reach the database, a response or a
+  log line.
 - **The agent's secrets and code stay out of the child's reach.** The child runs as the
   agent's user, so on Linux the agent makes its own process non-dumpable at startup
   (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's
@@ -376,8 +378,12 @@ conversion in `attachment_processing.py` and `converters/`:
   counted while a table is being built, a table at 1,000 rows, 50 columns and 1,000
   characters per cell, a workbook at 50 sheets. A DOCX cell spanning columns is repeated
   only up to the column limit, however wide a span it declares; an XLSX sheet is read
-  only up to row 1,048,576 (Excel's last row), whatever row numbers the file uses; and a
-  CSV's delimiter is detected from its first 8 KiB.
+  only up to row 1,048,576 (Excel's last row), whatever row numbers the file uses, and
+  only 51 columns wide, whatever columns its cells name (the columns note appears when
+  the 51st column has content; content further right with that column empty isn't
+  read); empty rows are skipped before any work on their cells, and a long value
+  repeated across cells is cleaned once; and a CSV's delimiter is detected from its
+  first 8 KiB.
 - **Image metadata is stripped.** Converted images are written fresh, without their
   metadata: no EXIF (GPS location, camera, dates), ICC profile, XMP, comments or PNG
   text chunks, so where a photo was taken doesn't travel with it to the model. Rendered
