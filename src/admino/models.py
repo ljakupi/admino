@@ -3299,8 +3299,10 @@ _ATTACHMENTS_PER_MESSAGE_MAX: Final = 50
 class AttachmentSummary(BaseModel):
     """One stored attachment as the API shows it: metadata only.
 
-    ``filename`` is the sanitized name, ``kind`` the detected type and
-    ``failure_reason`` a code (set when ``status`` is ``failed``).
+    ``filename`` is the sanitized name, ``kind`` the detected type,
+    ``failure_reason`` a code (set when ``status`` is ``failed``) and
+    ``token_estimate`` the estimated tokens of the converted file (null until
+    it is ``ready``).
     """
 
     id: UUID
@@ -3312,6 +3314,7 @@ class AttachmentSummary(BaseModel):
     status: AttachmentStatus
     failure_reason: str | None = Field(pattern=_ATTACHMENT_REASON_PATTERN)
     page_count: int | None = Field(ge=0)
+    token_estimate: int | None = Field(ge=0)
     created_at: datetime
 
 
