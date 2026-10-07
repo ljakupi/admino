@@ -16,7 +16,13 @@ pins, from a dry run (``make -n run``) of a copy of the Makefile in ``tmp_path``
 - with ``ADMINO_ATTACHMENTS_ROOT`` exported, the app and the ``mkdir`` use that value;
 - the dry run executes nothing (no ``data`` directory appears), and ``data/`` is
   git-ignored by the repository's .gitignore (checked in a throwaway repository
-  holding only that file, with the global and system git configs switched off).
+  holding only that file, with the global and system git configs switched off);
+- GH-281 audit fix round 1 (Decision 12, contract A11): before the app command, the
+  recipe also sets mode 0700 on a root that already exists, for the default and for an
+  exported root: ``install -d`` with a 0700 mode, or ``chmod 700``/``0700`` of the root
+  after the command that creates it. ``mkdir -m 0700`` alone (or ``umask 077`` before
+  it) leaves an existing directory's mode, so it is refused, as are another mode, another
+  path, ``install -d`` without a mode and a ``chmod`` after the app starts.
 
 The recipe's printed lines are tokenized with ``shlex`` (backslash continuations
 joined, ``;``/``&&``/``||``/``|`` separate commands).
@@ -31,6 +37,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import Final
+
+import pytest
 
 _REPO: Final = Path(__file__).resolve().parents[1]
 _APP_MODULE: Final = "admino.main"
@@ -231,6 +239,68 @@ def _checker_misses() -> list[str]:
     return misses
 
 
+def _secures_an_existing_directory(lines: list[str], root: str, before_line: int) -> bool:
+    """Whether a printed command before ``before_line`` sets mode 0700 on ``root`` even
+    when it already exists: ``install -d`` with a 0700 mode, or ``chmod`` 0700 of the
+    root after the command that creates it (``mkdir -m`` alone keeps an existing mode)."""
+    created = False
+    for line in lines[:before_line]:
+        for words in _commands(line):
+            command = words[0]
+            operands = [word.rstrip("/") for word in words[1:] if not word.startswith("-")]
+            mode = _option_value(words, "-m", "--mode")
+            if command == "install" and "-d" in words and root in operands:
+                if mode in _MODES_0700:
+                    return True
+                created = True
+            elif command == "mkdir" and root in operands:
+                created = True
+            elif (
+                command == "chmod"
+                and created
+                and operands[:1]
+                and operands[0] in _MODES_0700
+                and root in operands[1:]
+            ):
+                return True
+    return False
+
+
+_APP_COMMAND: Final = (
+    f"env -u PG_PASSWORD ADMINO_ATTACHMENTS_ROOT={_SAMPLE_ROOT} python -m admino.main\n"
+)
+# Recipes that also make an existing root private, and ones that don't.
+_EXISTING_ROOT_ACCEPTED: Final[tuple[str, ...]] = (
+    f"mkdir -p {_SAMPLE_ROOT} && chmod 700 {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+    f'mkdir -p -m 0700 "{_SAMPLE_ROOT}"\nchmod 0700 "{_SAMPLE_ROOT}"\n{_APP_COMMAND}',
+    f"install -d -m 0700 {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+    f"install -d -m 700 {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+)
+_EXISTING_ROOT_REFUSED: Final[tuple[str, ...]] = (
+    # mkdir's mode applies only to a directory it creates.
+    f"mkdir -p -m 0700 {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+    f"umask 077; mkdir -p {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+    # Another mode, another path, no mode.
+    f"mkdir -p {_SAMPLE_ROOT} && chmod 755 {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+    f"mkdir -p -m 0700 {_SAMPLE_ROOT} && chmod 700 /x/data\n{_APP_COMMAND}",
+    f"install -d {_SAMPLE_ROOT}\n{_APP_COMMAND}",
+    # After the app starts.
+    f"mkdir -p -m 0700 {_SAMPLE_ROOT}\n{_APP_COMMAND}chmod 700 {_SAMPLE_ROOT}\n",
+)
+
+
+def _existing_root_ok(text: str, root: str) -> bool:
+    lines = _logical_lines(text)
+    app_line, _ = _app_start(lines)
+    return _recipe_ok(text, root) and _secures_an_existing_directory(lines, root, app_line)
+
+
+def _existing_root_checker_misses() -> list[str]:
+    misses = [text for text in _EXISTING_ROOT_ACCEPTED if not _existing_root_ok(text, _SAMPLE_ROOT)]
+    misses.extend(text for text in _EXISTING_ROOT_REFUSED if _existing_root_ok(text, _SAMPLE_ROOT))
+    return misses
+
+
 def _git_ignored(relative: str, tmp_path: Path) -> bool:
     """Whether the repository's .gitignore ignores ``relative`` (a throwaway repository
     holding only that .gitignore; no global or system excludes)."""
@@ -311,3 +381,24 @@ def test_make_run_an_exported_root_wins(tmp_path: Path) -> None:
         _creates_private_directory(lines, exported, app_line),
         Path(exported).exists(),
     ) == ({"unsets_PG_PASSWORD": True, "roots": [exported]}, True, False)
+
+
+@pytest.mark.parametrize("exported", [False, True], ids=["default-root", "exported-root"])
+def test_make_run_sets_mode_0700_on_an_existing_root(tmp_path: Path, exported: bool) -> None:
+    """GH-281 Decision 12 (A11): an existing root (default or exported) is made 0700
+    before the app starts, not only a root ``mkdir`` creates. The check accepts
+    ``install -d -m 0700`` and a ``chmod 700`` after the mkdir, and refuses ``mkdir -m
+    0700`` alone, ``umask 077`` + ``mkdir``, a wrong mode or path and a late chmod."""
+    checkout = _checkout(tmp_path)
+    if exported:
+        root = str(tmp_path / "exported-attachments")
+        lines = _dry_run(checkout, root)
+    else:
+        root = str(checkout.resolve() / "data" / "attachments")
+        lines = _dry_run(checkout)
+    app_line, _ = _app_start(lines)
+
+    assert (
+        _existing_root_checker_misses(),
+        _secures_an_existing_directory(lines, root, app_line),
+    ) == ([], True)
