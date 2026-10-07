@@ -12,7 +12,8 @@ app's shutdown to end the detached runs:
   ``StreamingResponse`` never listens for ``http.disconnect`` under ASGI spec
   2.4, where a send to a gone client raises ``OSError`` instead. When the
   client leaves before the last frame, the relay ends and the run's stop
-  signal is set; the run itself goes on and is stored.
+  signal is set; the run itself goes on and is stored. It sends
+  ``Cache-Control: no-store`` (GH-278) and ``X-Accel-Buffering: no``.
 - ``detach``: starts a run's task apart from its response and keeps it
   referenced, with its stop signal, until it ends, so a gone client never
   ends (or lets the garbage collector drop) a run.
@@ -52,8 +53,9 @@ if TYPE_CHECKING:
 _EVENT_STREAM: Final = "text/event-stream"
 # RFC 9110 qvalue: 0 to 1 with at most three decimals.
 _QVALUE: Final = re.compile(r"0(?:\.\d{0,3})?|1(?:\.0{0,3})?")
-# Proxies (nginx) must neither cache nor buffer the stream.
-_HEADERS: Final = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+# A stream holds a user's chat, so no browser or proxy keeps a copy (no-store, like
+# every /api answer, GH-278); proxies (nginx) must not buffer it either.
+_HEADERS: Final = {"Cache-Control": "no-store", "X-Accel-Buffering": "no"}
 
 # The detached run tasks and their stop signals. The event loop keeps only weak
 # references to tasks, so this map holds each one until it ends.
@@ -125,7 +127,7 @@ class EventStreamResponse(StreamingResponse):
     media_type = _EVENT_STREAM
 
     def __init__(self, frames: AsyncIterable[str], *, stop: asyncio.Event | None) -> None:
-        """Answer 200 with ``frames``, uncached and unbuffered by proxies."""
+        """Answer 200 with ``frames``, never stored and unbuffered by proxies."""
         super().__init__(frames, headers=_HEADERS)
         self._stop = stop
 
