@@ -45,6 +45,16 @@ What these tests pin down:
   at each run (``organizations.ATTACHMENTS_ROOT`` patched between runs); a failing
   run is logged by class name only and the job continues; a cancellation (during a
   run or a sleep) ends it.
+- GH-281 (Decision 7, contract C1 to C3), the stray sweep in chunks:
+  ``SWEEP_CHUNK_SIZE == 1000``, read at call time. An org directory's old
+  ``<uuid>``/``<uuid>.d`` candidates are checked with ``ceil(n / SWEEP_CHUNK_SIZE)``
+  G3 statements, each binding that directory's org and at most ``SWEEP_CHUNK_SIZE``
+  ids; every candidate sits in exactly one chunk (2,500 strays: three statements);
+  the rows found in any chunk keep their files; a directory without a candidate
+  sends no G3. A chunk that raises skips its whole directory for the run (nothing in
+  it removed, a ``.part`` included), logged as ``Attachment directory of org <id>
+  couldn't be swept (<class name>).`` without the error's message; another org's
+  directory is still swept (each org takes the failing role once).
 
 The module is imported lazily (fixture ``gc``), so this file collects before it
 exists and every test fails on its own. Everything on disk lives under
@@ -65,6 +75,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
+import asyncpg
 import pytest
 
 from admino import organizations
@@ -998,3 +1009,161 @@ class TestRunGcJob:
             await asyncio.wait_for(gc.run_gc_job(db.pool), _WAIT_S)
 
         assert (db.attachment_row(orphan), _present(files)) == (None, [False, False, False])
+
+
+# ---------------------------------------------------------------------------
+# 7. The stray sweep in chunks (GH-281, Decision 7, contract C1 to C3)
+# ---------------------------------------------------------------------------
+
+_SWEEP_FAILED: Final = "Attachment directory of org {} couldn't be swept ({})."
+
+
+def _g3_chunks(db: FakeDb) -> list[tuple[uuid.UUID, list[uuid.UUID]]]:
+    """(the bound org, the bound ids in order) of every G3 statement."""
+    return [
+        (uuid.UUID(str(args[0])), [uuid.UUID(str(item)) for item in args[1]])
+        for sql, args in _attachment_calls(db)
+        if sql == _G3
+    ]
+
+
+def _strays(root: Path, org_id: uuid.UUID, now: datetime, count: int) -> list[str]:
+    """``count`` old ``<uuid>`` files without a row in the org's directory; their names."""
+    names = [str(uuid.uuid4()) for _ in range(count)]
+    for name in names:
+        _entry(root, org_id, name, now, age=_OLD)
+    return names
+
+
+def _live_files(
+    db: FakeDb, chat_id: uuid.UUID, root: Path, org_id: uuid.UUID, now: datetime, count: int
+) -> list[str]:
+    """``count`` young unsent rows (no orphans) whose ``<id>`` files are old: candidates
+    that G3 finds, so the sweep keeps them; their names."""
+    names = [str(_row(db, chat_id, now - timedelta(hours=1))) for _ in range(count)]
+    for name in names:
+        _entry(root, org_id, name, now, age=_OLD)
+    return names
+
+
+def _names(root: Path, org_id: uuid.UUID) -> list[str]:
+    """The entries left in the org's directory, sorted."""
+    org_dir = root / str(org_id)
+    return sorted(os.listdir(org_dir)) if org_dir.is_dir() else []
+
+
+class TestSweepChunks:
+    def test_attachment_gc_sweep_chunk_size_is_1000(self, gc: ModuleType) -> None:
+        chunk_size = getattr(gc, "SWEEP_CHUNK_SIZE", None)
+
+        assert chunk_size == 1000
+
+    async def test_attachment_gc_more_than_1000_strays_are_checked_in_chunks_of_1000(
+        self, gc: ModuleType, db: FakeDb, world: _World, root: Path, now: datetime
+    ) -> None:
+        """Org A's directory: 2,500 old strays and 10 old files of live rows (2,510
+        candidates); org B's: a young entry and an unknown name only (no candidate).
+        Three G3 statements, each binding org A and at most 1,000 ids, name every
+        candidate exactly once; none for org B. The strays go, the live files stay."""
+        strays = _strays(root, ORG_ID, now, 2500)
+        live = _live_files(db, world.chat_id, root, ORG_ID, now, 10)
+        _entry(root, OTHER_ORG_ID, str(uuid.uuid4()), now, age=_YOUNG)
+        _entry(root, OTHER_ORG_ID, "notes.txt", now, age=_OLD)
+
+        result = await gc.collect_garbage(db.pool, root, now=now)
+
+        chunks = _g3_chunks(db)
+        bound = [str(item) for _, ids in chunks for item in ids]
+        assert [org for org, _ in chunks] == [ORG_ID, ORG_ID, ORG_ID]
+        assert max(len(ids) for _, ids in chunks) <= 1000
+        assert (len(bound), set(bound)) == (2510, {*strays, *live})
+        assert (result, _names(root, ORG_ID)) == (2500, sorted(live))
+        assert len(_names(root, OTHER_ORG_ID)) == 2
+
+    async def test_attachment_gc_sweep_chunk_size_is_read_at_call_time(
+        self,
+        gc: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        now: datetime,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """SWEEP_CHUNK_SIZE patched to 2: org A's 5 candidates (4 of them live rows'
+        files, so they meet in at least two chunks) take three G3 statements, org B's 3
+        strays two; each binds its directory's org and at most 2 ids, every candidate
+        once. The rows found in any chunk keep their files; every stray goes."""
+        monkeypatch.setattr(gc, "SWEEP_CHUNK_SIZE", 2, raising=False)
+        live = _live_files(db, world.chat_id, root, ORG_ID, now, 4)
+        stray_a = _strays(root, ORG_ID, now, 1)
+        stray_b = _strays(root, OTHER_ORG_ID, now, 3)
+
+        result = await gc.collect_garbage(db.pool, root, now=now)
+
+        chunks = _g3_chunks(db)
+        by_org = {
+            org: sorted(str(item) for bound, ids in chunks if bound == org for item in ids)
+            for org in (ORG_ID, OTHER_ORG_ID)
+        }
+        assert sorted(str(org) for org, _ in chunks) == sorted(
+            [str(ORG_ID)] * 3 + [str(OTHER_ORG_ID)] * 2
+        )
+        assert max(len(ids) for _, ids in chunks) <= 2
+        assert by_org == {ORG_ID: sorted([*live, *stray_a]), OTHER_ORG_ID: sorted(stray_b)}
+        assert (result, _names(root, ORG_ID), _names(root, OTHER_ORG_ID)) == (
+            4,
+            sorted(live),
+            [],
+        )
+
+    @pytest.mark.parametrize("failing_org", ["org-a", "org-b"])
+    async def test_attachment_gc_failing_chunk_skips_only_its_directory(
+        self,
+        gc: ModuleType,
+        db: FakeDb,
+        world: _World,
+        root: Path,
+        now: datetime,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        failing_org: str,
+    ) -> None:
+        """SWEEP_CHUNK_SIZE 2; the second G3 of one org's directory (5 strays and an old
+        .part) raises: nothing of that directory is removed, one warning names the org
+        and the error's class (never its message, which holds a path), and the other
+        org's 3 strays still go. Each org takes the failing role once, so whatever order
+        the directories are visited in, one run meets the failure first."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr(gc, "SWEEP_CHUNK_SIZE", 2, raising=False)
+        failing, swept = (
+            (ORG_ID, OTHER_ORG_ID) if failing_org == "org-a" else (OTHER_ORG_ID, ORG_ID)
+        )
+        stuck = _strays(root, failing, now, 5)
+        part = f"{uuid.uuid4()}.part"
+        _entry(root, failing, part, now, age=_OLD)
+        _strays(root, swept, now, 3)
+        failing_calls: list[str] = []
+        original = db.handle
+
+        def handle(method: str, sql: str, args: tuple[Any, ...], via: str, tx: int | None) -> Any:
+            if norm(sql) == _G3 and uuid.UUID(str(args[0])) == failing:
+                failing_calls.append(sql)
+                if len(failing_calls) == 2:
+                    raise asyncpg.exceptions.QueryCanceledError(
+                        f"canceling statement due to statement timeout {_LEAK_DIR}"
+                    )
+            return original(method, sql, args, via, tx)
+
+        monkeypatch.setattr(db, "handle", handle)
+
+        result = await gc.collect_garbage(db.pool, root, now=now)
+
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.WARNING and record.name.startswith("admino")
+        ]
+        assert (result, _names(root, swept)) == (3, [])
+        assert _names(root, failing) == sorted([*stuck, part])
+        assert warnings == [_SWEEP_FAILED.format(failing, "QueryCanceledError")]
+        assert _LEAK_DIR not in _log_text(caplog)

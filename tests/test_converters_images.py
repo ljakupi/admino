@@ -39,6 +39,26 @@ the stored part back. What these tests pin down:
   call time.
 - JPEG output is re-encoded at ``JPEG_QUALITY`` (its quantization tables are
   quality 85's), never the uploaded bytes copied.
+- Malformed EXIF (GH-281 Decision 2, contract I1): a JPEG whose hand-built EXIF
+  block carries a readable orientation 6 plus one tag Pillow can't write back
+  (Make as RATIONAL -> AttributeError, InteropIFD as BYTE -> struct.error, XMP
+  as ASCII -> TypeError, each raised by ``ImageOps.exif_transpose``) converts
+  as stored: no orientation correction (stored size, quadrants in place), no
+  metadata in the output (info keys, APP1/APP2/APP13/COM segments, the EXIF
+  marker string), RGB at ``JPEG_QUALITY``. The same
+  block in a truncated JPEG is still ``corrupted_file``, and over the pixel
+  limit still ``image_too_large``.
+- Draft mode (GH-281 Decision 3, contract I3), observed through a spy wrapping
+  ``JpegImageFile.draft`` (requested size, whether it took effect, i.e. ran
+  before any pixel was loaded, and the size after): a JPEG larger than its
+  target (the stored size fitted into 2048 x 2048 as ``Image.thumbnail``
+  computes it) is drafted once with exactly that target (8192x4096 -> 2048x1024
+  decoded at 1/4; 4100x4100 -> 2050x2050 at 1/2; 2049x4110 -> 1025x2055 at
+  1/2). The output equals the non-draft path's (draft replaced by a no-op
+  returning None) in size and content: 2049x4110 -> 1021x2048 (a naive
+  thumbnail of the drafted image gives 1022x2048), 4100x2051 -> 2048x1024 (naive
+  2048x1025) and the same with orientation 6 -> 1024x2048, rotated. A JPEG
+  within 2048 x 2048 is not reduced; PNG and WEBP sources are never drafted.
 
 The converter modules are imported inside the helpers, so this file collects
 before they exist.
@@ -52,7 +72,7 @@ import zlib
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from PIL import ExifTags, Image, ImageCms, ImageFile, PngImagePlugin
+from PIL import ExifTags, Image, ImageCms, ImageFile, ImageOps, JpegImagePlugin, PngImagePlugin
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -328,6 +348,120 @@ def test_images_exif_orientation_applied(
     )
 
 
+# --- malformed EXIF (GH-281 Decision 2) -----------------------------------------------
+
+_BYTE, _ASCII, _SHORT, _RATIONAL = 1, 2, 3, 5
+_MAKE = 0x010F
+_XMP = 0x02BC
+_INTEROP_IFD = 0xA005
+_ExifEntry = tuple[int, int, int, bytes]
+# One tag Pillow reads but can't write back (what ImageOps.exif_transpose raises).
+_MALFORMED_EXIF: dict[str, tuple[_ExifEntry, type[Exception]]] = {
+    "make-as-rational": ((_MAKE, _RATIONAL, 1, struct.pack("<II", 1, 1)), AttributeError),
+    "interop-ifd-as-byte": ((_INTEROP_IFD, _BYTE, 1, b"\x07"), struct.error),
+    "xmp-as-ascii": ((_XMP, _ASCII, 1, b"\0"), TypeError),
+}
+
+
+def _exif_block(entries: list[_ExifEntry]) -> bytes:
+    """A hand-built EXIF block (``Exif\\0\\0`` + a little-endian TIFF with one IFD) of
+    ``(tag, type, count, value bytes)`` entries; values over 4 bytes follow the IFD."""
+    entries = sorted(entries)
+    data_offset = 8 + 2 + 12 * len(entries) + 4
+    ifd = struct.pack("<H", len(entries))
+    data = b""
+    for tag, kind, count, value in entries:
+        if len(value) <= 4:
+            field = value.ljust(4, b"\0")
+        else:
+            field = struct.pack("<I", data_offset + len(data))
+            data += value + b"\0" * (len(value) % 2)
+        ifd += struct.pack("<HHI", tag, kind, count) + field
+    ifd += struct.pack("<I", 0)
+    return b"Exif\0\0II*\0" + struct.pack("<I", 8) + ifd + data
+
+
+def _malformed_exif(case: str) -> bytes:
+    """Orientation 6 (readable), the marker as ImageDescription and the case's bad tag."""
+    description = b"EXIF-MARK-188\0"
+    return _exif_block(
+        [
+            (_IMAGE_DESCRIPTION, _ASCII, len(description), description),
+            (_ORIENTATION, _SHORT, 1, struct.pack("<H", 6)),
+            _MALFORMED_EXIF[case][0],
+        ]
+    )
+
+
+def _jpeg_with_malformed_exif(case: str, image: Image.Image) -> bytes:
+    data = _encode(image, "JPEG", exif=_malformed_exif(case))
+    # The fixture: Pillow reads orientation 6, but can't write the EXIF back without it.
+    source = Image.open(io.BytesIO(data))
+    assert source.getexif()[_ORIENTATION] == 6
+    with pytest.raises(_MALFORMED_EXIF[case][1]):
+        ImageOps.exif_transpose(source)
+    return data
+
+
+@pytest.mark.parametrize("case", list(_MALFORMED_EXIF))
+def test_images_malformed_exif_converts_as_stored_with_metadata_stripped(
+    tmp_path: Path, case: str
+) -> None:
+    from admino.converters import common
+
+    data = _jpeg_with_malformed_exif(case, _quadrants(64, 32))
+    reference = Image.open(io.BytesIO(_encode(_quadrants(), "JPEG", quality=common.JPEG_QUALITY)))
+
+    part, stored, stored_bytes = _single_image(tmp_path, data, "jpeg")
+
+    # Not rotated: the orientation of a malformed EXIF block isn't trusted.
+    assert (
+        (part.width, part.height),
+        stored.size,
+        _quadrant_colours(stored),
+        (stored.format, stored.mode, stored.quantization),
+        _metadata_left(stored, stored_bytes),
+    ) == (
+        (64, 32),
+        (64, 32),
+        ("red", "green", "blue", "yellow"),
+        ("JPEG", "RGB", reference.quantization),
+        {"info": [], "exif": [], "containers": [], "markers": []},
+    )
+
+
+@pytest.mark.parametrize("case", list(_MALFORMED_EXIF))
+def test_images_malformed_exif_keeps_decode_errors_and_the_pixel_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    from admino.converters import common
+    from admino.converters.common import ConversionError
+
+    data = _jpeg_with_malformed_exif(case, Image.effect_noise((64, 64), 60).convert("RGB"))
+
+    def outcome(name: str, upload: bytes) -> str:
+        directory = tmp_path / name
+        directory.mkdir()
+        try:
+            _convert(directory, upload, "jpeg")
+        except ConversionError as exc:
+            return exc.reason
+        return "converted"
+
+    outcomes = {
+        "intact": outcome("intact", data),
+        "truncated": outcome("truncated", data[: len(data) // 2]),
+    }
+    monkeypatch.setattr(common, "MAX_IMAGE_PIXELS", 64 * 64 - 1)
+    outcomes["over-the-pixel-limit"] = outcome("over-the-pixel-limit", data)
+
+    assert outcomes == {
+        "intact": "converted",
+        "truncated": "corrupted_file",
+        "over-the-pixel-limit": "image_too_large",
+    }
+
+
 # --- downscaling ----------------------------------------------------------------------
 
 
@@ -364,6 +498,154 @@ def test_images_longest_edge_fits_2048_never_upscaled(
         (part.width, part.height),
         estimate_image_tokens(part.width, part.height),
     )
+
+
+# --- JPEG draft mode (GH-281 Decision 3) ----------------------------------------------
+
+_DraftCall = tuple[tuple[int, int] | None, bool, tuple[int, int]]
+
+
+def _spy_jpeg_draft(monkeypatch: pytest.MonkeyPatch, *, effective: bool = True) -> list[_DraftCall]:
+    """Record every ``JpegImageFile.draft`` call: (requested size, whether it took
+    effect, the image's size after it). Pillow's draft returns None, changing nothing,
+    once the pixels are loaded (or on a second call), so "took effect" means it ran
+    before the load. ``effective=False`` makes draft a no-op returning None: the
+    non-draft path."""
+    real = JpegImagePlugin.JpegImageFile.draft
+    calls: list[_DraftCall] = []
+
+    def draft(
+        self: JpegImagePlugin.JpegImageFile, mode: str | None, size: tuple[int, int] | None
+    ) -> Any:
+        result = real(self, mode, size) if effective else None
+        requested = None if size is None else (int(size[0]), int(size[1]))
+        calls.append((requested, result is not None, self.size))
+        return result
+
+    monkeypatch.setattr(JpegImagePlugin.JpegImageFile, "draft", draft)
+    return calls
+
+
+def _spy_file_draft(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record the class of every opened image file (not a JPEG, which has its own
+    draft) whose ``draft`` is called; a plain in-memory image is not recorded."""
+    real = Image.Image.draft
+    files: list[str] = []
+
+    def draft(self: Image.Image, mode: str | None, size: tuple[int, int] | None) -> Any:
+        if isinstance(self, ImageFile.ImageFile):
+            files.append(type(self).__name__)
+        return real(self, mode, size)
+
+    monkeypatch.setattr(Image.Image, "draft", draft)
+    return files
+
+
+@pytest.mark.parametrize(
+    ("size", "target", "decoded"),
+    [
+        ((8192, 4096), (2048, 1024), (2048, 1024)),
+        ((4100, 4100), (2048, 2048), (2050, 2050)),
+        ((2049, 4110), (1021, 2048), (1025, 2055)),
+    ],
+    ids=["quarter-scale", "half-scale-square", "half-scale-portrait"],
+)
+def test_images_large_jpeg_is_drafted_once_to_the_target_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    size: tuple[int, int],
+    target: tuple[int, int],
+    decoded: tuple[int, int],
+) -> None:
+    data = _encode(Image.new("RGB", size, (90, 120, 150)), "JPEG")
+    calls = _spy_jpeg_draft(monkeypatch)
+
+    part, stored, _ = _single_image(tmp_path, data, "jpeg")
+
+    assert (calls, (part.width, part.height), stored.size) == (
+        [(target, True, decoded)],
+        target,
+        target,
+    )
+
+
+@pytest.mark.parametrize(
+    ("size", "orientation", "expected", "colours"),
+    [
+        ((2049, 4110), None, (1021, 2048), ("red", "green", "blue", "yellow")),
+        ((4100, 2051), None, (2048, 1024), ("red", "green", "blue", "yellow")),
+        ((4100, 2051), 6, (1024, 2048), ("blue", "red", "yellow", "green")),
+    ],
+    ids=["portrait", "landscape", "orientation-6"],
+)
+def test_images_drafted_jpeg_matches_the_non_draft_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    size: tuple[int, int],
+    orientation: int | None,
+    expected: tuple[int, int],
+    colours: tuple[str, ...],
+) -> None:
+    # A naive thumbnail of the drafted image is one pixel off for these sizes
+    # (2049x4110 drafted to 1025x2055 gives 1022x2048; 4100x2051 drafted to
+    # 2050x1026 gives 2048x1025): the output must be the non-draft path's.
+    params: dict[str, Any] = {}
+    if orientation is not None:
+        exif = Image.Exif()
+        exif[_ORIENTATION] = orientation
+        params["exif"] = exif
+    data = _encode(_quadrants(*size), "JPEG", **params)
+    observed = {}
+    for name, effective in (("draft", True), ("non-draft", False)):
+        directory = tmp_path / name
+        directory.mkdir()
+        calls = _spy_jpeg_draft(monkeypatch, effective=effective)
+        part, stored, _ = _single_image(directory, data, "jpeg")
+        observed[name] = (
+            [took_effect for _, took_effect, _ in calls] if effective else "no-op",
+            (part.width, part.height),
+            stored.size,
+            _quadrant_colours(stored),
+        )
+
+    assert observed == {
+        "draft": ([True], expected, expected, colours),
+        "non-draft": ("no-op", expected, expected, colours),
+    }
+
+
+def test_images_only_a_jpeg_larger_than_its_target_is_drafted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jpeg_calls = _spy_jpeg_draft(monkeypatch)
+    other_files = _spy_file_draft(monkeypatch)
+    cases = {
+        "jpeg-over": ("jpeg", (4100, 1000)),
+        "jpeg-at-2048": ("jpeg", (2048, 1000)),
+        "jpeg-small": ("jpeg", (64, 32)),
+        "png-over": ("png", (4100, 1000)),
+        "webp-over": ("webp", (4100, 1000)),
+    }
+    observed = {}
+    for name, (kind, size) in cases.items():
+        directory = tmp_path / name
+        directory.mkdir()
+        seen_jpeg, seen_other = len(jpeg_calls), len(other_files)
+        data = _encode(Image.new("RGB", size, (90, 120, 150)), _FORMAT[kind])
+        part, _, _ = _single_image(directory, data, kind)
+        observed[name] = (
+            any(after != size for _, _, after in jpeg_calls[seen_jpeg:]),  # decoded smaller
+            other_files[seen_other:],
+            (part.width, part.height),
+        )
+
+    assert observed == {
+        "jpeg-over": (True, [], (2048, 500)),
+        "jpeg-at-2048": (False, [], (2048, 1000)),
+        "jpeg-small": (False, [], (64, 32)),
+        "png-over": (False, [], (2048, 500)),
+        "webp-over": (False, [], (2048, 500)),
+    }
 
 
 # --- modes ----------------------------------------------------------------------------

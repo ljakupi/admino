@@ -62,6 +62,18 @@ What these tests pin down:
   no-store``, ``X-Content-Type-Options: nosniff``; any status downloads.
 - Logs: across uploads, refusals and a download, no record carries the
   filename, the raw header or the content (the success line carries the id).
+- GH-281 (Decision 6, contract G1 to G6), download ``Range`` errors: a ``Range`` the
+  file response would reject (malformed: no ``=``, another unit, no valid range, a
+  start after the end; unsatisfiable: a start at or past the size) is the 416 JSON
+  body ``{"detail": "Range not satisfiable", "reason": "range_not_satisfiable"}``
+  with ``Content-Range: bytes */<size>``, never Starlette's plain-text 400/416, also
+  when a matching ``If-Range`` (the ETag or Last-Modified) makes the Range apply; the
+  body never echoes the header. The route's OpenAPI responses document the 416 with
+  that body as its example. Regression guards: valid single and multiple ranges stay
+  206; a stale ``If-Range`` still means the whole file (200), whatever the Range; the
+  rate limit, then the ownership 404 (another org's, a colleague's, a trashed, an
+  unknown attachment, a row whose file is gone) come before the Range, with no
+  ``Content-Range``.
 
 New modules are imported inside the tests, so the file collects before they
 exist. No network, no real PostgreSQL, no LLM; files only under ``tmp_path``.
@@ -1623,3 +1635,200 @@ def test_attachments_api_logs_carry_no_filename_header_or_content(env: _Env) -> 
     combined = "\n".join(texts).casefold()
     forbidden = ["quokkabudget", "geheim%20187", "wombatledger", "mandantenliste"]
     assert [marker for marker in forbidden if marker in combined] == []
+
+
+# ---------------------------------------------------------------------------
+# 8. Download Range errors (GH-281, Decision 6, contract G1 to G6)
+# ---------------------------------------------------------------------------
+
+_RANGE_NOT_SATISFIABLE: Final = {
+    "detail": "Range not satisfiable",
+    "reason": "range_not_satisfiable",
+}
+_CONTENT_ROUTE: Final = "/api/attachments/{attachment_id}/content"
+_SIZE: Final = len(_TEXT)
+# (status, JSON body, media type, Content-Range) of the 416 for the seeded _TEXT file.
+_REFUSED_RANGE: Final = (416, _RANGE_NOT_SATISFIABLE, "application/json", f"bytes */{_SIZE}")
+# Ranges the file response would reject for _TEXT: malformed, then unsatisfiable.
+_BAD_RANGES: Final = [
+    pytest.param("bytes", id="no-equals-sign"),
+    pytest.param("items=0-1", id="unit-not-bytes"),
+    pytest.param("bytes=", id="no-range"),
+    pytest.param("bytes=abc", id="not-a-range"),
+    pytest.param("bytes=5-1", id="start-after-end"),
+    pytest.param("0-1", id="no-unit"),
+    pytest.param(f"bytes={_SIZE}-", id="start-at-the-size"),
+    pytest.param(f"bytes={_SIZE + 100}-{_SIZE + 200}", id="past-the-end"),
+]
+# One malformed and one unsatisfiable Range, for the checks that come before it.
+_ONE_OF_EACH: Final = [
+    pytest.param("bytes=abc", id="malformed"),
+    pytest.param(f"bytes={_SIZE}-", id="unsatisfiable"),
+]
+# An If-Range that is neither the file's ETag nor its Last-Modified.
+_STALE_IF_RANGE: Final = '"0123456789abcdef0123456789abcdef"'
+
+
+def _ranged(
+    client: TestClient,
+    caller: Account | None,
+    attachment_id: Any,
+    range_header: str,
+    *,
+    if_range: str | None = None,
+) -> httpx.Response:
+    """GET the content with ``Range: range_header`` (and ``If-Range`` when given)."""
+    headers = {**_cookie(caller), "Range": range_header}
+    if if_range is not None:
+        headers["If-Range"] = if_range
+    return client.get(f"/api/attachments/{attachment_id}/content", headers=headers)
+
+
+def _range_outcome(response: httpx.Response) -> tuple[int, Any, str, str | None]:
+    """(status, body, media type without parameters, Content-Range)."""
+    status, body = _outcome(response)
+    media_type = response.headers.get("content-type", "").partition(";")[0].strip()
+    return status, body, media_type, response.headers.get("content-range")
+
+
+class TestAttachmentsDownloadRange:
+    """A Range the file response rejects is the 416 envelope; valid ranges unchanged."""
+
+    @pytest.mark.parametrize("range_header", _BAD_RANGES)
+    def test_attachments_api_download_bad_range_is_416_range_not_satisfiable(
+        self, env: _Env, range_header: str
+    ) -> None:
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+
+        response = _ranged(env.client, caller, attachment, range_header)
+
+        assert _range_outcome(response) == _REFUSED_RANGE
+
+    @pytest.mark.parametrize("validator", ["etag", "last-modified"])
+    def test_attachments_api_download_bad_range_with_a_matching_if_range_is_416(
+        self, env: _Env, validator: str
+    ) -> None:
+        """If-Range names the file's current ETag or Last-Modified, so the Range
+        applies: a malformed one is the 416 too, never the plain-text 400."""
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+        current = _content(env.client, caller, attachment).headers[validator]
+
+        response = _ranged(env.client, caller, attachment, "bytes=abc", if_range=current)
+
+        assert _range_outcome(response) == _REFUSED_RANGE
+
+    def test_attachments_api_download_416_never_echoes_the_range_header(self, env: _Env) -> None:
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+        marker = "quokkarange281"
+
+        response = _ranged(env.client, caller, attachment, f"{marker}=0-1")
+
+        echoed = [text for text in (response.text, *response.headers.values()) if marker in text]
+        assert (_range_outcome(response), echoed) == (_REFUSED_RANGE, [])
+
+    def test_attachments_api_download_openapi_documents_the_416(self) -> None:
+        responses = make_app().openapi()["paths"][_CONTENT_ROUTE]["get"]["responses"]
+
+        documented = responses.get("416", {})
+
+        assert (
+            "range_not_satisfiable" in documented.get("description", ""),
+            documented.get("content", {}).get("application/json", {}).get("example"),
+        ) == (True, _RANGE_NOT_SATISFIABLE)
+
+    @pytest.mark.parametrize(
+        ("range_header", "content_range", "data"),
+        [
+            pytest.param("bytes=0-9", f"bytes 0-9/{_SIZE}", _TEXT[:10], id="first-ten"),
+            pytest.param(
+                "bytes=-5", f"bytes {_SIZE - 5}-{_SIZE - 1}/{_SIZE}", _TEXT[-5:], id="last-five"
+            ),
+        ],
+    )
+    def test_attachments_api_download_valid_range_is_206_as_before(
+        self, env: _Env, range_header: str, content_range: str, data: bytes
+    ) -> None:
+        """Regression guard (G2)."""
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+
+        response = _ranged(env.client, caller, attachment, range_header)
+
+        assert (
+            response.status_code,
+            response.headers.get("content-range"),
+            response.content,
+        ) == (206, content_range, data)
+
+    def test_attachments_api_download_two_ranges_are_206_multipart_as_before(
+        self, env: _Env
+    ) -> None:
+        """Regression guard (G2): ``multipart/byteranges`` with both parts."""
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+
+        response = _ranged(env.client, caller, attachment, "bytes=0-1,4-5")
+
+        content_type = response.headers.get("content-type", "")
+        boundary = content_type.partition("; boundary=")[2]
+        parts = [
+            f"--{boundary}\r\nContent-Type: {_MEDIA_TYPES['txt']}\r\n"
+            f"Content-Range: bytes {start}-{end}/{_SIZE}\r\n\r\n".encode()
+            + _TEXT[start : end + 1]
+            for start, end in ((0, 1), (4, 5))
+        ]
+        expected = b"\r\n".join(parts) + f"\r\n--{boundary}--".encode()
+        assert (response.status_code, content_type.partition(";")[0], response.content) == (
+            206,
+            "multipart/byteranges",
+            expected,
+        )
+
+    @pytest.mark.parametrize("range_header", _ONE_OF_EACH)
+    def test_attachments_api_download_bad_range_with_a_stale_if_range_is_the_whole_file(
+        self, env: _Env, range_header: str
+    ) -> None:
+        """Regression guard (G4): the Range is ignored, 200 with every byte."""
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+
+        response = _ranged(env.client, caller, attachment, range_header, if_range=_STALE_IF_RANGE)
+
+        assert (response.status_code, response.content) == (200, _TEXT)
+
+    @pytest.mark.parametrize("case", [*_NOT_THE_CALLERS, "file-gone"])
+    @pytest.mark.parametrize("range_header", _ONE_OF_EACH)
+    def test_attachments_api_download_bad_range_on_no_file_of_the_callers_is_404(
+        self, env: _Env, range_header: str, case: str
+    ) -> None:
+        """Regression guard (G3): ownership and the file come before the Range; the 404
+        carries no Content-Range (no size leaks)."""
+        if case == "file-gone":
+            caller = env.world.a["editor"]
+            attachment = _seed(env, caller, write=False)
+        else:
+            caller, attachment = _not_the_callers(env, case)
+
+        response = _ranged(env.client, caller, attachment, range_header)
+
+        assert (_outcome(response), response.headers.get("content-range")) == (
+            (404, _ATTACHMENT_NOT_FOUND),
+            None,
+        )
+
+    def test_attachments_api_download_rate_limit_comes_before_the_range_check(
+        self, env: _Env, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard (G3): burst 1, the second download with a malformed Range is
+        the 429."""
+        monkeypatch.setitem(server._RATE_LIMITS, _CONTENT_KEY, (0.001, 1))
+        caller = env.world.a["editor"]
+        attachment = _seed(env, caller)
+
+        first = _content(env.client, caller, attachment)
+        limited = _ranged(env.client, caller, attachment, "bytes=abc")
+
+        assert (first.status_code, _outcome(limited)) == (200, (429, _RATE_LIMITED))

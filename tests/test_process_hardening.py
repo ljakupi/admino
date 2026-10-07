@@ -213,6 +213,13 @@ def startup(monkeypatch: pytest.MonkeyPatch) -> Callable[[_FakeCtypes, str], _St
     """Run ``main()`` with every dependency mocked (no database, LLM, tools or
     server) and ``fake`` as the ctypes layer on ``platform_name``. Root logging
     stays pytest's (``_configure_logging`` is mocked) so caplog sees every record."""
+    import admino.organizations as organizations
+
+    # GH-281: main() sets organizations.ATTACHMENTS_ROOT from ADMINO_ATTACHMENTS_ROOT. A
+    # shell that exported it must not decide these tests, and the setting main() makes
+    # is restored after each test (other files read the process setting).
+    monkeypatch.delenv("ADMINO_ATTACHMENTS_ROOT", raising=False)
+    monkeypatch.setattr(organizations, "ATTACHMENTS_ROOT", organizations.ATTACHMENTS_ROOT)
 
     def run(fake: _FakeCtypes, platform_name: str) -> _Startup:
         import admino.main as main_module
