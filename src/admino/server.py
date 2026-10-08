@@ -83,7 +83,9 @@ Routes:
   response (GH-179; a streamed one before its ``done``). 409 ``run_active``
   while a run of the chat is going. GH-187: ``attachment_ids`` sends the
   caller's unsent uploads of the chat with the message (linked to the stored
-  user message).
+  user message). GH-286: a blank message (``str.strip()`` leaves nothing)
+  without files is the 422 ``message_empty``, after the rate limit and before
+  any database statement; with files it runs as sent.
 - POST /api/chats/{chat_id}/stop — Stops the chat's streamed run
   (``{"stopped": bool}``, GH-8).
 - POST /api/chats/{chat_id}/attachments — Stores one file (the raw request
@@ -96,7 +98,8 @@ Routes:
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created by its first run, until #177: a refused first
   message creates none); returns ChatResponse, always JSON. Titles the chat
-  and refuses a busy one like the route above.
+  and refuses a busy one or a blank message (``message_empty``, GH-286) like
+  the route above.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
   (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
   resumed run's LLM error code), or streams like a turn (GH-8).
@@ -557,7 +560,9 @@ Security notes:
   ``Cache-Control: no-store``, whatever its status or type, replacing any
   value a route or the static mount set: route JSON, every error (the CSRF
   403, 404 of an unknown path, 405, 422, 429, the request-ID middleware's
-  500 ...), the attachment download and the event streams (which keep
+  500 ...), the CORS preflight answers (200 and 400, GH-286: the security
+  headers wrap CORS, so every other path's preflight gets the security
+  headers too), the attachment download and the event streams (which keep
   ``X-Accel-Buffering: no``). The static mount's own values and ``/health``
   (no ``Cache-Control``) are unchanged.
 - Request IDs and unhandled errors (GH-158): ``RequestIdMiddleware`` (pure
@@ -859,6 +864,8 @@ class SecurityHeadersMiddleware:
     the PWA runs in a browser that respects these headers. Every response to
     an ``/api`` path also gets ``Cache-Control: no-store`` (GH-278), whatever
     its status or type, replacing any value a route or the static mount set.
+    It wraps the CORS middleware, so the CORS preflight answers that
+    middleware sends itself (200 and 400) get the same headers (GH-286).
 
     A pure ASGI middleware (GH-8): it sets the headers on the response start
     and passes ``receive`` and every body message through untouched, so a
@@ -1525,6 +1532,9 @@ _TOO_MANY_FILES_BODY: Final = {
     "detail": "Too many files for one message",
     "reason": "too_many_files",
 }
+# GH-286: a message that is blank (``str.strip()`` leaves nothing) and sends no files;
+# fixed text, never the input. Providers would get a whitespace-only user turn.
+_MESSAGE_EMPTY_BODY: Final = {"detail": "Message is empty", "reason": "message_empty"}
 # GH-281: a download's Range header the file response would reject (malformed or
 # unsatisfiable) or past the Range limits; fixed text, never the header.
 _RANGE_NOT_SATISFIABLE_BODY: Final = {
@@ -4214,6 +4224,17 @@ _EVENT_STREAM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         "content": {"text/event-stream": {"schema": {"type": "string"}}},
     }
 }
+# The OpenAPI 422 of the two message routes (GH-286). Documenting a 422 replaces
+# FastAPI's generated one, so the description names the validation list too.
+_MESSAGE_EMPTY_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    422: {
+        "description": (
+            "Validation Error (the usual list), or message_empty: the message is blank "
+            "(nothing but whitespace) and sends no files."
+        ),
+        "content": {"application/json": {"example": _MESSAGE_EMPTY_BODY}},
+    }
+}
 
 
 def _wants_event_stream(request: Request) -> bool:
@@ -4677,6 +4698,12 @@ async def post_chat_message(
     checked after the chat's owner check and linked to the stored user
     message. A message without files makes the statements it made before.
 
+    GH-286: a blank message (``str.strip()`` leaves nothing) without files is
+    the 422 ``message_empty`` right after the rate limit (which it spends),
+    before any database statement: no chat is read, so every chat id gets
+    the same answer. A blank message with files runs as sent; a message that
+    isn't blank is never trimmed.
+
     Args:
         request: The incoming request (its ``Accept`` header).
         principal: The logged-in principal (needs ``chat.send``).
@@ -4690,7 +4717,8 @@ async def post_chat_message(
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
         ``max_pending_confirmations`` in other chats; None otherwise. Or the
-        streamed run's EventStreamResponse. Or the 422 ``too_many_files``.
+        streamed run's EventStreamResponse. Or the JSON 422
+        ``message_empty`` (also for a streamed request) or ``too_many_files``.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
@@ -4704,6 +4732,9 @@ async def post_chat_message(
             the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
+    # Before any statement, so a blank message tells nothing about the chat (GH-286).
+    if not body.attachment_ids and not body.message.strip():
+        return JSONResponse(status_code=422, content=_MESSAGE_EMPTY_BODY)
     # Only a message with files reads the limit here (from the settings cache), so a
     # message without makes the statements it made before (GH-244).
     if body.attachment_ids:
@@ -4724,7 +4755,7 @@ async def post_message(
     body: ChatRequest,
     principal: _ChatSenderDep,
     background_tasks: BackgroundTasks,
-) -> ChatResponse | EventStreamResponse:
+) -> ChatResponse | EventStreamResponse | JSONResponse:
     """Handle POST /api/message — legacy: a turn in the caller's chat of a session id.
 
     The session id names the caller's own persisted chat
@@ -4736,6 +4767,10 @@ async def post_message(
     the same way (GH-179). Always JSON, whatever the ``Accept`` header
     (GH-8). Until #177.
 
+    GH-286: a blank message (``str.strip()`` leaves nothing; this route sends
+    no files) is the 422 ``message_empty`` right after the rate limit (which
+    it spends), before any database statement: no chat is read or created.
+
     Args:
         body: Validated ChatRequest with message and session_id.
         principal: The logged-in principal (needs ``chat.send``).
@@ -4746,7 +4781,8 @@ async def post_message(
         reply, the tool call summary, the pending confirmation and the error
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
-        ``max_pending_confirmations`` in other chats; None otherwise.
+        ``max_pending_confirmations`` in other chats; None otherwise. Or the
+        422 ``message_empty``.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
@@ -4756,6 +4792,9 @@ async def post_message(
             nothing to evict the 503 ``chats_busy``.
     """
     _check_rate_limit("/api/message", _user_caller(principal))
+    # Before any statement, so a blank first message creates no chat (GH-286).
+    if not body.message.strip():
+        return JSONResponse(status_code=422, content=_MESSAGE_EMPTY_BODY)
     return await _chat_turn(principal, body.message, body.session_id, background_tasks)
 
 
@@ -6754,12 +6793,14 @@ def create_app(
     # --- Middleware ---
     # Starlette wraps the LAST added middleware outermost. Resulting order for a
     # request: request IDs -> turn timings -> trusted proxy headers (when
-    # configured) -> CORS -> security headers -> cross-origin protection ->
+    # configured) -> security headers -> CORS -> cross-origin protection ->
     # routes. Cross-origin protection (CSRF) therefore refuses a cross-origin
     # write before authentication, rate limiting and handlers run, and its 403
-    # still gets the security headers.
+    # still gets the security headers. The security headers wrap CORS because
+    # CORS answers a preflight itself (200, or 400 for an origin, method or
+    # header it refuses) without calling the app: inside it, those answers
+    # would miss the security headers and, under /api, no-store (GH-286).
     app.add_middleware(CrossOriginProtectionMiddleware)
-    app.add_middleware(SecurityHeadersMiddleware)
 
     # --- CORS middleware ---
     # The one allowed origin is server.public_url. The PWA is served
@@ -6773,8 +6814,9 @@ def create_app(
         allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=["Content-Type"],
     )
+    app.add_middleware(SecurityHeadersMiddleware)
 
-    # --- Trusted proxy headers (outside CORS and every middleware above) ---
+    # --- Trusted proxy headers (outside every middleware above) ---
     # Added after them, so CORS, the security headers, the CSRF check, the per-IP rate
     # limits, the audit events and the handlers all see the client address and
     # scheme the trusted reverse proxy reports. Not installed without trusted
@@ -6923,7 +6965,7 @@ def create_app(
     app.post(
         "/api/chats/{chat_id}/messages",
         response_model=ChatResponse,
-        responses=_EVENT_STREAM_RESPONSES,
+        responses={**_EVENT_STREAM_RESPONSES, **_MESSAGE_EMPTY_RESPONSES},
     )(post_chat_message)
     app.post("/api/chats/{chat_id}/stop", response_model=ChatStopResponse)(post_chat_stop)
     app.post("/api/chats/{chat_id}/attachments", status_code=201, response_model=AttachmentSummary)(
@@ -6937,7 +6979,9 @@ def create_app(
         response_model=None,
         responses=_ATTACHMENT_CONTENT_RESPONSES,
     )(get_attachment_content)
-    app.post("/api/message", response_model=ChatResponse)(post_message)
+    app.post("/api/message", response_model=ChatResponse, responses=_MESSAGE_EMPTY_RESPONSES)(
+        post_message
+    )
     app.post(
         "/api/confirm/{confirmation_id}",
         response_model=ChatResponse,

@@ -74,6 +74,10 @@ Security notes:
   0027's CHECKs. ``ChatMessageCreate.attachment_ids`` holds at most 50 ids,
   each once; the duplicate refusal names no id. ``ChatRequest`` (the legacy
   route) takes no attachments.
+- Blank messages (GH-286): ``ChatMessageCreate.message`` and
+  ``ChatRequest.message`` take at most 32768 characters and accept an empty
+  or whitespace-only text, unstripped; the message routes refuse a blank one
+  without files with ``message_empty``.
 - Streamed chat turns (GH-8): ``AgentStatus`` gains ``stopped`` (a streamed
   run the user stopped; ``ChatResponse.status`` never carries it, a JSON run
   can't be stopped). The SSE event payloads (``RunStartedPayload`` to
@@ -631,13 +635,13 @@ class ChatRequest(BaseModel):
 
     Validated on receipt by the ASGI server before any processing. Unknown
     fields (e.g. a smuggled ``org_id`` or ``user_id``) are refused with a 422:
-    whose chat it is comes from the session only (GH-163).
+    whose chat it is comes from the session only (GH-163). A blank message
+    is valid here and kept as given; the route refuses it (GH-286).
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     message: str = Field(
-        min_length=1,
         max_length=32768,
         description="The user's message text.",
     )
@@ -3323,12 +3327,13 @@ class ChatMessageCreate(BaseModel):
 
     The chat comes from the path, the org and the owner from the session.
     ``attachment_ids`` are the caller's unsent uploads in that chat, each
-    at most once.
+    at most once. A blank message is valid here and kept as given; the
+    route refuses it when it sends no files (GH-286).
     """
 
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
-    message: str = Field(min_length=1, max_length=32768)
+    message: str = Field(max_length=32768)
     attachment_ids: list[UUID] = Field(
         default_factory=list, max_length=_ATTACHMENTS_PER_MESSAGE_MAX
     )

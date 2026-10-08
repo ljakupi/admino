@@ -45,7 +45,11 @@ Security notes:
   such as ``4481`` that a random request id, timestamp or count can also
   contain (GH-274: about one request id in 2,260 held those digits). They are
   not exhaustive: a leak of the digits alone, or of a fragment shorter than a
-  whole word (``zeph``), for example, is not seen.
+  whole word (``zeph``), for example, is not seen. On every record of the flow
+  they also report a set ``exc_info`` or ``stack_info``, and those probes in
+  any ``extra=`` field (an attribute beyond the standard ``LogRecord`` ones):
+  what no admino formatter writes, but another handler could (GH-286, #274
+  audit I-1).
 - No real database, LLM or network: ``check_health``, ``_check_llm_reachable``,
   ``resolve_session``, ``get_pool`` and ``organizations.list_orgs`` are patched.
   The chat route (GH-176: it persists into a chat per user and session id) gets
@@ -139,6 +143,16 @@ _SECRET_WORDS: Final[tuple[str, ...]] = tuple(
 # shorter than a whole word ("zeph"), for example, are not seen.
 _MESSAGE_PROBES: Final[tuple[str, ...]] = (_SECRET, *_SECRET_WORDS)
 _TEXT_PROBES: Final[tuple[str, ...]] = (*_MESSAGE_PROBES, "Traceback")
+# The attributes a record has without ``extra=`` (GH-286): Python's own, read off a
+# fresh LogRecord (``taskName`` since 3.12), plus the two a Formatter sets
+# (``message``, ``asctime``; logging refuses them as ``extra=`` keys). Every other
+# attribute came from ``extra=``, or from a filter: admino's ``request_id`` is
+# checked too (it is a random value, which no probe can match).
+_STANDARD_RECORD_ATTRIBUTES: Final = frozenset(
+    {*vars(logging.LogRecord("", logging.INFO, "", 0, "", (), None)), "message", "asctime"}
+)
+# The record fields that carry a traceback or a stack (GH-286): reported when set.
+_TRACE_FIELDS: Final[tuple[str, ...]] = ("exc_info", "stack_info")
 # Request ids pinned through admino.server.uuid4 (both valid uuid4 values): one
 # whose hex contains _SECRET_DIGITS (the GH-274 flake, made deterministic), and
 # one that shares nothing with _SECRET.
@@ -664,15 +678,31 @@ def _log_then_raise(form: str) -> Callable[..., NoReturn]:
     formats the exception into a sentence (``"%s", exc``); ``"upper-cased"`` logs
     the message upper-cased; ``"first-word-redacted"`` logs only its tail after a
     masked first word (``"*** secret 4481"``); ``"truncated-head"`` logs only its
-    first nine characters (``"zephyr se"``). Each line is written on an
-    ``admino.*`` logger while the request runs, through the configured handler.
+    first nine characters (``"zephyr se"``). The record-field forms (GH-286) log
+    the fixed ``"Lookup failed"`` and put the exception on the record only:
+    ``"exc-info"`` as ``exc_info=exc``, ``"stack-info"`` with ``stack_info=True``,
+    ``"extra-field"`` as ``extra={"detail": message}``, ``"upper-cased-extra"``
+    the same upper-cased, and ``"nested-extra"`` as
+    ``extra={"context": {"cause": exc}}`` (its ``str()`` is the exception's
+    ``repr``). Each line is written on an ``admino.*`` logger while the request
+    runs, through the configured handler.
     """
 
     def fail(*_args: object, **_kwargs: object) -> NoReturn:
         exc = RuntimeError(_SECRET)
         message = str(exc)
         logger = logging.getLogger(_LEAK_LOGGER)
-        if form == "bare-message":
+        if form == "exc-info":
+            logger.error("Lookup failed", exc_info=exc)
+        elif form == "stack-info":
+            logger.error("Lookup failed", stack_info=True)
+        elif form == "extra-field":
+            logger.error("Lookup failed", extra={"detail": message})
+        elif form == "upper-cased-extra":
+            logger.error("Lookup failed", extra={"detail": message.upper()})
+        elif form == "nested-extra":
+            logger.error("Lookup failed", extra={"context": {"cause": exc}})
+        elif form == "bare-message":
             logger.error(_SECRET)
         elif form == "str-of-exception":
             logger.error("Lookup failed: %s", exc)
@@ -713,14 +743,39 @@ def _message_leaks(logs: CapturedLogs) -> list[tuple[str, str]]:
     a character that no request id, timestamp or count has in any case, so a
     random value can't match it (GH-274). A test asserts ``== []`` (nothing
     leaked) or the exact leaks of a planted message.
+
+    Two more channels look at what no admino formatter writes but a record
+    carries to every handler, on every record of the flow (GH-286, #274 audit
+    I-1): ``"record-exc"`` names each of ``_TRACE_FIELDS`` (``exc_info``,
+    ``stack_info``) that any record has set, whatever it holds; and
+    ``"record-extra"`` the ``_MESSAGE_PROBES`` found, casefolded, in ``str()`` of
+    any attribute beyond ``_STANDARD_RECORD_ATTRIBUTES`` (an ``extra=`` field; a
+    container's ``str()`` holds the ``repr`` of what it nests).
     """
     text = logs.text.casefold()
-    messages = [record.getMessage().casefold() for record in logs.records]
+    records = logs.records
+    messages = [record.getMessage().casefold() for record in records]
+    extras = [
+        str(value).casefold()
+        for record in records
+        for name, value in vars(record).items()
+        if name not in _STANDARD_RECORD_ATTRIBUTES
+    ]
     leaks = [("text", probe) for probe in _TEXT_PROBES if probe.casefold() in text]
     leaks.extend(
         ("record", probe)
         for probe in _MESSAGE_PROBES
         if any(probe.casefold() in message for message in messages)
+    )
+    leaks.extend(
+        ("record-exc", field)
+        for field in _TRACE_FIELDS
+        if any(getattr(record, field) is not None for record in records)
+    )
+    leaks.extend(
+        ("record-extra", probe)
+        for probe in _MESSAGE_PROBES
+        if any(probe.casefold() in extra for extra in extras)
     )
     return leaks
 
@@ -784,6 +839,16 @@ _LEAK_FORMS: Final[dict[str, tuple[str, ...]]] = {
     "upper-cased": _MESSAGE_PROBES,
     "first-word-redacted": ("secret",),
     "truncated-head": ("zephyr",),
+}
+# The record-field forms of _log_then_raise (GH-286) and their exact leaks: the
+# message is in no text and no record's message, only on the record, so only the
+# record-field channel reports it (every message probe for an extra= field).
+_RECORD_FIELD_LEAK_FORMS: Final[dict[str, list[tuple[str, str]]]] = {
+    "exc-info": [("record-exc", "exc_info")],
+    "stack-info": [("record-exc", "stack_info")],
+    "extra-field": [("record-extra", probe) for probe in _MESSAGE_PROBES],
+    "upper-cased-extra": [("record-extra", probe) for probe in _MESSAGE_PROBES],
+    "nested-extra": [("record-extra", probe) for probe in _MESSAGE_PROBES],
 }
 
 
@@ -895,6 +960,28 @@ class TestUnhandledExceptions:
             *(("text", probe) for probe in _LEAK_FORMS[form]),
             *(("record", probe) for probe in _LEAK_FORMS[form]),
         ]
+
+    @pytest.mark.parametrize("form", list(_RECORD_FIELD_LEAK_FORMS))
+    @pytest.mark.parametrize("source", _SOURCES)
+    async def test_unhandled_exception_record_field_set_during_the_request_is_reported(
+        self, source: str, form: str
+    ) -> None:
+        """Positive control (GH-286, #274 audit I-1): a leak on a record field is reported.
+
+        The failing collaborator logs a fixed message with the exception on the
+        record only (``exc_info``, ``stack_info``, an ``extra=`` field: as is,
+        upper-cased or nested), right before it raises. No formatter writes
+        those, so the text and message channels see nothing; exactly the leaks
+        ``_RECORD_FIELD_LEAK_FORMS`` names are reported.
+        """
+        response, logs = await _unhandled(
+            source, request_id=_PLAIN_REQUEST_ID, fail=_log_then_raise(form)
+        )
+
+        planted = [entry for entry in logs.json_lines() if entry.get("logger") == _LEAK_LOGGER]
+        assert response.status_code == 500
+        assert [entry["request_id"] for entry in planted] == [_request_id(response)]
+        assert _message_leaks(logs) == _RECORD_FIELD_LEAK_FORMS[form]
 
     async def test_unhandled_exception_leak_probes_are_never_spelled_by_a_random_value(
         self,

@@ -15,6 +15,11 @@ the stored part back. What these tests pin down:
 - EXIF orientation 3, 6 and 8 applied (JPEG, and the PNG/WEBP EXIF chunk):
   dimensions swap for 6/8 and the quadrant colours land where the rotation
   puts them.
+- Orientations 5 to 8 (GH-286 Decision 7): the output size is fitted on the
+  oriented size (width and height swapped), the size ``Image.thumbnail`` gives
+  the turned image. A PNG stored 21847x400 becomes 37x2048 for each of them
+  (fitting the stored size, then turning, gives 38x2048), with the quadrants
+  where ``ImageOps.exif_transpose`` puts them.
 - Longest edge > 2048 -> downscaled to fit 2048 x 2048, aspect kept within
   1 px (4000x1000 -> 2048x512, portrait, 2049x1537); exactly 2048 and small
   images untouched (never upscaled).
@@ -30,7 +35,10 @@ the stored part back. What these tests pin down:
   marker strings.
 - The detected format must be the recorded kind (PNG recorded as jpeg, JPEG
   as png, WEBP as png, GIF as png, PNG as webp) -> ``corrupted_file``;
-  truncated or garbage images -> ``corrupted_file``; nothing written.
+  truncated or garbage images -> ``corrupted_file``; nothing written. A PNG
+  whose IDAT holds a corrupt (not truncated) zlib stream with valid CRCs is
+  ``corrupted_file`` too (GH-286 Decision 7): Pillow raises on its first pixel
+  load only, so only the load before the EXIF guard refuses it.
 - Pixel limit: a header declaring more than ``MAX_IMAGE_PIXELS`` ->
   ``image_too_large`` without decoding: 8000 x 8500 (over 64 M, under the
   ~89 M where Pillow starts to warn, so only our check sees it), 10000 x
@@ -154,20 +162,34 @@ def _quadrant_colours(image: Image.Image) -> tuple[str, str, str, str]:
     return tl, tr, bl, br
 
 
+def _png_chunk(kind: bytes, body: bytes) -> bytes:
+    """One PNG chunk: length, type, body and a valid CRC over type and body."""
+    return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+
+
 def _png_header_only(width: int, height: int) -> bytes:
     """A PNG declaring ``width`` x ``height`` with no pixel data to decode."""
-
-    def chunk(kind: bytes, body: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
-        )
-
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return (
         b"\x89PNG\r\n\x1a\n"
-        + chunk(b"IHDR", header)
-        + chunk(b"IDAT", zlib.compress(b""))
-        + chunk(b"IEND", b"")
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(b""))
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _png_with_corrupt_idat(garbage: bytes) -> bytes:
+    """A 64 x 64 RGB PNG whose IDAT holds a whole zlib stream with ``garbage``
+    written over it after its first eight bytes: a data error, not a truncation
+    (the stream keeps its length), and every chunk CRC is valid (PR #285 review)."""
+    header = struct.pack(">IIBBBBB", 64, 64, 8, 2, 0, 0, 0)
+    good = zlib.compress(b"".join(b"\0" + bytes(range(192)) for _ in range(64)))
+    idat = good[:8] + garbage + good[8 + len(garbage) :]
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
     )
 
 
@@ -346,6 +368,44 @@ def test_images_exif_orientation_applied(
         size,
         colours,
     )
+
+
+@pytest.mark.parametrize(
+    ("orientation", "colours"),
+    [
+        (5, ("red", "blue", "green", "yellow")),
+        (6, ("blue", "red", "yellow", "green")),
+        (7, ("yellow", "green", "blue", "red")),
+        (8, ("green", "yellow", "red", "blue")),
+    ],
+    ids=["orientation-5", "orientation-6", "orientation-7", "orientation-8"],
+)
+def test_images_orientations_5_to_8_fit_the_oriented_size(
+    tmp_path: Path, orientation: int, colours: tuple[str, ...]
+) -> None:
+    # Stored 21847x400 (PR #285 review): the turned image (400x21847) thumbnails
+    # to 37x2048, the stored one to 2048x38, i.e. 38x2048 once turned. Pillow
+    # rounds the shorter side to the ratio closest to width/height, which isn't
+    # symmetric in the two sides. A PNG (EXIF chunk before its pixels) is never
+    # drafted, so only the orientation explains the size.
+    exif = Image.Exif()
+    exif[_ORIENTATION] = orientation
+    data = _encode(_quadrants(21847, 400), "PNG", exif=exif)
+    turned = ImageOps.exif_transpose(Image.open(io.BytesIO(data)))
+    turned.thumbnail((2048, 2048))
+    fitted_first = Image.open(io.BytesIO(data))
+    fitted_first.thumbnail((2048, 2048))
+    # The fixture: Pillow's own sizes, and the size discriminates.
+    assert (turned.size, ImageOps.exif_transpose(fitted_first).size) == ((37, 2048), (38, 2048))
+
+    part, stored, _ = _single_image(tmp_path, data, "png")
+
+    assert (
+        (part.width, part.height),
+        stored.size,
+        _quadrant_colours(stored),
+        _quadrant_colours(turned),
+    ) == (turned.size, turned.size, colours, colours)
 
 
 # --- malformed EXIF (GH-281 Decision 2) -----------------------------------------------
@@ -899,6 +959,27 @@ def test_images_truncated_or_garbage_image_is_corrupted_file(
     tmp_path: Path, kind: str, build: Callable[[], bytes]
 ) -> None:
     assert _refusal(tmp_path, build(), kind) == ("corrupted_file", [])
+
+
+@pytest.mark.parametrize("garbage", [b"\xff" * 40, b"\x00\x01" * 30], ids=["ff", "0001"])
+def test_images_png_with_corrupt_pixel_data_is_corrupted_file(
+    tmp_path: Path, garbage: bytes
+) -> None:
+    """A corrupt (not truncated) IDAT stream is refused, with nothing written.
+
+    Unlike a truncated PNG, whose error Pillow raises on every load, a zlib data
+    error is raised on the first load only: a later load returns the partly
+    decoded pixels. A PNG without an EXIF chunk before its pixels loads them in
+    ``getexif()``, inside the EXIF guard that swallows errors, so only the load
+    before that guard turns this file into ``corrupted_file``.
+    """
+    data = _png_with_corrupt_idat(garbage)
+    # The fixture: the header opens, the pixels don't decode.
+    source = Image.open(io.BytesIO(data))
+    with pytest.raises(OSError):
+        source.load()
+
+    assert _refusal(tmp_path, data, "png") == ("corrupted_file", [])
 
 
 @pytest.mark.parametrize(
