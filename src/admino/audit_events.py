@@ -37,8 +37,8 @@ Security notes:
   #139 §5). ``AuditEvent`` refuses free text: targets are UUIDs, and metadata
   values are bools, safe-range ints, None, UUIDs, tokens from a closed
   vocabulary (member roles, permission decisions, tool names and actions)
-  or, under the key ``attachment_ids`` only, a list or tuple of 1 to 100
-  UUID objects (stored as canonical strings, GH-189). A string is never a
+  or, under the key ``attachment_ids`` only (and nothing else there), a list
+  or tuple of 1 to 100 UUID objects (stored as canonical strings, GH-189). A string is never a
   UUID here, also when it is UUID-shaped. The metadata's JSON text is at
   most 8192 bytes, as the database's metadata CHECK allows.
   A tool.call row stores a tool or action name the LLM chose only when it is
@@ -392,7 +392,7 @@ class AuditEvent(SealedModel):
     def _check_metadata(cls, value: object) -> dict[str, MetadataValue]:
         """Accept a flat mapping of at most 16 snake_case keys to non-content values.
 
-        A list is allowed under ``attachment_ids`` only, and the JSON text
+        A list is allowed under ``attachment_ids`` only and required there, and the JSON text
         record() writes is at most 8192 bytes: the database's metadata CHECK
         refuses the rest, so Python refuses it before any write.
         """
@@ -412,6 +412,9 @@ class AuditEvent(SealedModel):
                 raise ValueError(msg)
             if key != _METADATA_IDS_KEY and isinstance(item, list | tuple):
                 msg = "Only attachment_ids may hold a list."
+                raise ValueError(msg)
+            if key == _METADATA_IDS_KEY and not isinstance(item, list | tuple):
+                msg = "attachment_ids must be a list."
                 raise ValueError(msg)
             checked[key] = _metadata_value(item)
         if len(json.dumps(checked).encode("utf-8")) > _MAX_METADATA_BYTES:
