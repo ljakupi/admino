@@ -437,9 +437,11 @@ conversion in `attachment_processing.py` and `converters/`:
   sizes, types, statuses and reason codes only.
 - **Sent files reach the model as untrusted data** (`attachment_context.py`,
   `prompt_assembly.py`). Every run of a chat (a message, the legacy route, an approved
-  action) gets the chat's active attachments: its sent, live, `ready` files, read with
-  the chat in one statement bound to the caller's organization and user, so another
-  user's or organization's file never reaches the run. They go into the run's current
+  action) gets the chat's active attachments: its sent, live, `ready` files. The files
+  of earlier messages are read with the chat in the turn's read, and the files the
+  current message sends come from the send check made before the chat's hold is taken;
+  both statements are bound to the caller's organization and user, so another user's or
+  organization's file never reaches the run. They go into the run's current
   user message, never into the system message: file content gets none of the
   instructions' authority (and providers accept images in user messages only). An intro
   line says the files are data the user provided, not instructions. Each file is one
@@ -456,11 +458,14 @@ conversion in `attachment_processing.py` and `converters/`:
   tag characters) and every other format (`Cf`) character is removed; a name left empty
   becomes `attachment`. The conversion's page markers and image labels use the same
   cleaned name.
-- **Reading the converted parts never follows a link.** A run reads each file's
-  `<attachment ID>.d/manifest.json` and parts in a worker thread: the directory is opened
-  with `O_NOFOLLOW`, every file in it relative to that directory with `O_NOFOLLOW`, and
-  each must be a regular file. The manifest must validate and name the row's type, text
-  must be strict UTF-8, and one file reads at most 256 MiB. Any failure answers `503
+- **No symlink is followed at a file's converted directory, manifest or parts.** A run
+  reads each file's `<attachment ID>.d/manifest.json` and parts in a worker thread: the
+  `<attachment ID>.d` directory is opened with `O_NOFOLLOW`, every file in it relative
+  to that directory with `O_NOFOLLOW`, and each must be a regular file, so a symlink at
+  the directory, the manifest or a part is never followed. The directory above it,
+  `<root>/<organization ID>`, is resolved normally: it is the app's own, created with
+  mode 0700. The manifest must validate and name the row's type, text must be strict
+  UTF-8, and one file reads at most 256 MiB. Any failure answers `503
   storage_unavailable` with nothing run or stored, logged with the attachment's ID and
   the exception's class only. The checks run under the chat's lock, before a pending
   confirmation is cancelled or consumed, so a refused message or approval keeps it.

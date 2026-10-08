@@ -4338,6 +4338,38 @@ _MESSAGE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         },
     },
 }
+# The OpenAPI 422 and 503 of an approval (GH-189): slot 4 is built before the
+# confirmation is consumed, so either refusal leaves it pending. Documenting a 422
+# replaces FastAPI's generated one, so the description names the validation list too.
+_CONFIRM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    422: {
+        "description": (
+            "Validation Error (the usual list); or image_input_unsupported: an attachment "
+            "of the chat holds an image and the current model takes none (the "
+            "confirmation stays pending)."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "image_input_unsupported": {"value": _IMAGE_INPUT_UNSUPPORTED_BODY},
+                }
+            }
+        },
+    },
+    503: {
+        "description": (
+            "storage_unavailable: an attachment of the chat can't be read (the "
+            "confirmation stays pending)."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "storage_unavailable": {"value": _STORAGE_UNAVAILABLE_BODY},
+                }
+            }
+        },
+    },
+}
 # The OpenAPI 409 of the chat message route (GH-8, GH-187, GH-189).
 _SEND_CONFLICT_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     409: {
@@ -7185,7 +7217,7 @@ def create_app(
     app.post(
         "/api/confirm/{confirmation_id}",
         response_model=ChatResponse,
-        responses=_EVENT_STREAM_RESPONSES,
+        responses={**_EVENT_STREAM_RESPONSES, **_CONFIRM_RESPONSES},
     )(post_confirm)
     app.get("/api/me/settings", response_model=UserSettingsResponse)(get_my_settings)
     app.patch("/api/me/settings", response_model=UserSettingsResponse)(patch_my_settings)

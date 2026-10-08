@@ -13,7 +13,8 @@ and invitation.refuse, by migration 0016 for GH-161's
 org.permission_change, org.permission_promote, org.permission_promote_cancel
 and org.permission_demote, by migration 0020 for GH-164's user.profile_change,
 by migration 0021 for GH-166's password.change and by migration 0027 for
-GH-187's file.upload).
+GH-187's file.upload; the metadata CHECK is replaced by migration 0029 for
+GH-189's attachment ids).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -34,10 +35,12 @@ Outputs: one INSERT per event; the purge returns the number of rows removed.
 Security notes:
 - No content: an event holds IDs, counts, sizes and statuses only (tracker
   #139 §5). ``AuditEvent`` refuses free text: targets are UUIDs, and metadata
-  values are bools, safe-range ints, None, UUIDs, lists or tuples of 1 to
-  100 UUID objects (stored as canonical strings, GH-189), or tokens from a
-  closed vocabulary (member roles, permission decisions, tool names and
-  actions). A string is never a UUID here, also when it is UUID-shaped.
+  values are bools, safe-range ints, None, UUIDs, tokens from a closed
+  vocabulary (member roles, permission decisions, tool names and actions)
+  or, under the key ``attachment_ids`` only, a list or tuple of 1 to 100
+  UUID objects (stored as canonical strings, GH-189). A string is never a
+  UUID here, also when it is UUID-shaped. The metadata's JSON text is at
+  most 8192 bytes, as the database's metadata CHECK allows.
   A tool.call row stores a tool or action name the LLM chose only when it is
   a vocabulary token; anything else is stored as None, never as text. Its
   attachment ids are ids and a count only: never a file's name, kind, size
@@ -261,6 +264,10 @@ PURGE_INTERVAL_SECONDS: Final[int] = 86400
 _MAX_TARGETS: Final = 100
 _MAX_METADATA_IDS: Final = 100
 _MAX_METADATA_KEYS: Final = 16
+# Mirrors octet_length(metadata::text) <= 8192 (migration 0029).
+_MAX_METADATA_BYTES: Final = 8192
+# The only key whose value may be a list (migration 0029's metadata CHECK).
+_METADATA_IDS_KEY: Final = "attachment_ids"
 _MAX_SAFE_INT: Final = 2**53 - 1  # Largest int a JSON consumer reads exactly.
 _METADATA_KEY_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
@@ -383,7 +390,12 @@ class AuditEvent(SealedModel):
     @field_validator("metadata", mode="before")
     @classmethod
     def _check_metadata(cls, value: object) -> dict[str, MetadataValue]:
-        """Accept a flat mapping of at most 16 snake_case keys to non-content values."""
+        """Accept a flat mapping of at most 16 snake_case keys to non-content values.
+
+        A list is allowed under ``attachment_ids`` only, and the JSON text
+        record() writes is at most 8192 bytes: the database's metadata CHECK
+        refuses the rest, so Python refuses it before any write.
+        """
         if value is None:
             return {}
         if not isinstance(value, Mapping):
@@ -398,7 +410,13 @@ class AuditEvent(SealedModel):
             if type(key) is not str or _METADATA_KEY_RE.fullmatch(key) is None:
                 msg = "Metadata keys must be short lowercase snake_case."
                 raise ValueError(msg)
+            if key != _METADATA_IDS_KEY and isinstance(item, list | tuple):
+                msg = "Only attachment_ids may hold a list."
+                raise ValueError(msg)
             checked[key] = _metadata_value(item)
+        if len(json.dumps(checked).encode("utf-8")) > _MAX_METADATA_BYTES:
+            msg = "Metadata is too large."
+            raise ValueError(msg)
         return checked
 
     @model_validator(mode="after")
@@ -468,8 +486,9 @@ async def record(
         target_type: The kind of object acted on, if any.
         target_ids: The IDs of the objects acted on (UUID objects, at most 100).
         ip: The client address; a peer that isn't an IP address is stored as NULL.
-        metadata: Non-content details (roles, decisions, counts, IDs, a list or
-            tuple of 1 to 100 IDs).
+        metadata: Non-content details (roles, decisions, counts, IDs and,
+            under ``attachment_ids`` only, a list or tuple of 1 to 100 IDs),
+            at most 8192 bytes as JSON text.
 
     Raises:
         AuditRecordError: If the event is invalid (nothing is written) or the
@@ -572,7 +591,7 @@ async def record_tool_call(
         # Every id, also past the stored 100: the count must count ids only.
         if not all(isinstance(item, UUID) for item in attachment_ids):
             raise AuditRecordError from None
-        metadata["attachment_ids"] = list(attachment_ids[:_MAX_METADATA_IDS])
+        metadata[_METADATA_IDS_KEY] = list(attachment_ids[:_MAX_METADATA_IDS])
         metadata["attachment_count"] = len(attachment_ids)
     await record(
         executor,
