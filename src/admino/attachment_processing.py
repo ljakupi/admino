@@ -14,8 +14,10 @@ token estimate and the bytes of the derived files stored with the
 
 Inputs: the database pool, the attachments root, an attachment id and its
 org id, a processor ``(path, kind, ProcessingJob) -> ProcessedFile``; the
-job carries the row's file name (for the PDF page markers) and the
-platform's ``render_dpi`` and ``max_pages_per_file``, read once per file.
+job carries the row's file name as the prompt shows it
+(``prompt_assembly.prompt_filename``, GH-189: for the PDF page markers and
+the image labels) and the platform's ``render_dpi`` and
+``max_pages_per_file``, read once per file.
 Outputs: the row's final status (``process_attachment``), the number of
 files queued again at startup (``recover``).
 
@@ -51,6 +53,9 @@ Security notes:
   a traceback.
 - Logs carry attachment ids (through ``safe_log``), statuses and reason
   codes only: no file name, path or file content.
+- The converter's display name is the prompt name (GH-189, Decision 6):
+  default-ignorable and format characters of the stored name never reach a
+  page marker or an image label, which go to the model.
 - Parameterized SQL only. Imports nothing from the server, agent, LLM or
   tools layers; no LLM tool reaches this module.
 """
@@ -64,7 +69,7 @@ import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from admino import attachment_types, scoped_settings
+from admino import attachment_types, prompt_assembly, scoped_settings
 from admino.attachment_types import AttachmentRefusedError
 from admino.attachments import attachment_path, lock_org_storage, remove_derived
 from admino.converters import runner
@@ -121,7 +126,9 @@ _QUOTA_EXCEEDED: Final = "storage_quota_exceeded"
 class ProcessingJob:
     """What a processor needs besides the stored file and its kind.
 
-    ``filename`` is the row's sanitized name (the PDF page markers name it);
+    ``filename`` is the row's name as the prompt shows it
+    (``prompt_assembly.prompt_filename``; the PDF page markers and image
+    labels name it);
     ``render_dpi`` and ``max_pages`` are the platform's ``files`` settings.
     """
 
@@ -311,7 +318,7 @@ async def process_attachment(
         return None
     files = (await scoped_settings.current_platform_settings(pool)).files
     job = ProcessingJob(
-        filename=row["filename"],
+        filename=prompt_assembly.prompt_filename(row["filename"]),
         render_dpi=files.render_dpi,
         max_pages=files.max_pages_per_file,
     )
