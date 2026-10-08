@@ -92,6 +92,33 @@ admino talks to LLM providers and external APIs through its own thin, auditable
 clients. New runtime dependencies of any kind need explicit maintainer approval in
 the issue before the PR.
 
+### Adding or updating a dependency
+
+1. Get approval in the issue first. No dependency is added without it.
+2. Edit `pyproject.toml`. Use an exact pin (`name==X.Y.Z`) where the file already does.
+3. Run `uv lock`. To update one package only, run `uv lock --upgrade-package <name>`.
+4. Run `uv sync --extra dev` to refresh your `.venv`.
+5. Commit `pyproject.toml` and `uv.lock` together.
+
+CI runs `uv lock --check` and fails when `uv.lock` is out of date with
+`pyproject.toml`. CI (`uv sync --locked`) and the Docker image install only from
+`uv.lock`, hash-checked. Nothing resolves a version range at build time.
+
+The build backend (`hatchling`) is locked too, in the `build` dependency group. Keep
+its pin equal to `build-system.requires` in `pyproject.toml`.
+
+`uv` itself is a CI and Docker build-stage tool only. It is not a runtime dependency
+and the runtime image does not contain it. Its exact version and wheel hashes are in
+`requirements-uv.txt`, which CI and the `Dockerfile` both install with
+`pip install --require-hashes`. To bump it, regenerate the file and check that the
+committed lock is still accepted:
+
+```bash
+echo 'uv==X.Y.Z' | uv pip compile - --generate-hashes --python-version 3.12 --no-header
+# keep the comment header of requirements-uv.txt, replace the pin and hashes
+uv lock --check
+```
+
 ## Testing (TDD)
 
 admino is built test-first — this is a workflow requirement, not a suggestion:

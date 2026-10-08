@@ -69,6 +69,7 @@ your say-so.
 
 ```bash
 # 1. Install dependencies — uv builds an isolated .venv from pyproject + uv.lock
+#    (adding or updating one: see CONTRIBUTING.md, "Adding or updating a dependency")
 uv sync --extra dev          # all providers + dev tooling
 source .venv/bin/activate
 

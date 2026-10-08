@@ -42,6 +42,8 @@ uv sync --extra anthropic     # base deps + the Claude provider
 uv sync --extra dev
 ```
 
+To add or update a dependency, see [CONTRIBUTING.md](../CONTRIBUTING.md#adding-or-updating-a-dependency).
+
 The `openai` SDK is a core dependency because the default provider (Infomaniak) and the
 local vLLM provider speak the OpenAI-compatible API through it. The Anthropic SDK stays an
 **optional extra**. Activate the environment:
