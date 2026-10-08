@@ -27,17 +27,41 @@ FROM python:3.12.8-slim AS builder
 
 WORKDIR /build
 
-# Install build tools only in builder stage
-RUN pip install --no-cache-dir hatchling==1.27.0
+# uv installs the dependencies from uv.lock. It lives in this stage only: the
+# runtime stage copies /install and nothing else, so uv never ships. uv itself
+# comes from PyPI, pinned to an exact version with hashes in requirements-uv.txt.
+# UV_PYTHON_DOWNLOADS=never: uv must use this image's Python, never fetch one.
+ENV UV_PYTHON_DOWNLOADS=never \
+    UV_NO_CACHE=1 \
+    UV_LINK_MODE=copy
+COPY requirements-uv.txt .
+RUN pip install --no-cache-dir --require-hashes --only-binary=:all: -r requirements-uv.txt
 
-COPY pyproject.toml .
+COPY pyproject.toml uv.lock ./
+
+# Runtime dependencies: exactly the versions and hashes in uv.lock (no dev
+# group, plus the `all-providers` extra so the image supports every provider
+# selectable in config.yaml / Settings -> Agent without rebuilding). --locked
+# fails the build when uv.lock is out of date with pyproject.toml; nothing
+# resolves a version range here. The OpenAI SDK is a core dependency.
+RUN uv export --locked --no-dev --extra all-providers --no-emit-project \
+        --format requirements-txt --no-header --output-file /tmp/runtime.txt \
+    && uv pip install --require-hashes --no-deps --compile-bytecode \
+        --prefix /install -r /tmp/runtime.txt
+
+# The build backend (hatchling) is locked too, in the `build` dependency group.
+# It goes into a throwaway venv, never into /install.
+RUN uv export --locked --only-group build --no-emit-project \
+        --format requirements-txt --no-header --output-file /tmp/build.txt \
+    && uv venv /opt/build-venv \
+    && uv pip install --python /opt/build-venv --require-hashes --no-deps -r /tmp/build.txt
+
+# Build admino against that backend without build isolation (an isolated build
+# would resolve build-system.requires from PyPI), then install the wheel.
 COPY src/ src/
-
-# Install the package and all runtime dependencies into /install prefix.
-# The OpenAI SDK is a core dependency (default Infomaniak provider, vLLM, OpenAI);
-# the `all-providers` extra adds the Anthropic SDK so the image supports every
-# provider selectable in config.yaml / Settings → Agent without rebuilding.
-RUN pip install --no-cache-dir --prefix=/install ".[all-providers]"
+RUN uv build --wheel --no-build-isolation --python /opt/build-venv/bin/python \
+        --out-dir /tmp/wheels \
+    && uv pip install --no-deps --compile-bytecode --prefix /install /tmp/wheels/*.whl
 
 # -------------------------------------------------------------------
 # Stage 3: runtime — minimal image with a non-root user
