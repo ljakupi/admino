@@ -106,11 +106,113 @@ CI runs `uv lock --check` and fails when `uv.lock` is out of date with
 install instead of being built from source. Nothing resolves a version range at
 build time.
 
+Run uv at the exact version pinned in `requirements-uv.txt` (the one CI and the Docker
+build use). Older uv releases do not understand the relative `exclude-newer` below.
+
+#### Release waiting period
+
 Because builds no longer pick up new releases on their own, refresh the lock on
-purpose when a security release of a locked package comes out. Run
-`uv lock --upgrade` for the whole lock, or `uv lock --upgrade-package <name>` for
-one package. List the version changes in the PR. There is no automated scanning for
-this yet.
+purpose, for example with `uv lock --upgrade` for the whole lock or
+`uv lock --upgrade-package <name>` for one package. List every version change in the
+PR.
+
+`[tool.uv] exclude-newer = "7 days"` in `pyproject.toml` keeps a refresh from picking
+up any release younger than 7 days. A malicious or broken release is usually pulled
+within days, so the lock never takes one fresh. The setting is relative, so
+`uv lock --check` does not depend on the date it runs. A package already locked
+stays locked as the window moves on.
+
+A security bump that needs a younger release names its packages in
+`[tool.uv.exclude-newer-package]`, with a timestamp just after the fixed release's
+upload time and a comment naming the advisory or the issue that approved it. Always a
+timestamp, never `false` (no limit): a timestamp stops admitting newer releases once
+the window moves past it, while `false` would let a later routine refresh take the
+newest release of that package with no waiting period.
+
+```toml
+[tool.uv.exclude-newer-package]
+# GHSA-xxxx-xxxx-xxxx: fixed in 1.2.3, released 2026-01-02. Remove at the next routine refresh.
+somepackage = "2026-01-03T00:00:00Z"
+```
+
+Run `uv lock --upgrade-package <name>`, commit `pyproject.toml` and `uv.lock`
+together, and remove the entry at the next routine refresh, once the release is
+older than 7 days. An exact pin that no older release satisfies is handled the same
+way.
+
+#### npm: the same waiting period, by procedure
+
+npm has no setting that the lock check enforces, so the 7-day window for
+`static-src/package-lock.json` is a documented procedure, not an enforced setting.
+Pass `--before` with the date 7 days ago on every refresh or bump, so npm resolves only
+releases at least that old:
+
+```bash
+cd static-src
+# macOS (BSD date)
+npm update --package-lock-only --before="$(date -u -v-7d +%Y-%m-%d)"            # whole lock
+npm update --package-lock-only --before="$(date -u -v-7d +%Y-%m-%d)" <name>      # one package
+# Linux (GNU date)
+npm update --package-lock-only --before="$(date -u -d '7 days ago' +%F)"         # whole lock
+npm update --package-lock-only --before="$(date -u -d '7 days ago' +%F)" <name>  # one package
+```
+
+List every version change in the PR. A security bump that needs a younger release cites
+the advisory in the PR and depends on where the package sits:
+
+- **Transitive package:** cap the resolution just after the fixed release. Read its publish
+  time from `npm view <name> time --json` and run
+  `npm update --package-lock-only --before=<publish time + 1 min, ISO UTC> <name>`
+  (for example `--before=2026-10-07T09:52:45Z`). `package.json` stays unchanged. List every
+  lock entry that moves, since its dependencies resolve under the same cap.
+  Do not use `npm install <name>@<fixed>` here: it adds the package to `dependencies`.
+- **Fix outside the dependents' ranges:** add an exact `overrides` entry to `package.json`
+  (a devops change, reviewed and documented like the fork pin below).
+- **Package already in `package.json`:** `npm install --package-lock-only <name>@<fixed>`
+  rewrites the existing range.
+
+`static-src/package.json` pins one transitive package with an `overrides` entry (JSON has
+no comments, so the reason is here): `@trickfilm400/rollup-plugin-off-main-thread` at
+`3.0.0-pre1`. `workbox-build` 7.4.1 uses this single-maintainer fork, and its output
+becomes the prologue of the shipped service worker. That version was reviewed against
+`@surma/rollup-plugin-off-main-thread` 2.2.3. Re-diff it against upstream before moving
+the pin, and do not widen the override to a range. `npm ci` accepts a lock entry newer
+than the override, so the CI frontend job runs `npm ls --package-lock-only` on the fork and
+fails if the lock diverges from the pin.
+
+#### Dependency advisory scan
+
+The `Advisory scan` workflow (`.github/workflows/advisory-scan.yml`) runs
+`osv-scanner` on every PR, on pushes to `develop` and `main`, and weekly against
+`develop`. It fails when `uv.lock`, `static-src/package-lock.json` or
+`requirements-uv.txt` (the pinned uv installer) contains a package version with a known
+advisory in the OSV database. The scanner is CI-only:
+the workflow downloads one exact release and checks its SHA-256 before running it.
+To run the scan locally, download the same release from
+<https://github.com/google/osv-scanner/releases> (the `osv-scanner_SHA256SUMS` file
+lists the hashes), verify it, then run:
+
+```bash
+osv-scanner scan source --config=osv-scanner.toml \
+  --lockfile=uv.lock --lockfile=static-src/package-lock.json \
+  --lockfile=requirements-uv.txt
+```
+
+It exits 0 when clean and 1 when it finds an advisory. The normal fix is to move the
+package to a fixed release (`uv lock --upgrade-package <name>`, or the `npm` commands
+above in `static-src/`, with the same waiting period).
+
+If no fixed release exists yet, the advisory can be allowlisted in `osv-scanner.toml`
+at the repository root. The rules, enforced by a step in the workflow:
+
+- Only `[[IgnoredVulns]]` entries. Any other table or key fails the job.
+- Each entry has an `id` (the advisory id), a non-empty `reason`, and `ignoreUntil`
+  as a TOML date (`ignoreUntil = 2026-12-01`).
+- `ignoreUntil` is at most 90 days ahead. An entry is expired on its date (osv-scanner
+  ignores an advisory only before 00:00 UTC of `ignoreUntil`), so an entry dated today
+  or earlier fails the job even if its advisory no longer matches, so stale entries get removed.
+- The entry is part of the PR and is reviewed like code. Use it for an advisory
+  without a fixed release, never to silence a fixable one.
 
 The build backend (`hatchling`) is locked too, in the `build` dependency group. Keep
 its pin equal to `build-system.requires` in `pyproject.toml`.

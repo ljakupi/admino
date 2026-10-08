@@ -15,7 +15,7 @@ dependencies = [
     "httpx==0.28.1",
     "pydantic>=2.10.6,<3",
     "pydantic-settings>=2.7.0,<3",
-    "cryptography==44.0.2",
+    "cryptography==50.0.2",
     "google-auth-oauthlib==1.2.1",
     "google-api-python-client==2.166.0",
     "pyyaml==6.0.2",
@@ -41,9 +41,9 @@ all-providers = [
     "anthropic>=0.40.0,<1",
 ]
 dev = [
-    "pytest==8.3.5",
+    "pytest==9.1.1",
     "pytest-cov==6.0.0",
-    "pytest-asyncio==0.25.3",
+    "pytest-asyncio==1.4.0",
     "ruff==0.11.2",
     "mypy==1.15.0",
     "types-PyYAML==6.0.12.20241230",
@@ -102,3 +102,14 @@ ignore_missing_imports = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "--cov=src/admino --cov-report=term-missing --cov-report=html"
+
+[tool.uv]
+# GH-289: a lock refresh never picks up a release younger than 7 days (supply-chain
+# guard). A security bump names its packages below; see CONTRIBUTING.md,
+# "Release waiting period".
+exclude-newer = "7 days"
+
+[tool.uv.exclude-newer-package]
+# pypdfium2==5.14.0 (exact pin, approved in GH-188) was uploaded 2026-10-04 and has no
+# older release that satisfies the pin. Remove at the next routine refresh (after 2026-10-11).
+pypdfium2 = "2026-10-05T00:00:00Z"

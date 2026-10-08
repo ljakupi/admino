@@ -1,0 +1,124 @@
+name: Advisory scan
+
+# GH-289: fails when uv.lock, static-src/package-lock.json or
+# requirements-uv.txt locks a package
+# version with a known advisory (OSV database). Runs on every PR, on pushes to
+# develop/main, and weekly: an advisory can be published against a lock that
+# did not change. The weekly run is on the default branch, develop.
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+# Least privilege: the scan only reads the repository.
+permissions:
+  contents: read
+
+jobs:
+  advisory-scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # One exact release, checked against the hash below before it runs. To
+      # bump: take both from the release's osv-scanner_SHA256SUMS file.
+      OSV_SCANNER_VERSION: v2.6.0
+      OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The scan needs no push access; do not leave the token in .git/config.
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # osv-scanner alone lets an expired entry pass silently once its advisory
+      # no longer matches, and honours table types that could switch the rules
+      # off (PackageOverrides, GoVersionOverride). So the allowlist is checked
+      # here: only [[IgnoredVulns]], each with id + reason + ignoreUntil, not
+      # expired, at most 90 days ahead.
+      - name: Validate the allowlist (osv-scanner.toml)
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import sys
+          import tomllib
+
+          MAX_DAYS = 90
+          today = datetime.datetime.now(datetime.timezone.utc).date()
+          errors = []
+
+          with open("osv-scanner.toml", "rb") as handle:
+              data = tomllib.load(handle)
+
+          for key in data:
+              if key != "IgnoredVulns":
+                  errors.append(
+                      f"top-level key {key!r} is not allowed: only [[IgnoredVulns]] "
+                      "entries may be in osv-scanner.toml"
+                  )
+
+          entries = data.get("IgnoredVulns", [])
+          if not isinstance(entries, list):
+              errors.append("IgnoredVulns must be an array of tables ([[IgnoredVulns]])")
+              entries = []
+
+          for index, entry in enumerate(entries, start=1):
+              label = f"IgnoredVulns entry {index}"
+              if not isinstance(entry, dict):
+                  errors.append(f"{label}: must be a table")
+                  continue
+              advisory = entry.get("id")
+              if isinstance(advisory, str) and advisory.strip():
+                  label = f"IgnoredVulns entry {index} ({advisory})"
+              else:
+                  errors.append(f"{label}: missing or empty 'id'")
+              for key in entry:
+                  if key not in ("id", "reason", "ignoreUntil"):
+                      errors.append(f"{label}: unknown key {key!r}")
+              reason = entry.get("reason")
+              if not isinstance(reason, str) or not reason.strip():
+                  errors.append(f"{label}: missing or empty 'reason'")
+              until = entry.get("ignoreUntil")
+              if isinstance(until, datetime.datetime):
+                  until = until.date()
+              if not isinstance(until, datetime.date):
+                  errors.append(
+                      f"{label}: 'ignoreUntil' must be a TOML date (YYYY-MM-DD), "
+                      f"got {until!r}"
+                  )
+                  continue
+              if until <= today:
+                  errors.append(
+                      f"{label}: expired (ignoreUntil {until}; today is {today} UTC, "
+                      "and osv-scanner ignores only before 00:00 UTC of that date). Fix the "
+                      "dependency, or renew the entry with a new reason."
+                  )
+              elif (until - today).days > MAX_DAYS:
+                  errors.append(
+                      f"{label}: ignoreUntil {until} is more than {MAX_DAYS} days ahead "
+                      f"(latest allowed: {today + datetime.timedelta(days=MAX_DAYS)})"
+                  )
+
+          if errors:
+              for message in errors:
+                  print(f"::error file=osv-scanner.toml::{message}")
+              sys.exit(1)
+          print(f"osv-scanner.toml: {len(entries)} allowlist entries, all valid")
+          PY
+      - name: Download osv-scanner (pinned, SHA-256 checked)
+        run: |
+          curl --fail --silent --show-error --location \
+            --output osv-scanner \
+            "https://github.com/google/osv-scanner/releases/download/${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  osv-scanner" | sha256sum -c -
+          chmod +x osv-scanner
+      - name: Scan the lockfiles
+        run: >
+          ./osv-scanner scan source
+          --config=osv-scanner.toml
+          --lockfile=uv.lock
+          --lockfile=static-src/package-lock.json
+          --lockfile=requirements-uv.txt

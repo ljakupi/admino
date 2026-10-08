@@ -1,0 +1,17 @@
+{
+  "note": "Test-only data for tests/test_cryptography_compat.py: the Fernet key and the password protect nothing. Made once under the cryptography version below with admino's encrypt_refresh_token and hash_password; never regenerate it with a newer cryptography.",
+  "generated_with": {
+    "cryptography": "44.0.2",
+    "python": "3.12.8"
+  },
+  "generated_on": "2026-10-08",
+  "fernet": {
+    "key": "L8x2lZgivisK2yRvQ8xS8cuTkTo4i6Wwlgx2VC4WIew=",
+    "plaintext": "test-only-refresh-token-for-the-cryptography-44.0.2-compat-fixture",
+    "token": "gAAAAABqx1u-uYlpUnokC0ofYeojeuFr09vwX-rk_45q6DaqMLezbUvgV3m1_qnIOB5xxVonFExzQXrBqFigHSETMJW2E5m1m_UNkuqyyEic3mi90R_xTdwb5Etql2xDv1fszuyVEU5VxJbzCgKH-lll4J-2Vqh06h3sq8RzPAWOIjz27Upf4uo="
+  },
+  "argon2id": {
+    "password": "test-only password for the cryptography 44.0.2 compat fixture",
+    "phc": "$argon2id$v=19$m=19456,t=2,p=1$LGBl/CJu9A1P6058gdr3Cg$bBB7kIg5FzUb3R5ZnyaMVS3YEu9muXlmPFFAkhjtKjg"
+  }
+}

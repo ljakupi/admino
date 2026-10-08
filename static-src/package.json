@@ -29,5 +29,8 @@
     "vite-plugin-pwa": "^0.21.1",
     "vitest": "^4.1.11",
     "vue-tsc": "^2.2.0"
+  },
+  "overrides": {
+    "@trickfilm400/rollup-plugin-off-main-thread": "3.0.0-pre1"
   }
 }

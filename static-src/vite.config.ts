@@ -62,5 +62,7 @@ export default defineConfig({
     include: ['src/__tests__/**/*.test.ts'],
     restoreMocks: true,
     unstubGlobals: true,
+    // happy-dom nodeName shim for DOMPurify >= 3.4.8 (GH-289 Decision 8).
+    setupFiles: ['src/__tests__/setup/happyDomNodeName.ts'],
   },
 });
