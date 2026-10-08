@@ -1,6 +1,7 @@
 name: Advisory scan
 
-# GH-289: fails when uv.lock or static-src/package-lock.json locks a package
+# GH-289: fails when uv.lock, static-src/package-lock.json or
+# requirements-uv.txt locks a package
 # version with a known advisory (OSV database). Runs on every PR, on pushes to
 # develop/main, and weekly: an advisory can be published against a lock that
 # did not change. The weekly run is on the default branch, develop.
@@ -27,6 +28,9 @@ jobs:
       OSV_SCANNER_SHA256: ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The scan needs no push access; do not leave the token in .git/config.
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -86,9 +90,10 @@ jobs:
                       f"got {until!r}"
                   )
                   continue
-              if until < today:
+              if until <= today:
                   errors.append(
-                      f"{label}: expired on {until} (today is {today} UTC). Fix the "
+                      f"{label}: expired (ignoreUntil {until}; today is {today} UTC, "
+                      "and osv-scanner ignores only before 00:00 UTC of that date). Fix the "
                       "dependency, or renew the entry with a new reason."
                   )
               elif (until - today).days > MAX_DAYS:
@@ -116,3 +121,4 @@ jobs:
           --config=osv-scanner.toml
           --lockfile=uv.lock
           --lockfile=static-src/package-lock.json
+          --lockfile=requirements-uv.txt
