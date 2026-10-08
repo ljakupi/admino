@@ -23,8 +23,20 @@ What is pinned here:
   ids (default or empty) it calls ``record_tool_call`` exactly as today, with no
   ``attachment_ids`` keyword. End to end through the real ``record_tool_call``, asyncpg
   ids reach the bound metadata canonical.
+- Contract Amendment A1 (C10, security audit F1), the Python mirror of the database's
+  ``audit_events_metadata_check``: a list value is allowed under the key
+  ``attachment_ids`` only; under any other key (``ids``, ``attachments``, ``tool``,
+  ``target_ids``) it is refused with ``AuditRecordError`` and nothing is written. The
+  metadata JSON text stays within 8192 bytes: the largest metadata the other rules let
+  through (16 keys: 100 ids plus 15 forty-character keys holding UUIDs, about 5.3 KB,
+  over 0005's 4096) is accepted, and through tests/db_fakes.py's enforced CHECK
+  ``record_tool_call`` with 1, 100, 101 and 150 ids is stored (the first 100 and the
+  total). Over 8192 bytes can't be built within the key, value and 16-key rules, so the
+  refusal at 8193 bytes is pinned on the database side (tests/test_migration_0029.py).
 
-All asyncpg calls are mocked. No real PostgreSQL, LLM or network is used.
+The unit tests mock asyncpg; the Amendment A1 tests write through tests/db_fakes.py
+(which enforces the CHECK the shipped migrations define). No real PostgreSQL, LLM or
+network is used.
 
 Security notes: the audit log stays content-free (tracker #139 section 5): IDs and
 counts only, never a file name, kind, size or content; validation and write errors
@@ -48,6 +60,7 @@ import admino.main as main_module
 from admino import audit_events
 from admino.access import Principal
 from admino.audit_events import AuditAction, AuditEvent, AuditRecordError, TargetType, record
+from tests.db_fakes import FakeDb
 from tests.log_capture import configured_logging
 
 # ---------------------------------------------------------------------------
@@ -650,3 +663,101 @@ class TestMainRecorderForwardsAttachmentIds:
             2,
         )
         assert (metadata["escalated"], json.loads(row["target_ids"])) == (True, [str(_CHAT)])
+
+
+# ===========================================================================
+# 5. The database's metadata rule, mirrored (Amendment A1, security audit F1)
+# ===========================================================================
+
+# Keys a list must not hide under: only attachment_ids may hold one.
+_OTHER_LIST_KEYS: Final = ("ids", "attachments", "tool", "target_ids")
+
+
+def _largest_metadata() -> dict[str, Any]:
+    """The largest metadata the key, value and count rules allow: 100 ids under
+    attachment_ids plus 15 forty-character keys holding a UUID each (16 keys)."""
+    metadata: dict[str, Any] = {f"k{n:02d}".ljust(40, "x"): _IDS[100 + n] for n in range(15)}
+    metadata["attachment_ids"] = list(_IDS[:100])
+    return metadata
+
+
+@pytest.fixture()
+def fake_db() -> FakeDb:
+    """The shared FakeDb with the run's org: its INSERT INTO audit_events applies the
+    metadata CHECK the shipped migrations define."""
+    db = FakeDb()
+    db.add_org(_ORG)
+    return db
+
+
+class TestMetadataRuleSharedWithTheDatabase:
+    """C10: Python refuses what the database's metadata CHECK refuses, and nothing it
+    accepts; the rows record_tool_call builds pass that CHECK."""
+
+    @pytest.mark.parametrize("key", _OTHER_LIST_KEYS)
+    async def test_audit_events_list_under_another_key_raises_and_writes_nothing(
+        self, conn: MagicMock, key: str
+    ) -> None:
+        """The same list is accepted under attachment_ids; under any other key it is
+        refused before any write, and the error carries no id."""
+        await _record_list(conn, [_ID])
+        conn.execute.reset_mock()
+
+        with pytest.raises(AuditRecordError) as caught:
+            await record(
+                conn,
+                action=AuditAction.TOOL_CALL,
+                actor_kind="member",
+                actor_user_id=_USER,
+                org_id=_ORG,
+                target_type=TargetType.CHAT,
+                target_ids=(_CHAT,),
+                metadata={"decision": "allow", key: [_ID]},
+            )
+
+        conn.execute.assert_not_awaited()
+        _assert_refused_cleanly(caught.value, [_ID])
+
+    async def test_audit_events_largest_allowed_metadata_passes_the_database_check(
+        self, fake_db: FakeDb
+    ) -> None:
+        """16 keys with 100 ids: over 0005's 4096 bytes, within 8192; stored as bound."""
+        metadata = _largest_metadata()
+
+        await record(
+            fake_db.pool,
+            action=AuditAction.TOOL_CALL,
+            actor_kind="member",
+            actor_user_id=_USER,
+            org_id=_ORG,
+            target_type=TargetType.CHAT,
+            target_ids=(_CHAT,),
+            metadata=metadata,
+        )
+
+        stored = [row["metadata"] for row in fake_db.audit]
+        assert stored == [
+            {
+                **{key: str(value) for key, value in metadata.items() if key != "attachment_ids"},
+                "attachment_ids": _canonical(_IDS[:100]),
+            }
+        ]
+        assert 4096 < len(json.dumps(stored[0]).encode()) <= 8192
+
+    @pytest.mark.parametrize("size", [1, 100, 101, 150])
+    async def test_audit_events_record_tool_call_with_ids_passes_the_database_check(
+        self, fake_db: FakeDb, size: int
+    ) -> None:
+        """1 and 100 ids are stored with their count; 101 and 150 store the first 100
+        and the total."""
+        await audit_events.record_tool_call(
+            fake_db.pool, **_tool_call_kwargs(), attachment_ids=_IDS[:size]
+        )
+
+        assert [row["metadata"] for row in fake_db.audit] == [
+            {
+                **_todays_metadata(),
+                "attachment_ids": _canonical(_IDS[: min(size, 100)]),
+                "attachment_count": size,
+            }
+        ]

@@ -1,5 +1,6 @@
-"""Tests for migration 0029_chat_message_attachments.sql (GH-189, contract C13, issue
-Decision 11): the attachment ids an assistant message was answered with.
+"""Tests for migration 0029_chat_message_attachments.sql (GH-189, contract C13 and its
+Amendment A1, issue Decisions 10 and 11): the attachment ids an assistant message was
+answered with, and the audit metadata CHECK that lets a tool.call row carry them.
 
 There is no real PostgreSQL in the suite, so the shipped SQL file is the spec (the
 pipeline runs it on a throwaway postgres:16 as admino_app). The SQL is read with
@@ -15,33 +16,62 @@ parentheses, commas and comparison operators ignored, literals byte for byte).
 What is pinned:
 - ``0029_chat_message_attachments.sql`` ships as the only version 29, right after the
   versions 1 to 28; run_migrations applies it after 0028 (once). It opens with a
-  header comment that names the column.
-- Exactly one statement: ``ALTER TABLE chat_messages`` with one action, ``ADD COLUMN
+  header comment that names the column and ``audit_events_metadata_check``.
+- One ``ALTER TABLE chat_messages`` with one action, ``ADD COLUMN
   included_attachment_ids UUID[]``, nullable (NULL: no attachments in the slot), no
   default, nothing else on the column but exactly one CHECK, named
   ``chat_messages_included_attachment_ids_check``: ``included_attachment_ids IS NULL OR
   (role = 'assistant' AND array_ndims(...) = 1 AND cardinality(...) >= 1 AND
   array_position(..., NULL) IS NULL)``: a one-dimensional array of at least one
   non-NULL id, on an assistant row only.
+- Amendment A1 (security audit F1): after the column, ``ALTER TABLE audit_events DROP
+  CONSTRAINT audit_events_metadata_check`` (no IF EXISTS, no CASCADE), then ``ADD
+  CONSTRAINT audit_events_metadata_check CHECK (...)`` (validated: nothing after the
+  expression). Its meaning, compared as nested CASE / top-level AND structure with
+  whitespace (also inside the jsonpath literals, outside their strings) ignored, is
+  the contract's: an object of at most 8192 bytes (``octet_length(metadata::text)``,
+  up from 0005's 4096), with 0005's other rules kept as they were (at most 16 keys,
+  the key regex) and the value rule of 0005 kept for every key but
+  ``attachment_ids`` (no object or array, strings are ``^[a-z0-9_-]{1,64}$`` tokens);
+  ``attachment_ids``, when present, is an array of 1 to 100 strings matching the
+  canonical lowercase UUID regex. No other audit_events change: the action catalog
+  (``audit_events_action_check``) isn't named.
 - No privilege change: the file holds no GRANT or REVOKE (nested ones included), every
   (table, grantee) holds after 0029 what it held after 0028, and admino_app keeps
   exactly SELECT, INSERT on chat_messages (append-only), PUBLIC nothing.
 - Nothing else: no DO block, function, trigger, role, INSERT / UPDATE / DELETE /
-  TRUNCATE / COPY / MERGE, CREATE, DROP or default privileges, also not nested.
+  TRUNCATE / COPY / MERGE, CREATE, DROP or default privileges, also not nested; every
+  statement is the column's ALTER or the metadata CHECK's.
 - tests/db_fakes.py mirrors 0029 (contract C14): the contract's assistant INSERT (S8',
   ``$9::uuid[]``) stores the ids in the given order, NULL stays NULL, today's INSERT
   (S8) stores NULL; ``'{}'``, ``ARRAY[NULL]``, an id list with a NULL, a user or tool
   row with ids and a 2-D array are CheckViolationError on the shipped CHECK's name with
   nothing stored; ``add_chat_message(..., included_attachment_ids=)`` is checked the
   same way; the fake's chat_messages columns are 0024's followed by the new one.
+- The fake's INSERT INTO audit_events applies the shipped metadata CHECK: the
+  contract's verified accepted rows (today's six keys; plus 1 id and its count; plus
+  100 ids and a count of 150; exactly 8192 bytes) are stored, and its verified refused
+  rows (101 ids, ``[]``, a non-UUID or upper-case id, a number, a nested array or an
+  object in the ids, a plain string under attachment_ids, an array or object under
+  another key, free text, a bad key, 17 keys, 8193 bytes, a non-object) are
+  CheckViolationError on the shipped constraint's name with nothing stored.
+
+Changed in Amendment A1 (existing tests): ``_ADD_COLUMN_RE`` no longer reads ``ADD
+CONSTRAINT`` as a column named "constraint"; "adds only the column" counts ADD COLUMN
+actions on every table (the CHECK's actions are pinned in their own tests); "exactly
+one ALTER TABLE on chat_messages" became "the column's ALTER plus the metadata CHECK's
+statements, nothing else".
 
 Security notes:
 - The column holds attachment ids only: no name, kind, size or content of a file.
 - admino_app gains no privilege: chat_messages stays append-only for the app.
+- The audit metadata stays content-free in the database too: only ``attachment_ids``
+  may be an array, and only of UUIDs; free text, emails and file names stay refused.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from typing import TYPE_CHECKING, Any, Final
@@ -62,7 +92,7 @@ from tests.test_migration_0018 import (
 )
 from tests.test_migration_0024 import _canonical_default, _Column, _parse_column
 from tests.test_migration_0024 import _table as _table_0024
-from tests.test_migration_0027 import _ALTER_RE, _apply, _canon, _unwrap
+from tests.test_migration_0027 import _ALTER_RE, _apply, _balanced_end, _canon, _unwrap
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -77,12 +107,74 @@ _COLUMN: Final = "included_attachment_ids"
 _CHECK_NAME: Final = "chat_messages_included_attachment_ids_check"
 
 _SCHEMA: Final = r'(?:"?public"?\.)?'
+# ADD [COLUMN] name definition; ADD CONSTRAINT (the metadata CHECK) is no column.
 _ADD_COLUMN_RE: Final = re.compile(
-    r'add (?:column )?(?:if not exists )?"?(?P<name>\w+)"? (?P<definition>.+)'
+    r'add (?:column )?(?:if not exists )?(?!constraint\b)"?(?P<name>\w+)"? (?P<definition>.+)'
 )
 # A one-dimensional array type: "uuid[]" or "uuid array" (the SQL-standard spelling).
 _ARRAY_TYPE_RE: Final = re.compile(r"(?P<base>\w+)\s*(?:\[\s*\]|\s+array\b)\s*")
-_ALLOWED_STATEMENT: Final = re.compile(rf'alter table (?:only )?{_SCHEMA}"?{_TABLE}"? add .+')
+
+# Amendment A1: audit_events_metadata_check (migration 0005), replaced by 0029.
+_AUDIT_TABLE: Final = "audit_events"
+_AUDIT_MIGRATION: Final = "0005_audit_events.sql"
+_METADATA_CHECK: Final = "audit_events_metadata_check"
+_ACTION_CHECK: Final = "audit_events_action_check"
+_METADATA_BYTES: Final = 8192
+# A plain DROP (no IF EXISTS: a missing 0005 constraint fails loudly; no CASCADE).
+_DROP_METADATA_CHECK_RE: Final = re.compile(rf'drop constraint "?{_METADATA_CHECK}"?(?: restrict)?')
+# ADD CONSTRAINT ... CHECK (...) with nothing after it (no NOT VALID, no NO INHERIT).
+_ADD_METADATA_CHECK_RE: Final = re.compile(
+    rf'add constraint "?{_METADATA_CHECK}"? check ?\((?P<expression>.*)\)'
+)
+# The statement kinds 0029 may run (masked, normalized).
+_ALLOWED_STATEMENTS: Final[dict[str, re.Pattern[str]]] = {
+    "column": re.compile(rf'alter table (?:only )?{_SCHEMA}"?{_TABLE}"? add .+'),
+    "metadata check": re.compile(
+        rf'alter table (?:only )?{_SCHEMA}"?{_AUDIT_TABLE}"? (?:drop|add) constraint .+'
+    ),
+}
+# One CASE with one WHEN (masked text; a nested CASE sits in the THEN branch).
+_CASE_RE: Final = re.compile(r"case when (?P<when>.+?) then (?P<then>.+) else (?P<else>.+?) end")
+
+# The contract's CHECK (Amendment A1, verified on postgres:16-alpine), by conjunct.
+_IS_OBJECT: Final = "jsonb_typeof(metadata) = 'object'"
+_SIZE_CAP: Final = f"octet_length(metadata::text) <= {_METADATA_BYTES}"
+_OLD_SIZE_CAP: Final = "octet_length(metadata::text) <= 4096"
+_KEY_COUNT: Final = (
+    "jsonb_array_length(jsonb_path_query_array(metadata, 'strict $.keyvalue()')) <= 16"
+)
+_KEY_NAMES: Final = (
+    "NOT jsonb_path_exists(metadata,"
+    " 'strict $.keyvalue() ? (!(@.key like_regex \"^[a-z][a-z0-9_]{0,39}$\"))')"
+)
+# Every key but attachment_ids: no object or array, a string is a token.
+_SCALAR_VALUES: Final = (
+    "NOT jsonb_path_exists(metadata,"
+    ' \'strict $.keyvalue() ? (@.key != "attachment_ids") ? (@.value.type() == "object"'
+    ' || @.value.type() == "array" || (@.value.type() == "string"'
+    ' && !(@.value like_regex "^[a-z0-9_-]{1,64}$")))\')'
+)
+# 0005's value rule: the same, for every key.
+_OLD_SCALAR_VALUES: Final = (
+    "NOT jsonb_path_exists(metadata,"
+    ' \'strict $.* ? (@.type() == "object" || @.type() == "array"'
+    ' || (@.type() == "string" && !(@ like_regex "^[a-z0-9_-]{1,64}$")))\')'
+)
+_ATTACHMENT_IDS_RULE: Final = (
+    "CASE WHEN metadata ? 'attachment_ids' THEN"
+    " CASE WHEN jsonb_typeof(metadata -> 'attachment_ids') = 'array' THEN"
+    " jsonb_array_length(metadata -> 'attachment_ids') BETWEEN 1 AND 100"
+    " AND NOT jsonb_path_exists(metadata -> 'attachment_ids',"
+    ' \'strict $[*] ? (@.type() != "string" || !(@ like_regex'
+    ' "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"))\')'
+    " ELSE false END"
+    " ELSE true END"
+)
+_CONTRACT_METADATA_CHECK: Final = (
+    f"CASE WHEN {_IS_OBJECT} THEN "
+    + " AND ".join((_SIZE_CAP, _KEY_COUNT, _KEY_NAMES, _SCALAR_VALUES, _ATTACHMENT_IDS_RULE))
+    + " ELSE false END"
+)
 # Fragments 0029 must not contain (top level, DO / function bodies, literals).
 _FORBIDDEN: Final[dict[str, str]] = {
     "do": r"do\b",
@@ -138,6 +230,77 @@ _INSERT_TODAY: Final = """
 """
 _FIRST: Final = uuid.UUID("f9000000-0000-4000-8000-000000000002")
 _SECOND: Final = uuid.UUID("10000000-0000-4000-8000-000000000001")
+
+# The audit INSERT audit_events.record() runs (its statement's shape).
+_AUDIT_INSERT: Final = """
+    INSERT INTO audit_events
+        (org_id, actor_user_id, actor_kind, action, target_type, target_ids, ip, metadata)
+    VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::inet, $8::jsonb)
+"""
+_ACTOR: Final = uuid.UUID("29a1c0de-0000-4000-8000-000000000001")
+_TARGET_CHAT: Final = uuid.UUID("29a1c0de-0000-4000-8000-000000000002")
+# 101 canonical ids in descending order.
+_AUDIT_IDS: Final[tuple[str, ...]] = tuple(
+    str(uuid.UUID(f"{0xF0000000 - n:08x}-{n:04x}-4029-8000-{0x029000000000 + n:012x}"))
+    for n in range(101)
+)
+# The six keys of today's tool.call row (record_tool_call).
+_SIX_KEYS: Final[dict[str, Any]] = {
+    "tool": "memory",
+    "action": "read",
+    "decision": "allow",
+    "success": True,
+    "duration_ms": 42,
+    "escalated": False,
+}
+
+
+def _tool_call_metadata(**extra: Any) -> str:
+    """Today's six keys plus ``extra``, as the JSON text record() binds."""
+    return json.dumps({**_SIX_KEYS, **extra})
+
+
+def _sized_metadata(total: int) -> str:
+    """``{"a": 1...1, "b": 1...1}`` of exactly ``total`` bytes, which is also its jsonb
+    text form; two integers stay below Python's 4300-digit int conversion limit."""
+    digits = total - len('{"a": , "b": }')
+    first = digits // 2
+    return '{"a": ' + "1" * first + ', "b": ' + "1" * (digits - first) + "}"
+
+
+# Contract Amendment A1's verified cases (postgres:16-alpine), plus the size boundary.
+_ACCEPTED_METADATA: Final = [
+    pytest.param(json.dumps(_SIX_KEYS), id="todays-six-keys"),
+    pytest.param(
+        _tool_call_metadata(attachment_ids=list(_AUDIT_IDS[:1]), attachment_count=1),
+        id="one-id-and-its-count",
+    ),
+    pytest.param(
+        _tool_call_metadata(attachment_ids=list(_AUDIT_IDS[:100]), attachment_count=150),
+        id="hundred-ids-and-a-count-of-150",
+    ),
+    pytest.param(_sized_metadata(_METADATA_BYTES), id="exactly-8192-bytes"),
+]
+_REFUSED_METADATA: Final = [
+    pytest.param(
+        _tool_call_metadata(attachment_ids=list(_AUDIT_IDS), attachment_count=101), id="101-ids"
+    ),
+    pytest.param(_tool_call_metadata(attachment_ids=[]), id="empty-ids"),
+    pytest.param(_tool_call_metadata(attachment_ids=["report-2026"]), id="non-uuid-string"),
+    pytest.param(_tool_call_metadata(attachment_ids=[_AUDIT_IDS[0].upper()]), id="upper-case-id"),
+    pytest.param(_tool_call_metadata(attachment_ids=[7]), id="number-in-ids"),
+    pytest.param(_tool_call_metadata(attachment_ids=7), id="number-as-ids"),
+    pytest.param(_tool_call_metadata(attachment_ids=[[_AUDIT_IDS[0]]]), id="nested-array"),
+    pytest.param(_tool_call_metadata(attachment_ids={"id": _AUDIT_IDS[0]}), id="object-as-ids"),
+    pytest.param(_tool_call_metadata(attachment_ids=_AUDIT_IDS[0]), id="plain-string-as-ids"),
+    pytest.param(_tool_call_metadata(ids=[_AUDIT_IDS[0]]), id="array-under-another-key"),
+    pytest.param(_tool_call_metadata(target={"id": _AUDIT_IDS[0]}), id="object-under-another-key"),
+    pytest.param(_tool_call_metadata(note="Quarterly report.pdf"), id="free-text"),
+    pytest.param(_tool_call_metadata(**{"Bad-Key": 1}), id="bad-key"),
+    pytest.param(json.dumps({f"k{n}": n for n in range(17)}), id="17-keys"),
+    pytest.param(_sized_metadata(_METADATA_BYTES + 1), id="8193-bytes"),
+    pytest.param(json.dumps(list(_AUDIT_IDS[:1])), id="not-an-object"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +451,146 @@ def _header_lines() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers: the audit metadata CHECK (Amendment A1)
+# ---------------------------------------------------------------------------
+
+
+def _jsonpath_canon(path: str) -> str:
+    """A jsonpath literal without the whitespace outside its "..." strings."""
+    out: list[str] = []
+    in_string = False
+    escaped = False
+    for char in path:
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+            out.append(char)
+        elif not char.isspace():
+            out.append(char)
+    return "".join(out)
+
+
+def _condition_canon(text: str) -> str:
+    """0029's canonical form, with every '...' literal read as jsonpath."""
+    return _expr(re.sub(r"'((?:[^']|'')*)'", lambda m: f"'{_jsonpath_canon(m.group(1))}'", text))
+
+
+def _conjuncts(expression: str) -> list[str]:
+    """The top-level AND-ed parts of an expression, unwrapped: the AND of a BETWEEN and
+    the ANDs inside parentheses or a CASE ... END are no separators."""
+    expression = _unwrap(expression)
+    masked = _masked(expression)
+    parts: list[str] = []
+    depth = 0
+    start = 0
+    in_between = False
+    for token in re.finditer(r"\(|\)|\bcase\b|\bend\b|\bbetween\b|\band\b", masked):
+        word = token.group(0)
+        if word in {"(", "case"}:
+            depth += 1
+        elif word in {")", "end"}:
+            depth -= 1
+        elif depth:
+            continue
+        elif word == "between":
+            in_between = True
+        elif in_between:
+            in_between = False
+        else:
+            parts.append(expression[start : token.start()])
+            start = token.end()
+    parts.append(expression[start:])
+    return [_unwrap(part) for part in parts]
+
+
+def _check_meaning(expression: str) -> Any:
+    """A CHECK expression's meaning: an AND as the frozenset of its parts' meanings, a
+    one-WHEN CASE as ("case", when, then, else), anything else canonical."""
+    expression = _unwrap(_normalize(expression))
+    parts = _conjuncts(expression)
+    if len(parts) > 1:
+        return frozenset(_check_meaning(part) for part in parts)
+    case = _CASE_RE.fullmatch(_masked(expression))
+    if case is not None:
+        return (
+            "case",
+            *(
+                _check_meaning(expression[case.start(group) : case.end(group)])
+                for group in ("when", "then", "else")
+            ),
+        )
+    return _condition_canon(expression)
+
+
+def _then_conditions(meaning: Any) -> frozenset[Any]:
+    """The AND-ed conditions of a CASE meaning's THEN branch."""
+    assert isinstance(meaning, tuple), "the CHECK is one CASE WHEN ... THEN ... ELSE ... END"
+    then = meaning[2]
+    return then if isinstance(then, frozenset) else frozenset({then})
+
+
+def _metadata_check_steps() -> list[tuple[str, str, str]]:
+    """(table, "drop" | "add", the added expression or "") for every ALTER TABLE action
+    of 0029 on audit_events_metadata_check, in order."""
+    steps: list[tuple[str, str, str]] = []
+    for table, action in _alter_actions():
+        masked = _masked(action)
+        if _DROP_METADATA_CHECK_RE.fullmatch(masked):
+            steps.append((table, "drop", ""))
+        elif (added := _ADD_METADATA_CHECK_RE.fullmatch(masked)) is not None:
+            steps.append(
+                (table, "add", action[added.start("expression") : added.end("expression")])
+            )
+    return steps
+
+
+def _new_metadata_check() -> str:
+    """The expression 0029 re-adds audit_events_metadata_check with (exactly once)."""
+    added = [
+        expression
+        for table, kind, expression in _metadata_check_steps()
+        if (table, kind) == (_AUDIT_TABLE, "add")
+    ]
+    assert len(added) == 1, f"{_MIGRATION_NAME} must re-add {_METADATA_CHECK} once"
+    return added[0]
+
+
+def _old_metadata_check() -> str:
+    """0005's audit_events_metadata_check expression (inside CREATE TABLE audit_events)."""
+    sql = _normalize((db_mod._MIGRATIONS_DIR / _AUDIT_MIGRATION).read_text(encoding="utf-8"))
+    masked = _masked(sql)
+    found = re.search(rf'constraint "?{_METADATA_CHECK}"? check ?\(', masked)
+    assert found is not None, f"{_AUDIT_MIGRATION} defines no {_METADATA_CHECK}"
+    return sql[found.end() : _balanced_end(masked, found.end() - 1)]
+
+
+def _metadata_check_name() -> str:
+    """The name the fake's refusals must carry: the constraint 0029 re-adds (fails the
+    calling test while 0029 doesn't re-add it)."""
+    _new_metadata_check()
+    return _METADATA_CHECK
+
+
+def _action_kind(table: str, action: str) -> tuple[str, str]:
+    """(table, what the action does) for the column and the metadata CHECK, else the action."""
+    masked = _masked(action)
+    if (column := _ADD_COLUMN_RE.fullmatch(masked)) is not None:
+        return table, f"add column {column.group('name')}"
+    if _DROP_METADATA_CHECK_RE.fullmatch(masked):
+        return table, f"drop {_METADATA_CHECK}"
+    if _ADD_METADATA_CHECK_RE.fullmatch(masked):
+        return table, f"add {_METADATA_CHECK}"
+    return table, action
+
+
+# ---------------------------------------------------------------------------
 # Helpers: the FakeDb
 # ---------------------------------------------------------------------------
 
@@ -301,6 +604,27 @@ async def _insert(db: FakeDb, chat: uuid.UUID, role: str, ids: Any) -> Any:
     tool_call_id = "tc-1" if role == "tool" else None
     return await db.pool.fetchval(
         _INSERT_WITH_IDS, chat, ORG_ID, role, "Answer", None, tool_call_id, None, "complete", ids
+    )
+
+
+def _audit_db() -> FakeDb:
+    db = FakeDb()
+    db.add_org(ORG_ID)
+    return db
+
+
+async def _insert_audit(db: FakeDb, metadata: str) -> Any:
+    """A member's tool.call row on a chat, with ``metadata`` bound as the JSON text."""
+    return await db.pool.execute(
+        _AUDIT_INSERT,
+        ORG_ID,
+        _ACTOR,
+        "member",
+        "tool.call",
+        "chat",
+        json.dumps([str(_TARGET_CHAT)]),
+        None,
+        metadata,
     )
 
 
@@ -373,6 +697,10 @@ class TestMigration0029File:
         assert len(lines) >= 3
         assert _COLUMN in " ".join(lines)
 
+    def test_migration_0029_header_comment_names_the_metadata_check_replacement(self) -> None:
+        """Amendment A1: the header explains why audit_events_metadata_check is replaced."""
+        assert _METADATA_CHECK in " ".join(_header_lines())
+
 
 # ---------------------------------------------------------------------------
 # 2. The included_attachment_ids column
@@ -383,12 +711,11 @@ class TestMigration0029Column:
     """ALTER TABLE chat_messages ADD COLUMN included_attachment_ids UUID[] with its CHECK."""
 
     def test_migration_0029_adds_only_the_included_attachment_ids_column(self) -> None:
-        """One ALTER TABLE action: no other column, constraint, owner or trigger change."""
+        """One ADD COLUMN on any table: no other column (the metadata CHECK's DROP and ADD
+        CONSTRAINT are pinned by TestMigration0029MetadataCheck and the scope tests)."""
         actions = [(table, _ADD_COLUMN_RE.fullmatch(_masked(a))) for table, a in _alter_actions()]
 
-        assert [(table, m.group("name") if m else None) for table, m in actions] == [
-            (_TABLE, _COLUMN)
-        ]
+        assert [(table, m.group("name")) for table, m in actions if m] == [(_TABLE, _COLUMN)]
 
     def test_migration_0029_column_is_a_nullable_uuid_array_without_default(self) -> None:
         """UUID[] (ids only), NULL when the slot held no attachment, no default, no
@@ -434,7 +761,67 @@ class TestMigration0029Column:
 
 
 # ---------------------------------------------------------------------------
-# 3. Privileges
+# 3. The audit metadata CHECK (Amendment A1, security audit F1)
+# ---------------------------------------------------------------------------
+
+
+class TestMigration0029MetadataCheck:
+    """audit_events_metadata_check is replaced so a tool.call row can carry its ids."""
+
+    def test_migration_0029_metadata_check_is_dropped_then_re_added_under_its_name(
+        self,
+    ) -> None:
+        """A plain DROP (no IF EXISTS, no CASCADE), then one ADD of the same name on
+        audit_events, with nothing after the expression (no NOT VALID)."""
+        steps = [(table, kind) for table, kind, _ in _metadata_check_steps()]
+
+        assert steps == [(_AUDIT_TABLE, "drop"), (_AUDIT_TABLE, "add")]
+
+    def test_migration_0029_metadata_check_caps_the_metadata_at_8192_bytes(self) -> None:
+        """octet_length(metadata::text) <= 8192, and no other size condition."""
+        then = _then_conditions(_check_meaning(_new_metadata_check()))
+        sizes = [c for c in then if isinstance(c, str) and c.startswith("octet_length(")]
+
+        assert sizes == [_check_meaning(_SIZE_CAP)]
+
+    def test_migration_0029_metadata_check_allows_1_to_100_uuids_under_attachment_ids_only(
+        self,
+    ) -> None:
+        """attachment_ids, when present, is an array of 1 to 100 canonical lowercase UUID
+        strings, and it is the only key the scalar rule exempts."""
+        then = _then_conditions(_check_meaning(_new_metadata_check()))
+
+        assert {
+            "attachment_ids rule": _check_meaning(_ATTACHMENT_IDS_RULE) in then,
+            "scalar rule exempts attachment_ids only": _check_meaning(_SCALAR_VALUES) in then,
+        } == {"attachment_ids rule": True, "scalar rule exempts attachment_ids only": True}
+
+    def test_migration_0029_metadata_check_keeps_every_other_rule_of_0005(self) -> None:
+        """0005's object test, ELSE false, 16 keys and key regex stay as they were; only
+        the size cap and the value rule (now for every key but attachment_ids) change,
+        and the attachment_ids rule is added."""
+        old = _check_meaning(_old_metadata_check())
+        new = _check_meaning(_new_metadata_check())
+        old_then = _then_conditions(old)
+        replaced = {_check_meaning(_OLD_SIZE_CAP), _check_meaning(_OLD_SCALAR_VALUES)}
+        kept = {_check_meaning(_KEY_COUNT), _check_meaning(_KEY_NAMES)}
+        added = {
+            _check_meaning(_SIZE_CAP),
+            _check_meaning(_SCALAR_VALUES),
+            _check_meaning(_ATTACHMENT_IDS_RULE),
+        }
+
+        assert old_then == replaced | kept
+        assert _then_conditions(new) == kept | added
+        assert (new[0], new[1], new[3]) == (old[0], old[1], old[3])
+
+    def test_migration_0029_metadata_check_means_the_contract_check(self) -> None:
+        """Nothing more and nothing less than Amendment A1's verified CHECK."""
+        assert _check_meaning(_new_metadata_check()) == _check_meaning(_CONTRACT_METADATA_CHECK)
+
+
+# ---------------------------------------------------------------------------
+# 4. Privileges
 # ---------------------------------------------------------------------------
 
 
@@ -454,17 +841,37 @@ class TestMigration0029Privileges:
 
 
 # ---------------------------------------------------------------------------
-# 4. Nothing else
+# 5. Nothing else
 # ---------------------------------------------------------------------------
 
 
 class TestMigration0029Scope:
-    """Only the column and its CHECK."""
+    """Only the column with its CHECK, and the audit metadata CHECK's replacement."""
 
-    def test_migration_0029_runs_exactly_one_alter_table_on_chat_messages(self) -> None:
-        statements = _statements()
+    def test_migration_0029_runs_the_column_alter_and_the_metadata_check_statements_only(
+        self,
+    ) -> None:
+        """One ALTER TABLE chat_messages; every other statement drops or adds a
+        constraint on audit_events (which ones: the next test)."""
+        kinds = [
+            next((kind for kind, p in _ALLOWED_STATEMENTS.items() if p.fullmatch(_masked(s))), s)
+            for s in _statements()
+        ]
 
-        assert [bool(_ALLOWED_STATEMENT.fullmatch(_masked(s))) for s in statements] == [True]
+        assert (sorted(set(kinds)), kinds.count("column")) == (["column", "metadata check"], 1)
+
+    def test_migration_0029_alters_only_the_column_and_the_metadata_check(self) -> None:
+        """Every ALTER TABLE action, in order: the column, then the metadata CHECK's DROP
+        and ADD. No other audit_events change (no column, other constraint, trigger or
+        owner), and the action catalog (audit_events_action_check) isn't named."""
+        kinds = [_action_kind(table, action) for table, action in _alter_actions()]
+
+        assert kinds == [
+            (_TABLE, f"add column {_COLUMN}"),
+            (_AUDIT_TABLE, f"drop {_METADATA_CHECK}"),
+            (_AUDIT_TABLE, f"add {_METADATA_CHECK}"),
+        ]
+        assert _ACTION_CHECK not in _normalize(_raw_sql())
 
     def test_migration_0029_runs_no_grant_code_or_data_write(self) -> None:
         """No GRANT / REVOKE, DO block, function, trigger, role, INSERT / UPDATE / DELETE /
@@ -483,7 +890,7 @@ class TestMigration0029Scope:
 
 
 # ---------------------------------------------------------------------------
-# 5. tests/db_fakes.py mirrors 0029
+# 6. tests/db_fakes.py mirrors 0029
 # ---------------------------------------------------------------------------
 
 
@@ -568,3 +975,29 @@ class TestMigration0029FakeDb:
         assert added == [_COLUMN]
         assert list(row) == [*(name for name, _ in _table_0024(_TABLE).columns), *added]
         assert row[_COLUMN] is None
+
+    @pytest.mark.parametrize("metadata", _ACCEPTED_METADATA)
+    async def test_migration_0029_fake_audit_insert_stores_what_the_shipped_metadata_check_accepts(
+        self, metadata: str
+    ) -> None:
+        """Amendment A1: the contract's verified accepted rows, and exactly 8192 bytes."""
+        _metadata_check_name()
+        db = _audit_db()
+
+        await _insert_audit(db, metadata)
+
+        assert [row["metadata"] for row in db.audit] == [json.loads(metadata)]
+
+    @pytest.mark.parametrize("metadata", _REFUSED_METADATA)
+    async def test_migration_0029_fake_audit_insert_refuses_what_the_shipped_metadata_check_refuses(
+        self, metadata: str
+    ) -> None:
+        """CheckViolationError on the shipped constraint's name; nothing is stored."""
+        name = _metadata_check_name()
+        db = _audit_db()
+
+        with pytest.raises(asyncpg.CheckViolationError) as caught:
+            await _insert_audit(db, metadata)
+
+        assert caught.value.constraint_name == name
+        assert db.audit == []

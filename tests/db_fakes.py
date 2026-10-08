@@ -396,6 +396,24 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   INSERT INTO audit_events whose action isn't in ``AUDIT_ACTIONS`` (migration
   0021's catalog plus file.upload) is CheckViolationError, before the foreign
   key; ``add_audit`` seeds any action.
+- The audit metadata rule (``AUDIT_METADATA_CHECK``,
+  ``audit_events_metadata_check``; GH-189 contract Amendment A1): every INSERT
+  INTO audit_events is checked after the action catalog and before the
+  foreign key (PostgreSQL runs a table's CHECKs in name order, its foreign
+  keys at the end of the statement); a refusal is CheckViolationError naming
+  the constraint, with nothing stored. The fake enforces the definition the
+  shipped migrations leave in place (``audit_metadata_check_amended()``):
+  0005's until a later migration re-adds the constraint, then the amended
+  one. Both: a JSON object of at most 16 keys, each ``^[a-z][a-z0-9_]{0,39}$``,
+  every value a scalar and every string value a ``^[a-z0-9_-]{1,64}$`` token.
+  0005: no array anywhere, at most 4096 bytes. Amended: at most 8192 bytes,
+  and ``attachment_ids`` (only it, when present) is an array of 1 to 100
+  canonical lowercase UUID strings. The byte count is that of PostgreSQL's
+  jsonb text form (``metadata::text``) as the fake's JSONB input
+  (``_jsonb_text``) approximates it: jsonb key order, duplicate keys
+  collapsed (the last wins), ``", "`` and ``": "`` separators, strings UTF-8
+  (not ``\\u``-escaped), integers as written, floats as Python prints them.
+  ``add_audit`` seeds without this check too.
 - Helpers: ``add_attachment(chat_id, *, attachment_id=None, filename='a.pdf',
   kind='pdf', size_bytes=1, status='uploaded', failure_reason=None,
   page_count=None, token_estimate=None, derived_bytes=None, message_id=None,
@@ -599,6 +617,7 @@ Security notes:
 from __future__ import annotations
 
 import copy
+import functools
 import hashlib
 import json
 import re
@@ -610,6 +629,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from ipaddress import ip_address
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg
@@ -1222,6 +1242,25 @@ _AUDIT_ROW_ORDER: Final = (
     "ip",
     "metadata",
 )
+# GH-189 (contract Amendment A1): audit_events_metadata_check, as migration 0005
+# defines it and as a later migration (0029) replaces it.
+AUDIT_METADATA_CHECK: Final = "audit_events_metadata_check"
+_AUDIT_METADATA_KEYS_MAX: Final = 16
+_AUDIT_METADATA_KEY_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,39}")
+_AUDIT_METADATA_TOKEN_RE: Final = re.compile(r"[a-z0-9_-]{1,64}")
+_AUDIT_UUID_TEXT_RE: Final = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+_AUDIT_METADATA_BYTES_0005: Final = 4096
+_AUDIT_METADATA_BYTES_AMENDED: Final = 8192
+_AUDIT_ATTACHMENT_IDS_KEY: Final = "attachment_ids"
+_AUDIT_ATTACHMENT_IDS_MAX: Final = 100
+# A migration statement (comments removed, whitespace collapsed, lowercased) that
+# re-adds the constraint.
+_ADD_METADATA_CHECK_RE: Final = re.compile(
+    rf'add constraint (?:"?public"?\.)?"?{AUDIT_METADATA_CHECK}"?\b'
+)
+_SQL_COMMENT_RE: Final = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 
 
 # GH-166: migration 0021's users_timezone_check (the shape; the app checks the zone exists).
@@ -3330,6 +3369,7 @@ class FakeDb:
         assert "id" not in values and "occurred_at" not in values, "no backdating"
         row: dict[str, Any] = {"id": uuid.uuid4(), "occurred_at": datetime.now(UTC)}
         row.update(values)
+        metadata_text = row["metadata"]
         row["target_ids"] = json.loads(row["target_ids"])
         row["metadata"] = json.loads(row["metadata"])
         row["ip"] = None if row["ip"] is None else str(row["ip"])
@@ -3337,15 +3377,11 @@ class FakeDb:
             raise AuditWriteError("the audit write was refused")
         if row.get("action") not in AUDIT_ACTIONS:
             # GH-187: audit_events_action_check (migration 0027), before the foreign key.
-            failing = ", ".join(_pg_text(row.get(column)) for column in _AUDIT_ROW_ORDER)
-            raise _pg_error(
-                asyncpg.exceptions.CheckViolationError,
-                'new row for relation "audit_events" violates check constraint'
-                ' "audit_events_action_check"',
-                table="audit_events",
-                constraint="audit_events_action_check",
-                detail=f"Failing row contains ({failing}).",
-            )
+            raise _audit_check_violation("audit_events_action_check", row)
+        if not _audit_metadata_valid(metadata_text, amended=audit_metadata_check_amended()):
+            # GH-189: audit_events_metadata_check (0005, or as a later migration
+            # re-adds it), after the action CHECK (name order), before the foreign key.
+            raise _audit_check_violation(AUDIT_METADATA_CHECK, row)
         org_id = row.get("org_id")
         if org_id is not None and _canonical(org_id) not in self.orgs:
             msg = 'insert or update on table "audit_events" violates foreign key constraint'
@@ -4136,6 +4172,78 @@ def _compare(operator: str, left: Any, right: Any) -> bool:
 # GH-176: the chats and chat_messages tables (migration 0024): driver-shaped
 # errors, asyncpg's encoders, PostgreSQL's JSONB input and row comparison.
 # ---------------------------------------------------------------------------
+
+
+def _audit_check_violation(constraint: str, row: dict[str, Any]) -> asyncpg.PostgresError:
+    """The CheckViolationError PostgreSQL raises for an audit_events CHECK, with the row."""
+    failing = ", ".join(_pg_text(row.get(column)) for column in _AUDIT_ROW_ORDER)
+    return _pg_error(
+        asyncpg.exceptions.CheckViolationError,
+        f'new row for relation "audit_events" violates check constraint "{constraint}"',
+        table="audit_events",
+        constraint=constraint,
+        detail=f"Failing row contains ({failing}).",
+    )
+
+
+@functools.cache
+def audit_metadata_check_amended() -> bool:
+    """Whether a shipped migration after 0005 re-adds ``audit_events_metadata_check``.
+
+    The migrations next to the ``admino.database`` that is imported (the
+    module's own directory, not the patchable ``_MIGRATIONS_DIR``), comments
+    removed. False: the database holds 0005's CHECK, which refuses every array
+    value (GH-189 security audit F1).
+    """
+    from admino import database
+
+    directory = Path(database.__file__).parent / "migrations"
+    for path in sorted(directory.glob("*.sql")):
+        match = re.match(r"(\d{4})_", path.name)
+        if match is None or int(match.group(1)) <= 5:
+            continue
+        sql = _SQL_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8"))
+        if _ADD_METADATA_CHECK_RE.search(re.sub(r"\s+", " ", sql).lower()):
+            return True
+    return False
+
+
+def _audit_metadata_valid(text: str, *, amended: bool) -> bool:
+    """``audit_events_metadata_check`` on the bound metadata JSON text.
+
+    0005 (``amended=False``): an object of at most 4096 bytes and 16 keys
+    matching ``^[a-z][a-z0-9_]{0,39}$``, no object or array value, every string
+    value a ``^[a-z0-9_-]{1,64}$`` token. Amended (contract Amendment A1, as
+    verified on postgres:16-alpine): at most 8192 bytes; ``attachment_ids`` is
+    exempt from the value rule and, when present, must be an array of 1 to 100
+    strings matching the canonical lowercase UUID regex.
+    """
+    # octet_length(metadata::text): the bytes of the jsonb text form, which
+    # _jsonb_text approximates (jsonb key order, duplicate keys collapsed).
+    stored = _jsonb_text(text)
+    metadata = json.loads(stored)
+    if type(metadata) is not dict:
+        return False
+    limit = _AUDIT_METADATA_BYTES_AMENDED if amended else _AUDIT_METADATA_BYTES_0005
+    if len(stored.encode()) > limit or len(metadata) > _AUDIT_METADATA_KEYS_MAX:
+        return False
+    if any(_AUDIT_METADATA_KEY_RE.fullmatch(key) is None for key in metadata):
+        return False
+    for key, value in metadata.items():
+        if amended and key == _AUDIT_ATTACHMENT_IDS_KEY:
+            continue
+        if isinstance(value, dict | list):
+            return False
+        if type(value) is str and _AUDIT_METADATA_TOKEN_RE.fullmatch(value) is None:
+            return False
+    if not amended or _AUDIT_ATTACHMENT_IDS_KEY not in metadata:
+        return True
+    ids = metadata[_AUDIT_ATTACHMENT_IDS_KEY]
+    return (
+        type(ids) is list
+        and 1 <= len(ids) <= _AUDIT_ATTACHMENT_IDS_MAX
+        and all(type(item) is str and _AUDIT_UUID_TEXT_RE.fullmatch(item) for item in ids)
+    )
 
 
 def _pg_error(
