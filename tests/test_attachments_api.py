@@ -1915,6 +1915,11 @@ _WIDE_SIZE: Final = len(_WIDE)
 _WIDE_REFUSED: Final = (416, _RANGE_NOT_SATISFIABLE, "application/json", f"bytes */{_WIDE_SIZE}")
 _MAX_RANGES: Final = 16
 _MAX_RANGE_HEADER_CHARS: Final = 1024
+# The longest padded ``0-000...9`` range _range_of_length writes: its end stays far below
+# int()'s 4,300-digit limit (past it Starlette drops the range).
+_PADDED_RANGE_CHARS: Final = 1024
+# Starlette 1.7 ignores a Range of more than 100 comma-separated ranges (the whole file).
+_STARLETTE_MAX_RANGES: Final = 100
 
 
 def _separate_ranges(count: int) -> str:
@@ -1924,13 +1929,18 @@ def _separate_ranges(count: int) -> str:
 
 
 def _range_of_length(length: int) -> str:
-    """A valid Range of exactly ``length`` characters for the first ten bytes: copies of
-    ``0-9`` (overlapping, so they merge into one part), then ``0-`` and an end of ``9``
-    padded with fewer than 100 leading zeros (far below int()'s digit limit)."""
-    head = "bytes=" + "0-9," * max(0, (length - 100) // 4) + "0-"
-    zeros = length - len(head) - 1
-    assert zeros >= 0, length
-    return f"{head}{'0' * zeros}9"
+    """A valid Range of exactly ``length`` characters for the first ten bytes, the same on
+    every Starlette version: ``0-`` and an end of ``9`` padded with leading zeros, one such
+    range up to ``_PADDED_RANGE_CHARS`` characters (1,024 and 1,025 are a single range),
+    else as few equal copies as fit (they overlap, so one part), never more than
+    Starlette 1.7's 100 ranges."""
+    body = length - len("bytes=")
+    count = -(-(body + 1) // (_PADDED_RANGE_CHARS + 1))  # ranges, a comma between two
+    width, longer = divmod(body - (count - 1), count)
+    ranges = ["0-" + "0" * (width + (index < longer) - 3) + "9" for index in range(count)]
+    header = "bytes=" + ",".join(ranges)
+    assert (len(header), width >= 3, count <= _STARLETTE_MAX_RANGES) == (length, True, True)
+    return header
 
 
 def _first_ten(response: httpx.Response) -> tuple[int, str | None, bytes]:
@@ -2030,7 +2040,8 @@ class TestAttachmentsDownloadRangeLimits:
     def test_attachments_api_download_range_header_over_1024_chars_is_416(
         self, env: _Env, length: int
     ) -> None:
-        """A valid Range (overlapping copies of ``0-9``: one part) that is too long."""
+        """A valid Range of the first ten bytes (one part, ``_range_of_length``) that is
+        too long."""
         caller = env.world.a["editor"]
         attachment = _seed(env, caller, _WIDE)
         header = _range_of_length(length)
@@ -2132,7 +2143,8 @@ class TestAttachmentsDownloadRangeLimits:
         [
             pytest.param(_separate_ranges(17) + ",quokkalimit281", id="seventeen-parts"),
             pytest.param(
-                "bytes=quokkalimit281," + "0-9," * 300 + "0-9", id="header-over-1024-chars"
+                _range_of_length(1025).replace("bytes=", "bytes=quokkalimit281,", 1),
+                id="header-over-1024-chars",
             ),
         ],
     )
