@@ -26,7 +26,9 @@ What is pinned here:
 - Contract Amendment A1 (C10, security audit F1), the Python mirror of the database's
   ``audit_events_metadata_check``: a list value is allowed under the key
   ``attachment_ids`` only; under any other key (``ids``, ``attachments``, ``tool``,
-  ``target_ids``) it is refused with ``AuditRecordError`` and nothing is written. The
+  ``target_ids``) it is refused with ``AuditRecordError`` and nothing is written; under
+  ``attachment_ids`` a scalar (None, a bare UUID, a bool, an int, a vocabulary token) is
+  refused the same way, as the CHECK refuses any non-array (security re-audit R1). The
   metadata JSON text stays within 8192 bytes: the largest metadata the other rules let
   through (16 keys: 100 ids plus 15 forty-character keys holding UUIDs, about 5.3 KB,
   over 0005's 4096) is accepted, and through tests/db_fakes.py's enforced CHECK
@@ -672,6 +674,25 @@ class TestMainRecorderForwardsAttachmentIds:
 # Keys a list must not hide under: only attachment_ids may hold one.
 _OTHER_LIST_KEYS: Final = ("ids", "attachments", "tool", "target_ids")
 
+# Security re-audit R1: values valid under any other key, but no array, so the CHECK
+# refuses them under attachment_ids (a safe-range int, a vocabulary token, a bare UUID).
+_SAFE_INT: Final = 4189
+_SCALARS_UNDER_ATTACHMENT_IDS: Final = [
+    pytest.param(None, id="none"),
+    pytest.param(_ID, id="single-uuid"),
+    pytest.param(True, id="bool"),
+    pytest.param(0, id="zero"),
+    pytest.param(_SAFE_INT, id="int"),
+    pytest.param("allow", id="vocabulary-token"),
+]
+
+
+def _scalar_markers(value: object) -> list[str]:
+    """_markers() plus the decimal text of a multi-digit int."""
+    if type(value) is int and abs(value) >= 1000:
+        return [str(value)]
+    return _markers(value)
+
 
 def _largest_metadata() -> dict[str, Any]:
     """The largest metadata the key, value and count rules allow: 100 ids under
@@ -743,6 +764,44 @@ class TestMetadataRuleSharedWithTheDatabase:
             }
         ]
         assert 4096 < len(json.dumps(stored[0]).encode()) <= 8192
+
+    @pytest.mark.parametrize("value", _SCALARS_UNDER_ATTACHMENT_IDS)
+    async def test_audit_events_scalar_under_attachment_ids_raises_and_writes_nothing(
+        self, conn: MagicMock, value: object
+    ) -> None:
+        """Security re-audit R1: the CHECK refuses any attachment_ids that is no array, so
+        a scalar there (each one valid under another key) is refused before any write."""
+        await _record_list(conn, [_ID])
+        conn.execute.reset_mock()
+
+        with pytest.raises(AuditRecordError) as caught:
+            await _record_list(conn, value)
+
+        conn.execute.assert_not_awaited()
+        _assert_refused_cleanly(caught.value, value)
+        text = str(caught.value) + repr(caught.value.args)
+        assert [m for m in _scalar_markers(value) if m.lower() in text.lower()] == []
+
+    @pytest.mark.parametrize("value", _SCALARS_UNDER_ATTACHMENT_IDS)
+    def test_audit_events_scalar_under_attachment_ids_on_the_event_model_is_a_validation_error(
+        self, value: object
+    ) -> None:
+        """Security re-audit R1 at the model: refused, and the error doesn't show it."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as caught:
+            AuditEvent.model_validate(
+                {
+                    "org_id": _ORG,
+                    "actor_kind": "member",
+                    "actor_user_id": _USER,
+                    "action": AuditAction.TOOL_CALL,
+                    "metadata": {"attachment_ids": value},
+                }
+            )
+
+        text = str(caught.value).lower()
+        assert [m for m in _scalar_markers(value) if m.lower() in text] == []
 
     @pytest.mark.parametrize("size", [1, 100, 101, 150])
     async def test_audit_events_record_tool_call_with_ids_passes_the_database_check(
