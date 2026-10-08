@@ -22,8 +22,9 @@ is not. Spec:
   only, the methods ``GET, POST, PATCH, DELETE``, ``Content-Type`` as the one
   configured request header, ``Authorization`` refused, no credentials), the answer
   to a simple cross-origin request, and an ``OPTIONS`` without
-  ``Access-Control-Request-Method`` (not a preflight: the route answers its ``405``,
-  with the API headers).
+  ``Access-Control-Request-Method`` (not a preflight: routing answers its ``405``, with
+  the API headers; the route's names ``Allow: POST``, the PWA mount's, which gets the
+  request when the PWA is mounted at ``/``, names no method).
 - docs/configuration.md: the ``no-store`` paragraph of ``### Compression and
   caching`` names preflights.
 
@@ -31,9 +32,16 @@ Each unchanged case is checked next to an ``/api`` preflight of the same app, so
 proves the rule is active *and* leaves that case as it is. ``Vary`` is checked only
 for ``Origin``: Starlette's other ``Vary`` values differ between its versions.
 
-Inputs: the app from ``create_app()`` (tests/tenancy_world.py's ``make_app``, no
-static mount, ``public_url`` = ``tests.db_fakes.PUBLIC_URL``) behind the FakeDb, with
-the database health check patched. Outputs: assertions only.
+Inputs: the app from ``create_app()`` (tests/tenancy_world.py's ``make_app``,
+``public_url`` = ``tests.db_fakes.PUBLIC_URL``) behind the FakeDb, with the database
+health check patched. ``create_app`` mounts the PWA at ``/`` when it finds a build
+(``ADMINO_STATIC_DIR``, ``/app/static``, ``<repo>/static``), so the ``client``
+fixture's app has the mount in a tree with a build and none in CI; its tests are
+answered before routing (preflights) or by a route that matches before the mount, so
+their answers are the same either way. The non-preflight ``OPTIONS`` test, which the
+mount answers when present, builds both deployments explicitly: the PWA mounted from a
+``tmp_path`` site (tests/test_static_cache_headers.py's ``_write_site``) and the app
+without the mount. Outputs: assertions only.
 
 Security notes: every origin, path and id is a fixed fake value. No test reaches the
 database, an LLM, Google or Microsoft.
@@ -48,6 +56,8 @@ from typing import TYPE_CHECKING, Final
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.routing import Mount
+from starlette.staticfiles import StaticFiles
 
 from tests.db_fakes import PUBLIC_URL, FakeDb
 from tests.tenancy_world import (
@@ -58,9 +68,11 @@ from tests.tenancy_world import (
     use_roomy_rate_limits,
 )
 from tests.test_api_no_store import _SECURITY_HEADERS
+from tests.test_static_cache_headers import _write_site
 
 if TYPE_CHECKING:
     import httpx
+    from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
 _CONFIGURATION: Final = Path(__file__).resolve().parent.parent / "docs" / "configuration.md"
@@ -91,6 +103,13 @@ _ALLOW_METHODS: Final = ["GET, POST, PATCH, DELETE"]
 _ALLOW_HEADERS: Final = ["Accept, Accept-Language, Content-Language, Content-Type"]
 _MAX_AGE: Final = ["600"]
 _METHOD_NOT_ALLOWED: Final = {"detail": "Method Not Allowed"}
+
+# Who answers an OPTIONS /api/message that is not a preflight, by deployment, and the
+# Allow header of that 405 today. Without the PWA (CI's backend job, a tree without
+# `npm run build`) the route answers and names its method. With the PWA mounted at /
+# (the Docker image's /app/static, a tree with a build) routing hands the request to
+# the mount, whose StaticFiles 405 names none. The Allow value tells the two apart.
+_NOT_A_PREFLIGHT_ALLOW: Final = {"api-only": ["POST"], "pwa-mounted": []}
 
 
 @dataclass(frozen=True)
@@ -167,13 +186,50 @@ def _section(text: str, heading: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture()
-def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
-    """The app (no static mount) behind an empty FakeDb, roomy rate buckets and a
-    patched database health check, and a client that doesn't follow redirects."""
+def _use_fakes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty FakeDb, roomy rate buckets and a patched database health check."""
     use_fake_database(monkeypatch, FakeDb())
     use_roomy_rate_limits(monkeypatch)
     monkeypatch.setattr("admino.database.check_health", AsyncMock(return_value=True))
+
+
+def _without_pwa_mount(app: FastAPI) -> FastAPI:
+    """``app`` without the static mount ``create_app`` adds when it finds a PWA build.
+
+    That is the app ``create_app`` builds when it finds none (the mount is its only
+    static route, added last), whether or not this tree has a build.
+    """
+    app.router.routes[:] = [
+        route
+        for route in app.router.routes
+        if not (isinstance(route, Mount) and isinstance(route.app, StaticFiles))
+    ]
+    return app
+
+
+def _deployed_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, deployment: str
+) -> TestClient:
+    """A client of the app of ``deployment`` (``_NOT_A_PREFLIGHT_ALLOW``), behind the fakes.
+
+    ``pwa-mounted``: the PWA mounted at ``/`` from a ``tmp_path`` site
+    (``ADMINO_STATIC_DIR`` comes first in ``create_app``'s lookup). ``api-only``: the app
+    without the mount.
+    """
+    _use_fakes(monkeypatch)
+    if deployment == "pwa-mounted":
+        monkeypatch.setenv("ADMINO_STATIC_DIR", str(_write_site(tmp_path / "site")))
+        return make_client(make_app())
+    monkeypatch.delenv("ADMINO_STATIC_DIR", raising=False)
+    return make_client(_without_pwa_mount(make_app()))
+
+
+@pytest.fixture()
+def client(monkeypatch: pytest.MonkeyPatch) -> TestClient:
+    """The app as ``create_app`` builds it in this tree (the PWA mounted at ``/`` when
+    the tree has a build, see the module docstring) behind the fakes, and a client that
+    doesn't follow redirects."""
+    _use_fakes(monkeypatch)
     return make_client(make_app())
 
 
@@ -319,13 +375,17 @@ def test_api_preflight_headers_keep_simple_cross_origin_answers(client: TestClie
     }
 
 
+@pytest.mark.parametrize("deployment", list(_NOT_A_PREFLIGHT_ALLOW))
 def test_api_preflight_headers_options_without_request_method_is_not_a_preflight(
-    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, deployment: str
 ) -> None:
     """An ``OPTIONS`` without ``Access-Control-Request-Method`` (with or without an
-    ``Origin``) reaches the route as today: ``405`` with ``Allow: POST`` and the API
+    ``Origin``) is routed as today, without the PWA (the route) and with it mounted at
+    ``/`` (the mount): ``405`` with that answer's ``Allow`` (``POST``, none) and the API
     headers, the allowed origin echoed. A real preflight to the same path answers
     ``200`` with the same API headers."""
+    client = _deployed_client(monkeypatch, tmp_path, deployment)
+    allow = _NOT_A_PREFLIGHT_ALLOW[deployment]
     seen = {
         name: (
             response.status_code,
@@ -340,8 +400,8 @@ def test_api_preflight_headers_options_without_request_method_is_not_a_preflight
     control = _send_preflight(client, "/api/message", _PREFLIGHTS["allowed"])
 
     assert seen == {
-        "no-origin": (405, _METHOD_NOT_ALLOWED, ["POST"], [], _API_RESPONSE_HEADERS),
-        "origin": (405, _METHOD_NOT_ALLOWED, ["POST"], [PUBLIC_URL], _API_RESPONSE_HEADERS),
+        "no-origin": (405, _METHOD_NOT_ALLOWED, allow, [], _API_RESPONSE_HEADERS),
+        "origin": (405, _METHOD_NOT_ALLOWED, allow, [PUBLIC_URL], _API_RESPONSE_HEADERS),
     }
     assert (control.status_code, _response_headers(control)) == (200, _API_RESPONSE_HEADERS)
 
