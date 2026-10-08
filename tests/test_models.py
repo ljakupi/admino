@@ -121,9 +121,14 @@ class TestChatRequest:
         req = ChatRequest(message="a", session_id="s")
         assert req.message == "a"
 
-    def test_message_empty_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            ChatRequest(message="", session_id="s")
+    def test_message_empty_accepted(self) -> None:
+        """GH-286: the model takes an empty or whitespace-only message as given; POST
+        /api/message refuses a blank one with ``message_empty``."""
+        texts = ["", " ", chr(0x09) + chr(0x0A)]
+
+        accepted = [ChatRequest(message=text, session_id="s").message for text in texts]
+
+        assert accepted == texts
 
     def test_message_max_length(self) -> None:
         req = ChatRequest(message="x" * 32768, session_id="s")

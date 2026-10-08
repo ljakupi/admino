@@ -19,7 +19,9 @@ What these tests pin down:
   ``title_source`` or ``id`` never comes from the body) and hide their input
   from validation errors: a refused value never appears in the error text or
   in ``errors(include_input=False)``.
-- ``ChatMessageCreate.message``: 1 to 32768 characters, required.
+- ``ChatMessageCreate.message``: at most 32768 characters, required; an empty
+  or whitespace-only message is valid and kept as given (GH-286: the route
+  refuses a blank message without files with ``message_empty``).
 - ``ChatMessageCreate.attachment_ids`` (GH-187 contract section 3.1): the
   model's fields are exactly ``message`` and ``attachment_ids``; a list of
   UUIDs, empty when absent, at most 50; duplicates refused (also the same UUID
@@ -415,7 +417,7 @@ class TestChatTitleRules:
 
 
 class TestChatMessageCreate:
-    """POST /api/chats/{id}/messages: one message of 1 to 32768 characters."""
+    """POST /api/chats/{id}/messages: one message of at most 32768 characters."""
 
     @pytest.mark.parametrize("length", [1, 32768])
     def test_chat_models_message_create_accepts_1_to_32768_characters(self, length: int) -> None:
@@ -423,7 +425,19 @@ class TestChatMessageCreate:
 
         assert request.message == "m" * length  # type: ignore[attr-defined]
 
-    @pytest.mark.parametrize("message", ["", "m" * 32769], ids=["empty", "32769"])
+    def test_chat_models_message_create_accepts_empty_and_whitespace_only_as_given(
+        self,
+    ) -> None:
+        """GH-286: the model takes a blank message, unstripped (the route answers a blank
+        one without files with ``message_empty``)."""
+        model = _model("ChatMessageCreate")
+        texts = ["", " ", chr(0x09) + chr(0x0A), chr(0x3000), " " * 32768]
+
+        accepted = [model.model_validate({"message": text}).message for text in texts]  # type: ignore[attr-defined]
+
+        assert accepted == texts
+
+    @pytest.mark.parametrize("message", ["m" * 32769], ids=["32769"])
     def test_chat_models_message_create_refuses_out_of_range(self, message: str) -> None:
         exc = _rejects(_model("ChatMessageCreate"), {"message": message})
 
