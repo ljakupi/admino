@@ -47,8 +47,10 @@ Security notes:
   ``audit_events`` (tool, action, decision, success, duration — never
   arguments or output) through the recorder injected into the Agent, in the
   acting member's organization, targeting the run's persisted chat id
-  (GH-176). A principal without one (a Super Admin), a run id that isn't a
-  chat UUID or a failed write raises, so the agent aborts the run (H-1).
+  (GH-176), with the ids of the attachments in the run's prompt when it held
+  any (GH-189: ids and a count, never a file's name or content). A principal
+  without one (a Super Admin), a run id that isn't a chat UUID or a failed
+  write raises, so the agent aborts the run (H-1).
 - Registry is frozen after tool imports to block dynamic registration.
 - The server is non-dumpable on Linux (GH-188): the document conversion child
   runs as the same user, and without this it could read the server's
@@ -77,6 +79,7 @@ Security notes:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import sys
@@ -259,7 +262,9 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
     Each call writes one ``tool.call`` row through
     ``audit_events.record_tool_call`` naming the acting member (their org and
     user id, from ``TenantContext.from_principal``) and targeting the run's
-    chat, with the dispatch's ``escalated`` flag (GH-243). The run's
+    chat, with the dispatch's ``escalated`` flag (GH-243) and, for a run
+    whose prompt held attachments, their ids (GH-189; a run without any calls
+    ``record_tool_call`` without the keyword, exactly as before). The run's
     ``session_id`` is the persisted chat's id (GH-176: ``str(chat.id)``), so
     the row targets that UUID itself. A principal without an organization (a
     Super Admin, or a malformed principal) raises ``NoTenantContextError`` and
@@ -279,12 +284,14 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
         success: bool,
         duration_ms: int,
         escalated: bool,
+        attachment_ids: tuple[uuid.UUID, ...] = (),
     ) -> None:
         from admino import audit_events, database
         from admino.tenancy import TenantContext
 
         tenant = TenantContext.from_principal(principal)
-        await audit_events.record_tool_call(
+        write = functools.partial(
+            audit_events.record_tool_call,
             database.get_pool(),
             org_id=tenant.org_id,
             actor_user_id=tenant.user_id,
@@ -296,6 +303,10 @@ def _build_tool_call_recorder() -> ToolCallRecorder:
             duration_ms=duration_ms,
             escalated=escalated,
         )
+        if attachment_ids:
+            await write(attachment_ids=attachment_ids)
+        else:
+            await write()
 
     return record
 

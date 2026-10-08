@@ -25,11 +25,16 @@ two rules (GH-242):
   call); when it is None the keyword is not passed at all, so clients without
   it keep working. The client validates it and applies
   ``min(max_tokens, configured cap)``.
+- Image gate (GH-189): with ``image_input=False`` (the stored platform
+  ``llm.image_input``), a call whose messages hold an image part is refused
+  with an uncoded, non-user-facing ``LLMError`` before any request and
+  without a retry. The server refuses such a message first; this is
+  defence in depth, so no image ever reaches a model without image input.
 
 Inputs: the client, the call's messages and tools, an optional per-call output
-cap, the org's residency flag and the platform's retry limit. Outputs: the
-client's ``LLMResponse`` (or its stream items), or the client's / the guard's
-``LLMError``.
+cap, the org's residency flag, the platform's retry limit and whether the
+model takes image input. Outputs: the client's ``LLMResponse`` (or its stream
+items), or the client's / the guard's ``LLMError``.
 
 Security notes:
 - Pure policy: imports only the standard library, ``admino.llm`` and
@@ -37,6 +42,8 @@ Security notes:
   engine), and sees no user, org or account data, only the residency flag.
 - Each retry logs one WARNING naming the error code, the attempt number and
   the delay: never the error's message or any provider text.
+- The image gate's error message is fixed and nothing is logged for it: no
+  content or image data reaches the error or a log line.
 - ``_sleep`` and ``_random`` are module-level seams for tests; ``_random``
   draws from ``random.SystemRandom``.
 """
@@ -50,6 +57,7 @@ from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, Final
 
 from admino.llm import LLMError
+from admino.models import ImageContent
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -69,6 +77,7 @@ _RESIDENCY_BLOCKED_MESSAGE: Final = (
     "Your organization's data residency policy allows only Swiss-hosted AI models, "
     "and the active model isn't one. Ask your administrator to choose a Swiss model."
 )
+_IMAGE_INPUT_MESSAGE: Final = "The call holds an image part, but the model takes no image input."
 
 # Test seams: replaced by tests, looked up at call time.
 _sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
@@ -97,6 +106,27 @@ def check_residency(client: object, *, data_residency: bool) -> None:
     provider = getattr(client, "provider", None)
     if not (isinstance(provider, str) and provider in SWISS_PROVIDERS):
         raise residency_blocked_error()
+
+
+def _check_image_input(messages: list[LLMMessage], *, image_input: bool) -> None:
+    """Refuse a call that holds an image part when the model takes no image input.
+
+    Args:
+        messages: The call's messages; any content list counts, not only the
+            current user message's.
+        image_input: Whether the model accepts images. True never refuses.
+
+    Raises:
+        LLMError: uncoded and not user-facing (the run ends with the generic
+            error), with a fixed message that holds none of the content.
+    """
+    if image_input:
+        return
+    for message in messages:
+        if isinstance(message.content, list) and any(
+            isinstance(part, ImageContent) for part in message.content
+        ):
+            raise LLMError(_IMAGE_INPUT_MESSAGE)
 
 
 def backoff_delay(attempt: int) -> float:
@@ -147,6 +177,7 @@ async def chat(
     data_residency: bool,
     max_retries: int,
     max_tokens: int | None = None,
+    image_input: bool = True,
 ) -> LLMResponse:
     """Send one chat request through the residency guard and the retry policy.
 
@@ -159,17 +190,20 @@ async def chat(
         max_tokens: Per-call output cap (GH-179) passed to ``client.chat`` on
             every attempt; None calls ``client.chat(messages, tools=tools)``
             without the keyword, exactly as before.
+        image_input: Whether the model accepts images (``_check_image_input``).
 
     Returns:
         The client's response.
 
     Raises:
         ValueError: ``max_retries`` outside 0..5 (before any call).
-        LLMError: ``residency_blocked`` (no call made), a non-retryable error,
-            or the last retryable error once the retries are used up.
+        LLMError: ``residency_blocked`` or the image gate's error (no call
+            made), a non-retryable error, or the last retryable error once
+            the retries are used up.
     """
     _check_max_retries(max_retries)
     check_residency(client, data_residency=data_residency)
+    _check_image_input(messages, image_input=image_input)
     attempt = 0
     while True:
         try:
@@ -190,6 +224,7 @@ async def chat_stream(
     *,
     data_residency: bool,
     max_retries: int,
+    image_input: bool = True,
 ) -> AsyncGenerator[LLMStreamDelta | LLMResponse, None]:
     """Stream one chat reply through the residency guard and the retry policy.
 
@@ -204,17 +239,19 @@ async def chat_stream(
         tools: The call's tool definitions (the same object on every retry).
         data_residency: The requesting org's residency policy.
         max_retries: Retries of a retryable error (0..5).
+        image_input: Whether the model accepts images (``_check_image_input``).
 
     Yields:
         The client's ``LLMStreamDelta`` items, then its final ``LLMResponse``.
 
     Raises:
         ValueError: ``max_retries`` outside 0..5 (before any call).
-        LLMError: ``residency_blocked`` (nothing yielded, no call made), or
-            the client's error as described above.
+        LLMError: ``residency_blocked`` or the image gate's error (nothing
+            yielded, no call made), or the client's error as described above.
     """
     _check_max_retries(max_retries)
     check_residency(client, data_residency=data_residency)
+    _check_image_input(messages, image_input=image_input)
     attempt = 0
     while True:
         yielded = False

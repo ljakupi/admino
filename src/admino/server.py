@@ -4145,7 +4145,9 @@ def _read_external_content(loaded: list[LLMMessage], result: AgentResult) -> boo
     user typed or the reply quotes doesn't.
     """
     return any(
-        message.role == "tool" and untrusted.contains_wrapped(message.content)
+        message.role == "tool"
+        and isinstance(message.content, str)
+        and untrusted.contains_wrapped(message.content)
         for message in result.history[len(loaded) :]
     )
 

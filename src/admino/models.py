@@ -74,6 +74,14 @@ Security notes:
   0027's CHECKs. ``ChatMessageCreate.attachment_ids`` holds at most 50 ids,
   each once; the duplicate refusal names no id. ``ChatRequest`` (the legacy
   route) takes no attachments.
+- Content parts (GH-189): ``LLMMessage.content`` is a str or, on a user
+  message only, a non-empty list of ``TextContent`` (never blank) and
+  ``ImageContent`` (JPEG or PNG, standard base64 without a ``data:`` prefix)
+  parts. They and ``AttachmentContent`` (one active attachment for slot 4 of
+  the prompt) exist only in the context built for one LLM call: never
+  stored, logged or returned by an API. They are frozen, refuse unknown keys
+  and hide their input from validation errors, and so does ``LLMMessage``.
+  ``AgentConfig.image_input`` is the stored platform ``llm.image_input``.
 - Blank messages (GH-286): ``ChatMessageCreate.message`` and
   ``ChatRequest.message`` take at most 32768 characters and accept an empty
   or whitespace-only text, unstripped; the message routes refuse a blank one
@@ -948,23 +956,73 @@ class ToolCall(BaseModel):
         return v
 
 
+class TextContent(BaseModel):
+    """A text part of a user message's content (GH-189).
+
+    Never blank: a text whose ``text.strip() == ""`` is refused, so no
+    provider is ever sent a whitespace-only text block. The text is kept
+    verbatim and isn't capped (attachments go in full).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    type: Literal["text"] = "text"
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def _check_not_blank(cls, value: str) -> str:
+        """Refuse a whitespace-only text (the error never repeats it)."""
+        if not value.strip():
+            msg = "Text content must not be blank."
+            raise ValueError(msg)
+        return value
+
+
+class ImageContent(BaseModel):
+    """An image part of a user message's content (GH-189).
+
+    ``media_type`` is JPEG or PNG, the attachment converters' output types;
+    ``data`` is the image's standard base64, without a ``data:`` prefix.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    type: Literal["image"] = "image"
+    media_type: Literal["image/jpeg", "image/png"]
+    data: str = Field(min_length=1, pattern=r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+ContentPart = Annotated[TextContent | ImageContent, Field(discriminator="type")]
+"""One part of a user message's content list, told apart by its ``type``."""
+
+
 class LLMMessage(BaseModel):
     """A message in the LLM context window.
 
     Represents messages sent to and received from the LLM provider's chat API.
+    ``content`` is a str, or on a user message a non-empty list of content
+    parts (GH-189: slot 4's attachment blocks and images, then the user's
+    text). Content parts exist only in the context built for one LLM call:
+    they are never stored, logged or returned by an API.
 
     Note: content is NOT sanitised for control characters at this layer.
     Sanitisation is applied at the LLM client boundary (llm.py
     _strip_control_chars). Raw content is preserved here for context-window fidelity.
     """
 
+    # A content list carries file content: validation errors never repeat it.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     role: Literal["user", "assistant", "system", "tool"] = Field(
         description="The role of the message in the LLM context.",
     )
-    content: str = Field(
-        max_length=65536,
+    content: (
+        Annotated[str, Field(max_length=65536)] | Annotated[list[ContentPart], Field(min_length=1)]
+    ) = Field(
         description=(
-            "The message content. Empty strings are valid for tool responses with empty results."
+            "The message content: a str (empty strings are valid for tool responses with "
+            "empty results), or on a user message a non-empty list of content parts."
         ),
     )
     tool_call_id: str | None = Field(
@@ -981,6 +1039,18 @@ class LLMMessage(BaseModel):
             "and input. The OpenAI-compatible serializer replays them as tool_calls."
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_parts_on_user_only(self) -> LLMMessage:
+        """Refuse a content list on a system, assistant or tool message.
+
+        Every provider takes images in user messages only, and file content
+        must never get the system message's authority.
+        """
+        if isinstance(self.content, list) and self.role != "user":
+            msg = "Only user messages may carry content parts."
+            raise ValueError(msg)
+        return self
 
 
 class AgentConfig(BaseModel):
@@ -1019,6 +1089,13 @@ class AgentConfig(BaseModel):
         description=(
             "Retries of a transient LLM failure per call (GH-242: the stored"
             " platform llm.max_retries)."
+        ),
+    )
+    image_input: bool = Field(
+        default=True,
+        description=(
+            "Whether the run's model accepts image input (GH-189: the stored platform"
+            " llm.image_input). False: no image part reaches the LLM."
         ),
     )
 
@@ -3320,6 +3397,30 @@ class AttachmentSummary(BaseModel):
     page_count: int | None = Field(ge=0)
     token_estimate: int | None = Field(ge=0)
     created_at: datetime
+
+
+class AttachmentContent(BaseModel):
+    """One active attachment of a chat, as slot 4 of the prompt needs it (GH-189).
+
+    ``filename`` is the stored name (``prompt_assembly.prompt_filename`` makes
+    the prompt name of it) and ``parts`` the converted parts in manifest
+    order: an image part's label is the text part right before it. Built for
+    one run from the caller's own rows and derived files; never stored,
+    logged or returned by an API.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
+
+    id: UUID
+    filename: str = Field(min_length=1, max_length=_ATTACHMENT_FILENAME_MAX_LENGTH)
+    kind: AttachmentKind
+    page_count: int | None = Field(ge=0)
+    parts: tuple[ContentPart, ...]
+
+    @property
+    def has_images(self) -> bool:
+        """Whether any part is an image (the image-input gate refuses those)."""
+        return any(isinstance(part, ImageContent) for part in self.parts)
 
 
 class ChatMessageCreate(BaseModel):

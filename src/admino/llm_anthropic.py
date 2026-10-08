@@ -124,12 +124,13 @@ from admino.llm import (
     validate_tools_payload,
 )
 from admino.logs import safe_log
-from admino.models import LLMMessage, ToolCall
+from admino.models import LLMMessage, TextContent, ToolCall
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
     from admino.config import LLMConfig
+    from admino.models import ContentPart
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +212,8 @@ def _convert_messages_to_anthropic(
     before its tool_use blocks (GH-278), an assistant message left with no
     block is left out (GH-25 D11), so the messages around it merge, and a
     blank string merging with a block list is dropped. Text that isn't blank
-    is sent as stored.
+    is sent as stored. A user message's content list (GH-189) becomes text
+    and base64 ``image`` blocks in order, merged like any block list.
 
     Args:
         messages: Conversation messages (never changed).
@@ -223,6 +225,11 @@ def _convert_messages_to_anthropic(
     api_messages: list[dict[str, Any]] = []
 
     for msg in messages:
+        if isinstance(msg.content, list):
+            # Only a user message carries content parts (LLMMessage refuses them elsewhere).
+            parts = [_content_part_to_anthropic(part) for part in msg.content]
+            _append_merged(api_messages, "user", parts)
+            continue
         if msg.role == "system":
             system_parts.append(msg.content)
             continue
@@ -275,27 +282,45 @@ def _convert_messages_to_anthropic(
         else:
             content = msg.content
 
-        # Merge consecutive messages with the same role
-        if api_messages and api_messages[-1]["role"] == role:
-            prev_content = api_messages[-1]["content"]
-            if isinstance(prev_content, str) and isinstance(content, str):
-                api_messages[-1]["content"] = prev_content + "\n" + content
-            elif isinstance(prev_content, list) and isinstance(content, list):
-                api_messages[-1]["content"] = prev_content + content
-            # A whitespace-only string never becomes a text block (GH-278).
-            elif isinstance(prev_content, str) and isinstance(content, list):
-                head = [{"type": "text", "text": prev_content}] if prev_content.strip() else []
-                api_messages[-1]["content"] = [*head, *content]
-            elif isinstance(prev_content, list) and isinstance(content, str) and content.strip():
-                api_messages[-1]["content"] = [
-                    *prev_content,
-                    {"type": "text", "text": content},
-                ]
-        else:
-            api_messages.append({"role": role, "content": content})
+        _append_merged(api_messages, role, content)
 
     system_prompt = "\n".join(system_parts) if system_parts else ""
     return system_prompt, api_messages
+
+
+def _content_part_to_anthropic(part: ContentPart) -> dict[str, Any]:
+    """Return one content part as an Anthropic ``text`` or base64 ``image`` block."""
+    if isinstance(part, TextContent):
+        return {"type": "text", "text": part.text}
+    return {
+        "type": "image",
+        "source": {"type": "base64", "media_type": part.media_type, "data": part.data},
+    }
+
+
+def _append_merged(
+    api_messages: list[dict[str, Any]], role: str, content: str | list[dict[str, Any]]
+) -> None:
+    """Append one message, merged into the last one when it has the same role.
+
+    Anthropic requires alternating turns. Two strings join with a newline,
+    two block lists concatenate, and a string merging with a block list
+    becomes a text block only when it isn't blank (GH-278).
+    """
+    if not api_messages or api_messages[-1]["role"] != role:
+        api_messages.append({"role": role, "content": content})
+        return
+    prev_content = api_messages[-1]["content"]
+    if isinstance(prev_content, str) and isinstance(content, str):
+        api_messages[-1]["content"] = prev_content + "\n" + content
+    elif isinstance(prev_content, list) and isinstance(content, list):
+        api_messages[-1]["content"] = prev_content + content
+    # A whitespace-only string never becomes a text block (GH-278).
+    elif isinstance(prev_content, str) and isinstance(content, list):
+        head = [{"type": "text", "text": prev_content}] if prev_content.strip() else []
+        api_messages[-1]["content"] = [*head, *content]
+    elif isinstance(prev_content, list) and isinstance(content, str) and content.strip():
+        api_messages[-1]["content"] = [*prev_content, {"type": "text", "text": content}]
 
 
 def _parse_anthropic_tool_calls(content_blocks: list[Any]) -> list[ToolCall]:

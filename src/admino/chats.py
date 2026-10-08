@@ -117,7 +117,7 @@ import math
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol, cast
 from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
 
 import asyncpg
@@ -832,7 +832,7 @@ async def append_messages(
     rows = [
         (
             message.role,
-            message.content.replace(_NUL, ""),
+            cast("str", message.content).replace(_NUL, ""),
             _json_text(message.tool_use_blocks),
             message.tool_call_id,
             _json_text(calls) if index == last and calls else None,

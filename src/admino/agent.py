@@ -1058,7 +1058,9 @@ def _holds_untrusted_content(history: list[LLMMessage]) -> bool:
     that has scrolled out of the context may still have shaped the turn.
     """
     return any(
-        message.role == "tool" and untrusted.contains_wrapped(message.content)
+        message.role == "tool"
+        and isinstance(message.content, str)
+        and untrusted.contains_wrapped(message.content)
         for message in history
     )
 
