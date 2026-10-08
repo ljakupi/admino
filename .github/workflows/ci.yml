@@ -60,6 +60,11 @@ jobs:
       - name: Install dependencies
         working-directory: static-src
         run: npm ci
+      - name: Check the fork pin
+        working-directory: static-src
+        # npm ci accepts a lock entry newer than the override; npm ls exits 1 (ELSPROBLEMS)
+        # when the lock diverges from the reviewed pin (see CONTRIBUTING.md).
+        run: npm ls --package-lock-only @trickfilm400/rollup-plugin-off-main-thread
       - name: Check translations
         working-directory: static-src
         run: npm run check:i18n
