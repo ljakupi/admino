@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.27.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -51,6 +51,12 @@ dev = [
     "anthropic>=0.40.0,<1",
     "openai>=1.50.0,<2",
 ]
+
+# The build backend, locked in uv.lock so CI and the Docker build install it
+# from the lock (hash-checked) and build admino with --no-build-isolation.
+# Keep the version equal to build-system.requires above.
+[dependency-groups]
+build = ["hatchling==1.27.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/admino"]
