@@ -102,7 +102,15 @@ the issue before the PR.
 
 CI runs `uv lock --check` and fails when `uv.lock` is out of date with
 `pyproject.toml`. CI (`uv sync --locked`) and the Docker image install only from
-`uv.lock`, hash-checked. Nothing resolves a version range at build time.
+`uv.lock`, hash-checked, with `--no-build`: a package without a wheel fails the
+install instead of being built from source. Nothing resolves a version range at
+build time.
+
+Because builds no longer pick up new releases on their own, refresh the lock on
+purpose when a security release of a locked package comes out. Run
+`uv lock --upgrade` for the whole lock, or `uv lock --upgrade-package <name>` for
+one package. List the version changes in the PR. There is no automated scanning for
+this yet.
 
 The build backend (`hatchling`) is locked too, in the `build` dependency group. Keep
 its pin equal to `build-system.requires` in `pyproject.toml`.

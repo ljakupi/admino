@@ -43,10 +43,12 @@ COPY pyproject.toml uv.lock ./
 # group, plus the `all-providers` extra so the image supports every provider
 # selectable in config.yaml / Settings -> Agent without rebuilding). --locked
 # fails the build when uv.lock is out of date with pyproject.toml; nothing
-# resolves a version range here. The OpenAI SDK is a core dependency.
+# resolves a version range here. --no-build: a package without a wheel fails
+# the build instead of being built from source with unpinned build tools.
+# The OpenAI SDK is a core dependency.
 RUN uv export --locked --no-dev --extra all-providers --no-emit-project \
         --format requirements-txt --no-header --output-file /tmp/runtime.txt \
-    && uv pip install --require-hashes --no-deps --compile-bytecode \
+    && uv pip install --require-hashes --no-build --no-deps --compile-bytecode \
         --prefix /install -r /tmp/runtime.txt
 
 # The build backend (hatchling) is locked too, in the `build` dependency group.
@@ -54,7 +56,8 @@ RUN uv export --locked --no-dev --extra all-providers --no-emit-project \
 RUN uv export --locked --only-group build --no-emit-project \
         --format requirements-txt --no-header --output-file /tmp/build.txt \
     && uv venv /opt/build-venv \
-    && uv pip install --python /opt/build-venv --require-hashes --no-deps -r /tmp/build.txt
+    && uv pip install --python /opt/build-venv --require-hashes --no-build --no-deps \
+        -r /tmp/build.txt
 
 # Build admino against that backend without build isolation (an isolated build
 # would resolve build-system.requires from PyPI), then install the wheel.

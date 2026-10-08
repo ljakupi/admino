@@ -40,7 +40,7 @@ jobs:
       # version range here. --no-install-project: no build backend is resolved.
       - name: Install dependencies from uv.lock
         run: |
-          uv sync --locked --extra dev --no-install-project
+          uv sync --locked --extra dev --no-install-project --no-build
           echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
       # Single source of truth: `make check` runs lint, format-check, typecheck,
       # and the coverage-gated test suite (--cov-fail-under=90). The same target
