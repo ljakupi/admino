@@ -160,6 +160,10 @@ services:
     container_name: admino-agent
     restart: unless-stopped
 
+    # Docker's init (tini) is PID 1 so it reaps orphaned/grandchild processes
+    # of a killed conversion worker; the server is no longer PID 1 (GH-281).
+    init: true
+
     # Stop drains streamed chat runs for up to 30 s (server._DRAIN_TIMEOUT_S); 40 s keeps Docker's default 10 s SIGKILL from cutting it short.
     stop_grace_period: 40s
 
@@ -215,6 +219,9 @@ services:
       # PG_PASSWORD that env_file would pass in is blanked here (`environment`
       # takes precedence over `env_file`).
       PG_PASSWORD: ""
+      # Pins the root to the attachments volume's mount point, so a native-run
+      # value in .env (env_file) never moves it (GH-281).
+      ADMINO_ATTACHMENTS_ROOT: /app/data/attachments
 
     volumes:
       # No host user directory is mounted: the container sees only these paths.

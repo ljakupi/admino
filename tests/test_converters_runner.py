@@ -11,19 +11,33 @@ Pinned here:
   symlink inside it is never followed), a symlink at ``out_dir`` (to a directory, to a
   file, dangling) is unlinked without touching its target, a file is replaced; the new
   directory is empty with mode 0700.
-- The child: ``subprocess.run(list(WORKER_ARGV), input=<job JSON bytes>, stdout=PIPE,
-  stderr=DEVNULL, env=..., timeout=CONVERSION_TIMEOUT_S, check=False)``, never
-  ``shell=True``. The job ``{path, kind, out_dir, filename, render_dpi, max_pages}``
-  travels on stdin, none of it in argv. ``env`` is exactly ``{"PYTHONPATH": <the
-  server's>}``, or ``{}`` when the server has none: no API token, password or DSN.
+- The child (GH-281 contract R2): ``subprocess.Popen(list(WORKER_ARGV), stdin=PIPE,
+  stdout=PIPE, stderr=DEVNULL, env=...)``, never ``shell=True``; other keyword arguments
+  are the implementation's choice and not pinned. The job ``{path, kind, out_dir,
+  filename, render_dpi, max_pages}`` travels on stdin (the stand-in child reads it), none
+  of it in argv. ``env`` is exactly ``{"PYTHONPATH": <the server's>}``, or ``{}`` when the
+  server has none: no API token, password or DSN.
 - Outcomes: ``ok: true`` -> ``ConversionResult``, out_dir kept; ``ok: false`` with one of
   the nine codes (``output_too_large`` included, contract §12) -> ``ConversionError`` with
-  that code; a timeout -> ``conversion_timeout`` (a real sleeping child is killed and
-  reaped, and the call returns long before its sleep ends); a non-zero exit status (even
-  with a valid line), stdout that isn't exactly one valid result line, an unknown reason,
-  a negative estimate or a page count / estimate above 2**31 - 1 (INTEGER; 2**31 - 1
-  itself passes) -> ``processing_error``. out_dir is removed after every failure, and
-  nothing is logged.
+  that code; a child still running at ``CONVERSION_TIMEOUT_S`` -> ``conversion_timeout``
+  (a real sleeping child is killed and reaped, and the call returns long before its sleep
+  ends; also when the child already closed its stdout and only the wait for its exit is
+  left, contract R5); a non-zero exit status (even with a valid line), stdout that isn't
+  exactly one valid result line, an unknown reason, a negative estimate or a page count /
+  estimate above 2**31 - 1 (INTEGER; 2**31 - 1 itself passes) -> ``processing_error``.
+  out_dir is removed after every failure, and nothing is logged. A child that exits
+  without reading its stdin: the outcome follows its stdout and exit status, the broken
+  pipe is no error of its own (contract R3).
+- The stdout cap (GH-281 Decision 1, contract R1/R4/R7): ``MAX_RESULT_BYTES == 4096``
+  (int), read at call time. A child that writes more than the cap and then sleeps with
+  stdout open (cap + 1 bytes, 1 MiB) -> ``processing_error`` at once, long before the
+  timeout; its pid is gone (killed and reaped), out_dir removed, nothing logged. Exactly
+  the cap is no overflow: the cap lowered to a valid line's length converts, one byte
+  lower the same line is ``processing_error``. A child that writes 64 MiB and exits 0:
+  ``processing_error`` and the parent's traced memory peak during the call stays under
+  512 KiB (nothing past the cap is buffered; the call's own baseline, Popen included, is
+  about 90 KB). A KeyboardInterrupt while the parent waits:
+  the interrupt propagates, the child is killed and reaped, out_dir removed.
 - Derived bytes (contract §12.4, process M-3): ``ConversionResult(page_count,
   token_estimate, derived_bytes)``; after a successful child the PARENT measures
   ``derived_bytes`` = the sum of the sizes of the regular files directly in out_dir (a
@@ -39,21 +53,32 @@ Pinned here:
   text PDF convert end to end, out_dir keeps the manifest and the parts, and
   ``derived_bytes`` is their size on disk.
 
-``subprocess.run`` is replaced by a recorder for everything but the real runs. New modules
-are imported inside the tests, so the file collects before GH-188 exists.
+For the pins on the call, ``subprocess.Popen`` is replaced by a recorder that stays
+implementation-agnostic: it records each start (argv, keyword arguments, out_dir as the
+child finds it), runs the test's ``child(out_dir)`` hook, then starts a REAL stand-in
+child with the original ``Popen`` and the same keyword arguments (argv replaced) that
+reads all of stdin into a file, writes the configured stdout bytes and exits with the
+configured status. The cap, timeout and interrupt cases run real stand-ins through
+``WORKER_ARGV``. New modules are imported inside the tests, so the file collects before
+GH-188 exists.
 """
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
+import inspect
 import json
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import tracemalloc
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -108,9 +133,36 @@ def _options(filename: str = _FILENAME) -> Any:
     return _common().ConversionOptions(filename=filename, render_dpi=150, max_pages=100)
 
 
+# The real Popen, captured before any test replaces it.
+_REAL_POPEN: Final = subprocess.Popen
+
+# The stand-in child the recorder starts in place of the worker. Its settings come from
+# the JSON file named in argv[1]: it reads all of stdin into "job" (unless told not to),
+# writes its pid to "pid", writes the bytes of the "stdout" file to its stdout, sleeps
+# "sleep" seconds and exits with "returncode" (a negative one: killed by that signal).
+_STAND_IN: Final = (
+    "import json, os, sys, time\n"
+    "with open(sys.argv[1], encoding='utf-8') as handle:\n"
+    "    config = json.load(handle)\n"
+    "if config['read_stdin']:\n"
+    "    job = sys.stdin.buffer.read()\n"
+    "    with open(config['job'], 'wb') as handle:\n"
+    "        handle.write(job)\n"
+    "with open(config['pid'], 'w', encoding='ascii') as handle:\n"
+    "    handle.write(str(os.getpid()))\n"
+    "with open(config['stdout'], 'rb') as handle:\n"
+    "    sys.stdout.buffer.write(handle.read())\n"
+    "sys.stdout.buffer.flush()\n"
+    "time.sleep(config['sleep'])\n"
+    "if config['returncode'] < 0:\n"
+    "    os.kill(os.getpid(), -config['returncode'])\n"
+    "sys.exit(config['returncode'])\n"
+)
+
+
 @dataclass
 class _Call:
-    """One recorded subprocess.run call, with out_dir as the child would have found it."""
+    """One recorded child start, with out_dir as the child would have found it."""
 
     argv: list[str]
     kwargs: dict[str, Any]
@@ -121,27 +173,37 @@ class _Call:
 
 
 @dataclass
-class _FakeRun:
-    """A subprocess.run stand-in returning a canned CompletedProcess (or raising).
+class _FakeChild:
+    """What the recorder starts in place of the worker, and what it recorded.
 
-    ``child`` (if given) runs after the call is recorded, with out_dir: what the child
-    would have written there before it exited.
+    Each start is recorded (argv, every argument but argv by name, out_dir's state);
+    then ``child`` (if given) runs with out_dir: what the worker would have written there.
+    Then a REAL stand-in child starts with the original Popen and the same arguments
+    (argv replaced, ``executable`` dropped): it reads its stdin (unless ``read_stdin`` is
+    False), writes ``stdout``, sleeps ``sleep`` seconds and exits with ``returncode``.
+    With ``exit_before_returning`` the start waits until the stand-in has exited (so a
+    stand-in that never reads its stdin has closed it before the runner writes the job).
     """
 
     out_dir: Path
     returncode: int = 0
     stdout: bytes = _OK_LINE
-    raises: BaseException | None = None
+    sleep: float = 0.0
+    read_stdin: bool = True
+    exit_before_returning: bool = False
     child: Callable[[Path], None] | None = None
     calls: list[_Call] = field(default_factory=list)
+    work: Path = field(init=False)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
-        argv = args[0] if args else kwargs.pop("args")
+    def __post_init__(self) -> None:
+        self.work = Path(tempfile.mkdtemp(prefix="stand-in-", dir=self.out_dir.parent))
+
+    def record(self, arguments: dict[str, Any]) -> None:
         is_dir = self.out_dir.is_dir() and not self.out_dir.is_symlink()
         self.calls.append(
             _Call(
-                argv=argv,
-                kwargs=kwargs,
+                argv=arguments["args"],
+                kwargs={name: value for name, value in arguments.items() if name != "args"},
                 out_dir_is_dir=is_dir,
                 out_dir_is_symlink=self.out_dir.is_symlink(),
                 out_dir_mode=stat.S_IMODE(os.lstat(self.out_dir).st_mode) if is_dir else None,
@@ -150,9 +212,45 @@ class _FakeRun:
         )
         if self.child is not None:
             self.child(self.out_dir)
-        if self.raises is not None:
-            raise self.raises
-        return subprocess.CompletedProcess(argv, self.returncode, stdout=self.stdout)
+
+    def stand_in_argv(self) -> list[str]:
+        (self.work / "stdout.bin").write_bytes(self.stdout)
+        config = {
+            "read_stdin": self.read_stdin,
+            "job": str(self.work / "job.bin"),
+            "pid": str(self.work / "pid"),
+            "stdout": str(self.work / "stdout.bin"),
+            "sleep": self.sleep,
+            "returncode": self.returncode,
+        }
+        (self.work / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return [sys.executable, "-c", _STAND_IN, str(self.work / "config.json")]
+
+    def job(self) -> bytes:
+        """What the stand-in read from its stdin."""
+        return (self.work / "job.bin").read_bytes()
+
+    def pid_file(self) -> Path:
+        return self.work / "pid"
+
+
+def _popen_class(fake: _FakeChild) -> type[subprocess.Popen[bytes]]:
+    """A Popen subclass that records the start, then starts the stand-in instead."""
+
+    class _RecordingPopen(_REAL_POPEN):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            arguments = dict(inspect.signature(_REAL_POPEN).bind(*args, **kwargs).arguments)
+            fake.record(arguments)
+            spawn = {
+                name: value
+                for name, value in arguments.items()
+                if name not in ("args", "executable")
+            }
+            super().__init__(fake.stand_in_argv(), **spawn)
+            if fake.exit_before_returning:
+                self.wait()
+
+    return _RecordingPopen
 
 
 def _writes(sizes: dict[str, int]) -> Callable[[Path], None]:
@@ -170,15 +268,47 @@ def _disk_bytes(directory: Path) -> int:
     return sum(entry.stat().st_size for entry in directory.iterdir() if entry.is_file())
 
 
-def _patch_run(monkeypatch: pytest.MonkeyPatch, fake: _FakeRun) -> _FakeRun:
-    """Replace subprocess.run (and any reference the runner holds to it)."""
+def _patch_popen(monkeypatch: pytest.MonkeyPatch, fake: _FakeChild) -> _FakeChild:
+    """Replace subprocess.Popen (and any reference the runner holds to it) by a recorder
+    that starts ``fake``'s stand-in."""
     runner = _runner()
-    original = subprocess.run
-    monkeypatch.setattr(subprocess, "run", fake)
+    recorder = _popen_class(fake)
+    current = subprocess.Popen
     for name, value in list(vars(runner).items()):
-        if value is original:
-            monkeypatch.setattr(runner, name, fake)
+        if value is _REAL_POPEN or value is current:
+            monkeypatch.setattr(runner, name, recorder)
+    monkeypatch.setattr(subprocess, "Popen", recorder)
     return fake
+
+
+def _alive(pid: int) -> bool:
+    """The process still exists (running, or a zombie nobody reaped)."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _read_pid(pid_file: Path) -> int | None:
+    text = pid_file.read_text(encoding="ascii").strip() if pid_file.exists() else ""
+    return int(text) if text.isdigit() else None
+
+
+def _kill_leftover(pid_file: Path) -> None:
+    """Test cleanup only: kill and reap a child the call left behind."""
+    pid = _read_pid(pid_file)
+    if pid is not None and _alive(pid):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+        with contextlib.suppress(ChildProcessError):
+            os.waitpid(pid, 0)
+
+
+def _admino_records(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [record.name for record in caplog.records if record.name.startswith("admino")]
 
 
 @pytest.fixture
@@ -237,9 +367,10 @@ def test_converters_runner_child_gets_worker_argv_and_the_job_on_stdin(
     monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
 ) -> None:
     """argv is list(WORKER_ARGV), nothing of the job in it; the job is JSON bytes on
-    stdin with the path, kind, out_dir, file name, render_dpi and max_pages."""
+    stdin (what the child reads there) with the path, kind, out_dir, file name, render_dpi
+    and max_pages."""
     runner = _runner()
-    fake = _patch_run(monkeypatch, _FakeRun(out_dir))
+    fake = _patch_popen(monkeypatch, _FakeChild(out_dir))
     options = _common().ConversionOptions(filename=_FILENAME, render_dpi=220, max_pages=37)
 
     runner.run_conversion(stored, "pdf", out_dir, options)
@@ -247,8 +378,8 @@ def test_converters_runner_child_gets_worker_argv_and_the_job_on_stdin(
     [call] = fake.calls
     assert call.argv == list(runner.WORKER_ARGV)
     assert not any(_ATTACHMENT_ID in part or "März" in part for part in call.argv)
-    assert isinstance(call.kwargs["input"], bytes)
-    assert json.loads(call.kwargs["input"]) == {
+    assert call.kwargs.get("stdin") == subprocess.PIPE
+    assert json.loads(fake.job()) == {
         "path": str(stored),
         "kind": "pdf",
         "out_dir": str(out_dir),
@@ -261,21 +392,22 @@ def test_converters_runner_child_gets_worker_argv_and_the_job_on_stdin(
 def test_converters_runner_call_options_pinned_and_read_at_call_time(
     monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
 ) -> None:
-    """stdout=PIPE, stderr=DEVNULL, check=False, no shell; WORKER_ARGV and
-    CONVERSION_TIMEOUT_S are read when the call runs."""
+    """One child start with stdin=PIPE, stdout=PIPE, stderr=DEVNULL and no shell (GH-281
+    contract R2; other Popen arguments are not pinned); WORKER_ARGV is read when the call
+    runs. (CONVERSION_TIMEOUT_S read at call time: the real timeout tests below.)"""
     runner = _runner()
-    fake = _patch_run(monkeypatch, _FakeRun(out_dir))
+    fake = _patch_popen(monkeypatch, _FakeChild(out_dir))
     monkeypatch.setattr(runner, "WORKER_ARGV", ("/opt/python3", "-P", "-m", "worker_stub"))
-    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 7.5)
 
     runner.run_conversion(stored, "txt", out_dir, _options())
 
     [call] = fake.calls
     assert call.argv == ["/opt/python3", "-P", "-m", "worker_stub"]
-    assert call.kwargs["timeout"] == 7.5
-    assert call.kwargs["stdout"] == subprocess.PIPE
-    assert call.kwargs["stderr"] == subprocess.DEVNULL
-    assert call.kwargs.get("check", False) is False
+    assert (call.kwargs.get("stdin"), call.kwargs.get("stdout"), call.kwargs.get("stderr")) == (
+        subprocess.PIPE,
+        subprocess.PIPE,
+        subprocess.DEVNULL,
+    )
     assert call.kwargs.get("shell", False) is False
 
 
@@ -286,7 +418,7 @@ def test_converters_runner_child_env_holds_only_pythonpath(
     """env is exactly {"PYTHONPATH": <server's>} or {}: the server's API token, database
     password and DSN never reach the worker."""
     runner = _runner()
-    fake = _patch_run(monkeypatch, _FakeRun(out_dir))
+    fake = _patch_popen(monkeypatch, _FakeChild(out_dir))
     monkeypatch.setenv("INFOMANIAK_API_TOKEN", "ik-token-gh188-runner")
     monkeypatch.setenv("PG_APP_PASSWORD", "pg-password-gh188-runner")
     monkeypatch.setenv("DATABASE_URL", "postgresql://admino_app:pw-gh188@db:5432/admino")
@@ -348,7 +480,7 @@ def test_converters_runner_out_dir_reset_to_an_empty_0700_directory(
     outside survive."""
     outside = tmp_path / "outside"
     survivors = _plant(case, out_dir, outside)
-    fake = _patch_run(monkeypatch, _FakeRun(out_dir))
+    fake = _patch_popen(monkeypatch, _FakeChild(out_dir))
 
     _runner().run_conversion(stored, "pdf", out_dir, _options())
 
@@ -386,7 +518,7 @@ def test_converters_runner_ok_line_returns_the_result_and_keeps_out_dir(
     """ok true -> ConversionResult(page_count, token_estimate, derived_bytes); out_dir
     stays (empty here: derived_bytes 0). 2**31 - 1 is still a valid count."""
     runner = _runner()
-    _patch_run(monkeypatch, _FakeRun(out_dir, stdout=stdout))
+    _patch_popen(monkeypatch, _FakeChild(out_dir, stdout=stdout))
 
     result = runner.run_conversion(stored, "pdf", out_dir, _options())
 
@@ -401,7 +533,7 @@ def test_converters_runner_known_reason_raises_that_conversion_error(
 ) -> None:
     """ok false with one of the nine codes -> ConversionError(code); out_dir removed."""
     line = json.dumps({"ok": False, "reason": reason}).encode() + b"\n"
-    _patch_run(monkeypatch, _FakeRun(out_dir, stdout=line))
+    _patch_popen(monkeypatch, _FakeChild(out_dir, stdout=line))
 
     with pytest.raises(_common().ConversionError) as excinfo:
         _runner().run_conversion(stored, "pdf", out_dir, _options())
@@ -453,7 +585,7 @@ def test_converters_runner_bad_exit_or_output_is_processing_error(
     """A non-zero exit, or stdout that isn't exactly one valid result line (a count above
     PostgreSQL's INTEGER included) -> ConversionError("processing_error"); out_dir
     removed."""
-    _patch_run(monkeypatch, _FakeRun(out_dir, returncode=returncode, stdout=stdout))
+    _patch_popen(monkeypatch, _FakeChild(out_dir, returncode=returncode, stdout=stdout))
 
     with pytest.raises(_common().ConversionError) as excinfo:
         _runner().run_conversion(stored, "pdf", out_dir, _options())
@@ -465,16 +597,27 @@ def test_converters_runner_bad_exit_or_output_is_processing_error(
 def test_converters_runner_timeout_expired_is_conversion_timeout(
     monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
 ) -> None:
-    """subprocess.TimeoutExpired -> ConversionError("conversion_timeout"); out_dir removed."""
+    """A child still running when CONVERSION_TIMEOUT_S (1 s here) has passed (the
+    stand-in sleeps 60 s after a valid line) -> ConversionError("conversion_timeout");
+    out_dir removed, the child reaped."""
     runner = _runner()
-    expired = subprocess.TimeoutExpired(list(runner.WORKER_ARGV), 120.0)
-    _patch_run(monkeypatch, _FakeRun(out_dir, raises=expired))
+    fake = _patch_popen(monkeypatch, _FakeChild(out_dir, sleep=60.0))
+    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 1.0)
 
-    with pytest.raises(_common().ConversionError) as excinfo:
-        runner.run_conversion(stored, "pdf", out_dir, _options())
+    try:
+        with pytest.raises(_common().ConversionError) as excinfo:
+            runner.run_conversion(stored, "pdf", out_dir, _options())
+        pid = _read_pid(fake.pid_file())
+        alive = pid is not None and _alive(pid)
+    finally:
+        _kill_leftover(fake.pid_file())
 
-    assert _reason(excinfo) == "conversion_timeout"
-    assert not os.path.lexists(out_dir)
+    assert (_reason(excinfo), os.path.lexists(out_dir), pid is not None, alive) == (
+        "conversion_timeout",
+        False,
+        True,
+        False,
+    )
 
 
 def test_converters_runner_real_timeout_kills_and_reaps_the_child(
@@ -506,22 +649,27 @@ def test_converters_runner_failures_log_nothing(
     out_dir: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """A timeout, a crash and a known failure: the runner logs nothing at all."""
+    """A timeout (a stand-in sleeping past CONVERSION_TIMEOUT_S, 1 s here), a crash and a
+    known failure: the runner logs nothing at all."""
     runner = _runner()
     common = _common()
+    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 1.0)
     outcomes = [
-        _FakeRun(out_dir, raises=subprocess.TimeoutExpired(["worker"], 1.0)),
-        _FakeRun(out_dir, returncode=1, stdout=b"Traceback: /srv/x/Lohn.pdf\n"),
-        _FakeRun(out_dir, stdout=b'{"ok": false, "reason": "password_protected"}\n'),
+        _FakeChild(out_dir, sleep=60.0),
+        _FakeChild(out_dir, returncode=1, stdout=b"Traceback: /srv/x/Lohn.pdf\n"),
+        _FakeChild(out_dir, stdout=b'{"ok": false, "reason": "password_protected"}\n'),
     ]
     caplog.set_level(logging.DEBUG)
 
-    for fake in outcomes:
-        _patch_run(monkeypatch, fake)
-        with pytest.raises(common.ConversionError):
-            runner.run_conversion(stored, "pdf", out_dir, _options())
+    try:
+        for fake in outcomes:
+            _patch_popen(monkeypatch, fake)
+            with pytest.raises(common.ConversionError):
+                runner.run_conversion(stored, "pdf", out_dir, _options())
+    finally:
+        _kill_leftover(outcomes[0].pid_file())
 
-    assert [record.name for record in caplog.records if record.name.startswith("admino")] == []
+    assert _admino_records(caplog) == []
 
 
 # ---------------------------------------------------------------------------
@@ -588,9 +736,9 @@ def test_converters_runner_non_regular_entry_in_out_dir_is_processing_error(
     outside.mkdir()
     large = outside / "large.bin"
     large.write_bytes(b"L" * (1024 * 1024))
-    _patch_run(
+    _patch_popen(
         monkeypatch,
-        _FakeRun(out_dir, child=lambda directory: _plant_odd_entry(case, directory, outside)),
+        _FakeChild(out_dir, child=lambda directory: _plant_odd_entry(case, directory, outside)),
     )
 
     outcome = _outcome(lambda: _runner().run_conversion(stored, "pdf", out_dir, _options()))
@@ -619,7 +767,7 @@ def test_converters_runner_derived_bytes_held_against_the_cap(
     derived_bytes 1000; 600 + 401 -> output_too_large and out_dir removed."""
     monkeypatch.setattr(_common(), "MAX_DERIVED_BYTES", 1000)
     sizes = {"part-0001.txt": 600, "manifest.json": manifest_size}
-    _patch_run(monkeypatch, _FakeRun(out_dir, child=_writes(sizes)))
+    _patch_popen(monkeypatch, _FakeChild(out_dir, child=_writes(sizes)))
 
     outcome = _outcome(lambda: _runner().run_conversion(stored, "pdf", out_dir, _options()))
 
@@ -686,6 +834,265 @@ def test_converters_runner_out_dir_replaced_by_the_child_is_processing_error_and
         before,
     )
     assert stored.read_bytes() == b"%PDF-1.7 stored bytes"
+
+
+# ---------------------------------------------------------------------------
+# The stdout cap and the child's lifetime (GH-281 Decision 1, contract R)
+# ---------------------------------------------------------------------------
+
+# Contract R1: the most stdout bytes a result may have.
+_CAP: Final = 4096
+
+# A worker stand-in that reads its job, writes its pid to argv[1], writes argv[2] bytes
+# of "x" (no newline) in one burst and then sleeps 60 s, holding its stdout open.
+_FLOODER: Final = (
+    "import os, sys, time\n"
+    "sys.stdin.buffer.read()\n"
+    "with open(sys.argv[1], 'w', encoding='ascii') as handle:\n"
+    "    handle.write(str(os.getpid()))\n"
+    "sys.stdout.buffer.write(b'x' * int(sys.argv[2]))\n"
+    "sys.stdout.buffer.flush()\n"
+    "time.sleep(60)\n"
+)
+
+# A worker stand-in that reads its job, writes argv[1] (ASCII) to stdout and exits 0.
+_WRITER: Final = (
+    "import sys\nsys.stdin.buffer.read()\nsys.stdout.buffer.write(sys.argv[1].encode('ascii'))\n"
+)
+
+# A worker stand-in that reads its job, then writes 64 MiB of "x" (no newline) in 64 KiB
+# chunks and exits 0.
+_BULK_WRITER: Final = (
+    "import sys\n"
+    "sys.stdin.buffer.read()\n"
+    "chunk = b'x' * 65536\n"
+    "for _ in range(1024):\n"
+    "    sys.stdout.buffer.write(chunk)\n"
+)
+
+# A worker stand-in that reads its job (the parent has then closed its stdin), writes its
+# pid to argv[1] and sleeps 60 s.
+_JOB_THEN_SLEEP: Final = (
+    "import os, sys, time\n"
+    "sys.stdin.buffer.read()\n"
+    "with open(sys.argv[1], 'w', encoding='ascii') as handle:\n"
+    "    handle.write(str(os.getpid()))\n"
+    "time.sleep(60)\n"
+)
+
+# A worker stand-in that reads its job, writes its pid to argv[1], writes a valid ok line,
+# closes its stdout (the parent sees EOF) and then sleeps 60 s without exiting.
+_CLOSES_STDOUT_THEN_SLEEPS: Final = (
+    "import os, sys, time\n"
+    "sys.stdin.buffer.read()\n"
+    "with open(sys.argv[1], 'w', encoding='ascii') as handle:\n"
+    "    handle.write(str(os.getpid()))\n"
+    f"sys.stdout.buffer.write({_OK_LINE!r})\n"
+    "sys.stdout.buffer.flush()\n"
+    "os.close(1)\n"
+    "time.sleep(60)\n"
+)
+
+
+def test_converters_runner_max_result_bytes_is_4096() -> None:
+    """Contract R1: runner.MAX_RESULT_BYTES is the int 4096 (a valid result line is
+    under 100 bytes)."""
+    cap = getattr(_runner(), "MAX_RESULT_BYTES", None)
+
+    assert (type(cap), cap) == (int, _CAP)
+
+
+@pytest.mark.parametrize(
+    "burst", [_CAP + 1, 1024 * 1024], ids=["cap-plus-one-byte", "one-mebibyte"]
+)
+def test_converters_runner_stdout_over_the_cap_kills_and_reaps_the_child_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    stored: Path,
+    out_dir: Path,
+    caplog: pytest.LogCaptureFixture,
+    burst: int,
+) -> None:
+    """A child that writes more than MAX_RESULT_BYTES (4096 + 1 bytes, or 1 MiB) and then
+    sleeps 60 s with its stdout open: processing_error as soon as the cap is passed, well
+    before CONVERSION_TIMEOUT_S (8 s here) and without waiting for EOF or the child's
+    exit; its pid is gone right after (killed and reaped), out_dir removed, nothing
+    logged."""
+    runner = _runner()
+    pid_file = tmp_path / "flooder.pid"
+    monkeypatch.setattr(
+        runner, "WORKER_ARGV", (sys.executable, "-c", _FLOODER, str(pid_file), str(burst))
+    )
+    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 8.0)
+    caplog.set_level(logging.DEBUG)
+    started = time.monotonic()
+
+    try:
+        outcome = _outcome(lambda: runner.run_conversion(stored, "pdf", out_dir, _options()))
+        elapsed = time.monotonic() - started
+        pid = _read_pid(pid_file)
+        alive = pid is not None and _alive(pid)
+    finally:
+        _kill_leftover(pid_file)
+
+    assert (outcome, elapsed < 4.0, pid is not None, alive, os.path.lexists(out_dir)) == (
+        ("error", "processing_error"),
+        True,
+        True,
+        False,
+        False,
+    )
+    assert _admino_records(caplog) == []
+
+
+def test_converters_runner_result_cap_read_at_call_time_and_exactly_the_cap_passes(
+    monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
+) -> None:
+    """MAX_RESULT_BYTES is read at call time and exactly the cap is no overflow: lowered to
+    the length of a valid ok line (52 bytes) the line converts and out_dir stays; one byte
+    lower the same line is over the cap -> processing_error, out_dir removed."""
+    runner = _runner()
+    monkeypatch.setattr(runner, "WORKER_ARGV", (sys.executable, "-c", _WRITER, _OK_LINE.decode()))
+    outcomes: dict[int, tuple[object, bool]] = {}
+
+    for cap in (len(_OK_LINE), len(_OK_LINE) - 1):
+        monkeypatch.setattr(runner, "MAX_RESULT_BYTES", cap, raising=False)
+        try:
+            result: object = runner.run_conversion(stored, "pdf", out_dir, _options())
+        except _common().ConversionError as exc:
+            result = ("error", exc.reason)
+        outcomes[cap] = (result, os.path.lexists(out_dir))
+
+    assert outcomes == {
+        52: (runner.ConversionResult(page_count=2, token_estimate=40, derived_bytes=0), True),
+        51: (("error", "processing_error"), False),
+    }
+
+
+def test_converters_runner_nothing_past_the_cap_is_buffered(
+    monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
+) -> None:
+    """A child that writes 64 MiB to stdout and exits 0: processing_error, out_dir removed,
+    and the parent never holds its output: the traced memory peak during the call stays
+    under 512 KiB (at most MAX_RESULT_BYTES + 1 bytes of stdout are ever held; the call
+    itself, Popen's own buffers included, peaks around 90 KB, so neither buffering the
+    output nor one read of 512 KiB or more fits)."""
+    runner = _runner()
+    monkeypatch.setattr(runner, "WORKER_ARGV", (sys.executable, "-c", _BULK_WRITER))
+    started_tracing = not tracemalloc.is_tracing()
+    tracemalloc.start()
+
+    try:
+        tracemalloc.reset_peak()
+        outcome = _outcome(lambda: runner.run_conversion(stored, "pdf", out_dir, _options()))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        if started_tracing:
+            tracemalloc.stop()
+
+    assert (outcome, os.path.lexists(out_dir), peak < 512 * 1024) == (
+        ("error", "processing_error"),
+        False,
+        True,
+    )
+
+
+def test_converters_runner_keyboard_interrupt_kills_and_reaps_the_child(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stored: Path, out_dir: Path
+) -> None:
+    """Contract R7: a KeyboardInterrupt while the parent waits for a running child (it has
+    read its job and sleeps 60 s; CONVERSION_TIMEOUT_S 30 s) propagates, and the child is
+    killed and reaped (its pid is gone, no zombie), out_dir removed."""
+    runner = _runner()
+    pid_file = tmp_path / "interrupted.pid"
+    monkeypatch.setattr(
+        runner, "WORKER_ARGV", (sys.executable, "-c", _JOB_THEN_SLEEP, str(pid_file))
+    )
+    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 30.0)
+
+    def interrupt(signum: int, frame: object) -> None:
+        # Only once the child has read its job (the parent has written and closed its
+        # stdin and waits for the child's output); until then, look again shortly.
+        if _read_pid(pid_file) is not None:
+            raise KeyboardInterrupt
+        signal.setitimer(signal.ITIMER_REAL, 0.05)
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 0.05)
+    started = time.monotonic()
+    try:
+        try:
+            runner.run_conversion(stored, "pdf", out_dir, _options())
+        except KeyboardInterrupt:
+            outcome = "interrupted"
+        else:
+            outcome = "returned"
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous)
+        elapsed = time.monotonic() - started
+        pid = _read_pid(pid_file)
+        alive = pid is not None and _alive(pid)
+    finally:
+        _kill_leftover(pid_file)
+
+    assert (outcome, elapsed < 20.0, pid is not None, alive, os.path.lexists(out_dir)) == (
+        "interrupted",
+        True,
+        True,
+        False,
+        False,
+    )
+
+
+def test_converters_runner_child_that_never_reads_its_stdin_still_converts(
+    monkeypatch: pytest.MonkeyPatch, stored: Path, out_dir: Path
+) -> None:
+    """Regression guard, contract R3: a child that writes a valid ok line and exits 0
+    without reading its stdin (it has exited before the runner writes the job, so the
+    write meets a broken pipe): the outcome follows its stdout and exit status, the broken
+    pipe is no error of its own."""
+    runner = _runner()
+    _patch_popen(monkeypatch, _FakeChild(out_dir, read_stdin=False, exit_before_returning=True))
+
+    result = runner.run_conversion(stored, "pdf", out_dir, _options())
+
+    assert (result, out_dir.is_dir()) == (
+        runner.ConversionResult(page_count=2, token_estimate=40, derived_bytes=0),
+        True,
+    )
+
+
+def test_converters_runner_child_that_closed_stdout_but_runs_on_is_conversion_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stored: Path, out_dir: Path
+) -> None:
+    """Regression guard, contract R5: a child that writes a valid line and closes its
+    stdout but doesn't exit (it sleeps 60 s): the wait for its exit is held to the same
+    deadline (CONVERSION_TIMEOUT_S, 2 s here) -> conversion_timeout long before its sleep
+    ends; its pid is gone (killed and reaped), out_dir removed."""
+    runner = _runner()
+    pid_file = tmp_path / "lingering.pid"
+    monkeypatch.setattr(
+        runner, "WORKER_ARGV", (sys.executable, "-c", _CLOSES_STDOUT_THEN_SLEEPS, str(pid_file))
+    )
+    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 2.0)
+    started = time.monotonic()
+
+    try:
+        outcome = _outcome(lambda: runner.run_conversion(stored, "pdf", out_dir, _options()))
+        elapsed = time.monotonic() - started
+        pid = _read_pid(pid_file)
+        alive = pid is not None and _alive(pid)
+    finally:
+        _kill_leftover(pid_file)
+
+    assert (outcome, elapsed < 30.0, pid is not None, alive, os.path.lexists(out_dir)) == (
+        ("error", "conversion_timeout"),
+        True,
+        True,
+        False,
+        False,
+    )
 
 
 # ---------------------------------------------------------------------------

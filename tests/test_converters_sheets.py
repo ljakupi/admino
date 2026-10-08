@@ -71,8 +71,9 @@ What these tests pin down:
     widths of the rows openpyxl produces are recorded), so a kept row formats and
     cleans at most that many values; a None-only tail out to column ZZZ is no
     reason for the columns note; content in column 51 fires it, while content
-    further right with column 51 empty (column 60) is never read: no note, its
-    text absent (the documented trade-off). Cells beyond the cap that hold no
+    further right with column 51 empty (column 60) is never read: its text is
+    absent, and in a sheet without a ``<dimension>`` there is no note either
+    (the remaining trade-off, see GH-281 below). Cells beyond the cap that hold no
     value at all don't fire the note (the 13.2 rule: a value other than None,
     checked unformatted, so the no-note case uses value-less cells, not
     whitespace).
@@ -86,6 +87,21 @@ What these tests pin down:
     with that string cleaned once.
   Spies stop the slow paths early (a ``BaseException`` past a call budget, plus
   the SIGALRM deadline), so these tests fail fast on code that does the work.
+- Columns note from the declared dimension (GH-281 Decision 4, contract S1-S4):
+  the note also appears when the worksheet's ``<dimension>`` ends right of
+  column ``MAX_TABLE_COLUMNS + 1`` (cap read at call time; with a cap of 2,
+  column 3 doesn't fire it, column 4 does): data in columns A and 60 with
+  column 51 empty, openpyxl-written (openpyxl always writes the dimension) or
+  hand-built with ``A1:BH1``; content right of column 51 only in rows past the
+  row cap (the rows note first). Rows are still read 51 columns wide. A sheet
+  without a dimension, or with a rows-only one (``1:1``), keeps only the
+  column-51 rule; a malformed one is still ``corrupted_file``; one claiming
+  fewer rows than the sheet has cuts none; a huge one (``A1:XFD1048576``) adds
+  the note and no row or cell work (rows pulled from openpyxl counted).
+  When the kept rows hold nothing in their first 50 columns
+  but the columns note applies, the table text is the notes alone
+  (``table_text``, so XLSX, CSV and DOCX): an XLSX section is the note, not
+  ``(empty sheet)``; a sheet with nothing at all stays ``(empty sheet)``.
 
 The converter modules are imported inside fixtures, so this file collects
 before they exist and every test fails on its own.
@@ -179,6 +195,12 @@ def _workbook(
 
 def _sheet_xml(rows_xml: str) -> str:
     return f'<worksheet xmlns="{_NS_MAIN}"><sheetData>{rows_xml}</sheetData></worksheet>'
+
+
+def _sheet_xml_with_dimension(ref: str | None, rows_xml: str) -> str:
+    """A worksheet declaring ``<dimension ref="..."/>`` (none when ``ref`` is None)."""
+    dimension = "" if ref is None else f'<dimension ref="{ref}"/>'
+    return f'<worksheet xmlns="{_NS_MAIN}">{dimension}<sheetData>{rows_xml}</sheetData></worksheet>'
 
 
 def _xlsx_by_hand(
@@ -1213,8 +1235,10 @@ def test_sheets_xlsx_content_beyond_column_51_with_column_51_empty_is_not_read(
     out_dir: Path,
 ) -> None:
     # Revised 13.2 (a): rows are read MAX_TABLE_COLUMNS + 1 = 51 columns wide, so with
-    # column 51 empty the content in column 60 is never seen: no columns note, its text
-    # absent (the documented trade-off), and at most 51 values formatted.
+    # column 51 empty the content in column 60 is never seen: its text is absent and at
+    # most 51 values are formatted. This hand-built sheet declares no <dimension>, so only
+    # the column-51 rule applies and there is no columns note (GH-281 Decision 4: the
+    # remaining trade-off; a declared dimension right of column 51 fires it, see below).
     assert (get_column_letter(51), get_column_letter(60)) == ("AY", "BH")
     rows = '<row r="1">' + _inline("A1", "a") + _inline("BH1", "beyond") + "</row>"
     path = _xlsx_by_hand(tmp_path, [("S", _sheet_xml(rows))])
@@ -1250,6 +1274,168 @@ def test_sheets_xlsx_content_in_column_51_fires_the_columns_note(
         "## S\n\n| a |\n| --- |\n\n[Only the first 50 columns are included.]",
         True,
     )
+
+
+# --- XLSX columns note from the declared dimension (GH-281 Decision 4) ------------------
+
+_COLUMNS_NOTE = "[Only the first 50 columns are included.]"
+
+
+@pytest.mark.parametrize("build", ["openpyxl-written", "hand-built-dimension"])
+def test_sheets_xlsx_content_in_column_60_with_column_51_empty_adds_the_columns_note(
+    common: ModuleType,
+    sheets: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    out_dir: Path,
+    build: str,
+) -> None:
+    # Data in column A and in column 60 (BH), column 51 (AY) empty: the sheet's declared
+    # dimension (A1:BH1, which openpyxl writes itself) ends right of column 51, so the
+    # note appears, while rows are still read 51 columns wide (BH's text never read).
+    if build == "openpyxl-written":
+        path = _workbook(tmp_path, [("S", [["a", *[None] * 58, "beyond"]])])
+    else:
+        rows = '<row r="1">' + _inline("A1", "a") + _inline("BH1", "beyond") + "</row>"
+        path = _xlsx_by_hand(tmp_path, [("S", _sheet_xml_with_dimension("A1:BH1", rows))])
+    per_row = common.MAX_TABLE_COLUMNS + 1
+    widths = _xlsx_row_widths(monkeypatch)
+    calls = _spy_cells(monkeypatch, common, sheets, format_budget=per_row)
+
+    text = _xlsx_text(common, sheets, path, out_dir)
+
+    assert (text, _read_at_most(widths, per_row), len(calls.formatted) <= per_row) == (
+        f"## S\n\n| a |\n| --- |\n\n{_COLUMNS_NOTE}",
+        True,
+        True,
+    )
+
+
+def test_sheets_xlsx_dimension_covers_rows_past_the_row_cap_and_its_note_follows_the_rows_note(
+    common: ModuleType,
+    sheets: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    out_dir: Path,
+) -> None:
+    # Column 60 holds content only in row 4, past the row cap of 2 (never read): the
+    # dimension (A1:BH4) still fires the columns note, after the rows note.
+    path = _workbook(tmp_path, [("S", [["h"], ["r1"], ["r2"], [*[None] * 59, "far"]])])
+    monkeypatch.setattr(common, "MAX_TABLE_ROWS", 2)
+
+    assert _xlsx_text(common, sheets, path, out_dir) == (
+        f"## S\n\n| h |\n| --- |\n| r1 |\n\n[Only the first 2 rows are included.]\n{_COLUMNS_NOTE}"
+    )
+
+
+def test_sheets_xlsx_dimension_rule_reads_the_column_cap_at_call_time(
+    common: ModuleType, sheets: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Cap 2: a dimension ending at column 3 (cap + 1, the column rule (a) reads) is no
+    # reason for the note, column 4 is. A dimension without a column ("1:1") or none at
+    # all leaves rule (a) alone; a malformed one still fails at load. Every dimension
+    # claims row 1 only while the sheet has two rows: it never cuts rows off (it is
+    # dropped before the rows are read).
+    monkeypatch.setattr(common, "MAX_TABLE_COLUMNS", 2)
+    rows = '<row r="1">' + _inline("A1", "a") + '</row><row r="2">' + _inline("A2", "b") + "</row>"
+    refs = {
+        "ends-at-cap-plus-1": "A1:C1",
+        "ends-at-cap-plus-2": "A1:D1",
+        "rows-only": "1:1",
+        "no-dimension": None,
+        "malformed": "A1:ZZZZ1",
+    }
+    outcomes = {}
+    for label, ref in refs.items():
+        out = tmp_path / f"out-{label}"
+        out.mkdir()
+        path = _xlsx_by_hand(tmp_path, [("S", _sheet_xml_with_dimension(ref, rows))])
+        try:
+            outcomes[label] = _xlsx_text(common, sheets, path, out)
+        except common.ConversionError as exc:
+            outcomes[label] = exc.reason
+
+    table = "## S\n\n| a |\n| --- |\n| b |"
+    assert outcomes == {
+        "ends-at-cap-plus-1": table,
+        "ends-at-cap-plus-2": f"{table}\n\n[Only the first 2 columns are included.]",
+        "rows-only": table,
+        "no-dimension": table,
+        "malformed": "corrupted_file",
+    }
+
+
+@pytest.mark.parametrize("build", ["openpyxl-written", "hand-built-dimension"])
+def test_sheets_xlsx_sheet_with_content_only_right_of_column_51_is_the_columns_note_alone(
+    common: ModuleType, sheets: ModuleType, tmp_path: Path, out_dir: Path, build: str
+) -> None:
+    # Nothing in the 51 columns read, the dimension ends at column 60: the section is the
+    # note alone, not "(empty sheet)" and not an empty table. A sheet with nothing at all
+    # (and no wide dimension) stays "(empty sheet)".
+    if build == "openpyxl-written":
+        path = _workbook(tmp_path, [("S", [[*[None] * 59, "far"]]), ("Blank", [])])
+    else:
+        far = '<row r="1">' + _inline("BH1", "far") + "</row>"
+        path = _xlsx_by_hand(
+            tmp_path,
+            [
+                ("S", _sheet_xml_with_dimension("A1:BH1", far)),
+                ("Blank", _sheet_xml_with_dimension("A1", "")),
+            ],
+        )
+
+    assert _xlsx_text(common, sheets, path, out_dir) == (
+        f"## S\n\n{_COLUMNS_NOTE}\n\n## Blank\n\n(empty sheet)"
+    )
+
+
+def test_sheets_xlsx_huge_declared_dimension_only_adds_the_columns_note(
+    common: ModuleType,
+    sheets: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    out_dir: Path,
+) -> None:
+    # A1:XFD1048576 with two cells: the note, and no extra row or cell work (openpyxl
+    # would pad up to the declared last row if the dimension were kept for reading).
+    rows = '<row r="1">' + _inline("A1", "a") + '</row><row r="2">' + _inline("B2", "b") + "</row>"
+    path = _xlsx_by_hand(tmp_path, [("S", _sheet_xml_with_dimension("A1:XFD1048576", rows))])
+    pulled = _count_xlsx_rows(monkeypatch, stop_after=10)
+    widths = _xlsx_row_widths(monkeypatch)
+
+    with _deadline(30):
+        text = _xlsx_text(common, sheets, path, out_dir)
+
+    assert (text, pulled[0], _read_at_most(widths, common.MAX_TABLE_COLUMNS + 1)) == (
+        f"## S\n\n| a |  |\n| --- | --- |\n|  | b |\n\n{_COLUMNS_NOTE}",
+        2,
+        True,
+    )
+
+
+def test_sheets_table_text_content_only_beyond_the_column_cap_gives_the_notes_alone(
+    common: ModuleType, sheets: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Decision 4: no kept cell holds content in the first 50 columns (a whitespace cell
+    # cleans to nothing) but the columns note applies: the notes alone, no empty table.
+    beyond_only = sheets.table_text([[None] * 50 + ["x"]])
+    blank_within = sheets.table_text([["  ", *[None] * 49, "x"]])
+    monkeypatch.setattr(common, "MAX_TABLE_ROWS", 1)
+    with_rows_note = sheets.table_text([[None] * 50 + ["x"], [None] * 50 + ["y"]])
+
+    assert (beyond_only, blank_within, with_rows_note) == (
+        _COLUMNS_NOTE,
+        _COLUMNS_NOTE,
+        f"[Only the first 1 rows are included.]\n{_COLUMNS_NOTE}",
+    )
+
+
+def test_sheets_csv_content_only_beyond_the_column_cap_is_the_columns_note_alone(
+    common: ModuleType, sheets: ModuleType, tmp_path: Path, out_dir: Path
+) -> None:
+    data = ("," * 50 + "x\n" + "," * 50 + "y\n").encode()
+
+    assert _csv_text(common, sheets, _csv(tmp_path, data), out_dir) == _COLUMNS_NOTE
 
 
 def test_sheets_table_text_cleans_each_distinct_long_value_once_per_call(

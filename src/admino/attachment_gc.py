@@ -17,7 +17,10 @@ own transaction, and its files are removed after the commit (a rolled-back
 deletion never loses files). Then each org directory is swept: an old
 ``.part`` always goes (no upload runs for a day); an old ``<id>`` or
 ``<id>.d`` goes unless G3 finds the org's row (trashed rows included: their
-files wait for the trash purge of #194).
+files wait for the trash purge of #194). G3 runs once per chunk of at most
+``SWEEP_CHUNK_SIZE`` candidate ids (GH-281), so a directory full of strays
+never binds one huge array; a failing chunk skips the whole directory for
+that run (nothing in it is removed).
 
 Security notes:
 - Never follows a symlink: org directories that are symlinks are skipped,
@@ -56,6 +59,8 @@ logger = logging.getLogger(__name__)
 
 ORPHAN_AGE: Final = timedelta(hours=24)
 GC_INTERVAL_SECONDS: Final = 3600.0
+# At most this many candidate ids are bound to one G3 statement (read at call time).
+SWEEP_CHUNK_SIZE: Final = 1000
 
 _PART_SUFFIX: Final = ".part"
 _DERIVED_SUFFIX: Final = ".d"
@@ -203,12 +208,16 @@ async def _sweep_org_dir(
 ) -> int:
     """Remove the old stray entries of one org directory; count them."""
     candidates = await asyncio.to_thread(_old_entries, org_dir, cutoff)
-    checked = {entry.attachment_id for entry in candidates if not entry.is_part}
+    # <id> and <id>.d share an id: each id is checked once.
+    checked = sorted({entry.attachment_id for entry in candidates if not entry.is_part})
+    chunk_size = SWEEP_CHUNK_SIZE
     known: set[int] = set()
-    if checked:
-        rows = await pool.fetch(_KNOWN_SQL, org_id, list(checked))
+    # Every chunk is checked before anything is removed: a failing one leaves the
+    # whole directory for the next run.
+    for start in range(0, len(checked), chunk_size):
+        rows = await pool.fetch(_KNOWN_SQL, org_id, checked[start : start + chunk_size])
         # Compared by value: asyncpg returns its own UUID subclass.
-        known = {row["id"].int for row in rows}
+        known.update(row["id"].int for row in rows)
     doomed = [
         entry for entry in candidates if entry.is_part or entry.attachment_id.int not in known
     ]

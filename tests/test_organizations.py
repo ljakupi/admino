@@ -533,14 +533,16 @@ class TestConstantsAndErrors:
         assert parameters[1:] == expected
 
     def test_organizations_defaults(self, orgs: ModuleType) -> None:
-        """Emails are queued by default; the purge uses the attachments root and the hour."""
+        """Emails are queued by default; the purge defaults to the attachments root setting
+        read at call time (None) and to the hour."""
         create = inspect.signature(orgs.create_org).parameters
         purge = inspect.signature(orgs.purge_due_orgs).parameters
         job = inspect.signature(orgs.run_org_purge_job).parameters
 
         assert create["queue_email"].default is True
-        assert purge["attachments_root"].default == orgs.ATTACHMENTS_ROOT
-        assert job["attachments_root"].default == orgs.ATTACHMENTS_ROOT
+        # GH-281 Decision 8 (A5): None = organizations.ATTACHMENTS_ROOT read at call time.
+        assert purge["attachments_root"].default is None
+        assert job["attachments_root"].default is None
         assert job["interval_seconds"].default == orgs.PURGE_INTERVAL_SECONDS
 
 

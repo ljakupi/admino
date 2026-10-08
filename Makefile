@@ -126,13 +126,21 @@ dev-db-down:
 #   database owner (PG_USER/PG_PASSWORD; PG_APP_PASSWORD for admino_app).
 # run: migrate, then start the app as the runtime role admino_app
 #   (PG_APP_PASSWORD), with the owner password removed from its environment.
+#   It also sets ADMINO_ATTACHMENTS_ROOT (default: ./data/attachments, git-ignored;
+#   an exported value wins) so uploads work natively (GH-281). The root is created
+#   with mode 0700 and an existing one is chmod'ed to 0700 too (following a
+#   symlinked root); on a directory you don't own, `make run` stops.
 # In Docker the one-shot `migrate` service does the same before the agent starts.
 # --------------------------------------------------------------------------
+ADMINO_ATTACHMENTS_ROOT ?= $(CURDIR)/data/attachments
+
 migrate:
 	python -m $(PACKAGE).migrate
 
 run: migrate
-	env -u PG_PASSWORD python -m $(PACKAGE).main
+	mkdir -p -m 0700 "$(ADMINO_ATTACHMENTS_ROOT)"
+	chmod 700 "$(ADMINO_ATTACHMENTS_ROOT)"
+	ADMINO_ATTACHMENTS_ROOT="$(ADMINO_ATTACHMENTS_ROOT)" env -u PG_PASSWORD python -m $(PACKAGE).main
 
 clean:
 	find $(SRC_DIR) $(TESTS_DIR) -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true

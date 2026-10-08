@@ -326,10 +326,10 @@ conversion in `attachment_processing.py` and `converters/`:
   on the organization's row when the file is stored, so parallel uploads can't overrun
   it. A refused upload leaves no file, no row and no audit event. An exception after
   the commit (a cancelled connection release) never deletes the stored file, and
-  neither does a cancellation or a lost database connection during the commit itself,
-  when admino can't know whether the database applied it: a file left without its row
-  is removed by the hourly cleanup once it is 24 hours old, while a row left without
-  its file would stay broken.
+  neither does a cancellation, a lost database connection or a failure in the database
+  driver's protocol layer during the commit itself, when admino can't know whether the
+  database applied it: a file left without its row is removed by the hourly cleanup
+  once it is 24 hours old, while a row left without its file would stay broken.
 - **Parsed in a separate, short-lived process.** The parsers (PDFium through pypdfium2,
   python-docx, openpyxl, Pillow) read hostile files, so the agent's process never loads
   them. Each file is converted by its own child process (`python -m
@@ -338,17 +338,28 @@ conversion in `attachment_processing.py` and `converters/`:
   another organization's files. The job (the stored file's path, its type, its name and
   the limits) reaches the child on its standard input, never on its command line. Its
   environment holds only `PYTHONPATH`: no database password, API token, encryption key
-  or SMTP credential. Its error output is discarded unread. It's killed after 120
-  seconds (`conversion_timeout`), and on Linux it raises its own OOM score, so when
-  memory runs out the kernel kills the child first, not the agent. Before it reads the
-  job, it also limits itself to 130 seconds of CPU time and, on Linux, 2 GiB of address
-  space, so a parser that goes past either ends the child. On Linux it also turns off
-  its core dumps (a core size of 0), so a parser that crashes can't leave a memory image
-  of the child, holding the document, on the host. A crash, an exit without a valid
-  answer or an answer with an unknown code fails the file with `processing_error`, and
-  whatever the child wrote is removed. A failure is a fixed code in `failure_reason`: a
-  library's message, the file name and paths never reach the database, a response or a
-  log line.
+  or SMTP credential. Its error output is discarded unread, and its answer on standard
+  output (stdout) is read with a cap of 4 KiB (a valid answer is under 100 bytes): a
+  child that writes more is killed at once, without waiting for it to finish, and the
+  file fails with `processing_error`, so a flooding child can't fill the agent's memory.
+  It's killed after 120 seconds (`conversion_timeout`), and on Linux it raises its own
+  OOM score, so when memory runs out the kernel kills the child first, not the agent.
+  Before it reads the job, it also limits itself to 130 seconds of CPU time and, on
+  Linux, 2 GiB of address space, so a parser that goes past either ends the child. On
+  Linux it also turns off its core dumps (a core size of 0), so a parser that crashes
+  can't leave a memory image of the child, holding the document, on the host. A crash,
+  an exit without a valid answer or an answer with an unknown code fails the file with
+  `processing_error`, and whatever the child wrote is removed. A failure is a fixed code
+  in `failure_reason`: a library's message, the file name and paths never reach the
+  database, a response or a log line. The agent's container runs under an init process
+  (`init: true` in every Compose profile), which reaps the orphaned processes a killed
+  conversion may leave behind, so they don't pile up as zombies. The agent always kills
+  and reaps the child itself, but not the processes the child started: the grandchildren
+  of a killed conversion are not killed, they keep running until they exit, and the
+  container's init reaps them when they exit. Each one inherits the child's limits, but
+  the 130-second CPU limit (`RLIMIT_CPU`) applies per process: every process a
+  grandchild starts gets its own 130 seconds, so the tree as a whole has no CPU cap, and
+  its processes are only reaped by the container's init once they exit.
 - **The agent's secrets and code stay out of the child's reach.** The child runs as the
   agent's user, so on Linux the agent makes its own process non-dumpable at startup
   (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's
@@ -380,19 +391,26 @@ conversion in `attachment_processing.py` and `converters/`:
   only up to the column limit, however wide a span it declares; an XLSX sheet is read
   only up to row 1,048,576 (Excel's last row), whatever row numbers the file uses, and
   only 51 columns wide, whatever columns its cells name (the columns note appears when
-  the 51st column has content; content further right with that column empty isn't
-  read); empty rows are skipped before any work on their cells, and a long value
-  repeated across cells is cleaned once; and a CSV's delimiter is detected from its
-  first 8 KiB.
+  the 51st column has content, or when the sheet's declared dimension reaches past it;
+  content further right is never read); empty rows are skipped before any work on
+  their cells, and a long value repeated across cells is cleaned once; and a CSV's
+  delimiter is detected from its first 8 KiB.
 - **Image metadata is stripped.** Converted images are written fresh, without their
   metadata: no EXIF (GPS location, camera, dates), ICC profile, XMP, comments or PNG
   text chunks, so where a photo was taken doesn't travel with it to the model. Rendered
-  PDF pages carry none either. The original file keeps its metadata and downloads as it
-  was uploaded.
+  PDF pages carry none either. A malformed EXIF block isn't trusted at all: the image
+  converts as stored, without orientation correction, and its metadata is stripped all
+  the same. The original file keeps its metadata and downloads as it was uploaded.
 - **Downloads never render in admino's origin.** Only the chat's owner downloads a
   file, always as `Content-Disposition: attachment` with the detected type's
   `Content-Type`, `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`, so an
-  uploaded HTML or SVG file never opens as a page of admino.
+  uploaded HTML or SVG file never opens as a page of admino. A malformed or
+  unsatisfiable `Range` header answers `416` with the fixed code `range_not_satisfiable`
+  (never the header's text), and only after the owner check and the file lookup, so a
+  `Range` never reveals whether someone else's file exists or how large it is. So does a
+  `Range` longer than 1,024 characters or asking for more than 16 parts (ranges that
+  overlap or touch count as one), so a request for thousands of one-byte parts can't
+  hold the server's single worker busy for every organization.
 - **Names stay in the database.** The original name comes in a header, never in the URL
   (so not in an access log). It's cleaned (its last path segment only, without control
   or invisible formatting characters, at most 255 characters) and stored in the
@@ -554,9 +572,16 @@ We prefer to be transparent about what this does **not** guarantee:
   attachments volume, originals and converted parts; reach the internal network (the
   database, the vLLM container, the agent's own port) and the approved hosts; send DNS
   queries to any resolver (see *DNS egress is broad* above); and signal the agent's
-  process. Closing that takes a real sandbox, and the options for a follow-up are
-  Landlock (Linux 5.13 and later), confining the child to its one file and its output
-  directory, or a separate converter container with its own user and no network. The
+  process. Under `init: true` the agent is no longer the container's PID 1, which the
+  kernel shields from those signals, so a compromised conversion child can stop or kill
+  the agent's process. A killed agent ends its container, which the restart policy starts
+  again; a stopped one freezes admino for every organization until you restart it by
+  hand (`docker compose restart agent`), as the restart policy acts only on an exit.
+  Closing that takes a real sandbox, and the options for a follow-up are Landlock or a
+  separate converter container with its own user and no network. Landlock's filesystem
+  rules (Linux 5.13 and later) confine the child to its one file and its output
+  directory, but they don't block the stop or kill: only its signal scoping
+  (`LANDLOCK_SCOPE_SIGNAL`, Landlock ABI 6, Linux 6.12 and later) does. The
   parsers are pinned; keep admino up to date, as their security fixes arrive as
   dependency updates.
 - **The deletion window is checked when the deletion is scheduled, not when it's

@@ -305,7 +305,8 @@ fi
 # Drop root privileges before running the application. The entrypoint runs as
 # root so it can apply the iptables egress whitelist above; the app itself must
 # not. gosu does a clean setuid to admino and exec's the command with no extra
-# process, so the app becomes PID 1 with correct signal handling. If the
+# process (the app replaces the entrypoint). Under compose `init: true`,
+# docker-init is PID 1 and forwards signals to the app. If the
 # container was started as a non-root user (e.g. a compose `user:` override)
 # there is nothing to drop, so exec directly — iptables was already gated by
 # REQUIRE_EGRESS_WHITELIST in that case.

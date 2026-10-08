@@ -68,6 +68,15 @@ covering:
 - GH-188: main() calls ``process_hardening.make_non_dumpable()`` once before
   uvicorn.run; ``mock_deps`` patches it (when the module exists) so main() never
   makes the pytest process itself non-dumpable on Linux.
+- GH-281 (Decision 8, contract A4): right after the config loads and before the
+  database startup, main() sets ``organizations.ATTACHMENTS_ROOT`` from
+  ``ADMINO_ATTACHMENTS_ROOT`` (``organizations.resolve_attachments_root``): an
+  absolute path is used (``attachments.attachments_root()`` then returns it too), unset
+  or empty means ``/app/data/attachments`` (even over an earlier value), and any other
+  value exits 1 with exactly ``ERROR: ADMINO_ATTACHMENTS_ROOT must be an absolute
+  path.`` on stderr (never the value), before any database work or uvicorn.
+  ``mock_deps`` unsets the variable and restores ``organizations.ATTACHMENTS_ROOT``
+  after each test, so a main() run never leaks the setting into other tests.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -96,6 +105,7 @@ import uvicorn
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 import admino.main as main_module
+from admino import attachments, organizations
 from admino.config import AppConfig, LLMConfig
 from admino.llm import LLMError
 from admino.main import _async_startup, _configure_logging, _import_tool_modules, main
@@ -177,6 +187,12 @@ def mock_deps(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr("admino.main.load_app_config", mock_load_app_config)
     monkeypatch.setattr("admino.main._import_tool_modules", mock_import_tools)
+
+    # GH-281: main() sets organizations.ATTACHMENTS_ROOT from ADMINO_ATTACHMENTS_ROOT. A
+    # shell that sourced .env must not decide these tests, and the setting main() makes
+    # is restored after each test (other files read the process setting).
+    monkeypatch.delenv("ADMINO_ATTACHMENTS_ROOT", raising=False)
+    monkeypatch.setattr(organizations, "ATTACHMENTS_ROOT", organizations.ATTACHMENTS_ROOT)
     monkeypatch.setattr("admino.main.asyncio", mock_asyncio)
 
     # These are imported lazily inside main(), so we patch the module paths
@@ -304,6 +320,96 @@ class TestMainHappyPath:
         main(config_path=Path("c.yaml"))
 
         assert (harden.call_args_list, events) == ([call()], ["non_dumpable", "uvicorn"])
+
+
+# ---------------------------------------------------------------------------
+# GH-281: the attachments root from ADMINO_ATTACHMENTS_ROOT
+# ---------------------------------------------------------------------------
+
+_ROOT_DEFAULT = Path("/app/data/attachments")
+_ROOT_REFUSED = "ERROR: ADMINO_ATTACHMENTS_ROOT must be an absolute path.\n"
+
+
+class TestMainAttachmentsRoot:
+    """main() resolves ADMINO_ATTACHMENTS_ROOT once, before the database startup."""
+
+    def test_main_sets_the_attachments_root_before_the_database_startup(
+        self, mock_deps: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An absolute path is the setting from the database startup on, and every
+        consumer's accessor (``attachments.attachments_root()``) returns it."""
+        monkeypatch.setenv("ADMINO_ATTACHMENTS_ROOT", "/srv/admino-281/attachments")
+        seen_at_startup: list[Path] = []
+
+        def fake_run(coro: Any) -> Any:
+            if hasattr(coro, "close"):
+                coro.close()
+            seen_at_startup.append(organizations.ATTACHMENTS_ROOT)
+            return mock_deps["config"]
+
+        mock_deps["asyncio"].run = MagicMock(side_effect=fake_run)
+
+        main(config_path=Path("c.yaml"))
+
+        expected = Path("/srv/admino-281/attachments")
+        assert (
+            seen_at_startup[:1],
+            organizations.ATTACHMENTS_ROOT,
+            attachments.attachments_root(),
+        ) == ([expected], expected, expected)
+
+    @pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+    def test_main_unset_or_empty_attachments_root_is_the_default(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        value: str | None,
+    ) -> None:
+        """No value (or an empty one) sets the default, whatever the setting held."""
+        monkeypatch.setattr(organizations, "ATTACHMENTS_ROOT", tmp_path)
+        if value is not None:
+            monkeypatch.setenv("ADMINO_ATTACHMENTS_ROOT", value)
+
+        main(config_path=Path("c.yaml"))
+
+        assert (organizations.ATTACHMENTS_ROOT, attachments.attachments_root()) == (
+            _ROOT_DEFAULT,
+            _ROOT_DEFAULT,
+        )
+
+    @pytest.mark.parametrize(
+        "value",
+        ["data/attachments", ".", "   ", "zq281-relative/attachments"],
+        ids=["data-attachments", "dot", "whitespace", "relative-marker"],
+    )
+    def test_main_refuses_a_relative_attachments_root(
+        self,
+        mock_deps: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+        value: str,
+    ) -> None:
+        """Exit 1 with the fixed message alone on stderr (the value is never echoed, in
+        the output or a log), before any database work, app or uvicorn."""
+        monkeypatch.setenv("ADMINO_ATTACHMENTS_ROOT", value)
+        # Keep pytest's capture handler: no root handler writes log lines to stderr.
+        monkeypatch.setattr("admino.main._configure_logging", MagicMock())
+
+        with caplog.at_level(logging.DEBUG), pytest.raises(SystemExit) as exc_info:
+            main(config_path=Path("c.yaml"))
+
+        captured = capsys.readouterr()
+        assert (
+            exc_info.value.code,
+            captured.err,
+            captured.out,
+            "zq281" in caplog.text,
+            mock_deps["asyncio"].run.call_count,
+            mock_deps["create_app"].call_count,
+            mock_deps["uvicorn_run"].call_count,
+        ) == (1, _ROOT_REFUSED, "", False, 0, 0, 0)
 
 
 # ---------------------------------------------------------------------------

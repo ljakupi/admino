@@ -7,7 +7,8 @@ Inputs: the path of a stored ``xlsx`` or ``csv`` upload, the part writer and the
 conversion options (unused: sheets have no pages or labels).
 Outputs: one text part (none when there is no content); returns no page count.
 XLSX: ``## <sheet name>`` and its table (or ``(empty sheet)``) per worksheet in
-workbook order, chartsheets skipped. CSV: one table, no heading.
+workbook order, chartsheets skipped. CSV: one table, no heading. A table whose
+kept cells hold nothing within the column cap is its notes alone.
 
 Security notes:
 - The OOXML zip-bomb guard runs before openpyxl opens a workbook; openpyxl
@@ -33,10 +34,14 @@ Security notes:
   values; ``str`` caches its hash), so one huge shared string referenced by
   every cell is cleaned once, not once per cell.
 - Trade-off of the XLSX width: the columns note fires when a kept row has
-  content in column ``MAX_TABLE_COLUMNS + 1`` (51); content further right
-  with that column empty is neither read nor noted.
-- The worksheet's declared dimension is ignored, so a lying ``<dimension>``
-  can't cut real rows off.
+  content in column ``MAX_TABLE_COLUMNS + 1`` (51), or when the worksheet's
+  declared ``<dimension>`` ends right of it (column 52 or later, whatever the
+  row: the dimension covers the whole sheet). Content further right is never
+  read; in a sheet without a dimension (or with a rows-only one) it is not
+  noted either when column 51 is empty.
+- Apart from that column check, the declared dimension is dropped before any
+  row is read, so a lying ``<dimension>`` can't cut real rows off or add
+  row or cell work (a huge one only adds the note).
 - Any openpyxl, XML, ZIP or CSV error (while loading or while reading rows)
   is ``corrupted_file``; the library's message is dropped (``from None``).
 """
@@ -101,7 +106,7 @@ def format_cell(value: object) -> str:
     return str(value)
 
 
-def table_text(rows: Iterable[Sequence[object]]) -> str:
+def table_text(rows: Iterable[Sequence[object]], *, columns_cut: bool = False) -> str:
     """Build a capped Markdown table from raw rows, with its notes; ``""`` when empty.
 
     A row whose values are all None or ``""`` is skipped unformatted. In the
@@ -113,7 +118,11 @@ def table_text(rows: Iterable[Sequence[object]]) -> str:
     kept, each cut to ``MAX_TABLE_COLUMNS`` cells, then the table is trimmed
     to its rightmost non-empty column. Notes follow after a blank line, one
     per line: the rows note when another non-empty row follows the kept ones,
-    the columns note when a kept row has content beyond the column cap.
+    the columns note when a kept row has content beyond the column cap, or
+    when ``columns_cut`` is set (the caller knows of content beyond it that
+    the rows don't show: an XLSX sheet's declared dimension). When no kept
+    cell within the column cap holds content, the text is the notes alone
+    (``""`` without notes).
 
     Raises:
         ConversionError: ``text_too_large`` as soon as the kept cells hold more
@@ -128,7 +137,7 @@ def table_text(rows: Iterable[Sequence[object]]) -> str:
     clean_long = functools.lru_cache(maxsize=_LONG_VALUE_MEMO_SIZE)(_cell_text)
     kept: list[list[str]] = []
     chars = 0
-    rows_cut = columns_cut = False
+    rows_cut = False
     for row in rows:
         # Both counts run in C. None first: padded rows are all None, and
         # comparing a None with "" is the slow comparison.
@@ -156,15 +165,15 @@ def table_text(rows: Iterable[Sequence[object]]) -> str:
         chars += sum(len(cell) for cell in kept[-1])
         if chars > max_chars:
             raise ConversionError("text_too_large")
-    if not kept:
-        return ""
-    width = max(_used_width(row) for row in kept)
-    table = markdown_table([row[:width] for row in kept])
     notes = []
     if rows_cut:
         notes.append(f"[Only the first {max_rows} rows are included.]")
     if columns_cut:
         notes.append(f"[Only the first {max_columns} columns are included.]")
+    width = max((_used_width(row) for row in kept), default=0)
+    if not width:
+        return "\n".join(notes)
+    table = markdown_table([row[:width] for row in kept])
     return table + "\n\n" + "\n".join(notes) if notes else table
 
 
@@ -216,10 +225,17 @@ def _workbook_text(file: BinaryIO) -> str:
         sections: list[str] = []
         length = -len(_SECTION_SEPARATOR)
         for sheet in worksheets[:max_sheets]:
+            # The declared dimension, read before it is dropped: None without
+            # one or for a rows-only one ("1:1").
+            declared_columns = sheet.max_column
             sheet.reset_dimensions()
             # One column past the cap: enough for the columns note.
-            rows = sheet.iter_rows(values_only=True, max_col=common.MAX_TABLE_COLUMNS + 1)
-            table = table_text(itertools.islice(rows, MAX_SHEET_ROW_INDEX))
+            read_columns = common.MAX_TABLE_COLUMNS + 1
+            rows = sheet.iter_rows(values_only=True, max_col=read_columns)
+            table = table_text(
+                itertools.islice(rows, MAX_SHEET_ROW_INDEX),
+                columns_cut=isinstance(declared_columns, int) and declared_columns > read_columns,
+            )
             section = f"## {clean_cell(sheet.title)}\n\n{table or _EMPTY_SHEET}"
             length += len(_SECTION_SEPARATOR) + len(section)
             if length > common.MAX_TEXT_CHARS:

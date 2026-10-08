@@ -31,6 +31,11 @@ F6, the unknown commit outcome (security-audit-fix1 L-2):
 - Regression guards: a COMMIT the server refuses (a ``SerializationError``) and a failure
   before the COMMIT was sent (a cancellation right after the rename) remove both ``<id>``
   and ``<id>.part``.
+- GH-281 (Decision 5, contract U1): asyncpg's own ``InternalClientError`` and its
+  subclass ``ProtocolError`` at the COMMIT are unknown outcomes too. Applied: the error
+  propagates, the row, its event and ``<id>`` with its bytes stay, no ``.part``. Not
+  applied: no row, no event, ``<id>`` kept with its bytes; a GC run now keeps it (it is
+  younger than 24 h) and a GC run 25 h later removes it (no row: a stray).
 
 The new names are only read inside the tests (monkeypatched with ``raising=False``), so
 the file collects against the code before the fixes. Files live under tmp_path; no
@@ -46,6 +51,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 import asyncpg
@@ -408,6 +414,18 @@ def _connection_reset() -> BaseException:
     return ConnectionResetError(54, "Connection reset by peer")
 
 
+def _internal_client_error() -> BaseException:
+    # asyncpg's own failure in its protocol layer (GH-281): the COMMIT's answer is lost.
+    return asyncpg.InternalClientError("unknown error in protocol implementation")
+
+
+def _protocol_error() -> BaseException:
+    # A subclass of InternalClientError (GH-281 Decision 5).
+    return asyncpg.ProtocolError(
+        "the number of columns in the result row (2) is different from what was described (0)"
+    )
+
+
 def _serialization_failure() -> BaseException:
     return asyncpg.exceptions.SerializationError(
         "could not serialize access due to read/write dependencies among transactions"
@@ -512,6 +530,78 @@ class TestAttachmentsUnknownCommitOutcome:
 
         assert [outcome for _, outcome in db.transactions] == [f"rollback:{type(error).__name__}"]
         assert _stored(world) == ([], 0, [])
+
+
+_CLIENT_ERRORS: Final = [
+    pytest.param(_internal_client_error, id="internal-client-error"),
+    pytest.param(_protocol_error, id="protocol-error"),
+]
+
+
+class TestAttachmentsCommitClientError:
+    """GH-281 U1: asyncpg's InternalClientError (ProtocolError included) at the COMMIT is
+    an unknown outcome, like the F6 cases above."""
+
+    @pytest.mark.parametrize("make_error", _CLIENT_ERRORS)
+    async def test_attachments_client_error_at_applied_commit_keeps_row_and_file(
+        self,
+        att: ModuleType,
+        world: _World,
+        monkeypatch: pytest.MonkeyPatch,
+        make_error: Callable[[], BaseException],
+    ) -> None:
+        """The server applied the COMMIT; asyncpg then fails reading its answer: the
+        error propagates, and the row, its file.upload event and <id> with the bytes
+        stay; no .part."""
+        db = world.db
+        error = make_error()
+        _interrupt_commit(monkeypatch, db, error, applied=True)
+
+        with pytest.raises(type(error)):
+            await _upload(att, world, _Body([_DATA]).stream(), declared=len(_DATA))
+        entries = [f"{ORG_ID}/{attachment_id}" for attachment_id in db.attachments]
+
+        assert [outcome for _, outcome in db.transactions] == ["commit"]
+        assert (len(entries), len(db.audit_rows("file.upload"))) == (1, 1)
+        assert _left_on_disk(world.root) == entries
+        assert _content(world.root, entries[0]) == _DATA
+
+    @pytest.mark.parametrize("make_error", _CLIENT_ERRORS)
+    async def test_attachments_client_error_at_unapplied_commit_keeps_file_for_the_sweep(
+        self,
+        att: ModuleType,
+        world: _World,
+        monkeypatch: pytest.MonkeyPatch,
+        make_error: Callable[[], BaseException],
+    ) -> None:
+        """The COMMIT never took effect (the transaction rolled back): the error
+        propagates, no row and no event exist, and <id> is kept with its bytes (no
+        .part). A GC run now keeps it (younger than 24 h); a GC run 25 h later removes
+        it, since no row names it."""
+        import admino.attachment_gc as gc
+
+        db = world.db
+        error = make_error()
+        _interrupt_commit(monkeypatch, db, error, applied=False)
+
+        with pytest.raises(type(error)):
+            await _upload(att, world, _Body([_DATA]).stream(), declared=len(_DATA))
+        outcomes = [outcome for _, outcome in db.transactions]
+        stored = (_sizes(world), len(db.audit_rows("file.upload")))
+        entries = _left_on_disk(world.root)
+        kept = (
+            [_is_original(entry) for entry in entries],
+            _content(world.root, entries[0]) if entries else None,
+        )
+        current = datetime.now(UTC)
+        await gc.collect_garbage(db.pool, world.root, now=current)
+        after_young_run = _left_on_disk(world.root)
+        await gc.collect_garbage(db.pool, world.root, now=current + timedelta(hours=25))
+
+        assert (outcomes, stored) == ([f"rollback:{type(error).__name__}"], ([], 0))
+        assert kept == ([True], _DATA)
+        assert after_young_run == entries
+        assert _left_on_disk(world.root) == []
 
 
 # ---------------------------------------------------------------------------

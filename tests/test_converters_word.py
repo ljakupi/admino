@@ -24,7 +24,8 @@ and the part file is read back. What these tests pin down:
   trimmed, caps with the exact notes (monkeypatched small
   ``MAX_TABLE_ROWS``/``MAX_TABLE_COLUMNS``/``MAX_CELL_CHARS``; no note at the
   caps); paragraphs and tables keep body order; an all-empty table adds no
-  block (resolved gap: like an empty paragraph).
+  block (resolved gap: like an empty paragraph); a table with content only
+  beyond the column cap is its columns note alone (GH-281 Decision 4).
 - Output: one text part ``part-0001.txt``, page None, tokens ==
   ``estimate_text_tokens`` of the exact text; returns None; an empty document
   writes no part.
@@ -353,6 +354,24 @@ def test_word_paragraphs_and_tables_keep_body_order(tmp_path: Path) -> None:
     assert _text(tmp_path, document) == (
         "Before\n\n| k1 | v1 |\n| --- | --- |\n| a | b |\n\n"
         "Between\n\n| k2 |\n| --- |\n| c |\n\nAfter"
+    )
+
+
+def test_word_table_with_content_only_beyond_the_column_cap_is_its_columns_note_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # GH-281 Decision 4 (the shared table builder): nothing in the first 2 columns, the
+    # columns note applies, so the table's block is the note alone, not an empty table.
+    from admino.converters import common
+
+    monkeypatch.setattr(common, "MAX_TABLE_COLUMNS", 2)
+    document = docx.Document()
+    document.add_paragraph("Before")
+    _table(document, [["", "", "x"], [" ", "", "y"]])
+    document.add_paragraph("After")
+
+    assert _text(tmp_path, document) == (
+        "Before\n\n[Only the first 2 columns are included.]\n\nAfter"
     )
 
 

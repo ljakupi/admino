@@ -302,6 +302,10 @@ Security notes:
   ``Content-Type``, ``Content-Disposition: attachment; filename*=UTF-8''...``
   (the percent-encoded download name, never a raw header value) and
   ``Cache-Control: no-store``; ``nosniff`` comes with every response. A
+  malformed or unsatisfiable ``Range``, one longer than 1,024 characters and
+  one of more than 16 parts is the 416 ``range_not_satisfiable``
+  (fixed text, never the header), checked only after the ownership and the
+  file, so another user's file never reveals its size (GH-281). A
   message's ``attachment_ids`` above the platform ``max_files_per_message``
   is a 422 ``too_many_files`` before any attachment statement; after the
   chat's owner check, an id that isn't the caller's live file of the chat is
@@ -660,6 +664,7 @@ from starlette.background import BackgroundTask
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
+from starlette.responses import MalformedRangeHeader, RangeNotSatisfiable
 from starlette.staticfiles import StaticFiles
 
 from admino import (
@@ -1519,6 +1524,12 @@ _ATTACHMENT_ALREADY_SENT_BODY: Final = {
 _TOO_MANY_FILES_BODY: Final = {
     "detail": "Too many files for one message",
     "reason": "too_many_files",
+}
+# GH-281: a download's Range header the file response would reject (malformed or
+# unsatisfiable) or past the Range limits; fixed text, never the header.
+_RANGE_NOT_SATISFIABLE_BODY: Final = {
+    "detail": "Range not satisfiable",
+    "reason": "range_not_satisfiable",
 }
 
 # The stored status of a run's last message: a run's ``final`` is ``complete``.
@@ -5171,12 +5182,70 @@ async def get_attachment_metadata(
     return _attachment_summary(await attachments.get_attachment(get_pool(), tenant, attachment_id))
 
 
-async def get_attachment_content(principal: _ChatSenderDep, attachment_id: UUID) -> FileResponse:
+# A download's Range limits (GH-281): a long header or many parts make the file
+# response's parse and multipart body cost more than the bytes are worth. Read at
+# call time.
+_MAX_RANGE_HEADER_CHARS: int = 1024
+_MAX_RANGES: int = 16
+
+# The download's documented error beyond the shared ones (GH-281).
+_ATTACHMENT_CONTENT_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    416: {
+        "description": (
+            "range_not_satisfiable: the Range header is malformed, starts at or past "
+            "the end of the file, is longer than 1,024 characters or asks for more than "
+            "16 parts (overlapping and adjacent ranges count as one). Content-Range "
+            "names the file's size (bytes */<size>)."
+        ),
+        "content": {"application/json": {"example": _RANGE_NOT_SATISFIABLE_BODY}},
+    }
+}
+
+
+def _refused_range(request: Request, response: FileResponse, size: int) -> JSONResponse | None:
+    """The 416 ``range_not_satisfiable`` for a Range the file response would reject, else None.
+
+    The checks are FileResponse's own (Starlette private API, pinned to its
+    observable behaviour by the download tests): a Range ignored because of
+    a stale ``If-Range`` stays ignored (the whole file), and exactly the
+    Ranges it would answer with its plain-text 400 or 416 get the JSON 416.
+    A Range that applies is also refused past the limits: a header longer
+    than ``_MAX_RANGE_HEADER_CHARS`` (before any parsing) or more than
+    ``_MAX_RANGES`` parts once overlapping and adjacent ranges are merged
+    (the parts the file response would serve).
+
+    Args:
+        request: The download request (its ``Range`` and ``If-Range``).
+        response: The prepared file response (its ETag and Last-Modified).
+        size: The file's size in bytes.
+    """
+    range_header = request.headers.get("range")
+    if_range = request.headers.get("if-range")
+    if range_header is None or (if_range is not None and not response._should_use_range(if_range)):
+        return None
+    if len(range_header) <= _MAX_RANGE_HEADER_CHARS:
+        with contextlib.suppress(MalformedRangeHeader, RangeNotSatisfiable):
+            if len(response._parse_range_header(range_header, size)) <= _MAX_RANGES:
+                return None
+    return JSONResponse(
+        status_code=416,
+        content=_RANGE_NOT_SATISFIABLE_BODY,
+        headers={"Content-Range": f"bytes */{size}"},
+    )
+
+
+async def get_attachment_content(
+    request: Request, principal: _ChatSenderDep, attachment_id: UUID
+) -> FileResponse | JSONResponse:
     """Handle GET /api/attachments/{attachment_id}/content — download an attachment of the caller.
 
     Any status downloads (the stored original, not a processed artifact).
+    Order: the rate limit, the ownership, the file, then the ``Range`` header
+    (so nothing about a file that isn't the caller's, its size included,
+    depends on the header).
 
     Args:
+        request: The request (its ``Range`` and ``If-Range`` headers).
         principal: The logged-in principal (needs ``chat.send``).
         attachment_id: The attachment (a UUID; anything else is a 422).
 
@@ -5184,7 +5253,11 @@ async def get_attachment_content(principal: _ChatSenderDep, attachment_id: UUID)
         The stored bytes with the kind's ``Content-Type``, ``Content-Disposition:
         attachment`` naming the percent-encoded download name (the kind's
         extension added when the stored name's doesn't fit, so a ``.html``
-        name never downloads as HTML) and ``Cache-Control: no-store``.
+        name never downloads as HTML) and ``Cache-Control: no-store``. A
+        valid ``Range`` is the 206 with the requested bytes. A malformed or
+        unsatisfiable one, one longer than 1,024 characters and one of more
+        than 16 parts is the 416 ``range_not_satisfiable`` with
+        ``Content-Range: bytes */<size>`` (``_refused_range``).
 
     Raises:
         HTTPException: 429 when rate-limited. Anything but the caller's own
@@ -5204,7 +5277,7 @@ async def get_attachment_content(principal: _ChatSenderDep, attachment_id: UUID)
         raise attachments.AttachmentNotFoundError from None
     if not stat.S_ISREG(file_stat.st_mode):
         raise attachments.AttachmentNotFoundError
-    return FileResponse(
+    response = FileResponse(
         path,
         stat_result=file_stat,
         media_type=attachment_types.MEDIA_TYPES[record.kind],
@@ -5215,6 +5288,8 @@ async def get_attachment_content(principal: _ChatSenderDep, attachment_id: UUID)
             "Cache-Control": "no-store",
         },
     )
+    refused = _refused_range(request, response, file_stat.st_size)
+    return response if refused is None else refused
 
 
 # ---------------------------------------------------------------------------
@@ -6857,7 +6932,11 @@ def create_app(
     app.get("/api/attachments/{attachment_id}", response_model=AttachmentSummary)(
         get_attachment_metadata
     )
-    app.get("/api/attachments/{attachment_id}/content", response_model=None)(get_attachment_content)
+    app.get(
+        "/api/attachments/{attachment_id}/content",
+        response_model=None,
+        responses=_ATTACHMENT_CONTENT_RESPONSES,
+    )(get_attachment_content)
     app.post("/api/message", response_model=ChatResponse)(post_message)
     app.post(
         "/api/confirm/{confirmation_id}",

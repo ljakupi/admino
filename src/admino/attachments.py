@@ -45,15 +45,17 @@ Security notes:
   text. The composite foreign key of migration 0027 makes an attachment of
   someone else's chat impossible in the database too.
 - The file is named by its id only; the original name lives in the row.
-  Directories are created 0700, files 0600; the partial file is created
+  Directories are created 0700 (a missing root too; an existing root's
+  mode is left alone), files 0600; the partial file is created
   exclusively and never through a symlink. ``remove_files`` and
   ``remove_derived`` unlink a symlink instead of following it.
 - A refused or failed upload leaves no row, no file and no audit event: the
   partial (or renamed) file is removed on every failure before the commit,
   cancellation included, and on a COMMIT the server refuses. After the
   commit, a later exception (a cancelled connection release) never removes
-  the stored file; neither does a cancellation, a lost connection or a
-  socket error during the COMMIT itself, whose outcome is unknown (a file
+  the stored file; neither does a cancellation, a lost connection, a
+  socket error or an asyncpg protocol failure (``InternalClientError``)
+  during the COMMIT itself, whose outcome is unknown (a file
   left without a row is removed by the GC's stray-file sweep, a row left
   without its file would stay broken).
   A disk error is ``storage_unavailable``, never its message.
@@ -118,13 +120,16 @@ DETECT_CONCURRENCY: Final = 2
 
 # The errors that can interrupt a COMMIT the server may already have applied
 # (its answer is lost): the cancellation, the connection's loss (asyncpg's own
-# ConnectionDoesNotExistError is a PostgresConnectionError) and a socket error,
-# TimeoutError included. The stored file is kept then: a file without a row is
-# removed by the stray-file sweep, a row without its file would never heal.
+# ConnectionDoesNotExistError is a PostgresConnectionError), a socket error,
+# TimeoutError included, and a failure of asyncpg's own protocol layer while
+# reading the answer (InternalClientError, ProtocolError included; GH-281).
+# The stored file is kept then: a file without a row is removed by the
+# stray-file sweep, a row without its file would never heal.
 _UNKNOWN_COMMIT_OUTCOME: Final = (
     asyncio.CancelledError,
     OSError,
     asyncpg.InterfaceError,
+    asyncpg.InternalClientError,
     asyncpg.exceptions.PostgresConnectionError,
 )
 
@@ -220,10 +225,11 @@ class AttachmentAlreadySentError(Exception):
 
 
 def attachments_root() -> Path:
-    """The attachments volume: ``organizations.ATTACHMENTS_ROOT``, read at call time.
+    """The attachments root: ``organizations.ATTACHMENTS_ROOT``, read at call time.
 
-    Every caller (routes, lifespan, GC job, user deletion) goes through it, so
-    the uploads and the org purge always agree on the root.
+    ``main()`` sets it from ``ADMINO_ATTACHMENTS_ROOT`` before the database
+    startup (GH-281). Every caller (routes, lifespan, GC job, user deletion)
+    goes through it, so the uploads and the org purge always agree on the root.
     """
     return organizations.ATTACHMENTS_ROOT
 
@@ -248,8 +254,13 @@ def _disk_errors() -> Iterator[None]:
 
 
 def _create_part(org_dir: Path, part: Path) -> BinaryIO:
-    """Create the org's directory (0700) if needed and ``part`` exclusively (0600)."""
-    org_dir.mkdir(parents=True, exist_ok=True, mode=_DIRECTORY_MODE)
+    """Create the root and the org's directory (0700) if needed and ``part`` exclusively (0600).
+
+    Only a missing root gets 0700 (its parents keep the default mode); an
+    existing root's mode is the operator's and is left alone.
+    """
+    org_dir.parent.mkdir(parents=True, exist_ok=True, mode=_DIRECTORY_MODE)
+    org_dir.mkdir(exist_ok=True, mode=_DIRECTORY_MODE)
     return os.fdopen(os.open(part, _PART_FLAGS, _FILE_MODE), "wb")
 
 

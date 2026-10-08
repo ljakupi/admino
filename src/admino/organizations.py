@@ -38,16 +38,25 @@ One service, two callers: the Super Admin's platform routes and the admin CLI
   org, counts only). A failure rolls that org back; the next run retries it.
   ``run_org_purge_job`` runs it at startup and then hourly from the server
   lifespan.
+- The attachments root (GH-281): ``ATTACHMENTS_ROOT`` is the process's one
+  setting, read at call time by every consumer (``attachments.attachments_root()``
+  and the purge). It starts at ``DEFAULT_ATTACHMENTS_ROOT``; ``main()`` sets it
+  once from ``ADMINO_ATTACHMENTS_ROOT`` through ``resolve_attachments_root``
+  before the database startup, refusing a path that isn't absolute.
 
 Inputs: the database pool; the acting ``Principal`` (a Super Admin; the
 Operator for ``create_org`` only), the org id, the validated request models
 (``OrgCreateRequest``, ``OrgLimitsPatch``), the invitee's language, the
-configured public URL and the client IP; the attachments root (purge); the
-stored grace period (``scoped_settings.current_platform_settings``).
+configured public URL and the client IP; the attachments root (purge,
+default: the setting); the stored grace period
+(``scoped_settings.current_platform_settings``); the
+``ADMINO_ATTACHMENTS_ROOT`` value (``resolve_attachments_root``).
 Outputs: ``OrgSummary`` (org metadata only), a list of them, ``CreatedOrg``,
-the number of orgs purged, the number of residency orgs. Errors:
+the number of orgs purged, the number of residency orgs, the attachments
+root. Errors:
 ``PermissionError``, ``OrgNotFoundError``, ``InvalidOrgStatusError``,
-``accounts.DuplicateEmailError`` (a taken admin email), ``AuditRecordError``.
+``accounts.DuplicateEmailError`` (a taken admin email), ``AuditRecordError``,
+``ValueError`` (a root that isn't absolute; its text never holds the value).
 
 Security notes:
 - Authorization through ``access.can`` before any query: ``org.create`` (or
@@ -128,7 +137,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-ATTACHMENTS_ROOT: Final = Path("/app/data/attachments")
+DEFAULT_ATTACHMENTS_ROOT: Final = Path("/app/data/attachments")
+# The process setting (not Final): main() sets it once from ADMINO_ATTACHMENTS_ROOT
+# before the database startup. Read at call time, never bound at import.
+ATTACHMENTS_ROOT: Path = DEFAULT_ATTACHMENTS_ROOT
+_ATTACHMENTS_ROOT_NOT_ABSOLUTE: Final = "ADMINO_ATTACHMENTS_ROOT must be an absolute path."
 PURGE_INTERVAL_SECONDS: Final = 3600
 ORG_NOT_FOUND_MESSAGE: Final = "Organization not found"
 INVALID_STATUS_MESSAGE: Final = "This change isn't possible in the organization's current status."
@@ -717,6 +730,27 @@ async def count_residency_orgs(executor: sessions.Executor) -> int:
     return await scoped_settings.count_residency_orgs(executor)
 
 
+def resolve_attachments_root(value: str | None) -> Path:
+    """Return the attachments root an ``ADMINO_ATTACHMENTS_ROOT`` value names (GH-281).
+
+    Args:
+        value: The variable's value; None (unset) or empty means the default.
+
+    Returns:
+        ``DEFAULT_ATTACHMENTS_ROOT``, or the given absolute path.
+
+    Raises:
+        ValueError: The value isn't an absolute path (a relative one would
+            depend on the working directory). The message never holds the value.
+    """
+    if not value:
+        return DEFAULT_ATTACHMENTS_ROOT
+    root = Path(value)
+    if not root.is_absolute():
+        raise ValueError(_ATTACHMENTS_ROOT_NOT_ABSOLUTE)
+    return root
+
+
 def _remove_org_files(path: Path) -> None:
     """Remove an org's directory and everything under it (in a worker thread).
 
@@ -763,7 +797,7 @@ async def _purge_org(pool: asyncpg.Pool, org_id: UUID, attachments_root: Path) -
     return True
 
 
-async def purge_due_orgs(pool: asyncpg.Pool, *, attachments_root: Path = ATTACHMENTS_ROOT) -> int:
+async def purge_due_orgs(pool: asyncpg.Pool, *, attachments_root: Path | None = None) -> int:
     """Irreversibly purge every organization whose deletion grace period is over.
 
     Each due org is purged in its own transaction (see the module docstring);
@@ -772,15 +806,17 @@ async def purge_due_orgs(pool: asyncpg.Pool, *, attachments_root: Path = ATTACHM
 
     Args:
         pool: The database pool.
-        attachments_root: The directory holding one directory per org.
+        attachments_root: The directory holding one directory per org
+            (default: ``ATTACHMENTS_ROOT``, read at call time).
 
     Returns:
         The number of organizations purged.
     """
+    root = ATTACHMENTS_ROOT if attachments_root is None else attachments_root
     purged = 0
     for due in await pool.fetch(_DUE_SQL):
         try:
-            if await _purge_org(pool, due["id"], attachments_root):
+            if await _purge_org(pool, due["id"], root):
                 purged += 1
         except Exception as exc:
             logger.warning("Organization purge failed (%s); retrying next run.", type(exc).__name__)
@@ -790,7 +826,7 @@ async def purge_due_orgs(pool: asyncpg.Pool, *, attachments_root: Path = ATTACHM
 async def run_org_purge_job(
     pool: asyncpg.Pool,
     *,
-    attachments_root: Path = ATTACHMENTS_ROOT,
+    attachments_root: Path | None = None,
     interval_seconds: float = PURGE_INTERVAL_SECONDS,
 ) -> None:
     """Purge the due organizations now and then once per interval, until cancelled.
@@ -800,12 +836,14 @@ async def run_org_purge_job(
 
     Args:
         pool: The database pool.
-        attachments_root: The directory holding one directory per org.
+        attachments_root: The directory holding one directory per org
+            (default: ``ATTACHMENTS_ROOT``, read again at every run).
         interval_seconds: Seconds between runs (default: one hour).
     """
     while True:
+        root = ATTACHMENTS_ROOT if attachments_root is None else attachments_root
         try:
-            await purge_due_orgs(pool, attachments_root=attachments_root)
+            await purge_due_orgs(pool, attachments_root=root)
         except Exception as exc:
             logger.warning(
                 "Organization purge run failed (%s); retrying next interval.", type(exc).__name__

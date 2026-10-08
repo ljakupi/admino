@@ -120,6 +120,16 @@ make run
 (`PG_APP_PASSWORD`). It then starts the app with `PG_PASSWORD` removed from its
 environment. See [Database roles](SECURITY.md#database-roles).
 
+`make run` keeps uploaded files under `data/attachments` in your checkout (the `data`
+folder is git-ignored). It creates the folder if it's missing, sets its mode to 0700
+(readable by you only) and passes it to the app as `ADMINO_ATTACHMENTS_ROOT`. To keep
+the files somewhere else, export an absolute path to a folder used by admino only
+before `make run`, for example
+`export ADMINO_ATTACHMENTS_ROOT="$HOME/admino-attachments"`: an exported value wins. A
+relative path stops the app at startup. Changing the folder later doesn't move the
+files already stored: stop the app and move the folder yourself. See
+[Data & storage](configuration.md#data--storage).
+
 The API comes up on **http://localhost:8000**. Continue to
 [Create the first Super Admin](#5-create-the-first-super-admin).
 
@@ -304,6 +314,7 @@ This trips people up, so it's worth stating plainly:
 | Reads `.env`? | **No** — reads the shell environment + `config/config.yaml` | **Yes** — Compose loads it via `env_file` |
 | Getting secrets in | `set -a; source .env; set +a` (or `export` them) | Just edit `.env` |
 | PostgreSQL | Container via `make dev-db`, published on `127.0.0.1:5432` | Container on the internal network, not published |
+| Uploaded files | `data/attachments` in the checkout (`ADMINO_ATTACHMENTS_ROOT`) | The `admino-attachments` volume, whatever `.env` says |
 
 ## Upgrading from the single-tenant version
 

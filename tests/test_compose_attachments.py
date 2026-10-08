@@ -3,8 +3,9 @@
 Issue #187, "DevOps & security": "A named volume ``admino-attachments`` in
 compose, created by the entrypoint with ``admino`` ownership", and Decision 11:
 originals live at ``<ATTACHMENTS_ROOT>/<org_id>/<attachment_id>`` with
-``organizations.ATTACHMENTS_ROOT`` = ``/app/data/attachments`` (not
-configurable). Contract §6 pins:
+``organizations.ATTACHMENTS_ROOT`` = ``/app/data/attachments``. GH-281 (Decision 8)
+made the root configurable (``ADMINO_ATTACHMENTS_ROOT``, default
+``/app/data/attachments``); in the container it stays on the volume. Contract §6 pins:
 
 - docker-compose.yml declares the named volume ``attachments`` with
   ``name: admino-attachments`` and mounts it on the ``agent`` service at
@@ -12,6 +13,10 @@ configurable). Contract §6 pins:
 - no other service of any compose file (postgres, migrate, vllm, the prod
   overlay's Caddy, ...) mounts it, and no overlay changes the agent's mount: only
   the app reads the files, and a proxy never serves them directly;
+- GH-281 (contract A7): the agent's ``environment`` sets ``ADMINO_ATTACHMENTS_ROOT:
+  /app/data/attachments``, the volume's mount point (``environment`` wins over the
+  ``env_file``, so a ``.env`` value meant for native runs never moves the container's
+  root off the volume), and no overlay sets it to anything else;
 - the Dockerfile's runtime stage creates ``/app/data/attachments`` owned by
   admino (a fresh named volume copies the image directory's ownership);
 - entrypoint.sh (root, before the ``gosu admino`` drop) creates the directory
@@ -397,6 +402,46 @@ def test_compose_attachments_no_other_service_or_overlay_mounts_the_volume() -> 
     ]
 
     assert others == []
+
+
+_ROOT_VARIABLE: Final = "ADMINO_ATTACHMENTS_ROOT"
+
+
+def _environment(service: dict[str, Any]) -> dict[str, str | None]:
+    """A service's ``environment``, mapping or ``KEY=value`` list syntax."""
+    entries = service.get("environment") or {}
+    if isinstance(entries, dict):
+        return {str(key): None if value is None else str(value) for key, value in entries.items()}
+    environment: dict[str, str | None] = {}
+    for entry in entries:
+        key, separator, value = str(entry).partition("=")
+        environment[key] = value if separator else None
+    return environment
+
+
+def test_compose_attachments_agent_environment_pins_the_root_to_the_volume() -> None:
+    """GH-281 (contract A7): the agent's environment sets ADMINO_ATTACHMENTS_ROOT to
+    /app/data/attachments, the attachments volume's mount point, and no overlay's agent
+    environment sets it to another value."""
+    agent = _compose("docker-compose.yml")["services"]["agent"]
+    volume_targets = [target for source, target, _ in _mounts(agent) if source == _VOLUME_KEY]
+    overlay_values = {
+        name: _environment(((_compose(name).get("services") or {}).get("agent")) or {}).get(
+            _ROOT_VARIABLE, _ROOT
+        )
+        for name in _compose_files()
+        if name != "docker-compose.yml"
+    }
+
+    assert (
+        _environment(agent).get(_ROOT_VARIABLE),
+        volume_targets,
+        set(overlay_values.values()),
+    ) == (
+        _ROOT,
+        [_ROOT],
+        {_ROOT},
+    )
 
 
 # ---------------------------------------------------------------------------

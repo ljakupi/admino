@@ -34,6 +34,10 @@ What these tests pin down:
 - A worker that outlives ``runner.CONVERSION_TIMEOUT_S``: killed (its pid is gone
   afterwards, well before its own sleep ends), ``failed(conversion_timeout)``, no
   ``<id>.d``, the original kept.
+- A worker that floods its stdout (1 MiB, then sleeps with stdout open; GH-281
+  Decision 1): killed as soon as more than ``runner.MAX_RESULT_BYTES`` have arrived,
+  ``failed(processing_error)`` long before the timeout, its pid gone, no ``<id>.d``, the
+  original kept, the flood in no log record.
 - ``ProcessingPool().submit(...)`` + ``join()``: the same ``ready`` outcome with
   its estimate and artifacts.
 - No log record during the flows (a ready TXT, an encrypted PDF, a crashing worker
@@ -585,6 +589,57 @@ async def test_attachment_conversion_flow_timeout_kills_the_worker_and_fails(
         _original(flow, attachment_id).read_bytes() == _TXT,
     ) == ("failed", ("failed", "conversion_timeout", None, None), True, True)
     assert (pid is not None, alive, elapsed < 30.0) == (True, False, True)
+
+
+async def test_attachment_conversion_flow_worker_flooding_stdout_is_killed_and_fails(
+    ap: ModuleType,
+    flow: _Flow,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """GH-281 Decision 1: a worker that writes 1 MiB to stdout (a marker, no newline) and
+    then sleeps 60 s holding it open is killed as soon as more than runner.MAX_RESULT_BYTES
+    have arrived: failed(processing_error) well before CONVERSION_TIMEOUT_S (8 s here),
+    its pid gone right after (killed and reaped), no artifacts and no derived bytes, the
+    original kept; no log record holds the flood."""
+    from admino.converters import runner
+
+    pid_file = tmp_path / "worker.pid"
+    marker = "FLOOD-a41c"
+    flooder = (
+        f"import os, pathlib, sys, time; sys.stdin.buffer.read(); pathlib.Path({str(pid_file)!r})"
+        f".write_text(str(os.getpid())); sys.stdout.buffer.write(b{marker!r} * 104858); "
+        "sys.stdout.buffer.flush(); time.sleep(60)"
+    )
+    monkeypatch.setattr(runner, "WORKER_ARGV", (sys.executable, "-c", flooder))
+    monkeypatch.setattr(runner, "CONVERSION_TIMEOUT_S", 8.0)
+    caplog.set_level(logging.DEBUG)
+    attachment_id = _store(flow, _TXT, kind="txt", filename="notes.txt")
+    started = time.monotonic()
+    pid: int | None = None
+    try:
+        result = await _process(ap, flow, attachment_id)
+        elapsed = time.monotonic() - started
+        pid = int(pid_file.read_text(encoding="utf-8")) if pid_file.exists() else None
+        alive = pid is not None and _alive(pid)
+    finally:
+        if pid is not None and _alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+    assert (
+        result,
+        _row(flow, attachment_id),
+        _derived_bytes(flow, attachment_id),
+        _gone(_derived(flow, attachment_id)),
+        _original(flow, attachment_id).read_bytes() == _TXT,
+    ) == ("failed", ("failed", "processing_error", None, None), None, True, True)
+    assert (pid is not None, alive, elapsed < 4.0, marker in caplog.text) == (
+        True,
+        False,
+        True,
+        False,
+    )
 
 
 async def test_attachment_conversion_flow_pool_converts_to_the_same_ready_outcome(
