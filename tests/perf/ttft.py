@@ -50,12 +50,15 @@ default-model rule: "default: 397B", unless the 397B's short-prompt p50 TTFT is
 above 3.0 s, then "default: 122B (397B stays available to the Super Admin)".
 Exit status 0 when every run succeeded; 1 when a run failed or the rule can't
 be decided; 2 when ``INFOMANIAK_API_TOKEN`` is missing (from the environment and
-``.env``) or ``TTFT_RUNS`` is invalid.
+``.env``), ``.env`` can't be read or isn't valid UTF-8, or ``TTFT_RUNS`` is
+invalid. Every exit-2 error is one line on stderr, without a traceback.
 
 Security notes:
 - The token reaches admino's client through this process's environment only
   (never the operator's shell); this module never prints, logs or writes it,
-  and its error messages name the file and the variable, never a value.
+  and its error messages name the file and the variable, never a value. An
+  unreadable or non-UTF-8 ``.env`` gets one fixed line: never the OS or codec
+  error text, the path or anything from the file.
 - No other key of ``.env`` is read or set: the file is parsed as text, never
   sourced by a shell, so its other secrets stay out of this process.
 - No reply text is printed or kept: only its length is counted. A failed run
@@ -115,6 +118,8 @@ _TOKEN_ENV: Final = "INFOMANIAK_API_TOKEN"
 # The repository's .env (tests/perf/ttft.py -> the repository root), not the working
 # directory's. Not Final: main() looks it up at call time, so a check can point it elsewhere.
 _ENV_FILE: Path = Path(__file__).resolve().parents[2] / ".env"
+# Fixed: never the OSError/UnicodeDecodeError text (path, bytes, position) or the content.
+_ENV_UNREADABLE: Final = "the repository's .env can't be read or isn't valid UTF-8"
 # The token's .env line (fullmatch): an optional "export ", spaces around the key and the
 # "=". The key must be exact, so INFOMANIAK_API_TOKEN_OLD or a "#" comment never matches.
 _TOKEN_LINE: Final = re.compile(rf"\s*(?:export\s+)?{re.escape(_TOKEN_ENV)}\s*=(.*)")
@@ -184,7 +189,7 @@ _DETAILS: Final = (
 
 
 class SettingsError(ValueError):
-    """``TTFT_RUNS`` is invalid."""
+    """``TTFT_RUNS`` is invalid, or ``.env`` can't be read or isn't valid UTF-8."""
 
 
 @dataclass(frozen=True)
@@ -502,11 +507,17 @@ def token_from_env_file(path: Path) -> str | None:
     Returns:
         The value, or None when the file is missing, has no such line, or the
         value is empty or blank.
+
+    Raises:
+        SettingsError: The file exists but can't be read (any other OSError,
+            e.g. no permission or a directory) or isn't valid UTF-8; fixed text.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
+    except (OSError, UnicodeDecodeError):
+        raise SettingsError(_ENV_UNREADABLE) from None
     value: str | None = None
     for line in text.splitlines():
         match = _TOKEN_LINE.fullmatch(line)
@@ -532,7 +543,11 @@ def _configure_logging() -> None:
 def main() -> int:
     """Measure and print; see the module docstring for the exit statuses."""
     if not os.environ.get(_TOKEN_ENV, "").strip():
-        token = token_from_env_file(_ENV_FILE)
+        try:
+            token = token_from_env_file(_ENV_FILE)
+        except SettingsError as exc:
+            print(f"make ttft: {exc}", file=sys.stderr)
+            return 2
         if token is None:
             print(
                 f"make ttft needs {_TOKEN_ENV}: set it in the repository's .env "
