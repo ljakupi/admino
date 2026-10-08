@@ -10,8 +10,10 @@ statement (``LEFT JOIN LATERAL`` over chat_messages, ``ORDER BY seq DESC
 LIMIT``) as PostgreSQL does.
 
 What these tests pin down:
-- Surface: ``ChatTurn`` is a frozen dataclass of exactly ``chat`` and
-  ``history``; ``limit`` is keyword-only.
+- Surface: ``ChatTurn`` is a frozen dataclass of exactly ``chat``,
+  ``history`` and (GH-189, Decision 13, contract C4) ``attachments``; ``limit``
+  is keyword-only. The attachments themselves are
+  tests/test_chats_turn_attachments.py's.
 - One statement: a fetch SELECT naming chats and chat_messages, bound to
   ``(chat_id, tenant.org_id, tenant.user_id, limit)`` in that order, whether
   the chat is found or not ("nothing else read"); it writes nothing and opens
@@ -237,13 +239,14 @@ _CASES: Final[dict[str, tuple[str, int, list[LLMMessage]]]] = {
 # ---------------------------------------------------------------------------
 
 
-def test_chats_load_turn_result_is_a_frozen_dataclass_of_chat_and_history(
+def test_chats_load_turn_result_is_a_frozen_dataclass_of_chat_history_and_attachments(
     chats: ModuleType,
 ) -> None:
+    """GH-189 (Decision 13): the turn read also carries the chat's active attachments."""
     cls = chats.ChatTurn
 
     assert dataclasses.is_dataclass(cls)
-    assert {field.name for field in dataclasses.fields(cls)} == {"chat", "history"}
+    assert {field.name for field in dataclasses.fields(cls)} == {"chat", "history", "attachments"}
     assert cls.__dataclass_params__.frozen is True
 
 

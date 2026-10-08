@@ -1,4 +1,4 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-187).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-189).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
@@ -251,18 +251,48 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   back as asyncpg's (asyncpg UUIDs, inside arrays too; JSONB as the JSON text
   stored). Both statements name chats, so they run on the reader after the
   chat-table bind checks (UUID parameters, a bigint ``LIMIT $n``).
+- GH-189 (contract C4, C14; migration 0029): ``chat_messages`` gains
+  ``included_attachment_ids`` (UUID[], NULL; ALTER TABLE ... ADD COLUMN, so it
+  comes last in the column order and in the "Failing row contains" detail,
+  printed like array_out: ``{a,b}``, NULL elements as NULL). Its CHECK
+  ``CHAT_INCLUDED_ATTACHMENTS_CHECK`` runs in alphabetical order (after
+  content, before role): NULL passes; an empty array, a NULL element, a
+  multidimensional array and any non-assistant row holding ids are
+  CheckViolationError. The value travels as ``$n::uuid[]`` through asyncpg's
+  array encoder (a non-UUID element is a DataError; nested lists of one length
+  are a multidimensional array, others "non-homogeneous array", a DataError)
+  and is stored as a list of plain UUIDs. S8' (``INSERT INTO chat_messages
+  (..., status, included_attachment_ids) VALUES (..., $8, $9::uuid[]) RETURNING
+  id``) runs on the reader like S8. T2' (``load_turn``'s ``_TURN_SQL``) adds
+  ``ARRAY(SELECT ARRAY[a.id::text, a.filename, a.kind, a.page_count::text]
+  FROM attachments a JOIN chat_messages am ON am.id = a.message_id AND
+  am.org_id = a.org_id WHERE a.chat_id = c.id AND ... ORDER BY am.seq,
+  a.created_at, a.id) AS attachment_rows`` (Decision 3 as amended: the files
+  in the order they were sent, by the carrying message's seq, then upload
+  order). The sub-select's FROM list is read like any other: the inner JOIN
+  keeps only the attachments whose ``message_id`` names a message of their
+  org (an unsent file, ``message_id`` NULL, matches no message), its WHERE
+  reads ``c`` from the enclosing row, and its ORDER BY may sort by the joined
+  table's columns. The reader casts a column or a parenthesized expression
+  with ``::text`` (a uuid's canonical text, an int's digits, NULL stays NULL,
+  so a NULL page count is a None element inside its inner array), and the
+  array decodes as a list of four-element lists (``[]`` when nothing matches).
+  ``col = ANY(<array>)`` scans every element of a multidimensional array.
 - Helpers: ``add_chat(owner_user_id, *, org_id=None, chat_id=None, title='',
   title_source='auto', legacy_session_id=None, external_content=False,
   created_at=None, last_activity_at=None, deleted_at=None)`` (org_id: the
   owner's, another org refused by ``CHAT_OWNER_FKEY``; last_activity_at:
   created_at, itself now) and
   ``add_chat_message(chat_id, role, content, *, tool_use_blocks=None,
-  tool_call_id=None, tool_calls=None, status='complete', created_at=None)``
-  (org_id: the chat's; the next seq; the JSONB values as Python lists) seed
-  rows checked like an INSERT and return their ids; ``chat_row(chat_id)``,
-  ``chats_of(user_id)`` (any deletion state, by created_at then id) and
-  ``messages_of(chat_id)`` (by seq, the JSONB columns as Python values) read
-  copies back. ``add_account(user_id=...)`` gives an account a fixed id.
+  tool_call_id=None, tool_calls=None, status='complete', created_at=None,
+  included_attachment_ids=None)`` (org_id: the chat's; the next seq; the JSONB
+  values as Python lists; GH-189: the ids through the ``uuid[]`` encoder and
+  the CHECK) seed rows checked like an INSERT and return their ids;
+  ``chat_row(chat_id)``, ``chats_of(user_id)`` (any deletion state, by
+  created_at then id) and ``messages_of(chat_id)`` (by seq, the JSONB columns
+  as Python values, ``included_attachment_ids`` as None or a fresh list of
+  plain UUIDs) read copies back. ``add_account(user_id=...)`` gives an account
+  a fixed id.
 
 Attachments (GH-187, migration 0027; GH-188, migration 0028):
 - ``attachments`` (``attachments``, keyed by id, insertion order): ``id`` (UUID
@@ -352,6 +382,11 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
     above, the ready transaction's A3 (like the upload's), and A5 / A6 with the
     R list ``id, chat_id, message_id, filename, kind, size_bytes, status,
     failure_reason, page_count, token_estimate, created_at``.
+  - GH-189 (contract C5): A8' (``check_sendable``) selects ``id, message_id,
+    status, filename, kind, page_count`` with A8's predicates and ``ORDER BY
+    created_at, id``; T2' reads the chat's sent, live, ready attachments as a
+    correlated ``ARRAY(SELECT ARRAY[...] FROM attachments a JOIN chat_messages
+    am ... ORDER BY am.seq, a.created_at, a.id)`` (see Chats above).
   - A1 and A3 run on the reader like every SELECT whose main table is
     organizations (so ``after_org_lookup`` fires for them too). ``add_org``
     creates an org with ``storage_quota_bytes`` 0: under the contract's
@@ -581,7 +616,7 @@ import asyncpg
 from asyncpg.pgproto.pgproto import UUID as PgUUID  # noqa: N811
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable
+    from collections.abc import AsyncIterator, Callable, Sequence
 
 ORG_ID: Final = uuid.UUID("d4e5f6a7-b8c9-4d0e-8f1a-2b3c4d5e6f70")
 OTHER_ORG_ID: Final = uuid.UUID("e5f6a7b8-c9d0-4e1f-9a2b-3c4d5e6f7a81")
@@ -950,6 +985,9 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
         "tool_calls": "jsonb",
         "status": "text",
         "created_at": "timestamptz",
+        # GH-189 (migration 0029): ALTER TABLE ... ADD COLUMN appends it after
+        # created_at; a UUID[] bound as ``$n::uuid[]`` through asyncpg's array encoder.
+        "included_attachment_ids": "uuid[]",
     },
     # GH-187 (migration 0027): size_bytes is a BIGINT, page_count an INTEGER (their
     # encoders refuse values outside int64 / int32).
@@ -977,7 +1015,9 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
     "chats": frozenset({"legacy_session_id", "deleted_at"}),
-    "chat_messages": frozenset({"tool_use_blocks", "tool_call_id", "tool_calls"}),
+    "chat_messages": frozenset(
+        {"tool_use_blocks", "tool_call_id", "tool_calls", "included_attachment_ids"}
+    ),
     "attachments": frozenset(
         {
             "message_id",
@@ -1011,6 +1051,8 @@ CHAT_UPDATE_COLUMNS: Final = frozenset(
     {"title", "title_source", "last_activity_at", "external_content", "deleted_at"}
 )
 CHAT_EXTERNAL_CONTENT_RESET: Final = "chats.external_content can't be reset"
+# GH-189 (migration 0029): the CHECK on chat_messages.included_attachment_ids.
+CHAT_INCLUDED_ATTACHMENTS_CHECK: Final = "chat_messages_included_attachment_ids_check"
 # GH-271 (migration 0026): the composite foreign key (owner_user_id, org_id) ->
 # users (id, org_id) that ties a chat's owner to the chat's org (the only chats ->
 # users key: it replaced 0024's chats_owner_user_id_fkey).
@@ -1897,6 +1939,7 @@ class FakeDb:
         tool_calls: list[Any] | None = None,
         status: str = "complete",
         created_at: datetime | None = None,
+        included_attachment_ids: Sequence[Any] | None = None,
     ) -> uuid.UUID:
         """Store a chat_messages row (GH-176) as migration 0024 allows it; return its id.
 
@@ -1906,6 +1949,9 @@ class FakeDb:
         Python values, sent as their JSON text like the app's ``$n::jsonb``
         (so a str holding U+0000 fails like the escape ``\\u0000``). Checked like
         an INSERT. The chat's ``last_activity_at`` is not touched (a seed).
+        GH-189: ``included_attachment_ids`` (migration 0029) goes through the
+        ``uuid[]`` encoder and ``CHAT_INCLUDED_ATTACHMENTS_CHECK`` like the app's
+        ``$9::uuid[]``.
         """
         chat = (
             self.chats.get(uuid.UUID(int=chat_id.int)) if isinstance(chat_id, uuid.UUID) else None
@@ -1929,6 +1975,7 @@ class FakeDb:
             "tool_calls": None if tool_calls is None else json.dumps(tool_calls),
             "status": status,
             "created_at": created_at if created_at is not None else now,
+            "included_attachment_ids": included_attachment_ids,
         }
         row = self.build_chat_row("chat_messages", given, now)
         self.store_chat_row("chat_messages", row)
@@ -1946,7 +1993,10 @@ class FakeDb:
         return sorted(rows, key=lambda row: (row["created_at"], row["id"]))
 
     def messages_of(self, chat_id: uuid.UUID) -> list[dict[str, Any]]:
-        """Copies of a chat's chat_messages rows by seq; the JSONB columns as Python values."""
+        """Copies of a chat's chat_messages rows by seq; the JSONB columns as Python values.
+
+        GH-189: ``included_attachment_ids`` is None or a list of plain UUIDs.
+        """
         wanted = uuid.UUID(int=chat_id.int)
         rows = sorted(
             (row for row in self.chat_messages.values() if row["chat_id"] == wanted),
@@ -1959,6 +2009,12 @@ class FakeDb:
                     column: None if row[column] is None else json.loads(row[column])
                     for column in ("tool_use_blocks", "tool_calls")
                 },
+                # GH-189: None or a fresh list of plain UUIDs (never the stored list).
+                "included_attachment_ids": (
+                    None
+                    if row["included_attachment_ids"] is None
+                    else list(row["included_attachment_ids"])
+                ),
             }
             for row in rows
         ]
@@ -2816,6 +2872,11 @@ class FakeDb:
             call_id = row["tool_call_id"]
             rules = [
                 ("chat_messages_content_check", len(row["content"]) <= CHAT_CONTENT_MAX),
+                # GH-189 (migration 0029).
+                (
+                    CHAT_INCLUDED_ATTACHMENTS_CHECK,
+                    _included_attachment_ids_valid(row["role"], row["included_attachment_ids"]),
+                ),
                 ("chat_messages_role_check", row["role"] in CHAT_ROLES),
                 ("chat_messages_status_check", row["status"] in CHAT_MESSAGE_STATUSES),
                 (
@@ -4113,6 +4174,88 @@ def _pg_text(value: Any) -> str:
         return "t" if value else "f"
     if isinstance(value, datetime):
         return value.isoformat(sep=" ")
+    if isinstance(value, list):
+        # GH-189: an array as array_out prints it ({a,b}, NULL elements as NULL).
+        return "{" + ",".join("NULL" if item is None else _pg_text(item) for item in value) + "}"
+    return str(value)
+
+
+def _included_attachment_ids_valid(role: Any, ids: list[Any] | None) -> bool:
+    """Migration 0029's ``CHAT_INCLUDED_ATTACHMENTS_CHECK`` (GH-189), as PostgreSQL reads it.
+
+    ``included_attachment_ids IS NULL OR (role = 'assistant' AND
+    array_ndims(included_attachment_ids) = 1 AND cardinality(included_attachment_ids)
+    >= 1 AND array_position(included_attachment_ids, NULL) IS NULL)``: NULL passes;
+    a non-assistant row, an empty array (``'{}'``: no dimensions, cardinality 0), a
+    multidimensional array and an array holding a NULL element are refused
+    (verified on postgres:16-alpine).
+    """
+    if ids is None:
+        return True
+    return (
+        role == "assistant"
+        and len(ids) >= 1
+        and not any(isinstance(item, list) for item in ids)
+        and all(item is not None for item in ids)
+    )
+
+
+def _array_iterable(value: Any) -> bool:
+    """What asyncpg's array encoder takes as an array: a sized iterable that isn't a
+    str, bytes, bytearray, memoryview or mapping."""
+    return (
+        isinstance(value, Sized)
+        and isinstance(value, Iterable)
+        and not isinstance(value, str | bytes | bytearray | memoryview | Mapping)
+    )
+
+
+def _sub_array(value: Any) -> bool:
+    """An element asyncpg reads as a sub-array (GH-189): an array iterable but a tuple
+    (a nested tuple is a record for asyncpg)."""
+    return _array_iterable(value) and not isinstance(value, tuple)
+
+
+def _array_shape_error(value: Any) -> str | None:
+    """asyncpg's ``_get_array_shape`` check (GH-189): sub-arrays of one length, never
+    mixed with scalars ("non-homogeneous array"); None when the shape is fine."""
+    length = -2
+    for item in value:
+        if _sub_array(item):
+            if length == -2:
+                length = len(item)
+                if (error := _array_shape_error(item)) is not None:
+                    return error
+            elif len(item) != length:
+                return "non-homogeneous array"
+        elif length >= 0:
+            return "non-homogeneous array"
+        else:
+            length = -1
+    return None
+
+
+def _flat(elements: Iterable[Any]) -> list[Any]:
+    """The elements of a possibly multidimensional array (GH-189: ANY scans them all)."""
+    flat: list[Any] = []
+    for element in elements:
+        if isinstance(element, list):
+            flat.extend(_flat(element))
+        else:
+            flat.append(element)
+    return flat
+
+
+def _text_cast(value: Any) -> str | None:
+    """``<expr>::text`` (GH-189): a uuid in its canonical text, an int's digits, a
+    boolean as true / false; NULL stays NULL."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, uuid.UUID):
+        return str(uuid.UUID(int=value.int))
+    assert isinstance(value, int | Decimal), f"the fake can't cast {value!r} to text"
     return str(value)
 
 
@@ -4141,7 +4284,10 @@ def _encode_chat_value(kind: str, position: str, value: Any) -> Any:
     GH-187: ``int4`` / ``int8`` also refuse an int outside int32 / int64 ("value
     out of int32 range"); an array kind (``uuid[]``) takes a sized iterable that
     isn't a str, bytes or mapping (a list, tuple, set ...), each element through
-    the element kind's encoder (None allowed), and returns a list.
+    the element kind's encoder (None allowed), and returns a list. GH-189: nested
+    sized iterables (not tuples) of one length are a multidimensional array (a
+    list of lists); sub-arrays of different lengths, or mixed with scalars, are a
+    DataError ("non-homogeneous array"), as asyncpg's shape check refuses them.
     """
     if value is None:
         return None
@@ -4149,15 +4295,19 @@ def _encode_chat_value(kind: str, position: str, value: Any) -> Any:
     reason = f"{kind} expected"
     stored = value
     if kind.endswith("[]"):
-        valid = (
-            isinstance(value, Sized)
-            and isinstance(value, Iterable)
-            and not isinstance(value, str | bytes | bytearray | memoryview | Mapping)
-        )
+        valid = _array_iterable(value)
         if not valid:
             reason = f"a sized iterable container expected (got type {type(value).__name__!r})"
+        elif (shape := _array_shape_error(value)) is not None:
+            # GH-189: nested lists of one length are a multidimensional array.
+            valid, reason = False, shape
         else:
-            return [_encode_chat_value(kind[:-2], position, item) for item in value]
+            return [
+                _encode_chat_value(kind, position, item)
+                if _sub_array(item)
+                else _encode_chat_value(kind[:-2], position, item)
+                for item in value
+            ]
     elif kind == "uuid":
         if isinstance(value, uuid.UUID):
             stored = _canonical(value)
@@ -4635,6 +4785,11 @@ class _Statement:
             assert isinstance(amount, int | float) and not isinstance(amount, bool), amount
             unit = {"days": "days", "hours": "hours", "mins": "minutes", "secs": "seconds"}
             return timedelta(**{unit[match.group(1)]: amount})
+        if match := re.fullmatch(r"((?:\w+\.)?\w+|\( *\)) ?:: ?(?:text|varchar)", _masked(expr)):
+            # GH-189: ``a.id::text``, ``a.page_count::text`` (T2'): the value's text,
+            # NULL stays NULL. ``::`` binds tighter than any operator, so the cast
+            # applies to a column or a parenthesized expression only.
+            return _text_cast(self.value(expr[: match.end(1)], ctx))
         if (binary := _binary_split(expr)) is not None:
             left_text, operator, right_text = binary
             left, right = self.value(left_text, ctx), self.value(right_text, ctx)
@@ -4839,7 +4994,7 @@ class _Statement:
             assert isinstance(elements, Iterable) and not isinstance(elements, str), atom
             return any(
                 element is not None and _compare(match.group(2), left, element)
-                for element in elements
+                for element in _flat(elements)
             )
         if match := re.fullmatch(r"(\( *\)) ?(<>|!=|<=|>=|=|<|>) ?(\( *\))", masked):
             # GH-176: a row comparison, e.g. the keyset "(last_activity_at, id) < ($3, $4)".

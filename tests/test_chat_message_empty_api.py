@@ -33,9 +33,11 @@ What is pinned:
   trashed and an unknown chat id get the identical 422.
 - A blank message (``""`` or whitespace only) with at least one attachment id
   is accepted: it runs, the file is linked to the stored user message and the
-  text is stored and passed to the agent as sent (the provider gets the blank
-  text alone until #189). ``too_many_files``, ``attachment_not_found`` and
-  ``attachment_already_sent`` apply to it as today.
+  text is stored and passed to the agent as sent (GH-189: what the provider
+  gets is the agent's part). ``too_many_files``, ``attachment_not_found`` and
+  ``attachment_already_sent`` apply to it as today. GH-189 (Decision 7): the
+  sent files are ready ones with their derived files (``_files`` of
+  tests/test_chat_attachments_api.py, under a ``tmp_path`` attachments root).
 - Both operations document the 422 in OpenAPI: the description names
   ``message_empty`` next to the validation error and the body is the example;
   the chat route keeps its ``text/event-stream`` 200.
@@ -73,6 +75,7 @@ from tests.tenancy_world import (
     make_client,
     seed_chat,
     stub_agent,
+    use_attachment_storage,
     use_fake_database,
     use_fast_passwords,
     use_roomy_rate_limits,
@@ -148,13 +151,15 @@ _STANDARD_RECORD_ATTRS: Final = frozenset(
 
 
 @pytest.fixture()
-def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
+    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database; the
+    attachments root is under ``tmp_path`` (GH-189: a sent file's derived files)."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
     use_fast_passwords(monkeypatch)
     use_roomy_rate_limits(monkeypatch)
+    use_attachment_storage(monkeypatch, built, tmp_path / "attachments")
     return built
 
 

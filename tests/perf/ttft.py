@@ -21,16 +21,17 @@ product discovery nor the first TLS handshake counts):
 
 - the short prompt: a one-line question;
 - the 20-page document: a synthetic report of ``DOCUMENT_WORDS`` (10,000)
-  words generated deterministically in code (``synthetic_document``), standing
-  in for an attachment until #188, plus a question about it. Each run's
-  document differs from its first sentence on (its seed is the run), so the
-  provider's prefix cache can't serve one run from another's.
+  words generated deterministically in code (``synthetic_document``), sent as
+  the chat's one active attachment (a text file), plus a question about it.
+  Each run's document differs from its first sentence on (its seed is the
+  run), so the provider's prefix cache can't serve one run from another's.
 
-Every request is shaped like a chat turn: admino's assembled system prompt
-(``prompt_assembly.assemble``: the base prompt, the document in the
-attachments section, the date line) and the tool definitions a default org
-advertises (every tool module, the default permission matrix), sent through
-admino's own Infomaniak client (``create_llm_client`` with an ``LLMConfig`` for
+Every request is shaped like a chat turn: admino's assembled context
+(``prompt_assembly.assemble``: the system message with the base prompt and the
+date line; the user message opened by slot 4, the document's attachment block,
+since GH-189) and the tool definitions a default org advertises (every tool
+module, the default permission matrix), sent through admino's own Infomaniak
+client (``create_llm_client`` with an ``LLMConfig`` for
 the model): ``chat_stream``, so ``reasoning_effort: none`` and the configured
 output cap apply. No retries (the client alone, not ``llm_policy``).
 
@@ -85,6 +86,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
+from uuid import UUID
 
 from admino.llm import LLMError, LLMResponse, LLMStreamDelta
 
@@ -92,7 +94,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from admino.llm import LLMClient
-    from admino.models import LLMMessage
+    from admino.models import AttachmentContent, LLMMessage
     from admino.tools.registry import ToolDescription
 
 MODELS: Final = ("Qwen/Qwen3.5-397B-A17B-FP8", "Qwen/Qwen3.5-122B-A10B-FP8")
@@ -113,6 +115,9 @@ _DOCUMENT_QUESTION: Final = (
 )
 _RULE_397B: Final = "default: 397B"
 _RULE_122B: Final = "default: 122B (397B stays available to the Super Admin)"
+# The document's attachment: a fixed id (never part of the prompt) and file name.
+_DOCUMENT_ID: Final = UUID("5d0c3b1e-7a2f-4e9d-8c6b-1f0e9d8c7b6a")
+_DOCUMENT_NAME: Final = "report.txt"
 
 _TOKEN_ENV: Final = "INFOMANIAK_API_TOKEN"
 # The repository's .env (tests/perf/ttft.py -> the repository root), not the working
@@ -128,8 +133,8 @@ _CODE: Final = re.compile(r"[a-z_]{1,40}")
 _PINNED_LOGGERS: Final = ("httpx", "httpcore", "openai", "urllib3")
 
 # Vocabulary of the synthetic report: plain business prose, about 5.5 characters
-# per word with spaces and punctuation, so 10,000 words stay well inside one
-# 65,536-character system message next to admino's base prompt.
+# per word with spaces and punctuation, so 10,000 words are about 55,000
+# characters (the size the measurements have always used).
 _SUBJECTS: Final = (
     "The team",
     "Our finance group",
@@ -300,6 +305,23 @@ def _tools() -> tuple[list[ToolDescription], list[dict[str, Any]]]:
     return descriptions, list(_tool_descriptions_to_payload(descriptions))
 
 
+def _attachments(document: str) -> list[AttachmentContent]:
+    """The document as the chat's one active attachment (none for an empty document)."""
+    from admino.models import AttachmentContent, TextContent
+
+    if not document:
+        return []
+    return [
+        AttachmentContent(
+            id=_DOCUMENT_ID,
+            filename=_DOCUMENT_NAME,
+            kind="txt",
+            page_count=None,
+            parts=(TextContent(text=document),),
+        )
+    ]
+
+
 def build_request(
     user_message: str, document: str
 ) -> tuple[list[LLMMessage], list[dict[str, Any]]]:
@@ -313,7 +335,7 @@ def build_request(
         tools=descriptions,
         now=datetime.now(UTC),
         user_message=user_message,
-        attachments=document,
+        attachments=_attachments(document),
     )
     return messages, payload
 

@@ -858,7 +858,8 @@ class TestNoOrganizationAndRecorderContract:
             if name != "self"
         }
 
-        assert set(params) == _RECORDER_KWARGS
+        # GH-189 Decision 10: plus the optional attachment_ids keyword.
+        assert set(params) == _RECORDER_KWARGS | {"attachment_ids"}
         escalated = params["escalated"]
         assert escalated.kind is inspect.Parameter.KEYWORD_ONLY
         assert escalated.default is inspect.Parameter.empty
