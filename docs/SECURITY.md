@@ -362,13 +362,16 @@ conversion in `attachment_processing.py` and `converters/`:
   reaped and its group gets no signal, since its process id may already name another
   process; a grandchild that still holds the child's stdout keeps the conversion waiting
   until the timeout and is killed with the group then. Two kinds of process are left:
-  one that leaves the group with `setsid`, and one left behind by a child that exits by
-  itself, once it no longer holds the child's stdout. They keep running until they exit,
-  and the container's init reaps them when they exit. Each process the child starts
-  inherits its limits, but the 130-second CPU limit (`RLIMIT_CPU`) applies per process:
-  every process a grandchild starts gets its own 130 seconds, so the tree as a whole has
-  no CPU cap, and a process left running is only reaped by the container's init once it
-  exits.
+  one that leaves the group (a new group with `setpgid`, or a new session with
+  `setsid`), and one left behind by a child that exits by itself, once it no longer
+  holds the child's stdout. They keep running until they exit, and the container's init
+  reaps them when they exit. The group kill cleans up the helper processes a conversion
+  starts, but it doesn't contain a hostile child: that takes a real sandbox, and the
+  options for a follow-up are Landlock or a separate converter container (see *The
+  conversion process isn't a sandbox* below). Each process the child starts inherits its
+  limits, but the 130-second CPU limit (`RLIMIT_CPU`) applies per process: every process
+  a grandchild starts gets its own 130 seconds, so the tree as a whole has no CPU cap,
+  and a process left running is only reaped by the container's init once it exits.
 - **The agent's secrets and code stay out of the child's reach.** The child runs as the
   agent's user, so on Linux the agent makes its own process non-dumpable at startup
   (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's

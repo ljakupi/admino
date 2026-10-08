@@ -34,9 +34,9 @@ Security notes:
   SIGKILLed, then the child is killed and reaped. A child that exited by
   itself and was reaped gets no group kill: its pid may name another
   process by then. What remains runs until it exits, and the container's
-  init (``init: true``) reaps it then: a process that left the group with
-  ``setsid``, and one left behind by a child that exited by itself once it
-  no longer holds the child's stdout.
+  init (``init: true``) reaps it then: a process that left the group
+  (``setpgid`` to a new group, or ``setsid``), and one left behind by a
+  child that exited by itself once it no longer holds the child's stdout.
 - The argv is fixed (``WORKER_ARGV``, ``subprocess.Popen`` without a shell);
   the job (the path and the file name) travels on stdin, never in the argv
   a process listing shows.
@@ -202,7 +202,7 @@ def _run_worker(
             # reaped gets no group kill, its pid may belong to another process
             # by now. A missing group is fine, and macOS answers EPERM when every
             # process left in the group is a zombie. A process that left the
-            # group with setsid isn't reached; init reaps it once it exits.
+            # group (setpgid or setsid) isn't reached; init reaps it once it exits.
             if child.returncode is None:
                 with contextlib.suppress(ProcessLookupError, PermissionError):
                     os.killpg(child.pid, signal.SIGKILL)
