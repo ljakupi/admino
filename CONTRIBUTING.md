@@ -153,19 +153,32 @@ cd static-src
 npm update --package-lock-only --before="$(date -u -v-7d +%Y-%m-%d)"            # whole lock
 npm update --package-lock-only --before="$(date -u -v-7d +%Y-%m-%d)" <name>      # one package
 # Linux (GNU date)
-npm update --package-lock-only --before="$(date -u -d '7 days ago' +%F)" <name>
+npm update --package-lock-only --before="$(date -u -d '7 days ago' +%F)"         # whole lock
+npm update --package-lock-only --before="$(date -u -d '7 days ago' +%F)" <name>  # one package
 ```
 
-List every version change in the PR. A security bump that needs a younger release names
-the exact fixed version (`npm install --package-lock-only <name>@<fixed>`) and cites the
-advisory in the PR.
+List every version change in the PR. A security bump that needs a younger release cites
+the advisory in the PR and depends on where the package sits:
+
+- **Transitive package:** cap the resolution just after the fixed release. Read its publish
+  time from `npm view <name> time --json` and run
+  `npm update --package-lock-only --before=<publish time + 1 min, ISO UTC> <name>`
+  (for example `--before=2026-10-07T09:52:45Z`). `package.json` stays unchanged. List every
+  lock entry that moves, since its dependencies resolve under the same cap.
+  Do not use `npm install <name>@<fixed>` here: it adds the package to `dependencies`.
+- **Fix outside the dependents' ranges:** add an exact `overrides` entry to `package.json`
+  (a devops change, reviewed and documented like the fork pin below).
+- **Package already in `package.json`:** `npm install --package-lock-only <name>@<fixed>`
+  rewrites the existing range.
 
 `static-src/package.json` pins one transitive package with an `overrides` entry (JSON has
 no comments, so the reason is here): `@trickfilm400/rollup-plugin-off-main-thread` at
 `3.0.0-pre1`. `workbox-build` 7.4.1 uses this single-maintainer fork, and its output
 becomes the prologue of the shipped service worker. That version was reviewed against
 `@surma/rollup-plugin-off-main-thread` 2.2.3. Re-diff it against upstream before moving
-the pin, and do not widen the override to a range.
+the pin, and do not widen the override to a range. `npm ci` accepts a lock entry newer
+than the override, so the CI frontend job runs `npm ls --package-lock-only` on the fork and
+fails if the lock diverges from the pin.
 
 #### Dependency advisory scan
 
