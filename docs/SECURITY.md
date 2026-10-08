@@ -353,13 +353,22 @@ conversion in `attachment_processing.py` and `converters/`:
   in `failure_reason`: a library's message, the file name and paths never reach the
   database, a response or a log line. The agent's container runs under an init process
   (`init: true` in every Compose profile), which reaps the orphaned processes a killed
-  conversion may leave behind, so they don't pile up as zombies. The agent always kills
-  and reaps the child itself, but not the processes the child started: the grandchildren
-  of a killed conversion are not killed, they keep running until they exit, and the
-  container's init reaps them when they exit. Each one inherits the child's limits, but
-  the 130-second CPU limit (`RLIMIT_CPU`) applies per process: every process a
-  grandchild starts gets its own 130 seconds, so the tree as a whole has no CPU cap, and
-  its processes are only reaped by the container's init once they exit.
+  conversion may leave behind, so they don't pile up as zombies. The child starts in its
+  own session and process group, which the processes it starts (its grandchildren)
+  inherit. On a timeout, when its output passes the cap, or when the conversion ends any
+  other way before the agent has reaped the child, the agent kills the child's whole
+  process group (SIGKILL) and only then reaps the child, so the grandchildren still in
+  the group end with it. A child that exits by itself (a result, a refusal or a crash) is
+  reaped and its group gets no signal, since its process id may already name another
+  process; a grandchild that still holds the child's stdout keeps the conversion waiting
+  until the timeout and is killed with the group then. Two kinds of process are left:
+  one that leaves the group with `setsid`, and one left behind by a child that exits by
+  itself, once it no longer holds the child's stdout. They keep running until they exit,
+  and the container's init reaps them when they exit. Each process the child starts
+  inherits its limits, but the 130-second CPU limit (`RLIMIT_CPU`) applies per process:
+  every process a grandchild starts gets its own 130 seconds, so the tree as a whole has
+  no CPU cap, and a process left running is only reaped by the container's init once it
+  exits.
 - **The agent's secrets and code stay out of the child's reach.** The child runs as the
   agent's user, so on Linux the agent makes its own process non-dumpable at startup
   (`PR_SET_DUMPABLE`), before the server starts: the child can't read the agent's

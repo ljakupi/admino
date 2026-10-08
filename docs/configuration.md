@@ -806,7 +806,14 @@ Viewer's chats from before a role change stay stored, unused.
   chat that doesn't exist, is in the trash, or belongs to another user or another
   organization answers the same `404` `{"detail": "Chat not found", "reason":
   "chat_not_found"}`, so nobody learns that someone else's chat exists. A chat ID that
-  isn't a UUID answers `422`. A message (`POST /api/chats/{id}/messages` or
+  isn't a UUID answers `422`. A blank message (empty, or nothing but spaces, tabs, line
+  breaks and other whitespace) that sends no files answers `422` `{"detail": "Message
+  is empty", "reason": "message_empty"}` on both message routes, before any chat is read,
+  so every chat ID gets the same answer; it still counts against your rate limit. A
+  blank message with files (`attachment_ids`) is accepted and stored as sent (until
+  [#189](https://github.com/ljakupi/admino/issues/189) the model gets the blank text
+  alone, without the files). A message
+  (`POST /api/chats/{id}/messages` or
   `POST /api/message`) answers `409` `{"detail": "A message is already running in this
   chat.", "reason": "run_active"}` while another message of the chat is running (see
   "One message at a time" below), `429` `{"detail": "Too many of your chats are active.
@@ -1618,8 +1625,11 @@ A missing file (`404`) never gets `immutable`.
 
 Every API response (a path under `/api`) is `Cache-Control: no-store`, so no browser or
 proxy keeps a copy of a user's data. That includes every error (`401`, `403`, `404`,
-`405`, `422`, `429`, `500` and the rest), file downloads and the chat event streams,
-which also keep `X-Accel-Buffering: no`. `/health` sends no `Cache-Control`.
+`405`, `422`, `429`, `500` and the rest), the answers to CORS preflights (`OPTIONS`
+requests, allowed or refused), file downloads and the chat event streams, which also
+keep `X-Accel-Buffering: no`. `/health` sends no `Cache-Control`. A preflight to any
+other path gets the security headers and no `Cache-Control`, like that path's other
+answers.
 
 ### Model latency
 

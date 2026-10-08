@@ -27,10 +27,16 @@ Security notes:
   ``MAX_RESULT_BYTES`` + 1 bytes: as soon as more than the cap has arrived,
   the child is killed and reaped at once (``processing_error``), so a child
   flooding its stdout can't fill the server's memory.
-- However the call ends (an error, the deadline, a KeyboardInterrupt), the
-  child is killed if still running and reaped. Its own children are not
-  killed here: they run until they exit, and the container's init
-  (``init: true``) reaps them then.
+- The child leads its own session and process group
+  (``start_new_session=True``), which the processes it starts inherit.
+  However the call ends (an error, the deadline, the stdout cap, a
+  KeyboardInterrupt), while the child is still unreaped its whole group is
+  SIGKILLed, then the child is killed and reaped. A child that exited by
+  itself and was reaped gets no group kill: its pid may name another
+  process by then. What remains runs until it exits, and the container's
+  init (``init: true``) reaps it then: a process that left the group with
+  ``setsid``, and one left behind by a child that exited by itself once it
+  no longer holds the child's stdout.
 - The argv is fixed (``WORKER_ARGV``, ``subprocess.Popen`` without a shell);
   the job (the path and the file name) travels on stdin, never in the argv
   a process listing shows.
@@ -55,6 +61,7 @@ import os
 import select
 import selectors
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -172,13 +179,15 @@ def _run_worker(
     env = {} if pythonpath is None else {"PYTHONPATH": pythonpath}
     deadline = time.monotonic() + CONVERSION_TIMEOUT_S
     # A fixed argv (this interpreter and the worker module), no shell; the job
-    # travels on stdin.
+    # travels on stdin. The child leads a new session and process group (its
+    # pid), so whatever it starts can be killed with it.
     with subprocess.Popen(  # noqa: S603
         list(WORKER_ARGV),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         env=env,
+        start_new_session=True,
     ) as child:
         try:
             stdout = _exchange(child, job, deadline)
@@ -187,7 +196,17 @@ def _run_worker(
             raise ConversionError("conversion_timeout") from None
         finally:
             # However the call ends (the cap, the deadline, a KeyboardInterrupt),
-            # a child still running is SIGKILLed and the child is reaped here:
+            # the child's group is SIGKILLed while the child is still unreaped:
+            # an unreaped pid (running or a zombie) can't be reused, so the
+            # group id still names this child's group. A child the wait above
+            # reaped gets no group kill, its pid may belong to another process
+            # by now. A missing group is fine, and macOS answers EPERM when every
+            # process left in the group is a zombie. A process that left the
+            # group with setsid isn't reached; init reaps it once it exits.
+            if child.returncode is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(child.pid, signal.SIGKILL)
+            # Then the child is SIGKILLed if still running and reaped here:
             # Popen's own exit waits only briefly after an interrupt. kill()
             # polls first, so it never signals a pid that was already reaped.
             child.kill()
