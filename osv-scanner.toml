@@ -1,0 +1,16 @@
+# Allowlist for the advisory scan (.github/workflows/advisory-scan.yml, GH-289).
+#
+# Rules, enforced by the workflow's validation step:
+#   - Only [[IgnoredVulns]] entries. No other table or key (a PackageOverrides
+#     table could switch the scan off for a whole package).
+#   - Every entry has an `id` (the advisory id, e.g. GHSA-xxxx-xxxx-xxxx), a
+#     non-empty `reason`, and `ignoreUntil` as a TOML date.
+#   - `ignoreUntil` is at most 90 days ahead. An expired entry fails the job.
+#   - Use it only for an advisory with no fixed release yet. Otherwise bump the
+#     dependency (CONTRIBUTING.md, "Dependency advisory scan").
+#
+# Example:
+#   [[IgnoredVulns]]
+#   id = "GHSA-xxxx-xxxx-xxxx"
+#   ignoreUntil = 2026-12-01
+#   reason = "No fixed release; the vulnerable code path is not reachable because ..."
