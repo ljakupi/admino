@@ -62,6 +62,7 @@ Makefile
 # (frontend-builder stage), so host-built output must never leak into the
 # build context and stale caches must not be reused.
 static/
+static-src/node_modules
 static-src/node_modules/
 static-src/*.tsbuildinfo
 # Compiled Vite config left in older checkouts (GH-212). Vite loads
