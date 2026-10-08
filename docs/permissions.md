@@ -75,6 +75,10 @@ dispatch layer adds a hard rule on top:
   the email itself is long out of view. Today the
   one such action is `memory.store`: an email that says "remember X" makes the agent stop
   and ask before it stores anything.
+- The files you send with a message are external content too, from the run's first
+  action on: every run whose model gets them asks first (an approved action's included),
+  and the chat keeps the mark (see
+  [Configuration → Attachments](configuration.md#attachments)).
 - Approving runs that one call. The next action that changes something asks again.
 - Read-only actions (read, list, search, recall) keep running on their own. Which actions
   count as changing something is listed in

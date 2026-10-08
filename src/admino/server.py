@@ -85,7 +85,11 @@ Routes:
   caller's unsent uploads of the chat with the message (linked to the stored
   user message). GH-286: a blank message (``str.strip()`` leaves nothing)
   without files is the 422 ``message_empty``, after the rate limit and before
-  any database statement; with files it runs as sent.
+  any database statement; with files it runs as sent. GH-189: a file that
+  isn't ready is the 409 ``attachment_not_ready``; every run of the chat gets
+  its active attachments in full (slot 4), refused with the 503
+  ``storage_unavailable`` when one can't be read and the 422
+  ``image_input_unsupported`` when one holds an image the model can't take.
 - POST /api/chats/{chat_id}/stop — Stops the chat's streamed run
   (``{"stopped": bool}``, GH-8).
 - POST /api/chats/{chat_id}/attachments — Stores one file (the raw request
@@ -97,12 +101,15 @@ Routes:
   original (the chat's owner only).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created by its first run, until #177: a refused first
-  message creates none); returns ChatResponse, always JSON. Titles the chat
-  and refuses a busy one or a blank message (``message_empty``, GH-286) like
-  the route above.
+  message creates none); returns ChatResponse, always JSON. Titles the chat,
+  passes its active attachments (GH-189) and refuses a busy one, a blank
+  message (``message_empty``, GH-286) or an attachment it can't send
+  (``storage_unavailable``, ``image_input_unsupported``) like the route above.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
   (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
-  resumed run's LLM error code), or streams like a turn (GH-8).
+  resumed run's LLM error code), or streams like a turn (GH-8). An approval
+  resumes with the chat's active attachments (GH-189; the 503 and 422 above
+  leave the confirmation pending).
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -312,10 +319,31 @@ Security notes:
   message's ``attachment_ids`` above the platform ``max_files_per_message``
   is a 422 ``too_many_files`` before any attachment statement; after the
   chat's owner check, an id that isn't the caller's live file of the chat is
-  the 404 ``attachment_not_found`` and a sent one the 409
-  ``attachment_already_sent``, all before the run with nothing stored. Log
+  the 404 ``attachment_not_found``, a sent one the 409
+  ``attachment_already_sent`` and one that isn't ``ready`` the 409
+  ``attachment_not_ready`` (GH-189), all before the run with nothing stored. Log
   lines carry ids, sizes and kinds only: never a file name, a header value or
   file bytes.
+- Attachment injection (GH-189, ``admino.attachment_context``,
+  ``admino.prompt_assembly``): a chat's active attachments (its sent, live,
+  ``ready`` files, read with the chat in ``chats.load_turn``, then the
+  message's own files) are slot 4 of every run of the chat: a turn, a legacy
+  turn and an approved confirmation. Under the chat's hold, before a pending
+  confirmation is cancelled or consumed, their derived files are read from
+  ``<root>/<org_id>/<id>.d`` (the caller's org and rows only, no symlink
+  followed): one that can't be read is the 503 ``storage_unavailable``, then
+  an image part while the stored ``llm.image_input`` is false the 422
+  ``image_input_unsupported``. Both are fixed JSON bodies (a streamed request's
+  too) with nothing run, stored or audited and the confirmation kept. The
+  content goes to the agent only (``attachments``), wrapped as untrusted
+  data in the current user message, never in the system message, a log, a
+  stored message or an API answer. A run with attachments counts as having
+  read external content from its first dispatch (side-effecting actions
+  need a confirmation), sets the chat's sticky ``external_content`` flag,
+  titles a first exchange with the fallback (no model call), and stores
+  every assistant message with the slot's ids; its ``tool.call`` rows carry
+  the ids and their count. A denial reads no attachment. Log lines name ids
+  and codes only.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -674,6 +702,7 @@ from starlette.staticfiles import StaticFiles
 
 from admino import (
     accounts,
+    attachment_context,
     attachment_gc,
     attachment_processing,
     attachment_types,
@@ -814,6 +843,7 @@ if TYPE_CHECKING:
     from admino.llm import LLMClient
     from admino.models import (
         AgentStatus,
+        AttachmentContent,
         LLMErrorCode,
         MessageStatus,
         SettingsPatchLLM,
@@ -1531,6 +1561,21 @@ _ATTACHMENT_ALREADY_SENT_BODY: Final = {
 _TOO_MANY_FILES_BODY: Final = {
     "detail": "Too many files for one message",
     "reason": "too_many_files",
+}
+# GH-189: a message's file that isn't ready yet (or failed); the client polls the file.
+_ATTACHMENT_NOT_READY_BODY: Final = {
+    "detail": "Attachment is not ready",
+    "reason": "attachment_not_ready",
+}
+# GH-189: an active attachment's derived files can't be read (the upload's 503 text).
+_STORAGE_UNAVAILABLE_BODY: Final = {
+    "detail": attachment_types.REFUSAL_DETAILS["storage_unavailable"],
+    "reason": "storage_unavailable",
+}
+# GH-189: an active attachment holds an image and the stored llm.image_input is false.
+_IMAGE_INPUT_UNSUPPORTED_BODY: Final = {
+    "detail": "The current model does not accept image input",
+    "reason": "image_input_unsupported",
 }
 # GH-286: a message that is blank (``str.strip()`` leaves nothing) and sends no files;
 # fixed text, never the input. Providers would get a whitespace-only user turn.
@@ -3748,8 +3793,9 @@ async def _platform_run_settings() -> scoped_settings.StoredPlatformSettings:
 def _run_config(platform: scoped_settings.StoredPlatformSettings) -> AgentConfig:
     """The AgentConfig of one agent run.
 
-    The stored tool-call, context and timeout limits, and the stored LLM retry
-    limit (``llm.max_retries``, GH-242).
+    The stored tool-call, context and timeout limits, the stored LLM retry
+    limit (``llm.max_retries``, GH-242) and whether the model takes images
+    (``llm.image_input``, GH-189: the agent's last guard against an image part).
     """
     limits = platform.limits
     return AgentConfig(
@@ -3757,6 +3803,7 @@ def _run_config(platform: scoped_settings.StoredPlatformSettings) -> AgentConfig
         max_context_messages=limits.max_context_messages,
         confirmation_timeout_s=float(limits.confirmation_timeout_s),
         llm_max_retries=platform.llm.max_retries,
+        image_input=platform.llm.image_input,
     )
 
 
@@ -4006,6 +4053,8 @@ class _HeldRun:
     title_message: str | None = None
     # The files the turn's user message sends (GH-187, checked before the hold).
     attachment_ids: tuple[UUID, ...] = ()
+    # Slot 4 of the run (GH-189): the chat's active attachments, read under the hold.
+    slot: tuple[AttachmentContent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -4040,9 +4089,15 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
     reply naming the call, the last one with status ``error``, and the run
     reports ``error_code: "rate_limit"``.
 
+    GH-189: a run whose slot 4 held attachments stores every assistant message
+    with the slot's ids in slot order (``included_attachment_ids``) and sets
+    the chat's sticky ``external_content`` flag: the files are external
+    content for every later run of the chat.
+
     Args:
         run: The held run (the pool, the caller's org scope, the chat, the
-            loaded messages and the platform settings read for the request).
+            loaded messages, the platform settings read for the request and
+            the run's slot).
         result: The run's result.
 
     Returns:
@@ -4100,6 +4155,8 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
             # GH-187: linked to the turn's user message in its transaction; none (the
             # default) adds no statement.
             attachment_ids=run.attachment_ids,
+            included_attachment_ids=[content.id for content in run.slot],
+            external_content=bool(run.slot),
         )
     except BaseException:
         # Whatever stopped the store (a chat trashed meanwhile, a database error, a
@@ -4152,6 +4209,34 @@ def _read_external_content(loaded: list[LLMMessage], result: AgentResult) -> boo
     )
 
 
+async def _read_slot(
+    tenant: TenantContext,
+    platform: scoped_settings.StoredPlatformSettings,
+    active: Sequence[chats.ActiveAttachment],
+) -> tuple[AttachmentContent, ...] | JSONResponse:
+    """Slot 4 of a run: the content of the chat's active attachments, in slot order (GH-189).
+
+    Called under the chat's hold, before a pending confirmation is cancelled
+    or consumed. The derived files of every active attachment are read in
+    worker threads (``attachment_context.load_contents``, no statement): one
+    that can't be read is the 503 ``storage_unavailable``. Then an image part
+    while the stored ``llm.image_input`` is false is the 422
+    ``image_input_unsupported``: the parts read decide, not the kind. Both are
+    fixed bodies that name no file; the caller returns them with nothing run
+    or stored. No active attachment gives ``()``.
+    """
+    try:
+        contents = await attachment_context.load_contents(
+            attachments.attachments_root(), tenant.org_id, active
+        )
+    except attachment_context.AttachmentUnavailableError:
+        # The reader logged the attachment id and the cause's class, never a path.
+        return JSONResponse(status_code=503, content=_STORAGE_UNAVAILABLE_BODY)
+    if not platform.llm.image_input and any(content.has_images for content in contents):
+        return JSONResponse(status_code=422, content=_IMAGE_INPUT_UNSUPPORTED_BODY)
+    return tuple(contents)
+
+
 def _running_llm_client() -> LLMClient:
     """The agent's LLM client at the moment of the call (a title task's resolver).
 
@@ -4176,8 +4261,9 @@ def _title_call(
     and the reply, or the fallback from the message. A turn stored as
     ``error`` (a confirmation refused with ``rate_limit`` included) or
     ``stopped`` (GH-8) makes no model call, nor does a run whose new ``tool``
-    results hold wrapped external content (``_read_external_content``): the
-    reply may quote an email or a file, which must not choose the title. The
+    results hold wrapped external content (``_read_external_content``) or
+    whose slot 4 held attachments (GH-189): the reply may quote an email or a
+    file, which must not choose the title. The
     call gets the agent's client when it runs (``_running_llm_client``), the
     org's data residency and the stored ``llm.max_retries``, and holds no chat
     lock: a later turn's history holds the reply, so it titles nothing again.
@@ -4193,7 +4279,7 @@ def _title_call(
         user_message=run.title_message,
         assistant_message=result.response,
         run_failed=stored.status in ("error", "stopped"),
-        external_content=_read_external_content(run.loaded, result),
+        external_content=bool(run.slot) or _read_external_content(run.loaded, result),
         data_residency=run.policy.data_residency,
         max_retries=run.platform.llm.max_retries,
     )
@@ -4226,15 +4312,49 @@ _EVENT_STREAM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         "content": {"text/event-stream": {"schema": {"type": "string"}}},
     }
 }
-# The OpenAPI 422 of the two message routes (GH-286). Documenting a 422 replaces
-# FastAPI's generated one, so the description names the validation list too.
-_MESSAGE_EMPTY_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+# The OpenAPI 422 and 503 of the two message routes (GH-286, GH-189). Documenting a 422
+# replaces FastAPI's generated one, so the description names the validation list too.
+_MESSAGE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     422: {
         "description": (
-            "Validation Error (the usual list), or message_empty: the message is blank "
-            "(nothing but whitespace) and sends no files."
+            "Validation Error (the usual list); message_empty: the message is blank "
+            "(nothing but whitespace) and sends no files; or image_input_unsupported: an "
+            "attachment of the chat holds an image and the current model takes none."
         ),
         "content": {"application/json": {"example": _MESSAGE_EMPTY_BODY}},
+    },
+    503: {
+        "description": (
+            "chats_busy: too many chats are active; or storage_unavailable: an attachment "
+            "of the chat can't be read."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "chats_busy": {"value": _CHATS_BUSY_BODY},
+                    "storage_unavailable": {"value": _STORAGE_UNAVAILABLE_BODY},
+                }
+            }
+        },
+    },
+}
+# The OpenAPI 409 of the chat message route (GH-8, GH-187, GH-189).
+_SEND_CONFLICT_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    409: {
+        "description": (
+            "run_active: a run of the chat is going; attachment_already_sent: a file was "
+            "sent with another message; or attachment_not_ready: a file isn't ready yet "
+            "(poll GET /api/attachments/{attachment_id} until it is)."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "run_active": {"value": _RUN_ACTIVE_BODY},
+                    "attachment_already_sent": {"value": _ATTACHMENT_ALREADY_SENT_BODY},
+                    "attachment_not_ready": {"value": _ATTACHMENT_NOT_READY_BODY},
+                }
+            }
+        },
     }
 }
 
@@ -4462,7 +4582,7 @@ async def _chat_turn(
     *,
     attachment_ids: Sequence[UUID] = (),
     streamed: bool = False,
-) -> ChatResponse | EventStreamResponse:
+) -> ChatResponse | EventStreamResponse | JSONResponse:
     """Run one user message in a chat and store the turn (the two turn routes).
 
     The caller spent the ``/api/message`` bucket. Expired confirmations are
@@ -4489,6 +4609,20 @@ async def _chat_turn(
     (``attachments.check_sendable``, one statement; none without files), before
     the hold and the run, and the stored turn links them to its user message
     (``_finish_run``).
+
+    GH-189: a file that isn't ``ready`` is refused there too (the 409
+    ``attachment_not_ready``). Under the hold, after the chat is read and
+    before a pending confirmation is cancelled, slot 4 is built
+    (``_read_slot``): the chat's active attachments (``turn.attachments``,
+    the files of earlier messages in send order) followed by the message's
+    own files. A file whose derived files can't be read is the 503
+    ``storage_unavailable``, an image part without the stored
+    ``llm.image_input`` the 422 ``image_input_unsupported``; either is JSON
+    (a streamed request's too) with nothing run or stored and the pending
+    confirmation kept. A run with a slot gets it as ``attachments``, counts
+    as having read external content (its title is the fallback) and is
+    stored with the slot's ids (``_finish_run``). The legacy route makes the
+    same two checks.
 
     A legacy session id keeps its separate reads before the hold
     (``org_permissions.load_tool_policy``,
@@ -4538,7 +4672,8 @@ async def _chat_turn(
 
     Returns:
         The turn's ChatResponse (``session_id`` echoes a legacy session id),
-        or the streamed turn's EventStreamResponse.
+        the streamed turn's EventStreamResponse, or the JSON 503
+        ``storage_unavailable`` or 422 ``image_input_unsupported`` (GH-189).
 
     Raises:
         HTTPException: 422 over the stored message length; 500 when the agent
@@ -4549,6 +4684,8 @@ async def _chat_turn(
             one of the chat (404 ``attachment_not_found``; no run).
         attachments.AttachmentAlreadySentError: A file was already sent (409
             ``attachment_already_sent``; no run).
+        attachments.AttachmentNotReadyError: A file isn't ready (409
+            ``attachment_not_ready``, GH-189; no run).
         ChatRunActiveError: A run of the chat is going (409 ``run_active``,
             GH-8; no run, nothing stored).
         ChatRuntimeUserLimitError: The chat has no runtime entry and the
@@ -4580,6 +4717,8 @@ async def _chat_turn(
     session_id: str | None = None
     # A legacy session id without a chat yet: its chat is created under the hold.
     new_session: str | None = None
+    # The message's own files, the newest of the slot (GH-189); the legacy route sends none.
+    sent: list[chats.ActiveAttachment] = []
     # Resolves the chat (the 404) before the hold; it is read again under the hold.
     if isinstance(chat_ref, UUID):
         # One statement for the policy, the prompt context and the owner check: a send
@@ -4587,7 +4726,7 @@ async def _chat_turn(
         setup = await turn_setup.load_turn_setup(pool, tenant, chat_ref)
         if not setup.chat_found:
             raise chats.ChatNotFoundError
-        await attachments.check_sendable(pool, tenant, chat_ref, attachment_ids)
+        sent = await attachments.check_sendable(pool, tenant, chat_ref, attachment_ids)
         policy = setup.policy
         prompt_context = setup.prompt_context
         chat_id = chat_ref
@@ -4627,6 +4766,10 @@ async def _chat_turn(
             pool, tenant, chat_id, limit=platform.limits.max_context_messages
         )
         chat, loaded = turn.chat, turn.history
+        # Before the pending confirmation is cancelled: a refused message keeps it.
+        slot = await _read_slot(tenant, platform, [*turn.attachments, *sent])
+        if isinstance(slot, JSONResponse):
+            return slot
         if _chat_runtime.pop_pending(chat.id) is not None:
             logger.info(
                 "Chat %s got a new message while a confirmation was pending: cancelled",
@@ -4649,6 +4792,7 @@ async def _chat_turn(
             policy=policy,
             title_message=message if first_exchange else None,
             attachment_ids=tuple(attachment_ids),
+            slot=slot,
         )
         start = functools.partial(
             _agent.run,
@@ -4661,6 +4805,9 @@ async def _chat_turn(
             prompt_context=prompt_context,
             earlier_external_content=chat.external_content,
         )
+        if slot:
+            # Only with a slot: a chat without attachments runs exactly as before.
+            start = functools.partial(start, attachments=slot)
         if streamed:
             return _start_stream(held, run, start)
         try:
@@ -4706,6 +4853,14 @@ async def post_chat_message(
     the same answer. A blank message with files runs as sent; a message that
     isn't blank is never trimmed.
 
+    GH-189: a listed file that isn't ``ready`` is the 409
+    ``attachment_not_ready`` (after ``attachment_not_found`` and
+    ``attachment_already_sent``, before the chat's hold); the client polls
+    GET /api/attachments/{id}. Under the hold the chat's active attachments
+    are read: the 503 ``storage_unavailable`` when one can't be, then the 422
+    ``image_input_unsupported`` when one holds an image and the stored
+    ``llm.image_input`` is false (``_chat_turn``).
+
     Args:
         request: The incoming request (its ``Accept`` header).
         principal: The logged-in principal (needs ``chat.send``).
@@ -4719,16 +4874,18 @@ async def post_chat_message(
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
         ``max_pending_confirmations`` in other chats; None otherwise. Or the
-        streamed run's EventStreamResponse. Or the JSON 422
-        ``message_empty`` (also for a streamed request) or ``too_many_files``.
+        streamed run's EventStreamResponse. Or the JSON (also for a streamed
+        request) 422 ``message_empty``, ``too_many_files`` or
+        ``image_input_unsupported``, or 503 ``storage_unavailable``.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
             length, 500 when a JSON turn's agent fails. A chat the caller
             can't reach is the 404 ``chat_not_found``; a file that isn't the
-            caller's live one of the chat the 404 ``attachment_not_found``
-            and a file already sent the 409 ``attachment_already_sent``
-            (GH-187); a chat whose run is going the 409 ``run_active``
+            caller's live one of the chat the 404 ``attachment_not_found``,
+            a file already sent the 409 ``attachment_already_sent``
+            (GH-187) and a file not ready the 409 ``attachment_not_ready``
+            (GH-189); a chat whose run is going the 409 ``run_active``
             (GH-8); the caller at their chat-runtime bound the 429
             ``rate_limit`` (GH-24); a full chat runtime with nothing to evict
             the 503 ``chats_busy``.
@@ -4773,6 +4930,10 @@ async def post_message(
     no files) is the 422 ``message_empty`` right after the rate limit (which
     it spends), before any database statement: no chat is read or created.
 
+    GH-189: the chat's active attachments (files sent to it through the chat
+    route) go to the run like there, with the same 503
+    ``storage_unavailable`` and 422 ``image_input_unsupported`` under the hold.
+
     Args:
         body: Validated ChatRequest with message and session_id.
         principal: The logged-in principal (needs ``chat.send``).
@@ -4784,7 +4945,8 @@ async def post_message(
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
         ``max_pending_confirmations`` in other chats; None otherwise. Or the
-        422 ``message_empty``.
+        422 ``message_empty`` or ``image_input_unsupported``, or the 503
+        ``storage_unavailable``.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
@@ -4844,7 +5006,7 @@ async def post_confirm(
         description="Confirmation identifier. Alphanumeric, hyphens, underscores only.",
     ),
     body: ConfirmRequest = ...,  # type: ignore[assignment]
-) -> ChatResponse | EventStreamResponse:
+) -> ChatResponse | EventStreamResponse | JSONResponse:
     """Handle POST /api/confirm/{confirmation_id} — approve or deny a pending action.
 
     The body names the chat by ``chat_id`` or by the legacy ``session_id``
@@ -4858,7 +5020,14 @@ async def post_confirm(
     are checked (``_utc_now``) and the confirmation is consumed: one that
     expired meanwhile (while the request waited for the hold) is popped and
     answers the same 404 as one already reaped, with nothing run or stored
-    (GH-24). A denial stores the closing ``tool`` results (the denied call's
+    (GH-24). GH-189: an approval first reads the chat with its latest
+    messages and active attachments (``chats.load_turn``) and builds slot 4
+    (``_read_slot``) before the confirmation is consumed: the 503
+    ``storage_unavailable`` or the 422 ``image_input_unsupported`` (JSON,
+    streamed or not) leaves it pending, with nothing run or stored. The
+    resumed run gets the slot like a turn, and its stored assistant messages
+    record the slot's ids. A denial reads no attachment and stores the
+    closing ``tool`` results (the denied call's
     "Tool call denied by the user.", any other dangling call's cancelled
     result) and the assistant's denial, so the history stays well-formed. An
     approval resumes the agent on the latest ``max_context_messages`` stored
@@ -4894,7 +5063,8 @@ async def post_confirm(
         ChatResponse naming the chat (``session_id`` echoed when given) with
         the result of the resumed agent run (its LLM error code, or
         ``rate_limit`` when the confirmation it asked for was refused; None
-        for a denial); or the streamed EventStreamResponse.
+        for a denial); or the streamed EventStreamResponse; or an approval's
+        JSON 503 ``storage_unavailable`` or 422 ``image_input_unsupported``.
 
     Raises:
         HTTPException: 404 if no confirmation is pending for the chat, it has
@@ -4956,13 +5126,12 @@ async def post_confirm(
             _chat_runtime.pop_pending(chat.id)
             raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
 
-        # Consume the pending confirmation regardless of approval/denial.
-        _chat_runtime.pop_pending(chat.id)
-        loaded = await chats.load_recent_history(
-            pool, tenant, chat.id, limit=platform.limits.max_context_messages
-        )
-
         if not body.approved:
+            # A denial is consumed at once and reads no attachment (GH-189).
+            _chat_runtime.pop_pending(chat.id)
+            loaded = await chats.load_recent_history(
+                pool, tenant, chat.id, limit=platform.limits.max_context_messages
+            )
             logger.info("Confirmation denied for chat %s", safe_log(chat.id))
             # Safe f-string: tool and action are Pydantic-validated with
             # pattern=r"^[a-z][a-z0-9_]{0,62}$", restricting to alphanumeric/
@@ -5004,15 +5173,30 @@ async def post_confirm(
 
         # Approved — resume the agent with the pending confirmation, the chat's
         # external_content flag as read under the hold (a turn that ran ahead may have
-        # set it; security audit M-1) and the prompt context as it is now (GH-170: a
-        # change made while the confirmation was pending applies to the resumed run).
-        chat = await chats.get_chat(pool, tenant, chat.id)
+        # set it; security audit M-1), the chat's active attachments (GH-189) and the
+        # prompt context as it is now (GH-170: a change made while the confirmation was
+        # pending applies to the resumed run).
+        turn = await chats.load_turn(
+            pool, tenant, chat.id, limit=platform.limits.max_context_messages
+        )
+        # Before the confirmation is consumed: a refused approval leaves it pending.
+        slot = await _read_slot(tenant, platform, turn.attachments)
+        if isinstance(slot, JSONResponse):
+            return slot
+        _chat_runtime.pop_pending(chat.id)
+        chat, loaded = turn.chat, turn.history
         prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
 
         logger.info("Resuming agent for chat %s after a confirmation", safe_log(chat.id))
 
         run = _HeldRun(
-            pool=pool, tenant=tenant, chat=chat, loaded=loaded, platform=platform, policy=policy
+            pool=pool,
+            tenant=tenant,
+            chat=chat,
+            loaded=loaded,
+            platform=platform,
+            policy=policy,
+            slot=slot,
         )
         start = functools.partial(
             _agent.run,
@@ -5026,6 +5210,9 @@ async def post_confirm(
             prompt_context=prompt_context,
             earlier_external_content=chat.external_content,
         )
+        if slot:
+            # Only with a slot: a chat without attachments resumes exactly as before.
+            start = functools.partial(start, attachments=slot)
         if streamed:
             return _start_stream(held, run, start)
         try:
@@ -6602,6 +6789,16 @@ async def _attachment_already_sent_handler(request: Request, exc: Exception) -> 
     return JSONResponse(status_code=409, content=_ATTACHMENT_ALREADY_SENT_BODY)
 
 
+async def _attachment_not_ready_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``attachments.AttachmentNotReadyError``: the 409 ``attachment_not_ready``.
+
+    GH-189: a message listing a file that is ``uploaded``, ``processing`` or
+    ``failed``; refused before the chat's hold, with nothing stored. The
+    client polls GET /api/attachments/{id} until the file is ready.
+    """
+    return JSONResponse(status_code=409, content=_ATTACHMENT_NOT_READY_BODY)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -6858,6 +7055,7 @@ def create_app(
     app.add_exception_handler(
         attachments.AttachmentAlreadySentError, _attachment_already_sent_handler
     )
+    app.add_exception_handler(attachments.AttachmentNotReadyError, _attachment_not_ready_handler)
 
     # --- Routes ---
     # Public: health check, login, password reset, the invitation link routes
@@ -6967,7 +7165,7 @@ def create_app(
     app.post(
         "/api/chats/{chat_id}/messages",
         response_model=ChatResponse,
-        responses={**_EVENT_STREAM_RESPONSES, **_MESSAGE_EMPTY_RESPONSES},
+        responses={**_EVENT_STREAM_RESPONSES, **_SEND_CONFLICT_RESPONSES, **_MESSAGE_RESPONSES},
     )(post_chat_message)
     app.post("/api/chats/{chat_id}/stop", response_model=ChatStopResponse)(post_chat_stop)
     app.post("/api/chats/{chat_id}/attachments", status_code=201, response_model=AttachmentSummary)(
@@ -6981,7 +7179,7 @@ def create_app(
         response_model=None,
         responses=_ATTACHMENT_CONTENT_RESPONSES,
     )(get_attachment_content)
-    app.post("/api/message", response_model=ChatResponse, responses=_MESSAGE_EMPTY_RESPONSES)(
+    app.post("/api/message", response_model=ChatResponse, responses=_MESSAGE_RESPONSES)(
         post_message
     )
     app.post(

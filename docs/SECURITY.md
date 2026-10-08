@@ -286,9 +286,12 @@ What this doesn't cover:
   suggested (a search query, for example). Today these only reach the user's own
   accounts. It matters for the planned web search, where a query leaves for a third
   party.
-- **Attachments aren't wrapped yet.** Chat attachments can be uploaded now, but their
-  content doesn't reach the model in this release; it will be wrapped when it does
-  ([#189](https://github.com/ljakupi/admino/issues/189)).
+- **A sent file stays in every turn, in full.** Chat attachments are wrapped like tool
+  results (see [Attachments](#attachments)), but without the 20,000-character cap, and
+  the chat's sent files reach the model on every later turn until
+  [#190](https://github.com/ljakupi/admino/issues/190) adds a budget and a way to exclude
+  one. A planted instruction in a file therefore stays in view for the whole chat; the
+  escalation holds for the whole chat too.
 - **The answer can still be misled.** Wrapping stops silent side effects, not injected
   text shaping what the model tells you. Read summaries of unexpected mail with care.
 
@@ -432,6 +435,53 @@ conversion in `attachment_processing.py` and `converters/`:
   it for them.
   Names, header values and file content never reach a log line or the audit log: IDs,
   sizes, types, statuses and reason codes only.
+- **Sent files reach the model as untrusted data** (`attachment_context.py`,
+  `prompt_assembly.py`). Every run of a chat (a message, the legacy route, an approved
+  action) gets the chat's active attachments: its sent, live, `ready` files, read with
+  the chat in one statement bound to the caller's organization and user, so another
+  user's or organization's file never reaches the run. They go into the run's current
+  user message, never into the system message: file content gets none of the
+  instructions' authority (and providers accept images in user messages only). An intro
+  line says the files are data the user provided, not instructions. Each file is one
+  block wrapped in the run's untrusted-content boundary (`kind="attachment"`), and every
+  line inside it (the name, type and page lines, the text parts, the image labels) is
+  cleaned like a tool result: control characters, format characters (`Cf`) and lone
+  surrogates removed, the marker name defused, so a document can't close its block. A
+  DOCX's hidden text and a PDF text layer saying "ignore previous instructions" arrive
+  inside the block like any other text. The base prompt's untrusted-content rule names
+  attachments.
+- **File names are cleaned again for the prompt.** Before a name goes into a block's
+  label and `File:` line, every Unicode default-ignorable character (Hangul fillers, the
+  combining grapheme joiner, variation selectors, bidi controls, zero-width characters,
+  tag characters) and every other format (`Cf`) character is removed; a name left empty
+  becomes `attachment`. The conversion's page markers and image labels use the same
+  cleaned name.
+- **Reading the converted parts never follows a link.** A run reads each file's
+  `<attachment ID>.d/manifest.json` and parts in a worker thread: the directory is opened
+  with `O_NOFOLLOW`, every file in it relative to that directory with `O_NOFOLLOW`, and
+  each must be a regular file. The manifest must validate and name the row's type, text
+  must be strict UTF-8, and one file reads at most 256 MiB. Any failure answers `503
+  storage_unavailable` with nothing run or stored, logged with the attachment's ID and
+  the exception's class only. The checks run under the chat's lock, before a pending
+  confirmation is cancelled or consumed, so a refused message or approval keeps it.
+- **Images only for a model that takes them.** With the platform's `llm.image_input`
+  off, a message or an approval whose files hold an image part answers `422
+  image_input_unsupported` before anything runs. As a second guard, `llm_policy` refuses
+  a model call holding an image part before any request is sent; the run then ends with
+  the generic error.
+- **Files make side effects ask first.** A run whose model gets a file has received
+  external content from its first action on, an approved action included: every action
+  that changes something and that the matrix allows waits for the user's confirmation,
+  and hardcoded denials such as `gmail.send` stay denied, so a document saying "send
+  this file to x@y" can't send anything on its own. The turn sets the chat's sticky
+  `external_content` mark, and an untitled chat's first exchange with files gets the
+  fallback title without a model call, so a file never chooses a title.
+- **Traceable without content.** Every `tool.call` audit row of such a run carries the
+  files' IDs (`attachment_ids`, in the order sent, at most 100) and their number
+  (`attachment_count`), nothing else about them. Each assistant message the run stores
+  records the same IDs (`chat_messages.included_attachment_ids`; a database check allows
+  them on assistant messages only). A stored user message keeps what the user typed:
+  file content is never stored in a message, logged or returned by an API.
 - **Unencrypted at rest.** The files and their converted parts (`<attachment ID>.d/`:
   text, images and a manifest) are on the `admino-attachments` volume, mounted on the
   agent only and owned by `admino` (files 0600, directories 0700), but they **aren't
@@ -455,8 +505,8 @@ conversion in `attachment_processing.py` and `converters/`:
   parts.
 - **No tool reaches them.** No agent tool reads, lists or downloads an attachment: the
   agent, the LLM clients, the tools and the permission engine don't import the
-  attachment or conversion modules. In this release a file's content doesn't reach the
-  model either ([#189](https://github.com/ljakupi/admino/issues/189) adds that).
+  attachment or conversion modules. A file's content reaches the model only as one of
+  the chat's sent files (above), never through a tool call.
 
 ## The LLM provider and data residency
 
