@@ -46,6 +46,11 @@ section 6 pins the upload's cross-site refusal (403, nothing stored). GH-190
 adds ``PATCH /api/attachments/{attachment_id}`` (``{"active": false}`` on an
 attachment of the caller's own chat: a JSON body) and ``GET
 /api/chats/{chat_id}/attachments`` (the files of a chat of the caller's own).
+GH-194 adds the trash: ``DELETE /api/attachments/{attachment_id}`` (a live file
+of the caller's own chat), ``GET /api/trash`` and ``DELETE /api/trash`` (the
+caller's own trash, holding a trashed chat), and restore and delete forever of
+a trashed chat (``/api/trash/chats/{chat_id}``) and of a file trashed on its own
+(``/api/trash/attachments/{attachment_id}``), all of the caller's own (no body).
 GH-245 adds ``POST /api/chats/{chat_id}/retry`` (no body; a request on a chat of the
 caller's own whose one turn failed, so the stub agent re-runs it: 200). Its section 7
 pins the retry's cross-site refusal (403, nothing run or changed).
@@ -115,6 +120,8 @@ from tests.tenancy_world import (
     seed_chat,
     seed_failed_chat,
     seed_pending_confirmation,
+    seed_trashed_attachment,
+    seed_trashed_chat,
     stub_agent,
     upload_headers,
     use_attachment_storage,
@@ -398,6 +405,58 @@ def _list_own_chat_attachments(world: World, caller: Account, _client: TestClien
     return _Request("GET", f"/api/chats/{chat_id}/attachments")
 
 
+def _delete_own_attachment(world: World, caller: Account, _client: TestClient) -> _Request:
+    """GH-194: move a live attachment of a chat of the caller's own to the trash."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 194")
+    return _Request("DELETE", f"/api/attachments/{seed_attachment(world.db, chat_id)}")
+
+
+def _own_trash(method: str) -> _Builder:
+    """GH-194: list (GET) or empty (DELETE) the caller's own trash, holding a trashed chat
+    with a file."""
+
+    def build(world: World, caller: Account, _client: TestClient) -> _Request:
+        seed_trashed_chat(
+            world.db,
+            _chat_owner(world, caller),
+            title="Tenancy trashed chat 194",
+            messages=(("user", "Tenancy question 194"),),
+            filenames=("tenancy-trashed-194.txt",),
+        )
+        return _Request(method, "/api/trash")
+
+    return build
+
+
+def _own_trashed_chat(method: str, suffix: str) -> _Builder:
+    """GH-194: restore (POST ``suffix`` "/restore") or delete forever (DELETE "") a trashed
+    chat of the caller's own, holding a message and a file."""
+
+    def build(world: World, caller: Account, _client: TestClient) -> _Request:
+        chat_id = seed_trashed_chat(
+            world.db,
+            _chat_owner(world, caller),
+            title="Tenancy trashed chat 194",
+            messages=(("user", "Tenancy question 194"),),
+            filenames=("tenancy-trashed-194.txt",),
+        )
+        return _Request(method, f"/api/trash/chats/{chat_id}{suffix}")
+
+    return build
+
+
+def _own_trashed_attachment(method: str, suffix: str) -> _Builder:
+    """GH-194: restore (POST ``suffix`` "/restore") or delete forever (DELETE "") a file
+    the caller deleted on its own from a live chat of its own."""
+
+    def build(world: World, caller: Account, _client: TestClient) -> _Request:
+        chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 194")
+        attachment_id = seed_trashed_attachment(world.db, chat_id)
+        return _Request(method, f"/api/trash/attachments/{attachment_id}{suffix}")
+
+    return build
+
+
 def _platform_org(method: str, suffix: str, json: dict[str, Any] | None = None) -> _Builder:
     """A platform request on org A's path."""
 
@@ -547,6 +606,16 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     # GH-190: exclude an attachment (a JSON body); list a chat's attachments.
     ("PATCH", "/api/attachments/{attachment_id}"): _exclude_own_attachment,
     ("GET", "/api/chats/{chat_id}/attachments"): _list_own_chat_attachments,
+    # GH-194: no request body; the caller's own live file, trash, trashed chat and file.
+    ("DELETE", "/api/attachments/{attachment_id}"): _delete_own_attachment,
+    ("GET", "/api/trash"): _own_trash("GET"),
+    ("DELETE", "/api/trash"): _own_trash("DELETE"),
+    ("POST", "/api/trash/chats/{chat_id}/restore"): _own_trashed_chat("POST", "/restore"),
+    ("POST", "/api/trash/attachments/{attachment_id}/restore"): _own_trashed_attachment(
+        "POST", "/restore"
+    ),
+    ("DELETE", "/api/trash/chats/{chat_id}"): _own_trashed_chat("DELETE", ""),
+    ("DELETE", "/api/trash/attachments/{attachment_id}"): _own_trashed_attachment("DELETE", ""),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _plain("GET", "/api/oauth/google/authorize"),
     ("GET", "/api/oauth/microsoft/authorize"): _plain("GET", "/api/oauth/microsoft/authorize"),

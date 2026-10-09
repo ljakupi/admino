@@ -302,15 +302,16 @@ LIVE_ORDER: Final = (
 # ---------------------------------------------------------------------------
 
 
-def _migrations_copy(target: Path, extra: str | None) -> Path:
-    """0001 to 0029 of the shipped migrations in ``target``, plus ``extra`` as 0030."""
+def _migrations_copy(target: Path, extra: str | None, *, through: int = 29) -> Path:
+    """0001 to ``through`` (0029) of the shipped migrations in ``target``, plus ``extra``
+    as 0030."""
     from admino import database
 
     source = Path(database.__file__).parent / "migrations"
     target.mkdir()
     for path in sorted(source.glob("*.sql")):
         match = re.match(r"(\d{4})_", path.name)
-        if match is not None and int(match.group(1)) <= 29:
+        if match is not None and int(match.group(1)) <= through:
             shutil.copyfile(path, target / path.name)
     if extra is not None:
         (target / "0030_context_budget.sql").write_text(extra, encoding="utf-8")
@@ -551,15 +552,21 @@ class TestShippedSchemaReader:
             read_0030, attachment_update_columns=UPDATE_COLUMNS_0029
         )
 
-    def test_fakedb_shipped_migrations_give_the_0030_schema(self, read_0030: ShippedSchema) -> None:
-        """The tree's own migrations (what the fake uses unpatched) leave 0030's schema,
-        and the fake's import-time UPDATE grant is that one (RED until 0030 ships)."""
-        shipped = db_fakes.shipped_schema()
+    def test_fakedb_shipped_migrations_give_the_0030_schema(
+        self, tmp_path: Path, read_0030: ShippedSchema
+    ) -> None:
+        """The tree's own migrations through 0030 (what the fake uses unpatched, later
+        migrations on top) leave 0030's schema, and the fake's import-time UPDATE grant
+        is the shipped one, 0030's included (RED until 0030 ships). GH-194: read
+        through 0030, as 0032 adds its own parts (tests/test_fakedb_trash.py)."""
+        tree = db_fakes.read_shipped_schema(_migrations_copy(tmp_path / "tree", None, through=30))
+        grant = db_fakes.ATTACHMENT_UPDATE_COLUMNS
 
-        assert (shipped, db_fakes.ATTACHMENT_UPDATE_COLUMNS) == (
+        assert (tree, grant == db_fakes.shipped_schema().attachment_update_columns) == (
             read_0030,
-            read_0030.attachment_update_columns,
+            True,
         )
+        assert read_0030.attachment_update_columns <= grant
 
 
 # ---------------------------------------------------------------------------

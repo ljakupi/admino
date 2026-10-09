@@ -35,6 +35,19 @@ Viewer, plus a Super Admin):
   included) and the audit log as they were; ``GET
   /api/chats/{chat_id}/attachments`` on org B's chat, a colleague's or an
   unknown id is the chat routes' ``chat_not_found`` 404 and never lists a file.
+- GH-194's trash: ``POST /api/trash/chats/{chat_id}/restore``, ``POST
+  /api/trash/attachments/{attachment_id}/restore``, ``DELETE
+  /api/trash/chats/{chat_id}`` and ``DELETE /api/trash/attachments/{attachment_id}``
+  on org B's trashed chat (with its messages and a file trashed with it) or
+  org B's file trashed on its own answer the chat routes' ``chat_not_found``
+  or ``attachment_not_found`` 404 exactly like an unknown id, and B's rows,
+  files on disk (originals and derived ``<id>.d/``) and audit log stay; B's
+  Editor still restores or deletes it afterwards. ``DELETE
+  /api/attachments/{attachment_id}`` (move a live file to the trash) joins the
+  attachment routes above (org B's, a colleague's, an unknown file: 404, the
+  row stays live). ``GET /api/trash`` lists only the caller's own items and
+  ``DELETE /api/trash`` purges only the caller's own (``own_user``); a
+  colleague's trash and the role refusals are in tests/test_trash_isolation.py.
 - GH-245: ``POST /api/chats/{chat_id}/retry`` (no body) on org B's chat, a
   colleague's (an Org Admin's, an Editor's, a Viewer's; for an Org Admin too) or an
   unknown id is the chat routes' ``chat_not_found`` 404, also when that chat's
@@ -123,6 +136,8 @@ from tests.tenancy_world import (
     seed_chat,
     seed_failed_chat,
     seed_pending_confirmation,
+    seed_trashed_attachment,
+    seed_trashed_chat,
     stub_agent,
     upload_headers,
     use_attachment_storage,
@@ -326,6 +341,29 @@ def _user_settings_row(db: FakeDb, user_id: uuid.UUID) -> dict[str, Any] | None:
 def _audit_org_ids(rows: list[dict[str, Any]]) -> set[uuid.UUID | None]:
     """The org ids of audit rows."""
     return {None if row["org_id"] is None else _plain(row["org_id"]) for row in rows}
+
+
+def _org_trash_state(world: World, org_id: uuid.UUID) -> dict[str, Any]:
+    """GH-194: one org's chats, chat messages and attachments rows (trashed ones
+    included), its files under the attachments root (originals and derived files) and
+    its audit rows, as copies."""
+    tables = world.db.snapshot()
+    return {
+        name: sorted(
+            (row for row in tables[name].values() if _plain(row["org_id"]) == org_id),
+            key=lambda row: str(row["id"]),
+        )
+        for name in ("chats", "chat_messages", "attachments")
+    } | {
+        "files": {
+            path: data for path, data in attachment_files().items() if path.startswith(f"{org_id}/")
+        },
+        "audit": [
+            copy.deepcopy(row)
+            for row in world.db.audit_rows()
+            if row["org_id"] is not None and _plain(row["org_id"]) == org_id
+        ],
+    }
 
 
 def _switch_off(db: FakeDb, org_id: uuid.UUID, *tools: str) -> None:
@@ -648,13 +686,114 @@ def _list_chat_attachments(client: TestClient, caller: Account, ident: str) -> h
     return client.get(f"/api/chats/{ident}/attachments", headers=caller.cookie)
 
 
-def _attachment_case(send: Callable[[TestClient, Account, str], httpx.Response]) -> _PathIdCase:
-    """A GH-187 attachment read: org A's Editor, the attachment_not_found 404, B's / A's
-    marked attachment (its file on disk)."""
+def _delete_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-194: DELETE /api/attachments/{attachment_id} (move a live file to the trash)."""
+    return client.delete(f"/api/attachments/{ident}", headers=caller.cookie)
+
+
+# GH-194: trash items carry the marker in their title, messages, file names and bytes.
+def _marked_trashed_chat(world: World, owner: Account, marker: str) -> uuid.UUID:
+    """A trashed chat of ``owner`` titled and holding a question with ``marker``, and a
+    file named and filled with ``marker`` trashed with it (original and derived text)."""
+    return seed_trashed_chat(
+        world.db,
+        owner,
+        title=f"{marker} Papierkorb",
+        messages=(("user", f"{marker} question"), ("assistant", f"{marker} answer")),
+        filenames=(f"{marker} Anhang.txt",),
+    )
+
+
+def _marked_trashed_attachment(world: World, owner: Account, marker: str) -> uuid.UUID:
+    """A file named and filled with ``marker`` that ``owner`` deleted on its own from a
+    live marked chat (original and derived text on disk)."""
+    return seed_trashed_attachment(
+        world.db,
+        _marked_chat(world, owner, marker),
+        filename=f"{marker} Papierkorb.txt",
+        data=f"{marker} Papierkorbinhalt\n".encode(),
+    )
+
+
+def _b_trashed_chat(world: World, _client: TestClient) -> str:
+    return str(_marked_trashed_chat(world, world.b["editor"], _B_MARKER))
+
+
+def _a_trashed_chat(world: World, _client: TestClient) -> str:
+    return str(_marked_trashed_chat(world, world.a["editor"], _A_MARKER))
+
+
+def _b_trashed_attachment(world: World, _client: TestClient) -> str:
+    return str(_marked_trashed_attachment(world, world.b["editor"], _B_MARKER))
+
+
+def _a_trashed_attachment(world: World, _client: TestClient) -> str:
+    return str(_marked_trashed_attachment(world, world.a["editor"], _A_MARKER))
+
+
+def _restore_trashed_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-194: POST /api/trash/chats/{chat_id}/restore (no body)."""
+    return client.post(f"/api/trash/chats/{ident}/restore", headers=caller.cookie)
+
+
+def _purge_trashed_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-194: DELETE /api/trash/chats/{chat_id} (delete forever)."""
+    return client.delete(f"/api/trash/chats/{ident}", headers=caller.cookie)
+
+
+def _restore_trashed_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-194: POST /api/trash/attachments/{attachment_id}/restore (no body)."""
+    return client.post(f"/api/trash/attachments/{ident}/restore", headers=caller.cookie)
+
+
+def _purge_trashed_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-194: DELETE /api/trash/attachments/{attachment_id} (delete forever)."""
+    return client.delete(f"/api/trash/attachments/{ident}", headers=caller.cookie)
+
+
+def _trashed_chat_case(
+    own_status: int, send: Callable[[TestClient, Account, str], httpx.Response]
+) -> _PathIdCase:
+    """A GH-194 trashed-chat route: org A's Editor, the chat_not_found 404, B's / A's
+    marked trashed chat."""
+    return _PathIdCase(
+        caller="editor",
+        detail="Chat not found",
+        own_status=own_status,
+        seed_foreign=_b_trashed_chat,
+        seed_own=_a_trashed_chat,
+        send=send,
+        unknown_id=_uuid_id,
+        reason="chat_not_found",
+    )
+
+
+def _trashed_attachment_case(
+    own_status: int, send: Callable[[TestClient, Account, str], httpx.Response]
+) -> _PathIdCase:
+    """A GH-194 trashed-file route: org A's Editor, the attachment_not_found 404, B's / A's
+    marked file trashed on its own."""
     return _PathIdCase(
         caller="editor",
         detail="Attachment not found",
-        own_status=200,
+        own_status=own_status,
+        seed_foreign=_b_trashed_attachment,
+        seed_own=_a_trashed_attachment,
+        send=send,
+        unknown_id=_uuid_id,
+        reason="attachment_not_found",
+    )
+
+
+def _attachment_case(
+    send: Callable[[TestClient, Account, str], httpx.Response], own_status: int = 200
+) -> _PathIdCase:
+    """A GH-187 attachment route: org A's Editor, the attachment_not_found 404, B's / A's
+    marked live attachment (its file on disk); ``own_status`` on the own one."""
+    return _PathIdCase(
+        caller="editor",
+        detail="Attachment not found",
+        own_status=own_status,
         seed_foreign=_b_attachment,
         seed_own=_a_attachment,
         send=send,
@@ -836,6 +975,17 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
     # GH-190: only the owner excludes a file (200 on the own one) or lists a chat's files.
     ("PATCH", "/api/attachments/{attachment_id}"): _attachment_case(_exclude_attachment),
     ("GET", "/api/chats/{chat_id}/attachments"): _chat_case(200, _list_chat_attachments),
+    # GH-194: only the owner moves a live file to the trash (204 on the own one), restores
+    # (200) or deletes forever (204) a trashed chat or a file trashed on its own.
+    ("DELETE", "/api/attachments/{attachment_id}"): _attachment_case(_delete_attachment, 204),
+    ("POST", "/api/trash/chats/{chat_id}/restore"): _trashed_chat_case(200, _restore_trashed_chat),
+    ("DELETE", "/api/trash/chats/{chat_id}"): _trashed_chat_case(204, _purge_trashed_chat),
+    ("POST", "/api/trash/attachments/{attachment_id}/restore"): _trashed_attachment_case(
+        200, _restore_trashed_attachment
+    ),
+    ("DELETE", "/api/trash/attachments/{attachment_id}"): _trashed_attachment_case(
+        204, _purge_trashed_attachment
+    ),
 }
 
 _PATH_ID_PARAMS: Final = [
@@ -874,9 +1024,22 @@ _ATTACHMENT_ROUTES: Final[tuple[Route, ...]] = (
     ("GET", "/api/attachments/{attachment_id}/content"),
     # GH-190: the exclusion.
     ("PATCH", "/api/attachments/{attachment_id}"),
+    # GH-194: moving a live file to the trash.
+    ("DELETE", "/api/attachments/{attachment_id}"),
 )
 _ATTACHMENT_ROUTE_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _ATTACHMENT_ROUTES
+]
+
+# GH-194: restore and delete forever of a trashed chat and of a file trashed on its own.
+_TRASH_ITEM_ROUTES: Final[tuple[Route, ...]] = (
+    ("POST", "/api/trash/chats/{chat_id}/restore"),
+    ("DELETE", "/api/trash/chats/{chat_id}"),
+    ("POST", "/api/trash/attachments/{attachment_id}/restore"),
+    ("DELETE", "/api/trash/attachments/{attachment_id}"),
+)
+_TRASH_ITEM_ROUTE_PARAMS: Final = [
+    pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _TRASH_ITEM_ROUTES
 ]
 
 # The org user routes of GH-164 that name a user in the path.
@@ -1462,6 +1625,31 @@ class TestAttachmentPathRoutes:
         assert _state(world.db) == before
         assert "A-colleague-187" not in colleague.text
         assert str(attachment_id) not in colleague.text
+
+
+class TestTrashPathRoutes:
+    """GH-194: org B's trash item, named by org A's Editor: the 404 of an unknown id, and
+    every row, file and audit row of org B stays (its derived files included)."""
+
+    @covers(*_TRASH_ITEM_ROUTES)
+    @pytest.mark.parametrize("route", _TRASH_ITEM_ROUTE_PARAMS)
+    def test_cross_org_trash_route_keeps_the_other_orgs_item_rows_files_and_audit(
+        self, world: World, client: TestClient, agent: MagicMock, route: Route
+    ) -> None:
+        """B's item and the rest of B's trash (rows, messages, files on disk, audit rows)
+        are exactly as before; B's marker (title, file name, bytes) never appears in the
+        404; no run."""
+        case = _PATH_ID_CASES[route]
+        foreign = case.seed_foreign(world, client)
+        before = _org_trash_state(world, world.org_b)
+
+        response = case.send(client, world.a["editor"], foreign)
+
+        assert (response.status_code, response.json()) == (404, case.not_found)
+        assert _org_trash_state(world, world.org_b) == before
+        assert len(before["files"]) == 2
+        assert _B_MARKER not in response.text
+        agent.run.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -2302,7 +2490,59 @@ class TestOwnUserChatRoutes:
 # 3b. Platform user routes (GH-167): the org in the path scopes the user
 # ---------------------------------------------------------------------------
 
+
 # The Super Admin's user actions, each with its success status on the user's own org.
+class TestOwnUserTrashRoutes:
+    """GH-194: the caller's own trash only (``own_user``): the list and emptying it."""
+
+    @covers(("GET", "/api/trash"))
+    def test_cross_org_trash_list_shows_only_the_callers_own_items(
+        self, world: World, client: TestClient
+    ) -> None:
+        """Org A's and org B's Editors each have a trashed chat and a file trashed on its
+        own: A's Editor lists exactly its own two items, never B's ids or marker; B's
+        Editor lists its own two (control)."""
+        own = {
+            str(_marked_trashed_chat(world, world.a["editor"], _A_MARKER)),
+            str(_marked_trashed_attachment(world, world.a["editor"], _A_MARKER)),
+        }
+        foreign = {
+            str(_marked_trashed_chat(world, world.b["editor"], _B_MARKER)),
+            str(_marked_trashed_attachment(world, world.b["editor"], _B_MARKER)),
+        }
+
+        response = client.get("/api/trash", headers=world.a["editor"].cookie)
+        b_view = client.get("/api/trash", headers=world.b["editor"].cookie)
+
+        assert response.status_code == 200, response.text
+        assert {item["id"] for item in response.json()["items"]} == own
+        assert [mark for mark in (*foreign, _B_MARKER) if mark in response.text] == []
+        assert b_view.status_code == 200, b_view.text
+        assert {item["id"] for item in b_view.json()["items"]} == foreign
+
+    @covers(("DELETE", "/api/trash"))
+    def test_cross_org_trash_empty_purges_only_the_callers_own_items(
+        self, world: World, client: TestClient
+    ) -> None:
+        """A's Editor empties its trash: 200 ``{"chats": 1, "attachments": 1}``; org B's
+        trashed rows, files on disk and audit rows stay as they were, and B's Editor
+        still lists its two items."""
+        _marked_trashed_chat(world, world.a["editor"], _A_MARKER)
+        _marked_trashed_attachment(world, world.a["editor"], _A_MARKER)
+        foreign = {
+            str(_marked_trashed_chat(world, world.b["editor"], _B_MARKER)),
+            str(_marked_trashed_attachment(world, world.b["editor"], _B_MARKER)),
+        }
+        before = _org_trash_state(world, world.org_b)
+
+        response = client.delete("/api/trash", headers=world.a["editor"].cookie)
+
+        assert (response.status_code, response.json()) == (200, {"chats": 1, "attachments": 1})
+        assert _org_trash_state(world, world.org_b) == before
+        b_view = client.get("/api/trash", headers=world.b["editor"].cookie)
+        assert {item["id"] for item in b_view.json()["items"]} == foreign
+
+
 _PLATFORM_USER_ACTIONS: Final[dict[str, int]] = {
     "deactivate": 200,
     "reactivate": 200,
@@ -2556,8 +2796,10 @@ _CASE_CLASSES: Final = (
     TestChatPathRoutes,
     TestChatRetryPathRoute,
     TestAttachmentPathRoutes,
+    TestTrashPathRoutes,
     TestOwnOrgRoutes,
     TestOwnUserAccountRoutes,
     TestOwnUserOAuthRoutes,
     TestOwnUserChatRoutes,
+    TestOwnUserTrashRoutes,
 )

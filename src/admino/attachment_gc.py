@@ -17,10 +17,10 @@ own transaction, and its files are removed after the commit (a rolled-back
 deletion never loses files). Then each org directory is swept: an old
 ``.part`` always goes (no upload runs for a day); an old ``<id>`` or
 ``<id>.d`` goes unless G3 finds the org's row (trashed rows included: their
-files wait for the trash purge of #194). G3 runs once per chunk of at most
-``SWEEP_CHUNK_SIZE`` candidate ids (GH-281), so a directory full of strays
-never binds one huge array; a failing chunk skips the whole directory for
-that run (nothing in it is removed).
+files wait for the trash purge, ``admino.trash``). G3 runs once per chunk
+of at most ``SWEEP_CHUNK_SIZE`` candidate ids (GH-281), so a directory full
+of strays never binds one huge array; a failing chunk skips the whole
+directory for that run (nothing in it is removed).
 
 Security notes:
 - Never follows a symlink: org directories that are symlinks are skipped,

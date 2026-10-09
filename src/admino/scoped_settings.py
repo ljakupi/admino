@@ -27,7 +27,9 @@ owner, and this module is the service behind their routes and the startup:
   run, without a capability check (an internal read: every member's run
   needs it); it returns the stored switches, residency not applied.
   ``org_residency`` (GH-162) reads the org's ``data_residency`` policy the
-  same way, and ``load_prompt_context`` (GH-170) a chat run's prompt
+  same way, ``trash_retention_days`` (GH-194) the org's effective trash
+  retention (clamped like the settings page shows it) for the trash and its
+  purge job, and ``load_prompt_context`` (GH-170) a chat run's prompt
   inputs: the org's instructions and default response language and the
   user's response language, timezone and personal instructions, in one
   read of a live user of the tenant's org. Their pure row conversions
@@ -70,17 +72,19 @@ Inputs: the database pool (or a connection, for the platform reads); the
 acting ``Principal`` (from the session), the validated patch models
 (``UserSettingsPatch``, ``OrgSettingsPatch``, ``PlatformSettingsPatch``) and
 the client IP; the ``AppConfig`` (startup); an account kind and, for a
-member, their org id; a chat run's ``TenantContext``.
+member, their org id; a chat run's ``TenantContext``; an org id (the trash
+retention).
 Outputs: ``UserSettingsResponse``, ``OrgSettingsResponse``,
-``StoredPlatformSettings``, an org's switches (tool name -> bool) and its
-residency flag, a run's ``PromptContext``, the
-overlaid ``AppConfig`` and a ``SessionPolicy``. Errors: ``PermissionError``,
-``AuditRecordError``, ``InvalidPlatformSettingsError`` (the merged trash
-minimum exceeds the maximum), ``InvalidOrgSettingsError`` (a changed org trash
-retention outside the platform's trash bounds), ``ResidencyConfirmationError``
-(the confirmed residency-org count changed before the write), ``LookupError``
-(the org settings of an org without an organizations row), ``RuntimeError``
-(no platform row: startup always seeds it first), ``ValueError`` (no session
+``StoredPlatformSettings``, an org's switches (tool name -> bool), its
+residency flag and its effective trash retention, a run's
+``PromptContext``, the overlaid ``AppConfig`` and a ``SessionPolicy``.
+Errors: ``PermissionError``, ``AuditRecordError``,
+``InvalidPlatformSettingsError`` (the merged trash minimum exceeds the
+maximum), ``InvalidOrgSettingsError`` (a changed org trash retention outside
+the platform's trash bounds), ``ResidencyConfirmationError`` (the confirmed
+residency-org count changed before the write), ``LookupError`` (the org
+settings of an org without an organizations row), ``RuntimeError`` (no
+platform row: startup always seeds it first), ``ValueError`` (no session
 policy for the kind, or a member without an org id).
 
 Security notes:
@@ -200,6 +204,8 @@ _ORG_SQL: Final = """
 """
 # GH-162: the org's data residency policy (the Super Admin's switch).
 _ORG_RESIDENCY_SQL: Final = "SELECT data_residency FROM organizations WHERE id = $1"
+# R1 (GH-194): the org's stored trash retention, for the trash and its purge job.
+_TRASH_RETENTION_SQL: Final = "SELECT trash_retention_days FROM org_settings WHERE org_id = $1"
 # GH-242: the number of orgs with data residency on (every status).
 _RESIDENCY_ORGS_SQL: Final = (
     "SELECT count(*) AS residency_orgs FROM organizations WHERE data_residency"
@@ -646,6 +652,11 @@ async def reset_user_settings(pool: asyncpg.Pool, *, actor: Principal) -> UserSe
     )
 
 
+def _effective_trash_days(stored: int, bounds: PlatformRetention) -> int:
+    """The stored org trash retention clamped into the platform's trash bounds."""
+    return min(max(stored, bounds.trash_min_days), bounds.trash_max_days)
+
+
 # Any (here and in the org helpers below): the stored values are asyncpg
 # record values, each of its column's type.
 def _org_response(stored: Mapping[str, Any], bounds: PlatformRetention) -> OrgSettingsResponse:
@@ -654,9 +665,7 @@ def _org_response(stored: Mapping[str, Any], bounds: PlatformRetention) -> OrgSe
     The trash retention shown is the stored value clamped into the platform's
     trash bounds, which come along read-only.
     """
-    retention = min(
-        max(stored["trash_retention_days"], bounds.trash_min_days), bounds.trash_max_days
-    )
+    retention = _effective_trash_days(stored["trash_retention_days"], bounds)
     return OrgSettingsResponse.model_validate(
         {
             "profile": {
@@ -686,8 +695,9 @@ async def get_org_settings(pool: asyncpg.Pool, *, actor: Principal) -> OrgSettin
     The effective trash retention is the stored ``trash_retention_days``
     clamped into the platform's trash bounds (``min(max(stored, min_days),
     max_days)``): a stored value may lie outside bounds the Super Admin
-    narrowed after it was set. Any later consumer of the stored retention
-    (a trash purge job) must apply the same clamp, never the raw column.
+    narrowed after it was set. Any other consumer of the stored retention
+    (the trash and its purge job) reads it through ``trash_retention_days``,
+    which applies the same clamp, never the raw column.
 
     Args:
         pool: The database pool.
@@ -849,6 +859,35 @@ async def update_org_settings(
                 ),
             )
     return _org_response(new, bounds)
+
+
+async def trash_retention_days(executor: sessions.Executor, org_id: UUID) -> int:
+    """Return the org's effective trash retention in days (GH-194).
+
+    The stored ``trash_retention_days`` (30 without an org_settings row, the
+    column default) clamped into the platform's trash bounds exactly as
+    ``get_org_settings`` shows it. No capability check: an internal read for
+    the member's own trash and the system's purge job. Only the org's row is
+    read; nothing is written.
+
+    Args:
+        executor: The pool, or a connection.
+        org_id: The org.
+
+    Returns:
+        The effective retention (0 purges a deleted item at once).
+
+    Raises:
+        RuntimeError: If the platform settings cache is empty and there is no
+            platform row.
+    """
+    row: Record | None = await executor.fetchrow(_TRASH_RETENTION_SQL, org_id)
+    stored: int = (
+        _ORG_SETTINGS_DEFAULTS["trash_retention_days"]
+        if row is None
+        else row["trash_retention_days"]
+    )
+    return _effective_trash_days(stored, (await current_platform_settings(executor)).retention)
 
 
 async def org_residency(executor: sessions.Executor, tenant: TenantContext) -> bool:

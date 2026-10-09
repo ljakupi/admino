@@ -12,7 +12,10 @@ org's storage quota counts the originals and their derived files. GH-190
 again (``set_active``, the ``active`` flag; an excluded file stays linked to
 its message and listed), lists their chat's files (``list_chat_attachments``)
 and the context budget counts the chat's ready, active files
-(``ready_active_attachments``).
+(``ready_active_attachments``). GH-194 (migration 0032): a member moves one
+of their live files to the trash on its own (``trash_attachment``: the file
+is its own trash group, its files stay on disk); listing, restoring and
+purging the trash are ``admino.trash``, which imports this module.
 
 Inputs: the pool or an executor, the caller's ``TenantContext``, a chat id,
 an attachment id, the already sanitized file name, the declared
@@ -67,6 +70,11 @@ Security notes:
   nothing. ``check_sendable`` refuses over every id, excluded ones included,
   and returns the active ones only, so an excluded file never reaches the
   slot.
+- Trash (GH-194): ``trash_attachment`` sets only ``deleted_at`` and
+  ``trash_group_id`` (migration 0032 grants the runtime role UPDATE on the
+  group) of the caller's live file and records ``file.delete`` (the file's
+  id, no metadata) in the same transaction, so a failed audit write rolls it
+  back.
 - The file is named by its id only; the original name lives in the row.
   Directories are created 0700 (a missing root too; an existing root's
   mode is left alone), files 0600; the partial file is created
@@ -92,7 +100,7 @@ Security notes:
   ``remove_files`` and ``remove_derived`` log ids and an exception's class
   name only. No audit event carries a file name.
 - Parameterized SQL only (the contract's forms A1-A4', A5'/A6', A7', A8'',
-  A10a/A10b, A11/A11' and A12), every value a bind parameter (the list
+  A10a/A10b, A11/A11', A12 and A13), every value a bind parameter (the list
   filters bind NULL for "any"). Imports nothing from the server, agent, LLM
   or tools layers.
 """
@@ -212,6 +220,12 @@ _SENDABLE_SQL: Final = """
     WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4
       AND deleted_at IS NULL
     ORDER BY created_at, id
+"""
+# A13 (GH-194): the caller's live attachment goes to the trash as its own group.
+_TRASH_SQL: Final = """
+    UPDATE attachments SET deleted_at = now(), trash_group_id = id
+    WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
+    RETURNING id
 """
 # A10a (GH-190): the caller's live attachment, locked for the flag's compare-and-set ...
 _LOCK_SQL: Final = """
@@ -733,6 +747,42 @@ async def set_active(
             ip=ip,
         )
     return _record({**dict(row), "active": active})
+
+
+async def trash_attachment(
+    pool: asyncpg.Pool, tenant: TenantContext, attachment_id: UUID, *, ip: str | None
+) -> None:
+    """Move the caller's live attachment to the trash and record ``file.delete``.
+
+    One transaction: the file's ``deleted_at`` with the file as its own trash
+    group (A13), then the audit event. Its files stay on disk until it is
+    purged (``admino.trash``).
+
+    Args:
+        pool: The database pool.
+        tenant: The caller's org scope.
+        attachment_id: The attachment.
+        ip: The client IP, for the audit event.
+
+    Raises:
+        AttachmentNotFoundError: Unless the attachment is the caller's (in
+            the caller's org, their own) and not trashed; nothing is written.
+        AuditRecordError: If the event can't be recorded; the trash is rolled
+            back.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        if await conn.fetchval(_TRASH_SQL, attachment_id, tenant.org_id, tenant.user_id) is None:
+            raise AttachmentNotFoundError
+        await audit_events.record(
+            conn,
+            action=AuditAction.FILE_DELETE,
+            actor_kind="member",
+            actor_user_id=tenant.user_id,
+            org_id=tenant.org_id,
+            target_type=TargetType.FILE,
+            target_ids=(attachment_id,),
+            ip=ip,
+        )
 
 
 async def list_chat_attachments(

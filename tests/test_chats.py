@@ -62,7 +62,8 @@ What these tests pin down (contract §2; GH-266 contract §2):
   statement binds it.
 - ``rename_chat``: title + ``'user'``, ``last_activity_at`` unchanged,
   idempotent.
-- ``trash_chat``: ``deleted_at`` set and exactly one ``chat.delete`` audit row
+- ``trash_chat``: ``deleted_at`` set (GH-194, S6': and ``trash_group_id`` = the
+  chat's own id) and exactly one ``chat.delete`` audit row
   (member actor, org, target chat, the IP, no metadata) in the same transaction
   on the same connection; a failed audit write raises ``AuditRecordError`` and
   nothing changes; trashing twice is ``ChatNotFoundError``; a trashed chat is
@@ -1661,6 +1662,20 @@ class TestTrashChat:
         assert row is not None
         assert row["deleted_at"] is not None
         assert started <= row["deleted_at"] <= datetime.now(UTC)
+
+    async def test_chats_trash_makes_the_chat_its_own_trash_group(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """GH-194 (S6', migration 0032): the trashed chat is its own trash group."""
+        alice = _member(db)
+        chat_id = db.add_chat(alice.user_id)
+
+        await chats.trash_chat(db.pool, alice.tenant, chat_id, ip=_IP)
+
+        row = db.chat_row(chat_id)
+        assert row is not None
+        assert row["deleted_at"] is not None
+        assert plain(row["trash_group_id"]) == chat_id
 
     @pytest.mark.parametrize("ip", [_IP, None])
     async def test_chats_trash_records_one_chat_delete_event(

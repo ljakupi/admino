@@ -13,9 +13,11 @@ Super Admin's org metadata counts the org's chats (``count_org_chats``).
 GH-179's background task stores the automatic title (``set_auto_title``).
 GH-187's attachments follow their chat: a turn links the files its user
 message carried (``append_messages``), and the trash takes them along
-(``trash_chat``). GH-189: the turn read (``load_turn``, T2') also returns the
-chat's active attachments (``ActiveAttachment``: sent with one of its
-messages, live, ``ready``, in the order they were sent), and a run whose
+(``trash_chat``; GH-194: as the chat's trash group, which restoring the chat
+brings back; listing, restoring and purging the trash are ``admino.trash``,
+which imports this module). GH-189: the turn read (``load_turn``, T2') also
+returns the chat's active attachments (``ActiveAttachment``: sent with one of
+its messages, live, ``ready``, in the order they were sent), and a run whose
 slot 4 held them stores the slot's ids on each of its assistant messages
 (S8', migration 0029) and sets the chat's sticky ``external_content`` flag.
 GH-190: the turn read (T2'') leaves out excluded files (``attachments.active``
@@ -82,11 +84,13 @@ Behaviour:
   ``append_messages`` touches the chat first (no row: nothing is written),
   then inserts the messages in order, linking the given attachments (A9)
   right after the turn's first ``user`` message, so a later failure unlinks
-  them with the turn; ``trash_chat`` sets ``deleted_at`` on the chat, then
-  on its live attachments (A10; their files stay on disk until #194's
-  purge), and records ``chat.delete`` on the same connection, so a failed
-  audit write rolls the trash back. ``get_or_create_legacy_chat`` uses no
-  transaction of its own: a concurrent first message of the same session
+  them with the turn; ``trash_chat`` sets ``deleted_at`` on the chat with
+  the chat as its own trash group (S6'), then on its live attachments with
+  the chat's id as their group (A10'; a file trashed on its own before keeps
+  its group and stamp, and the files stay on disk until the trash purge of
+  ``admino.trash``), and records ``chat.delete`` on the same connection, so
+  a failed audit write rolls the trash back. ``get_or_create_legacy_chat``
+  uses no transaction of its own: a concurrent first message of the same session
   loses the INSERT on the partial unique key ``chats_legacy_session_key`` and
   selects the winner's chat (whose id differs from the one given). Only that
   key's violation is the race (GH-271): any other unique violation (the given
@@ -110,9 +114,9 @@ Security notes:
   ``ChatNotFoundError`` with a fixed text and change nothing. Only the org
   notice and the platform count are org-wide (org id and live chats only).
 - Attachments are linked only when they are the caller's, in this chat, in
-  the caller's org, unsent and live (A9 states all five), and trashed only
-  with their chat after its owner check (A10 binds the trashed chat and the
-  caller's org). The turn read (T2'') returns only the attachments of the
+  the caller's org, unsent and live (A9 states all five), and trashed here
+  only with their chat after its owner check (A10' binds the trashed chat and
+  the caller's org). The turn read (T2'') returns only the attachments of the
   caller's chat whose org and owner are the chat's, sent with one of its
   messages, live, ``ready`` and active; the detail page's attachment ids are
   those of the page's messages (the checked chat's) in the caller's org.
@@ -129,32 +133,37 @@ Security notes:
   (migration 0025's trigger refuses a reset in the database too).
 - The runtime role may update only ``title``, ``title_source``,
   ``last_activity_at``, ``external_content`` and ``deleted_at`` of a chat
-  (migration 0025), and only ``message_id``, ``updated_at`` and
-  ``deleted_at`` (among others) of an attachment (migration 0027): every
-  UPDATE here stays within them.
+  (migration 0025) plus its ``trash_group_id`` (migration 0032), and only
+  ``message_id``, ``updated_at``, ``deleted_at`` and ``trash_group_id``
+  (among others) of an attachment (migrations 0027, 0032): every UPDATE here
+  stays within them.
 - ``chat_messages`` is append-only for the runtime role (SELECT, INSERT; no
-  UPDATE or DELETE). The one delete is GH-245's ``delete_failed_turn``
-  (migration 0031, until #182's versions), which runs as the owner and checks
-  the chat's org, owner and liveness, the turn's failed status and the turn's
-  shape itself: between its user row and its last row only tool calls, their
-  results (complete or awaiting confirmation) and assistant ``error`` rows. An
-  app bug removes at most the caller's chat's failed last turn. The shape
-  check (security audit M-1) keeps the bound against a compromised runtime
-  role too, which can INSERT a forged ``error`` row and un-trash a chat: a
-  completed answer stays ``complete`` (no UPDATE), so a forged row after it
-  is refused. The documented residual: such a role can still remove a turn
-  whose tail is a still-awaiting confirmation (pending or expired), an
-  already failed last turn, rows it inserted itself, the org notices after
-  the chat's last answer (they are ``user`` rows) and, only if it was
-  already compromised before migration 0031 ran and planted rows then, the
-  completed answers 0031's backfill set to ``error``; it can't remove a
-  completed turn otherwise. Fail-closed: a stopped or approval turn whose
-  tool-call message came without call ids (no tool_use blocks) can't be
-  replaced (the function refuses it; the retry answers 500, a stream
-  ``internal_error``, and leaves the turn). A GH-25 D9 partial (the text a
-  streamed run showed before it timed out) is part of the failed answer: an
-  ``error`` run stores it ``error`` (migration 0031 backfills the older
-  ones). The function unlinks the turn's files first: a file is never
+  UPDATE or DELETE): messages go only with their whole chat (GH-194's delete
+  forever and trash purge in ``admino.trash`` run ``DELETE FROM chats``,
+  migration 0032, whose cascade to the messages runs as the table owner) or
+  with their failed turn. The one delete of a turn is GH-245's
+  ``delete_failed_turn`` (migration 0031, until #182's versions), which runs
+  as the owner and checks the chat's org, owner and liveness, the turn's
+  failed status and the turn's shape itself: between its user row and its
+  last row only tool calls, their results (complete or awaiting
+  confirmation) and assistant ``error`` rows. An app bug removes at most the
+  caller's chat's failed last turn. The shape check (security audit M-1)
+  keeps the bound against a compromised runtime role too, which can INSERT a
+  forged ``error`` row and un-trash a chat: a completed answer stays
+  ``complete`` (no UPDATE), so a forged row after it is refused. The
+  documented residual: such a role can still remove a turn whose tail is a
+  still-awaiting confirmation (pending or expired), an already failed last
+  turn, rows it inserted itself, the org notices after the chat's last
+  answer (they are ``user`` rows) and, only if it was already compromised
+  before migration 0031 ran and planted rows then, the completed answers
+  0031's backfill set to ``error``; it can't remove a completed turn
+  otherwise (only with its whole chat). Fail-closed: a stopped or approval
+  turn whose tool-call message came without call ids (no tool_use blocks)
+  can't be replaced (the function refuses it; the retry answers 500, a
+  stream ``internal_error``, and leaves the turn). A GH-25 D9 partial (the
+  text a streamed run showed before it timed out) is part of the failed
+  answer: an ``error`` run stores it ``error`` (migration 0031 backfills the
+  older ones). The function unlinks the turn's files first: a file is never
   deleted with its message.
 - System prompts and instructions are never stored: a ``system`` message is
   refused before any statement, and so is a message whose content is a list
@@ -268,16 +277,18 @@ _RENAME_SQL: Final = """
     RETURNING id, org_id, owner_user_id, title, title_source, external_content,
         created_at, last_activity_at
 """
-# S6: the trash is a timestamp (restore and purge are #194).
+# S6' (GH-194): the trash is a timestamp and a group; a trashed chat is its own group
+# (restore and purge are admino.trash).
 _TRASH_SQL: Final = """
-    UPDATE chats SET deleted_at = now()
+    UPDATE chats SET deleted_at = now(), trash_group_id = id
     WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
     RETURNING id
 """
-# A10 (GH-187): the trashed chat's live attachments go to the trash with it; their files
-# stay on disk until #194's purge. Bound to the chat S6 just trashed and the caller's org.
+# A10' (GH-187, GH-194): the trashed chat's live attachments go to the trash with it, in
+# the chat's group; their files stay on disk until the trash purge. Bound to the chat S6'
+# just trashed and the caller's org.
 _TRASH_ATTACHMENTS_SQL: Final = """
-    UPDATE attachments SET deleted_at = now()
+    UPDATE attachments SET deleted_at = now(), trash_group_id = $1
     WHERE chat_id = $1 AND org_id = $2 AND deleted_at IS NULL
 """
 # S7: a turn's activity, and GH-243's sticky flag when a tool result held
@@ -954,10 +965,13 @@ async def trash_chat(
 ) -> None:
     """Move the caller's chat and its attachments to the trash and record ``chat.delete``.
 
-    One transaction: the chat's ``deleted_at``, then the same stamp on each of
-    its attachments that isn't trashed yet (GH-187, A10; one trashed earlier
-    keeps its stamp), then the audit event. The attachments' files stay on
-    disk (#194 restores and purges).
+    One transaction: the chat's ``deleted_at`` with the chat as its own trash
+    group (S6'), then the same stamp on each of its attachments that isn't
+    trashed yet, in the chat's group (GH-187, GH-194, A10'; one trashed
+    earlier keeps its stamp and group), then the audit event. The
+    attachments' files stay on disk: restoring the chat brings back exactly
+    its group, and the purge removes the chat with every file
+    (``admino.trash``).
 
     Args:
         pool: The database pool.

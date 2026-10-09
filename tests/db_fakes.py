@@ -177,15 +177,17 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   whose type the SQL implies (a cast, ``col <op> $n``, a row comparison, an
   INSERT position, ``LIMIT $n``) through its encoder; every str argument's
   U+0000 (used or not); and migration 0024's grants: admino_app may not
-  DELETE chats nor UPDATE or DELETE chat_messages (InsufficientPrivilegeError;
-  the cascades still run). JSONB values travel as JSON text (``$n::jsonb``,
-  no codec, like ``oauth_tokens.scopes``): parsed on write, stored and
+  DELETE chats (GH-194: until a shipped migration, 0032, grants it) nor UPDATE
+  or DELETE chat_messages (InsufficientPrivilegeError; the cascades still run).
+  JSONB values travel as JSON text (``$n::jsonb``, no codec, like
+  ``oauth_tokens.scopes``): parsed on write, stored and
   returned as a JSON str, re-serialized with JSONB's key order (shorter keys
   first), so it may differ from the text sent; a list or dict bound directly
   is a DataError.
 - Migration 0025 (GH-266): an UPDATE of chats may SET only title,
   title_source, last_activity_at, external_content and deleted_at
-  (``CHAT_UPDATE_COLUMNS``); naming id, org_id, owner_user_id, created_at or
+  (``CHAT_UPDATE_COLUMNS``; GH-194: the shipped GRANTs decide, 0032 adds
+  trash_group_id); naming id, org_id, owner_user_id, created_at or
   legacy_session_id is InsufficientPrivilegeError "permission denied for table
   chats", raised before the statement runs (nothing changes), in a ``col =``
   piece and (GH-271) in a row-constructor piece ``(a, b) = (...)`` (a row,
@@ -343,7 +345,7 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   UPDATE may SET only the shipped column grant (``ATTACHMENT_UPDATE_COLUMNS``,
   GH-190: read from the migrations' GRANTs; through 0029: message_id, status,
   failure_reason, page_count, token_estimate and derived_bytes (0028),
-  updated_at, deleted_at; 0030 adds active).
+  updated_at, deleted_at; 0030 adds active, GH-194's 0032 trash_group_id).
   Naming id, org_id, chat_id, owner_user_id, filename, kind, size_bytes or
   created_at (also in a row-constructor piece) is InsufficientPrivilegeError
   "permission denied for table attachments", raised before the statement runs
@@ -478,6 +480,58 @@ C6, C7, C10):
 - Helpers: ``add_attachment(..., active=True)`` (``active=False`` seeds an
   excluded file once 0030 ships); ``attachment_row(id)["active"]`` and
   ``attachments_of(chat_id)`` read the flag back (no key before 0030).
+
+The trash: restore, delete forever and the retention purge (GH-194, migration
+0032; contract §1, §2, §5):
+- Gated on the shipped migrations like 0030 (``ShippedSchema.trash_group_tables``,
+  ``trash_group_checks``, ``chat_update_columns``, ``delete_tables``; the
+  defaults are 0030's schema). Until a shipped migration adds them there is no
+  ``trash_group_id`` key in any row: a statement on chats or attachments that
+  names the column is UndefinedColumnError when it is parsed (before its
+  arguments are encoded, whatever rows exist), ``add_chat`` /
+  ``add_attachment(trash_group_id=...)`` refuse it the same way, admino_app
+  may not DELETE chats (InsufficientPrivilegeError) and chat.purge /
+  file.purge are refused by ``audit_events_action_check``. The gate reads the
+  statements, never a version number: GH-245's ``0031_chat_retry.sql`` adds
+  none of them, so it leaves the trash schema off. Once a shipped migration
+  (``0032_trash.sql``) runs the contract's statements:
+  - ``chats.trash_group_id`` and ``attachments.trash_group_id`` (UUID, NULL;
+    ALTER TABLE ... ADD COLUMN, so each is its table's last column, after
+    attachments.active, and last in the "Failing row contains" detail): the
+    id of the item whose deletion moved the row to the trash.
+  - ``chats_trash_group_check`` / ``attachments_trash_group_check``
+    (``TRASH_GROUP_CHECKS``): ``(deleted_at IS NULL) = (trash_group_id IS
+    NULL)`` on every INSERT and UPDATE (seeds included), CheckViolationError
+    with the ``constraint_name`` and the row's detail; the name sorts last, so
+    it runs after every other CHECK of the table.
+  - Grants (read from the GRANT / REVOKE statements, table-level and
+    column-level, a table-level REVOKE taking the column grants with it):
+    DELETE on chats, UPDATE (trash_group_id) on chats and attachments.
+    ``DELETE FROM chats`` cascades to the chat's chat_messages and every
+    attachments row of the chat (any state), never another chat's rows.
+  - The catalog: 0030's plus chat.purge and file.purge.
+- The SQL forms of contract §5 run on the reader as postgres:16 answered them
+  (verified as admino_app for GH-194): R1, S6' and A10' (the chat its own group,
+  its live files the chat's group; ``trash_group_id = id`` in SET reads the
+  row's own id), A13, T1c / T1c' / T1a / T1a' (``deleted_at > $3``, the column
+  comparison ``trash_group_id = id``, the keyset row comparison ``(deleted_at,
+  id) < ($4, $5)``, ``ORDER BY deleted_at DESC, id DESC``, LIMIT), T2 (RETURNING
+  the chat record; a restored legacy chat whose ``(owner_user_id,
+  legacy_session_id)`` already has a live chat is UniqueViolationError on
+  ``CHAT_LEGACY_SESSION_KEY``, nothing changed), T3, T4, T6, T7 and J3 (``FOR
+  UPDATE``, recorded, no effect), T8, T9, T10, E1, E2, J1, J2, J4 and J5. Every
+  timestamp parameter compared with deleted_at goes through the timestamptz
+  encoder (an aware datetime, DataError otherwise); a comparison with a NULL
+  deleted_at is not true. One new reader feature for J1: ``SELECT ... UNION
+  [ALL] SELECT ... [ORDER BY <output column>, ...] [LIMIT $n]`` (left-associative;
+  UNION removes duplicate rows, NULLs equal; the first SELECT names the
+  columns; a different column count is PostgresSyntaxError; without ORDER BY
+  the rows come back reversed).
+- Helpers: ``add_chat(..., deleted_at=X)`` gives the chat ``trash_group_id`` =
+  its id; ``add_attachment(..., deleted_at=X)`` its chat's id when that chat is
+  trashed, else its own id (0032's backfill); a live row gets NULL; both take
+  an explicit ``trash_group_id=`` (None included) checked like an INSERT.
+  ``chat_row`` / ``attachment_row`` / ``attachments_of`` read the column back.
 
 Retrying a failed answer (GH-245, migration 0031; contract C1, C2, C5):
 - The SQL forms run on the reader as PostgreSQL answers them, with no new
@@ -1160,7 +1214,8 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
     },
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
-    "chats": frozenset({"legacy_session_id", "deleted_at"}),
+    # GH-194: trash_group_id (migration 0032) is nullable; it exists once 0032 ships.
+    "chats": frozenset({"legacy_session_id", "deleted_at", "trash_group_id"}),
     "chat_messages": frozenset(
         {"tool_use_blocks", "tool_call_id", "tool_calls", "included_attachment_ids"}
     ),
@@ -1172,6 +1227,7 @@ _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
             "deleted_at",
             "token_estimate",
             "derived_bytes",
+            "trash_group_id",
         }
     ),
 }
@@ -1222,14 +1278,21 @@ ATTACHMENT_CHAT_FKEY: Final = "attachments_chat_fkey"
 # order: ALTER TABLE ... ADD COLUMN appends it after derived_bytes), and the name of
 # the action catalog CHECK 0030 replaces.
 ATTACHMENT_ACTIVE_COLUMN: Final = "active"
-_ATTACHMENT_TYPES_0030: Final[dict[str, str]] = {
-    **_CHAT_TYPES["attachments"],
-    ATTACHMENT_ACTIVE_COLUMN: "bool",
-}
-_ATTACHMENT_COLUMNS_0030: Final = frozenset(_ATTACHMENT_TYPES_0030)
 AUDIT_ACTION_CHECK: Final = "audit_events_action_check"
-# The UPDATE statements a column grant applies to (normalized SQL): chats (migration
-# 0025's CHAT_UPDATE_COLUMNS) and attachments (the shipped GRANTs, ``_update_grant``).
+# GH-194 (migration 0032): the trash group column chats and attachments gain (ALTER
+# TABLE ... ADD COLUMN appends it last), the CHECK that ties it to deleted_at on each
+# table, and the partial unique index a restored chat's legacy session id can hit.
+TRASH_GROUP_COLUMN: Final = "trash_group_id"
+TRASH_GROUP_CHECKS: Final[dict[str, str]] = {
+    "chats": "chats_trash_group_check",
+    "attachments": "attachments_trash_group_check",
+}
+CHAT_LEGACY_SESSION_KEY: Final = "chats_legacy_session_key"
+# The chat-family tables admino_app may DELETE from before 0032 (0027's attachments;
+# 0024 grants no DELETE on chats or chat_messages).
+_DELETE_TABLES_0030: Final = frozenset({"attachments"})
+# The UPDATE statements a column grant applies to (normalized SQL): chats and
+# attachments (the shipped GRANTs, ``_update_grant``).
 _GRANTED_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?(chats|attachments)\b")
 # The BIGINT columns the fake models: sum() of one is NUMERIC (a Decimal from asyncpg).
 _BIGINT_COLUMNS: Final = frozenset({"size_bytes", "derived_bytes", "seq", "storage_quota_bytes"})
@@ -1387,19 +1450,44 @@ _SQL_COMMENT_RE: Final = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 # ---------------------------------------------------------------------------
 # GH-190: the schema the shipped migrations leave in place, for what migration
 # 0030 changes (attachments.active and its UPDATE grant, the max_context_messages
-# CHECK, the audit action catalog). Read from the migrations next to the imported
-# ``admino.database``, comments removed, whitespace collapsed, lowercased.
+# CHECK, the audit action catalog). GH-194: and for what migration 0032 changes
+# (trash_group_id on chats and attachments, their CHECKs, admino_app's DELETE on
+# chats and UPDATE of the new columns, the catalog). Read from the migrations next
+# to the imported ``admino.database``, comments removed, whitespace collapsed,
+# lowercased.
 # ---------------------------------------------------------------------------
 
 _ADD_ACTIVE_RE: Final = re.compile(
     r'(?<![\w.])alter table (?:if exists )?(?:only )?(?:"?public"?\.)?"?attachments"?'
     r' add (?:column )?(?:if not exists )?"?active"?(?![\w"])'
 )
-_ATTACHMENT_PRIVILEGE_RE: Final = re.compile(
-    r"(?<![\w.])(?P<verb>grant|revoke) (?P<privileges>[^;]*?) on (?:table )?"
-    r'(?:"?public"?\.)?"?attachments"? (?:to|from) (?P<grantees>[^;]*)'
+# GH-194: ``ALTER TABLE chats|attachments ADD [COLUMN] trash_group_id ...`` (one statement).
+_ADD_TRASH_GROUP_RE: Final = re.compile(
+    r'alter table (?:if exists )?(?:only )?(?:"?public"?\.)?"?(chats|attachments)"?'
+    rf' add (?:column )?(?:if not exists )?"?{TRASH_GROUP_COLUMN}"?(?![\w"]).*'
 )
-_UPDATE_PRIVILEGE_RE: Final = re.compile(r"(?<![\w.])update ?\(([^()]*)\)")
+# GH-194: a trash group CHECK added (either side order) or a constraint dropped.
+_ADD_TRASH_GROUP_CHECK_RE: Final = re.compile(
+    r'alter table (?:only )?(?:"?public"?\.)?"?(?P<table>chats|attachments)"? add constraint'
+    r' "?(?P<name>(?P=table)_trash_group_check)"? check ?\( ?'
+    r"(?:\( ?deleted_at is null ?\) ?= ?\( ?trash_group_id is null ?\)"
+    r"|\( ?trash_group_id is null ?\) ?= ?\( ?deleted_at is null ?\)) ?\)"
+)
+_DROP_CONSTRAINT_RE: Final = re.compile(
+    r'alter table .*? drop constraint (?:if exists )?"?(?P<name>\w+)"?(?: cascade| restrict)?'
+)
+# GH-194: one GRANT or REVOKE statement on tables (privileges, table list, grantees).
+_PRIVILEGE_STATEMENT_RE: Final = re.compile(
+    r"(?P<verb>grant|revoke) (?:grant option for )?(?P<privileges>.+?) on (?:table )?"
+    r'(?P<tables>(?:"?public"?\.)?"?\w+"?(?: ?, ?(?:"?public"?\.)?"?\w+"?)*)'
+    r" (?:to|from) (?P<grantees>.+)"
+)
+# A comma between two privileges (not one inside a column list).
+_PRIVILEGE_SPLIT_RE: Final = re.compile(r",(?![^()]*\))")
+_PRIVILEGE_ITEM_RE: Final = re.compile(r"(\w+)(?: privileges)?(?: ?\(([^()]*)\))?")
+_ALL_TABLE_PRIVILEGES: Final = frozenset(
+    {"select", "insert", "update", "delete", "truncate", "references", "trigger"}
+)
 _CONTEXT_MESSAGES_BETWEEN_RE: Final = re.compile(
     r"check ?\( ?\(?max_context_messages between (\d+) and (\d+)\)? ?\)"
 )
@@ -1410,7 +1498,8 @@ _ACTION_CATALOG_RE: Final = re.compile(
 
 @dataclass(frozen=True)
 class ShippedSchema:
-    """What a migrations directory leaves in place for the parts 0030 changes (GH-190).
+    """What a migrations directory leaves in place for the parts 0030 (GH-190) and
+    0032 (GH-194) change.
 
     ``attachments_active``: a migration adds ``attachments.active`` (``ALTER
     TABLE attachments ADD COLUMN active ...``; the fake then models it as
@@ -1422,22 +1511,93 @@ class ShippedSchema:
     re-added one, e.g. 0030's ``platform_settings_max_context_messages_check``).
     ``audit_actions``: the IN list of the last ``AUDIT_ACTION_CHECK`` a
     migration adds (0005's inline one, then each replacement).
+
+    GH-194 (the defaults are what 0001 to 0031 leave in place):
+    ``trash_group_tables``: the tables a migration gives ``trash_group_id``
+    (``ALTER TABLE chats|attachments ADD COLUMN trash_group_id ...``; the fake
+    models it as a nullable UUID, the table's last column).
+    ``trash_group_checks``: the ``TRASH_GROUP_CHECKS`` a migration adds (``CHECK
+    ((deleted_at IS NULL) = (trash_group_id IS NULL))``) and no later one drops.
+    ``chat_update_columns``: the columns admino_app may UPDATE on chats (0024's
+    table-wide UPDATE, 0025's REVOKE and column grant, then every later GRANT /
+    REVOKE). ``delete_tables``: the chat-family tables admino_app may DELETE from
+    (table-level ``GRANT DELETE ON ...``, minus the REVOKEs).
     """
 
     attachments_active: bool
     attachment_update_columns: frozenset[str]
     max_context_messages_bounds: tuple[int, int]
     audit_actions: frozenset[str]
+    trash_group_tables: frozenset[str] = frozenset()
+    trash_group_checks: frozenset[str] = frozenset()
+    chat_update_columns: frozenset[str] = CHAT_UPDATE_COLUMNS
+    delete_tables: frozenset[str] = _DELETE_TABLES_0030
+
+
+@dataclass
+class _Privileges:
+    """admino_app's privileges on the chat-family tables while the migrations are read.
+
+    ``tables``: table-level privileges per table; ``columns``: column-level ones
+    (privilege -> columns) per table. As in PostgreSQL, revoking a table-level
+    privilege also revokes that privilege on every column.
+    """
+
+    tables: dict[str, set[str]]
+    columns: dict[str, dict[str, set[str]]]
+
+    def apply(self, statement: str) -> None:
+        """Apply one GRANT / REVOKE statement (anything else is ignored)."""
+        match = _PRIVILEGE_STATEMENT_RE.fullmatch(statement)
+        if match is None or "admino_app" not in re.findall(r"\w+", match.group("grantees")):
+            return
+        grant = match.group("verb") == "grant"
+        tables = [
+            name.strip().replace('"', "").removeprefix("public.")
+            for name in match.group("tables").split(",")
+        ]
+        for item in _PRIVILEGE_SPLIT_RE.split(match.group("privileges")):
+            parsed = _PRIVILEGE_ITEM_RE.fullmatch(item.strip())
+            assert parsed is not None, f"the fake can't read the privilege {item!r}"
+            privilege, listed = parsed.groups()
+            names = _ALL_TABLE_PRIVILEGES if privilege == "all" else frozenset({privilege})
+            for table in tables:
+                if table not in _CHAT_TABLES:
+                    continue
+                for name in names:
+                    if listed is not None:
+                        columns = {column.strip().strip('"') for column in listed.split(",")}
+                        held = self.columns[table].setdefault(name, set())
+                        if grant:
+                            held |= columns
+                        else:
+                            held -= columns
+                    elif grant:
+                        self.tables[table].add(name)
+                    else:
+                        self.tables[table].discard(name)
+                        self.columns[table].pop(name, None)
+
+    def update_columns(self, table: str, columns: Iterable[str]) -> frozenset[str]:
+        """The columns admino_app may UPDATE (``columns``: every column of the table)."""
+        if "update" in self.tables[table]:
+            return frozenset(columns)
+        return frozenset(self.columns[table].get("update", set()))
 
 
 def read_shipped_schema(directory: Path) -> ShippedSchema:
     """The ``ShippedSchema`` of the migrations in ``directory`` (``NNNN_*.sql``, in name order).
 
-    Tests point it at a tmp copy of the migrations (with or without a 0030
-    file) and monkeypatch ``shipped_schema`` to return the result.
+    Tests point it at a tmp copy of the migrations (with or without a 0030 or a
+    0032 file) and monkeypatch ``shipped_schema`` to return the result.
     """
     active = False
-    update_columns: set[str] = set()
+    trash_tables: set[str] = set()
+    trash_checks: set[str] = set()
+    privileges = _Privileges(
+        tables={table: set() for table in _CHAT_TABLES},
+        columns={table: {} for table in _CHAT_TABLES},
+    )
     bounds: tuple[int, int] | None = None
     actions: frozenset[str] | None = None
     for path in sorted(directory.glob("*.sql")):
@@ -1446,18 +1606,14 @@ def read_shipped_schema(directory: Path) -> ShippedSchema:
         sql = _SQL_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8"))
         text = re.sub(r"\s+", " ", sql).lower()
         active = active or _ADD_ACTIVE_RE.search(text) is not None
-        for match in _ATTACHMENT_PRIVILEGE_RE.finditer(text):
-            if "admino_app" not in re.findall(r"\w+", match.group("grantees")):
-                continue
-            columns = {
-                column.strip().strip('"')
-                for listed in _UPDATE_PRIVILEGE_RE.findall(match.group("privileges"))
-                for column in listed.split(",")
-            }
-            if match.group("verb") == "grant":
-                update_columns |= columns
-            else:
-                update_columns -= columns
+        for statement in (piece.strip() for piece in text.split(";")):
+            if added := _ADD_TRASH_GROUP_RE.fullmatch(statement):
+                trash_tables.add(added.group(1))
+            elif check := _ADD_TRASH_GROUP_CHECK_RE.fullmatch(statement):
+                trash_checks.add(check.group("name"))
+            elif dropped := _DROP_CONSTRAINT_RE.fullmatch(statement):
+                trash_checks.discard(dropped.group("name"))
+            privileges.apply(statement)
         for match in _CONTEXT_MESSAGES_BETWEEN_RE.finditer(text):
             bounds = (int(match.group(1)), int(match.group(2)))
         for match in _ACTION_CATALOG_RE.finditer(text):
@@ -1466,9 +1622,19 @@ def read_shipped_schema(directory: Path) -> ShippedSchema:
     assert actions is not None, f"no {AUDIT_ACTION_CHECK} in {directory}"
     return ShippedSchema(
         attachments_active=active,
-        attachment_update_columns=frozenset(update_columns),
+        attachment_update_columns=privileges.update_columns(
+            "attachments", _chat_types_of("attachments", active, "attachments" in trash_tables)
+        ),
         max_context_messages_bounds=bounds,
         audit_actions=actions,
+        trash_group_tables=frozenset(trash_tables),
+        trash_group_checks=frozenset(trash_checks),
+        chat_update_columns=privileges.update_columns(
+            "chats", _chat_types_of("chats", False, "chats" in trash_tables)
+        ),
+        delete_tables=frozenset(
+            table for table in _CHAT_TABLES if "delete" in privileges.tables[table]
+        ),
     )
 
 
@@ -1481,18 +1647,50 @@ def _shipped_schema_of_the_tree() -> ShippedSchema:
 
 
 def shipped_schema() -> ShippedSchema:
-    """The schema the fake models for what migration 0030 changes (GH-190).
+    """The schema the fake models for what migrations 0030 (GH-190) and 0032 (GH-194) change.
 
     The shipped migrations decide: until one adds ``attachments.active`` the
     column doesn't exist (any statement naming it is UndefinedColumnError,
     ``add_attachment(active=False)`` too), until one re-adds the
     max_context_messages CHECK with ``BETWEEN 0 AND 200`` a 0 is refused, and
     until one adds file.exclude / file.include to the action catalog those
-    actions are refused. Every reader site calls this function at run time, so
-    a test switches the schema with ``monkeypatch.setattr(db_fakes,
-    "shipped_schema", lambda: schema)``.
+    actions are refused. GH-194: until one adds ``trash_group_id`` to chats and
+    attachments the column doesn't exist (a statement naming it is
+    UndefinedColumnError, ``add_chat`` / ``add_attachment(trash_group_id=...)``
+    too), its CHECKs aren't there, admino_app may not DELETE chats nor UPDATE the
+    column, and chat.purge / file.purge are refused. Every reader site calls
+    this function at run time, so a test switches the schema with
+    ``monkeypatch.setattr(db_fakes, "shipped_schema", lambda: schema)``.
     """
     return _shipped_schema_of_the_tree()
+
+
+@functools.cache
+def _chat_types_of(table: str, active: bool, trash_group: bool) -> dict[str, str]:
+    """A chat-family table's column types in column order: the base columns, then the
+    columns later migrations append (0030's ``active``, then 0032's ``trash_group_id``)."""
+    types = dict(_CHAT_TYPES[table])
+    if active:
+        types[ATTACHMENT_ACTIVE_COLUMN] = "bool"
+    if trash_group:
+        types[TRASH_GROUP_COLUMN] = "uuid"
+    return types
+
+
+@functools.cache
+def _chat_columns_of(table: str, active: bool, trash_group: bool) -> frozenset[str]:
+    """The column names of ``_chat_types_of`` (cached: the reader asks for every column)."""
+    return frozenset(_chat_types_of(table, active, trash_group))
+
+
+def _chat_schema_key(table: str) -> tuple[str, bool, bool]:
+    """The shipped schema's shape of a chat-family table (for ``_chat_types_of``)."""
+    schema = shipped_schema()
+    return (
+        table,
+        table == "attachments" and schema.attachments_active,
+        table in schema.trash_group_tables,
+    )
 
 
 # The attachments columns admino_app may UPDATE after every shipped migration (the
@@ -1504,24 +1702,24 @@ def _chat_types(table: str) -> dict[str, str]:
     """A chat-family table's column types in column order, as the shipped schema has them.
 
     GH-190: attachments gains ``active`` (bool, after derived_bytes) once a
-    shipped migration adds it.
+    shipped migration adds it. GH-194: chats and attachments gain
+    ``trash_group_id`` (uuid, last) once a shipped migration adds it.
     """
-    if table == "attachments" and shipped_schema().attachments_active:
-        return _ATTACHMENT_TYPES_0030
-    return _CHAT_TYPES[table]
+    return _chat_types_of(*_chat_schema_key(table))
 
 
 def _table_columns(table: str) -> frozenset[str]:
     """The columns of a table the reader models, as the shipped schema has them (GH-190)."""
-    if table == "attachments" and shipped_schema().attachments_active:
-        return _ATTACHMENT_COLUMNS_0030
+    if table in _CHAT_TABLES:
+        return _chat_columns_of(*_chat_schema_key(table))
     return _COLUMNS[table]
 
 
 def _update_grant(table: str) -> frozenset[str]:
-    """The columns admino_app may SET in an UPDATE of chats (0025) or attachments (GRANTs)."""
+    """The columns admino_app may SET in an UPDATE of chats or attachments (the shipped
+    GRANTs; GH-194: chats' too, 0025's ``CHAT_UPDATE_COLUMNS`` until 0032 ships)."""
     if table == "chats":
-        return CHAT_UPDATE_COLUMNS
+        return shipped_schema().chat_update_columns
     return shipped_schema().attachment_update_columns
 
 
@@ -1831,6 +2029,18 @@ def _bound(args: tuple[Any, ...], pattern: str, text: str) -> Any:
     """The bind argument of the first ``<column> = $n`` the pattern finds (None if absent)."""
     match = re.search(pattern, text)
     return None if match is None else args[int(match.group(1)) - 1]
+
+
+# GH-194: the default of ``add_chat`` / ``add_attachment``'s ``trash_group_id`` (derived
+# from ``deleted_at`` as 0032's backfill does; an explicit None is a value).
+_DERIVED: Final = object()
+
+
+def _refuse_trash_group_seed(table: str, value: Any) -> None:
+    """GH-194: before 0032 ships, seeding ``trash_group_id`` is UndefinedColumnError."""
+    if value is not _DERIVED:
+        msg = f'column "{TRASH_GROUP_COLUMN}" of relation "{table}" does not exist'
+        raise _pg_error(asyncpg.exceptions.UndefinedColumnError, msg, table=table)
 
 
 @dataclass(frozen=True)
@@ -2378,6 +2588,7 @@ class FakeDb:
         created_at: datetime | None = None,
         last_activity_at: datetime | None = None,
         deleted_at: datetime | None = None,
+        trash_group_id: Any = _DERIVED,
     ) -> uuid.UUID:
         """Store a chats row (GH-176) as migrations 0024 to 0026 allow it; return its id.
 
@@ -2388,6 +2599,14 @@ class FakeDb:
         ``created_at``. Every value is checked like an INSERT (DataError,
         CharacterNotInRepertoireError, NotNull, the CHECKs, the partial unique
         legacy session key, the foreign keys). Returns a plain uuid.UUID.
+
+        GH-194: once a shipped migration adds ``trash_group_id`` (0032), a
+        trashed chat (``deleted_at`` set) is its own trash group by default
+        (``trash_group_id`` = its id, what 0032's backfill gives an existing
+        trashed chat) and a live one has none; an explicit ``trash_group_id=``
+        is stored as given (checked like an INSERT, the trash group CHECK
+        included). Before that, any ``trash_group_id=`` is UndefinedColumnError,
+        as an INSERT naming the column would be.
         """
         if org_id is None:
             owner = (
@@ -2417,6 +2636,14 @@ class FakeDb:
             "last_activity_at": last_activity_at if last_activity_at is not None else created,
             "deleted_at": deleted_at,
         }
+        if "chats" not in shipped_schema().trash_group_tables:
+            _refuse_trash_group_seed("chats", trash_group_id)
+        elif trash_group_id is not _DERIVED:
+            given[TRASH_GROUP_COLUMN] = trash_group_id
+        elif deleted_at is not None:
+            # GH-194: 0032's backfill makes every trashed chat its own trash group.
+            chat_id = chat_id if chat_id is not None else uuid.uuid4()
+            given[TRASH_GROUP_COLUMN] = chat_id
         if chat_id is not None:
             given["id"] = chat_id
         row = self.build_chat_row("chats", given, now)
@@ -2532,6 +2759,7 @@ class FakeDb:
         updated_at: datetime | None = None,
         deleted_at: datetime | None = None,
         active: Any = True,
+        trash_group_id: Any = _DERIVED,
     ) -> uuid.UUID:
         """Store an attachments row (GH-187) as the shipped migrations allow it; return its id.
 
@@ -2548,6 +2776,14 @@ class FakeDb:
         NotNullViolationError); before that the row has no ``active`` key and
         any other value than True is UndefinedColumnError, as an INSERT naming
         the column would be.
+
+        GH-194: once a shipped migration adds ``trash_group_id`` (0032), a
+        trashed file (``deleted_at`` set) defaults to the trash group 0032's
+        backfill gives it: its chat's id when that chat is trashed (the chat's
+        deletion moved it), else its own id (deleted on its own); a live file
+        has none. An explicit ``trash_group_id=`` is stored as given (checked
+        like an INSERT, the trash group CHECK included). Before that, any
+        ``trash_group_id=`` is UndefinedColumnError.
         """
         chat = (
             self.chats.get(uuid.UUID(int=chat_id.int)) if isinstance(chat_id, uuid.UUID) else None
@@ -2583,6 +2819,15 @@ class FakeDb:
         }
         if active is not True or shipped_schema().attachments_active:
             given[ATTACHMENT_ACTIVE_COLUMN] = active
+        if "attachments" not in shipped_schema().trash_group_tables:
+            _refuse_trash_group_seed("attachments", trash_group_id)
+        elif trash_group_id is not _DERIVED:
+            given[TRASH_GROUP_COLUMN] = trash_group_id
+        elif deleted_at is not None:
+            # GH-194: 0032's backfill: the chat's group when the chat is trashed, else
+            # the file's own.
+            trashed_chat = chat["deleted_at"] is not None
+            given[TRASH_GROUP_COLUMN] = chat["id"] if trashed_chat else given["id"]
         row = self.build_chat_row("attachments", given, now)
         self.store_chat_row("attachments", row)
         return uuid.UUID(int=row["id"].int)
@@ -2787,6 +3032,7 @@ class FakeDb:
             # GH-176: every statement naming chats or chat_messages runs on the reader,
             # after the checks asyncpg and PostgreSQL make before it runs.
             _refuse_missing_active(n)
+            _refuse_missing_trash_group(n)
             _check_chat_binds(n, args)
             return self._run_statement(method, n, args)
         if method == "fetch" and _LAST_ADMIN_GUARD_RE.fullmatch(n):
@@ -3346,6 +3592,7 @@ class FakeDb:
                 ("chats_title_check", len(row["title"]) <= CHAT_TITLE_MAX),
                 ("chats_title_source_check", row["title_source"] in CHAT_TITLE_SOURCES),
             ]
+            rules += self._trash_group_rules(table, row)
         elif table == "attachments":
             reason = row["failure_reason"]
             filename = row["filename"]
@@ -3378,6 +3625,7 @@ class FakeDb:
                     token_estimate is None or token_estimate >= 0,
                 ),
             ]
+            rules += self._trash_group_rules(table, row)
         else:
             blocks = row["tool_use_blocks"]
             calls = None if row["tool_calls"] is None else json.loads(row["tool_calls"])
@@ -3445,9 +3693,9 @@ class FakeDb:
             # The driver's DETAIL repeats the key, legacy session id included.
             raise _pg_error(
                 asyncpg.exceptions.UniqueViolationError,
-                'duplicate key value violates unique constraint "chats_legacy_session_key"',
+                f'duplicate key value violates unique constraint "{CHAT_LEGACY_SESSION_KEY}"',
                 table=table,
-                constraint="chats_legacy_session_key",
+                constraint=CHAT_LEGACY_SESSION_KEY,
                 detail=(
                     f"Key (owner_user_id, legacy_session_id)=({row['owner_user_id']},"
                     f" {row['legacy_session_id']}) already exists."
@@ -3518,6 +3766,17 @@ class FakeDb:
                 table="chat_messages",
                 constraint="chat_messages_chat_fkey",
             )
+
+    @staticmethod
+    def _trash_group_rules(table: str, row: dict[str, Any]) -> list[tuple[str, bool]]:
+        """GH-194 (migration 0032): ``<table>_trash_group_check``, ``(deleted_at IS NULL) =
+        (trash_group_id IS NULL)``, once a shipped migration adds it. Its name sorts
+        after every other CHECK of chats and attachments, so it runs last."""
+        constraint = TRASH_GROUP_CHECKS[table]
+        if constraint not in shipped_schema().trash_group_checks:
+            return []
+        valid = (row["deleted_at"] is None) == (row.get(TRASH_GROUP_COLUMN) is None)
+        return [(constraint, valid)]
 
     def drop_chats(self, doomed: set[uuid.UUID]) -> None:
         """Delete chats rows and, ON DELETE CASCADE, their messages and attachments."""
@@ -5242,6 +5501,22 @@ def _refuse_missing_active(n: str) -> None:
         raise _pg_error(asyncpg.exceptions.UndefinedColumnError, msg, table="attachments")
 
 
+def _refuse_missing_trash_group(n: str) -> None:
+    """GH-194: before a shipped migration adds ``trash_group_id`` to chats / attachments, a
+    statement on such a table that names it (outside literals) is UndefinedColumnError.
+
+    Refused when the statement is parsed, like ``_refuse_missing_active``: before
+    any argument is encoded and whatever rows the tables hold.
+    """
+    masked = _masked_literals(n)
+    if not re.search(rf"\b{TRASH_GROUP_COLUMN}\b", masked):
+        return
+    for table in TRASH_GROUP_CHECKS:
+        if re.search(rf"\b{table}\b", masked) and table not in shipped_schema().trash_group_tables:
+            msg = f'column "{TRASH_GROUP_COLUMN}" does not exist'
+            raise _pg_error(asyncpg.exceptions.UndefinedColumnError, msg, table=table)
+
+
 def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     """What asyncpg and PostgreSQL check before a chat-table statement runs.
 
@@ -5249,10 +5524,12 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     ``$n`` numbering (IndeterminateDatatypeError); each typed parameter through
     asyncpg's encoder (DataError); every str argument through the server's text
     input (U+0000: CharacterNotInRepertoireError), used or not; then the
-    grants of migration 0024: admino_app may not DELETE chats and may not
-    UPDATE or DELETE chat_messages (InsufficientPrivilegeError); and those of
-    migration 0025 (GH-266): an UPDATE of chats may SET only the
-    ``CHAT_UPDATE_COLUMNS`` (another existing column: InsufficientPrivilegeError;
+    grants of migration 0024: admino_app may not DELETE chats (GH-194: until a
+    shipped GRANT, 0032's, allows it; ``ShippedSchema.delete_tables``) and may
+    not UPDATE or DELETE chat_messages (InsufficientPrivilegeError); and those of
+    migration 0025 (GH-266): an UPDATE of chats may SET only the shipped
+    column grant (``CHAT_UPDATE_COLUMNS`` until 0032 adds trash_group_id; another
+    existing column: InsufficientPrivilegeError;
     a column chats doesn't have is left to the reader's UndefinedColumnError,
     which PostgreSQL raises first). GH-271: every column of a row-constructor
     piece ``(a, b, ...) = ...`` (a row, ``ROW(...)`` or a sub-select) is
@@ -5283,11 +5560,14 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
             _encode_chat_value("text", f"${index + 1}", arg)
             _refuse_nul(arg)
     denied = re.match(
-        r"(?:delete from (?:only )?(?:public\.)?(chats|chat_messages)"
+        r"(?:delete from (?:only )?(?:public\.)?(chats|chat_messages|attachments)"
         r"|update (?:only )?(?:public\.)?(chat_messages))\b",
         n,
     )
-    if denied is not None:
+    if denied is not None and (
+        denied.group(2) is not None or denied.group(1) not in shipped_schema().delete_tables
+    ):
+        # GH-194: DELETE follows the shipped GRANTs (0027's attachments; 0032 adds chats).
         msg = f"permission denied for table {denied.group(1) or denied.group(2)}"
         raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
     if (granted := _GRANTED_UPDATE_RE.match(n)) is not None:
@@ -5886,6 +6166,8 @@ class _Statement:
         if match := re.fullmatch(r"select exists ?\( *\)(?: as (\w+))?", masked):
             inner = n[masked.index("(") + 1 : masked.rindex(")")].strip()
             return [{match.group(1) or "exists": bool(self.select(inner))}]
+        if re.search(r"(?<![\w.])union(?!\w)", masked):
+            return self.union(n)
         clauses = _clauses(
             n,
             (
@@ -5932,6 +6214,69 @@ class _Statement:
         if "limit" in clauses:
             rows = rows[: self.limit(clauses["limit"])]
         return rows
+
+    def union(self, n: str) -> list[dict[str, Any]]:
+        """``SELECT ... UNION [ALL] SELECT ... [ORDER BY <output column>, ...] [LIMIT $n]``.
+
+        GH-194 (J1). Left-associative, as in PostgreSQL: each UNION removes
+        duplicate rows from everything before it (NULLs equal), UNION ALL keeps
+        them. The columns are named by the first SELECT; every SELECT must have
+        as many (PostgresSyntaxError otherwise). A trailing ORDER BY / LIMIT
+        applies to the whole result and may name output columns only; any other
+        ORDER BY or LIMIT, or a row lock, fails the test. Without ORDER BY the rows
+        come back reversed (PostgreSQL promises no order).
+        """
+        masked = _masked(n)
+        parts: list[str] = []
+        keep_all: list[bool] = []
+        start = 0
+        for match in re.finditer(r" union( all)? ", masked):
+            parts.append(n[start : match.start()].strip())
+            keep_all.append(match.group(1) is not None)
+            start = match.end()
+        last = n[start:].strip()
+        tail = re.search(r"(?<![\w.])(?:order by|limit)(?!\w)", _masked(last))
+        parts.append(last[: tail.start()].strip() if tail is not None else last)
+        trailing = _clauses(last[tail.start() :], ("order by", "limit")) if tail else {}
+        for part in parts:
+            part_masked = _masked(part)
+            assert part.startswith("select "), f"the fake can't read this UNION part: {part}"
+            assert not re.search(
+                r"(?<![\w.])(?:order by|limit|offset|for (?:update|no key update|share|key"
+                r" share))(?!\w)",
+                part_masked,
+            ), f"the fake reads ORDER BY / LIMIT after the last UNION part only: {n}"
+        names = [
+            [name for _, name, _ in _select_items(_clauses(part, ("select", "from"))["select"])]
+            for part in parts
+        ]
+        if len({len(listed) for listed in names}) != 1:
+            msg = "each UNION query must have the same number of columns"
+            raise asyncpg.exceptions.PostgresSyntaxError(msg)
+        rows: list[dict[str, Any]] = []
+        for index, part in enumerate(parts):
+            rows += [dict(zip(names[0], row.values(), strict=True)) for row in self.select(part)]
+            if index > 0 and not keep_all[index - 1]:
+                distinct: dict[tuple[Any, ...], dict[str, Any]] = {}
+                for row in rows:
+                    distinct.setdefault(tuple(_canonical(value) for value in row.values()), row)
+                rows = list(distinct.values())
+        key = f"union:{n}"
+        self.derived[key] = frozenset(names[0])
+        contexts: list[_Context] = [{key: (key, row)} for row in rows]
+        if "order by" in trailing:
+            for piece in _top_split(trailing["order by"], ","):
+                column = re.fullmatch(r"(\w+)(?: (?:asc|desc))?(?: nulls (?:first|last))?", piece)
+                assert column is not None and column.group(1) in names[0], (
+                    f"the fake orders a UNION by its output columns only: {n}"
+                )
+            contexts = self.ordered(contexts, trailing["order by"])
+        else:
+            contexts = contexts[::-1]
+        result = [kept for ctx in contexts if (kept := ctx[key][1]) is not None]
+        if "limit" in trailing:
+            result = result[: self.limit(trailing["limit"])]
+        return result
 
     def limit(self, text: str) -> int | None:
         """A LIMIT value: a bigint (DataError otherwise), never negative; NULL: no limit."""

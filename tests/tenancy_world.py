@@ -73,6 +73,27 @@ owner reaches them: anything but the caller's own live attachment is
 ``CHAT_NOT_FOUND``. ``seed_attachment`` passes ``active=False`` (an excluded
 file, migration 0030) through to ``db.add_attachment`` with the other fields.
 
+GH-194 (the trash): seven member rows gated by ``chat.send`` (Org Admin,
+Editor; a Viewer and the Super Admin get 403). ``GET /api/trash`` (the
+caller's own trash, paged) and ``DELETE /api/trash`` (empty it) are
+``own_user``; ``POST /api/trash/chats/{chat_id}/restore``, ``POST
+/api/trash/attachments/{attachment_id}/restore``, ``DELETE
+/api/trash/chats/{chat_id}`` and ``DELETE /api/trash/attachments/{attachment_id}``
+(restore, delete forever) and ``DELETE /api/attachments/{attachment_id}``
+(move one live file to the trash) are ``path_id``. The trash is the owner's
+own (Decision 1, V1): another org's, a colleague's (an Org Admin's request on
+an Editor's item included) and an unknown item answer ``CHAT_NOT_FOUND`` or
+``ATTACHMENT_NOT_FOUND`` and change nothing. ``DELETE /api/chats/{chat_id}``
+keeps its row (it now goes through the trash service). Helpers:
+``seed_trashed_chat`` (a chat of an account deleted ``TRASHED_AGO`` ago, well
+inside the default 30-day retention, with its messages and the files its
+deletion moved) and ``seed_trashed_attachment`` (a file deleted on its own in
+a live chat, or with its trashed chat), both through ``FakeDb.add_chat`` /
+``add_attachment`` with ``deleted_at`` (the FakeDb gives the trash group of
+migration 0032's backfill once 0032 ships); each trashed file has its
+original and a derived text file ``<id>.d/text.txt`` under the attachments
+root, so ``attachment_files`` sees what a purge would remove.
+
 GH-245 (retry a failed answer): ``POST /api/chats/{chat_id}/retry`` (no body) is a
 member row gated by ``chat.send``: only the chat's owner re-runs its failed last
 turn, so another org's, a colleague's and an unknown chat answer
@@ -366,6 +387,72 @@ def seed_attachment(
     directory.mkdir(parents=True, exist_ok=True)
     (directory / str(attachment_id)).write_bytes(data)
     return attachment_id
+
+
+# GH-194: how long ago a seeded trash item was deleted (inside the default 30-day retention).
+TRASHED_AGO: Final = timedelta(hours=1)
+
+
+def seed_trashed_attachment(
+    db: FakeDb,
+    chat_id: uuid.UUID,
+    *,
+    filename: str = "tenancy-trashed-194.txt",
+    data: bytes = b"Tenancy trashed attachment 194\n",
+    deleted_at: datetime | None = None,
+    **fields: Any,
+) -> uuid.UUID:
+    """Store a trashed attachments row of ``chat_id`` (``seed_attachment`` with
+    ``deleted_at``, ``TRASHED_AGO`` ago by default) and its derived text file
+    ``<ATTACHMENTS_ROOT>/<org_id>/<attachment_id>.d/text.txt``; return its id.
+
+    In a live chat the file was deleted on its own (its own trash group once
+    migration 0032 ships: a trash item); in a trashed chat it went with the
+    chat (the chat's group: not an item of its own). Call
+    ``use_attachment_storage`` first.
+    """
+    stamp = deleted_at if deleted_at is not None else datetime.now(UTC) - TRASHED_AGO
+    attachment_id = seed_attachment(
+        db, chat_id, filename=filename, data=data, deleted_at=stamp, **fields
+    )
+    chat = db.chat_row(chat_id)
+    assert chat is not None
+    derived = Path(organizations.ATTACHMENTS_ROOT) / str(chat["org_id"]) / f"{attachment_id}.d"
+    derived.mkdir(parents=True, exist_ok=True)
+    (derived / "text.txt").write_bytes(data)
+    return attachment_id
+
+
+def seed_trashed_chat(
+    db: FakeDb,
+    owner: Account | uuid.UUID,
+    *,
+    title: str = "",
+    messages: Sequence[tuple[str, str]] = (),
+    filenames: Sequence[str] = (),
+    deleted_at: datetime | None = None,
+) -> uuid.UUID:
+    """Store a chat of ``owner`` in the owner's org, moved to the trash ``TRASHED_AGO``
+    ago (or at ``deleted_at``), with ``messages`` and one attachment per name in
+    ``filenames`` trashed with it (same ``deleted_at``; ``seed_trashed_attachment``);
+    return the chat's id.
+
+    The chat is its own trash group once migration 0032 ships (a trash item); its
+    files carry the chat's group (they come back with it). A title makes
+    ``title_source`` "user".
+    """
+    stamp = deleted_at if deleted_at is not None else datetime.now(UTC) - TRASHED_AGO
+    chat_id = db.add_chat(
+        _user_id(owner),
+        title=title,
+        title_source="user" if title else "auto",
+        deleted_at=stamp,
+    )
+    for role, content in messages:
+        db.add_chat_message(chat_id, role, content)
+    for name in filenames:
+        seed_trashed_attachment(db, chat_id, filename=name, data=name.encode(), deleted_at=stamp)
+    return chat_id
 
 
 def attachment_files() -> dict[str, bytes]:
@@ -778,6 +865,31 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         "PATCH", "/api/attachments/{attachment_id}", "member", Capability.CHAT_SEND, "path_id"
     ),
     RouteSpec("GET", "/api/chats/{chat_id}/attachments", "member", Capability.CHAT_SEND, "path_id"),
+    # GH-194: move one live file to the trash; the caller's own trash (list, empty), and
+    # restore and delete forever per item (owner-private, V1: not even an Org Admin).
+    RouteSpec(
+        "DELETE", "/api/attachments/{attachment_id}", "member", Capability.CHAT_SEND, "path_id"
+    ),
+    RouteSpec("GET", "/api/trash", "member", Capability.CHAT_SEND, "own_user"),
+    RouteSpec("DELETE", "/api/trash", "member", Capability.CHAT_SEND, "own_user"),
+    RouteSpec(
+        "POST", "/api/trash/chats/{chat_id}/restore", "member", Capability.CHAT_SEND, "path_id"
+    ),
+    RouteSpec(
+        "POST",
+        "/api/trash/attachments/{attachment_id}/restore",
+        "member",
+        Capability.CHAT_SEND,
+        "path_id",
+    ),
+    RouteSpec("DELETE", "/api/trash/chats/{chat_id}", "member", Capability.CHAT_SEND, "path_id"),
+    RouteSpec(
+        "DELETE",
+        "/api/trash/attachments/{attachment_id}",
+        "member",
+        Capability.CHAT_SEND,
+        "path_id",
+    ),
     # --- own Google/Microsoft connections ---
     RouteSpec("GET", "/api/oauth/google/authorize", "member", Capability.OAUTH_CONNECT, "own_user"),
     RouteSpec(

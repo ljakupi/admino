@@ -1,4 +1,4 @@
-"""Stubs for the background jobs of the server lifespan tests (GH-154, GH-157, GH-187).
+"""Stubs for the background jobs of the server lifespan tests (GH-154, GH-157, GH-187, GH-194).
 
 The lifespan helpers in test_audit_events, test_email_outbox,
 test_session_management_api, test_critical_permissions_api and
@@ -24,6 +24,11 @@ test runs only what it tests and no real job touches their MagicMock pool.
   stub), so the unrelated lifespan tests keep running before GH-187; once a
   module exists its function must exist too (no ``create=True``). Neither real
   task then runs a query on a test's pool or scans the real attachments root.
+- GH-194 adds the trash retention purge, ``admino.trash.run_purge_job`` (now
+  and then hourly; it removes attachment files too). Its lifespan behavior is
+  specified in tests/test_trash_lifespan.py. ``patch_attachment_jobs`` stubs it
+  as well, the same way: nothing until ``admino.trash`` exists, then the job
+  must exist.
 """
 
 from __future__ import annotations
@@ -39,6 +44,7 @@ if TYPE_CHECKING:
 _LOGIN_THROTTLE_MODULE = "admino.login_throttle"
 _ATTACHMENT_GC_MODULE = "admino.attachment_gc"
 _ATTACHMENT_PROCESSING_MODULE = "admino.attachment_processing"
+_TRASH_MODULE = "admino.trash"
 
 
 def patch_org_purge_job(job: Callable[..., Any]) -> contextlib.AbstractContextManager[Any]:
@@ -62,9 +68,11 @@ def patch_login_throttle_purge_job(
 def patch_attachment_jobs(
     gc_job: Callable[..., Any] | None = None,
     recover: Callable[..., Any] | None = None,
+    trash_purge_job: Callable[..., Any] | None = None,
 ) -> Iterator[None]:
-    """Patch admino.attachment_gc.run_gc_job with ``gc_job`` and
-    admino.attachment_processing.recover with ``recover`` (GH-187).
+    """Patch admino.attachment_gc.run_gc_job with ``gc_job``,
+    admino.attachment_processing.recover with ``recover`` (GH-187) and
+    admino.trash.run_purge_job with ``trash_purge_job`` (GH-194).
 
     Each defaults to an ``AsyncMock`` that returns at once (``recover`` returns
     0, the number of files it queued). A module that doesn't exist yet is
@@ -80,6 +88,13 @@ def patch_attachment_jobs(
                 patch(
                     f"{_ATTACHMENT_PROCESSING_MODULE}.recover",
                     recover or AsyncMock(return_value=0),
+                )
+            )
+        if importlib.util.find_spec(_TRASH_MODULE) is not None:
+            stack.enter_context(
+                patch(
+                    f"{_TRASH_MODULE}.run_purge_job",
+                    trash_purge_job or AsyncMock(return_value=None),
                 )
             )
         yield

@@ -321,7 +321,7 @@ edits.
 | `instructions` | `""` | up to 8,000 characters | the organization's instructions for the assistant, in every chat of the organization |
 | `security.session_idle_timeout_minutes` | 60 | 15–480 | the members' sessions |
 | `security.session_max_lifetime_hours` | 12 | 1–72 | the members' sessions |
-| `retention.trash_retention_days` | 30 | 0–90, within the platform's trash bounds | the organization's trash (later release) |
+| `retention.trash_retention_days` | 30 | 0–90, within the platform's trash bounds | how long deleted chats and files stay in the members' [trash](#trash) (`0`: deleted for good at once) |
 | `tools.<service>` | on | on / off | which tool services the agent may use |
 
 - **Instructions** (`""` clears them) are kept exactly as typed. Control and formatting
@@ -344,6 +344,9 @@ edits.
   (`"reason": "trash_retention_bounds"`), and nothing is changed. When the Super Admin
   narrows the bounds later, your stored value stays, and the response shows it clamped
   into the new bounds, with the bounds next to it (`trash_min_days`, `trash_max_days`).
+  That clamped value is the one the [trash](#trash) uses. A change applies at once to
+  what the trash lists and can restore; items it makes expire are deleted for good by
+  the next hourly purge, not at once.
 - **Read-only here**: the data residency policy (`data_residency`, set by the Super
   Admin, see [Organizations](#organizations-super-admin)), the plan (`plan.seats` and
   `plan.storage_quota` in bytes; there's no budget in this release) and the trash bounds.
@@ -393,7 +396,7 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
 | `security` | `session_max_lifetime_hours` | 12 | 1–72 | Super Admin sessions |
 
 - A change applies without a restart: the next message, upload, login attempt, deletion
-  schedule or audit purge uses the new value.
+  schedule, trash request, trash purge or audit purge uses the new value.
 - `llm.max_input_tokens` and `llm.image_input` come from `config.yaml` again at every start,
   like the provider and the model IDs, so a change here lasts until the next restart; edit
   `config.yaml` to keep it. `llm.max_retries` isn't in `config.yaml`: a stored value is
@@ -708,7 +711,7 @@ Viewer's chats from before a role change stay stored, unused.
 | `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
 | `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. Each message carries its `attachment_ids`. It also carries `pending_confirmation` and `confirmation_status` (see below), `context_usage` (see [Context budget](#context-budget)), and `retryable`: `true` exactly when the chat's latest message ended as `error` or `stopped`, so that a [retry](#retrying-a-failed-reply) would run, whatever page you read. |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
-| `DELETE /api/chats/{id}` | Moves the chat to the trash, with its [attachments](#attachments), and answers `204`. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete`, with the chat's ID only. |
+| `DELETE /api/chats/{id}` | Moves the chat to the [trash](#trash), with its [attachments](#attachments), and answers `204`; you can restore it from there until it expires. When your organization's trash retention is 0, the chat is deleted for good in the same request: its messages and files are gone when the `204` comes. If that step fails, the `204` still comes and the chat waits in the trash for the next hourly purge (see [Trash](#trash)). A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete` (and `chat.purge` when it's deleted for good), with the chat's ID only. |
 | `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`, optionally with the files you uploaded into the chat, `"attachment_ids": [...]` (see [Attachments](#attachments)). Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, the `context_usage` and `context_notice` (see [Context budget](#context-budget)), and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
 | `POST /api/chats/{id}/stop` | Stops the chat's streamed message. It needs no body and answers `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed message running (see [Stopping a reply](#stopping-a-reply)). |
 | `POST /api/chats/{id}/retry` | Runs the chat's latest message again when its last answer ended as `error` or `stopped`, and replaces the failed turn with the new one. It needs no body. Answers like `POST /api/chats/{id}/messages`: JSON, or streamed with `Accept: text/event-stream`. When the last answer didn't fail, it answers `409` `not_retryable` (see [Retrying a failed reply](#retrying-a-failed-reply)). |
@@ -1164,6 +1167,7 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
 | `GET /api/chats/{id}/attachments?status=&active=&cursor=&limit=` | Lists the chat's attachments, oldest first: `{"attachments": [...], "next_cursor": ...}`, each item like `GET /api/attachments/{id}` (see [Listing a chat's files](#listing-a-chats-files)). |
 | `GET /api/attachments/{id}` | The attachment: `id`, `chat_id`, `message_id` (`null` until a message carries it), `filename`, `kind`, `size_bytes`, `status`, `failure_reason`, `page_count`, `token_estimate`, `active` (`false` once [excluded](#excluding-a-file)), `context_report` (`null`, except for a file refused with `context_overflow`, see [File conversion](#file-conversion)) and `created_at`. |
 | `PATCH /api/attachments/{id}` | Excludes the file from the chat's later messages, `{"active": false}`, or includes it again, `{"active": true}`, and answers the attachment like `GET` (see [Excluding a file](#excluding-a-file)). |
+| `DELETE /api/attachments/{id}` | Moves the file to the [trash](#trash), sent or not, in any status, and answers `204`. When your organization's trash retention is 0, it's deleted for good in the same request. |
 | `GET /api/attachments/{id}/content` | Downloads the original file, in any status. |
 
 - **The name** travels in the `X-Attachment-Name` header, never in the URL, so it can't
@@ -1323,30 +1327,32 @@ attachment route. Like a chat, an attachment is private to the chat's owner.
 - **Rate limits** apply per user, each answering `429` `{"detail": "Rate limit
   exceeded"}`: uploads a burst of `max_files_per_message`, then one every 2 seconds;
   metadata 5 per second (burst 50); downloads 2 per second (burst 30); a chat's list 1
-  per second (burst 10); excluding and including a burst of 5, then one every 2 seconds.
-  A user also has
+  per second (burst 10); excluding and including a burst of 5, then one every 2 seconds;
+  deleting a burst of 5, then one every 2 seconds. A user also has
   at most `max_files_per_message` uploads in progress at once: one more answers the same
   `429` before any byte of it is read, and the slot is free again as soon as one of
   them ends, however it ends.
-- **Trash and deletion.** Moving a chat to the trash moves its attachments there too:
-  they can't be read or sent anymore, their files stay on disk and they still count
-  against the storage quota until the trash is purged
-  ([#194](https://github.com/ljakupi/admino/issues/194)). Deleting a user deletes their
-  attachments and files. Purging an organization deletes its attachments directory.
+- **Trash and deletion.** `DELETE /api/attachments/{id}` moves one of your files to the
+  [trash](#trash), and moving a chat to the trash moves its attachments there too. A file
+  in the trash can't be read, listed or sent anymore. Its files stay on disk and still
+  count against the storage quota until it's deleted for good: from the trash, by the
+  trash's hourly purge once it expires, or at once when the organization's trash
+  retention is 0. Deleting a user deletes their attachments and files. Purging an
+  organization deletes its attachments directory.
 - **Unsent files expire.** A background job (at startup, then every hour) deletes an
-  attachment that no message carried within 24 hours, with its files, recorded as
-  `file.delete` by the system with `{"orphan": true}`. It also removes leftover files
-  older than 24 hours that no attachment owns (an interrupted upload, a failed removal).
+  attachment that no message carried within 24 hours, in the trash or not, with its
+  files, recorded as `file.delete` by the system with `{"orphan": true}`. It also
+  removes leftover files older than 24 hours that no attachment owns (an interrupted
+  upload, a failed removal).
 - **Audit and logs.** Each upload is recorded as `file.upload`, with the attachment's ID
-  and size only, and each exclusion or inclusion as `file.exclude` or `file.include`,
-  with the attachment's ID only. Each tool call of a message whose model got files
+  and size only, each exclusion or inclusion as `file.exclude` or `file.include`, and
+  each deletion as `file.delete` (see [Trash](#trash) for restoring and deleting for
+  good), with the attachment's ID only. Each tool call of a message whose model got files
   records their IDs (the active files sent, in the order sent, at most 100) and their
   count in its `tool.call` event (`attachment_ids`, `attachment_count`). Reads, listings,
   downloads, sending and the conversion (a system step) aren't recorded.
   Names and content never reach the audit log or a log line: IDs, sizes, types, statuses
   and failure codes only.
-- There's no route yet to delete one attachment: the trash comes with
-  [#194](https://github.com/ljakupi/admino/issues/194).
 
 #### File conversion
 
@@ -1685,6 +1691,108 @@ the order the model would get them:
 - A new upload that doesn't fit is refused once it's converted, with the same report on
   `GET /api/attachments/{id}`: see **A file that doesn't fit the chat** under
   [File conversion](#file-conversion).
+
+### Trash
+
+Deleting a chat (`DELETE /api/chats/{id}`, see [Chats](#chats)) or a file
+(`DELETE /api/attachments/{id}`, see [Attachments](#attachments)) moves it to your trash,
+where you can restore it until it expires. Your trash is yours alone in this release:
+nobody else sees or restores it, not even an Org Admin. Org Admins and Editors use it;
+Viewers and the Super Admin get `403` on every trash route.
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/trash?item_type=&cursor=&limit=` | Lists your trash, the latest deletion first: `{"items": [...], "next_cursor": ..., "retention_days": ...}`. `item_type` is `chat` or `attachment` (both when it's left out). `limit` is 1–100, 50 by default. Pages work like the [chat list's](#chats). |
+| `POST /api/trash/chats/{id}/restore` | Restores the chat with the files deleted with it, and answers `200` with the chat, as `GET /api/chats` lists it. |
+| `POST /api/trash/attachments/{id}/restore` | Restores a file you deleted on its own, and answers `200` with the attachment, like `GET /api/attachments/{id}` (`context_report` is `null`). |
+| `DELETE /api/trash/chats/{id}` | Deletes the chat for good, with its messages and all of its files, and answers `204`. |
+| `DELETE /api/trash/attachments/{id}` | Deletes the file for good and answers `204`. |
+| `DELETE /api/trash` | Empties your trash and answers `200` `{"chats": 2, "attachments": 5}`: how many chats and files were deleted for good. |
+
+- **Items.** Each item is `{"item_type", "id", "name", "chat_id", "deleted_at",
+  "expires_at"}`. `name` is the chat's title (`""` for an untitled chat) or the file's
+  name. `chat_id` is the file's chat, and `null` for a chat. `expires_at` is `deleted_at`
+  plus the retention, so a client can show the days left. `retention_days` is your
+  organization's retention right now: `0` means a delete can't be undone.
+- **Groups.** A chat goes to the trash with its files, as one item: the chat. Restoring
+  it brings back the chat and those files. A file you deleted on its own before you
+  deleted its chat stays in the trash as its own item; restore it after the chat. A file
+  that went with its chat isn't listed on its own, and the file routes answer `404` for
+  it.
+- **Nothing else changes.** A restored chat keeps its messages and its last activity
+  time; a restored file keeps its message and whether it was
+  [excluded](#excluding-a-file). Restoring your chat or file that isn't in the trash
+  answers `200` with it and records nothing.
+- **Retention and expiry.** The retention is your organization's
+  `retention.trash_retention_days`, kept within the platform's trash bounds (see
+  [Organization settings](#organization-settings); 30 days when it was never set). It's
+  read on every request, so a change applies at once. An item expires once the
+  retention has passed since `deleted_at`. From then on it isn't listed, and restoring it
+  answers `404`, even before the purge removes it. Deleting it for good and emptying the
+  trash still remove it. Whatever the retention, a file never sent with a message is
+  deleted for good once it's 24 hours old, in the trash or not (see
+  [Attachments](#attachments)); restoring it then answers `404`.
+- **Retention 0.** `DELETE /api/chats/{id}` and `DELETE /api/attachments/{id}` delete the
+  chat or file for good in the same request: when the `204` comes, its rows and files are
+  gone, and nothing is listed or restorable. If that last step fails, the `204` still
+  stands: the item stays in the trash, already expired, and the next purge removes it.
+- **Deleting for good** removes the rows first: a chat's messages and all of its files go
+  with it. Then the files on disk go: each original, a partial upload and the converted
+  parts (the extracted text and the page images). Only an item in your trash can be
+  deleted for good: a live chat or file, and a file that went to the trash with its chat,
+  answer `404`. Emptying the trash deletes your chats first, then the files you deleted
+  on their own, each in its own transaction. A file deleted on its own inside a chat
+  that's also in the trash goes with the chat, so `attachments` doesn't count it.
+- **The purge job.** At startup and then every hour, admino deletes the expired items of
+  every organization for good, each organization with its own retention: its chats, then
+  its files deleted on their own, rows first and then the files on disk, as above. Each
+  item goes in its own transaction with its audit event. One that fails is logged (IDs
+  and error types only) and tried again on the next run; an item restored meanwhile is
+  skipped. A file left on disk by a failed removal is removed by the hourly cleanup of
+  [unsent files](#attachments) once it's 24 hours old. A lowered retention hides the
+  newly expired items at once, and the next run deletes them.
+- **Errors** use the usual `{"detail", "reason"}` body and never repeat what you sent.
+  Another user's item (an Org Admin's request on an Editor's item included), another
+  organization's and an unknown one answer the same `404` as an item that isn't in your
+  trash, and nothing changes.
+
+  | Status | `reason` | When |
+  | --- | --- | --- |
+  | `404` | `chat_not_found` | restoring a chat that isn't yours, has expired or doesn't exist; deleting for good a chat that isn't in your trash |
+  | `404` | `attachment_not_found` | the same for a file, and a file that went to the trash with its chat |
+  | `409` | `chat_in_trash` | restoring a file whose chat is in the trash: restore the chat first. `{"detail": "The file's chat is in the trash", "reason": "chat_in_trash"}` |
+  | `409` | `restore_conflict` | restoring a chat of `POST /api/message` whose `session_id` has a new chat since: `{"detail": "A live chat already uses this chat's session", "reason": "restore_conflict"}` |
+  | `422` | `invalid_cursor` | a cursor that doesn't decode, or one from another list |
+
+  A `409` changes nothing. An ID that isn't a UUID, a `limit` out of range, an unknown
+  `item_type` and a cursor over 200 characters answer `422`, without echoing them.
+- **Rate limits** apply per user, each route with its own, answering `429` `{"detail":
+  "Rate limit exceeded"}`: the list 1 per second (burst 10); each restore and each
+  delete for good a burst of 5, then one every 2 seconds; emptying a burst of 2, then one
+  every 5 seconds. Every route that changes something refuses cross-site requests.
+- **Audit.** Each change is recorded in your organization's audit log, in the same
+  transaction, with the item's ID as the target and nothing else about it: never a title
+  or a file name. A failed audit write is a `500` and leaves that item as it was; a
+  delete for good then removes no row and no file. Two cases differ. In a retention-0
+  delete, a failed `chat.purge` or `file.purge` write still answers `204`, with the item
+  left in the trash for the next purge. When you empty the trash, the items deleted for
+  good before the failure stay deleted.
+
+  | Event | When | By |
+  | --- | --- | --- |
+  | `chat.delete`, `file.delete` | a chat or a file moved to the trash | you |
+  | `chat.restore`, `file.restore` | a chat or a file restored | you |
+  | `chat.purge` | a chat deleted for good, with `{"file_count": n}`: the number of files deleted with it | you (deleting for good, emptying, retention 0) or the system (the purge job) |
+  | `file.purge` | a file deleted for good | you or the system, likewise |
+
+  Your events carry your client IP; the purge job's carry none. Listing the trash
+  records nothing.
+- **Upgrading.** Chats and files in the trash before this release become trash items: a
+  chat together with the files deleted with it. Those deleted longer ago than your
+  organization's retention (30 days unless an Org Admin changed it, see **Retention and
+  expiry** above) are deleted for good when admino first starts after the upgrade. To
+  keep them, raise `retention.trash_retention_days` (see
+  [Organization settings](#organization-settings)) before upgrading.
 
 ## Organizations (Super Admin)
 
@@ -2183,7 +2291,8 @@ attachments' files live on a Docker volume.
   and with its owner (see [Chats](#chats)). They hold your messages, the assistant's
   replies and the tool results. The assistant's instructions (the platform's rules, the
   organization's and your personal instructions) are never stored. The app can add
-  messages but can't edit or delete a single one. A [retry](#retrying-a-failed-reply)
+  messages but can't edit or delete a single one: messages go only with their whole chat
+  or, on a retry, with their failed turn. A [retry](#retrying-a-failed-reply)
   removes the failed turn only through `delete_failed_turn` (migration 0031), a function
   that runs as the owner and refuses anything but the failed last turn of a chat that
   isn't in the trash, shaped like a real failed turn, so `admino_app` itself still can't
@@ -2192,9 +2301,8 @@ attachments' files live on a Docker volume.
   marks as `error` the text a reply showed before it timed out that was stored
   `complete` before this release, so those turns can be retried. Deleting a
   user deletes their chats, and purging an organization deletes all of its chats. A chat
-  in the trash stays stored, only marked with `deleted_at`; restoring and purging the
-  trash come with
-  [#194](https://github.com/ljakupi/admino/issues/194).
+  or a file in the trash stays stored, marked with `deleted_at`, until it's restored or
+  deleted for good (see [Trash](#trash)).
 - **Attachments** (see [Attachments](#attachments)). The `attachments` table holds each
   file's chat, owner, the message that carried it, its cleaned original name, type,
   size, the size of its converted parts, status, page count and token estimate. The
@@ -2214,10 +2322,10 @@ attachments' files live on a Docker volume.
   mount point. It must be an absolute path: any other value (a relative path such as
   `data/attachments`) stops admino at startup with `ERROR: ADMINO_ATTACHMENTS_ROOT must
   be an absolute path.` Uploads, downloads, the conversion, the cleanup of unsent files,
-  user deletion and the organization purge all use this one folder. Docker Compose sets
-  it to `/app/data/attachments` for the agent, so a value in `.env` meant for a native
-  run never moves the container's files off the volume. `make run` sets it to
-  `data/attachments` in your checkout (see
+  the trash, user deletion and the organization purge all use this one folder. Docker
+  Compose sets it to `/app/data/attachments` for the agent, so a value in `.env` meant
+  for a native run never moves the container's files off the volume. `make run` sets it
+  to `data/attachments` in your checkout (see
   [Getting started](getting-started.md#3-run-locally-with-uv)). A root that doesn't exist
   yet is created with mode 0700; an existing one keeps its permissions.
 
@@ -2225,8 +2333,9 @@ attachments' files live on a Docker volume.
   files treats every directory under it whose name is a UUID as an organization's and
   deletes the entries in it that admino doesn't know. Changing the setting doesn't move
   the existing files. Files left under the old root are no longer downloaded, deleted
-  with their user or organization, or cleaned up. To change it, stop admino, move the
-  whole folder (keeping its permissions) to the new path by hand, then start admino again.
+  with their user or organization or from the trash, or cleaned up. To change it, stop
+  admino, move the whole folder (keeping its permissions) to the new path by hand, then
+  start admino again.
 - **The audit log** is the **append-only `audit_events` table**. Every tool call adds one
   row with the chat's ID, the tool, the action, the permission decision, success and
   duration. Arguments, tool output and message text are never stored. Rows are kept for 12
