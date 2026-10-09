@@ -68,14 +68,47 @@ Security notes:
   passes ``earlier_external_content=True`` (GH-176: a persisted chat loads
   only its latest messages, and its sticky flag covers the older ones), the
   run has attachments (GH-189: slot 4's blocks are wrapped with the run's
-  boundary, so the files count from the first dispatch), or a dispatch
-  returns a wrapped result. From then on every dispatch, the resume
+  boundary, so the files count from the first dispatch), or a dispatch (the
+  resume pre-dispatch included) returns a wrapped result, judged on the full
+  result before the GH-190 cut. From then on every dispatch, the resume
   pre-dispatch included, passes ``escalate_side_effects=True`` and the
   registry turns an allowed side effect into ``confirm``; a hardcoded denial
   such as ``gmail.send`` stays denied. The flag only tightens a decision and
-  never reaches the permission engine. The attachment ids and the flag are
-  locals of the run, never stored on the agent. No content, file name,
-  label or boundary is logged.
+  never reaches the permission engine. The run reports it as
+  ``AgentResult.external_content`` on every return path (GH-190), so the
+  caller's sticky chat flag holds even when the cut removed a wrapped block's
+  begin marker from the stored result. The attachment ids and the flag belong
+  to the run (its locals and its report), never to the agent. No content,
+  file name, label or boundary is logged.
+- Context budget (GH-190, ``admino.context_budget``): before every LLM call
+  of a run (the first, the tool loop, the streamed path, after a resumed
+  confirmation) the call must satisfy ``instructions + attachments + history
+  + reserved output <= budget``. The instructions are the call's system
+  message and tools payload, the attachments count their stored
+  ``token_estimate`` (never their text), the reserve is the run config's
+  ``reserved_output_tokens``, and the budget is ``max_input_tokens`` less
+  ``context_margin_percent`` (rounded up). A positive ``max_context_messages``
+  (the secondary cap) trims first, as before; 0 is no cap, and the window is
+  then the whole history without its leading ``tool`` results (their call
+  lies before the load limit). The budget then keeps the newest whole earlier
+  turns that fit (a turn is a user message and everything up to the next
+  one), so a tool call never travels without its results, nor a result
+  without its call. The current turn (the new message, or the request a
+  resumed confirmation answers, and everything after it) and the attachments
+  are never dropped: when even they don't fit, the run ends before that call
+  with status "error", ``error_code="context_too_long"`` and the fixed
+  ``CONTEXT_TOO_LONG_MESSAGE`` reply stored like any coded failure. No LLM
+  call is made (on the streamed path ``chat_stream`` isn't called), nothing
+  more is dispatched, and one line with token and tool-call counts only is
+  logged. ``AgentResult.context_notice`` carries the drops (counts only) of
+  the run's last call, made or refused; the cap's drops and the leading
+  ``tool`` results don't count.
+- Tool-result cut (GH-190): every ``tool`` message the run appends (a
+  dispatch, the resume pre-dispatch) carries
+  ``context_budget.truncate_tool_result(result, max_tool_result_tokens)``: a
+  longer result is sent and stored as its longest fitting prefix plus a fixed
+  marker, which bounds what one result adds to every later call and to the
+  stored chat. Escalation is still decided on the full result (see above).
 - A run is never anonymous: ``run`` takes the caller's ``principal`` as a
   required keyword (GH-149); the agent makes no access decision with it.
 - Tool context (GH-162): each run derives its ``TenantContext`` once from
@@ -183,16 +216,18 @@ import asyncio
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
 from secrets import token_urlsafe
 from typing import TYPE_CHECKING, Protocol
 
-from admino import llm_policy, prompt_assembly, request_timing, untrusted
+from admino import context_budget, llm_policy, prompt_assembly, request_timing, untrusted
 from admino.llm import LLMError, LLMResponse, strip_control_chars
 from admino.models import (
     AgentConfig,
     AgentResult,
+    ContextNotice,
     LLMMessage,
     PendingConfirmation,
     PromptContext,
@@ -202,6 +237,7 @@ from admino.models import (
 from admino.permissions import PermissionResult
 from admino.tenancy import NoTenantContextError, TenantContext
 from admino.tools.registry import ToolCallResult, dispatch_tool_call, get_registered_tools
+from admino.tools.registry import tools_payload as _tool_descriptions_to_payload
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -212,7 +248,6 @@ if TYPE_CHECKING:
     from admino.models import AttachmentContent, LLMErrorCode, ToolPolicy
     from admino.permissions import PermissionState
     from admino.streaming import RunStream
-    from admino.tools.registry import ToolDescription
 
 logger = logging.getLogger(__name__)
 
@@ -288,6 +323,20 @@ class ToolCallRecorder(Protocol):
         """
 
 
+@dataclass
+class _RunReport:
+    """What a run reports on every return path besides its outcome (GH-190).
+
+    ``external_content`` is the run's escalation flag (GH-243), reported as
+    ``AgentResult.external_content``; ``context_notice`` is the drops of the
+    run's last LLM call, made or refused. ``Agent.run`` copies both onto the
+    result, so no return path can leave them out. One per run, never shared.
+    """
+
+    external_content: bool = False
+    context_notice: ContextNotice | None = None
+
+
 # ---------------------------------------------------------------------------
 # Agent
 # ---------------------------------------------------------------------------
@@ -326,8 +375,8 @@ class Agent:
                 after every ``dispatch_tool_call`` with the run's principal
                 and content-free metadata. If it raises, the run aborts (H-1).
             agent_config: Runtime limits (``max_tool_calls``,
-                ``max_context_messages``, ``confirmation_timeout_s``) of a run
-                that is given none.
+                ``max_context_messages``, ``confirmation_timeout_s``) and token
+                budget (GH-190) of a run that is given none.
             clock: Returns the current timezone-aware time for the system
                 prompt's date line, read once per run (GH-170). None: the
                 current UTC time.
@@ -364,9 +413,15 @@ class Agent:
         occurs. Each LLM call gets the run's system message
         (``prompt_assembly.system_prompt`` over ``prompt_context``, the run's
         advertised tools and the run's clock reading: the same on every call
-        of the run) and a trimmed window of the history in which the current
-        user message is always kept; with ``attachments``, slot 4 opens that
-        message (``prompt_assembly.assemble``).
+        of the run) and a window of the history in which the current turn is
+        always kept; with ``attachments``, slot 4 opens its user message
+        (``prompt_assembly.assemble``). The window is the secondary cap's
+        (``max_context_messages``; 0: the whole history), then the newest whole
+        earlier turns that fit the token budget beside the instructions, the
+        attachments' estimates, the current turn and the reserved output
+        (GH-190). When even the current turn doesn't fit, the run ends before
+        that call with ``error_code="context_too_long"``. Every tool result
+        the run appends is cut to ``max_tool_result_tokens``.
 
         Args:
             user_message: The user's message text. Must already be validated
@@ -390,8 +445,10 @@ class Agent:
             agent_config: This run's limits (``max_tool_calls``,
                 ``max_context_messages``, ``confirmation_timeout_s``,
                 ``llm_max_retries``; GH-160/GH-242: the stored platform
-                limits). None: the construction-time config. Applies to this
-                run only.
+                limits) and its token budget (``max_input_tokens``,
+                ``reserved_output_tokens``, ``context_margin_percent``,
+                ``max_tool_result_tokens``; GH-190). None: the
+                construction-time config. Applies to this run only.
             prompt_context: The org's and the user's prompt inputs
                 (instructions, response languages, timezone; GH-170), loaded
                 by the caller for this request. None: ``PromptContext()``.
@@ -413,21 +470,28 @@ class Agent:
                 every LLM call carries them as slot 4 of the current user
                 message, the run escalates allowed side effects from its first
                 dispatch (the resume pre-dispatch included), and every recorder
-                call gets their ids. Empty: the run is exactly a run without
-                attachments. Applies to this run only.
+                call gets their ids; each counts its stored ``token_estimate``
+                against every call's budget (GH-190). Empty: the run is exactly
+                a run without attachments. Applies to this run only.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
             history (user/assistant/tool messages only — never the system
-            message), a summary of tool calls made during the run and, for a
-            coded LLM failure, its ``error_code``.
+            message; tool results as cut), a summary of tool calls made during
+            the run, for a coded LLM failure (``context_too_long`` included)
+            its ``error_code``, and on every return path (GH-190) its
+            ``context_notice`` (the last LLM call's dropped earlier turns, made
+            or refused; None when it dropped none) and ``external_content``
+            (whether the run received external content).
         """
+        report = _RunReport()
         # GH-243: one random boundary for the whole run, so every tool result
         # this run wraps carries the same markers and no content can guess them.
         with untrusted.run_boundary():
-            return await self._run_in_boundary(
+            result = await self._run_in_boundary(
                 user_message,
                 session_id,
+                report=report,
                 history=history,
                 principal=principal,
                 tool_policy=tool_policy,
@@ -438,6 +502,12 @@ class Agent:
                 stream=stream,
                 attachments=attachments,
             )
+        return result.model_copy(
+            update={
+                "external_content": report.external_content,
+                "context_notice": report.context_notice,
+            }
+        )
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -448,6 +518,7 @@ class Agent:
         user_message: str,
         session_id: str,
         *,
+        report: _RunReport,
         history: list[LLMMessage],
         principal: Principal,
         tool_policy: ToolPolicy,
@@ -458,7 +529,10 @@ class Agent:
         stream: RunStream | None,
         attachments: Sequence[AttachmentContent],
     ) -> AgentResult:
-        """Run the agent loop inside the run's untrusted-content boundary (see ``run``)."""
+        """Run the agent loop inside the run's untrusted-content boundary (see ``run``).
+
+        ``report`` is filled as the run goes: ``run`` copies it onto the result.
+        """
         config = self._config if agent_config is None else agent_config
         # GH-162: the run's tool context, derived once from the principal (never
         # from LLM output or history). A principal without an org (a Super
@@ -480,12 +554,13 @@ class Agent:
         # GH-176: a persisted chat passes only its latest messages, so the
         # caller's flag covers external content older than that tail. GH-189:
         # attached files are external content too, from the first dispatch on.
-        # The flag and the ids are locals of this run, never stored on the
-        # agent, so concurrent and later runs keep their own.
-        holds_attachments = bool(attachments)
+        # GH-190: the same flag is the run's reported ``external_content``, so
+        # the caller's sticky chat flag survives a tool result the cut stripped
+        # of its marker. The flag and the ids belong to this run (its report and
+        # locals), never to the agent, so concurrent and later runs keep their own.
         attachment_ids = tuple(attachment.id for attachment in attachments)
-        received_untrusted = (
-            holds_attachments
+        report.external_content = (
+            bool(attachments)
             or earlier_external_content
             or _holds_untrusted_content(working_history)
         )
@@ -557,6 +632,19 @@ class Agent:
         # the run advertises) and one clock reading.
         prompt_inputs = PromptContext() if prompt_context is None else prompt_context
         now = self._clock()
+        # GH-190: what every call of the run spends besides its history (the
+        # system message and tools payload it sends, the attachments' stored
+        # estimates, the reply's reserve) is fixed for the run, and so is the
+        # budget it must fit.
+        system_text = prompt_assembly.system_prompt(prompt_inputs, tools=descriptions, now=now)
+        fixed_tokens = (
+            context_budget.prompt_tokens(system_text, tools_payload)
+            + sum(attachment.token_estimate for attachment in attachments)
+            + config.reserved_output_tokens
+        )
+        token_limit = context_budget.budget_limit(
+            config.max_input_tokens, config.context_margin_percent
+        )
         # Carry a one-shot pending_confirmation that is applied to the FIRST
         # dispatch only, then cleared. This matches the server contract:
         # a confirmation resumes exactly one tool call.
@@ -570,7 +658,7 @@ class Agent:
         # and THEN let the main loop call the LLM with a completed history
         # so the assistant can produce its natural-language follow-up.
         if is_resume and pending_confirmation is not None:
-            pre_result = await self._resume_pending_dispatch(
+            resumed = await self._resume_pending_dispatch(
                 pending_confirmation=pending_confirmation,
                 principal=principal,
                 tenant=tenant,
@@ -578,20 +666,20 @@ class Agent:
                 session_id=session_id,
                 working_history=working_history,
                 tool_records=tool_records,
-                escalate_side_effects=received_untrusted,
+                escalate_side_effects=report.external_content,
                 attachment_ids=attachment_ids,
                 stream=stream,
+                max_tool_result_tokens=config.max_tool_result_tokens,
             )
-            if pre_result is not None:
+            if isinstance(resumed, AgentResult):
                 # H-1: the resumed dispatch could not be recorded —
                 # ``_resume_pending_dispatch`` has already logged and built the
                 # terminal error. Return it before any LLM call.
-                return pre_result
-            # The resumed call's result is now the last history message.
-            received_untrusted = (
-                holds_attachments
-                or earlier_external_content
-                or _holds_untrusted_content(working_history)
+                return resumed
+            # GH-190: decided on the FULL result, since the stored one may have
+            # been cut past its wrapped block's begin marker.
+            report.external_content = report.external_content or untrusted.contains_wrapped(
+                resumed.result
             )
             tool_calls_used += 1
             carry_confirmation = None  # consumed on pre-dispatch
@@ -602,16 +690,44 @@ class Agent:
             # GH-8 (a): a stopped run makes no further LLM call.
             if stream is not None and stream.stop.is_set():
                 return _stopped(working_history, tool_records, "")
-            # 1. Call the LLM with the system message + a trimmed context window.
+            # 1. GH-190: the secondary cap's window first, then the token budget
+            #    keeps its newest whole earlier turns that fit beside the current
+            #    turn. Every call re-checks, since the run's results grow it.
+            window, window_current = _context_window(
+                working_history,
+                current_idx=current_idx,
+                max_messages=config.max_context_messages,
+            )
+            fitted = context_budget.fit(
+                window, current_idx=window_current, fixed_tokens=fixed_tokens, limit=token_limit
+            )
+            report.context_notice = (
+                ContextNotice(
+                    dropped_turns=fitted.dropped_turns, dropped_messages=fitted.dropped_messages
+                )
+                if fitted.dropped_turns
+                else None
+            )
+            if not fitted.fits:
+                # Even the current turn doesn't fit: no LLM call is made for it.
+                logger.warning(
+                    "Agent run refused before its LLM call: context too long"
+                    " (%d of %d tokens, %d tool calls)",
+                    fitted.used,
+                    token_limit,
+                    len(tool_records),
+                )
+                return self._terminal_error(
+                    history=working_history,
+                    tool_records=tool_records,
+                    message=context_budget.CONTEXT_TOO_LONG_MESSAGE,
+                    error_code="context_too_long",
+                )
             context = prompt_assembly.assemble(
                 prompt_inputs,
                 tools=descriptions,
                 now=now,
-                history=_context_window(
-                    working_history,
-                    current_idx=current_idx,
-                    max_messages=config.max_context_messages,
-                ),
+                history=fitted.messages,
                 # GH-189: slot 4 opens the context's current user message on
                 # every call; the history itself keeps the user's text.
                 attachments=attachments,
@@ -746,7 +862,7 @@ class Agent:
                     tool_policy=tool_policy,
                     session_id=session_id,
                     pending_confirmation=carry_confirmation,
-                    escalate_side_effects=received_untrusted,
+                    escalate_side_effects=report.external_content,
                     attachment_ids=attachment_ids,
                 )
                 if dispatched is None:
@@ -756,8 +872,11 @@ class Agent:
                 result, dispatch_duration_ms = dispatched
                 carry_confirmation = None  # consumed on the first dispatch
                 # GH-243: from here on, later calls (this batch's included)
-                # are escalated once a result carried external content.
-                received_untrusted = received_untrusted or untrusted.contains_wrapped(result.result)
+                # are escalated once a result carried external content. GH-190:
+                # judged on the FULL result, before the cut below.
+                report.external_content = report.external_content or untrusted.contains_wrapped(
+                    result.result
+                )
                 # M-4 design note: EVERY dispatch (including denied and
                 # validation-failed calls) counts against the cap.  This is
                 # intentional — it prevents the LLM from cheaply probing
@@ -807,10 +926,13 @@ class Agent:
                 # Feed the tool result back to the LLM as a tool-role message.
                 # Carry tool_call_id from the ToolCall so Anthropic/OpenAI can
                 # link the result to the originating tool_use/tool_call block.
+                # GH-190: a result over the cap is sent and stored cut.
                 working_history.append(
                     LLMMessage(
                         role="tool",
-                        content=result.result,
+                        content=context_budget.truncate_tool_result(
+                            result.result, config.max_tool_result_tokens
+                        ),
                         tool_call_id=tool_call.tool_call_id,
                     )
                 )
@@ -988,7 +1110,8 @@ class Agent:
         escalate_side_effects: bool,
         attachment_ids: tuple[UUID, ...],
         stream: RunStream | None,
-    ) -> AgentResult | None:
+        max_tool_result_tokens: int,
+    ) -> ToolCallResult | AgentResult:
         """Resume an approved pending confirmation by dispatching the tool call.
 
         Called once at the top of ``run()`` when resuming. Dispatches the
@@ -997,10 +1120,12 @@ class Agent:
         with the run's ``escalate_side_effects`` (GH-243: an escalated call
         stays an escalated ``confirm``) and ``attachment_ids`` (GH-189, for
         the recorder), appends the resulting
-        ``tool_result`` to ``working_history``, and records the call in
+        ``tool_result`` to ``working_history`` (GH-190: cut to
+        ``max_tool_result_tokens``), and records the call in
         ``tool_records`` (reported to ``stream`` when the run is streamed).
 
-        Returns ``None`` on success, or a terminal ``AgentResult`` if the
+        Returns the dispatch's full, uncut result on success (the caller
+        judges escalation on it), or a terminal ``AgentResult`` if the
         dispatch could not be recorded (H-1) — in which case the caller must
         return it immediately, before any LLM call.
 
@@ -1040,11 +1165,11 @@ class Agent:
         working_history.append(
             LLMMessage(
                 role="tool",
-                content=result.result,
+                content=context_budget.truncate_tool_result(result.result, max_tool_result_tokens),
                 tool_call_id=tool_call.tool_call_id,
             )
         )
-        return None
+        return result
 
     def _terminal_limit(
         self,
@@ -1128,13 +1253,14 @@ def _context_window(
     *,
     current_idx: int | None,
     max_messages: int,
-) -> list[LLMMessage]:
-    """Return the history part of one LLM call's context.
+) -> tuple[list[LLMMessage], int]:
+    """Return the history part of one LLM call's context before the token budget.
 
     ``history`` must hold no ``system`` messages (see
-    :func:`_drop_system_messages`). ``prompt_assembly.assemble`` puts the
-    run's system message before the result, so ``max_messages`` counts it.
-    The result is:
+    :func:`_drop_system_messages`). With a cap (``max_messages`` > 0, the
+    secondary cap of GH-190), ``prompt_assembly.assemble`` puts the run's
+    system message before the window, so ``max_messages`` counts it. The
+    window is then:
 
     - the current user message ``history[current_idx]``, exactly once — the
       system message and this message are the floor and are always sent, even
@@ -1143,24 +1269,40 @@ def _context_window(
       remaining budget via :func:`_trim_context` (which also drops leading
       orphaned ``tool`` results).
 
-    ``current_idx`` is ``None`` only when the history holds no user message to
-    pin; the result is then the trimmed history alone.
-
     The pinned message goes back to its chronological position: a window that
     reaches into the messages before it holds every message after it, and the
     first message after it is the assistant turn answering it, so no orphaned
     ``tool`` result can follow it.
+
+    Without a cap (``max_messages`` 0) the window is the whole history without
+    its leading ``tool`` messages: a loaded history can start with results
+    whose assistant call lies before the load limit, and a result is never
+    sent without its call.
+
+    ``current_idx`` is ``None`` only on a resumed confirmation whose history
+    holds no user message (the request lies before the load limit): every
+    message of it then comes after the request, so the whole window is the
+    current turn.
+
+    Returns:
+        The window and the index in it where the current turn starts (the
+        current user message; 0 when ``current_idx`` is None).
     """
+    if max_messages == 0:
+        start = 0
+        while start < len(history) and history[start].role == "tool":
+            start += 1
+        return history[start:], 0 if current_idx is None else current_idx - start
     budget = max_messages - 1  # the system message
     if current_idx is None:
         # Guard budget <= 0 so _trim_context does not emit its L-5 warning.
-        return _trim_context(history, budget) if budget > 0 else []
+        return (_trim_context(history, budget) if budget > 0 else []), 0
     pinned = history[current_idx]
     after = history[current_idx + 1 :]
     budget -= 1  # the pinned message
     tail = _trim_context(history[:current_idx] + after, budget) if budget > 0 else []
     insert_at = max(0, len(tail) - len(after))
-    return [*tail[:insert_at], pinned, *tail[insert_at:]]
+    return [*tail[:insert_at], pinned, *tail[insert_at:]], insert_at
 
 
 def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessage]:
@@ -1228,37 +1370,6 @@ def _filter_mid_system(messages: list[LLMMessage]) -> list[LLMMessage]:
         else:
             filtered.append(msg)
     return filtered
-
-
-def _tool_descriptions_to_payload(
-    descriptions: list[ToolDescription],
-) -> list[dict[str, object]]:
-    """Convert registry tool descriptions to the provider ``tools`` array format.
-
-    Each tool is described as::
-
-        {
-            "type": "function",
-            "function": {
-                "name": "<tool>.<action>",
-                "description": "...",
-                "parameters": { ...json schema... }
-            }
-        }
-    """
-    payload: list[dict[str, object]] = []
-    for desc in descriptions:
-        payload.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": f"{desc.tool}.{desc.action}",
-                    "description": desc.description,
-                    "parameters": desc.parameters_schema,
-                },
-            }
-        )
-    return payload
 
 
 def _safe_identifier(value: str) -> str:
