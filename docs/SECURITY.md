@@ -274,7 +274,11 @@ the dispatch layer in `tools/registry.py`):
   block never leaves it open: the kept part ends with the block's own end marker on a
   line of its own, then the cut marker, all within the cap, so a look-alike close tag or
   a forged truncation note before the cut point still sits inside the block. A block
-  that starts past the cut is dropped whole, its begin marker included. So the
+  that starts past the cut keeps none of its content: at most a piece of its begin
+  marker stays. The tool layer already limits every result to 65,536 characters with a
+  plain slice, which can end inside a block; such a result is closed the same way, even
+  when it fits the cap. A cut result is never longer than 65,536 characters and never
+  ends inside a block. So the
   escalation is decided on the full result, before the cut, and a run that received
   wrapped content reports it to the server, which sets the chat's sticky
   `external_content` mark (later turns escalate too, and an untitled chat gets its
