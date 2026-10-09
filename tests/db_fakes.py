@@ -513,7 +513,19 @@ Retrying a failed answer (GH-245, migration 0031; contract C1, C2, C5):
   chat and org) is ``error`` or ``stopped`` (``FAILED_TURN_STATUSES``); no
   assistant or tool row of the chat follows it (user rows, e.g. an org notice,
   may); a user row at or before it exists (the turn starts at the latest
-  one). NULL arguments are refused the same way (the function isn't STRICT).
+  one); every row strictly between that user row and through_seq is what a
+  real failed turn holds there (C1', security audit M-1, with C1'b): a
+  ``tool`` row or an ``assistant`` row with at least one tool_use block
+  (``coalesce(jsonb_array_length(tool_use_blocks), 0) > 0``: NULL and ``[]``
+  are none), with status ``complete`` or ``awaiting_confirmation``
+  (``FAILED_TURN_BODY_STATUSES``), or an ``assistant`` row with status
+  ``error`` (C1'b: GH-25 D9's partial reply of a streamed run that timed out
+  after text, stored ``error`` as part of the failed answer; 0031 backfills
+  the ones stored ``complete`` before). So a forged ``error`` row after a
+  completed answer (stored ``complete``; admino_app can't UPDATE it), a
+  completed tool turn or a ``limit_reached`` notice is refused (a forged row
+  after a still-awaiting tool call is not: the documented residual). NULL
+  arguments are refused the same way (the function isn't STRICT).
   Then every attachment of the turn user row in that chat and org (trashed and
   excluded ones too) gets ``message_id`` NULL and ``updated_at`` now, and the
   chat's rows from the turn's seq to through_seq are deleted (the ON DELETE
@@ -1529,6 +1541,10 @@ DELETE_FAILED_TURN: Final = "delete_failed_turn"
 DELETE_FAILED_TURN_REFUSAL: Final = "only a failed turn of a live chat can be deleted"
 # The statuses the row at through_seq must have (the function's IN list).
 FAILED_TURN_STATUSES: Final = frozenset({"error", "stopped"})
+# C1' (security audit M-1): the statuses a tool row or a tool_use assistant row
+# strictly between the turn's user row and through_seq must have (the shape
+# check's IN list; C1'b admits any assistant row with status 'error' besides).
+FAILED_TURN_BODY_STATUSES: Final = frozenset({"complete", "awaiting_confirmation"})
 # The function's parameters in order, as asyncpg encodes them (uuid x 3, bigint).
 _DELETE_FAILED_TURN_KINDS: Final = ("uuid", "uuid", "uuid", "int8")
 _FUNCTION_NAME: Final = r'(?:"?public"?\.)?"?(\w+)"?'
@@ -1553,6 +1569,29 @@ _DOLLAR_QUOTE_RE: Final = re.compile(r"\$(\w*)\$")
 _DELETE_FAILED_TURN_RE: Final = re.compile(
     rf"select (?:public\.)?{DELETE_FAILED_TURN} ?\((?P<args>[^()]*)\)(?: as (?P<alias>\w+))?;?"
 )
+
+
+def _failed_turn_body_row(row: Mapping[str, Any]) -> bool:
+    """Whether a stored chat_messages row may sit strictly between a failed turn's user
+    row and through_seq (C1', security audit M-1, amended by C1'b): what the shape
+    check's ``NOT (...)`` admits, ``(status IN ('complete', 'awaiting_confirmation') AND
+    (role = 'tool' OR (role = 'assistant' AND
+    coalesce(jsonb_array_length(tool_use_blocks), 0) > 0))) OR (role = 'assistant' AND
+    status = 'error')``. The second branch is GH-25 D9's partial reply (a streamed run
+    that timed out after text), stored ``error`` with the failed answer since C1'b.
+    status and role are NOT NULL; ``tool_use_blocks`` is NULL or a JSON array (its CHECK),
+    so a NULL or ``[]`` column counts no tool_use block."""
+    if row["role"] == "assistant" and row["status"] == "error":
+        return True
+    if row["status"] not in FAILED_TURN_BODY_STATUSES:
+        return False
+    if row["role"] == "tool":
+        return True
+    if row["role"] != "assistant" or row["tool_use_blocks"] is None:
+        return False
+    blocks = json.loads(row["tool_use_blocks"])
+    assert isinstance(blocks, list), "chat_messages_tool_use_blocks_check keeps an array"
+    return len(blocks) > 0
 
 
 @dataclass(frozen=True)
@@ -3879,7 +3918,15 @@ class FakeDb:
         an InsufficientPrivilegeError ``DELETE_FAILED_TURN_REFUSAL`` with
         nothing changed: the live chat of that org and owner; the row at
         through_seq ended ``error`` or ``stopped``; no assistant or tool row
-        after it; the latest user row at or before it (the turn). Then the
+        after it; the latest user row at or before it (the turn); then (C1',
+        security audit M-1) the turn's shape: every row strictly between that
+        user row and through_seq is a ``tool`` row or an ``assistant`` row with
+        at least one tool_use block, ``complete`` or ``awaiting_confirmation``
+        (what a real failed turn holds there: tool calls, their results, an
+        approval's awaiting row), or (C1'b) an ``assistant`` row with status
+        ``error`` (GH-25 D9's partial reply before the error reply), so a row
+        admino_app forged after a completed answer, tool turn or
+        ``limit_reached`` notice deletes nothing. Then the
         turn user row's attachments are unlinked (``message_id`` NULL,
         ``updated_at`` now; trashed and excluded ones too) and the rows from
         the turn's seq to through_seq are deleted (their cascade reaches no
@@ -3947,6 +3994,11 @@ class FakeDb:
         if not users:
             raise refusal
         turn = max(users, key=lambda row: row["seq"])
+        if any(
+            turn["seq"] < row["seq"] < through_seq and not _failed_turn_body_row(row)
+            for row in rows
+        ):
+            raise refusal
         if DELETE_FAILED_TURN not in functions.security_definer:
             # Run as admino_app, the body's DELETE is refused and the statement undone.
             msg = "permission denied for table chat_messages"

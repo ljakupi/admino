@@ -17,21 +17,33 @@ What is pinned:
   30; run_migrations applies it after 0030 (once). It opens with a header comment that
   names delete_failed_turn, says chat_messages stays append-only for admino_app (no
   UPDATE or DELETE), that the function is SECURITY DEFINER with a pinned search_path,
-  that the turn's files are unlinked first, that #182 replaces it, and the grants.
-- Exactly three top-level statements, in this order: ``CREATE FUNCTION
+  that the turn's files are unlinked first, that #182 replaces it, and the grants; since
+  the audit fixes it also names the turn's ``shape`` check (C1'), its ``residual`` and
+  the ``backfill`` of GH-25 D9's timeout partials (C1'b).
+- Exactly four top-level statements, in this order: ``CREATE FUNCTION
   delete_failed_turn(target_chat uuid, target_org uuid, target_owner uuid, through_seq
   bigint) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public,
   pg_temp`` (not OR REPLACE, no other option); ``REVOKE ALL ON FUNCTION
   delete_failed_turn(uuid, uuid, uuid, bigint) FROM PUBLIC``; ``GRANT EXECUTE ON FUNCTION
-  delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app`` (no grant option).
+  delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app`` (no grant option); the
+  C1'b backfill ``UPDATE chat_messages m SET status = 'error' WHERE ...`` exactly as the
+  contract states it (normalized like the body): every ``assistant`` row stored
+  ``complete`` without tool_use blocks whose next row in its chat by seq is an
+  ``assistant`` ``error`` row (a D9 partial stored before C1'b) becomes ``error``.
 - The function body equals the contract's statement for statement (comments blanked,
-  whitespace collapsed, keywords case-insensitive, '...' literals byte for byte). Every
-  RAISE is ``RAISE EXCEPTION 'only a failed turn of a live chat can be deleted' USING
+  whitespace collapsed, keywords case-insensitive, '...' literals byte for byte),
+  including C1' (security audit M-1): after the turn's user row is found and before the
+  unlink, the turn's shape is checked (every row strictly between that user row and
+  through_seq is a ``tool`` row or an ``assistant`` row with at least one tool_use
+  block, ``complete`` or ``awaiting_confirmation``, or, C1'b, an ``assistant`` row with
+  status ``error``: GH-25 D9's partial reply before the error reply). Five RAISEs, every
+  RAISE ``RAISE EXCEPTION 'only a failed turn of a live chat can be deleted' USING
   ERRCODE = 'insufficient_privilege'`` (a plain literal: no row data), and the body runs
   static SQL only (no EXECUTE, format() or quoting helpers).
 - Nothing else: no table, column, index, trigger, rule, policy, role or schema change,
-  no table GRANT or REVOKE, no DO block, no data write outside the function body, no
-  default privileges, no OWNER TO, no SET ROLE, also not nested in a body or a literal.
+  no table GRANT or REVOKE, no DO block, no data write outside the function body but
+  the one backfill UPDATE on chat_messages, no default privileges, no OWNER TO, no SET
+  ROLE, also not nested in a body or a literal.
 - After every shipped migration: admino_app holds exactly SELECT, INSERT on
   chat_messages (never UPDATE or DELETE), PUBLIC nothing; every table's privileges are
   what they were after 0030. admino_app may EXECUTE exactly purge_audit_events(integer),
@@ -45,9 +57,17 @@ What is pinned:
 
 Security notes:
 - The runtime role still can't UPDATE or DELETE a chat message: the only delete path is
-  the owner-run function, which checks the chat's org, owner and liveness and the turn's
-  failed status itself, so a bug or injected SQL running as admino_app can delete at most
-  the caller-named chat's failed last turn, never another org's or a colleague's rows.
+  the owner-run function, which checks the chat's org, owner and liveness, the turn's
+  failed status and the turn's shape itself, so a bug or injected SQL running as
+  admino_app can delete at most the caller-named chat's failed last turn, never another
+  org's or a colleague's rows. admino_app can INSERT rows and un-trash a chat, so the
+  shape check (C1', security audit M-1) is what keeps a forged ``error`` row after a
+  completed answer, tool turn or ``limit_reached`` notice from erasing that turn; the
+  documented residual is a turn whose tail is a still-awaiting confirmation, an already
+  failed turn and rows the role forged itself. Admitting ``assistant`` ``error`` rows
+  (C1'b) opens nothing: a completed answer stays ``complete`` (admino_app can't UPDATE
+  it), so a forged row after it is still refused; the backfill runs as the migration
+  owner, once, and only turns a D9 partial (followed by its error reply) into ``error``.
 - SECURITY DEFINER with ``search_path = public, pg_temp`` (two names, not one literal):
   the function can't be hijacked through objects in another schema.
 - The refusal names no chat, org, user or row: the error carries no data.
@@ -113,7 +133,7 @@ _ARGUMENTS: Final = (
 _SEARCH_PATH: Final = ("public", "pg_temp")
 _REFUSAL: Final = "only a failed turn of a live chat can be deleted"
 _ERRCODE: Final = "insufficient_privilege"
-_RAISE_COUNT: Final = 4
+_RAISE_COUNT: Final = 5
 _MESSAGES: Final = "chat_messages"
 _PURGES: Final = ("purge_audit_events(integer)", "purge_org_audit_events(uuid)")
 _EXECUTABLE: Final = frozenset({*_PURGES, _SIGNATURE})
@@ -156,6 +176,18 @@ BEGIN
         RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
             USING ERRCODE = 'insufficient_privilege';
     END IF;
+    PERFORM 1 FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org
+        AND seq > turn_seq AND seq < through_seq
+        AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                AND (role = 'tool'
+                    OR (role = 'assistant'
+                        AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+            OR (role = 'assistant' AND status = 'error'));
+    IF FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
     UPDATE attachments SET message_id = NULL, updated_at = now()
     WHERE message_id = turn_id AND chat_id = target_chat AND org_id = target_org;
     DELETE FROM chat_messages
@@ -164,6 +196,23 @@ BEGIN
     GET DIAGNOSTICS deleted = ROW_COUNT;
     RETURN deleted;
 END;
+"""
+
+# C1'b: 0031's fourth statement, the backfill of GH-25 D9 partials stored ``complete``
+# before the append rule (validated on postgres:16: RUN_DIR/audit-fix-0031-validated.sql).
+_CONTRACT_BACKFILL: Final = """
+UPDATE chat_messages m SET status = 'error'
+WHERE m.role = 'assistant' AND m.status = 'complete'
+    AND coalesce(jsonb_array_length(m.tool_use_blocks), 0) = 0
+    AND EXISTS (
+        SELECT 1 FROM chat_messages n
+        WHERE n.chat_id = m.chat_id AND n.org_id = m.org_id
+            AND n.seq = (
+                SELECT min(x.seq) FROM chat_messages x
+                WHERE x.chat_id = m.chat_id AND x.org_id = m.org_id AND x.seq > m.seq
+            )
+            AND n.role = 'assistant' AND n.status = 'error'
+    )
 """
 
 # Argument / type spellings PostgreSQL treats as one type.
@@ -215,9 +264,9 @@ _FORBIDDEN: Final[dict[str, str]] = {
     "security invoker": r"\bsecurity invoker\b",
     "disable": r"\bdisable\b",
 }
-# Data writes that may only appear inside the function body.
+# Data writes that may only appear inside the function body (C1'b: but the backfill).
 _TOP_LEVEL_WRITES: Final[dict[str, str]] = {
-    "update": r"\bupdate (?:only )?\S+ set\b",
+    "update": r"\bupdate (?:only )?\S+(?: (?:as )?(?!set\b)\w+)? set\b",
     "delete": r"\bdelete from\b",
     "select": r"^select\b|\bperform\b",
 }
@@ -323,13 +372,15 @@ def _raises() -> list[tuple[str, str, str]]:
 
 
 def _kind(statement: _Statement) -> str:
-    """create function / revoke / grant, else the statement itself."""
+    """create function / revoke / grant / update, else the statement itself."""
     if _function_of(statement.raw) is not None:
         return "create function"
     if re.match(r"revoke\b", statement.masked):
         return "revoke"
     if re.match(r"grant\b", statement.masked):
         return "grant"
+    if re.match(r"update\b", statement.masked):
+        return "update"
     return statement.norm
 
 
@@ -554,7 +605,10 @@ class TestMigration0031File:
     def test_migration_0031_opens_with_a_header_comment_naming_what_it_adds(self) -> None:
         """What, why and grants, before any statement: the function, chat_messages staying
         append-only for admino_app (no UPDATE or DELETE), SECURITY DEFINER with a pinned
-        search_path, the files unlinked first, #182, and what is granted."""
+        search_path, the files unlinked first, #182, and what is granted; and the audit
+        fixes: the turn's ``shape`` check (C1'), its ``residual`` (what a compromised
+        runtime role can still remove) and the ``backfill`` of the GH-25 D9 partials
+        stored before (C1'b)."""
         lines = _header_lines()
         header = " ".join(lines)
 
@@ -572,6 +626,11 @@ class TestMigration0031File:
             is not None,
             "names #182": "#182" in header,
             "says what is granted": re.search(r"\bgrant", header, re.IGNORECASE) is not None,
+            "says the turn's shape is checked": re.search(r"\bshape\b", header, re.IGNORECASE)
+            is not None,
+            "names the residual": re.search(r"\bresidual\b", header, re.IGNORECASE) is not None,
+            "says the D9 partials are backfilled": re.search(r"\bbackfill", header, re.IGNORECASE)
+            is not None,
         }
 
         assert len(lines) >= 3
@@ -584,19 +643,34 @@ class TestMigration0031File:
 
 
 class TestMigration0031Statements:
-    """CREATE FUNCTION, REVOKE ALL FROM PUBLIC, GRANT EXECUTE TO admino_app; nothing else."""
+    """CREATE FUNCTION, REVOKE ALL FROM PUBLIC, GRANT EXECUTE TO admino_app, the D9
+    backfill UPDATE; nothing else."""
 
-    def test_migration_0031_runs_exactly_the_three_statements_in_the_contract_order(
+    def test_migration_0031_runs_exactly_the_four_statements_in_the_contract_order(
         self,
     ) -> None:
         """The function first (a privilege on a missing function fails), then the REVOKE
-        from PUBLIC, then the GRANT: no other top-level statement (so no data write, DO
-        block or table change outside the function body)."""
+        from PUBLIC, then the GRANT, then C1'b's backfill UPDATE: no other top-level
+        statement (so no other data write, DO block or table change outside the function
+        body)."""
         assert [_kind(statement) for statement in _top_statements()] == [
             "create function",
             "revoke",
             "grant",
+            "update",
         ]
+
+    def test_migration_0031_backfill_is_the_contract_update_statement(self) -> None:
+        """C1'b: the fourth statement is the contract's UPDATE, statement for statement
+        (comments, layout and keyword case aside, '...' literals byte for byte): an
+        ``assistant`` row stored ``complete`` without tool_use blocks (NULL or ``[]``)
+        becomes ``error`` only when its chat's next row by seq (same chat and org) is an
+        ``assistant`` ``error`` row, so a D9 partial stored before C1'b joins its failed
+        answer and a completed answer followed by a user row (or by nothing) is kept."""
+        statements = _top_statements()
+
+        assert len(statements) == 4, [_kind(statement) for statement in statements]
+        assert _body_statements(statements[3].raw) == _body_statements(_CONTRACT_BACKFILL)
 
     def test_migration_0031_revokes_all_on_the_function_from_public_only(self) -> None:
         """The file's only REVOKE (nested ones included): ALL (EXECUTE, a function's only
@@ -637,17 +711,20 @@ class TestMigration0031Statements:
         assert fragments, f"{_MIGRATION_NAME} runs nothing"
         assert offenders == []
 
-    def test_migration_0031_writes_no_data_outside_the_function_body(self) -> None:
-        """No UPDATE, DELETE, SELECT or PERFORM at the top level (the body's DML runs only
-        when admino_app calls the function)."""
-        offenders = [
-            (kind, statement.masked)
+    def test_migration_0031_writes_no_data_outside_the_function_body_but_the_backfill(
+        self,
+    ) -> None:
+        """At the top level exactly one UPDATE, DELETE, SELECT or PERFORM: C1'b's backfill
+        UPDATE on chat_messages (the body's DML runs only when admino_app calls the
+        function); no other data write, no DELETE, no other table updated."""
+        writes = [
+            (kind, _body_statements(statement.raw))
             for statement in _top_statements()
             for kind, pattern in _TOP_LEVEL_WRITES.items()
             if re.search(pattern, statement.masked)
         ]
 
-        assert offenders == []
+        assert writes == [("update", _body_statements(_CONTRACT_BACKFILL))]
 
 
 # ---------------------------------------------------------------------------
@@ -712,14 +789,18 @@ class TestMigration0031FunctionBody:
     def test_migration_0031_body_is_the_contract_body_statement_for_statement(self) -> None:
         """The live, owned chat; the row at through_seq ended as error or stopped; no
         assistant or tool row after it; the turn's start (the latest user message at or
-        before it); the files unlinked; the turn deleted; the deleted count returned.
-        Comments, layout and keyword case aside, statement for statement."""
+        before it); the turn's shape (C1', security audit M-1: only tool rows and
+        assistant rows with tool_use blocks, complete or awaiting_confirmation, or (C1'b)
+        assistant rows with status error, GH-25 D9's partial, strictly between that user
+        message and through_seq); the files unlinked; the turn
+        deleted; the deleted count returned. Comments, layout and keyword case aside,
+        statement for statement."""
         assert _body_statements(_shipped_body()) == _body_statements(_CONTRACT_BODY)
 
     def test_migration_0031_every_raise_is_the_plain_refusal_with_insufficient_privilege(
         self,
     ) -> None:
-        """Four RAISE EXCEPTION 'only a failed turn of a live chat can be deleted' USING
+        """Five RAISE EXCEPTION 'only a failed turn of a live chat can be deleted' USING
         ERRCODE = 'insufficient_privilege' (42501): a plain literal, so the error carries
         no chat, org, user or row data; no other RAISE (NOTICE, a format placeholder)."""
         assert _raises() == [("exception", _REFUSAL, _ERRCODE)] * _RAISE_COUNT

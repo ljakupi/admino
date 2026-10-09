@@ -41,11 +41,21 @@ What these tests pin down:
   NEW user row with their rows intact (never deleted), ``last_activity_at`` is bumped,
   ``external_content`` stays set, and an org notice stored after the failed answer is
   kept before the new turn. A refusal (n a ``complete`` row, another chat's failed
-  row) raises ``asyncpg.InsufficientPrivilegeError`` and changes nothing (no insert,
-  no link, rolled back); a trashed, a colleague's, another org's or an unknown chat is
+  row, an ``error`` row forged after a completed tool turn: C1', security audit M-1)
+  raises ``asyncpg.InsufficientPrivilegeError`` and changes nothing (no insert, no
+  link, rolled back); a trashed, a colleague's, another org's or an unknown chat is
   ``ChatNotFoundError`` and the function is never called; ``messages`` without a
   ``user`` message is ``ValueError`` before any statement; the default (omitted or
   None) runs exactly today's statements.
+- The failed answer's partial (C1'b, Decision 7, GH-25 D9): with ``final_status``
+  ``"error"`` every NON-last ``assistant`` message without tool_use blocks (None or
+  ``[]``) is stored ``error`` too (a streamed run's text shown before it timed out),
+  while non-last assistant messages WITH blocks, ``tool`` and ``user`` messages stay
+  ``complete``; with ``complete``, ``stopped``, ``awaiting_confirmation`` or
+  ``limit_reached`` every non-last row stays ``complete``. Such a D9 turn
+  (``U A(partial, error) A(error)``) is a target and is replaced (3 rows), also when a
+  retry itself timed out after text (stored by ``append_messages(..., replace_through=n,
+  final_status="error")``, then retried again).
 - A retry of a retry through the three functions (Decision 2: V1 keeps nothing of a
   failed turn).
 - Tenant isolation (§5): every statement binds the caller's org, every statement on
@@ -203,6 +213,19 @@ _TARGET_SHAPES: Final[dict[str, tuple[tuple[_Spec, ...], str, str, str]]] = {
             ("a2", "assistant", "I'll add it.", "complete", {"tool_use_blocks": [CREATE_CALL]}),
             ("t2", "tool", PENDING_LIMIT_RESULT, "complete", {"tool_call_id": "call_create_3"}),
             ("a3", "assistant", "Action google_calendar.create was not run.", "error", {}),
+        ),
+        "a3",
+        "error",
+        "u2",
+    ),
+    # C1'b (GH-25 D9): a streamed run that timed out after text, its partial stored error.
+    "timeout-partial-error": (
+        (
+            _U1,
+            _A1,
+            ("u2", "user", MESSAGE_CANARY, "complete", {}),
+            ("a2", "assistant", "Day one: Zurich ", "error", {}),
+            ("a3", "assistant", ANSWER_CANARY, "error", {}),
         ),
         "a3",
         "error",
@@ -969,6 +992,121 @@ async def test_chats_retry_append_stores_the_runs_status_and_tool_calls_on_the_l
     assert [row["tool_calls"] for row in rows[len(_MAIN_KEPT) : -1]] == [None] * 3
 
 
+# ---------------------------------------------------------------------------
+# 5b. The failed answer's partial is stored with it (C1'b, GH-25 D9)
+# ---------------------------------------------------------------------------
+
+_FINAL_STATUSES: Final = ("complete", "stopped", "awaiting_confirmation", "limit_reached")
+
+
+def _d9_turn(partial_blocks: list[dict[str, Any]] | None = None) -> list[LLMMessage]:
+    """A run's new messages ending in an error reply: the user message, a tool call and
+    its result, the text a streamed call showed before it timed out (no tool_use blocks:
+    None or ``[]``), then the error reply."""
+    return [
+        LLMMessage(role="user", content=MESSAGE_CANARY),
+        LLMMessage(role="assistant", content="Checking again.", tool_use_blocks=[MEMORY_CALL]),
+        LLMMessage(role="tool", content="one note", tool_call_id="call_mem_2"),
+        LLMMessage(role="assistant", content="Day one: Zurich ", tool_use_blocks=partial_blocks),
+        LLMMessage(role="assistant", content=ANSWER_CANARY),
+    ]
+
+
+@pytest.mark.parametrize("blocks", [None, []], ids=["null-blocks", "empty-blocks"])
+async def test_chats_retry_append_error_run_stores_its_blockless_partial_as_error(
+    chats: ModuleType, seeded: _Seeded, blocks: list[dict[str, Any]] | None
+) -> None:
+    """C1'b: final_status "error": the non-last assistant message without tool_use blocks
+    (the D9 partial) is stored ``error``, part of the failed answer; the user message,
+    the assistant message with a tool_use block and the tool result stay ``complete``;
+    the error reply (last) carries ``error`` as before."""
+    db = seeded.db
+    chat_id, _ = _shape_chat(seeded, (_U1, _A1))
+
+    await chats.append_messages(
+        db.pool, seeded.editor, chat_id, _d9_turn(blocks), final_status="error"
+    )
+
+    rows = db.messages_of(chat_id)[2:]
+    assert [(row["role"], row["status"]) for row in rows] == [
+        ("user", "complete"),
+        ("assistant", "complete"),
+        ("tool", "complete"),
+        ("assistant", "error"),
+        ("assistant", "error"),
+    ]
+
+
+async def test_chats_retry_append_only_an_error_run_marks_a_blockless_partial(
+    chats: ModuleType, seeded: _Seeded
+) -> None:
+    """C1'b: the rule is the error run's alone. The same messages stored with every
+    other final status keep every non-last row ``complete`` (the last row gets the
+    status); with ``error`` the blockless non-last answer is ``error`` too."""
+    db = seeded.db
+    stored: dict[str, list[str]] = {}
+    for status in ("error", *_FINAL_STATUSES):
+        chat_id, _ = _shape_chat(seeded, (_U1, _A1))
+        await chats.append_messages(
+            db.pool, seeded.editor, chat_id, _d9_turn(), final_status=status
+        )
+        stored[status] = [row["status"] for row in db.messages_of(chat_id)[2:]]
+
+    assert stored == {
+        "error": ["complete", "complete", "complete", "error", "error"],
+        **{status: ["complete"] * 4 + [status] for status in _FINAL_STATUSES},
+    }
+
+
+async def test_chats_retry_append_retry_that_timed_out_after_text_can_be_retried_again(
+    chats: ModuleType, seeded: _Seeded
+) -> None:
+    """C1'b with Decision 2: the retry of the main chat's failed turn times out after
+    text, so its new turn is stored ``U A(partial, error) A(error)`` in place of the old
+    one; that turn is the next target (the error reply, the same message and files) and
+    the next retry replaces it, leaving only the kept rows and the newest turn."""
+    db, pool, editor = seeded.db, seeded.db.pool, seeded.editor
+    kept = [row for row in db.messages_of(seeded.main) if row["seq"] < seeded.seq("q2")]
+    timed_out = [
+        LLMMessage(role="user", content=MESSAGE_CANARY),
+        LLMMessage(role="assistant", content="Day one: Zurich "),
+        LLMMessage(role="assistant", content=ANSWER_CANARY),
+    ]
+
+    await chats.append_messages(
+        pool,
+        editor,
+        seeded.main,
+        timed_out,
+        final_status="error",
+        attachment_ids=TURN_FILES,
+        replace_through=seeded.seq("a4"),
+    )
+    failed = [(row["role"], row["status"]) for row in db.messages_of(seeded.main)[len(kept) :]]
+    target = await chats.read_retry_target(pool, editor, seeded.main)
+    await chats.append_messages(
+        pool,
+        editor,
+        seeded.main,
+        _new_turn(target.message, "Done."),
+        attachment_ids=target.attachment_ids,
+        replace_through=target.through_seq,
+    )
+
+    rows = db.messages_of(seeded.main)
+    assert failed == [("user", "complete"), ("assistant", "error"), ("assistant", "error")]
+    assert (target.status, target.message, target.attachment_ids) == (
+        "error",
+        MESSAGE_CANARY,
+        TURN_FILES,
+    )
+    assert rows[: len(kept)] == kept
+    assert [(row["role"], row["content"], row["status"]) for row in rows[len(kept) :]] == [
+        ("user", MESSAGE_CANARY, "complete"),
+        ("assistant", "Done.", "complete"),
+    ]
+
+
 @pytest.mark.parametrize("chat", ["main", "user_stop"])
 async def test_chats_retry_append_moves_the_turns_files_to_the_new_user_message(
     chats: ModuleType, seeded: _Seeded, chat: str
@@ -1085,6 +1223,52 @@ async def test_chats_retry_append_refused_turn_raises_and_changes_nothing(
     assert db.snapshot() == before
     assert db.transactions[-1] == (calls[0].tx, "rollback:InsufficientPrivilegeError")
     assert MESSAGE_CANARY not in str(caught.value)
+
+
+async def test_chats_retry_append_forged_error_after_a_completed_turn_is_refused(
+    chats: ModuleType, seeded: _Seeded
+) -> None:
+    """C1' (security audit M-1): an ``error`` row stored after a completed tool turn (an
+    INSERT is all a compromised runtime role needs) makes the chat's latest row look
+    failed, but the replacing store is refused: InsufficientPrivilegeError, the
+    transaction rolled back, nothing deleted, inserted or linked (the turn's file stays on
+    its user row)."""
+    db = seeded.db
+    chat_id, stored = _shape_chat(
+        seeded,
+        (
+            _U1,
+            _A1,
+            ("u2", "user", MESSAGE_CANARY, "complete", {}),
+            ("a2", "assistant", "Checking.", "complete", {"tool_use_blocks": [CALENDAR_CALL]}),
+            ("t2", "tool", TOOL_CANARY, "complete", {"tool_call_id": "call_cal_1"}),
+            ("a3", "assistant", "You see the dentist on Monday.", "complete", {}),
+            ("forged", "assistant", ANSWER_CANARY, "error", {}),
+        ),
+    )
+    file_id = db.add_attachment(
+        chat_id, kind="pdf", status="ready", message_id=stored["u2"].id, created_at=_T1
+    )
+    target = await chats.read_retry_target(db.pool, seeded.editor, chat_id)
+    before = db.snapshot()
+    calls_before = len(db.calls)
+
+    with pytest.raises(asyncpg.InsufficientPrivilegeError) as caught:
+        await chats.append_messages(
+            db.pool,
+            seeded.editor,
+            chat_id,
+            _new_turn(),
+            attachment_ids=(file_id,),
+            replace_through=stored["forged"].seq,
+        )
+
+    calls = db.calls[calls_before:]
+    assert (target.through_seq, target.status) == (stored["forged"].seq, "error")
+    assert [_form(call) for call in calls] == ["S7", "R2"]
+    assert db.snapshot() == before
+    assert db.transactions[-1] == (calls[0].tx, "rollback:InsufficientPrivilegeError")
+    assert str(caught.value) == "only a failed turn of a live chat can be deleted"
 
 
 @pytest.mark.parametrize(

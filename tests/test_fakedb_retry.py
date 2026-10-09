@@ -18,6 +18,34 @@ and C2 (checked on postgres:16 as admino_app during preflight):
   rolls back with the transaction; fetchval / fetchrow / fetch / execute answer
   like asyncpg; the binds are checked like a chat statement; only the
   four-argument signature resolves. These are RED until 0031 ships.
+- The turn's shape (C1', security audit M-1, Decision 7; the cases of
+  RUN_DIR/audit-fix-pg-probe.sql, run on postgres:16 as admino_app): every
+  row strictly between the turn's user row and through_seq must be a ``tool``
+  row or an ``assistant`` row with at least one tool_use block, ``complete``
+  or ``awaiting_confirmation``. The real failed shapes pass with their counts
+  (a tool turn ending ``error`` 4, an approval continuation with its awaiting
+  row ending ``error`` 4, a stop on the user row 1, a stopped ``tool`` row
+  after an assistant row with two blocks 4, a stopped partial 2, GH-24's
+  pending-limit turn ``U A(tool_use) T(denied) A(error)`` 4, two tool rounds
+  ending ``error`` 6); a row admino_app forged after a completed answer,
+  after a completed tool turn, after a ``limit_reached`` notice or after an
+  answer whose tool_use_blocks is ``[]`` is refused with nothing changed (the
+  turn's file stays linked), also when the function isn't SECURITY DEFINER
+  (the check runs before the body's DELETE); every (middle row kind, status)
+  cell is decided by that rule; the documented residual, a row forged after a
+  still-awaiting tool call, deletes 3.
+- GH-25 D9 partials (C1'b, Decision 7; RUN_DIR/audit-fix-pg-legacy.sql and
+  audit-fix-pg-after.sql on postgres:16): a streamed run that timed out after
+  text stores its partial reply (an ``assistant`` row without tool_use
+  blocks) right before the error reply, now with status ``error``, and the
+  shape check also admits ``assistant`` rows with status ``error``. The new
+  D9 turn ``U A(partial, error) A(error)`` deletes 3 (also with ``[]``
+  blocks), a tool turn ending in a D9 partial deletes 5; the grid admits an
+  ``assistant`` ``error`` row of every block kind in the middle (a ``tool``
+  ``error`` row stays refused). A legacy D9 turn whose partial is still
+  ``complete`` (stored before C1'b; on PostgreSQL 0031's backfill UPDATE turns
+  it into ``error``, the fake runs no migration data statement) is refused
+  like the forged row it can't be told from, nothing changed.
 - Before a migration creates the function (0030's migrations,
   ``monkeypatch.setattr(db_fakes, "shipped_functions", ...)``) the call is
   UndefinedFunctionError; a 0031 without the GRANT is "permission denied for
@@ -52,13 +80,18 @@ from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, ShippedFunctions
 REFUSAL = "only a failed turn of a live chat can be deleted"
 DELETE_SQL = "SELECT delete_failed_turn($1, $2, $3, $4)"
 
-# Contract C1: migration 0031, the statements exactly as the contract states them.
+# Contract C1 (with C1', security audit M-1, and C1'b, GH-25 D9 partials): migration
+# 0031, the statements exactly as the contract states them.
 MIGRATION_0031 = """\
 -- GH-245: retry a failed chat answer. chat_messages stays append-only for
 -- admino_app (no UPDATE or DELETE). delete_failed_turn runs as the owner
 -- (SECURITY DEFINER, pinned search_path) and deletes only a live chat's failed
--- last turn, after unlinking the turn's files (never cascaded); it refuses
--- anything else. #182 (versions) replaces it. EXECUTE to admino_app only.
+-- last turn (the shape check: only tool calls, their results, an approval's
+-- awaiting row and the failed answer's error rows between its user row and
+-- the failed row: security audit M-1; the residual is a turn ending in a
+-- still-awaiting call), after unlinking the turn's files (never cascaded); it
+-- refuses anything else. #182 (versions) replaces it. EXECUTE to admino_app
+-- only. The backfill marks GH-25 D9 timeout partials stored before as error.
 CREATE FUNCTION delete_failed_turn(
     target_chat uuid, target_org uuid, target_owner uuid, through_seq bigint
 ) RETURNS bigint
@@ -100,6 +133,18 @@ BEGIN
         RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
             USING ERRCODE = 'insufficient_privilege';
     END IF;
+    PERFORM 1 FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org
+        AND seq > turn_seq AND seq < through_seq
+        AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                AND (role = 'tool'
+                    OR (role = 'assistant'
+                        AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+            OR (role = 'assistant' AND status = 'error'));
+    IF FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
     UPDATE attachments SET message_id = NULL, updated_at = now()
     WHERE message_id = turn_id AND chat_id = target_chat AND org_id = target_org;
     DELETE FROM chat_messages
@@ -112,6 +157,19 @@ $$;
 
 REVOKE ALL ON FUNCTION delete_failed_turn(uuid, uuid, uuid, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app;
+
+UPDATE chat_messages m SET status = 'error'
+WHERE m.role = 'assistant' AND m.status = 'complete'
+    AND coalesce(jsonb_array_length(m.tool_use_blocks), 0) = 0
+    AND EXISTS (
+        SELECT 1 FROM chat_messages n
+        WHERE n.chat_id = m.chat_id AND n.org_id = m.org_id
+            AND n.seq = (
+                SELECT min(x.seq) FROM chat_messages x
+                WHERE x.chat_id = m.chat_id AND x.org_id = m.org_id AND x.seq > m.seq
+            )
+            AND n.role = 'assistant' AND n.status = 'error'
+    );
 """
 _GRANT_LINE = (
     "GRANT EXECUTE ON FUNCTION delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app;\n"
@@ -612,6 +670,280 @@ class TestDeleteFailedTurn:
         )
 
         assert (len(refused), deleted) == (2, 1)
+
+
+# ---------------------------------------------------------------------------
+# 1b. The turn's shape (C1', security audit M-1; RED until 0031 ships)
+# ---------------------------------------------------------------------------
+
+# A row of a seeded turn: (role, content, status, extra add_chat_message keywords).
+_Row = tuple[str, str, str, dict[str, Any]]
+
+_TWO_BLOCKS = [
+    {"type": "tool_use", "id": "toolu_1", "name": "memory_read", "input": {}},
+    {"type": "tool_use", "id": "toolu_2", "name": "memory_read", "input": {}},
+]
+_SECOND_CALL = [{"type": "tool_use", "id": "toolu_2", "name": "memory_list", "input": {}}]
+_CREATE_CALL = [
+    {"type": "tool_use", "id": "toolu_c", "name": "google_calendar_create", "input": {}}
+]
+# GH-24: the closing tool result of a confirmation refused at the pending limit.
+_PENDING_LIMIT_RESULT = "Tool call denied: too many confirmations are pending."
+
+_U: _Row = ("user", "question", "complete", {})
+_CALL: _Row = ("assistant", "", "complete", {"tool_use_blocks": _TOOL_USE})
+_RESULT: _Row = ("tool", "result", "complete", {"tool_call_id": "toolu_1"})
+_ERROR: _Row = ("assistant", "The provider failed.", "error", {})
+_FINAL: _Row = ("assistant", "final answer", "complete", {})
+_FORGED_ERROR: _Row = ("assistant", "forged", "error", {})
+# GH-25 D9 (C1'b): a streamed run's text shown before it timed out, stored ``error``
+# (no tool_use blocks) right before the error reply.
+_D9_PARTIAL: _Row = ("assistant", "Day one: Zurich ", "error", {})
+_TIMEOUT_ERROR: _Row = ("assistant", "The request timed out.", "error", {})
+
+# The real failed turns (what the server stores) and how many rows each deletes.
+_REAL_TURNS: dict[str, tuple[tuple[_Row, ...], int]] = {
+    "tool-turn-error": ((_U, _CALL, _RESULT, _ERROR), 4),
+    "approval-continuation-error": (
+        (
+            _U,
+            ("assistant", "", "awaiting_confirmation", {"tool_use_blocks": _TOOL_USE}),
+            _RESULT,
+            _ERROR,
+        ),
+        4,
+    ),
+    "stopped-user-row": ((("user", "question", "stopped", {}),), 1),
+    "stopped-tool-row-after-two-blocks": (
+        (
+            _U,
+            ("assistant", "partial text", "complete", {"tool_use_blocks": _TWO_BLOCKS}),
+            _RESULT,
+            ("tool", "cut", "stopped", {"tool_call_id": "toolu_2"}),
+        ),
+        4,
+    ),
+    "stopped-partial": ((_U, ("assistant", "part", "stopped", {})), 2),
+    "pending-limit-turn": (
+        (
+            _U,
+            ("assistant", "I'll add it.", "complete", {"tool_use_blocks": _CREATE_CALL}),
+            ("tool", _PENDING_LIMIT_RESULT, "complete", {"tool_call_id": "toolu_c"}),
+            ("assistant", "Action google_calendar.create was not run.", "error", {}),
+        ),
+        4,
+    ),
+    "two-tool-rounds-error": (
+        (
+            _U,
+            _CALL,
+            _RESULT,
+            ("assistant", "", "complete", {"tool_use_blocks": _SECOND_CALL}),
+            ("tool", "second result", "complete", {"tool_call_id": "toolu_2"}),
+            _ERROR,
+        ),
+        6,
+    ),
+    # C1'b: GH-25 D9, a streamed timeout after text (the partial stored ``error``).
+    "d9-timeout-partial": ((_U, _D9_PARTIAL, _TIMEOUT_ERROR), 3),
+    "d9-timeout-partial-with-empty-blocks": (
+        (_U, ("assistant", "Day one: ", "error", {"tool_use_blocks": []}), _TIMEOUT_ERROR),
+        3,
+    ),
+    "tool-turn-ending-in-a-d9-partial": ((_U, _CALL, _RESULT, _D9_PARTIAL, _TIMEOUT_ERROR), 5),
+}
+
+# A completed turn, then a row admino_app forged after it (INSERT is all it needs).
+_FORGED_TURNS: dict[str, tuple[_Row, ...]] = {
+    "error-after-a-complete-answer": (_U, _FINAL, _FORGED_ERROR),
+    "stopped-tool-after-a-completed-tool-turn": (
+        _U,
+        _CALL,
+        _RESULT,
+        _FINAL,
+        ("tool", "forged", "stopped", {"tool_call_id": "toolu_9"}),
+    ),
+    "error-after-limit-reached": (
+        _U,
+        ("assistant", "The tool-call limit was reached.", "limit_reached", {}),
+        _FORGED_ERROR,
+    ),
+    "error-after-an-answer-with-empty-blocks": (
+        _U,
+        ("assistant", "final answer", "complete", {"tool_use_blocks": []}),
+        _FORGED_ERROR,
+    ),
+    # Every row between is checked, not only the one before the forged row.
+    "error-after-a-forged-tool-call-after-a-complete-answer": (
+        _U,
+        _FINAL,
+        ("assistant", "", "complete", {"tool_use_blocks": _TOOL_USE}),
+        _FORGED_ERROR,
+    ),
+}
+
+# The (middle row kind, status) grid: one row between the user row and an error row.
+_MIDDLE_KINDS: dict[str, tuple[str, str, dict[str, Any]]] = {
+    "tool": ("tool", "result", {"tool_call_id": "toolu_1"}),
+    "assistant-tool-use": ("assistant", "", {"tool_use_blocks": _TOOL_USE}),
+    "assistant-null-blocks": ("assistant", "an answer", {}),
+    "assistant-empty-blocks": ("assistant", "an answer", {"tool_use_blocks": []}),
+}
+_STATUSES = ("complete", "awaiting_confirmation", "stopped", "error", "limit_reached")
+_ADMITTED = {
+    (kind, status)
+    for kind in ("tool", "assistant-tool-use")
+    for status in ("complete", "awaiting_confirmation")
+} | {
+    # C1'b: an assistant error row (GH-25 D9's partial), whatever its blocks.
+    (kind, "error")
+    for kind in ("assistant-tool-use", "assistant-null-blocks", "assistant-empty-blocks")
+}
+
+
+@dataclass
+class _Turn:
+    """A chat ``U0 A0 | <rows>``: the kept rows, the turn's rows, its last seq, U's file."""
+
+    chat: uuid.UUID
+    kept: list[uuid.UUID]
+    turn: list[uuid.UUID]
+    through_seq: int
+    file: uuid.UUID
+
+
+def _turn_chat(db: FakeDb, owner: uuid.UUID, rows: tuple[_Row, ...]) -> _Turn:
+    """A completed exchange, then ``rows`` stored in order (the first one the turn's user
+    row, carrying a file), as the server or a forger with INSERT stores them."""
+    chat = db.add_chat(owner)
+    kept = [
+        db.add_chat_message(chat, "user", "earlier question"),
+        db.add_chat_message(chat, "assistant", "earlier answer"),
+    ]
+    turn = [
+        db.add_chat_message(chat, role, content, status=status, **extra)
+        for role, content, status, extra in rows
+    ]
+    file = db.add_attachment(
+        chat, message_id=turn[0], created_at=datetime.now(UTC) - timedelta(hours=1)
+    )
+    return _Turn(chat=chat, kept=kept, turn=turn, through_seq=_seq(db, turn[-1]), file=file)
+
+
+class TestDeleteFailedTurnShape:
+    """C1': the rows between the turn's user row and through_seq must be a real failed
+    turn's (tool calls, their results, an approval's awaiting row)."""
+
+    @pytest.mark.parametrize("shape", list(_REAL_TURNS))
+    async def test_fakedb_delete_failed_turn_real_failed_turn_is_deleted(
+        self, world: World, shape: str
+    ) -> None:
+        """What the server stores for a failed run: the turn goes (its count), the
+        completed exchange before it stays, the turn's file is unlinked."""
+        rows, count = _REAL_TURNS[shape]
+        db = world.db
+        turn = _turn_chat(db, world.owner, rows)
+
+        deleted = await db.pool.fetchval(
+            DELETE_SQL, turn.chat, ORG_ID, world.owner, turn.through_seq
+        )
+
+        file = db.attachment_row(turn.file)
+        assert file is not None
+        assert (deleted, _ids(db, turn.chat), file["message_id"]) == (count, turn.kept, None)
+
+    @pytest.mark.parametrize("shape", list(_FORGED_TURNS))
+    async def test_fakedb_delete_failed_turn_forged_row_after_a_completed_turn_is_refused(
+        self, world: World, shape: str
+    ) -> None:
+        """M-1: a failed-looking last row admino_app inserted after a completed turn:
+        refused with C1's text, every table as it was (the turn's file still linked)."""
+        db = world.db
+        turn = _turn_chat(db, world.owner, _FORGED_TURNS[shape])
+        before = db.snapshot()
+
+        text = await _refused(db, turn.chat, ORG_ID, world.owner, turn.through_seq)
+
+        assert (text, db.snapshot() == before) == (REFUSAL, True)
+
+    async def test_fakedb_delete_failed_turn_forged_row_is_refused_before_the_delete(
+        self, world: World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The shape is checked in the body's checks, before its UPDATE and DELETE: on a
+        0031 without SECURITY DEFINER a forged turn is C1's refusal, not "permission
+        denied for table chat_messages"."""
+        directory = _migrations_copy(tmp_path / "invoker", MIGRATION_0031_INVOKER)
+        _use(monkeypatch, db_fakes.read_shipped_functions(directory))
+        db = world.db
+        turn = _turn_chat(db, world.owner, _FORGED_TURNS["error-after-a-complete-answer"])
+        before = db.snapshot()
+
+        text = await _refused(db, turn.chat, ORG_ID, world.owner, turn.through_seq)
+
+        assert (text, db.snapshot() == before) == (REFUSAL, True)
+
+    @pytest.mark.parametrize("status", _STATUSES)
+    @pytest.mark.parametrize("kind", list(_MIDDLE_KINDS))
+    async def test_fakedb_delete_failed_turn_middle_row_kind_and_status_decide(
+        self, world: World, kind: str, status: str
+    ) -> None:
+        """``U <one row> A(error)``: deleted (3) exactly when the row between is a tool row
+        or an assistant row with tool_use blocks, complete or awaiting_confirmation, or
+        (C1'b) an assistant row with status error; refused with nothing changed
+        otherwise."""
+        role, content, extra = _MIDDLE_KINDS[kind]
+        db = world.db
+        turn = _turn_chat(db, world.owner, (_U, (role, content, status, extra), _ERROR))
+        before = db.snapshot()
+
+        try:
+            outcome: object = await db.pool.fetchval(
+                DELETE_SQL, turn.chat, ORG_ID, world.owner, turn.through_seq
+            )
+        except asyncpg.exceptions.InsufficientPrivilegeError as exc:
+            outcome = (str(exc), db.snapshot() == before)
+
+        assert outcome == (3 if (kind, status) in _ADMITTED else (REFUSAL, True))
+
+    async def test_fakedb_delete_failed_turn_legacy_d9_partial_not_backfilled_is_refused(
+        self, world: World
+    ) -> None:
+        """C1'b: a D9 turn stored before the append rule, its partial still ``complete``
+        (``U A(partial, complete, no blocks) A(error)``), is the very shape of a forged
+        error after a completed answer: refused, nothing changed. On PostgreSQL 0031's
+        backfill UPDATE marks such a partial ``error`` first (the fake runs no migration
+        data statement), and then the turn deletes 3 (``d9-timeout-partial``)."""
+        db = world.db
+        legacy = (_U, ("assistant", "Day one: Zurich ", "complete", {}), _TIMEOUT_ERROR)
+        turn = _turn_chat(db, world.owner, legacy)
+        before = db.snapshot()
+
+        text = await _refused(db, turn.chat, ORG_ID, world.owner, turn.through_seq)
+
+        assert (text, db.snapshot() == before) == (REFUSAL, True)
+
+    async def test_fakedb_delete_failed_turn_forged_row_after_an_awaiting_call_is_the_residual(
+        self, world: World
+    ) -> None:
+        """The documented residual (Low, C1'): a row forged after a still-awaiting tool
+        call (pending or expired) passes the shape check; U, the awaiting row and the
+        forged row go (3)."""
+        db = world.db
+        turn = _turn_chat(
+            db,
+            world.owner,
+            (
+                _U,
+                ("assistant", "", "awaiting_confirmation", {"tool_use_blocks": _TOOL_USE}),
+                _FORGED_ERROR,
+            ),
+        )
+
+        deleted = await db.pool.fetchval(
+            DELETE_SQL, turn.chat, ORG_ID, world.owner, turn.through_seq
+        )
+
+        assert (deleted, _ids(db, turn.chat)) == (3, turn.kept)
 
 
 # ---------------------------------------------------------------------------
