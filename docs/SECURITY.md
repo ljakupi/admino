@@ -123,10 +123,12 @@ How it's enforced:
 - **A chat keeps its owner and its mark.** On `chats`, `admino_app` may update only the
   title and its source, the last activity time, the external-content mark and the trash
   time and group: it can't change a chat's ID, organization, owner, creation time or
-  legacy session ID. It may delete a chat (deleting it for good from the trash): its
-  messages and files go with it through the foreign keys' cascade, which runs as the
-  tables' owner, so the app still can't delete or edit a single message. A database
-  trigger refuses clearing the external-content mark, so a chat that once
+  legacy session ID. It may delete any chat, live or in the trash: the database doesn't
+  limit this. The app deletes only a chat in the caller's trash, or a trashed chat past
+  its organization's retention, and locks it first. The chat's messages and attachment
+  rows go with it through the foreign keys' cascade, which runs as the tables' owner. So
+  the app can delete a whole chat, but it can never delete or edit a single message. A
+  database trigger refuses clearing the external-content mark, so a chat that once
   held external content keeps asking before actions that change something (see
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
   The database also ties a chat's owner to the chat's organization (a composite foreign
@@ -229,10 +231,11 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
 - **The trash is its owner's.** The data layer (`trash.py`) lists, restores and deletes
   for good only the caller's own chats and files, within the caller's organization:
   another user's item (an Org Admin's request on an Editor's item included), another
-  organization's and an unknown one answer the same `404` as above, with nothing
-  changed. The hourly purge job works per organization, each with its own retention.
-  Every delete, restore and purge writes its audit event (IDs, a file count and the
-  client IP only) in the transaction that changes the rows.
+  organization's and an unknown one answer the same `404` `chat_not_found` or
+  `attachment_not_found` as above, with nothing changed. The hourly purge job works per
+  organization, each with its own retention. Every delete, restore and purge writes its
+  audit event (IDs, a file count and the client IP only) in the transaction that changes
+  the rows.
 - **Operator blindness.** The Super Admin reaches only the platform routes and their own
   account. Platform responses carry metadata and counts, never content, titles or file
   names. Of an organization's chats, the Super Admin sees only how many aren't in the
@@ -555,11 +558,13 @@ conversion in `attachment_processing.py` and `converters/`:
   deleted during its conversion.
 - **Deleted for good means off the disk.** A file in the trash keeps its files until it's
   deleted for good (from the trash, by the hourly purge once its organization's
-  retention has passed, or at once with a retention of 0). Then its row goes first, with
-  its audit event in the same transaction, and only after the commit its original, a
-  partial upload and its converted parts. A purge that rolls back (a failed audit write)
-  removes no file; a file a failed removal leaves behind is removed by the hourly cleanup
-  once it's 24 hours old.
+  retention has passed, or at once with a retention of 0). A file never sent with a
+  message is deleted for good once it's 24 hours old, in the trash or not (see
+  [Configuration → Attachments](configuration.md#attachments)). Either way, its row goes
+  first, with its audit event in the same transaction, and only after the commit its
+  original, a partial upload and its converted parts. A purge that rolls back (a failed
+  audit write) removes no file; a file a failed removal leaves behind is removed by the
+  hourly cleanup once it's 24 hours old.
 - **Converted parts are capped and counted.** A small file can convert into far more
   bytes than it holds (a crafted 28 KB PDF of 100 pages renders to more than a gigabyte
   of page images), and the volume is shared by every organization and, at Docker's

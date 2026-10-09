@@ -710,7 +710,7 @@ Viewer's chats from before a role change stay stored, unused.
 | `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
 | `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. Each message carries its `attachment_ids`. It also carries `pending_confirmation` and `confirmation_status` (see below), and `context_usage` (see [Context budget](#context-budget)). |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
-| `DELETE /api/chats/{id}` | Moves the chat to the [trash](#trash), with its [attachments](#attachments), and answers `204`; you can restore it from there until it expires. When your organization's trash retention is 0, the chat is deleted for good in the same request: its messages and files are gone when the `204` comes. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete` (and `chat.purge` when it's deleted for good), with the chat's ID only. |
+| `DELETE /api/chats/{id}` | Moves the chat to the [trash](#trash), with its [attachments](#attachments), and answers `204`; you can restore it from there until it expires. When your organization's trash retention is 0, the chat is deleted for good in the same request: its messages and files are gone when the `204` comes. If that step fails, the `204` still comes and the chat waits in the trash for the next hourly purge (see [Trash](#trash)). A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete` (and `chat.purge` when it's deleted for good), with the chat's ID only. |
 | `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`, optionally with the files you uploaded into the chat, `"attachment_ids": [...]` (see [Attachments](#attachments)). Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, the `context_usage` and `context_notice` (see [Context budget](#context-budget)), and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
 | `POST /api/chats/{id}/stop` | Stops the chat's streamed message. It needs no body and answers `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed message running (see [Stopping a reply](#stopping-a-reply)). |
 
@@ -1634,7 +1634,9 @@ Viewers and the Super Admin get `403` on every trash route.
   read on every request, so a change applies at once. An item expires once the
   retention has passed since `deleted_at`. From then on it isn't listed, and restoring it
   answers `404`, even before the purge removes it. Deleting it for good and emptying the
-  trash still remove it.
+  trash still remove it. Whatever the retention, a file never sent with a message is
+  deleted for good once it's 24 hours old, in the trash or not (see
+  [Attachments](#attachments)); restoring it then answers `404`.
 - **Retention 0.** `DELETE /api/chats/{id}` and `DELETE /api/attachments/{id}` delete the
   chat or file for good in the same request: when the `204` comes, its rows and files are
   gone, and nothing is listed or restorable. If that last step fails, the `204` still
@@ -1675,8 +1677,11 @@ Viewers and the Super Admin get `403` on every trash route.
   every 5 seconds. Every route that changes something refuses cross-site requests.
 - **Audit.** Each change is recorded in your organization's audit log, in the same
   transaction, with the item's ID as the target and nothing else about it: never a title
-  or a file name. A failed audit write is a `500` and changes nothing; a delete for good
-  then removes no row and no file.
+  or a file name. A failed audit write is a `500` and leaves that item as it was; a
+  delete for good then removes no row and no file. Two cases differ. In a retention-0
+  delete, a failed `chat.purge` or `file.purge` write still answers `204`, with the item
+  left in the trash for the next purge. When you empty the trash, the items deleted for
+  good before the failure stay deleted.
 
   | Event | When | By |
   | --- | --- | --- |
@@ -1687,6 +1692,12 @@ Viewers and the Super Admin get `403` on every trash route.
 
   Your events carry your client IP; the purge job's carry none. Listing the trash
   records nothing.
+- **Upgrading.** Chats and files in the trash before this release become trash items: a
+  chat together with the files deleted with it. Those deleted longer ago than your
+  organization's retention (30 days unless an Org Admin changed it, see **Retention and
+  expiry** above) are deleted for good when admino first starts after the upgrade. To
+  keep them, raise `retention.trash_retention_days` (see
+  [Organization settings](#organization-settings)) before upgrading.
 
 ## Organizations (Super Admin)
 
