@@ -1,5 +1,5 @@
 """Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153,
-GH-161, GH-164, GH-166, GH-187).
+GH-161, GH-164, GH-166, GH-187, GH-190).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
@@ -65,6 +65,9 @@ What these tests pin down:
   validator refuses anyway). The orphan GC deletes an attachment never sent
   within 24 h as a ``file.delete`` by the system, with ``{"orphan": True}``.
   Downloads are not audited.
+- GH-190: two more org-scoped actions, ``file.exclude`` and ``file.include``
+  (52 in all): a member excluded one of their attachments from later turns, or
+  included it again. The target is the file; there is no metadata.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -220,6 +223,9 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         "user.profile_change",
         # GH-187: a member uploads an attachment (metadata: size_bytes).
         "file.upload",
+        # GH-190: a member excludes an attachment from later turns, or includes it again.
+        "file.exclude",
+        "file.include",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -279,6 +285,7 @@ _ISSUE_CATEGORIES: list[Any] = [
     ),
     pytest.param({"project.restore", "chat.restore", "file.restore"}, id="restores"),
     pytest.param({"file.upload"}, id="file-uploads"),
+    pytest.param({"file.exclude", "file.include"}, id="file-exclusions"),
     pytest.param({"export.create"}, id="exports"),
     pytest.param({"project.admin_access"}, id="org-admin-access-to-other-users-projects"),
     pytest.param({"org.settings_change"}, id="org-settings-changes"),
@@ -681,13 +688,13 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 50 actions of the spec (GH-146's 39, GH-152's
+        """The catalog has exactly the 52 actions of the spec (GH-146's 39, GH-152's
         session.revoke and session.force_logout, GH-153's invitation.resend and
         invitation.refuse, GH-161's four org.permission_* actions, GH-164's
-        user.profile_change, GH-166's password.change, GH-187's file.upload): nothing
-        missing, nothing extra."""
+        user.profile_change, GH-166's password.change, GH-187's file.upload, GH-190's
+        file.exclude and file.include): nothing missing, nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 50
+        assert len(AuditAction) == 52
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:

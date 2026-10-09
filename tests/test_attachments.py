@@ -5,7 +5,8 @@ What these tests pin down:
 - ``attachments_root()`` is ``organizations.ATTACHMENTS_ROOT`` read at call time;
   ``attachment_path(root, org, id)`` is ``root/<org>/<id>``; ``AttachmentRecord`` has
   exactly the contract's R columns (GH-188 contract section 7: ``token_estimate``
-  after ``page_count``; A5's RETURNING and A6's SELECT list them).
+  after ``page_count``; GH-190 contract C6: ``active`` before ``created_at``; A5''s
+  RETURNING and A6''s SELECT list them).
 - ``upload_attachment`` refuses, with the exact ``AttachmentRefusedError.reason`` (or
   ``chats.ChatNotFoundError``) and NOTHING stored (no row, no file or ``.part`` under
   the root, no ``file.upload`` event):
@@ -53,7 +54,8 @@ What these tests pin down:
   GH-188 (contract 12.4): A7' = used_bytes counts the originals plus the derived bytes
   (NULL derived bytes count 0).
 - ``check_sendable`` (A8; GH-189 Decision 7 and contract C5: A8', which also
-  reads status, filename, kind and page count in ``created_at, id`` order): no
+  reads status, filename, kind and page count in ``created_at, id`` order; GH-190
+  contract C6: A8'' also reads token_estimate, derived_bytes and active): no
   statement and ``[]`` for no ids; the files as a list when every id is the
   caller's live, unsent, ready attachment of this chat; any id that isn't
   (another chat, another org, a colleague's, trashed, unknown) is
@@ -109,7 +111,7 @@ _FIXED_ID: Final = uuid.UUID("187a0c2e-1b2c-4d3e-8f40-5a6b7c8d9e02")
 
 _R: Final = (
     "id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason, "
-    "page_count, token_estimate, created_at"
+    "page_count, token_estimate, active, created_at"
 )
 _R_COLUMNS: Final = tuple(column.strip() for column in _R.split(","))
 # Literal pieces joined with the R column list (no SQL is built from input).
@@ -133,8 +135,10 @@ _FORMS: Final[dict[str, str]] = {
     "A6": _SELECT + _R + _A6_TAIL,
     "A7": "SELECT count(*) AS file_count, coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), "
     "0) AS used_bytes FROM attachments WHERE org_id = $1",
-    # GH-189 (contract C5): A8' reads what the slot needs, in upload order.
-    "A8": "SELECT id, message_id, status, filename, kind, page_count FROM attachments "
+    # GH-189 (contract C5): A8' reads what the slot needs, in upload order; GH-190
+    # (contract C6): A8'' also its estimate, derived bytes and flag.
+    "A8": "SELECT id, message_id, status, filename, kind, page_count, token_estimate, "
+    "derived_bytes, active FROM attachments "
     "WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4 "
     "AND deleted_at IS NULL ORDER BY created_at, id",
 }
@@ -420,6 +424,8 @@ class TestAttachmentsUploadStored:
             "failure_reason": None,
             "page_count": None,
             "token_estimate": None,
+            # GH-190 (migration 0030): a new file is active.
+            "active": True,
             "created_at": row["created_at"],
         }
         assert (row["org_id"], row["owner_user_id"], row["deleted_at"]) == (

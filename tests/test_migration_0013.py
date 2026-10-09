@@ -18,6 +18,8 @@ What these tests pin down:
   model-name regex CHECK; the five ``LimitsConfig`` fields as ``INTEGER NOT
   NULL`` with exactly the ``LimitsConfig`` bounds; ``updated_at``. The
   migration inserts no platform row (startup seeds it from config.yaml).
+  (GH-190: ``LimitsConfig.max_context_messages`` is 0 to 200 now, and migration
+  0030 re-adds that CHECK with those bounds; 0013's own CHECK stays 1 to 200.)
 - ``org_settings``: ``org_id UUID PRIMARY KEY REFERENCES organizations (id) ON
   DELETE CASCADE`` and one ``<tool>_enabled BOOLEAN NOT NULL DEFAULT true``
   per ``ToolsSettings`` field; ``updated_at``.
@@ -79,6 +81,10 @@ _LIMIT_BOUNDS: dict[str, tuple[int, int]] = {
     "max_message_length": (1, 100_000),
     "max_context_messages": (1, 200),
 }
+# LimitsConfig's bounds today: GH-190 (Decision 8) widened max_context_messages to 0 (no
+# cap), and migration 0030 re-adds its CHECK with those bounds (the model sync for that
+# column is pinned in tests/test_migration_0030.py). 0013's own CHECK stays 1 to 200.
+_CONFIG_BOUNDS: dict[str, tuple[int, int]] = {**_LIMIT_BOUNDS, "max_context_messages": (0, 200)}
 _TOOLS = (
     "gmail",
     "google_calendar",
@@ -690,8 +696,10 @@ class TestMigration0013PlatformSettings:
 
     @pytest.mark.parametrize("column", sorted(_LIMIT_BOUNDS))
     def test_migration_0013_platform_limit_bounds_equal_limits_config(self, column: str) -> None:
-        """The CHECK range is exactly LimitsConfig's ge/le (and the contract's)."""
-        assert _field_bounds(column) == _LIMIT_BOUNDS[column]
+        """The CHECK range is the contract's, and LimitsConfig's ge/le are the bounds the
+        shipped migrations leave (0013's, but max_context_messages 0 to 200 since GH-190's
+        migration 0030)."""
+        assert _field_bounds(column) == _CONFIG_BOUNDS[column]
         assert _bounds("platform_settings", column) == _LIMIT_BOUNDS[column]
 
     def test_migration_0013_platform_updated_at(self) -> None:

@@ -220,8 +220,9 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   its owner, and `chats.py` links one to a message or trashes it only with its own chat.
   Another user's, another organization's, a trashed chat's and an unknown attachment all
   answer the same `404` `{"detail": "Attachment not found", "reason":
-  "attachment_not_found"}`; Viewers and the Super Admin get `403`. See
-  [Attachments](#attachments).
+  "attachment_not_found"}`, on the reads and on an exclusion alike; a chat's attachment
+  list answers the chat's `404` for any chat that isn't the caller's own. Viewers and the
+  Super Admin get `403`. See [Attachments](#attachments).
 - **Operator blindness.** The Super Admin reaches only the platform routes and their own
   account. Platform responses carry metadata and counts, never content, titles or file
   names. Of an organization's chats, the Super Admin sees only how many aren't in the
@@ -265,6 +266,24 @@ the dispatch layer in `tools/registry.py`):
   are never relaxed. The permission engine is unchanged and never sees the content, and
   the call's audit row records `escalated`. See
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first).
+- **Long results are cut, the escalation isn't.** A tool result whose estimate is above
+  `context.max_tool_result_tokens` (8,000 tokens by default) is cut to its longest
+  beginning that fits, followed by the marker `[tool result truncated to fit the
+  context]`, and the cut result is what the model gets and the chat stores (see
+  [Configuration → Context budget](configuration.md#context-budget)). A cut inside a
+  block never leaves it open: the kept part ends with the block's own end marker on a
+  line of its own, then the cut marker, all within the cap, so a look-alike close tag or
+  a forged truncation note before the cut point still sits inside the block. A block
+  that starts past the cut keeps none of its content: at most a piece of its begin
+  marker stays. The tool layer already limits every result to 65,536 characters with a
+  plain slice, which can end inside a block; such a result is closed the same way, even
+  when it fits the cap. A cut result is never longer than 65,536 characters and never
+  ends inside a block. So the
+  escalation is decided on the full result, before the cut, and a run that received
+  wrapped content reports it to the server, which sets the chat's sticky
+  `external_content` mark (later turns escalate too, and an untitled chat gets its
+  fallback title) even when the cut removed every wrapped part. Neither depends on the
+  stored, cut result.
 - **Nothing logged.** No wrapped content, label or boundary reaches a log line.
 
 What this doesn't cover:
@@ -286,12 +305,12 @@ What this doesn't cover:
   suggested (a search query, for example). Today these only reach the user's own
   accounts. It matters for the planned web search, where a query leaves for a third
   party.
-- **A sent file stays in every turn, in full.** Chat attachments are wrapped like tool
-  results (see [Attachments](#attachments)), but without the 20,000-character cap, and
-  the chat's sent files reach the model on every later turn until
-  [#190](https://github.com/ljakupi/admino/issues/190) adds a budget and a way to exclude
-  one. A planted instruction in a file therefore stays in view for the whole chat; the
-  escalation holds for the whole chat too.
+- **A sent file stays in every turn, in full, until it's excluded.** Chat attachments
+  are wrapped like tool results (see [Attachments](#attachments)), but without the
+  20,000-character cap, and the chat's active files reach the model on every later turn:
+  the context budget leaves out old turns, never a file. A planted instruction in a file
+  therefore stays in view until the user excludes the file. The escalation holds for the
+  whole chat, excluded file or not: excluding doesn't clear the chat's sticky mark.
 - **The answer can still be misled.** Wrapping stops silent side effects, not injected
   text shaping what the model tells you. Read summaries of unexpected mail with care.
 
@@ -437,7 +456,8 @@ conversion in `attachment_processing.py` and `converters/`:
   sizes, types, statuses and reason codes only.
 - **Sent files reach the model as untrusted data** (`attachment_context.py`,
   `prompt_assembly.py`). Every run of a chat (a message, the legacy route, an approved
-  action) gets the chat's active attachments: its sent, live, `ready` files. The files
+  action) gets the chat's active attachments: its sent, live, `ready` files that the
+  owner hasn't excluded. The files
   of earlier messages are read with the chat in the turn's read, and the files the
   current message sends come from the send check made before the chat's hold is taken;
   both statements are bound to the caller's organization and user, so another user's or
@@ -469,6 +489,16 @@ conversion in `attachment_processing.py` and `converters/`:
   storage_unavailable` with nothing run or stored, logged with the attachment's ID and
   the exception's class only. The checks run under the chat's lock, before a pending
   confirmation is cancelled or consumed, so a refused message or approval keeps it.
+- **Bounded memory per turn.** Before a turn reads any file, the sizes stored for the
+  active files' converted parts (measured by the agent when each conversion ended) are
+  added up and checked against `context.max_attachment_mb_per_turn` (64 MiB by default,
+  1 to 1024). Over the cap, a message (on either route) or an approval answers `422
+  attachment_bytes_exceeded` before anything is read into memory, so a file is never
+  read in part, and nothing runs or is stored. The token check (`422 context_overflow`,
+  the files' estimates against the model's budget) comes first, from stored values too,
+  and both come before the `503` above and the image check below. Each file also keeps
+  its own bound of 256 MiB, whatever the volume holds. The cap is per turn: turns of
+  different chats running at once each have their own. A denial reads no file.
 - **Images only for a model that takes them.** With the platform's `llm.image_input`
   off, a message or an approval whose files hold an image part answers `422
   image_input_unsupported` before anything runs. As a second guard, `llm_policy` refuses
@@ -482,11 +512,26 @@ conversion in `attachment_processing.py` and `converters/`:
   `external_content` mark, and an untitled chat's first exchange with files gets the
   fallback title without a model call, so a file never chooses a title.
 - **Traceable without content.** Every `tool.call` audit row of such a run carries the
-  files' IDs (`attachment_ids`, in the order sent, at most 100) and their number
-  (`attachment_count`), nothing else about them. Each assistant message the run stores
-  records the same IDs (`chat_messages.included_attachment_ids`; a database check allows
-  them on assistant messages only). A stored user message keeps what the user typed:
-  file content is never stored in a message, logged or returned by an API.
+  IDs of the active files it got (`attachment_ids`, in the order sent, at most 100) and
+  their number (`attachment_count`), nothing else about them. Each assistant message the
+  run stores records the same IDs (`chat_messages.included_attachment_ids`; a database
+  check allows them on assistant messages only). A stored user message keeps what the
+  user typed: file content is never stored in a message, logged or returned by an API.
+- **Exclusion is the owner's, and audited.** `PATCH /api/attachments/{id}` sets
+  `attachments.active` (migration 0030's grant lets the runtime role update that column,
+  no other) on the caller's own live attachment only: the statement is bound to the
+  caller's organization and user, and anything else is the `404` above. It needs
+  `chat.send`, the CSRF check and its per-user rate limit. A change writes its
+  `file.exclude` or `file.include` audit row, with the attachment's ID as the target and
+  no metadata, in the same transaction; the same value again writes nothing. An excluded
+  file is neither read nor sent, and isn't named in later `tool.call` rows, but its row,
+  its link to its message, the earlier replies' `included_attachment_ids` and its files
+  stay.
+- **Reports and logs name IDs only.** The refusals' per-file report (`context_overflow`,
+  `attachment_bytes_exceeded`) and the `context_report` of a file refused at upload list
+  each file's ID, token estimate and converted size, never its name. `context_usage` and
+  `context_notice` are counts. The log line of a file refused at upload holds its ID and
+  `context_overflow` only, and a message ended by the budget logs counts only.
 - **Unencrypted at rest.** The files and their converted parts (`<attachment ID>.d/`:
   text, images and a manifest) are on the `admino-attachments` volume, mounted on the
   agent only and owned by `admino` (files 0600, directories 0700), but they **aren't

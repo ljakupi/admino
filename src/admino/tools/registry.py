@@ -2,7 +2,9 @@
 
 Provides the ``@register_tool`` decorator for registering async tool handler
 functions, a dispatch function that enforces permission checks before execution,
-and a listing function that returns tool metadata for the LLM's ``tools`` array.
+a listing function that returns tool metadata for the LLM's ``tools`` array, and
+``tools_payload``, that array in the provider format (GH-190: the agent sends it,
+the context budget counts it).
 
 Architecture:
 - The registry is a module-level dict mapping ``(tool_name, action_name)`` to
@@ -607,6 +609,42 @@ def get_registered_tools(
             )
         )
     return descriptions
+
+
+def tools_payload(descriptions: list[ToolDescription]) -> list[dict[str, object]]:
+    """Convert tool descriptions to the provider ``tools`` array the agent sends.
+
+    The agent sends it and the context budget (GH-190) counts it, so both use
+    this one function. Each tool is described as::
+
+        {
+            "type": "function",
+            "function": {
+                "name": "<tool>.<action>",
+                "description": "...",
+                "parameters": { ...json schema... }
+            }
+        }
+
+    ``side_effect`` is registry metadata and never reaches the payload.
+
+    Args:
+        descriptions: The run's advertised tools (``get_registered_tools``).
+
+    Returns:
+        One function entry per description, in the given order.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": f"{desc.tool}.{desc.action}",
+                "description": desc.description,
+                "parameters": desc.parameters_schema,
+            },
+        }
+        for desc in descriptions
+    ]
 
 
 def get_tool_entry(tool: str, action: str) -> ToolDescription | None:

@@ -88,7 +88,23 @@ limits:
   max_pending_confirmations: 3
   confirmation_timeout_s: 300
   max_message_length: 4000
-  max_context_messages: 20
+  # An optional cap on the messages sent to the model, applied before the
+  # token budget below; 0 means no cap (the budget alone decides, and a turn
+  # reads the chat's latest 200 messages).
+  max_context_messages: 0
+
+# The context budget. Every LLM call must fit llm.max_input_tokens minus a
+# safety margin: the instructions, the chat's active attachments, the newest
+# whole earlier turns and llm.max_response_tokens kept for the reply. Older
+# turns are left out first. Read at every start; not a platform setting.
+# Uncomment the section to change a default.
+# context:
+#   # Percent of max_input_tokens kept back for estimation error (0 to 50).
+#   safety_margin_percent: 10
+#   # The most MiB of converted attachment files one turn may read (1 to 1024).
+#   max_attachment_mb_per_turn: 64
+#   # A tool result above this many tokens is cut, with a marker (256 to 100000).
+#   max_tool_result_tokens: 8000
 
 # Single source of truth for outbound network access: entrypoint.sh derives
 # the iptables egress whitelist from this list (Docker mode), and main.py

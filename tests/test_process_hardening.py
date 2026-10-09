@@ -203,6 +203,12 @@ def _mock_config() -> MagicMock:
     config.limits.max_tool_calls_per_message = 10
     config.limits.max_context_messages = 20
     config.limits.confirmation_timeout_s = 300
+    # GH-190 (contract C11): the context budget main() passes to the construction-time AgentConfig.
+    config.llm.max_input_tokens = 200_000
+    config.llm.max_response_tokens = 4096
+    config.context.safety_margin_percent = 10
+    config.context.max_attachment_mb_per_turn = 64
+    config.context.max_tool_result_tokens = 8000
     config.server.host = "127.0.0.1"
     config.server.port = 8000
     return config

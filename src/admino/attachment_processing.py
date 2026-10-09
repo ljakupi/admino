@@ -17,14 +17,23 @@ org id, a processor ``(path, kind, ProcessingJob) -> ProcessedFile``; the
 job carries the row's file name as the prompt shows it
 (``prompt_assembly.prompt_filename``, GH-189: for the PDF page markers and
 the image labels) and the platform's ``render_dpi`` and
-``max_pages_per_file``, read once per file.
+``max_pages_per_file``, read once per file (with the platform model's
+``max_input_tokens``); optionally the context budget's settings
+(``context_budget.BudgetSettings``, GH-190: the app builds its pool with
+them).
 Outputs: the row's final status (``process_attachment``), the number of
 files queued again at startup (``recover``).
 
-Statements (contract forms P1'/P2''/P3-P5): P1' is a compare-and-set from
-``uploaded`` to ``processing`` (only one job ever processes a row); P2''/P3
-write the outcome only while the row is still ``processing``, so a row
-deleted meanwhile is never re-created or overwritten. With derived bytes,
+Statements (contract forms P1'/P2''/P3-P6/P3''): P1' is a compare-and-set
+from ``uploaded`` to ``processing`` (only one job ever processes a row);
+P2''/P3/P3'' write the outcome only while the row is still ``processing``,
+so a row deleted meanwhile is never re-created or overwritten. With a
+budget (GH-190, Decision 7), after the page check P6 sums the stored
+estimates of the chat's other live, ``ready``, active attachments; when the
+file's estimate on top of them is above the attachments' share of the
+budget (``budget_limit(max_input_tokens, margin) - reserved output``), P3''
+stores ``failed`` / ``context_overflow`` with the estimate, so the client
+can see why, and the quota is never reached. With derived bytes,
 the ready outcome is one transaction: the org row locked and the org's
 used bytes summed (``attachments.lock_org_storage``, A3/A4'), then P2'', or
 P3 ``storage_quota_exceeded`` when the derived files don't fit. A file that
@@ -38,8 +47,10 @@ one of its global workers), so one org's queue never holds back another
 org's files.
 
 Security notes:
-- Tenancy: P1'-P3 bind the attachment's org id; P4/P5 are the system's
-  startup recovery across all orgs and never return content (ids only).
+- Tenancy: P1'-P3, P6 and P3'' bind the attachment's org id; P6 counts
+  only files of the same chat, org and owner as the processed row, and
+  returns a sum, never a row. P4/P5 are the system's startup recovery
+  across all orgs and never return content (ids only).
 - Shared storage: a conversion's derived files count toward its org's quota
   (checked under the org row lock, like an upload's), and the pool's per-org
   slot keeps one org from starving the others' conversions.
@@ -52,12 +63,15 @@ Security notes:
   class name only (its message can hold a file name or a path), never with
   a traceback.
 - Logs carry attachment ids (through ``safe_log``), statuses and reason
-  codes only: no file name, path or file content.
+  codes only: no file name, path, file content or token count (the upload
+  rejection logs the id and ``context_overflow``).
 - The converter's display name is the prompt name (GH-189, Decision 6):
   default-ignorable and format characters of the stored name never reach a
   page marker or an image label, which go to the model.
 - Parameterized SQL only. Imports nothing from the server, agent, LLM or
-  tools layers; no LLM tool reaches this module.
+  tools layers directly (``context_budget``, whose instruction count reads
+  the tool registry, is used for its arithmetic only); no LLM tool reaches
+  this module.
 """
 
 from __future__ import annotations
@@ -72,6 +86,7 @@ from typing import TYPE_CHECKING, Final
 from admino import attachment_types, prompt_assembly, scoped_settings
 from admino.attachment_types import AttachmentRefusedError
 from admino.attachments import attachment_path, lock_org_storage, remove_derived
+from admino.context_budget import available_attachment_tokens, budget_limit
 from admino.converters import runner
 from admino.converters.common import ConversionError, ConversionOptions
 from admino.logs import safe_log
@@ -83,6 +98,7 @@ if TYPE_CHECKING:
 
     import asyncpg
 
+    from admino.context_budget import BudgetSettings
     from admino.models import AttachmentKind, AttachmentStatus
 
 logger = logging.getLogger(__name__)
@@ -108,6 +124,23 @@ _FAILED_SQL: Final = """
     UPDATE attachments SET status = 'failed', failure_reason = $3, updated_at = now()
     WHERE id = $1 AND org_id = $2 AND status = 'processing'
 """
+# P6 (GH-190, Decision 7): the stored estimates of the chat's other live, ready, active
+# attachments (sent or not; NULL counts 0), reached through this row's chat and owner.
+_OTHER_TOKENS_SQL: Final = """
+    SELECT coalesce(sum(o.token_estimate), 0)
+    FROM attachments a
+    JOIN attachments o ON o.chat_id = a.chat_id AND o.org_id = a.org_id
+        AND o.owner_user_id = a.owner_user_id
+    WHERE a.id = $1 AND a.org_id = $2 AND o.id <> a.id
+      AND o.status = 'ready' AND o.active AND o.deleted_at IS NULL
+"""
+# P3'' (GH-190): the upload rejection, with the estimate that decided it, only while
+# still processing.
+_OVERFLOW_SQL: Final = """
+    UPDATE attachments SET status = 'failed', failure_reason = $3, token_estimate = $4,
+        updated_at = now()
+    WHERE id = $1 AND org_id = $2 AND status = 'processing'
+"""
 # P4: rows a restart interrupted go back to the queue.
 _RESET_SQL: Final = (
     "UPDATE attachments SET status = 'uploaded', updated_at = now() WHERE status = 'processing'"
@@ -120,6 +153,8 @@ _QUEUED_SQL: Final = (
 _NO_ROW: Final = "UPDATE 0"
 # The failure code of derived files that don't fit the org's quota.
 _QUOTA_EXCEEDED: Final = "storage_quota_exceeded"
+# The failure code of a file that doesn't fit the model's context with the chat's others.
+_CONTEXT_OVERFLOW: Final = "context_overflow"
 
 
 @dataclass(frozen=True)
@@ -240,6 +275,23 @@ async def _fail(
     await remove_derived(root, org_id, attachment_id)
 
 
+async def _fits_context(
+    pool: asyncpg.Pool, attachment_id: UUID, org_id: UUID, estimate: int, available: int
+) -> bool:
+    """Whether the file's estimate plus the chat's other ready, active files' fit (P6)."""
+    others = int(await pool.fetchval(_OTHER_TOKENS_SQL, attachment_id, org_id))
+    return others + estimate <= available
+
+
+async def _reject_overflow(
+    pool: asyncpg.Pool, root: Path, attachment_id: UUID, org_id: UUID, estimate: int | None
+) -> None:
+    """Write ``context_overflow`` with the file's estimate (P3''); drop the derived artifacts."""
+    await pool.execute(_OVERFLOW_SQL, attachment_id, org_id, _CONTEXT_OVERFLOW, estimate)
+    logger.info("Attachment %s failed processing (%s).", safe_log(attachment_id), _CONTEXT_OVERFLOW)
+    await remove_derived(root, org_id, attachment_id)
+
+
 async def _store_ready(
     pool: asyncpg.Pool, attachment_id: UUID, org_id: UUID, processed: ProcessedFile
 ) -> tuple[AttachmentStatus, bool]:
@@ -287,11 +339,13 @@ async def process_attachment(
     org_id: UUID,
     *,
     processor: Processor = convert_stored_file,
+    budget: BudgetSettings | None = None,
 ) -> AttachmentStatus | None:
     """Process one uploaded attachment and store the outcome.
 
     The platform settings are read once, after the row is claimed and before
-    the processor runs; the page check reuses that read, before the derived
+    the processor runs; the page check reuses that read, then (with a
+    ``budget``, GH-190 Decision 7) the context check, before the derived
     bytes are held against the org's quota. A file that doesn't end ``ready``
     (a failure, or its row or org deleted meanwhile) loses its derived
     artifacts; the stored original is never touched here.
@@ -303,6 +357,11 @@ async def process_attachment(
         org_id: Its org.
         processor: Runs in a worker thread on the stored file, its kind and
             the job.
+        budget: The context budget's settings: the file ends ``failed`` with
+            ``context_overflow`` (its estimate stored) when its estimate plus
+            those of the chat's other live, ``ready``, active files is above
+            the attachments' share of the platform model's budget (P6, then
+            P3''). None, the default, checks nothing.
 
     Returns:
         ``ready`` or ``failed``; None when the row isn't this org's
@@ -316,7 +375,8 @@ async def process_attachment(
     row = await pool.fetchrow(_START_SQL, attachment_id, org_id)
     if row is None:
         return None
-    files = (await scoped_settings.current_platform_settings(pool)).files
+    platform = await scoped_settings.current_platform_settings(pool)
+    files = platform.files
     job = ProcessingJob(
         filename=prompt_assembly.prompt_filename(row["filename"]),
         render_dpi=files.render_dpi,
@@ -339,6 +399,15 @@ async def process_attachment(
     if page_count is not None and page_count > files.max_pages_per_file:
         await _fail(pool, root, attachment_id, org_id, "too_many_pages")
         return "failed"
+    if budget is not None:
+        available = available_attachment_tokens(
+            budget_limit(platform.llm.max_input_tokens, budget.safety_margin_percent),
+            budget.reserved_output_tokens,
+        )
+        estimate = processed.token_estimate
+        if not await _fits_context(pool, attachment_id, org_id, estimate or 0, available):
+            await _reject_overflow(pool, root, attachment_id, org_id, estimate)
+            return "failed"
     status, owned = await _store_ready(pool, attachment_id, org_id, processed)
     if not owned:
         # Refused by the quota, or the row was deleted while the processor ran:
@@ -362,11 +431,20 @@ class ProcessingPool:
     """
 
     def __init__(
-        self, *, workers: int = MAX_WORKERS, processor: Processor = convert_stored_file
+        self,
+        *,
+        workers: int = MAX_WORKERS,
+        processor: Processor = convert_stored_file,
+        budget: BudgetSettings | None = None,
     ) -> None:
-        """Create an idle pool; nothing is bound to an event loop yet."""
+        """Create an idle pool; nothing is bound to an event loop yet.
+
+        ``budget`` goes to every job (``process_attachment``'s context check;
+        None checks nothing).
+        """
         self._workers = workers
         self._processor = processor
+        self._budget = budget
         self._loop: asyncio.AbstractEventLoop | None = None
         self._slots = asyncio.Semaphore(workers)
         self._tasks: set[asyncio.Task[None]] = set()
@@ -413,7 +491,12 @@ class ProcessingPool:
         async with turn, slots:
             try:
                 await process_attachment(
-                    pool, root, attachment_id, org_id, processor=self._processor
+                    pool,
+                    root,
+                    attachment_id,
+                    org_id,
+                    processor=self._processor,
+                    budget=self._budget,
                 )
             except Exception as exc:
                 logger.warning(

@@ -25,6 +25,9 @@ What these tests pin down:
   (None until the file is ready, then the estimated tokens of its text and
   images), required (no default: the response always carries it), the field
   right after ``page_count``.
+- GH-190 (contract C2): the JSON keys gain ``active`` (required) and
+  ``context_report`` (null unless the file failed with ``context_overflow``);
+  both are pinned in tests/test_context_models.py.
 
 Security notes:
 - The summary is what a client sees of a stored file: the filename is the
@@ -63,6 +66,8 @@ _SUMMARY_KEYS = frozenset(
         "failure_reason",
         "page_count",
         "token_estimate",
+        "active",
+        "context_report",
         "created_at",
     }
 )
@@ -105,6 +110,7 @@ def _payload(**overrides: Any) -> dict[str, Any]:
         "failure_reason": None,
         "page_count": None,
         "token_estimate": None,
+        "active": True,
         "created_at": _TIMESTAMP,
     }
     payload.update(overrides)
@@ -165,6 +171,8 @@ class TestAttachmentSummary:
             "failure_reason": "corrupted_file",
             "page_count": 0,
             "token_estimate": None,
+            "active": True,
+            "context_report": None,
             "created_at": "2026-10-07T09:30:00Z",
         }
 

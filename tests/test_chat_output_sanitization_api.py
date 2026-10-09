@@ -21,15 +21,16 @@ Pinned (C6):
   joined ``delta`` texts equal ``sanitize_display_text(<the cut reply>)``, which
   is GET /api/chats/{id}'s content of the stored reply; the stored raw reply is
   the cut one; no 8 characters of the key's body are in any frame or in GET; the
-  stream ends ``message_saved{status: "complete"}``, ``done`` with no ``error``.
+  stream ends ``context_usage`` (GH-190, Decision 4), ``message_saved{status:
+  "complete"}``, ``done`` with no ``error``.
   The same turn over JSON returns and stores the cut reply (status ``final``).
 - A streamed ``timeout`` after text (D9): the frames are ``run_started``, the
-  deltas ending at the same word as the stored partial message,
+  deltas ending at the same word as the stored partial message, ``context_usage``,
   ``message_saved{status: "error", message_id: <the LAST stored message, the
   error reply>}``, ``error{code: "timeout", message: <the error reply>}``,
   ``done``; GET shows the user message, the cut partial reply, then the error
   reply with status ``error``; no part of a key cut by the timeout anywhere.
-- ``malformed_response`` (D1): over SSE ``message_saved{error}`` then
+- ``malformed_response`` (D1): over SSE ``context_usage``, ``message_saved{error}``, then
   ``error{code: "malformed_response", message: <the error's message>}`` (never
   ``internal_error``), the deltas sent before it ending at a word, and nothing
   but the error reply stored after the user message; over JSON a 200 with
@@ -59,6 +60,7 @@ from admino.agent import Agent
 from admino.llm import LLMError, LLMResponse, LLMStreamDelta, provider_status_error
 from admino.models import AgentConfig, LLMMessage, ToolCall, sanitize_display_text
 from admino.tools import registry
+from tests.context_frames import fix_instructions, usage_frame
 from tests.credential_keys import GITHUB_FINE_GRAINED, surviving_chunks
 from tests.db_fakes import FakeDb, plain
 from tests.tenancy_world import (
@@ -230,6 +232,13 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
 
 
 @pytest.fixture(autouse=True)
+def _fixed_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GH-190: the instructions count a constant (tests/context_frames.py), so every
+    ``context_usage`` frame is deterministic."""
+    fix_instructions(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
 def _empty_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     """An empty, unfrozen registry (any tool call is unknown); the old one is restored."""
     monkeypatch.setattr(registry, "_REGISTRY", {})
@@ -355,6 +364,12 @@ def _joined(frames: list[Frame]) -> str:
     return "".join(payload["text"] for name, payload in frames if name == "delta")
 
 
+def _usage(db: FakeDb, chat_id: uuid.UUID) -> Frame:
+    """GH-190 (Decision 4): the ``context_usage`` frame right before ``message_saved``: the
+    chat as its next turn starts, read now (tests/context_frames.py)."""
+    return usage_frame(db, chat_id)
+
+
 def _saved(db: FakeDb, chat_id: uuid.UUID, status: str) -> Frame:
     """``message_saved`` naming the chat's last stored message (read now) with ``status``."""
     last = db.messages_of(chat_id)[-1]
@@ -412,12 +427,12 @@ def test_chat_output_truncated_final_turn_streams_and_stores_only_the_cut_reply(
 
     frames = _stream(response)
     names = _names(frames)
-    assert (names[0], names[-2:], set(names[1:-2])) == (
+    assert (names[0], names[-3:], set(names[1:-3])) == (
         "run_started",
-        ["message_saved", "done"],
+        ["context_usage", "message_saved", "done"],
         {"delta"},
     )
-    assert frames[-2] == _saved(db, chat_id, "complete")
+    assert frames[-3:-1] == [_usage(db, chat_id), _saved(db, chat_id, "complete")]
     assert _joined(frames) == sanitize_display_text(reply)
     assert _stored(db, chat_id) == [("user", "Show me the key"), ("assistant", reply)]
     shown = _detail(client, editor, chat_id)
@@ -478,6 +493,7 @@ def test_chat_output_streamed_timeout_after_text_stores_the_partial_then_the_err
     assert frames == [
         ("run_started", {"chat_id": str(chat_id)}),
         ("delta", {"text": _KEPT}),
+        _usage(db, chat_id),
         _saved(db, chat_id, "error"),
         ("error", {"code": "timeout", "message": _TIMEOUT_MESSAGE}),
         ("done", {}),
@@ -526,6 +542,7 @@ def test_chat_output_malformed_response_streams_error_malformed_response(
     assert frames == [
         ("run_started", {"chat_id": str(chat_id)}),
         *(("delta", {"text": text}) for text in sent),
+        _usage(db, chat_id),
         _saved(db, chat_id, "error"),
         ("error", {"code": "malformed_response", "message": _MALFORMED_MESSAGE}),
         ("done", {}),

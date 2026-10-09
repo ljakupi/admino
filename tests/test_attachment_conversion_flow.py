@@ -40,6 +40,11 @@ What these tests pin down:
   original kept, the flood in no log record.
 - ``ProcessingPool().submit(...)`` + ``join()``: the same ``ready`` outcome with
   its estimate and artifacts.
+- GH-190 (Decision 7, contract C7): a real TXT conversion under a budget
+  (``process_attachment(..., budget=...)``) whose attachment share is exactly its
+  estimate ends ``ready``; one token less and it ends
+  ``failed(context_overflow)`` with its estimate stored, no derived bytes and no
+  ``<id>.d``, the original kept.
 - No log record during the flows (a ready TXT, an encrypted PDF, a crashing worker
   that echoes its job, file name and path included, to stdout and stderr) holds
   the file name, a path under ``tmp_path`` or the file's text.
@@ -640,6 +645,41 @@ async def test_attachment_conversion_flow_worker_flooding_stdout_is_killed_and_f
         True,
         False,
     )
+
+
+@pytest.mark.parametrize(("slack", "expected"), [(0, "ready"), (-1, "failed")], ids=["at", "over"])
+async def test_attachment_conversion_flow_budget_rejects_a_file_over_the_chats_budget(
+    ap: ModuleType, flow: _Flow, monkeypatch: pytest.MonkeyPatch, slack: int, expected: str
+) -> None:
+    """The real estimate decides: the platform's 10 000 input tokens, no margin and
+    10 000 - E - slack reserved output tokens leave E + slack tokens for the attachments."""
+    from admino import context_budget
+
+    estimate = _text_tokens(_TXT_TEXT)
+    _platform(flow, monkeypatch, max_input_tokens=10_000)
+    budget = context_budget.BudgetSettings(
+        reserved_output_tokens=10_000 - estimate - slack,
+        safety_margin_percent=0,
+        max_turn_bytes=context_budget.MIB,
+        max_tool_result_tokens=8000,
+    )
+    attachment_id = _store(flow, _TXT, kind="txt", filename="notes.txt")
+
+    result = await ap.process_attachment(
+        flow.db.pool, flow.root, attachment_id, ORG_ID, budget=budget
+    )
+
+    if expected == "ready":
+        assert (result, _row(flow, attachment_id)) == ("ready", ("ready", None, None, estimate))
+        assert _derived(flow, attachment_id).is_dir()
+    else:
+        assert (result, _row(flow, attachment_id), _derived_bytes(flow, attachment_id)) == (
+            "failed",
+            ("failed", "context_overflow", None, estimate),
+            None,
+        )
+        assert _gone(_derived(flow, attachment_id))
+    assert _original(flow, attachment_id).read_bytes() == _TXT
 
 
 async def test_attachment_conversion_flow_pool_converts_to_the_same_ready_outcome(

@@ -42,7 +42,10 @@ raw body: a short text file, its name in ``X-Attachment-Name``, into a chat of
 the caller's own) and the attachment reads ``GET /api/attachments/{attachment_id}``
 and ``.../content`` (an attachment of the caller's own chat, its file on disk
 under a per-test attachments root); orgs A and B get a storage quota. Its
-section 6 pins the upload's cross-site refusal (403, nothing stored).
+section 6 pins the upload's cross-site refusal (403, nothing stored). GH-190
+adds ``PATCH /api/attachments/{attachment_id}`` (``{"active": false}`` on an
+attachment of the caller's own chat: a JSON body) and ``GET
+/api/chats/{chat_id}/attachments`` (the files of a chat of the caller's own).
 
 Adding a route (each later issue): give it a ``RouteSpec`` row in
 ``ROUTES`` (tests/tenancy_world.py), a well-formed request in ``_REQUESTS``
@@ -364,6 +367,20 @@ def _own_attachment(suffix: str) -> _Builder:
     return build
 
 
+def _exclude_own_attachment(world: World, caller: Account, _client: TestClient) -> _Request:
+    """GH-190: exclude (``{"active": false}``) an attachment of a chat of the caller's own."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 190")
+    attachment_id = seed_attachment(world.db, chat_id)
+    return _Request("PATCH", f"/api/attachments/{attachment_id}", {"active": False})
+
+
+def _list_own_chat_attachments(world: World, caller: Account, _client: TestClient) -> _Request:
+    """GH-190: list the files of a chat of the caller's own (it holds one)."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 190")
+    seed_attachment(world.db, chat_id)
+    return _Request("GET", f"/api/chats/{chat_id}/attachments")
+
+
 def _platform_org(method: str, suffix: str, json: dict[str, Any] | None = None) -> _Builder:
     """A platform request on org A's path."""
 
@@ -508,6 +525,9 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ("POST", "/api/chats/{chat_id}/attachments"): _own_chat_upload,
     ("GET", "/api/attachments/{attachment_id}"): _own_attachment(""),
     ("GET", "/api/attachments/{attachment_id}/content"): _own_attachment("/content"),
+    # GH-190: exclude an attachment (a JSON body); list a chat's attachments.
+    ("PATCH", "/api/attachments/{attachment_id}"): _exclude_own_attachment,
+    ("GET", "/api/chats/{chat_id}/attachments"): _list_own_chat_attachments,
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _plain("GET", "/api/oauth/google/authorize"),
     ("GET", "/api/oauth/microsoft/authorize"): _plain("GET", "/api/oauth/microsoft/authorize"),
@@ -576,6 +596,8 @@ _BODY_ROUTES: Final[frozenset[tuple[str, str]]] = frozenset(
         ("POST", "/api/chats"),
         ("PATCH", "/api/chats/{chat_id}"),
         ("POST", "/api/chats/{chat_id}/messages"),
+        # GH-190: {"active": bool}.
+        ("PATCH", "/api/attachments/{attachment_id}"),
         ("POST", "/api/platform/orgs"),
         ("PATCH", "/api/platform/orgs/{org_id}/limits"),
         ("PATCH", "/api/platform/orgs/{org_id}/residency"),

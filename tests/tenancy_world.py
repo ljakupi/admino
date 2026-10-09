@@ -64,6 +64,15 @@ file); ``seed_attachment`` stores an attachment row of a chat and its file
 under the root; ``attachment_files`` maps every file under the root to its
 bytes, for "nothing changed on disk" checks.
 
+GH-190 (context budgeting and attachment exclusion): ``PATCH
+/api/attachments/{attachment_id}`` (``{"active": bool}``: exclude a file from
+later turns, or include it again) and ``GET /api/chats/{chat_id}/attachments``
+(the chat's files, paged) are member rows gated by ``chat.send``. Only the
+owner reaches them: anything but the caller's own live attachment is
+``ATTACHMENT_NOT_FOUND``, anything but the caller's own live chat
+``CHAT_NOT_FOUND``. ``seed_attachment`` passes ``active=False`` (an excluded
+file, migration 0030) through to ``db.add_attachment`` with the other fields.
+
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
 - The expected role matrix is spelled out here on purpose: deriving it from
@@ -315,8 +324,8 @@ def seed_attachment(
     ``<ATTACHMENTS_ROOT>/<org_id>/<attachment_id>``; return the attachment's id.
 
     ``fields`` go to ``db.add_attachment`` (status, failure_reason, message_id,
-    deleted_at, ...). The root is read at call time: call ``use_attachment_storage``
-    first.
+    deleted_at, GH-190's active, ...). The root is read at call time: call
+    ``use_attachment_storage`` first.
     """
     attachment_id = db.add_attachment(
         chat_id, filename=filename, kind=kind, size_bytes=len(data), **fields
@@ -732,6 +741,11 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
         Capability.CHAT_SEND,
         "path_id",
     ),
+    # GH-190: exclude or include an attachment of the caller's own; list a chat's files.
+    RouteSpec(
+        "PATCH", "/api/attachments/{attachment_id}", "member", Capability.CHAT_SEND, "path_id"
+    ),
+    RouteSpec("GET", "/api/chats/{chat_id}/attachments", "member", Capability.CHAT_SEND, "path_id"),
     # --- own Google/Microsoft connections ---
     RouteSpec("GET", "/api/oauth/google/authorize", "member", Capability.OAUTH_CONNECT, "own_user"),
     RouteSpec(

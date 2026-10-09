@@ -29,6 +29,12 @@ Viewer, plus a Super Admin):
   "attachment_not_found"}`` for org B's attachment, a colleague's (for an Org
   Admin too: downloads are the chat owner's only) and an unknown id, never
   showing the file's name or bytes; the owner still reads it (the control).
+- GH-190: ``PATCH /api/attachments/{attachment_id}`` (exclude) on org B's
+  attachment, a colleague's or an unknown id is the same
+  ``attachment_not_found`` 404 and leaves the row (its ``active`` flag
+  included) and the audit log as they were; ``GET
+  /api/chats/{chat_id}/attachments`` on org B's chat, a colleague's or an
+  unknown id is the chat routes' ``chat_not_found`` 404 and never lists a file.
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
   promotions, the permission summary, invitations, the user list and its
@@ -598,6 +604,16 @@ def _download_attachment(client: TestClient, caller: Account, ident: str) -> htt
     return client.get(f"/api/attachments/{ident}/content", headers=caller.cookie)
 
 
+def _exclude_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-190: PATCH /api/attachments/{attachment_id} ``{"active": false}``."""
+    return client.patch(f"/api/attachments/{ident}", json={"active": False}, headers=caller.cookie)
+
+
+def _list_chat_attachments(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-190: GET /api/chats/{chat_id}/attachments."""
+    return client.get(f"/api/chats/{ident}/attachments", headers=caller.cookie)
+
+
 def _attachment_case(send: Callable[[TestClient, Account, str], httpx.Response]) -> _PathIdCase:
     """A GH-187 attachment read: org A's Editor, the attachment_not_found 404, B's / A's
     marked attachment (its file on disk)."""
@@ -771,14 +787,17 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
     ("POST", "/api/chats/{chat_id}/attachments"): _chat_case(201, _upload_attachment),
     ("GET", "/api/attachments/{attachment_id}"): _attachment_case(_get_attachment),
     ("GET", "/api/attachments/{attachment_id}/content"): _attachment_case(_download_attachment),
+    # GH-190: only the owner excludes a file (200 on the own one) or lists a chat's files.
+    ("PATCH", "/api/attachments/{attachment_id}"): _attachment_case(_exclude_attachment),
+    ("GET", "/api/chats/{chat_id}/attachments"): _chat_case(200, _list_chat_attachments),
 }
 
 _PATH_ID_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]} {route[1]}") for route in _PATH_ID_CASES
 ]
 
-# The chat routes of GH-176 (and GH-8's stop route, GH-187's upload) that name a chat
-# in the path.
+# The chat routes of GH-176 (and GH-8's stop route, GH-187's upload, GH-190's list of a
+# chat's attachments) that name a chat in the path.
 _CHAT_ROUTES: Final[tuple[Route, ...]] = (
     ("GET", "/api/chats/{chat_id}"),
     ("PATCH", "/api/chats/{chat_id}"),
@@ -786,6 +805,8 @@ _CHAT_ROUTES: Final[tuple[Route, ...]] = (
     ("POST", "/api/chats/{chat_id}/messages"),
     ("POST", "/api/chats/{chat_id}/stop"),
     ("POST", "/api/chats/{chat_id}/attachments"),
+    # GH-190: the list of a chat's attachments.
+    ("GET", "/api/chats/{chat_id}/attachments"),
 )
 # Space-free ids, so the RED record (gates.sh cuts node ids at a space) names each case.
 _CHAT_ROUTE_PARAMS: Final = [
@@ -798,10 +819,13 @@ _COLLEAGUE_PAIRS: Final = [
     pytest.param("org_admin", "viewer", id="org-admin-on-viewers-chat"),
 ]
 
-# GH-187: the attachment reads (metadata and download) that name an attachment.
+# GH-187: the attachment reads (metadata and download) that name an attachment, and
+# GH-190's exclusion.
 _ATTACHMENT_ROUTES: Final[tuple[Route, ...]] = (
     ("GET", "/api/attachments/{attachment_id}"),
     ("GET", "/api/attachments/{attachment_id}/content"),
+    # GH-190: the exclusion.
+    ("PATCH", "/api/attachments/{attachment_id}"),
 )
 _ATTACHMENT_ROUTE_PARAMS: Final = [
     pytest.param(route, id=f"{route[0]}:{route[1]}") for route in _ATTACHMENT_ROUTES

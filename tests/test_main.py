@@ -77,6 +77,11 @@ covering:
   path.`` on stderr (never the value), before any database work or uvicorn.
   ``mock_deps`` unsets the variable and restores ``organizations.ATTACHMENTS_ROOT``
   after each test, so a main() run never leaks the setting into other tests.
+- GH-190 (contract C11): the construction-time ``AgentConfig`` also takes
+  ``max_input_tokens`` (``config.llm``), ``reserved_output_tokens``
+  (``llm.max_response_tokens``), ``context_margin_percent`` and
+  ``max_tool_result_tokens`` (``config.context``), and ``max_context_messages`` 0 (no
+  cap). ``_make_mock_config`` sets those config values, so main() gets numbers.
 
 Security notes:
 - All external dependencies are mocked — no real LLM, no real config files,
@@ -138,6 +143,12 @@ def _make_mock_config() -> MagicMock:
     config.limits.max_tool_calls_per_message = 10
     config.limits.max_context_messages = 20
     config.limits.confirmation_timeout_s = 300
+    # GH-190: the context budget main() passes to the construction-time AgentConfig.
+    config.llm.max_input_tokens = 200_000
+    config.llm.max_response_tokens = 4096
+    config.context.safety_margin_percent = 10
+    config.context.max_attachment_mb_per_turn = 64
+    config.context.max_tool_result_tokens = 8000
     config.server.host = "127.0.0.1"
     config.server.port = 8000
     config.database.min_pool_size = 2
@@ -788,6 +799,39 @@ class TestAgentConfigWiring:
         assert agent_config.max_tool_calls == 15
         assert agent_config.max_context_messages == 25
         assert agent_config.confirmation_timeout_s == 200.0
+
+    def test_agent_config_receives_the_context_budget_from_config(
+        self, mock_deps: dict[str, Any]
+    ) -> None:
+        """GH-190 (contract C11): max_context_messages 0 (no cap), the model's
+        max_input_tokens, the reserved output (llm.max_response_tokens), the margin and the
+        tool-result cap (the context section) reach the construction-time AgentConfig."""
+        config = mock_deps["config"]
+        config.limits.max_context_messages = 0
+        config.llm.max_input_tokens = 64000
+        config.llm.max_response_tokens = 1234
+        config.context.safety_margin_percent = 15
+        config.context.max_tool_result_tokens = 5000
+
+        main(config_path=Path("c.yaml"))
+
+        agent_config = mock_deps["Agent"].call_args.kwargs["agent_config"]
+        assert {
+            name: getattr(agent_config, name, None)
+            for name in (
+                "max_context_messages",
+                "max_input_tokens",
+                "reserved_output_tokens",
+                "context_margin_percent",
+                "max_tool_result_tokens",
+            )
+        } == {
+            "max_context_messages": 0,
+            "max_input_tokens": 64000,
+            "reserved_output_tokens": 1234,
+            "context_margin_percent": 15,
+            "max_tool_result_tokens": 5000,
+        }
 
     @pytest.mark.parametrize("removed", ["audit_logger", "model_name"])
     def test_agent_receives_no_audit_logger_or_model_name(

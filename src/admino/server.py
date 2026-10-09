@@ -71,8 +71,9 @@ Routes:
 - GET  /api/chats         — One page of the caller's chats, latest activity
   first (``limit``, ``cursor``).
 - GET  /api/chats/{chat_id} — The chat's summary, one page of its messages
-  (the latest first, ``cursor`` to earlier ones), its confirmation state and
-  context.
+  (the latest first, ``cursor`` to earlier ones; each with its attachments'
+  ids, GH-190), its confirmation state and ``context_usage`` (GH-190: how full
+  the chat's context is as its next turn starts).
 - PATCH /api/chats/{chat_id} — Renames the chat.
 - DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
 - POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
@@ -90,26 +91,40 @@ Routes:
   its active attachments in full (slot 4), refused with the 503
   ``storage_unavailable`` when one can't be read and the 422
   ``image_input_unsupported`` when one holds an image the model can't take.
+  GH-190: before those, the 422 ``context_overflow`` when the files' token
+  estimates alone don't fit the budget and the 422
+  ``attachment_bytes_exceeded`` when their converted files are above the
+  per-turn byte cap (each with a per-file report by id); the answer carries
+  ``context_usage`` and ``context_notice`` (JSON fields, SSE events).
 - POST /api/chats/{chat_id}/stop — Stops the chat's streamed run
   (``{"stopped": bool}``, GH-8).
 - POST /api/chats/{chat_id}/attachments — Stores one file (the raw request
   body, its name in ``X-Attachment-Name``) in a chat of the caller (201
   AttachmentSummary, GH-187); audited.
 - GET  /api/attachments/{attachment_id} — An attachment's metadata and
-  processing status (the chat's owner only).
+  processing status (the chat's owner only); GH-190: ``context_report`` for a
+  file refused at upload with ``context_overflow``.
+- PATCH /api/attachments/{attachment_id} — Excludes (``{"active": false}``) or
+  includes again (``{"active": true}``) an attachment of the caller's in the
+  chat's later turns (GH-190); audited (``file.exclude``, ``file.include``).
+- GET  /api/chats/{chat_id}/attachments — One page of the caller's files of
+  their chat, oldest first (``limit``, ``cursor``, ``status`` and ``active``
+  filters; GH-190).
 - GET  /api/attachments/{attachment_id}/content — Downloads the stored
   original (the chat's owner only).
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created by its first run, until #177: a refused first
   message creates none); returns ChatResponse, always JSON. Titles the chat,
   passes its active attachments (GH-189) and refuses a busy one, a blank
-  message (``message_empty``, GH-286) or an attachment it can't send
-  (``storage_unavailable``, ``image_input_unsupported``) like the route above.
+  message (``message_empty``, GH-286) or attachments it can't send
+  (``context_overflow``, ``attachment_bytes_exceeded``, GH-190;
+  ``storage_unavailable``, ``image_input_unsupported``) like the route above.
 - POST /api/confirm/{cid} — Approve or deny a pending confirmation of a chat
   (``chat_id``, or the legacy ``session_id``); returns ChatResponse (with the
   resumed run's LLM error code), or streams like a turn (GH-8). An approval
-  resumes with the chat's active attachments (GH-189; the 503 and 422 above
-  leave the confirmation pending).
+  resumes with the chat's active attachments (GH-189; the 503 and the 422s
+  above leave the confirmation pending). Both answers carry ``context_usage``
+  (GH-190), an approval also ``context_notice``.
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -178,7 +193,8 @@ Security notes:
   legacy route, so alternating routes doesn't double the LLM rate. A cursor
   that doesn't decode is a 422 ``invalid_cursor``; no error repeats a title,
   message or cursor. A turn runs on the latest ``max_context_messages``
-  messages (``chats.load_turn``, with the chat) and passes the chat's sticky
+  messages (200 when it is 0, no cap: GH-190; ``chats.load_turn``, with the
+  chat) and passes the chat's sticky
   ``external_content`` flag, read under the chat's lock (an approval that
   waited for a running turn gets what that turn stored), as
   ``earlier_external_content`` (GH-243 covers the whole conversation); its new
@@ -344,6 +360,33 @@ Security notes:
   every assistant message with the slot's ids; its ``tool.call`` rows carry
   the ids and their count. A denial reads no attachment. Log lines name ids
   and codes only.
+- Context budget (GH-190, ``admino.context_budget``): every run gets the
+  stored model's ``max_input_tokens`` and, from config.yaml, the reserved
+  output (``llm.max_response_tokens``), the safety margin and the
+  tool-result cap; the agent fits each LLM call (whole oldest turns dropped)
+  and cuts long tool results. Under the chat's hold, before any derived file
+  is read and before a pending confirmation is cancelled or consumed, the
+  slot's files are checked from their stored ``token_estimate`` and
+  ``derived_bytes`` (``_read_slot``): the 422 ``context_overflow``, then the
+  422 ``attachment_bytes_exceeded`` (the per-turn byte cap bounds the memory
+  one turn reads), each ``{"detail", "reason", "report"}`` naming files by id
+  only, the same JSON for a streamed request, with nothing read, run, stored
+  or audited. A denial is never refused. Every chat answer carries
+  ``context_usage`` (token counts) and a run's ``context_notice`` (dropped
+  turn and message counts); a streamed run sends them as the
+  ``context_notice`` and ``context_usage`` events before ``message_saved``.
+  The usage of a turn is computed from what the run loaded and stored, of
+  ``GET /api/chats/{chat_id}`` from the turn setup and the turn read (the
+  owner check first): nothing is read from disk. A run that reports external
+  content (a wrapped tool result the cut shortened, A1) sets the chat's
+  sticky flag and titles with the fallback. ``PATCH
+  /api/attachments/{attachment_id}`` and ``GET
+  /api/chats/{chat_id}/attachments`` need ``chat.send`` and their per-user
+  buckets, and reach the caller's own live attachments and chats only: the
+  same 404s as the other attachment and chat routes. An exclusion or
+  inclusion records ``file.exclude`` / ``file.include`` in its transaction
+  (ids only); the same value again records nothing. No log line, error body
+  or audit row names a file or holds its content.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -710,6 +753,7 @@ from admino import (
     auth,
     chat_titles,
     chats,
+    context_budget,
     event_stream,
     invitations,
     llm_policy,
@@ -743,8 +787,10 @@ from admino.models import (
     PROVIDER_TOOLS,
     AgentConfig,
     AgentResult,
+    AttachmentListResponse,
+    AttachmentStatus,
     AttachmentSummary,
-    ChatContext,
+    AttachmentUpdateRequest,
     ChatCreateRequest,
     ChatDetailResponse,
     ChatListResponse,
@@ -756,6 +802,8 @@ from admino.models import (
     ChatSummary,
     ChatUpdateRequest,
     ConfirmRequest,
+    ContextRefusal,
+    ContextReportItem,
     CriticalPermissionPromote,
     CriticalPermissionsResponse,
     CriticalPermissionState,
@@ -844,8 +892,13 @@ if TYPE_CHECKING:
     from admino.models import (
         AgentStatus,
         AttachmentContent,
+        ContextNotice,
+        ContextRefusalReason,
+        ContextReport,
+        ContextUsage,
         LLMErrorCode,
         MessageStatus,
+        PromptContext,
         SettingsPatchLLM,
         ToolCallRecord,
         ToolPolicy,
@@ -1206,6 +1259,9 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     "/api/chats/attachments/create": (0.5, 10),
     "/api/attachments/get": (5.0, 50),
     "/api/attachments/content/get": (2.0, 30),
+    # GH-190: excluding or including an attachment, and listing a chat's files, per user.
+    "/api/attachments/patch": (0.5, 5),
+    "/api/chats/attachments/list": (1.0, 10),
     # GH-159: the settings scopes, per user.
     "/api/me/settings/get": (1.0, 10),
     "/api/me/settings/patch": (0.5, 5),
@@ -1576,6 +1632,12 @@ _STORAGE_UNAVAILABLE_BODY: Final = {
 _IMAGE_INPUT_UNSUPPORTED_BODY: Final = {
     "detail": "The current model does not accept image input",
     "reason": "image_input_unsupported",
+}
+# GH-190 (Decision 5): a turn whose attachments alone don't fit, tokens checked before
+# bytes. The 422 body adds the per-file report (ids and stored sizes, never a name).
+_CONTEXT_REFUSAL_DETAILS: Final[dict[ContextRefusalReason, str]] = {
+    "context_overflow": "The chat's attachments don't fit the model's context",
+    "attachment_bytes_exceeded": "The chat's attachments are too large for one turn",
 }
 # GH-286: a message that is blank (``str.strip()`` leaves nothing) and sends no files;
 # fixed text, never the input. Providers would get a whitespace-only user turn.
@@ -3790,20 +3852,120 @@ async def _platform_run_settings() -> scoped_settings.StoredPlatformSettings:
     return await scoped_settings.current_platform_settings(get_pool())
 
 
+def _budget_settings() -> context_budget.BudgetSettings:
+    """The context budget's start-time settings (GH-190), from the app's config.yaml.
+
+    Raises:
+        HTTPException: 500 before ``create_app`` set the config.
+    """
+    if _config is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    return context_budget.BudgetSettings.from_config(_config)
+
+
+def _token_budget(
+    platform: scoped_settings.StoredPlatformSettings, settings: context_budget.BudgetSettings
+) -> int:
+    """The token budget of one LLM call: the stored model's input limit minus the margin."""
+    return context_budget.budget_limit(
+        platform.llm.max_input_tokens, settings.safety_margin_percent
+    )
+
+
+def _history_limit(platform: scoped_settings.StoredPlatformSettings) -> int:
+    """The messages a turn reads: the stored ``max_context_messages``, or 200 without a cap.
+
+    GH-190 (Decision 8): 0 is no cap, so the token budget alone decides what
+    the model gets of the latest ``context_budget.HISTORY_LOAD_LIMIT``.
+    """
+    return platform.limits.max_context_messages or context_budget.HISTORY_LOAD_LIMIT
+
+
 def _run_config(platform: scoped_settings.StoredPlatformSettings) -> AgentConfig:
     """The AgentConfig of one agent run.
 
     The stored tool-call, context and timeout limits, the stored LLM retry
-    limit (``llm.max_retries``, GH-242) and whether the model takes images
-    (``llm.image_input``, GH-189: the agent's last guard against an image part).
+    limit (``llm.max_retries``, GH-242), whether the model takes images
+    (``llm.image_input``, GH-189: the agent's last guard against an image
+    part) and (GH-190) the context budget: the stored model's
+    ``max_input_tokens`` and, from config.yaml, the reserved output, the
+    safety margin and the tool-result cap. A ``max_context_messages`` of 0
+    passes as 0: no message cap.
     """
     limits = platform.limits
+    settings = _budget_settings()
     return AgentConfig(
         max_tool_calls=limits.max_tool_calls_per_message,
         max_context_messages=limits.max_context_messages,
         confirmation_timeout_s=float(limits.confirmation_timeout_s),
         llm_max_retries=platform.llm.max_retries,
         image_input=platform.llm.image_input,
+        max_input_tokens=platform.llm.max_input_tokens,
+        reserved_output_tokens=settings.reserved_output_tokens,
+        context_margin_percent=settings.safety_margin_percent,
+        max_tool_result_tokens=settings.max_tool_result_tokens,
+    )
+
+
+def _chat_usage(
+    platform: scoped_settings.StoredPlatformSettings,
+    history: Sequence[LLMMessage],
+    *,
+    prompt_context: PromptContext,
+    policy: ToolPolicy,
+    attachment_tokens: int,
+) -> ContextUsage:
+    """How full the chat's context is as its next turn starts (GH-190, Decision 4).
+
+    The instructions (``context_budget.instructions_tokens`` of the caller's
+    prompt context and tool policy at ``_utc_now``), the chat's active
+    attachments (their stored estimates), the newest whole turns of
+    ``history`` that fit and the reserved output, over the budget of the
+    stored model. Counts only: nothing here is logged or read from disk.
+    """
+    settings = _budget_settings()
+    return context_budget.chat_usage(
+        history,
+        instructions=context_budget.instructions_tokens(prompt_context, policy, now=_utc_now()),
+        attachment_tokens=attachment_tokens,
+        reserved_output_tokens=settings.reserved_output_tokens,
+        budget=_token_budget(platform, settings),
+    )
+
+
+def _row_tokens(active: Sequence[chats.ActiveAttachment]) -> int:
+    """The stored token estimates of attachment rows (NULL as 0)."""
+    return sum(attachment.token_estimate or 0 for attachment in active)
+
+
+def _context_report(
+    platform: scoped_settings.StoredPlatformSettings, items: Sequence[ContextReportItem]
+) -> ContextReport:
+    """The per-file report of files against the budget and the per-turn byte cap (GH-190).
+
+    ``available_tokens`` is the stored model's budget minus the reserved
+    output (at least 0), ``max_bytes`` the config's
+    ``context.max_attachment_mb_per_turn`` in bytes. Ids and stored sizes
+    only, never a name.
+    """
+    settings = _budget_settings()
+    return context_budget.context_report(
+        items,
+        available_tokens=context_budget.available_attachment_tokens(
+            _token_budget(platform, settings), settings.reserved_output_tokens
+        ),
+        max_bytes=settings.max_turn_bytes,
+    )
+
+
+def _report_item(
+    attachment_id: UUID, token_estimate: int | None, derived_bytes: int | None
+) -> ContextReportItem:
+    """One file of a context report: its id and stored sizes, NULL as 0."""
+    return ContextReportItem(
+        attachment_id=attachment_id,
+        token_estimate=token_estimate or 0,
+        derived_bytes=derived_bytes or 0,
     )
 
 
@@ -3890,11 +4052,16 @@ async def get_chat_detail(
     ``pending`` (with ``pending_confirmation``) only for a live one in
     ``_chat_runtime``, ``expired`` when the latest message awaits a
     confirmation that is gone (expired, or lost in a restart), else ``none``.
-    ``context`` (interim until #190) counts every message of the chat against
-    the stored platform ``max_context_messages`` (the latest messages a run
-    sends to the model). One ``chats.read_chat_detail`` read: the owner check
-    runs once, and the latest status is read without its message (GH-266).
-    Reading changes nothing.
+    One ``chats.read_chat_detail`` read: the owner check runs once (a chat the
+    caller can't reach stops there), the page's messages carry their live
+    attachments' ids (GH-190, excluded ones included), and the latest status
+    is read without its message (GH-266). GH-190: ``context_usage`` is the
+    chat as its next turn will start (``_chat_usage``): the turn setup
+    (``turn_setup.load_turn_setup``: the caller's prompt context and their
+    org's tool policy) and the turn read (``chats.load_turn``: the latest
+    messages as a turn loads them, ``max_context_messages`` or 200 without a
+    cap, and the active attachments' stored estimates; no derived file is
+    read). Reading changes nothing.
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -3905,9 +4072,9 @@ async def get_chat_detail(
 
     Returns:
         ChatDetailResponse: the summary, the page's messages in chronological
-        order (sanitized content and tool-call summaries, never the raw tool
-        inputs), the cursor of earlier messages, the confirmation state and
-        the context.
+        order (sanitized content, tool-call summaries and attachment ids, never
+        the raw tool inputs), the cursor of earlier messages, the confirmation
+        state and the context usage (token counts only).
 
     Raises:
         HTTPException: 429 when rate-limited. Another org's, a colleague's,
@@ -3920,10 +4087,20 @@ async def get_chat_detail(
 
     from admino.database import get_pool
 
+    pool = get_pool()
     tenant = TenantContext.from_principal(principal)
-    detail = await chats.read_chat_detail(get_pool(), tenant, chat_id, limit=limit, cursor=cursor)
-    chat, page, message_count = detail.chat, detail.page, detail.message_count
-    max_context = (await _platform_run_settings()).limits.max_context_messages
+    detail = await chats.read_chat_detail(pool, tenant, chat_id, limit=limit, cursor=cursor)
+    chat, page = detail.chat, detail.page
+    platform = await _platform_run_settings()
+    setup = await turn_setup.load_turn_setup(pool, tenant, chat.id)
+    turn = await chats.load_turn(pool, tenant, chat.id, limit=_history_limit(platform))
+    usage = _chat_usage(
+        platform,
+        turn.history,
+        prompt_context=setup.prompt_context,
+        policy=setup.policy,
+        attachment_tokens=_row_tokens(turn.attachments),
+    )
     pending = _chat_runtime.get_pending(chat.id)
     confirmation_status: Literal["none", "pending", "expired"] = "none"
     if pending is not None:
@@ -3943,11 +4120,7 @@ async def get_chat_detail(
         next_cursor=page.next_cursor,
         pending_confirmation=None if pending is None else _summarise_pending(pending),
         confirmation_status=confirmation_status,
-        context=ChatContext(
-            message_count=message_count,
-            max_context_messages=max_context,
-            truncated=message_count > max_context,
-        ),
+        context_usage=usage,
     )
 
 
@@ -4049,6 +4222,9 @@ class _HeldRun:
     loaded: list[LLMMessage]
     platform: scoped_settings.StoredPlatformSettings
     policy: ToolPolicy
+    # The caller's prompt inputs the run got: the stored turn's context usage counts
+    # the instructions they make (GH-190).
+    prompt_context: PromptContext
     # The user message of an untitled chat's first exchange (GH-179); None: no title.
     title_message: str | None = None
     # The files the turn's user message sends (GH-187, checked before the hold).
@@ -4067,6 +4243,10 @@ class _StoredRun:
     pending: PendingConfirmationSummary | None
     # The turn's last stored message; None when the run added no message.
     message_id: UUID | None
+    # GH-190: the chat as its next turn starts, and the earlier turns the run's last
+    # LLM call left out (None: none).
+    context_usage: ContextUsage
+    context_notice: ContextNotice | None
 
 
 async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
@@ -4092,7 +4272,13 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
     GH-189: a run whose slot 4 held attachments stores every assistant message
     with the slot's ids in slot order (``included_attachment_ids``) and sets
     the chat's sticky ``external_content`` flag: the files are external
-    content for every later run of the chat.
+    content for every later run of the chat. GH-190 (A1): so does a run that
+    reports external content (``result.external_content``: a wrapped tool
+    result, judged before the cut that may have removed its marker).
+
+    GH-190: the stored turn reports the chat's context usage over the loaded
+    messages and the ones stored (the pending-limit closures included,
+    ``_chat_usage``), and the run's ``context_notice``.
 
     Args:
         run: The held run (the pool, the caller's org scope, the chat, the
@@ -4156,7 +4342,7 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
             # default) adds no statement.
             attachment_ids=run.attachment_ids,
             included_attachment_ids=[content.id for content in run.slot],
-            external_content=bool(run.slot),
+            external_content=bool(run.slot) or result.external_content,
         )
     except BaseException:
         # Whatever stopped the store (a chat trashed meanwhile, a database error, a
@@ -4176,6 +4362,14 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
         error_code=error_code,
         pending=pending_summary,
         message_id=message_id,
+        context_usage=_chat_usage(
+            run.platform,
+            [*run.loaded, *new_messages],
+            prompt_context=run.prompt_context,
+            policy=run.policy,
+            attachment_tokens=sum(content.token_estimate for content in run.slot),
+        ),
+        context_notice=result.context_notice,
     )
 
 
@@ -4191,6 +4385,8 @@ def _chat_response(
         status=cast("_JsonStatus", stored.status),
         pending_confirmation=stored.pending,
         error_code=stored.error_code,
+        context_usage=stored.context_usage,
+        context_notice=stored.context_notice,
     )
 
 
@@ -4209,6 +4405,12 @@ def _read_external_content(loaded: list[LLMMessage], result: AgentResult) -> boo
     )
 
 
+def _context_refusal_body(reason: ContextRefusalReason, report: ContextReport) -> dict[str, object]:
+    """The send rule's 422 body (GH-190): the fixed text, the code and the per-file report."""
+    refusal = ContextRefusal(detail=_CONTEXT_REFUSAL_DETAILS[reason], reason=reason, report=report)
+    return refusal.model_dump(mode="json")
+
+
 async def _read_slot(
     tenant: TenantContext,
     platform: scoped_settings.StoredPlatformSettings,
@@ -4217,14 +4419,32 @@ async def _read_slot(
     """Slot 4 of a run: the content of the chat's active attachments, in slot order (GH-189).
 
     Called under the chat's hold, before a pending confirmation is cancelled
-    or consumed. The derived files of every active attachment are read in
-    worker threads (``attachment_context.load_contents``, no statement): one
-    that can't be read is the 503 ``storage_unavailable``. Then an image part
-    while the stored ``llm.image_input`` is false is the 422
-    ``image_input_unsupported``: the parts read decide, not the kind. Both are
-    fixed bodies that name no file; the caller returns them with nothing run
-    or stored. No active attachment gives ``()``.
+    or consumed. GH-190 (Decisions 5 and 6): first, from the stored values
+    only and before any derived file is read, the slot's files are checked
+    against the budget: a ``token_estimate`` sum above the budget minus the
+    reserved output is the 422 ``context_overflow``, else a ``derived_bytes``
+    sum above ``context.max_attachment_mb_per_turn`` MiB the 422
+    ``attachment_bytes_exceeded`` (NULL counts 0; exactly at a limit runs),
+    each with the per-file report (``_context_report``: ids in slot order,
+    never a name). So a turn never reads more than the cap into memory, and
+    never a file partially. Then the derived files of every active attachment
+    are read in worker threads (``attachment_context.load_contents``, no
+    statement): one that can't be read is the 503 ``storage_unavailable``.
+    Then an image part while the stored ``llm.image_input`` is false is the
+    422 ``image_input_unsupported``: the parts read decide, not the kind.
+    Every refusal is a JSON body that names no file; the caller returns it
+    with nothing run or stored. No active attachment gives ``()``.
     """
+    report = _context_report(
+        platform,
+        [
+            _report_item(attachment.id, attachment.token_estimate, attachment.derived_bytes)
+            for attachment in active
+        ],
+    )
+    reason = context_budget.overflow_reason(report)
+    if reason is not None:
+        return JSONResponse(status_code=422, content=_context_refusal_body(reason, report))
     try:
         contents = await attachment_context.load_contents(
             attachments.attachments_root(), tenant.org_id, active
@@ -4261,9 +4481,10 @@ def _title_call(
     and the reply, or the fallback from the message. A turn stored as
     ``error`` (a confirmation refused with ``rate_limit`` included) or
     ``stopped`` (GH-8) makes no model call, nor does a run whose new ``tool``
-    results hold wrapped external content (``_read_external_content``) or
-    whose slot 4 held attachments (GH-189): the reply may quote an email or a
-    file, which must not choose the title. The
+    results hold wrapped external content (``_read_external_content``), whose
+    slot 4 held attachments (GH-189) or that reports external content (GH-190
+    A1: a wrapped result cut past its marker): the reply may quote an email or
+    a file, which must not choose the title. The
     call gets the agent's client when it runs (``_running_llm_client``), the
     org's data residency and the stored ``llm.max_retries``, and holds no chat
     lock: a later turn's history holds the reply, so it titles nothing again.
@@ -4279,7 +4500,9 @@ def _title_call(
         user_message=run.title_message,
         assistant_message=result.response,
         run_failed=stored.status in ("error", "stopped"),
-        external_content=bool(run.slot) or _read_external_content(run.loaded, result),
+        external_content=bool(run.slot)
+        or result.external_content
+        or _read_external_content(run.loaded, result),
         data_residency=run.policy.data_residency,
         max_retries=run.platform.llm.max_retries,
     )
@@ -4307,21 +4530,65 @@ _EVENT_STREAM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     200: {
         "description": (
             "The ChatResponse, or the run's events with Accept: text/event-stream "
-            "(run_started, delta, tool_call, confirm, message_saved, error, title, done)."
+            "(run_started, delta, tool_call, confirm, context_notice, context_usage, "
+            "message_saved, error, title, done)."
         ),
         "content": {"text/event-stream": {"schema": {"type": "string"}}},
     }
 }
-# The OpenAPI 422 and 503 of the two message routes (GH-286, GH-189). Documenting a 422
-# replaces FastAPI's generated one, so the description names the validation list too.
+# GH-190: the send rule's refusals as OpenAPI examples, one file each at the default
+# limits (the budget of 200,000 input tokens at a 10 % margin, 4,096 reserved, 64 MiB).
+_EXAMPLE_ATTACHMENT_ID: Final = UUID("6f1d2c3b-4a5e-4b7c-8d9e-0a1b2c3d4e5f")
+_CONTEXT_OVERFLOW_EXAMPLE: Final = _context_refusal_body(
+    "context_overflow",
+    context_budget.context_report(
+        [
+            ContextReportItem(
+                attachment_id=_EXAMPLE_ATTACHMENT_ID, token_estimate=190_000, derived_bytes=760_000
+            )
+        ],
+        available_tokens=175_904,
+        max_bytes=64 * context_budget.MIB,
+    ),
+)
+_ATTACHMENT_BYTES_EXAMPLE: Final = _context_refusal_body(
+    "attachment_bytes_exceeded",
+    context_budget.context_report(
+        [
+            ContextReportItem(
+                attachment_id=_EXAMPLE_ATTACHMENT_ID, token_estimate=1_200, derived_bytes=70_000_000
+            )
+        ],
+        available_tokens=175_904,
+        max_bytes=64 * context_budget.MIB,
+    ),
+)
+# The GH-190 part of the 422 descriptions below.
+_CONTEXT_REFUSALS_DESCRIPTION: Final = (
+    "context_overflow: the token estimates of the files the turn would send (the "
+    "chat's active attachments and the message's own) are above the budget minus the "
+    "reserved output; attachment_bytes_exceeded: their converted files are above the "
+    "per-turn byte cap (both checked before any file is read, tokens first, with a "
+    "per-file report by id)"
+)
+# The OpenAPI 422 and 503 of the two message routes (GH-286, GH-189, GH-190). Documenting
+# a 422 replaces FastAPI's generated one, so the description names the validation list too.
 _MESSAGE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     422: {
         "description": (
             "Validation Error (the usual list); message_empty: the message is blank "
-            "(nothing but whitespace) and sends no files; or image_input_unsupported: an "
-            "attachment of the chat holds an image and the current model takes none."
+            "(nothing but whitespace) and sends no files; "
+            + _CONTEXT_REFUSALS_DESCRIPTION
+            + " under report: attachments (attachment_id, token_estimate, derived_bytes "
+            "per file), attachment_tokens, available_tokens, attachment_bytes and "
+            "max_bytes; or image_input_unsupported: an attachment of the chat holds an "
+            "image and the current model takes none."
         ),
-        "content": {"application/json": {"example": _MESSAGE_EMPTY_BODY}},
+        "content": {
+            # GH-286 pins the blank-message body as the example, and OpenAPI forbids
+            # example beside examples, so the other codes are described in words.
+            "application/json": {"example": _MESSAGE_EMPTY_BODY}
+        },
     },
     503: {
         "description": (
@@ -4338,19 +4605,23 @@ _MESSAGE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         },
     },
 }
-# The OpenAPI 422 and 503 of an approval (GH-189): slot 4 is built before the
-# confirmation is consumed, so either refusal leaves it pending. Documenting a 422
+# The OpenAPI 422 and 503 of an approval (GH-189, GH-190): slot 4 is built before the
+# confirmation is consumed, so every refusal leaves it pending. Documenting a 422
 # replaces FastAPI's generated one, so the description names the validation list too.
 _CONFIRM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     422: {
         "description": (
-            "Validation Error (the usual list); or image_input_unsupported: an attachment "
-            "of the chat holds an image and the current model takes none (the "
-            "confirmation stays pending)."
+            "Validation Error (the usual list); "
+            + _CONTEXT_REFUSALS_DESCRIPTION
+            + "; or image_input_unsupported: an attachment of the chat holds an image "
+            "and the current model takes none (the confirmation stays pending; a denial "
+            "is never refused)."
         ),
         "content": {
             "application/json": {
                 "examples": {
+                    "context_overflow": {"value": _CONTEXT_OVERFLOW_EXAMPLE},
+                    "attachment_bytes_exceeded": {"value": _ATTACHMENT_BYTES_EXAMPLE},
                     "image_input_unsupported": {"value": _IMAGE_INPUT_UNSUPPORTED_BODY},
                 }
             }
@@ -4474,12 +4745,20 @@ class _RunFrames:
 
 
 def _report_stored(frames: _RunFrames, stored: _StoredRun) -> None:
-    """Send how a stored run ended: the frames after its deltas and tool calls (C5.3)."""
+    """Send how a stored run ended: the frames after its deltas and tool calls (C5.3).
+
+    GH-190 (Decision 4): ``confirm``, then ``context_notice`` (only when the
+    run's last LLM call dropped earlier turns) and ``context_usage``, then
+    ``message_saved`` and ``error``.
+    """
     if stored.status == "limit_reached":
         # The agent adds the limit notice without streaming it.
         frames.text(display_pieces(stored.response))
     if stored.pending is not None:
         frames.send("confirm", stored.pending)
+    if stored.context_notice is not None:
+        frames.send("context_notice", stored.context_notice)
+    frames.send("context_usage", stored.context_usage)
     if stored.message_id is not None:
         frames.send(
             "message_saved",
@@ -4656,6 +4935,15 @@ async def _chat_turn(
     stored with the slot's ids (``_finish_run``). The legacy route makes the
     same two checks.
 
+    GH-190: ``_read_slot`` first checks the slot's stored estimates and sizes
+    (no statement, nothing read): the 422 ``context_overflow`` or
+    ``attachment_bytes_exceeded`` with the per-file report, JSON for a
+    streamed request too, nothing run or stored and the pending confirmation
+    kept. The turn reads the latest ``max_context_messages`` messages (200
+    without a cap), the run gets the budget in its config (``_run_config``),
+    and the answer carries the chat's ``context_usage`` and the run's
+    ``context_notice`` (``_finish_run``).
+
     A legacy session id keeps its separate reads before the hold
     (``org_permissions.load_tool_policy``,
     ``scoped_settings.load_prompt_context``, ``chats.find_legacy_chat``;
@@ -4671,7 +4959,8 @@ async def _chat_turn(
     message is refused at once (``ChatRunActiveError``, the 409
     ``run_active``), with nothing run or stored and the chat's pending
     confirmation untouched. Under the hold the chat and its latest
-    ``max_context_messages`` messages are read (``chats.load_turn``: a chat
+    ``max_context_messages`` messages (200 without a cap, GH-190) are read
+    (``chats.load_turn``: a chat
     trashed meanwhile is the 404), a pending confirmation of the chat is
     cancelled (a message instead of a confirmation), a dangling ``tool_use``
     gets its synthetic cancelled result, and the agent runs with
@@ -4704,7 +4993,8 @@ async def _chat_turn(
 
     Returns:
         The turn's ChatResponse (``session_id`` echoes a legacy session id),
-        the streamed turn's EventStreamResponse, or the JSON 503
+        the streamed turn's EventStreamResponse, or the JSON 422
+        ``context_overflow`` or ``attachment_bytes_exceeded`` (GH-190), 503
         ``storage_unavailable`` or 422 ``image_input_unsupported`` (GH-189).
 
     Raises:
@@ -4794,9 +5084,7 @@ async def _chat_turn(
         # The chat and its latest messages, read under the hold in one statement: a chat
         # trashed meanwhile is the 404, and an approval that ran in front may have set
         # external_content (GH-243), which must escalate this run (audit M-1).
-        turn = await chats.load_turn(
-            pool, tenant, chat_id, limit=platform.limits.max_context_messages
-        )
+        turn = await chats.load_turn(pool, tenant, chat_id, limit=_history_limit(platform))
         chat, loaded = turn.chat, turn.history
         # Before the pending confirmation is cancelled: a refused message keeps it.
         slot = await _read_slot(tenant, platform, [*turn.attachments, *sent])
@@ -4822,6 +5110,7 @@ async def _chat_turn(
             loaded=loaded,
             platform=platform,
             policy=policy,
+            prompt_context=prompt_context,
             title_message=message if first_exchange else None,
             attachment_ids=tuple(attachment_ids),
             slot=slot,
@@ -4893,6 +5182,15 @@ async def post_chat_message(
     ``image_input_unsupported`` when one holds an image and the stored
     ``llm.image_input`` is false (``_chat_turn``).
 
+    GH-190: before any of them is read, the 422 ``context_overflow`` when the
+    token estimates of the chat's active files and the message's own are
+    above the budget minus the reserved output, then the 422
+    ``attachment_bytes_exceeded`` above the per-turn byte cap, each with the
+    per-file report (ids only). An excluded file the message lists is linked
+    to it but not sent. The answer carries ``context_usage`` and
+    ``context_notice`` (a streamed one sends them as events before
+    ``message_saved``).
+
     Args:
         request: The incoming request (its ``Accept`` header).
         principal: The logged-in principal (needs ``chat.send``).
@@ -4907,7 +5205,8 @@ async def post_chat_message(
         "error"``, GH-24) when the caller already holds the stored
         ``max_pending_confirmations`` in other chats; None otherwise. Or the
         streamed run's EventStreamResponse. Or the JSON (also for a streamed
-        request) 422 ``message_empty``, ``too_many_files`` or
+        request) 422 ``message_empty``, ``too_many_files``,
+        ``context_overflow``, ``attachment_bytes_exceeded`` or
         ``image_input_unsupported``, or 503 ``storage_unavailable``.
 
     Raises:
@@ -4964,7 +5263,10 @@ async def post_message(
 
     GH-189: the chat's active attachments (files sent to it through the chat
     route) go to the run like there, with the same 503
-    ``storage_unavailable`` and 422 ``image_input_unsupported`` under the hold.
+    ``storage_unavailable`` and 422 ``image_input_unsupported`` under the hold,
+    and (GH-190) first the same 422 ``context_overflow`` and
+    ``attachment_bytes_exceeded``; the answer carries ``context_usage`` and
+    ``context_notice``.
 
     Args:
         body: Validated ChatRequest with message and session_id.
@@ -4977,8 +5279,9 @@ async def post_message(
         code: the run's LLM error code, or ``rate_limit`` (``status:
         "error"``, GH-24) when the caller already holds the stored
         ``max_pending_confirmations`` in other chats; None otherwise. Or the
-        422 ``message_empty`` or ``image_input_unsupported``, or the 503
-        ``storage_unavailable``.
+        422 ``message_empty``, ``context_overflow``,
+        ``attachment_bytes_exceeded`` or ``image_input_unsupported``, or the
+        503 ``storage_unavailable``.
 
     Raises:
         HTTPException: 429 when rate-limited, 422 over the stored message
@@ -5054,16 +5357,22 @@ async def post_confirm(
     answers the same 404 as one already reaped, with nothing run or stored
     (GH-24). GH-189: an approval first reads the chat with its latest
     messages and active attachments (``chats.load_turn``) and builds slot 4
-    (``_read_slot``) before the confirmation is consumed: the 503
-    ``storage_unavailable`` or the 422 ``image_input_unsupported`` (JSON,
-    streamed or not) leaves it pending, with nothing run or stored. The
-    resumed run gets the slot like a turn, and its stored assistant messages
-    record the slot's ids. A denial reads no attachment and stores the
-    closing ``tool`` results (the denied call's
-    "Tool call denied by the user.", any other dangling call's cancelled
-    result) and the assistant's denial, so the history stays well-formed. An
-    approval resumes the agent on the latest ``max_context_messages`` stored
-    messages (the dangling ``tool_use`` left as it is: the resume dispatches
+    (``_read_slot``) before the confirmation is consumed: the 422
+    ``context_overflow`` or ``attachment_bytes_exceeded`` (GH-190, from the
+    stored values), the 503 ``storage_unavailable`` or the 422
+    ``image_input_unsupported`` (JSON, streamed or not) leaves it pending,
+    with nothing run or stored. The resumed run gets the slot like a turn,
+    and its stored assistant messages record the slot's ids. A denial reads
+    no attachment file and is never refused: it reads the chat's latest
+    messages and active attachments' rows (``chats.load_turn``) and the
+    caller's prompt context, and stores the closing ``tool`` results (the
+    denied call's "Tool call denied by the user.", any other dangling call's
+    cancelled result) and the assistant's denial, so the history stays
+    well-formed. Both answers carry ``context_usage`` (GH-190: for a denial
+    over the loaded and the stored messages, the files counted from their
+    rows), an approval also the run's ``context_notice``. An approval
+    resumes the agent on the latest ``max_context_messages`` stored messages
+    (200 without a cap; the dangling ``tool_use`` left as it is: the resume dispatches
     it), with the caller's principal, the chat's ``external_content`` flag
     (read again under the hold, so a turn that ran in front of the approval
     counts), the stored platform limits and LLM retry limit (read on every
@@ -5081,8 +5390,9 @@ async def post_confirm(
 
     GH-8: with an ``Accept`` header listing ``text/event-stream`` an approval
     streams the resumed run like a turn (no title), and a denial streams
-    ``run_started``, the denial as a ``delta``, ``message_saved`` and ``done``
-    once it is stored and the chat is free; every refusal is the JSON error.
+    ``run_started``, the denial as a ``delta``, ``context_usage`` (GH-190),
+    ``message_saved`` and ``done`` once it is stored and the chat is free;
+    every refusal is the JSON error.
 
     Args:
         request: The incoming request (its ``Accept`` header).
@@ -5096,7 +5406,9 @@ async def post_confirm(
         the result of the resumed agent run (its LLM error code, or
         ``rate_limit`` when the confirmation it asked for was refused; None
         for a denial); or the streamed EventStreamResponse; or an approval's
-        JSON 503 ``storage_unavailable`` or 422 ``image_input_unsupported``.
+        JSON 422 ``context_overflow`` or ``attachment_bytes_exceeded``
+        (GH-190), 503 ``storage_unavailable`` or 422
+        ``image_input_unsupported``.
 
     Raises:
         HTTPException: 404 if no confirmation is pending for the chat, it has
@@ -5159,24 +5471,27 @@ async def post_confirm(
             raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
 
         if not body.approved:
-            # A denial is consumed at once and reads no attachment (GH-189).
+            # A denial is consumed at once and reads no attachment (GH-189): the turn read
+            # gives its history and the active attachments' stored estimates (GH-190).
             _chat_runtime.pop_pending(chat.id)
-            loaded = await chats.load_recent_history(
-                pool, tenant, chat.id, limit=platform.limits.max_context_messages
-            )
+            turn = await chats.load_turn(pool, tenant, chat.id, limit=_history_limit(platform))
+            prompt_context = await scoped_settings.load_prompt_context(pool, tenant)
             logger.info("Confirmation denied for chat %s", safe_log(chat.id))
             # Safe f-string: tool and action are Pydantic-validated with
             # pattern=r"^[a-z][a-z0-9_]{0,62}$", restricting to alphanumeric/
             # underscore. ChatResponse.sanitize_response provides defence-in-depth.
             denial = f"Action {pending.tool_call.tool}.{pending.tool_call.action} was denied."
-            message_id = await chats.append_messages(
-                pool,
-                tenant,
-                chat.id,
-                [
-                    *_denied_tool_results(loaded, pending, _DENIED_TOOL_RESULT_MSG),
-                    LLMMessage(role="assistant", content=denial),
-                ],
+            denied = [
+                *_denied_tool_results(turn.history, pending, _DENIED_TOOL_RESULT_MSG),
+                LLMMessage(role="assistant", content=denial),
+            ]
+            message_id = await chats.append_messages(pool, tenant, chat.id, denied)
+            usage = _chat_usage(
+                platform,
+                [*turn.history, *denied],
+                prompt_context=prompt_context,
+                policy=policy,
+                attachment_tokens=_row_tokens(turn.attachments),
             )
             if streamed:
                 # Sent once the handler returned: the chat is free by then.
@@ -5190,6 +5505,8 @@ async def post_confirm(
                         error_code=None,
                         pending=None,
                         message_id=message_id,
+                        context_usage=usage,
+                        context_notice=None,
                     ),
                 )
                 frames.end()
@@ -5201,6 +5518,7 @@ async def post_confirm(
                 tool_calls=[],
                 status="final",
                 pending_confirmation=None,
+                context_usage=usage,
             )
 
         # Approved — resume the agent with the pending confirmation, the chat's
@@ -5208,9 +5526,7 @@ async def post_confirm(
         # set it; security audit M-1), the chat's active attachments (GH-189) and the
         # prompt context as it is now (GH-170: a change made while the confirmation was
         # pending applies to the resumed run).
-        turn = await chats.load_turn(
-            pool, tenant, chat.id, limit=platform.limits.max_context_messages
-        )
+        turn = await chats.load_turn(pool, tenant, chat.id, limit=_history_limit(platform))
         # Before the confirmation is consumed: a refused approval leaves it pending.
         slot = await _read_slot(tenant, platform, turn.attachments)
         if isinstance(slot, JSONResponse):
@@ -5228,6 +5544,7 @@ async def post_confirm(
             loaded=loaded,
             platform=platform,
             policy=policy,
+            prompt_context=prompt_context,
             slot=slot,
         )
         start = functools.partial(
@@ -5421,13 +5738,22 @@ async def get_attachment_metadata(
 ) -> AttachmentSummary:
     """Handle GET /api/attachments/{attachment_id} — an attachment of the caller.
 
+    GH-190 (Decision 7): a file the conversion refused because the chat's
+    files would not fit the model's context (``failed`` with
+    ``context_overflow``) also gets ``context_report``: the chat's live,
+    ``ready``, active files in upload order (``attachments.ready_active_attachments``,
+    one more statement, only then), followed by this file, each by id with its
+    stored estimate and bytes (NULL as 0; the refused file's derived files are
+    gone), against the budget of the stored model and the per-turn byte cap.
+
     Args:
         principal: The logged-in principal (needs ``chat.send``).
         attachment_id: The attachment (a UUID; anything else is a 422).
 
     Returns:
-        The attachment's AttachmentSummary: its metadata and processing
-        status (any status), never its bytes.
+        The attachment's AttachmentSummary: its metadata, processing status
+        (any status) and ``active`` flag, never its bytes; ``context_report``
+        is null but for a ``context_overflow`` failure.
 
     Raises:
         HTTPException: 429 when rate-limited. Anything but the caller's own
@@ -5438,8 +5764,129 @@ async def get_attachment_metadata(
 
     from admino.database import get_pool
 
+    pool = get_pool()
     tenant = TenantContext.from_principal(principal)
-    return _attachment_summary(await attachments.get_attachment(get_pool(), tenant, attachment_id))
+    record = await attachments.get_attachment(pool, tenant, attachment_id)
+    summary = _attachment_summary(record)
+    if record.status != "failed" or record.failure_reason != "context_overflow":
+        return summary
+    others = await attachments.ready_active_attachments(pool, tenant, record.chat_id)
+    report = _context_report(
+        await _platform_run_settings(),
+        [
+            *(
+                _report_item(other.id, other.token_estimate, other.derived_bytes)
+                for other in others
+            ),
+            _report_item(record.id, record.token_estimate, None),
+        ],
+    )
+    return summary.model_copy(update={"context_report": report})
+
+
+async def patch_attachment(
+    request: Request,
+    principal: _ChatSenderDep,
+    attachment_id: UUID,
+    body: AttachmentUpdateRequest,
+) -> AttachmentSummary:
+    """Handle PATCH /api/attachments/{attachment_id} — exclude or include an attachment (GH-190).
+
+    Spends the per-user ``/api/attachments/patch`` bucket, then sets the flag
+    on the caller's own live attachment, whatever its status (a failed file
+    or one whose derived files are missing included, so a chat it blocks can
+    go on): ``attachments.set_active`` in one transaction with its audit
+    event, ``file.exclude`` or ``file.include`` (the attachment's id as the
+    target, the client IP, no metadata). The same value again changes and
+    records nothing (idempotent). An excluded file stays linked to its
+    message and listed, and leaves the slot of every later turn (the send
+    rule, GH-189's checks, the upload check and ``tool.call``'s ids count
+    active files only). Nothing is logged: no name, no id.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (needs ``chat.send``).
+        attachment_id: The attachment (a UUID; anything else is a 422).
+        body: Validated AttachmentUpdateRequest: ``{"active": <strict bool>}``
+            and nothing else (a 422 never echoes the input).
+
+    Returns:
+        The attachment's AttachmentSummary with the new ``active`` value
+        (``context_report`` null).
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            live attachment (another org's, a colleague's, an Org Admin's
+            request on an Editor's file included, a trashed or an unknown
+            one) is the 404 ``attachment_not_found`` with nothing changed.
+    """
+    _check_rate_limit("/api/attachments/patch", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    record = await attachments.set_active(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        attachment_id,
+        body.active,
+        ip=request.client.host if request.client is not None else None,
+    )
+    return _attachment_summary(record)
+
+
+async def get_chat_attachments(
+    principal: _ChatSenderDep,
+    chat_id: UUID,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    cursor: Annotated[str | None, Query(max_length=200)] = None,
+    status: AttachmentStatus | None = None,
+    active: bool | None = None,
+) -> AttachmentListResponse:
+    """Handle GET /api/chats/{chat_id}/attachments — one page of a chat's files (GH-190).
+
+    Spends the per-user ``/api/chats/attachments/list`` bucket, then lists the
+    caller's live attachments of their own chat (``attachments.list_chat_attachments``:
+    the chat's owner check first, then the page): oldest first (``created_at``,
+    then ``id``), sent or not, active or not; trashed files aren't listed.
+    Metadata only, never a file's bytes or converted text. Reading changes
+    nothing and logs nothing.
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+        limit: The page size, 1 to 100 (default 50).
+        cursor: The previous page's ``next_cursor``; none for the first page.
+        status: Only files of this status (``uploaded``, ``processing``,
+            ``ready``, ``failed``); none: every status.
+        active: Only included (true) or excluded (false) files; none: both.
+
+    Returns:
+        AttachmentListResponse: the page's AttachmentSummary items and the
+        next page's cursor (None on the last page).
+
+    Raises:
+        HTTPException: 429 when rate-limited. Another org's, a colleague's, a
+            trashed and an unknown chat are the 404 ``chat_not_found``, with no
+            attachment read; a cursor that doesn't decode is the 422
+            ``invalid_cursor`` (never echoed).
+    """
+    _check_rate_limit("/api/chats/attachments/list", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    page = await attachments.list_chat_attachments(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        chat_id,
+        limit=limit,
+        cursor=cursor,
+        status=status,
+        active=active,
+    )
+    return AttachmentListResponse(
+        attachments=[_attachment_summary(record) for record in page.attachments],
+        next_cursor=page.next_cursor,
+    )
 
 
 # A download's Range limits (GH-281): a long header or many parts make the file
@@ -7004,7 +7451,10 @@ def create_app(
     # Pending critical permission promotions start empty, like a restart (GH-161).
     org_permissions.clear_pending()
     # A fresh attachment processing pool (GH-187): no job of an earlier app carries over.
-    _processing = attachment_processing.ProcessingPool()
+    # GH-190: every job checks the chat's context budget (the upload rejection).
+    _processing = attachment_processing.ProcessingPool(
+        budget=context_budget.BudgetSettings.from_config(config)
+    )
 
     # Rate-limit buckets start empty (fresh process state, test isolation).
     _rate_buckets.clear()
@@ -7205,6 +7655,12 @@ def create_app(
     )
     app.get("/api/attachments/{attachment_id}", response_model=AttachmentSummary)(
         get_attachment_metadata
+    )
+    app.patch("/api/attachments/{attachment_id}", response_model=AttachmentSummary)(
+        patch_attachment
+    )
+    app.get("/api/chats/{chat_id}/attachments", response_model=AttachmentListResponse)(
+        get_chat_attachments
     )
     app.get(
         "/api/attachments/{attachment_id}/content",

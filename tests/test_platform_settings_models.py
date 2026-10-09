@@ -28,6 +28,8 @@ What these tests pin down:
   change."), where an empty section or a null counts as not given; an llm-only
   patch still works as in #159.
 - Validation errors of every patch model never repeat the rejected input.
+- GH-190: ``limits.max_context_messages`` is 0 to 200 (0: no cap, the budget
+  alone decides), and the config default is 0.
 
 New symbols are looked up per test, so a missing model fails its own tests and
 not the whole module.
@@ -89,7 +91,7 @@ _LIMITS: dict[str, tuple[int, int, int]] = {
     "max_pending_confirmations": (3, 1, 50),
     "confirmation_timeout_s": (300, 10, 3600),
     "max_message_length": (4000, 1, 100_000),
-    "max_context_messages": (20, 1, 200),
+    "max_context_messages": (0, 0, 200),
 }
 # section -> (response model, patch model, field table)
 _SECTIONS: dict[str, tuple[str, str, dict[str, tuple[int, int, int]]]] = {

@@ -3,11 +3,10 @@
 Contract C3 T2: ``chats.load_turn(executor, tenant, chat_id, *, limit)`` reads
 the caller's live chat and its latest ``limit`` messages with ONE statement
 (the send path's third and last query before the LLM call, run under the
-chat's run lock), replacing ``chats.get_chat`` plus
-``chats.load_recent_history`` (which runs ``get_chat`` again and the message
-read). It runs against tests/db_fakes.py, which evaluates the contract's T2
-statement (``LEFT JOIN LATERAL`` over chat_messages, ``ORDER BY seq DESC
-LIMIT``) as PostgreSQL does.
+chat's run lock), replacing ``chats.get_chat`` plus the message read (GH-190:
+``chats.load_recent_history`` is gone, tests/test_chats_context.py). It runs
+against tests/db_fakes.py, which evaluates the contract's T2 statement (``LEFT
+JOIN LATERAL`` over chat_messages, ``ORDER BY seq DESC LIMIT``) as PostgreSQL does.
 
 What these tests pin down:
 - Surface: ``ChatTurn`` is a frozen dataclass of exactly ``chat``,
@@ -18,9 +17,9 @@ What these tests pin down:
   ``(chat_id, tenant.org_id, tenant.user_id, limit)`` in that order, whether
   the chat is found or not ("nothing else read"); it writes nothing and opens
   no transaction.
-- Equivalence (the spec): ``chat`` equals ``chats.get_chat`` and ``history``
-  equals ``chats.load_recent_history(..., limit=limit)`` on the same database,
-  with the literal expectation of each case beside it: a limit below, equal to
+- The window (the spec): ``chat`` equals ``chats.get_chat`` and ``history`` is
+  the literal expectation of each case (GH-190: ``load_recent_history``, the
+  former oracle, is removed): a limit below, equal to
   and above the message count; an empty chat (``history == []``); windows that
   start with one or two tool results (dropped) or with the assistant turn that
   called them (kept, its ``tool_use_blocks`` decoded); a window of tool
@@ -328,16 +327,15 @@ async def test_chats_load_turn_writes_nothing(chats: ModuleType, seeded: _Seeded
 
 
 @pytest.mark.parametrize("case", list(_CASES))
-async def test_chats_load_turn_history_equals_load_recent_history(
+async def test_chats_load_turn_history_is_the_latest_window(
     chats: ModuleType, seeded: _Seeded, case: str
 ) -> None:
+    """GH-190: the literal expectation only (``load_recent_history`` is removed)."""
     attribute, limit, expected = _CASES[case]
     chat_id = getattr(seeded, attribute)
 
     turn, _ = await _load(chats, seeded.db, seeded.editor, chat_id, limit)
 
-    oracle = await chats.load_recent_history(seeded.db.pool, seeded.editor, chat_id, limit=limit)
-    assert turn.history == oracle
     assert turn.history == expected
     assert type(turn.history) is list
     assert all(type(message) is LLMMessage for message in turn.history)

@@ -22,7 +22,8 @@ Inputs: a kind (one of ``UNTRUSTED_KINDS``), a short label (e.g. ``gmail
 message 18c2f``) and the formatted tool output or a line of a file.
 Outputs: the wrapped string (``wrap``), the begin and end markers
 (``markers``), the sanitized text (``sanitize_text``), whether a text holds a
-begin marker (``contains_wrapped``), and the run's boundary (``run_boundary``).
+begin marker (``contains_wrapped``), the end marker of a cut text's open block
+(``open_block_end``), and the run's boundary (``run_boundary``).
 
 The boundary ``B`` is 16 lowercase hex characters from ``secrets``. Inside a
 ``run_boundary()`` block every ``wrap`` uses the block's boundary (one per
@@ -58,6 +59,12 @@ Security notes:
   depend on the model recognising markers: once a run has received wrapped
   content, every side-effecting ``allow`` action needs the user's
   confirmation.
+- A long tool result is cut (``context_budget.truncate_tool_result``). A cut
+  inside a block would drop its end marker, and a look-alike close tag or a
+  forged truncation note before the cut point would then pass as outside the
+  block with nothing after it to contradict it. ``open_block_end`` names the
+  end marker the cut appends, so a cut never leaves a block open. It reads
+  the boundary from the text, never from the current run.
 """
 
 from __future__ import annotations
@@ -91,7 +98,8 @@ _MARKER_NAME_RE: Final = re.compile("untrusted_content", re.IGNORECASE)
 _DEFANGED_MARKER_NAME: Final = "untrusted-content"
 _WHITESPACE_RE: Final = re.compile(r"\s+")
 _LABEL_REMOVED_RE: Final = re.compile('["<>]')
-_BEGIN_MARKER_RE: Final = re.compile(r'<untrusted_content_[0-9a-f]{16} kind="')
+# Group 1 is the boundary, which names the block's end marker (``open_block_end``).
+_BEGIN_MARKER_RE: Final = re.compile(r'<untrusted_content_([0-9a-f]{16}) kind="')
 
 
 @contextmanager
@@ -205,3 +213,27 @@ def contains_wrapped(text: str) -> bool:
         True when a begin marker is present.
     """
     return _BEGIN_MARKER_RE.search(text) is not None
+
+
+def open_block_end(text: str) -> str | None:
+    """Return the end marker of the last block in ``text`` when that block is open.
+
+    Wraps never nest, so only the last begin marker can open a block that is
+    still open; it is closed when its own end marker (the same boundary)
+    occurs after it. A forged end marker (another boundary, a look-alike or
+    defanged name) doesn't close it.
+
+    Args:
+        text: A tool result, possibly cut.
+
+    Returns:
+        ``</untrusted_content_<B>>`` for the last begin marker's boundary
+        ``B`` when that end marker doesn't follow it; None when ``text`` holds
+        no begin marker or its last block is closed.
+    """
+    matches = list(_BEGIN_MARKER_RE.finditer(text))
+    if not matches:
+        return None
+    last = matches[-1]
+    end = f"</untrusted_content_{last.group(1)}>"
+    return end if text.find(end, last.end()) == -1 else None

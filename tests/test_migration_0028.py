@@ -28,11 +28,13 @@ What is pinned (contract sections 8 and 12.4):
 - One ``GRANT UPDATE (token_estimate, derived_bytes) ON attachments TO admino_app``,
   after both columns exist; the file's only GRANT (nested ones included), without
   grant option. Statement order: the two ALTERs, the GRANT, the requeue UPDATE.
-- After every shipped migration admino_app holds on attachments SELECT, INSERT,
+- After every migration up to 0028 admino_app holds on attachments SELECT, INSERT,
   DELETE and UPDATE on exactly message_id, status, failure_reason, page_count,
   token_estimate, derived_bytes, updated_at and deleted_at (no table-wide UPDATE, no
   grant option); PUBLIC holds nothing; 0028 adds ``update(token_estimate)`` and
   ``update(derived_bytes)`` and changes no other privilege of any table or role.
+  (GH-190: migration 0030 adds ``update(active)``; the cumulative set after every
+  shipped migration is pinned in tests/test_migration_0030.py.)
 - The one data write: ``UPDATE attachments SET status = 'uploaded', updated_at =
   now() WHERE status = 'ready'`` (files ready before this release have no derived
   files; the startup recovery converts them). No other statement: no DO block,
@@ -43,7 +45,8 @@ What is pinned (contract sections 8 and 12.4):
   value (for derived_bytes one past the INTEGER range: a BIGINT), and a negative one
   is CheckViolationError on the shipped CHECK's name with the row unchanged; the
   fake's attachments columns are 0027's followed by the columns 0028 adds, in the
-  file's order (ALTER TABLE ... ADD COLUMN appends them).
+  file's order (ALTER TABLE ... ADD COLUMN appends them; GH-190: 0030's ``active``
+  follows them, pinned in tests/test_migration_0030.py).
 
 Security notes:
 - admino_app gains exactly two updatable columns, both counters the processing step
@@ -536,11 +539,13 @@ class TestMigration0028Privileges:
     def test_migration_0028_admino_app_privileges_on_attachments_after_every_migration(
         self,
     ) -> None:
-        """SELECT, INSERT, DELETE and UPDATE on exactly the eight columns the application
-        writes (derived_bytes included, contract 12.4; no table-wide UPDATE, so never id,
-        org_id, chat_id, owner_user_id, filename, kind, size_bytes or created_at; no grant
-        option); PUBLIC nothing."""
-        acl = _acl()
+        """After every migration up to 0028: SELECT, INSERT, DELETE and UPDATE on exactly
+        the eight columns the application writes (derived_bytes included, contract 12.4;
+        no table-wide UPDATE, so never id, org_id, chat_id, owner_user_id, filename,
+        kind, size_bytes or created_at; no grant option); PUBLIC nothing. (GH-190:
+        migration 0030 adds update(active); the set after every shipped migration is
+        pinned in tests/test_migration_0030.py.)"""
+        acl = _acl(_VERSION)
 
         assert {
             _ROLE: acl.get((_TABLE, _ROLE), frozenset()),
@@ -708,14 +713,17 @@ class TestMigration0028FakeDb:
 
     def test_migration_0028_fake_columns_are_0027s_then_the_added_ones(self) -> None:
         """ADD COLUMN appends: the fake's attachments row has 0027's columns in order,
-        then token_estimate and derived_bytes in the file's order (NULL by default)."""
+        then token_estimate and derived_bytes in the file's order (NULL by default).
+        GH-190: a later migration's columns (0030's active) follow them; which ones is
+        pinned by that migration's test."""
         added = [name for table, name, _ in _added_columns() if table == _TABLE]
         db = FakeDb()
         member = db.add_account(org_id=ORG_ID)
         attachment = db.add_attachment(db.add_chat(member))
         row = db.attachment_row(attachment)
         assert row is not None
+        expected = [*(name for name, _ in _table().columns), *added]
 
         assert added == list(_ADDED)
-        assert list(row) == [*(name for name, _ in _table().columns), *added]
+        assert list(row)[: len(expected)] == expected
         assert (row[_COLUMN], row[_DERIVED]) == (None, None)

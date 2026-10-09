@@ -35,7 +35,7 @@ What is pinned:
   The line says ``db_queries_before_llm=3``; ``db_queries`` is every statement of
   the request (the turn's store and the tool-call recorder included). The run gets
   what the old loaders read on the same database (``load_tool_policy``,
-  ``load_prompt_context``, ``load_recent_history``, the chat's
+  ``load_prompt_context``, ``load_turn``'s history, the chat's
   ``external_content``); a residency org's run isn't offered the blocked tools and
   refuses a non-Swiss provider before any LLM call.
 - Refusals keep their order and statements: another org's, a colleague's, a
@@ -772,8 +772,9 @@ def test_chat_timing_send_run_gets_what_the_old_loaders_read(
     service off, the org's instructions and language, the Editor's language, timezone and
     personal instructions; org B differs) and seven stored messages under a stored
     ``max_context_messages`` of 5: the run gets exactly what ``load_tool_policy``,
-    ``load_prompt_context`` and ``load_recent_history`` read on the same database and
-    the chat's ``external_content`` flag, after three statements."""
+    ``load_prompt_context`` and ``load_turn`` (its history; GH-190 removed
+    ``load_recent_history``, which read the same) read on the same database and the
+    chat's ``external_content`` flag, after three statements."""
     db = h.db
     editor = h.world.a["editor"]
     _stored_limits(monkeypatch, max_context_messages=5)
@@ -785,7 +786,7 @@ def test_chat_timing_send_run_gets_what_the_old_loaders_read(
     tenant = _tenant(editor)
     policy = asyncio.run(org_permissions.load_tool_policy(db.pool, tenant))
     context = asyncio.run(scoped_settings.load_prompt_context(db.pool, tenant))
-    history = asyncio.run(chats.load_recent_history(db.pool, tenant, chat_id, limit=5))
+    history = asyncio.run(chats.load_turn(db.pool, tenant, chat_id, limit=5)).history
     # The expectations hold the non-default values (so the comparison means something).
     assert (
         ("gmail", "send") in policy.promoted,

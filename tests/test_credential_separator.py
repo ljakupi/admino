@@ -187,7 +187,8 @@ def _stored_message(text: str) -> str:
 
 def _live_reply(text: str) -> str:
     """The live reply of a chat turn (``ChatResponse.response``)."""
-    return ChatResponse(chat_id=uuid4(), response=text).response
+    usage = {"used": 0, "max": 1, "percent": 0}  # GH-190: required on every reply
+    return ChatResponse(chat_id=uuid4(), response=text, context_usage=usage).response
 
 
 def _removal_set() -> list[str]:

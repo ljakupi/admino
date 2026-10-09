@@ -82,6 +82,12 @@ Security notes:
   stored, logged or returned by an API. They are frozen, refuse unknown keys
   and hide their input from validation errors, and so does ``LLMMessage``.
   ``AgentConfig.image_input`` is the stored platform ``llm.image_input``.
+- Context budget (GH-190): ``ContextUsage`` and ``ContextNotice`` carry
+  token and message counts only. ``ContextReport`` (the send refusal's and an
+  overflowing upload's report) names files by id with their stored token
+  estimate and derived bytes, never by name. ``AttachmentUpdateRequest``
+  takes a strict bool and nothing else and hides its input from validation
+  errors. ``ChatMessageView.attachment_ids`` are ids only.
 - Blank messages (GH-286): ``ChatMessageCreate.message`` and
   ``ChatRequest.message`` take at most 32768 characters and accept an empty
   or whitespace-only text, unstripped; the message routes refuse a blank one
@@ -748,6 +754,34 @@ class PendingConfirmationSummary(BaseModel):
         return _redact_arg(v, 0)
 
 
+class ContextUsage(BaseModel):
+    """How full the chat's context is as its next turn starts (GH-190): token counts only.
+
+    ``used`` adds up the instructions, the chat's active attachments, the
+    stored history the budget keeps and the reserved output; ``max`` is the
+    token budget of one LLM call. ``percent`` goes above 100 only when the
+    attachments alone don't fit.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    used: int = Field(ge=0, description="Estimated tokens the chat's next turn starts with.")
+    max: int = Field(
+        ge=1,
+        description="The token budget of one LLM call: the model's input limit minus the margin.",
+    )
+    percent: int = Field(ge=0, description="used * 100 // max, rounded down.")
+
+
+class ContextNotice(BaseModel):
+    """Earlier turns the run's last LLM call left out to fit the budget (GH-190): counts only."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dropped_turns: int = Field(ge=1, description="Earlier turns left out, oldest first.")
+    dropped_messages: int = Field(ge=1, description="The messages of those turns.")
+
+
 class ChatResponse(BaseModel):
     """Response body of a chat turn and of a confirmation (GH-176: names its chat).
 
@@ -823,6 +857,17 @@ class ChatResponse(BaseModel):
             " ``rate_limit`` (GH-24) when too many confirmations are pending,"
             " so the confirmation this run asked for was denied. None on"
             " success and for uncoded errors."
+        ),
+    )
+
+    context_usage: ContextUsage = Field(
+        description="How full the chat's context is as its next turn starts (GH-190).",
+    )
+    context_notice: ContextNotice | None = Field(
+        default=None,
+        description=(
+            "Set when the run's last LLM call left earlier turns out to fit the"
+            " token budget (GH-190); null otherwise."
         ),
     )
 
@@ -1069,11 +1114,12 @@ class AgentConfig(BaseModel):
     )
     max_context_messages: int = Field(
         default=40,
-        ge=1,
+        ge=0,
         le=200,
         description=(
-            "Maximum conversation messages sent as LLM context. The system"
-            " prompt and the current user message are always sent."
+            "Optional cap on the conversation messages sent as LLM context, applied"
+            " before the token budget; 0 means no cap (GH-190). The system prompt"
+            " and the current user message are always sent."
         ),
     )
     confirmation_timeout_s: float = Field(
@@ -1096,6 +1142,39 @@ class AgentConfig(BaseModel):
         description=(
             "Whether the run's model accepts image input (GH-189: the stored platform"
             " llm.image_input). False: no image part reaches the LLM."
+        ),
+    )
+    max_input_tokens: int = Field(
+        default=200_000,
+        ge=1000,
+        le=2_000_000,
+        description=(
+            "The most input tokens the run's model accepts (GH-190: the stored"
+            " platform llm.max_input_tokens)."
+        ),
+    )
+    reserved_output_tokens: int = Field(
+        default=4096,
+        ge=1,
+        le=65536,
+        description="Tokens every LLM call keeps free for the reply (llm.max_response_tokens).",
+    )
+    context_margin_percent: int = Field(
+        default=10,
+        ge=0,
+        le=50,
+        description=(
+            "The share of max_input_tokens kept back as a safety margin, in percent"
+            " (context.safety_margin_percent)."
+        ),
+    )
+    max_tool_result_tokens: int = Field(
+        default=8000,
+        ge=256,
+        le=100_000,
+        description=(
+            "A longer tool result is cut to this many tokens, with a marker"
+            " (context.max_tool_result_tokens)."
         ),
     )
 
@@ -1214,6 +1293,22 @@ class AgentResult(BaseModel):
             "True when the run ends ``final`` with an answer the LLM output cap (or"
             " the 65536-character content cap) cut: ``response`` then ends at its"
             " last complete word (GH-25). False for every other outcome."
+        ),
+    )
+    context_notice: ContextNotice | None = Field(
+        default=None,
+        description=(
+            "The earlier turns the run's last LLM call (made or refused) left out to"
+            " fit the token budget (GH-190); None when it dropped none."
+        ),
+    )
+    external_content: bool = Field(
+        default=False,
+        description=(
+            "True when the run received external content (GH-190): attachments in its"
+            " slot, earlier_external_content, a wrapped tool result in its history, or"
+            " a dispatch whose full result was wrapped, judged before any cut. The"
+            " chat's sticky external_content flag is stored from it."
         ),
     )
 
@@ -2108,7 +2203,8 @@ _ToolCallsPerMessage = Annotated[int, Field(ge=1, le=100)]
 _PendingConfirmations = Annotated[int, Field(ge=1, le=50)]
 _ConfirmationTimeoutS = Annotated[int, Field(ge=10, le=3600)]
 _MessageLength = Annotated[int, Field(ge=1, le=100_000)]
-_ContextMessages = Annotated[int, Field(ge=1, le=200)]
+# 0: no message cap, the token budget alone decides (GH-190, migration 0030).
+_ContextMessages = Annotated[int, Field(ge=0, le=200)]
 _FileSizeMb = Annotated[int, Field(ge=1, le=500)]
 _FilesPerMessage = Annotated[int, Field(ge=1, le=50)]
 _PagesPerFile = Annotated[int, Field(ge=1, le=1000)]
@@ -3376,14 +3472,62 @@ _ATTACHMENT_MAX_BYTES: Final = 524_288_000
 _ATTACHMENT_REASON_PATTERN: Final = r"^[a-z][a-z0-9_]{0,63}$"
 _ATTACHMENTS_PER_MESSAGE_MAX: Final = 50
 
+ContextRefusalReason = Literal["context_overflow", "attachment_bytes_exceeded"]
+"""Why a turn's attachments alone don't fit (GH-190): too many tokens, or too many bytes."""
+
+
+class ContextReportItem(BaseModel):
+    """One file of a context report: its id and stored sizes, never its name (GH-190)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    attachment_id: UUID
+    token_estimate: int = Field(ge=0, description="The file's stored token estimate (null as 0).")
+    derived_bytes: int = Field(
+        ge=0, description="The bytes of the file's converted text and images (null as 0)."
+    )
+
+
+class ContextReport(BaseModel):
+    """The files a turn would send and how they compare with the limits (GH-190).
+
+    ``attachments`` are in slot order; ``attachment_tokens`` and
+    ``attachment_bytes`` are their sums, ``available_tokens`` the budget minus
+    the reserved output (at least 0) and ``max_bytes`` the per-turn byte cap.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    attachments: list[ContextReportItem]
+    attachment_tokens: int = Field(ge=0)
+    available_tokens: int = Field(ge=0)
+    attachment_bytes: int = Field(ge=0)
+    max_bytes: int = Field(ge=1)
+
+
+class ContextRefusal(BaseModel):
+    """The 422 body of a turn whose attachments alone don't fit (GH-190).
+
+    ``reason`` is the stable code (tokens are checked before bytes) and
+    ``report`` names the files by id only.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    detail: str = Field(max_length=200)
+    reason: ContextRefusalReason
+    report: ContextReport
+
 
 class AttachmentSummary(BaseModel):
     """One stored attachment as the API shows it: metadata only.
 
     ``filename`` is the sanitized name, ``kind`` the detected type,
-    ``failure_reason`` a code (set when ``status`` is ``failed``) and
+    ``failure_reason`` a code (set when ``status`` is ``failed``),
     ``token_estimate`` the estimated tokens of the converted file (null until
-    it is ``ready``).
+    it is ``ready``) and ``active`` whether the file is sent with the chat's
+    turns (GH-190: an excluded file stays listed). ``context_report`` is set
+    only on a file that failed with ``context_overflow``.
     """
 
     id: UUID
@@ -3396,7 +3540,28 @@ class AttachmentSummary(BaseModel):
     failure_reason: str | None = Field(pattern=_ATTACHMENT_REASON_PATTERN)
     page_count: int | None = Field(ge=0)
     token_estimate: int | None = Field(ge=0)
+    active: bool
+    context_report: ContextReport | None = None
     created_at: datetime
+
+
+class AttachmentUpdateRequest(BaseModel):
+    """PATCH /api/attachments/{attachment_id} request body: include or exclude the file.
+
+    A strict bool and nothing else (GH-190); the attachment comes from the
+    path, its owner and org from the session.
+    """
+
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
+
+    active: StrictBool
+
+
+class AttachmentListResponse(BaseModel):
+    """GET /api/chats/{chat_id}/attachments response: one page of the chat's files, oldest first."""
+
+    attachments: list[AttachmentSummary] = Field(max_length=100)
+    next_cursor: str | None = Field(default=None, max_length=_CURSOR_MAX_LENGTH)
 
 
 class AttachmentContent(BaseModel):
@@ -3404,9 +3569,11 @@ class AttachmentContent(BaseModel):
 
     ``filename`` is the stored name (``prompt_assembly.prompt_filename`` makes
     the prompt name of it) and ``parts`` the converted parts in manifest
-    order: an image part's label is the text part right before it. Built for
-    one run from the caller's own rows and derived files; never stored,
-    logged or returned by an API.
+    order: an image part's label is the text part right before it.
+    ``token_estimate`` is the row's stored estimate (NULL as 0), what the
+    context budget counts for the file (GH-190). Built for one run from the
+    caller's own rows and derived files; never stored, logged or returned by
+    an API.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -3416,6 +3583,7 @@ class AttachmentContent(BaseModel):
     kind: AttachmentKind
     page_count: int | None = Field(ge=0)
     parts: tuple[ContentPart, ...]
+    token_estimate: int = Field(default=0, ge=0)
 
     @property
     def has_images(self) -> bool:
@@ -3471,7 +3639,8 @@ class ChatMessageView(BaseModel):
 
     ``content`` is sanitized like ``ChatResponse.response`` and ``tool_calls``
     holds the sanitized ``ToolCallRecord``s; the raw tool inputs the model sent
-    stay in the database and are never exposed.
+    stay in the database and are never exposed. ``attachment_ids`` are the
+    message's live files, included or excluded, in upload order (GH-190).
     """
 
     id: UUID
@@ -3481,24 +3650,15 @@ class ChatMessageView(BaseModel):
     tool_calls: list[ToolCallRecord] | None = Field(default=None, max_length=50)
     status: MessageStatus
     created_at: datetime
+    attachment_ids: list[UUID] = Field(
+        default_factory=list, max_length=_ATTACHMENTS_PER_MESSAGE_MAX
+    )
 
     @field_validator("content")
     @classmethod
     def _sanitize_content(cls, value: str) -> str:
         """Strip control characters and credential patterns, as in the live reply."""
         return sanitize_display_text(value)
-
-
-class ChatContext(BaseModel):
-    """How much of the chat the model sees (interim until #190 removes it).
-
-    ``truncated`` is true when the chat holds more messages than the stored
-    platform limit ``max_context_messages`` sends to the model.
-    """
-
-    message_count: int = Field(ge=0)
-    max_context_messages: int = Field(ge=1, le=200)
-    truncated: bool
 
 
 class ChatDetailResponse(ChatSummary):
@@ -3508,13 +3668,15 @@ class ChatDetailResponse(ChatSummary):
     ``next_cursor`` points to earlier messages. ``confirmation_status`` is
     ``pending`` with a live pending confirmation, ``expired`` when the latest
     message awaits a confirmation that is gone (expired or lost in a restart).
+    ``context_usage`` is how full the chat's context is as its next turn
+    starts (GH-190).
     """
 
     messages: list[ChatMessageView] = Field(max_length=100)
     next_cursor: str | None = Field(default=None, max_length=_CURSOR_MAX_LENGTH)
     pending_confirmation: PendingConfirmationSummary | None = None
     confirmation_status: Literal["none", "pending", "expired"]
-    context: ChatContext
+    context_usage: ContextUsage
 
 
 # ---------------------------------------------------------------------------

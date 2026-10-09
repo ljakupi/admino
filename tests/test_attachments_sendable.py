@@ -2,7 +2,8 @@
 
 Issue #189, Decision 7: a message may carry only the caller's live, unsent and
 ``ready`` attachments of the chat. ``check_sendable`` decides it with ONE
-statement (A8') and refuses, in this order, ``AttachmentNotFoundError`` (an id
+statement (A8'; GH-190 contract C6: A8'', which also reads the estimate, the
+derived bytes and the flag) and refuses, in this order, ``AttachmentNotFoundError`` (an id
 that isn't the caller's live attachment of this chat: another chat's, a
 colleague's, another org's, a trashed or an unknown one; the server's ``404
 attachment_not_found``), ``AttachmentAlreadySentError`` (``409
@@ -10,15 +11,18 @@ attachment_already_sent``) and the new ``AttachmentNotReadyError`` for a file
 whose status is ``uploaded``, ``processing`` or ``failed`` (``409
 attachment_not_ready``). On success it returns what the slot needs: the files
 as ``chats.ActiveAttachment`` in upload order (``created_at``, then ``id``).
-Runs against tests/db_fakes.py, which evaluates A8' as PostgreSQL does.
+Runs against tests/db_fakes.py, which evaluates A8'' as PostgreSQL does. The
+exclusion side of A8'' (refusals over every id, active ones returned) is
+tests/test_attachments_active.py's.
 
 What these tests pin down:
 - No ids (``[]``, ``()``): ``[]`` and no statement.
-- Otherwise exactly one statement, the contract's A8' (fetch, on the given
+- Otherwise exactly one statement, the contract's A8'' (fetch, on the given
   executor), bound to (the ids, the chat, the caller's org, the caller), for an
   accepted and for a refused set alike; nothing is written.
 - The result: a list of ``chats.ActiveAttachment`` (id, stored name, kind,
-  page count: 0 stays 0, NULL is None) in ``created_at`` then ``id`` order,
+  page count, GH-190: token estimate and derived bytes; 0 stays 0, NULL is
+  None) in ``created_at`` then ``id`` order,
   whatever the order of the given ids.
 - The error order, each case proved both ways (the faults in either order give
   the winning error, and the losing fault alone gives its own error, so an
@@ -75,8 +79,10 @@ MIDDLE: Final = uuid.UUID("a1890000-0000-4000-8000-0000000000e2")
 TIE_LOW: Final = uuid.UUID("11890000-0000-4000-8000-0000000000e3")
 TIE_HIGH: Final = uuid.UUID("91890000-0000-4000-8000-0000000000e4")
 
+# GH-190 (contract C6): A8'', with the estimate, the derived bytes and the flag.
 _A8_PRIME: Final = (
-    "SELECT id, message_id, status, filename, kind, page_count FROM attachments "
+    "SELECT id, message_id, status, filename, kind, page_count, token_estimate, "
+    "derived_bytes, active FROM attachments "
     "WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4 "
     "AND deleted_at IS NULL ORDER BY created_at, id"
 )
@@ -138,9 +144,10 @@ def seeded() -> _Seeded:
     add(chat, attachment_id=TIE_HIGH, filename="data.csv", kind="csv", status="ready",
         created_at=_T0 + timedelta(seconds=2))  # fmt: skip
     add(chat, attachment_id=EARLY, filename=READY_CANARY, kind="pdf", status="ready",
-        page_count=4, created_at=_T0)  # fmt: skip
+        page_count=4, token_estimate=4195, derived_bytes=81920, created_at=_T0)  # fmt: skip
     add(chat, attachment_id=TIE_LOW, filename="notes.docx", kind="docx", status="ready",
-        page_count=0, created_at=_T0 + timedelta(seconds=2))  # fmt: skip
+        page_count=0, token_estimate=0, derived_bytes=0,
+        created_at=_T0 + timedelta(seconds=2))  # fmt: skip
     other_chat = seed_chat(db, editor, title="Other")
     colleague_chat = seed_chat(db, world.a["viewer"], title="Colleague")
     other_org_chat = seed_chat(db, world.b["editor"], title="Other org")
@@ -274,12 +281,33 @@ async def test_attachments_sendable_returns_active_attachments_in_upload_order(
     active = chats.ActiveAttachment
     assert type(result) is list
     assert result == [
-        active(id=EARLY, filename=READY_CANARY, kind="pdf", page_count=4),
+        active(
+            id=EARLY,
+            filename=READY_CANARY,
+            kind="pdf",
+            page_count=4,
+            token_estimate=4195,
+            derived_bytes=81920,
+        ),  # fmt: skip
         active(id=MIDDLE, filename="scan.png", kind="png", page_count=None),
-        active(id=TIE_LOW, filename="notes.docx", kind="docx", page_count=0),
+        active(
+            id=TIE_LOW,
+            filename="notes.docx",
+            kind="docx",
+            page_count=0,
+            token_estimate=0,
+            derived_bytes=0,
+        ),  # fmt: skip
         active(id=TIE_HIGH, filename="data.csv", kind="csv", page_count=None),
     ]
     assert all(type(item) is active for item in result)
+    # GH-190: ints as stored (0 stays 0), NULL as None.
+    assert [(type(item.token_estimate), type(item.derived_bytes)) for item in result] == [
+        (int, int),
+        (type(None), type(None)),
+        (int, int),
+        (type(None), type(None)),
+    ]
 
 
 async def test_attachments_sendable_returns_one_file_as_a_one_item_list(
@@ -288,7 +316,14 @@ async def test_attachments_sendable_returns_one_file_as_a_one_item_list(
     result = await _check(att, seeded, [TIE_LOW])
 
     assert result == [
-        chats.ActiveAttachment(id=TIE_LOW, filename="notes.docx", kind="docx", page_count=0)
+        chats.ActiveAttachment(
+            id=TIE_LOW,
+            filename="notes.docx",
+            kind="docx",
+            page_count=0,
+            token_estimate=0,
+            derived_bytes=0,
+        )
     ]
 
 

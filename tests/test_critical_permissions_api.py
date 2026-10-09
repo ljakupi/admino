@@ -55,8 +55,8 @@ reauthenticate" and "server.py routes"):
   contract's exact text to every live chat of the promoting org (all its
   members' chats), none to another org's chats nor to trashed ones, once per
   completed resolution, without touching the chats' ``last_activity_at``; the
-  history the next run loads (``chats.load_recent_history``) keeps it through
-  ``_trim_context``.
+  history the next run loads (``chats.load_turn``; GH-190 removed
+  ``chats.load_recent_history``) keeps it through ``_trim_context``.
 - The agent run of an org's member gets ``tool_policy`` (a ``ToolPolicy``)
   whose ``promoted`` holds that org's completed promotions only.
 - GH-162: the fixture orgs have no data residency. In a residency org a
@@ -1639,7 +1639,8 @@ class TestPromotionNotice:
     ) -> None:
         """GH-66: the notice is stored user-role (a system one would be dropped by the
         agent's _filter_mid_system), so the history the next run loads
-        (chats.load_recent_history) keeps it through _trim_context."""
+        (chats.load_turn; GH-190 removed chats.load_recent_history) keeps it through
+        _trim_context."""
         from admino import chats
         from admino.agent import _trim_context
         from admino.tenancy import TenantContext
@@ -1651,7 +1652,7 @@ class TestPromotionNotice:
         assert _get(client, admin_a).status_code == 200
         tenant = TenantContext(org_id=ORG_ID, user_id=admin_a.id, role="org_admin")
 
-        loaded = asyncio.run(chats.load_recent_history(db.pool, tenant, chat, limit=40))
+        loaded = asyncio.run(chats.load_turn(db.pool, tenant, chat, limit=40)).history
         trimmed = _trim_context(loaded, max_messages=40)
 
         assert [

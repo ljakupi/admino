@@ -21,7 +21,8 @@ chats' stored messages and the fake tool's log. Pinned:
   (``stopped``) BEFORE every job cancellation and before the pool closes;
 - a run whose client is still connected: the shutdown sets the run's stop
   signal (the run makes no follow-up LLM call and is stored ``stopped``, the
-  stream ends ``message_saved{stopped}``, ``done``) and still waits for it;
+  stream ends ``context_usage`` (GH-190), ``message_saved{stopped}``, ``done``) and
+  still waits for it;
 - the bound: ``server._DRAIN_TIMEOUT_S`` (30 seconds, read at shutdown time).
   Patched to 0.3 s with two runs parked in their tools, the shutdown waits
   about that long, then cancels the jobs and closes the pool while the runs
@@ -38,10 +39,11 @@ frame builder ``_RunFrames`` uses, is wrapped so that building one event fails
 payload with ASCII-escaped CJK, as in the audit's probe; or a ``ValueError``
 whose message carries the payload). A failing ``tool_call`` frame: the run
 completes, the tool call is audited and stored with its record, the stream is
-``run_started``, the deltas, ``message_saved{complete}``, ``done`` (only the
-failed frame is missing). A failing ``confirm`` frame: the confirmation is kept
+``run_started``, the deltas, ``context_usage`` (GH-190), ``message_saved{complete}``,
+``done`` (only the failed frame is missing). A failing ``confirm`` frame: the confirmation is kept
 (GET /api/chats/{id} shows it pending), the stream is ``run_started``, the
-gated call's ``tool_call``, ``message_saved{awaiting_confirmation}``, ``done``.
+gated call's ``tool_call``, ``context_usage``, ``message_saved{awaiting_confirmation}``,
+``done``.
 Each logs a record naming
 the event and the exception class, and no record holds the payload, a tool
 argument, the message or the reply.
@@ -73,6 +75,7 @@ from admino.llm import LLMResponse, LLMStreamDelta
 from admino.models import AgentConfig, LLMMessage, ToolCall
 from admino.server import create_app
 from admino.tools import registry
+from tests.context_frames import fix_instructions, usage_frame
 from tests.tenancy_world import (
     CLIENT_IP,
     SESSION_COOKIE,
@@ -372,6 +375,13 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     return built
 
 
+@pytest.fixture(autouse=True)
+def _fixed_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GH-190: the instructions count a constant (tests/context_frames.py), so every
+    ``context_usage`` frame is deterministic."""
+    fix_instructions(monkeypatch)
+
+
 @pytest.fixture()
 def tools(monkeypatch: pytest.MonkeyPatch) -> _Tools:
     """An unfrozen registry holding memory.store (allowed) and google_calendar.create
@@ -522,6 +532,12 @@ def _saved(db: FakeDb, chat_id: uuid.UUID, status: str) -> tuple[str, dict[str, 
         "message_saved",
         {"message_id": str(db.messages_of(chat_id)[-1]["id"]), "status": status},
     )
+
+
+def _usage(db: FakeDb, chat_id: uuid.UUID) -> tuple[str, dict[str, Any]]:
+    """GH-190 (Decision 4): the ``context_usage`` frame right before ``message_saved``: the
+    chat as its next turn starts, read now (tests/context_frames.py)."""
+    return usage_frame(db, chat_id)
 
 
 def _records(db: FakeDb, chat_id: uuid.UUID) -> list[dict[str, Any]]:
@@ -746,8 +762,8 @@ async def test_stream_shutdown_sets_a_connected_runs_stop_and_waits_for_it(
     assert llm.streams == [_SAVE]
     assert _rows(db, chat_id) == list(_stopped_turn(_SAVE, _STORED, _STORE))
     frames = _frames(streamed.text)
-    assert _names(frames) == ["run_started", "tool_call", "message_saved", "done"]
-    assert frames[-2] == _saved(db, chat_id, "stopped")
+    assert _names(frames) == ["run_started", "tool_call", "context_usage", "message_saved", "done"]
+    assert frames[-3:-1] == [_usage(db, chat_id), _saved(db, chat_id, "stopped")]
     assert probe.seen["close_pool"].audited == 1
     assert probe.seen["close_pool"].stored == (_stopped_turn(_SAVE, _STORED, _STORE),)
 
@@ -875,10 +891,11 @@ async def test_stream_tool_call_frame_that_fails_to_build_is_dropped_and_the_tur
     frames = _frames(streamed.text)
     assert [name for name in _names(frames) if name != "delta"] == [
         "run_started",
+        "context_usage",
         "message_saved",
         "done",
     ]
-    assert frames[-2] == _saved(db, chat_id, "complete")
+    assert frames[-3:-1] == [_usage(db, chat_id), _saved(db, chat_id, "complete")]
     assert _delta_text(frames) == _FINAL_REPLY
     assert _rows(db, chat_id) == [
         ("user", _SAVE, None, "complete"),
@@ -932,9 +949,9 @@ async def test_stream_confirm_frame_that_fails_to_build_is_dropped_and_the_confi
 
     assert streamed.status_code == 200, streamed.text
     frames = _frames(streamed.text)
-    assert _names(frames) == ["run_started", "tool_call", "message_saved", "done"]
+    assert _names(frames) == ["run_started", "tool_call", "context_usage", "message_saved", "done"]
     assert (frames[1][1]["tool"], frames[1][1]["permission"]) == ("google_calendar", "confirm")
-    assert frames[-2] == _saved(db, chat_id, "awaiting_confirmation")
+    assert frames[-3:-1] == [_usage(db, chat_id), _saved(db, chat_id, "awaiting_confirmation")]
     assert detail.status_code == 200, detail.text
     body = detail.json()
     pending = body["pending_confirmation"]

@@ -78,7 +78,7 @@ export const DEFAULTS_BOUNDS: { [path: string]: { min: number; max: number } } =
   'limits.max_pending_confirmations': { min: 1, max: 50 },
   'limits.confirmation_timeout_s': { min: 10, max: 3600 },
   'limits.max_message_length': { min: 1, max: 100000 },
-  'limits.max_context_messages': { min: 1, max: 200 },
+  'limits.max_context_messages': { min: 0, max: 200 },
   'files.max_file_size_mb': { min: 1, max: 500 },
   'files.max_files_per_message': { min: 1, max: 50 },
   'files.max_pages_per_file': { min: 1, max: 1000 },
