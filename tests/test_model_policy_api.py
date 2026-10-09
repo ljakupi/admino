@@ -341,6 +341,10 @@ def _config() -> AppConfig:
                 "vllm_model": "Qwen/Qwen3-4B-Instruct-2507",
                 "anthropic_model": "claude-sonnet-4-6",
                 "openai_model": "gpt-4o",
+                # GH-294 Decision 3: a PATCHed max_input_tokens must fit this reserve
+                # plus the 10 % margin; 512 lets the field's lower bound (1000, budget
+                # 900) through, where the default 4096 would refuse it.
+                "max_response_tokens": 512,
             },
         }
     )

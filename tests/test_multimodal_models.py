@@ -110,6 +110,7 @@ def _attachment(**overrides: Any) -> dict[str, Any]:
         "kind": "pdf",
         "page_count": 3,
         "parts": [{"type": "text", "text": "[report.pdf — page 1]\nHello"}],
+        "token_estimate": 0,
     }
     payload.update(overrides)
     return payload

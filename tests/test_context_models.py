@@ -24,7 +24,8 @@ What these tests pin down:
   next_cursor: str | None <= 200}``.
 - ``AttachmentSummary`` gains ``active`` (required) and ``context_report``
   (``ContextReport | None``, default None); ``AttachmentContent`` gains
-  ``token_estimate`` (default 0, >= 0); ``ChatMessageView`` gains
+  ``token_estimate`` (>= 0, required since GH-294 Decision 9: every caller passes
+  the stored estimate); ``ChatMessageView`` gains
   ``attachment_ids`` (UUIDs, default ``[]``, at most 50).
 - ``ChatDetailResponse`` requires ``context_usage`` and has no ``context``
   field; ``ChatContext`` is gone from ``admino.models``.
@@ -529,17 +530,29 @@ class TestAttachmentSummaryContext:
         )
         assert isinstance(summary.context_report, _model("ContextReport"))  # type: ignore[attr-defined]
 
-    def test_context_models_attachment_content_token_estimate_defaults_to_zero(self) -> None:
+    def test_context_models_attachment_content_token_estimate_is_required(self) -> None:
+        """GH-294 Decision 9: no default, so every caller passes the stored estimate."""
         model = _model("AttachmentContent")
-        base = {"id": _UUID, "filename": "a.txt", "kind": "txt", "page_count": None, "parts": []}
+        base: dict[str, Any] = {
+            "id": _UUID,
+            "filename": "a.txt",
+            "kind": "txt",
+            "page_count": None,
+            "parts": [],
+        }
+        with pytest.raises(ValidationError) as exc_info:
+            model.model_validate(base)
         values = {
-            "default": getattr(model.model_validate(base), "token_estimate", None),
+            "zero": getattr(
+                model.model_validate({**base, "token_estimate": 0}), "token_estimate", None
+            ),
             "given": getattr(
                 model.model_validate({**base, "token_estimate": 4195}), "token_estimate", None
             ),
         }
 
-        assert values == {"default": 0, "given": 4195}
+        assert _errors(exc_info.value) == [(("token_estimate",), "missing")]
+        assert values == {"zero": 0, "given": 4195}
         assert _outcome(model, {**base, "token_estimate": -1}) == [("token_estimate",)]
 
 

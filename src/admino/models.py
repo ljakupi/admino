@@ -3571,9 +3571,10 @@ class AttachmentContent(BaseModel):
     the prompt name of it) and ``parts`` the converted parts in manifest
     order: an image part's label is the text part right before it.
     ``token_estimate`` is the row's stored estimate (NULL as 0), what the
-    context budget counts for the file (GH-190). Built for one run from the
-    caller's own rows and derived files; never stored, logged or returned by
-    an API.
+    context budget counts for the file (GH-190). It has no default (GH-294,
+    Decision 9), so no caller can leave it out and have the budget count
+    the file as 0. Built for one run from the caller's own rows and derived
+    files; never stored, logged or returned by an API.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid", hide_input_in_errors=True)
@@ -3583,7 +3584,7 @@ class AttachmentContent(BaseModel):
     kind: AttachmentKind
     page_count: int | None = Field(ge=0)
     parts: tuple[ContentPart, ...]
-    token_estimate: int = Field(default=0, ge=0)
+    token_estimate: int = Field(ge=0)
 
     @property
     def has_images(self) -> bool:

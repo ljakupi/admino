@@ -79,6 +79,10 @@ llm:
   # (1000 to 2000000) and whether it accepts images. Like the provider and the
   # model IDs, they are re-applied on every start; the Super Admin edits them
   # in Platform → Defaults until the next restart.
+  # The model must fit: max_response_tokens (4096 by default) must be below
+  # max_input_tokens minus context.safety_margin_percent of it (rounded up),
+  # so at least one input token is left. With the defaults that means
+  # max_input_tokens 4553 or more; otherwise admino refuses to start.
   max_input_tokens: 200000
   image_input: true
 
@@ -96,7 +100,9 @@ limits:
 # The context budget. Every LLM call must fit llm.max_input_tokens minus a
 # safety margin: the instructions, the chat's active attachments, the newest
 # whole earlier turns and llm.max_response_tokens kept for the reply. Older
-# turns are left out first. Read at every start; not a platform setting.
+# turns are left out first. The reply's reserve must stay below that budget
+# (see llm.max_input_tokens), or admino refuses to start. Read at every
+# start; not a platform setting.
 # Uncomment the section to change a default.
 # context:
 #   # Percent of max_input_tokens kept back for estimation error (0 to 50).

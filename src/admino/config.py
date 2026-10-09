@@ -12,7 +12,11 @@ GH-159), seeded from this config. The llm section's provider, models and
 platform setting only, never read from this file. The ``context`` section
 (GH-190: the budget's safety margin, the per-turn attachment byte cap and the
 tool-result cap) is read at start like ``llm.max_response_tokens`` and is
-never a platform setting.
+never a platform setting. ``AppConfig`` refuses a model whose reserved
+output (``llm.max_response_tokens``) isn't below the budget of one LLM call
+(``context_budget.budget_limit`` of ``llm.max_input_tokens`` and
+``context.safety_margin_percent``, GH-294 Decisions 1 and 2): such a model
+would refuse every turn, so admino doesn't start.
 
 Environment variable overrides are supported for deployment flexibility.
 Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
@@ -53,6 +57,9 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+# The start check reuses the runtime's budget arithmetic, so both agree by
+# construction; context_budget imports nothing that imports this module.
+from admino.context_budget import budget_limit
 from admino.logs import safe_log, safe_url
 
 if TYPE_CHECKING:
@@ -614,6 +621,39 @@ class AppConfig(BaseModel):
         default="text",
         description="Log line format: text, or JSON lines with a per-request ID (GH-158).",
     )
+
+    @model_validator(mode="after")
+    def validate_context_fits_the_model(self) -> AppConfig:
+        """Refuse a model whose reserved output leaves no input token (GH-294, Decisions 1-2).
+
+        One LLM call's budget is ``budget_limit(llm.max_input_tokens,
+        context.safety_margin_percent)``; the reply's reserve
+        (``llm.max_response_tokens``) must stay below it. A model that misses
+        this would refuse every turn at runtime, so admino refuses to start
+        instead. The check lives here because neither ``LLMConfig`` nor
+        ``ContextConfig`` holds both sections.
+
+        The message holds config values only: the provider, the active model
+        ID (already validated against a strict pattern; "no model set" when
+        unset) and the three integers. No URL or credential.
+
+        Raises:
+            ValueError: The reserve is at or above the budget.
+        """
+        max_input = self.llm.max_input_tokens
+        margin = self.context.safety_margin_percent
+        reserved = self.llm.max_response_tokens
+        budget = budget_limit(max_input, margin)
+        if reserved < budget:
+            return self
+        model = self.llm.active_model_name
+        named = f"model {model}" if model else "no model set"
+        msg = (
+            f"The context budget doesn't fit llm.provider {self.llm.provider} ({named}):"
+            f" llm.max_response_tokens {reserved} must be below llm.max_input_tokens"
+            f" {max_input} minus context.safety_margin_percent {margin} ({budget} tokens)."
+        )
+        raise ValueError(msg)
 
 
 # ---------------------------------------------------------------------------

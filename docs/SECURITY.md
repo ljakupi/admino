@@ -482,7 +482,10 @@ conversion in `attachment_processing.py` and `converters/`:
   reads each file's `<attachment ID>.d/manifest.json` and parts in a worker thread: the
   `<attachment ID>.d` directory is opened with `O_NOFOLLOW`, every file in it relative
   to that directory with `O_NOFOLLOW`, and each must be a regular file, so a symlink at
-  the directory, the manifest or a part is never followed. The directory above it,
+  the directory, the manifest or a part is never followed. A directory or a FIFO
+  planted at the manifest's or a part's name is refused without being read (a FIFO's
+  open doesn't block), and every refusal closes each descriptor the read opened, so
+  reading such a file again and again leaks no descriptor. The directory above it,
   `<root>/<organization ID>`, is resolved normally: it is the app's own, created with
   mode 0700. The manifest must validate and name the row's type, text must be strict
   UTF-8, and one file reads at most 256 MiB. Any failure answers `503

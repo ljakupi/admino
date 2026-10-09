@@ -58,6 +58,12 @@ before the load limit. ``test_agent_context_budget_no_cap_leading_orphan_results
 pins the issue's "never a result without its call" for that case (the cap path drops such
 results today via ``_trim_context``).
 
+GH-294 Decision 10 (test-gap pins, passing by design, each proven on its #190 mutant):
+``test_agent_context_budget_later_calls_notice_replaces_an_earlier_calls_notice`` (A13: a
+notice kept from the first call) and
+``test_agent_context_budget_no_cap_orphan_and_an_oversized_current_turn_end_too_long``
+(A10: the no-cap window's current index not shifted by the dropped leading results).
+
 Every new name (``admino.context_budget``, ``models.ContextNotice``, the new AgentConfig and
 AgentResult fields, ``registry.tools_payload``) is looked up inside the tests and helpers, so
 this file collects before GH-190 and each test fails on its own. Each test builds its
@@ -911,6 +917,34 @@ class TestEveryCall:
         assert second_call == [*turns[2], _as_user(current), calls, tool_message]
         assert (result.status, _notice(result)) == ("final", _dropped(2, 4))
 
+    async def test_agent_context_budget_later_calls_notice_replaces_an_earlier_calls_notice(
+        self, probe: _Probe, recorder: _Recorder
+    ) -> None:
+        """The first call drops one turn, the second two: the notice is the second call's.
+
+        GH-294 Decision 10 pins #190 mutant A13 (``report.context_notice =
+        report.context_notice or ...`` keeps the first call's notice). The current message
+        leaves 699 tokens once turn 1 (700) is gone; the tool loop adds 1000 tokens, so
+        turn 2 (900) no longer fits either.
+        """
+        turns = _three_turns()
+        earlier = _flat(*turns)
+        current = _message((await _room()) - _total(earlier) + 1)
+        look = _call("look", "big", "c-1")
+        calls = _calls_message(look)
+        big = _sized("loop-result ", 1000 - _tokens(calls) - _MESSAGE_OVERHEAD)
+        probe.results["look:big"] = lambda: big
+        llm = _ScriptedLLM(_tools(look), _text("Done."))
+
+        result = await _run(_agent(llm, recorder), current, config=_limits(), history=earlier)
+
+        tool_message = LLMMessage(role="tool", content=big, tool_call_id="c-1")
+        assert [_labels(_history_of(context)) for context in llm.received] == [
+            _labels([*turns[1], *turns[2], _as_user(current)]),
+            _labels([*turns[2], _as_user(current), calls, tool_message]),
+        ]
+        assert (result.status, _notice(result)) == ("final", _dropped(2, 4))
+
     @pytest.mark.parametrize(
         "end", ["final", "awaiting_confirmation", "limit_reached", "llm_error"]
     )
@@ -1097,6 +1131,47 @@ class TestContextTooLong:
         ]
         assert recorder.outcomes() == [("probe", "look", "allow", True, False)]
         assert _notice(result) == _dropped(3, 6)
+
+    @pytest.mark.parametrize("call", ["first-call", "later-call"])
+    async def test_agent_context_budget_no_cap_orphan_and_an_oversized_current_turn_end_too_long(
+        self, probe: _Probe, recorder: _Recorder, call: str
+    ) -> None:
+        """No cap, a loaded history opening with an orphan result, a current turn over the budget.
+
+        GH-294 Decision 10 pins #190 mutant A10 (the no-cap window's current index not
+        shifted by the dropped leading result): the run still ends with context_too_long
+        before the refused call. The current message is never dropped to make room, and no
+        call goes out with the current turn split from its tool calls and results.
+        """
+        history = [_result("orphan-h8", "h-8", 50), *_turn(1, 300), *_turn(2, 300)]
+        look = _call("look", "big", "c-1")
+        calls = _calls_message(look)
+        if call == "first-call":
+            current = _message((await _room()) + 1)
+            llm = _ScriptedLLM(_text("never sent"))
+            refused: list[LLMMessage] = [_as_user(current)]
+        else:
+            current = _message(50)
+            # The second call's current turn alone is one token over.
+            big = _sized(
+                "loop-result ", (await _room()) - 50 - _tokens(calls) + 1 - _MESSAGE_OVERHEAD
+            )
+            probe.results["look:big"] = lambda: big
+            llm = _ScriptedLLM(_tools(look), _text("never sent"))
+            refused = [
+                _as_user(current),
+                calls,
+                LLMMessage(role="tool", content=big, tool_call_id="c-1"),
+            ]
+
+        result = await _run(_agent(llm, recorder), current, config=_limits(), history=history)
+
+        assert (result.status, result.error_code) == ("error", "context_too_long")
+        assert len(llm.received) == (0 if call == "first-call" else 1)
+        assert result.history[-len(refused) - 1 :] == [
+            *refused,
+            LLMMessage(role="assistant", content=_TOO_LONG),
+        ]
 
     async def test_agent_context_budget_refusal_logs_no_content(
         self, probe: _Probe, recorder: _Recorder

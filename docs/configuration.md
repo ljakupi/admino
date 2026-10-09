@@ -417,6 +417,15 @@ next to it; **Save** stays off until something changed, and **Reset** drops your
   attack; raise `lockout_minutes` or lower `lockout_after_failures` instead.
 - A value out of range answers `422`. A trash minimum above the maximum, after merging
   with the stored values, answers `400`. Nothing is changed in either case.
+- A `llm.max_input_tokens` that leaves no room for the reserved output and the safety
+  margin (see [Context budget](#context-budget): the reserved output must be below the
+  budget) answers `422` `{"detail": "The model's max input tokens leave no room for the
+  reserved output and the safety margin", "reason": "max_input_tokens_too_small"}`.
+  With the defaults (4,096 reserved, a 10 % margin), 4,553 is the smallest value
+  accepted. It's checked against `config.yaml`'s `llm.max_response_tokens` and
+  `context.safety_margin_percent` before anything else: nothing is changed or recorded,
+  and a provider switch in the same request isn't made. A request without
+  `llm.max_input_tokens` isn't checked.
 
 ### How the assistant's instructions are layered
 
@@ -1355,7 +1364,11 @@ and images. They're what the model gets once the file is sent (see
   `GET /api/attachments/{id}` adds `context_report`, the same report as the send
   refusal's: the chat's live, `ready`, active files in upload order, then this file. To
   get it in, [exclude](#excluding-a-file) some of the chat's other files, then upload it
-  again.
+  again. A file that was excluded (`active: false`) by the time of this check, while it
+  was still `uploaded` or `processing` (during its conversion included), skips it: it
+  becomes `ready` with its `token_estimate`, and the send rule (see
+  [When the files alone don't fit](#when-the-files-alone-dont-fit)) applies once it's
+  included again.
 - **Upgrading.** Files that were `ready` before this release have no converted parts:
   the upgrade's migration puts them back to `uploaded`, and the agent converts them when
   it starts.
@@ -1442,6 +1455,17 @@ instructions + attachments + history + reserved output ≤ budget
 - **The reserved output** is `llm.max_response_tokens` (4,096 by default), the output cap
   every model call gets, so the reply always has room. The files may take the rest: the
   budget minus the reserved output (175,904 tokens with the defaults).
+- **The model must fit.** The reserved output must be below the budget, so at least one
+  token is left for the input; a reserve equal to the budget is refused like one above
+  it. With the defaults (4,096 reserved, a 10 % margin), `llm.max_input_tokens` must be
+  at least 4,553: its budget is 4,553 − 456 = 4,097. admino checks it at every start,
+  from `config.yaml`: a model that doesn't fit stops admino from starting, and the error
+  names the active provider and model ID (or "no model set") with
+  `llm.max_input_tokens`, `llm.max_response_tokens` and
+  `context.safety_margin_percent`. Lower `max_response_tokens` or the margin, or fix
+  `max_input_tokens`. The platform setting is checked the same way when it's changed:
+  `PATCH /api/platform/settings` answers `422` `max_input_tokens_too_small` (see
+  [Platform defaults](#platform-defaults)).
 - **How it counts.** Tokens are estimated the same way as a file's
   [`token_estimate`](#file-conversion), so files and messages are counted alike:
   - the instructions: the assistant's system message (the
@@ -1465,6 +1489,9 @@ instructions + attachments + history + reserved output ≤ budget
 - **`max_context_messages`** (a [platform default](#platform-defaults), from 0 to 200)
   is an optional second cap. When it's set, it applies first: each call sends at most
   that many messages, the instructions included, and the budget works on what it kept.
+  What it keeps never starts with a tool result: one whose tool call the cap cut (or that
+  was already first in what the message read) is left out too, so the model never gets a
+  tool result without the tool call it answers.
   A message then reads the chat's latest `max_context_messages` messages. With `0`, the
   default, there's no such cap: a message reads the chat's latest 200 messages, and the
   budget alone decides how many of them the model sees.

@@ -24,11 +24,15 @@ them).
 Outputs: the row's final status (``process_attachment``), the number of
 files queued again at startup (``recover``).
 
-Statements (contract forms P1'/P2''/P3-P6/P3''): P1' is a compare-and-set
+Statements (contract forms P1'/P2''/P3-P7/P3''): P1' is a compare-and-set
 from ``uploaded`` to ``processing`` (only one job ever processes a row);
 P2''/P3/P3'' write the outcome only while the row is still ``processing``,
 so a row deleted meanwhile is never re-created or overwritten. With a
-budget (GH-190, Decision 7), after the page check P6 sums the stored
+budget (GH-190, Decision 7), after the page check P7 reads the file's own
+``active`` flag (GH-294, Decision 8): a file excluded by then (before the
+claim or during the conversion) skips P6 and the rejection, since the send
+rule checks it if it is included later; an active file, or a row that is
+gone, gets the check. P6 sums the stored
 estimates of the chat's other live, ``ready``, active attachments; when the
 file's estimate on top of them is above the attachments' share of the
 budget (``budget_limit(max_input_tokens, margin) - reserved output``), P3''
@@ -47,10 +51,11 @@ one of its global workers), so one org's queue never holds back another
 org's files.
 
 Security notes:
-- Tenancy: P1'-P3, P6 and P3'' bind the attachment's org id; P6 counts
+- Tenancy: P1'-P3, P6, P7 and P3'' bind the attachment's org id; P6 counts
   only files of the same chat, org and owner as the processed row, and
-  returns a sum, never a row. P4/P5 are the system's startup recovery
-  across all orgs and never return content (ids only).
+  returns a sum, never a row; P7 returns one flag of the processed row.
+  P4/P5 are the system's startup recovery across all orgs and never return
+  content (ids only).
 - Shared storage: a conversion's derived files count toward its org's quota
   (checked under the org row lock, like an upload's), and the pool's per-org
   slot keeps one org from starving the others' conversions.
@@ -134,6 +139,10 @@ _OTHER_TOKENS_SQL: Final = """
     WHERE a.id = $1 AND a.org_id = $2 AND o.id <> a.id
       AND o.status = 'ready' AND o.active AND o.deleted_at IS NULL
 """
+# P7 (GH-294, Decision 8): the file's own active flag, read right before P6, so an
+# exclusion made at any time before the check (during the conversion included)
+# counts; None when the row is gone.
+_ACTIVE_SQL: Final = "SELECT active FROM attachments WHERE id = $1 AND org_id = $2"
 # P3'' (GH-190): the upload rejection, with the estimate that decided it, only while
 # still processing.
 _OVERFLOW_SQL: Final = """
@@ -361,7 +370,10 @@ async def process_attachment(
             ``context_overflow`` (its estimate stored) when its estimate plus
             those of the chat's other live, ``ready``, active files is above
             the attachments' share of the platform model's budget (P6, then
-            P3''). None, the default, checks nothing.
+            P3''). A file excluded by the time of the check (its own
+            ``active`` flag, P7, read right before P6; GH-294 Decision 8)
+            skips P6 and the rejection. None, the default, checks nothing
+            (no P7 either).
 
     Returns:
         ``ready`` or ``failed``; None when the row isn't this org's
@@ -399,7 +411,10 @@ async def process_attachment(
     if page_count is not None and page_count > files.max_pages_per_file:
         await _fail(pool, root, attachment_id, org_id, "too_many_pages")
         return "failed"
-    if budget is not None:
+    # An excluded file (P7 False) isn't checked: it takes no room in the context
+    # until it is included again, and the send rule checks it then. An active
+    # file, or a row that is gone (None), is checked as before.
+    if budget is not None and await pool.fetchval(_ACTIVE_SQL, attachment_id, org_id) is not False:
         available = available_attachment_tokens(
             budget_limit(platform.llm.max_input_tokens, budget.safety_margin_percent),
             budget.reserved_output_tokens,

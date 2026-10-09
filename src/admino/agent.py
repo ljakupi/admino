@@ -1274,10 +1274,14 @@ def _context_window(
     first message after it is the assistant turn answering it, so no orphaned
     ``tool`` result can follow it.
 
-    Without a cap (``max_messages`` 0) the window is the whole history without
-    its leading ``tool`` messages: a loaded history can start with results
-    whose assistant call lies before the load limit, and a result is never
-    sent without its call.
+    Without a cap (``max_messages`` 0) the window is the whole history.
+
+    Either way the window never starts with a ``tool`` message: its leading
+    ones are dropped, whether or not the cap cut anything (GH-294, Decision
+    4). A loaded history can start with results whose assistant call lies
+    before the load limit, and a window that fits under the cap keeps it
+    whole; a result is never sent without its call. The current user message
+    and every message after it are never among those dropped.
 
     ``current_idx`` is ``None`` only on a resumed confirmation whose history
     holds no user message (the request lies before the load limit): every
@@ -1286,23 +1290,30 @@ def _context_window(
 
     Returns:
         The window and the index in it where the current turn starts (the
-        current user message; 0 when ``current_idx`` is None).
+        current user message, counted after the dropped leading results; 0
+        when ``current_idx`` is None).
     """
+    # turn_start: the current user message's index in the window, before the
+    # leading results are dropped; None when the whole window is the current turn.
     if max_messages == 0:
-        start = 0
-        while start < len(history) and history[start].role == "tool":
-            start += 1
-        return history[start:], 0 if current_idx is None else current_idx - start
-    budget = max_messages - 1  # the system message
-    if current_idx is None:
+        window, turn_start = history, current_idx
+    elif current_idx is None:
+        budget = max_messages - 1  # the system message
         # Guard budget <= 0 so _trim_context does not emit its L-5 warning.
-        return (_trim_context(history, budget) if budget > 0 else []), 0
-    pinned = history[current_idx]
-    after = history[current_idx + 1 :]
-    budget -= 1  # the pinned message
-    tail = _trim_context(history[:current_idx] + after, budget) if budget > 0 else []
-    insert_at = max(0, len(tail) - len(after))
-    return [*tail[:insert_at], pinned, *tail[insert_at:]], insert_at
+        window, turn_start = (_trim_context(history, budget) if budget > 0 else []), None
+    else:
+        budget = max_messages - 2  # the system message and the pinned one
+        pinned = history[current_idx]
+        after = history[current_idx + 1 :]
+        tail = _trim_context(history[:current_idx] + after, budget) if budget > 0 else []
+        turn_start = max(0, len(tail) - len(after))
+        window = [*tail[:turn_start], pinned, *tail[turn_start:]]
+    start = 0
+    # A user message ends the leading results, so the current one and every
+    # message after it stay.
+    while start < len(window) and window[start].role == "tool":
+        start += 1
+    return window[start:], 0 if turn_start is None else turn_start - start
 
 
 def _trim_context(history: list[LLMMessage], max_messages: int) -> list[LLMMessage]:
