@@ -21,14 +21,20 @@ The OAuth callback (GH-162) re-resolves the session that started an
 authorization by its row id (``resolve_session_by_id``): the same checks as
 the token lookup, but it never touches ``last_seen_at``.
 
+An approval (GH-298) re-reads its caller's account under its chat's hold
+(``recheck_principal``): the account rules of the session lookup, applied to
+the users row as it is now, so a change made while the approval waited
+refuses it.
+
 Inputs: a database executor (the pool or a connection) plus a raw session
-token or (the OAuth callback) a session id; the user id, policy, client IP
-and user agent of a new session; the user or org whose sessions all end; the
-new Super Admin policy, or an org and its new policy.
+token or (the OAuth callback) a session id, or a member's Principal to
+re-check; the user id, policy, client IP and user agent of a new session;
+the user or org whose sessions all end; the new Super Admin policy, or an
+org and its new policy.
 Outputs: the raw token of a new session (``create_session``), the
 ``AuthenticatedSession`` of a usable session or None (``resolve_session``,
-``resolve_session_by_id``),
-nothing (``revoke_session``), the number of rows deleted
+``resolve_session_by_id``), the account's current Principal or None
+(``recheck_principal``), nothing (``revoke_session``), the number of rows deleted
 (``revoke_user_sessions``, ``revoke_org_sessions``,
 ``purge_expired_sessions``) or re-timed (``apply_super_admin_policy``,
 ``apply_org_policy``).
@@ -36,10 +42,17 @@ nothing (``revoke_session``), the number of rows deleted
 Security notes:
 - The one Principal builder: this is the only module that builds an
   ``access.Principal`` (tests/test_access.py allowlists it), and it builds it
-  from the session's users row only, never from request data.
+  from a users row only, never from request data.
   ``resolve_session`` takes nothing but the executor and the token,
   ``resolve_session_by_id`` nothing but the executor and the session id
-  (which the OAuth state binding stored server-side, never a request value).
+  (which the OAuth state binding stored server-side, never a request value),
+  ``recheck_principal`` nothing but the executor and a Principal this module
+  built (its user id and org id are the binds).
+- The re-check (GH-298) is one read of the users row within the principal's
+  org, with the org's status, and writes nothing. It fails closed: a missing
+  row, a user that isn't active or is deleted, a row that isn't a member's,
+  an org that isn't active, an invalid Principal or another user, kind or
+  org is None.
 - Re-checked on every request: one query re-reads the session, the user and
   the org, and the decision is made here on each call. A deleted, expired or
   idle session (past the row's own timeout), a user that isn't active or is
@@ -139,6 +152,17 @@ _RESOLVE_SQL: Final = _RESOLVE_SELECT + "    WHERE s.token_hash = $1\n"
 _RESOLVE_BY_ID_SQL: Final = _RESOLVE_SELECT + "    WHERE s.id = $1\n"
 
 _TOUCH_SQL: Final = "UPDATE sessions SET last_seen_at = now() WHERE id = $1"
+
+# GH-298: an approval re-reads its caller's account, with the org's status, under
+# the chat's hold. Bound to the request principal's org too: an account no longer in
+# it has no row.
+_ACCOUNT_SQL: Final = """
+    SELECT u.id AS user_id, u.kind, u.org_id, u.role, u.status, u.deleted_at,
+           o.status AS org_status
+    FROM users u
+    JOIN organizations o ON o.id = u.org_id
+    WHERE u.id = $1 AND u.org_id = $2
+"""
 
 _REVOKE_SQL: Final = "DELETE FROM sessions WHERE token_hash = $1"
 
@@ -263,6 +287,25 @@ def _client_ip(ip: str | None) -> IPv4Address | IPv6Address | None:
         return None
 
 
+# Any: asyncpg returns an untyped Record.
+def _active_account(row: Any) -> bool:
+    """True when a row's user is active and not deleted, and a member's org is active.
+
+    The account rules session resolution and ``recheck_principal`` share.
+    """
+    if row["status"] != "active" or row["deleted_at"] is not None:
+        return False
+    return not (row["kind"] == "member" and row["org_status"] != "active")
+
+
+# Any: asyncpg returns an untyped Record.
+def _row_principal(row: Any) -> Principal:
+    """Build the Principal of a users row; raises ``ValidationError`` when it isn't one."""
+    return Principal(
+        user_id=row["user_id"], kind=row["kind"], org_id=row["org_id"], role=row["role"]
+    )
+
+
 # Any: asyncpg returns an untyped Record (or None).
 def _usable_session(row: Any, now: datetime) -> AuthenticatedSession | None:
     """Build the AuthenticatedSession of a resolve row, or None when it isn't usable.
@@ -287,17 +330,12 @@ def _usable_session(row: Any, now: datetime) -> AuthenticatedSession | None:
         return None
     if expires_at <= now or last_seen_at + timedelta(minutes=idle_minutes) <= now:
         return None
-    if row["status"] != "active" or row["deleted_at"] is not None:
-        return None
-    if row["kind"] == "member" and row["org_status"] != "active":
+    if not _active_account(row):
         return None
     try:
-        principal = Principal(
-            user_id=row["user_id"], kind=row["kind"], org_id=row["org_id"], role=row["role"]
-        )
         return AuthenticatedSession(
             session_id=row["session_id"],
-            principal=principal,
+            principal=_row_principal(row),
             ui_language=row["ui_language"],
             response_language=row["response_language"],
         )
@@ -399,6 +437,52 @@ async def resolve_session_by_id(
     """
     row = await executor.fetchrow(_RESOLVE_BY_ID_SQL, session_id)
     return _usable_session(row, datetime.now(UTC))
+
+
+async def recheck_principal(executor: Executor, principal: Principal) -> Principal | None:
+    """Re-read a member's account and return its current Principal (GH-298).
+
+    An approval (``POST /api/confirm``) calls it first under its chat's hold,
+    so a change made to the caller's account while the request waited
+    refuses it like a request sent after the change. The caller compares the
+    returned role with the capability it needs; the request keeps the
+    principal it arrived with.
+
+    Args:
+        executor: The pool or a connection.
+        principal: The request's principal, built by ``resolve_session``
+            from its session row (never request data).
+
+    Returns:
+        The Principal built from the account as it is now, or None (fail
+        closed) when ``principal`` isn't a member, the account has no row in
+        the principal's org (deleted, or no longer a member of it), the user
+        isn't active or is deleted, the row isn't a member's, the org isn't
+        active (deactivated, pending deletion), the row doesn't form a valid
+        Principal, or it isn't the same user, kind and org as ``principal``.
+
+    Security notes: one parameterized read of the users row by the
+    principal's user id and org id, joined with the org's status; it writes
+    nothing (no ``last_seen_at``, no session). Logs carry no ID or value.
+    """
+    if principal.kind != "member" or principal.org_id is None:
+        return None
+    row = await executor.fetchrow(_ACCOUNT_SQL, principal.user_id, principal.org_id)
+    if row is None or row["kind"] != "member" or not _active_account(row):
+        return None
+    try:
+        current = _row_principal(row)
+    except ValidationError:
+        # No IDs or values: the row is inconsistent, and the request is refused.
+        logger.warning("An account row failed validation; the request is refused.")
+        return None
+    if (current.user_id, current.kind, current.org_id) != (
+        principal.user_id,
+        principal.kind,
+        principal.org_id,
+    ):
+        return None
+    return current
 
 
 async def revoke_session(executor: Executor, token: str) -> None:
