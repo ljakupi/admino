@@ -2,19 +2,20 @@
 
 Every security-relevant action (logins and lockouts, password resets and
 changes, session revocations and forced logouts, invitations, role and profile
-changes, activations, sharing changes, file uploads, deletions and restores, exports, Org
-Admin access to other users' projects, org and platform settings, org tool
-permissions, Super Admin actions, residency policy, break-glass sessions, agent
-tool calls) is
-written through ``record()`` as one row of the ``audit_events`` table
-(migration 0005; the action catalog CHECK is replaced by migration 0009 for
-GH-152's session actions, by migration 0010 for GH-153's invitation.resend
-and invitation.refuse, by migration 0016 for GH-161's
+changes, activations, sharing changes, file uploads, deletions, restores,
+exclusions and inclusions, exports, Org Admin access to other users' projects,
+org and platform settings, org tool permissions, Super Admin actions, residency
+policy, break-glass sessions, agent tool calls) is written through
+``record()`` as one row of the ``audit_events`` table (migration 0005; the
+action catalog CHECK is replaced by migration 0009 for GH-152's session
+actions, by migration 0010 for GH-153's invitation.resend and
+invitation.refuse, by migration 0016 for GH-161's
 org.permission_change, org.permission_promote, org.permission_promote_cancel
 and org.permission_demote, by migration 0020 for GH-164's user.profile_change,
-by migration 0021 for GH-166's password.change and by migration 0027 for
-GH-187's file.upload; the metadata CHECK is replaced by migration 0029 for
-GH-189's attachment ids).
+by migration 0021 for GH-166's password.change, by migration 0027 for
+GH-187's file.upload and by migration 0030 for GH-190's file.exclude and
+file.include; the metadata CHECK is replaced by migration 0029 for GH-189's
+attachment ids).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -138,6 +139,10 @@ class AuditAction(StrEnum):
     FILE_UPLOAD = "file.upload"
     FILE_DELETE = "file.delete"
     FILE_RESTORE = "file.restore"
+    # A member excludes one of their attachments from later turns, or includes
+    # it again (GH-190); the target is the file, there is no metadata
+    FILE_EXCLUDE = "file.exclude"
+    FILE_INCLUDE = "file.include"
     # Org Admin access to other users' projects
     PROJECT_ADMIN_ACCESS = "project.admin_access"
     # Exports
@@ -218,6 +223,8 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.FILE_UPLOAD: "org",
         AuditAction.FILE_DELETE: "org",
         AuditAction.FILE_RESTORE: "org",
+        AuditAction.FILE_EXCLUDE: "org",
+        AuditAction.FILE_INCLUDE: "org",
         AuditAction.PROJECT_ADMIN_ACCESS: "org",
         AuditAction.EXPORT_CREATE: "org",
         AuditAction.ORG_SETTINGS_CHANGE: "org",

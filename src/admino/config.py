@@ -9,7 +9,10 @@ and limits are stored in ``platform_settings`` (``admino.scoped_settings``,
 GH-159), seeded from this config. The llm section's provider, models and
 (GH-242) the active model's capabilities (``max_input_tokens``,
 ``image_input``) are stored again on every start; the LLM retry limit is a
-platform setting only, never read from this file.
+platform setting only, never read from this file. The ``context`` section
+(GH-190: the budget's safety margin, the per-turn attachment byte cap and the
+tool-result cap) is read at start like ``llm.max_response_tokens`` and is
+never a platform setting.
 
 Environment variable overrides are supported for deployment flexibility.
 Secrets (OAUTH_ENCRYPTION_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET)
@@ -475,13 +478,40 @@ class LimitsConfig(BaseModel):
         description="Maximum length of a user message in characters.",
     )
     max_context_messages: int = Field(
-        default=20,
-        ge=1,
+        default=0,
+        ge=0,
         le=200,
         description=(
-            "Maximum conversation messages sent as context to the LLM. The"
-            " system prompt and the current user message are always sent."
+            "Optional cap on the conversation messages sent as context to the LLM,"
+            " applied before the token budget; 0 means no cap (GH-190). The system"
+            " prompt and the current user message are always sent."
         ),
+    )
+
+
+class ContextConfig(BaseModel):
+    """The context budget's deployment knobs (GH-190), read at start; not platform settings."""
+
+    safety_margin_percent: int = Field(
+        default=10,
+        ge=0,
+        le=50,
+        description=(
+            "Share of the model's max_input_tokens kept back for estimation error;"
+            " the rest is the token budget of one LLM call."
+        ),
+    )
+    max_attachment_mb_per_turn: int = Field(
+        default=64,
+        ge=1,
+        le=1024,
+        description="The most MiB of converted attachment files one turn may read.",
+    )
+    max_tool_result_tokens: int = Field(
+        default=8000,
+        ge=256,
+        le=100_000,
+        description="A tool result above this many tokens is cut, with a marker.",
     )
 
 
@@ -573,6 +603,7 @@ class AppConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
     limits: LimitsConfig = Field(default_factory=LimitsConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
     egress: EgressConfig = Field(default_factory=EgressConfig)
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
