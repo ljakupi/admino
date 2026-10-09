@@ -529,7 +529,8 @@ Security notes:
   failed audit write is a 500 with nothing changed; a 422 never echoes the
   password. Pending promotions live in process memory (a restart cancels
   them); an org's due ones are completed by that org's next chat run, summary
-  or critical-permissions request, and a user-role notice (GH-66) is stored
+  or critical-permissions request (an approval completes them under its
+  chat's hold, GH-296), and a user-role notice (GH-66) is stored
   in every chat of that org that isn't in the trash and whose latest message
   doesn't await a confirmation (``chats.append_org_notice``, GH-24: it would
   split a ``tool_use`` from its result), never in another org's.
@@ -5417,8 +5418,8 @@ async def post_confirm(
     (read again under the hold, so a turn that ran in front of the approval
     counts), the stored platform limits and LLM retry limit (read on every
     request, under the hold: GH-160, GH-242, GH-294) and their org's tool
-    policy as it is now (loaded again, after completing the org's due
-    promotions; GH-161), then stores the
+    policy as it is when the approval runs (loaded under the hold, after
+    completing the org's due promotions; GH-161, GH-296), then stores the
     run like a turn (a confirmation it asks for counts against the caller's
     stored ``max_pending_confirmations`` in their other chats, the consumed
     one not included; GH-24). An approved resume also loads the caller's
@@ -5434,10 +5435,17 @@ async def post_confirm(
     nothing more), for an approval and a denial alike: a change made while
     the request waited for the hold (``image_input``, the limits, the retry
     limit, ``max_input_tokens``) applies to the approved run and to the
-    denial's ``context_usage``. Decision 7: an approval whose chat was
-    trashed while it waited answers the 404 ``chat_not_found`` with its
-    pending confirmation removed first, so nothing is left for the reaper
-    and nothing is run, stored or audited.
+    denial's ``context_usage``. GH-296 (Decision 1): right after them, and
+    once, the org's due promotions are completed and its tool policy is
+    loaded, under the hold too: an Org Admin's deny set while the approval
+    waited refuses the approved call, and a promotion that fell due
+    meanwhile is completed by the approval itself. A confirm refused by the
+    confirmation checks (the 404 or 400, before or under the hold) completes
+    no promotion and loads no policy. Decision 7: an approval whose chat was
+    trashed while it waited has read the platform settings, the promotions
+    and the policy, then answers the 404 ``chat_not_found`` with its pending
+    confirmation removed first, so nothing is left for the reaper and
+    nothing is run, stored or audited.
 
     GH-8: with an ``Accept`` header listing ``text/event-stream`` an approval
     streams the resumed run like a turn (no title), and a denial streams
@@ -5478,9 +5486,8 @@ async def post_confirm(
     from admino.database import get_pool
 
     pool = get_pool()
-    await _resolve_due_promotions(pool, principal)
+    # Built before the hold: the chat lookup is scoped to it.
     tenant = TenantContext.from_principal(principal)
-    policy = await org_permissions.load_tool_policy(pool, tenant)
 
     try:
         if body.chat_id is not None:
@@ -5525,6 +5532,11 @@ async def post_confirm(
         # Read under the hold, once (GH-294, Decision 6): a change made while this request
         # waited behind a running turn (image_input, the limits) applies to its run.
         platform = await _platform_run_settings()
+        # Then, once and under the hold too (GH-296, Decision 1): the org's due promotions
+        # are completed and its tool policy is loaded, so a change made while this request
+        # waited (an Org Admin's deny, a promotion whose cooldown passed) applies to it.
+        await _resolve_due_promotions(pool, principal)
+        policy = await org_permissions.load_tool_policy(pool, tenant)
 
         if not body.approved:
             # A denial is consumed at once and reads no attachment (GH-189): the turn read

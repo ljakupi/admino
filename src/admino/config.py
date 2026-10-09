@@ -89,6 +89,8 @@ _TRUSTED_PROXIES_ERROR: Final = (
     "server.trusted_proxies entries must be IPv4 or IPv6 addresses or CIDR networks, "
     "without host bits set, a scope ID, or a prefix length of 0."
 )
+# The location load_app_config logs for an error of the whole config (an empty loc).
+_ROOT_ERROR_LOCATION: Final = "(config)"
 _INSECURE_COOKIE_ERROR: Final = (
     "server.cookie_secure may be false (COOKIE_SECURE=false) only in development, with "
     "a plain-http localhost server.public_url; an https public URL needs the Secure cookie."
@@ -843,7 +845,9 @@ def load_app_config(config_path: Path) -> AppConfig:
 
     Reads config.yaml, applies environment variable overrides, validates
     with Pydantic, and returns the config. Falls back to defaults if the
-    config file does not exist.
+    config file does not exist. Each validation error is logged with its
+    dotted location (``(config)`` for an error of the whole config, such as
+    the context budget fit check; GH-296) and its message, never the input.
 
     Args:
         config_path: Path to config.yaml.
@@ -895,8 +899,14 @@ def load_app_config(config_path: Path) -> AppConfig:
         for err in exc.errors(include_input=False):
             # Sanitize loc elements — adversarial YAML keys could inject non-printable
             # characters or overly long strings into the log.
-            safe_loc = ".".join(safe_log(part) for part in err["loc"])
-            logger.error("Config validation error at %s: %s", safe_loc, err["msg"])
+            # A model-level error of the whole config (the context budget fit
+            # check) has an empty loc: name it with a fixed label, never a value.
+            location = (
+                ".".join(safe_log(part) for part in err["loc"])
+                if err["loc"]
+                else _ROOT_ERROR_LOCATION
+            )
+            logger.error("Config validation error at %s: %s", location, err["msg"])
         msg = (
             f"Invalid application config: validation failed on "
             f"{error_count} field(s) — check server logs for details"
