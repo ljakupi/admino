@@ -28,8 +28,8 @@ What these tests pin down:
   file's, the processed file's) count 0.
 - Over: status ``failed``, reason ``context_overflow``, ``token_estimate`` the
   processed estimate, ``derived_bytes`` NULL, no ``<id>.d`` left, the original
-  kept, the result ``failed``; exactly P1', P6, P3'' (no P2'', no quota statement,
-  even under a zero quota); P6 and P3'' in the contract's forms and binds.
+  kept, the result ``failed``; exactly P1', P7, P6, P3'' (no P2'', no quota
+  statement, even under a zero quota); P6 and P3'' in the contract's forms and binds.
 - Order: a page-count failure comes first (no P6); P6 runs before the quota
   transaction (an under-budget file of a full org is still
   ``storage_quota_exceeded`` after P6).
@@ -39,6 +39,14 @@ What these tests pin down:
   statements (no P6).
 - The pool: with a budget every job is checked, without one none is.
 - Logs: the over-budget line names the id and ``context_overflow``; no file name.
+- GH-294 (Decision 8): right before P6 the processor reads the file's own
+  ``active`` flag (P7, contract form, binds the id and the org id). An exclusion
+  made before the claim or during the conversion skips P6 and the rejection: the
+  file is ``ready`` with the converter's estimate (even one over the attachments'
+  share on its own), its derived files kept, still excluded. An active file and
+  one included again before the check are checked as before (``context_overflow``).
+  A row gone during the conversion (P7 finds none) gets P6 as today, then owns
+  nothing. No budget: no P7; a page-count failure: no P7.
 
 Imports of the module under test and of ``admino.context_budget`` are lazy.
 """
@@ -60,6 +68,7 @@ from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, plain
 
 if TYPE_CHECKING:
     import uuid
+    from collections.abc import Callable
     from pathlib import Path
     from types import ModuleType
 
@@ -76,7 +85,7 @@ _WAIT_S: Final = 30.0
 
 _T0: Final = datetime(2026, 10, 9, 11, 0, 0, tzinfo=UTC)
 
-# Contract forms (GH-187/188 P1', P2'', P3, A3, A4'; GH-190 C7 P6, P3'').
+# Contract forms (GH-187/188 P1', P2'', P3, A3, A4'; GH-190 C7 P6, P3''; GH-294 P7).
 P1: Final = """
     UPDATE attachments SET status = 'processing', updated_at = now()
     WHERE id = $1 AND org_id = $2 AND status = 'uploaded'
@@ -109,6 +118,8 @@ P3_SECOND: Final = """
         updated_at = now()
     WHERE id = $1 AND org_id = $2 AND status = 'processing'
 """
+# GH-294 Decision 8: the processed file's own active flag, right before P6.
+P7: Final = "SELECT active FROM attachments WHERE id = $1 AND org_id = $2"
 
 
 def _canon(sql: str) -> str:
@@ -123,6 +134,7 @@ _FORMS: Final = {
     "P3": _canon(P3),
     "P3''": _canon(P3_SECOND),
     "P6": _canon(P6),
+    "P7": _canon(P7),
     "A3": _canon(A3),
     "A4'": _canon(A4),
 }
@@ -224,14 +236,16 @@ def _derived_dir(world: _World, attachment_id: uuid.UUID) -> Path:
     return _original(world, attachment_id).with_name(f"{attachment_id}.d")
 
 
-def _upload(world: _World, chat_id: uuid.UUID | None = None) -> uuid.UUID:
-    """An uploaded row (named with the canary) and its stored original."""
+def _upload(world: _World, chat_id: uuid.UUID | None = None, *, active: bool = True) -> uuid.UUID:
+    """An uploaded row (named with the canary) and its stored original; ``active`` False:
+    the member excluded it before the processor claimed it."""
     attachment_id = world.db.add_attachment(
         world.chat if chat_id is None else chat_id,
         filename=NAME_CANARY,
         kind="pdf",
         size_bytes=8,
         created_at=_T0 + timedelta(minutes=1),
+        active=active,
     )
     path = _original(world, attachment_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -250,10 +264,12 @@ def _other(world: _World, chat_id: uuid.UUID | None = None, **values: Any) -> uu
 
 
 class _Processor:
-    """A sync processor: writes ``<id>.d`` (as a conversion does) and returns ``result``."""
+    """A sync processor: writes ``<id>.d`` (as a conversion does) and returns ``result``;
+    ``during`` runs before it returns (what the member does while the file converts)."""
 
-    def __init__(self, result: Any) -> None:
+    def __init__(self, result: Any, during: Callable[[], None] | None = None) -> None:
         self.result = result
+        self.during = during
         self.calls = 0
 
     def __call__(self, path: Path, kind: str, job: Any) -> Any:
@@ -262,6 +278,8 @@ class _Processor:
         derived.mkdir()
         (derived / "part-0001.txt").write_text("converted", encoding="utf-8")
         (derived / "manifest.json").write_text("{}", encoding="utf-8")
+        if self.during is not None:
+            self.during()
         return self.result
 
 
@@ -349,7 +367,7 @@ async def test_attachment_processing_budget_over_fails_without_storing_the_deriv
     ap: ModuleType, world: _World
 ) -> None:
     """failed / context_overflow with the estimate; no derived bytes, no <id>.d, the
-    original kept; exactly P1', P6, P3'' (no P2'', nothing counted in the quota)."""
+    original kept; exactly P1', P7, P6, P3'' (no P2'', nothing counted in the quota)."""
     _seed_others(world)
     attachment_id = _upload(world)
     world.db.calls.clear()
@@ -362,7 +380,7 @@ async def test_attachment_processing_budget_over_fails_without_storing_the_deriv
     )
     assert not _derived_dir(world, attachment_id).exists()
     assert _original(world, attachment_id).read_bytes() == b"%PDF-1.7"
-    assert _outcome_forms(world.db) == ["P1'", "P6", "P3''"]
+    assert _outcome_forms(world.db) == ["P1'", "P7", "P6", "P3''"]
     (p6,) = _calls_of(world.db, "P6")
     (p3,) = _calls_of(world.db, "P3''")
     assert [plain(arg) for arg in p6.args] == [attachment_id, ORG_ID]
@@ -384,7 +402,7 @@ async def test_attachment_processing_budget_under_runs_p6_then_the_quota_transac
     result = await _process(ap, world, attachment_id, _processed(ap, 3_000), _budget())
 
     assert (result, _state(world, attachment_id)) == ("ready", ("ready", None, 3_000, 120))
-    assert _outcome_forms(world.db) == ["P1'", "P6", "A3", "A4'", "P2''"]
+    assert _outcome_forms(world.db) == ["P1'", "P7", "P6", "A3", "A4'", "P2''"]
     assert _derived_dir(world, attachment_id).is_dir()
 
 
@@ -495,7 +513,7 @@ async def test_attachment_processing_budget_over_never_reaches_the_quota(
 async def test_attachment_processing_budget_under_still_meets_the_quota(
     ap: ModuleType, world: _World
 ) -> None:
-    """Under the budget in a full org: P6, then the quota refuses the derived files."""
+    """Under the budget in a full org: P7, P6, then the quota refuses the derived files."""
     world.db.add_org(ORG_ID, storage_quota_bytes=0)
     attachment_id = _upload(world)
     world.db.calls.clear()
@@ -506,7 +524,7 @@ async def test_attachment_processing_budget_under_still_meets_the_quota(
         "failed",
         ("failed", "storage_quota_exceeded"),
     )
-    assert _outcome_forms(world.db) == ["P1'", "P6", "A3", "A4'", "P3"]
+    assert _outcome_forms(world.db) == ["P1'", "P7", "P6", "A3", "A4'", "P3"]
 
 
 @pytest.mark.parametrize(
@@ -629,3 +647,109 @@ async def test_attachment_processing_budget_logs_the_id_and_the_code_only(
     assert str(attachment_id) in lines[0]
     assert all(NAME_CANARY not in record.getMessage() for record in caplog.records)
     assert all(str(world.root) not in record.getMessage() for record in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 7. The file's own active flag (GH-294, Decision 8)
+# ---------------------------------------------------------------------------
+
+# Over the attachments' share (8 000) on its own, and so with the chat's 5 000 too.
+_OVER_ALONE: Final = _AVAILABLE + 1
+_CHECKED: Final = ["P1'", "P7", "P6", "P3''"]
+_UNCHECKED: Final = ["P1'", "P7", "A3", "A4'", "P2''"]
+
+
+def _set_active(world: _World, attachment_id: uuid.UUID, active: bool) -> Callable[[], None]:
+    """Set the stored row's flag, as ``PATCH /api/attachments/{id}`` does (it accepts a
+    file that is still processing)."""
+
+    def flip() -> None:
+        world.db.attachments[attachment_id]["active"] = active
+
+    return flip
+
+
+@pytest.mark.parametrize(
+    ("seeded", "during", "expected"),
+    [
+        (True, None, "failed"),
+        (False, None, "ready"),
+        (True, False, "ready"),
+        (False, True, "failed"),
+    ],
+    ids=[
+        "active",
+        "excluded-before-the-claim",
+        "excluded-during-the-conversion",
+        "included-again-during-the-conversion",
+    ],
+)
+async def test_attachment_processing_budget_own_active_flag_decides_the_check(
+    ap: ModuleType, world: _World, seeded: bool, during: bool | None, expected: str
+) -> None:
+    """P7 reads the flag after the conversion, right before P6. Excluded then: no P6, no
+    rejection; ready with the converter's estimate (over the share even alone), the
+    derived files kept, still excluded. Active then (or included again): checked as
+    before, context_overflow."""
+    _seed_others(world)
+    attachment_id = _upload(world, active=seeded)
+    flip = None if during is None else _set_active(world, attachment_id, during)
+    world.db.calls.clear()
+
+    result = await ap.process_attachment(
+        world.db.pool,
+        world.root,
+        attachment_id,
+        ORG_ID,
+        processor=_Processor(_processed(ap, _OVER_ALONE), during=flip),
+        budget=_budget(),
+    )
+
+    row = world.db.attachment_row(attachment_id)
+    assert row is not None
+    ready = expected == "ready"
+    assert (result, _state(world, attachment_id), row["active"]) == (
+        expected,
+        ("ready", None, _OVER_ALONE, 120)
+        if ready
+        else ("failed", "context_overflow", _OVER_ALONE, None),
+        seeded if during is None else during,
+    )
+    assert _derived_dir(world, attachment_id).is_dir() is ready
+    assert (
+        _outcome_forms(world.db),
+        [[plain(arg) for arg in call.args] for call in _calls_of(world.db, "P7")],
+    ) == (_UNCHECKED if ready else _CHECKED, [[attachment_id, ORG_ID]])
+
+
+async def test_attachment_processing_budget_row_gone_during_the_conversion_gets_p6(
+    ap: ModuleType, world: _World
+) -> None:
+    """The row is deleted while the file converts: P7 finds no row and P6 runs as today
+    (nothing counts through a gone row, so the file fits); the ready outcome matches no
+    row and the derived files are removed; the original is left to its deleter."""
+    _seed_others(world)
+    attachment_id = _upload(world)
+    original = _original(world, attachment_id)
+    derived = _derived_dir(world, attachment_id)
+
+    def delete() -> None:
+        del world.db.attachments[attachment_id]
+
+    world.db.calls.clear()
+
+    await ap.process_attachment(
+        world.db.pool,
+        world.root,
+        attachment_id,
+        ORG_ID,
+        processor=_Processor(_processed(ap, 3_000), during=delete),
+        budget=_budget(),
+    )
+
+    assert (
+        _outcome_forms(world.db),
+        world.db.attachment_row(attachment_id),
+        derived.exists(),
+        original.exists(),
+    ) == (["P1'", "P7", "P6", "A3", "A4'", "P2''"], None, False, True)

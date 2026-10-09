@@ -257,6 +257,7 @@ def _attachments(text: str) -> list[Any]:
             kind="pdf",
             page_count=1,
             parts=(TextContent(text=text),),
+            token_estimate=0,
         )
     ]
 

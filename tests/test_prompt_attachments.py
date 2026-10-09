@@ -226,6 +226,7 @@ def _attachment(
         kind=kind,
         page_count=page_count,
         parts=parts if parts is not None else (_text("Budget approved."),),
+        token_estimate=0,
     )
 
 

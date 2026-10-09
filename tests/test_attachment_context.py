@@ -431,6 +431,7 @@ class TestReadContent:
             kind="txt",
             page_count=None,
             parts=tuple(m.text(text=text) for text in texts),
+            token_estimate=0,
         )
 
     def test_attachment_context_pdf_gives_label_then_image_in_order(
@@ -691,6 +692,7 @@ def _three(m: _Names, org_dir: Path) -> tuple[list[Any], list[Any]]:
             kind="txt",
             page_count=None,
             parts=(m.text(text="Third file."),),
+            token_estimate=0,
         ),
         m.content(
             id=second.id,
@@ -698,6 +700,7 @@ def _three(m: _Names, org_dir: Path) -> tuple[list[Any], list[Any]]:
             kind="png",
             page_count=None,
             parts=(m.image(media_type="image/png", data=_b64(_png())),),
+            token_estimate=0,
         ),
         m.content(
             id=third.id,
@@ -705,6 +708,7 @@ def _three(m: _Names, org_dir: Path) -> tuple[list[Any], list[Any]]:
             kind="md",
             page_count=None,
             parts=(m.text(text="# Second file"),),
+            token_estimate=0,
         ),
     ]
     return [first, second, third], contents

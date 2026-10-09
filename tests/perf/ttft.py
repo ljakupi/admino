@@ -318,6 +318,8 @@ def _attachments(document: str) -> list[AttachmentContent]:
             kind="txt",
             page_count=None,
             parts=(TextContent(text=document),),
+            # Slot 4 only: no context budget is applied to this request.
+            token_estimate=0,
         )
     ]
 

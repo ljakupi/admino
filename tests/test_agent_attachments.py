@@ -372,7 +372,12 @@ def _attachment(
     attachment_id: UUID, filename: str, kind: str, page_count: int | None, *parts: Any
 ) -> Any:
     return models.AttachmentContent(
-        id=attachment_id, filename=filename, kind=kind, page_count=page_count, parts=parts
+        id=attachment_id,
+        filename=filename,
+        kind=kind,
+        page_count=page_count,
+        parts=parts,
+        token_estimate=0,
     )
 
 

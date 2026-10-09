@@ -93,6 +93,7 @@ def _attachments(count: int) -> list[Any]:
             kind="txt",
             page_count=None,
             parts=(models.TextContent(text=_FILE_TEXT),),
+            token_estimate=0,
         )
         for n in range(count)
     ]
