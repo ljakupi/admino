@@ -621,9 +621,9 @@ routes. Editors, Viewers and the Super Admin get `403`.
   changes, admino emails the old address a short notice (without either address), and a
   password reset link the user already got stops working. A new role applies from the
   user's next request. A Viewer keeps their chats, connections and notes, unused.
-- `POST /api/org/users/{id}/deactivate` ends every session of the user at once and emails
-  them that their account was deactivated. Their chats, connections, notes and settings
-  are kept.
+- `POST /api/org/users/{id}/deactivate` ends every session of the user at once (an
+  approval of theirs still waiting in a chat is refused too) and emails them that their
+  account was deactivated. Their chats, connections, notes and settings are kept.
 - `POST /api/org/users/{id}/reactivate` needs a free seat (active and invited users take
   one), and emails the user a link to log in.
 - `DELETE /api/org/users/{id}` deletes the account with its sessions, chats, connections,
@@ -873,6 +873,10 @@ Viewer's chats from before a role change stay stored, unused.
   [excluding](#excluding-a-file) the file at fault, or deny it. A denial reads no file and
   is never refused for one. The approved action is checked against your organization's
   [permissions](permissions.md#per-organization) as they are when the approval runs.
+  An approval or a denial that waited behind a reply still running in the chat is refused
+  like any later request when, meanwhile, your account was deactivated or deleted or your
+  organization deactivated (`401`), or you were made a Viewer (`403`): nothing runs, and
+  the confirmation stays pending until it expires.
 - **At most 3 pending confirmations per user.** You can have up to
   `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
   confirmations waiting at once, across your chats. When you're at the limit, a message
