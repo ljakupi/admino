@@ -871,7 +871,8 @@ Viewer's chats from before a role change stay stored, unused.
   `image_input_unsupported` (see [Attachments](#attachments)) runs nothing and leaves the
   confirmation pending, so you can approve it again later, after
   [excluding](#excluding-a-file) the file at fault, or deny it. A denial reads no file and
-  is never refused for one.
+  is never refused for one. The approved action is checked against your organization's
+  [permissions](permissions.md#per-organization) as they are when the approval runs.
 - **At most 3 pending confirmations per user.** You can have up to
   `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
   confirmations waiting at once, across your chats. When you're at the limit, a message
@@ -1460,8 +1461,8 @@ instructions + attachments + history + reserved output ≤ budget
   it. With the defaults (4,096 reserved, a 10 % margin), `llm.max_input_tokens` must be
   at least 4,553: its budget is 4,553 − 456 = 4,097. admino checks it at every start,
   from `config.yaml`: a model that doesn't fit stops admino from starting, and the error
-  names the active provider and model ID (or "no model set") with
-  `llm.max_input_tokens`, `llm.max_response_tokens` and
+  (logged as `Config validation error at (config): …`) names the active provider and
+  model ID (or "no model set") with `llm.max_input_tokens`, `llm.max_response_tokens` and
   `context.safety_margin_percent`. Lower `max_response_tokens` or the margin, or fix
   `max_input_tokens`. The platform setting is checked the same way when it's changed:
   `PATCH /api/platform/settings` answers `422` `max_input_tokens_too_small` (see

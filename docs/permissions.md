@@ -38,6 +38,9 @@ Each organization has its own permission matrix:
   first, what is denied, and which services the organization switched off.
 - Every chat run uses its own organization's matrix, critical promotions and tool services.
   One organization's changes never reach another organization's chats.
+- An approval uses the matrix as it is when it runs, even one changed while the approval
+  waited behind a reply still running in its chat: a pair set to denied meanwhile is
+  refused, not run, and a promotion whose cooldown ended meanwhile applies to it.
 - When the organization's data residency policy is on, the Google and Microsoft tools
   (Gmail, Google Calendar, Google Drive, Outlook, Outlook Calendar, OneDrive) count as
   switched off, whatever the matrix and the service switches say: the agent isn't offered
