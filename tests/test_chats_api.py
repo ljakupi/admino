@@ -47,13 +47,17 @@ What these tests pin down:
   from the runtime (the read keeps it), "expired" with null when the latest
   message is ``awaiting_confirmation`` and the runtime holds no live one
   (never set, past its expiry: reaped, after a new ``create_app()``).
-  ``context``: ``message_count`` (all messages, not the page), the STORED
-  platform ``max_context_messages`` and ``truncated`` on both sides of it.
+  GH-190 (Decision 13): the interim ``context`` (``message_count``,
+  ``max_context_messages``, ``truncated``) is gone, ``context_usage {used, max,
+  percent}`` replaces it (its values: tests/test_chat_detail_context_api.py), and
+  every message carries ``attachment_ids`` (Decision 12).
   GH-266: a request runs the owner-checked chat lookup (``admino.chats``'s S2) exactly
-  once, the message page is the only statement selecting ``content`` and the latest
-  status is read by a status-only query, for a chat with a tool turn, an empty chat,
-  an earlier page (``confirmation_status`` still the latest message's), a live pending
-  and an expired confirmation; an invalid cursor runs the owner lookup only.
+  once, the message page (S9' / S11') is read once and the latest status by a
+  status-only query; GH-190 (Decision 14) adds the turn setup (T1) and the turn read
+  (T2'') for ``context_usage`` and drops the message count. For a chat with a tool
+  turn, an empty chat, an earlier page (``confirmation_status`` still the latest
+  message's), a live pending and an expired confirmation; an invalid cursor runs the
+  owner lookup only.
 - PATCH: renames (stripped), ``title_source`` "user", ``last_activity_at``
   untouched, idempotent; bad, missing or null titles and extra keys are 422
   without echo, nothing changed.
@@ -125,15 +129,26 @@ _CSRF_REFUSED: Final = {"detail": "Cross-origin request refused"}
 _RATE_LIMITED: Final = {"detail": "Rate limit exceeded"}
 
 _SUMMARY_KEYS: Final = frozenset({"id", "title", "title_source", "created_at", "last_activity_at"})
+# GH-190: ``context_usage`` replaces the interim ``context`` (Decision 13).
 _DETAIL_KEYS: Final = _SUMMARY_KEYS | {
     "messages",
     "next_cursor",
     "pending_confirmation",
     "confirmation_status",
-    "context",
+    "context_usage",
 }
+# GH-190: every message carries its ``attachment_ids`` (Decision 12).
 _MESSAGE_KEYS: Final = frozenset(
-    {"id", "role", "content", "tool_call_id", "tool_calls", "status", "created_at"}
+    {
+        "id",
+        "role",
+        "content",
+        "tool_call_id",
+        "tool_calls",
+        "status",
+        "created_at",
+        "attachment_ids",
+    }
 )
 
 # A statement naming either chat table (the session lookup names neither).
@@ -146,9 +161,12 @@ _OWNER_LOOKUP: Final = re.compile(
 # A SELECT's column list and its table (normalized SQL).
 _SELECT_FROM: Final = re.compile(r"select (.+?) from (chats|chat_messages)\b")
 # What a detail request of a chat it finds runs on the chat tables (GH-266): the owner
-# lookup once, the message page (the only statement selecting ``content``), the count
-# and the status-only read of the latest message.
-_DETAIL_READS: Final = Counter({"owner-lookup": 1, "page": 1, "count": 1, "status": 1})
+# lookup once, the message page and the status-only read of the latest message; GH-190
+# (Decision 14) adds the turn setup (T1) and the turn read (T2'') for ``context_usage``
+# and drops the message count.
+_DETAIL_READS: Final = Counter(
+    {"owner-lookup": 1, "page": 1, "status": 1, "turn-setup": 1, "turn": 1}
+)
 
 _FOREIGN_ORIGIN: Final = "https://evil.example"
 # TestClient sends ``Host: testserver``: an Origin with that host is same-origin.
@@ -331,13 +349,19 @@ def _chat_statements(db: FakeDb, since: int) -> list[str]:
 
 def _statement_kind(sql: str) -> str:
     """A chat-table statement of a detail request (GH-266): ``owner-lookup`` (S2),
-    ``page`` (a chat_messages SELECT of ``content``), ``count`` (``count(*)`` only),
-    ``status`` (``status`` only), else the normalized SQL itself."""
+    ``page`` (a chat_messages SELECT of ``content``; GH-190's S9' / S11' name it
+    ``m.content``), ``count`` (``count(*)`` only), ``status`` (``status`` only),
+    GH-190's ``turn-setup`` (T1, the organizations row joined to the chat) and ``turn``
+    (T2'', the chat with its latest messages), else the normalized SQL itself."""
     if _OWNER_LOOKUP.fullmatch(sql):
         return "owner-lookup"
+    if "from organizations o" in sql and "left join chats c" in sql:
+        return "turn-setup"
+    if "from chats c left join lateral" in sql:
+        return "turn"
     match = _SELECT_FROM.match(sql)
     if match is not None and match.group(2) == "chat_messages":
-        columns = [column.strip() for column in match.group(1).split(",")]
+        columns = [column.strip().removeprefix("m.") for column in match.group(1).split(",")]
         if "content" in columns:
             return "page"
         if columns == ["count(*)"]:
@@ -919,7 +943,7 @@ class TestChatsList:
 
 
 class TestChatsDetail:
-    """The summary, a page of sanitized messages, the confirmation state and context."""
+    """The summary, a page of sanitized messages, the confirmation state and context usage."""
 
     def test_chats_api_detail_returns_the_summary_and_chronological_messages(
         self, world: World, client: TestClient
@@ -1188,36 +1212,41 @@ class TestChatsDetail:
         assert (body["confirmation_status"], body["pending_confirmation"]) == ("expired", None)
 
     @pytest.mark.parametrize(
-        ("count", "truncated"),
-        [pytest.param(3, False, id="at-the-limit"), pytest.param(4, True, id="over-the-limit")],
+        "count",
+        [pytest.param(3, id="at-the-limit"), pytest.param(4, id="over-the-limit")],
     )
-    def test_chats_api_detail_context_reports_truncation_against_the_stored_limit(
-        self, world: World, client: TestClient, count: int, truncated: bool
+    def test_chats_api_detail_reports_context_usage_instead_of_the_interim_context(
+        self, world: World, client: TestClient, count: int
     ) -> None:
-        """The stored platform max_context_messages (3, not the default 20); the count
-        covers every message, not the page of 1."""
+        """GH-190 (Decision 13): the interim ``context`` is gone, ``context_usage``
+        replaces it. With the stored platform max_context_messages 3 (not the default
+        20), the usage of 4 messages is that of the latest 3: a turn loads no more."""
         row = world.db.platform_row()
         assert row is not None
         row["max_context_messages"] = 3
         scoped_settings._platform_cache = None
         caller = world.a["editor"]
         chat = world.db.add_chat(caller.user_id)
+        latest = world.db.add_chat(caller.user_id)
         for number in range(count):
             world.db.add_chat_message(
                 chat, "user" if number % 2 == 0 else "assistant", f"m{number}"
             )
+        for number in range(count - 3, count):
+            world.db.add_chat_message(
+                latest, "user" if number % 2 == 0 else "assistant", f"m{number}"
+            )
 
         response = _detail(client, caller, chat, limit=1)
+        reference = _detail(client, caller, latest, limit=1)
 
         assert response.status_code == 200, response.text
         body = response.json()
         assert len(body["messages"]) == 1
-        assert body["context"] == {
-            "message_count": count,
-            "max_context_messages": 3,
-            "truncated": truncated,
-        }
-        assert body["context"]["truncated"] is truncated
+        assert "context" not in body
+        assert set(body["context_usage"]) == {"used", "max", "percent"}
+        assert reference.status_code == 200, reference.text
+        assert body["context_usage"] == reference.json()["context_usage"]
 
     @pytest.mark.parametrize(
         ("case", "status"),
@@ -1233,9 +1262,10 @@ class TestChatsDetail:
         self, world: World, client: TestClient, case: str, status: str
     ) -> None:
         """GH-266: one owner-checked lookup (S2) per request, not one per read; the
-        page is the only statement selecting ``content``; the latest status is read by a
-        status-only query. ``confirmation_status`` is unchanged (on an earlier page too,
-        it is the latest message's)."""
+        page is read once; the latest status is read by a status-only query. GH-190
+        (Decision 14): then the turn setup and the turn read, and no message count.
+        ``confirmation_status`` is unchanged (on an earlier page too, it is the latest
+        message's)."""
         caller = world.a["editor"]
         params: dict[str, Any] = {}
         if case == "messages":

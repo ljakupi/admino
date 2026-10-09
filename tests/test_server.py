@@ -146,13 +146,19 @@ def _make_config() -> Any:
     It has no ``auth`` attribute at all (GH-149): the server must never read
     ``config.auth`` again, so touching it raises AttributeError. The server
     section carries the real defaults the app reads (GH-156): CORS allows
-    ``public_url`` only, and no proxy is trusted.
+    ``public_url`` only, and no proxy is trusted. GH-190 (contract C11): the chat
+    routes' context budget reads the output cap (``llm.max_response_tokens``) and
+    the ``context`` section, so they carry config.yaml's defaults.
     """
     config = MagicMock()
     del config.auth
     config.limits.max_message_length = 4000
     config.server.public_url = "http://localhost:8000"
     config.server.trusted_proxies = []
+    config.llm.max_response_tokens = 4096
+    config.context.safety_margin_percent = 10
+    config.context.max_attachment_mb_per_turn = 64
+    config.context.max_tool_result_tokens = 8000
     return config
 
 
@@ -2601,6 +2607,8 @@ class TestConfirmationPathInjection:
 
 # GH-176: ChatResponse requires the chat's id.
 _SANITISATION_CHAT_ID = UUID("7c1d2e3f-4a5b-4c6d-8e7f-90a1b2c3d4e5")
+# GH-190 (Decision 4): ChatResponse requires the chat's context usage.
+_SANITISATION_USAGE: dict[str, int] = {"used": 1200, "max": 9000, "percent": 13}
 
 
 class TestChatResponseSanitisation:
@@ -2621,6 +2629,7 @@ class TestChatResponseSanitisation:
         resp = ChatResponse(
             chat_id=_SANITISATION_CHAT_ID,
             session_id="test",
+            context_usage=_SANITISATION_USAGE,
             response="Hello <script>alert(1)</script>",
             tool_calls=[],
         )
@@ -2635,6 +2644,7 @@ class TestChatResponseSanitisation:
         resp = ChatResponse(
             chat_id=_SANITISATION_CHAT_ID,
             session_id="test",
+            context_usage=_SANITISATION_USAGE,
             response="The token is Bearer sk-proj-abcdefghijklmnopqrstuvwxyz123",
             tool_calls=[],
         )
@@ -2648,6 +2658,7 @@ class TestChatResponseSanitisation:
         resp = ChatResponse(
             chat_id=_SANITISATION_CHAT_ID,
             session_id="test",
+            context_usage=_SANITISATION_USAGE,
             response="Hello \u202e dlrow",
             tool_calls=[],
         )

@@ -387,7 +387,8 @@ _SECTION_FIELDS: dict[str, dict[str, tuple[int, int, int]]] = {
         "max_pending_confirmations": (3, 1, 50),
         "confirmation_timeout_s": (300, 10, 3600),
         "max_message_length": (4000, 1, 100000),
-        "max_context_messages": (20, 1, 200),
+        # GH-190 (Decision 8): 0 means no cap; config.yaml's default is 0.
+        "max_context_messages": (0, 0, 200),
     },
     "files": {
         "max_file_size_mb": (50, 1, 500),

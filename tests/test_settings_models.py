@@ -28,7 +28,8 @@ What these tests pin down:
   unknown fields (so ``vllm_base_url``, ``timeout_s`` or a key can never be
   patched) and model names must fully match ``[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}``
   (a trailing newline is refused: the database CHECK would reject it with a 500).
-- ``PlatformLimits`` has exactly the ``LimitsConfig`` fields and bounds.
+- ``PlatformLimits`` has exactly the ``LimitsConfig`` fields and bounds
+  (GH-190: ``max_context_messages`` is 0 to 200, where 0 means no cap).
 - ``UserSettingsResponse``, ``OrgSettingsResponse`` and
   ``PlatformSettingsResponse`` carry exactly their scope's sections (the
   platform one: llm, limits, files, retention, security since GH-160; the org
@@ -92,7 +93,7 @@ _LIMIT_BOUNDS: dict[str, tuple[int, int]] = {
     "max_pending_confirmations": (1, 50),
     "confirmation_timeout_s": (10, 3600),
     "max_message_length": (1, 100_000),
-    "max_context_messages": (1, 200),
+    "max_context_messages": (0, 200),
 }
 _NOT_STRICT_BOOLS: tuple[object, ...] = ("yes", "true", "false", "1", "on", 1, 0, 1.0)
 _GOOD_MODEL_NAMES = (

@@ -14,7 +14,10 @@ which evaluates T2', S8' and the column's CHECK as PostgreSQL does.
 What these tests pin down:
 - Surface: ``ChatTurn`` is a frozen dataclass of exactly ``chat``, ``history``
   and ``attachments``; ``ActiveAttachment`` is a frozen, sealed model of exactly
-  ``id``, ``filename``, ``kind`` and ``page_count`` (an unknown kind refused).
+  ``id``, ``filename``, ``kind``, ``page_count`` and (GH-190, contract C5)
+  ``token_estimate`` and ``derived_bytes``, both None by default (an unknown
+  kind refused). T2'' itself (the estimates, excluded files, the exact form) is
+  tests/test_chats_context.py's.
 - Included: the chat's sent, live, ready files in send order: the files of the
   older message first, whenever they were uploaded (a file uploaded before
   every other one but sent with the later message comes last); within one
@@ -306,10 +309,20 @@ def test_chats_turn_attachments_chat_turn_is_a_frozen_dataclass_of_three_fields(
 def test_chats_turn_attachments_active_attachment_has_exactly_the_slot_fields(
     chats: ModuleType,
 ) -> None:
+    """GH-190 (contract C5): the stored estimate and derived bytes join the slot's
+    fields, None unless given (a NULL column)."""
     cls = chats.ActiveAttachment
     item = cls(id=FIRST, filename="a.pdf", kind="pdf", page_count=None)
 
-    assert set(cls.model_fields) == {"id", "filename", "kind", "page_count"}
+    assert set(cls.model_fields) == {
+        "id",
+        "filename",
+        "kind",
+        "page_count",
+        "token_estimate",
+        "derived_bytes",
+    }
+    assert (item.token_estimate, item.derived_bytes) == (None, None)
     with pytest.raises(pydantic.ValidationError):
         item.filename = "b.pdf"
     with pytest.raises(pydantic.ValidationError):

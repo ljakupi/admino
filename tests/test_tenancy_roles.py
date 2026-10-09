@@ -25,7 +25,10 @@ sends a short text file (raw body, ``X-Attachment-Name``) into a chat of the
 caller's own (a Viewer's too); the attachment reads name an attachment of a
 chat of the caller's own, its file under a per-test attachments root; orgs A
 and B have a storage quota. The Super Admin's requests name org A's Org
-Admin's chat and attachment.
+Admin's chat and attachment. GH-190: the exclusion (``PATCH
+/api/attachments/{attachment_id}`` with ``{"active": false}``) and the list of
+a chat's files (``GET /api/chats/{chat_id}/attachments``) act on an attachment
+and a chat of the caller's own (a Viewer's too).
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -40,7 +43,8 @@ Outputs (the expectations):
 - GH-187: the three attachment rows are gated by their own capability, not
   just by its roles (``file.upload`` and ``chat.send`` have the same roles):
   with ``access.can`` refusing only the row's capability, the Editor's valid
-  request is a 403 that changes nothing.
+  request is a 403 that changes nothing. GH-190's two attachment rows
+  (``chat.send``) are checked the same way.
 
 Completeness: a new non-public ``ROUTES`` row fails
 ``test_tenancy_roles_every_non_public_route_has_a_setup`` until it gets a
@@ -368,6 +372,20 @@ def _own_attachment(suffix: str) -> Callable[[World, Account], _Request]:
     return prepare
 
 
+def _exclude_own_attachment(world: World, caller: Account) -> _Request:
+    """GH-190: exclude (``{"active": false}``) an attachment of a chat of the caller's own."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 190")
+    attachment_id = seed_attachment(world.db, chat_id, filename="rollen-190.txt")
+    return _Request("PATCH", f"/api/attachments/{attachment_id}", json={"active": False})
+
+
+def _list_own_chat_attachments(world: World, caller: Account) -> _Request:
+    """GH-190: the files of a chat of the caller's own (it holds one)."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 190")
+    seed_attachment(world.db, chat_id, filename="rollen-190.txt")
+    return _Request("GET", f"/api/chats/{chat_id}/attachments")
+
+
 def _oauth_disconnect(provider: str) -> Callable[[World, Account], _Request]:
     """Disconnect the caller's own connection (seeded for a member; the Super Admin has none)."""
 
@@ -532,6 +550,10 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     ("POST", "/api/chats/{chat_id}/attachments"): _Setup(_upload_attachment, 201),
     ("GET", "/api/attachments/{attachment_id}"): _Setup(_own_attachment(""), 200),
     ("GET", "/api/attachments/{attachment_id}/content"): _Setup(_own_attachment("/content"), 200),
+    # GH-190: exclude an attachment of the caller's own (200 with its summary); list a
+    # chat's attachments (200).
+    ("PATCH", "/api/attachments/{attachment_id}"): _Setup(_exclude_own_attachment, 200),
+    ("GET", "/api/chats/{chat_id}/attachments"): _Setup(_list_own_chat_attachments, 200),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _Setup(
         _plain("GET", "/api/oauth/google/authorize"), 200
@@ -756,6 +778,9 @@ _ATTACHMENT_ROUTES: Final[tuple[tuple[str, str], ...]] = (
     ("POST", "/api/chats/{chat_id}/attachments"),
     ("GET", "/api/attachments/{attachment_id}"),
     ("GET", "/api/attachments/{attachment_id}/content"),
+    # GH-190
+    ("PATCH", "/api/attachments/{attachment_id}"),
+    ("GET", "/api/chats/{chat_id}/attachments"),
 )
 
 
@@ -786,7 +811,8 @@ class TestAttachmentRouteCapabilities:
         self, world: World, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str]
     ) -> None:
         """With ``can`` refusing only the row's capability (``file.upload`` for the upload,
-        ``chat.send`` for the reads), org A's Editor's valid request is 403 Forbidden and
+        ``chat.send`` for the reads and GH-190's exclusion and list), org A's Editor's valid
+        request (its JSON body and query included) is 403 Forbidden and
         changes nothing (no table, audit row or file). Control: before the refusal, the
         same request succeeds with the route's documented status."""
         spec = next(spec for spec in ROUTES if (spec.method, spec.path) == route)
@@ -798,6 +824,8 @@ class TestAttachmentRouteCapabilities:
         allowed = client.request(
             control.method,
             control.url,
+            params=control.params,
+            json=control.json,
             content=control.content,
             headers={**control.headers, **caller.cookie},
         )
@@ -809,6 +837,8 @@ class TestAttachmentRouteCapabilities:
         response = client.request(
             request.method,
             request.url,
+            params=request.params,
+            json=request.json,
             content=request.content,
             headers={**request.headers, **caller.cookie},
         )

@@ -22,7 +22,7 @@ What these tests pin down (contract §2; GH-266 contract §2):
   are frozen; every ``json.dumps`` in the module passes ``allow_nan=False``
   (GH-266's fail-closed backstop).
 - Tenant isolation (owner-private V1): for every function that takes a chat id
-  (get, rename, trash, append, load history, read the chat detail, count),
+  (get, rename, trash, append, load the turn, read the chat detail, count),
   another org's chat, another user's chat in the same org, a trashed
   chat and an unknown id raise the same ``ChatNotFoundError`` (same type, same
   text, no id or title in it) and change nothing (no INSERT, the whole state
@@ -87,7 +87,8 @@ What these tests pin down (contract §2; GH-266 contract §2):
   text the driver gets is strict JSON. A ``system`` message is a
   ``ValueError`` with nothing written; an empty list runs no statement; a
   failure midway rolls everything back.
-- ``load_recent_history``: the latest ``limit`` messages in chronological order
+- ``load_turn``'s history (GH-190: ``load_recent_history`` is removed, its tests
+  read ``load_turn``): the latest ``limit`` messages in chronological order
   as ``LLMMessage``s equal to what was appended (the tool turn's pairing kept),
   leading orphan ``tool`` messages of the tail dropped.
 - ``read_chat_detail`` (GH-266, replaces ``list_messages`` and
@@ -96,8 +97,10 @@ What these tests pin down (contract §2; GH-266 contract §2):
   beginning; walking returns every message once in order; bad and list cursors
   are ``InvalidCursorError``, and so is a crafted cursor whose seq a BIGINT
   can't hold (2**63, 10**40) or that is negative, refused before any statement
-  binds it (security audit L-1)), the chat's message count and its latest
-  message's status (highest seq; None when empty), the same on every page.
+  binds it (security audit L-1)) and its latest message's status (highest
+  seq; None when empty), the same on every page; GH-190 (Decision 13): no
+  message count (no count statement, no ``message_count`` field), and each
+  message record carries ``attachment_ids`` (tests/test_chats_context.py).
   The owner-checked lookup (S2) runs exactly once and first; a not-found chat
   (with or without a bad cursor) and an invalid cursor run S2 only; the
   status read selects only ``status`` (no statement but the page selects
@@ -197,7 +200,7 @@ _CHAT_ID_FUNCTIONS: Final = (
     "rename_chat",
     "trash_chat",
     "append_messages",
-    "load_recent_history",
+    "load_turn",
     "read_chat_detail",
 )
 _ALL_FUNCTIONS: Final = (
@@ -229,7 +232,7 @@ _SIGNATURES: Final[dict[str, tuple[int, set[str]]]] = {
             "external_content",
         },
     ),
-    "load_recent_history": (3, {"limit"}),
+    "load_turn": (3, {"limit"}),
     "read_chat_detail": (3, {"limit", "cursor"}),
     "append_org_notice": (3, set()),
     "count_org_chats": (2, set()),
@@ -244,7 +247,8 @@ _CHAT_RECORD_FIELDS: Final = {
     "created_at",
     "last_activity_at",
 }
-_CHAT_DETAIL_FIELDS: Final = {"chat", "page", "message_count", "latest_status"}
+# GH-190 (Decision 13): the message count is gone.
+_CHAT_DETAIL_FIELDS: Final = {"chat", "page", "latest_status"}
 _MESSAGE_RECORD_FIELDS: Final = {
     "id",
     "seq",
@@ -255,6 +259,8 @@ _MESSAGE_RECORD_FIELDS: Final = {
     "tool_calls",
     "status",
     "created_at",
+    # GH-190 (Decision 12, contract C5): the message's live attachment ids.
+    "attachment_ids",
 }
 _GARBAGE_CURSORS: Final = (
     "not-a-cursor",
@@ -421,8 +427,8 @@ async def _call_with_chat(
         return await chats.append_messages(
             pool, tenant, chat_id, [LLMMessage(role="user", content="Injected?")]
         )
-    if name == "load_recent_history":
-        return await chats.load_recent_history(pool, tenant, chat_id, limit=10)
+    if name == "load_turn":
+        return await chats.load_turn(pool, tenant, chat_id, limit=10)
     assert name == "read_chat_detail"
     return await chats.read_chat_detail(pool, tenant, chat_id, limit=10, cursor=None)
 
@@ -1738,7 +1744,7 @@ class TestTrashChat:
 
         page = await chats.list_chats(db.pool, alice.tenant, limit=50, cursor=None)
         assert [plain(record.id) for record in page.chats] == [kept]
-        for name in ("get_chat", "read_chat_detail", "load_recent_history"):
+        for name in ("get_chat", "read_chat_detail", "load_turn"):
             with pytest.raises(chats.ChatNotFoundError):
                 await _call_with_chat(chats, db, name, alice.tenant, chat_id)
 
@@ -2244,12 +2250,13 @@ class TestAppendMessages:
 
 
 # ---------------------------------------------------------------------------
-# 9. load_recent_history
+# 9. load_turn's history (GH-190: load_recent_history is removed)
 # ---------------------------------------------------------------------------
 
 
 class TestLoadRecentHistory:
-    """The latest messages as LLMMessages, chronological, no orphan tool results first."""
+    """The latest messages as LLMMessages, chronological, no orphan tool results first
+    (read through ``load_turn``, the only history read left)."""
 
     async def test_chats_history_round_trip_preserves_the_tool_turn(
         self, chats: ModuleType, db: FakeDb
@@ -2263,7 +2270,7 @@ class TestLoadRecentHistory:
         await chats.append_messages(
             db.pool, alice.tenant, chat.id, history, tool_calls=[_record(query="invoice")]
         )
-        loaded = await chats.load_recent_history(db.pool, alice.tenant, chat.id, limit=50)
+        loaded = (await chats.load_turn(db.pool, alice.tenant, chat.id, limit=50)).history
 
         assert all(type(message) is LLMMessage for message in loaded)
         assert loaded == history
@@ -2279,7 +2286,7 @@ class TestLoadRecentHistory:
         history = _seven_message_history()
         _seed_history(db, chat_id, history)
 
-        loaded = await chats.load_recent_history(db.pool, alice.tenant, chat_id, limit=limit)
+        loaded = (await chats.load_turn(db.pool, alice.tenant, chat_id, limit=limit)).history
 
         assert loaded == history[start:]
         assert {message.role for message in loaded} <= {"user", "assistant", "tool"}
@@ -2289,7 +2296,8 @@ class TestLoadRecentHistory:
 # 10. read_chat_detail (GH-266: replaces list_messages and latest_message_status)
 # ---------------------------------------------------------------------------
 
-# The detail statements (contract §2.3): S2's owner check, the page (S9 / S9b), S10, S15.
+# The detail statements (contract §2.3): S2's owner check, the page (S9 / S9b; GH-190:
+# S9' / S11'), S15. GH-190 (Decision 13): no S10 count any more.
 _OWNER_CHECK_PREDICATES: Final = frozenset(
     {"id = $n", "org_id = $n", "owner_user_id = $n", "deleted_at is null"}
 )
@@ -2343,13 +2351,13 @@ def _seed_statuses(db: FakeDb, chat_id: uuid.UUID, statuses: list[str]) -> list[
 
 class TestChatDetail:
     """The caller's chat with one page of its messages (the latest page ascending, the
-    cursor walking back), its message count and its latest message's status."""
+    cursor walking back) and its latest message's status."""
 
-    async def test_chats_detail_returns_the_chat_latest_page_count_and_latest_status(
+    async def test_chats_detail_returns_the_chat_latest_page_and_latest_status(
         self, chats: ModuleType, db: FakeDb
     ) -> None:
         """The chat is the stored row; the page the latest three ascending with a cursor;
-        the count all seven messages; the status the highest seq's."""
+        the status the highest seq's (GH-190: no message count)."""
         alice = _member(db)
         chat_id = db.add_chat(alice.user_id, title="Plans", created_at=_PAST)
         seqs = _seed_statuses(db, chat_id, [*["complete"] * 6, "limit_reached"])
@@ -2361,7 +2369,6 @@ class TestChatDetail:
         _assert_record_is_row(detail.chat, row)
         assert [record.seq for record in detail.page.messages] == seqs[-3:]
         assert isinstance(detail.page.next_cursor, str)
-        assert (detail.message_count, type(detail.message_count)) == (7, int)
         assert detail.latest_status == "limit_reached"
 
     async def test_chats_detail_has_exactly_the_contract_fields_and_is_frozen(
@@ -2374,7 +2381,7 @@ class TestChatDetail:
 
         assert _field_names(detail) == _CHAT_DETAIL_FIELDS
         with pytest.raises((AttributeError, TypeError, ValueError)):
-            detail.message_count = 99
+            detail.latest_status = "error"
 
     async def test_chats_messages_latest_page_is_ascending(
         self, chats: ModuleType, db: FakeDb
@@ -2413,8 +2420,11 @@ class TestChatDetail:
 
         page = detail.page
         assert all(_field_names(record) == _MESSAGE_RECORD_FIELDS for record in page.messages)
+        # GH-190: no file is linked to these messages, so each has attachment_ids [].
+        stored = _MESSAGE_RECORD_FIELDS - {"attachment_ids"}
         expected = [
-            {name: row[name] for name in _MESSAGE_RECORD_FIELDS} for row in db.messages_of(chat_id)
+            {**{name: row[name] for name in stored}, "attachment_ids": []}
+            for row in db.messages_of(chat_id)
         ]
         assert [
             {name: getattr(record, name) for name in _MESSAGE_RECORD_FIELDS}
@@ -2441,11 +2451,11 @@ class TestChatDetail:
         assert all(len(page) == limit for page in pages[:-1])
         assert all(isinstance(cursor, str) and len(cursor) <= 200 for cursor in cursors[:-1])
 
-    async def test_chats_detail_count_and_latest_status_are_the_chats_on_every_page(
+    async def test_chats_detail_latest_status_is_the_chats_on_every_page(
         self, chats: ModuleType, db: FakeDb
     ) -> None:
-        """Walking back with the cursor, every detail carries the chat's count and its
-        latest message's status, never the page's (each earlier page ends otherwise)."""
+        """Walking back with the cursor, every detail carries the chat's latest message's
+        status, never the page's (each earlier page ends otherwise; GH-190: no count)."""
         alice = _member(db)
         chat_id = db.add_chat(alice.user_id)
         _seed_statuses(
@@ -2455,9 +2465,7 @@ class TestChatDetail:
         details = await _walk_details(chats, db, alice.tenant, chat_id, 2)
 
         assert [len(detail.page.messages) for detail in details] == [2, 2, 1]
-        assert [(detail.message_count, detail.latest_status) for detail in details] == [
-            (5, "stopped")
-        ] * 3
+        assert [detail.latest_status for detail in details] == ["stopped"] * 3
 
     @pytest.mark.parametrize("total", [0, 3])
     async def test_chats_messages_beginning_has_no_cursor(
@@ -2537,8 +2545,8 @@ class TestChatDetail:
     async def test_chats_detail_runs_the_owner_check_once_and_first(
         self, chats: ModuleType, db: FakeDb, with_cursor: bool
     ) -> None:
-        """S2 exactly once and before anything else, then the page, the count and the
-        status read, one statement each."""
+        """S2 exactly once and before anything else, then the page and the status read,
+        one statement each (GH-190: no count)."""
         alice = _member(db)
         chat_id = db.add_chat(alice.user_id)
         _seed_history(db, chat_id, _seven_message_history())
@@ -2554,7 +2562,7 @@ class TestChatDetail:
 
         kinds = [_detail_statement(call) for call in db.calls]
         assert kinds[:1] == ["owner"]
-        assert Counter(kinds) == Counter({"owner": 1, "page": 1, "count": 1, "status": 1})
+        assert Counter(kinds) == Counter({"owner": 1, "page": 1, "status": 1})
 
     async def test_chats_detail_reads_the_latest_status_without_the_row(
         self, chats: ModuleType, db: FakeDb
@@ -2608,12 +2616,12 @@ class TestChatDetail:
 
 
 # ---------------------------------------------------------------------------
-# 11. The message count and the latest message status
+# 11. The latest message status (GH-190: no message count)
 # ---------------------------------------------------------------------------
 
 
 class TestCounts:
-    """Per-chat counts and the latest status (by seq, through read_chat_detail)."""
+    """The latest status per chat (by seq, through read_chat_detail)."""
 
     async def test_chats_latest_status_is_the_highest_seq(
         self, chats: ModuleType, db: FakeDb
@@ -2642,7 +2650,7 @@ class TestCounts:
 
         detail = await chats.read_chat_detail(db.pool, alice.tenant, chat_id, limit=10, cursor=None)
 
-        assert (detail.latest_status, detail.message_count) == (None, 0)
+        assert (detail.latest_status, detail.page.messages) == (None, [])
 
 
 # ---------------------------------------------------------------------------
@@ -3131,7 +3139,7 @@ class TestLogs:
             tool_calls=[_record(query=_MARK_CONTENT)],
         )
         await chats.list_chats(pool, tenant, limit=10, cursor=None)
-        await chats.load_recent_history(pool, tenant, chat.id, limit=10)
+        await chats.load_turn(pool, tenant, chat.id, limit=10)
         await chats.read_chat_detail(pool, tenant, chat.id, limit=1, cursor=None)
         await chats.append_org_notice(pool, tenant, _MARK_NOTICE)
         await chats.get_or_create_legacy_chat(pool, tenant, _MARK_SESSION, chat_id=uuid.uuid4())

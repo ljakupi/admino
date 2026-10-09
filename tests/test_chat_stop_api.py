@@ -39,10 +39,11 @@ What is pinned:
 - A stopped streamed turn (C3, C5.3, C5.4): ``{"stopped": true}``; the LLM's
   stream is closed while it is still parked (never released, never timed
   out); exactly one LLM call; frames ``run_started``, the deltas,
-  ``message_saved{stopped}``, ``done``; stored: the user message, then the
-  forwarded text as the assistant message (none without text), the last one
-  with status ``stopped``; the concatenated delta frames equal that message
-  as GET /api/chats/{id} shows it; the stop writes no audit row.
+  ``context_usage`` (GH-190, Decision 4), ``message_saved{stopped}``, ``done``;
+  stored: the user message, then the forwarded text as the assistant message
+  (none without text), the last one with status ``stopped``; the concatenated
+  delta frames equal that message as GET /api/chats/{id} shows it; the stop
+  writes no audit row.
 - C11 (audit core L-1): the stopped reply and its deltas end at the forwarded
   text's last ASCII whitespace (the unfinished last word is dropped, also after
   a disconnect); a stop while the LLM is parked right after a delta ending
@@ -101,6 +102,7 @@ from admino.llm import LLMResponse, LLMStreamDelta
 from admino.models import AgentConfig, LLMMessage, ToolCall, sanitize_display_text
 from admino.server import create_app
 from admino.tools import registry
+from tests.context_frames import fix_instructions, usage_frame
 from tests.credential_keys import GITHUB_FINE_GRAINED, surviving_chunks
 from tests.db_fakes import FakeDb
 from tests.tenancy_world import (
@@ -371,6 +373,13 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     return built
 
 
+@pytest.fixture(autouse=True)
+def _fixed_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GH-190: the instructions count a constant (tests/context_frames.py), so every
+    ``context_usage`` frame is deterministic."""
+    fix_instructions(monkeypatch)
+
+
 @pytest.fixture()
 def tools(monkeypatch: pytest.MonkeyPatch) -> _Tools:
     """An unfrozen registry holding memory.store (allowed, a side effect) and
@@ -533,6 +542,12 @@ def _saved(db: FakeDb, chat_id: uuid.UUID, status: str) -> tuple[str, dict[str, 
         "message_saved",
         {"message_id": str(db.messages_of(chat_id)[-1]["id"]), "status": status},
     )
+
+
+def _usage(db: FakeDb, chat_id: uuid.UUID) -> tuple[str, dict[str, Any]]:
+    """GH-190 (Decision 4): the ``context_usage`` frame right before ``message_saved``: the
+    chat as its next turn starts, read now (tests/context_frames.py)."""
+    return usage_frame(db, chat_id)
 
 
 def _chat_calls(db: FakeDb, since: int) -> list[str]:
@@ -851,6 +866,7 @@ async def test_chat_stop_before_the_first_delta_closes_the_parked_stream(
     ]
     assert _frames(streamed.text) == [
         ("run_started", {"chat_id": str(chat_id)}),
+        _usage(db, chat_id),
         _saved(db, chat_id, "stopped"),
         ("done", {}),
     ]
@@ -889,9 +905,9 @@ async def test_chat_stop_after_deltas_stores_the_forwarded_text_as_the_stopped_r
     frames = _frames(streamed.text)
     names = _names(frames)
     assert names[0] == "run_started"
-    assert names[-2:] == ["message_saved", "done"]
-    assert set(names[1:-2]) == {"delta"}
-    assert frames[-2] == _saved(db, chat_id, "stopped")
+    assert names[-3:] == ["context_usage", "message_saved", "done"]
+    assert set(names[1:-3]) == {"delta"}
+    assert frames[-3:-1] == [_usage(db, chat_id), _saved(db, chat_id, "stopped")]
     assert _delta_text(frames) == "Partial answer and "
     assert detail.status_code == 200, detail.text
     assert detail.json()["messages"][-1]["content"] == _delta_text(frames)
@@ -948,6 +964,7 @@ async def test_chat_stop_inside_a_key_stores_and_streams_no_part_of_it(
         ("delta", {"text": "vault"}),
         ("tool_call", record),
         ("delta", {"text": "Here is the key "}),
+        _usage(db, chat_id),
         _saved(db, chat_id, "stopped"),
         ("done", {}),
     ]
@@ -1004,6 +1021,7 @@ async def test_chat_stop_during_a_tool_dispatch_finishes_and_records_it_and_skip
     assert _frames(streamed.text) == [
         ("run_started", {"chat_id": str(chat_id)}),
         ("tool_call", record),
+        _usage(db, chat_id),
         _saved(db, chat_id, "stopped"),
         ("done", {}),
     ]
@@ -1091,6 +1109,7 @@ async def test_chat_stop_first_exchange_gets_the_fallback_title_without_a_model_
     assert (chat["title"], chat["title_source"]) == (expected, "auto")
     assert _frames(streamed.text) == [
         ("run_started", {"chat_id": str(chat_id)}),
+        _usage(db, chat_id),
         _saved(db, chat_id, "stopped"),
         ("title", {"title": expected}),
         ("done", {}),
@@ -1183,6 +1202,7 @@ async def test_chat_stop_streamed_approval_while_the_follow_up_call_is_parked(
     assert _frames(streamed.text) == [
         ("run_started", {"chat_id": str(chat_id)}),
         ("tool_call", record),
+        _usage(db, chat_id),
         _saved(db, chat_id, "stopped"),
         ("done", {}),
     ]
@@ -1216,8 +1236,8 @@ async def test_chat_stop_streamed_approval_during_the_approved_call_finishes_it_
     assert llm.streams == []
     assert _rows(db, chat_id)[-1] == ("tool", _CREATED, _CREATE.tool_call_id, "stopped")
     frames = _frames(streamed.text)
-    assert _names(frames) == ["run_started", "tool_call", "message_saved", "done"]
-    assert frames[2] == _saved(db, chat_id, "stopped")
+    assert _names(frames) == ["run_started", "tool_call", "context_usage", "message_saved", "done"]
+    assert frames[2:4] == [_usage(db, chat_id), _saved(db, chat_id, "stopped")]
 
 
 # ---------------------------------------------------------------------------

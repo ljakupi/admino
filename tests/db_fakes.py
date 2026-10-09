@@ -1,4 +1,4 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-189).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-190).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
@@ -340,9 +340,10 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   chat_messages) deletes the attachments naming it. ``conn.transaction()``
   snapshots and restores the table.
 - Grants (admino_app, migrations 0027 and 0028): SELECT, INSERT and DELETE; an
-  UPDATE may SET only ``ATTACHMENT_UPDATE_COLUMNS`` (message_id, status,
+  UPDATE may SET only the shipped column grant (``ATTACHMENT_UPDATE_COLUMNS``,
+  GH-190: read from the migrations' GRANTs; through 0029: message_id, status,
   failure_reason, page_count, token_estimate and derived_bytes (0028),
-  updated_at, deleted_at).
+  updated_at, deleted_at; 0030 adds active).
   Naming id, org_id, chat_id, owner_user_id, filename, kind, size_bytes or
   created_at (also in a row-constructor piece) is InsufficientPrivilegeError
   "permission denied for table attachments", raised before the statement runs
@@ -393,9 +394,10 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
     ``used + size > quota`` every upload is refused until a test sets a quota
     (``add_org(org_id, storage_quota_bytes=...)``).
 - The audit action catalog (``audit_events_action_check``, migration 0027): an
-  INSERT INTO audit_events whose action isn't in ``AUDIT_ACTIONS`` (migration
-  0021's catalog plus file.upload) is CheckViolationError, before the foreign
-  key; ``add_audit`` seeds any action.
+  INSERT INTO audit_events whose action isn't in the shipped catalog
+  (``AUDIT_ACTIONS``: migration 0021's catalog plus file.upload; GH-190: 0030's
+  once it ships, see below) is CheckViolationError, before the foreign key;
+  ``add_audit`` seeds any action.
 - The audit metadata rule (``AUDIT_METADATA_CHECK``,
   ``audit_events_metadata_check``; GH-189 contract Amendment A1): every INSERT
   INTO audit_events is checked after the action catalog and before the
@@ -426,6 +428,56 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   ``attachment_row(attachment_id)`` reads a copy back (None when there is
   none) and ``attachments_of(chat_id)`` copies of a chat's rows, trashed ones
   included, by created_at then id.
+
+Context budgeting and attachment exclusion (GH-190, migration 0030; contract C5,
+C6, C7, C10):
+- The schema follows the shipped migrations (``shipped_schema()``: the
+  ``ShippedSchema`` that ``read_shipped_schema`` reads from the migrations next
+  to the imported ``admino.database``, comments removed). Until a migration
+  ships them, the fake is 0029's schema: there is no ``attachments.active`` (a
+  statement on attachments that names ``active`` outside a literal is
+  UndefinedColumnError when it is parsed, before its arguments are encoded and
+  whatever rows exist; ``add_attachment`` stores no ``active`` key and refuses
+  any other value than True), max_context_messages must be 1 to 200, and
+  file.exclude / file.include are refused by ``audit_events_action_check``.
+  Once the migrations directory holds a ``0030_*.sql`` with those statements,
+  it is 0030's schema:
+  - ``attachments.active`` BOOLEAN NOT NULL DEFAULT true, appended after
+    derived_bytes (column order, the "Failing row contains" detail, ``t`` /
+    ``f``); a non-bool is a DataError, NULL a NotNullViolationError; admino_app
+    may UPDATE it once a shipped GRANT says so (``GRANT UPDATE (active) ON
+    attachments TO admino_app``; a later REVOKE takes it back); an INSERT
+    without it (A5, ``add_attachment()``) stores true.
+  - ``platform_settings.max_context_messages``: the BETWEEN bounds of the last
+    CHECK a shipped migration puts on it (0013's 1 to 200, 0030's 0 to 200),
+    seeded and through the reader alike.
+  - The audit action catalog: the IN list of the last
+    ``audit_events_action_check`` a shipped migration adds (``AUDIT_ACTIONS`` is
+    0027's; 0030's adds file.exclude and file.include).
+  - Tests switch the schema with ``monkeypatch.setattr(db_fakes,
+    "shipped_schema", lambda: db_fakes.read_shipped_schema(<a tmp copy of the
+    migrations>))`` (tests/test_fakedb_context_budget.py builds 0029's and
+    0030's that way); the schema is fixed before a test seeds its rows.
+- The SQL forms run on the reader as PostgreSQL answers them, with one new
+  reader feature: ``coalesce($n, col)`` / ``coalesce(col, $n)`` types ``$n`` as
+  the column (A11's ``status = coalesce($4, status) AND active = coalesce($5,
+  active)``: a non-str status or a non-bool flag is a DataError). T2''
+  (``a.token_estimate::text``, ``a.derived_bytes::text`` and the bare boolean
+  ``a.active`` in the correlated ARRAY sub-select: six-element text arrays, NULL
+  as None), A8'' and A12 (``active`` / ``token_estimate`` / ``derived_bytes``
+  selected, the bare ``active`` predicate), A5' / A6' / A10a / A11 / A11' (the
+  R list with ``active`` before created_at; FOR UPDATE recorded; A11' the keyset
+  row comparison ``(created_at, id) > ($6, $7)``), A10b (``SET active = $3``,
+  "UPDATE <n>"), P6 (the attachments self-join, aliases ``a`` and ``o``;
+  ``coalesce(sum(o.token_estimate), 0)`` is an int, 0 over no row: sum(integer)
+  is bigint, which asyncpg returns as an int), P3'' (failed with reason and
+  estimate, "UPDATE 0" unless processing), S9' / S11' (a correlated
+  ``ARRAY(SELECT a.id ... ORDER BY a.created_at, a.id)`` per message row: a list
+  of asyncpg UUIDs, ``[]`` without files). S9' / S11' and P3'' name no
+  ``active``: they run before 0030 too.
+- Helpers: ``add_attachment(..., active=True)`` (``active=False`` seeds an
+  excluded file once 0030 ships); ``attachment_row(id)["active"]`` and
+  ``attachments_of(chat_id)`` read the flag back (no key before 0030).
 
 The login throttle (GH-157):
 - ``throttle`` holds the login_throttle rows of migration 0012 (scope,
@@ -1031,6 +1083,8 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
         # BIGINT like size_bytes (contract §12.4).
         "token_estimate": "int4",
         "derived_bytes": "int8",
+        # GH-190 (migration 0030): ``active`` (BOOLEAN NOT NULL DEFAULT true) comes
+        # after derived_bytes once a shipped migration adds it (``_chat_types``).
     },
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
@@ -1077,9 +1131,9 @@ CHAT_INCLUDED_ATTACHMENTS_CHECK: Final = "chat_messages_included_attachment_ids_
 # users (id, org_id) that ties a chat's owner to the chat's org (the only chats ->
 # users key: it replaced 0024's chats_owner_user_id_fkey).
 CHAT_OWNER_FKEY: Final = "chats_owner_org_fkey"
-# GH-187 (migration 0027): the attachments CHECKs, the composite foreign key to the
-# chat (and its owner and org), and the only columns admino_app may UPDATE (GH-188,
-# migration 0028: plus token_estimate and derived_bytes).
+# GH-187 (migration 0027): the attachments CHECKs and the composite foreign key to
+# the chat (and its owner and org). The columns admino_app may UPDATE are read from
+# the shipped GRANTs (``ATTACHMENT_UPDATE_COLUMNS``, below ``shipped_schema``).
 ATTACHMENT_KINDS: Final = frozenset(
     {"pdf", "docx", "xlsx", "csv", "txt", "md", "png", "jpeg", "webp"}
 )
@@ -1092,24 +1146,18 @@ FAILURE_REASON_RE: Final = re.compile(r"[a-z][a-z0-9_]{0,63}")
 # controls, '/' and '\' (U+2028, U+2029, U+200B and U+00AD are not cntrl there).
 _FILENAME_REFUSED_RE: Final = re.compile(r"[\x00-\x1f\x7f-\x9f/\\]")
 ATTACHMENT_CHAT_FKEY: Final = "attachments_chat_fkey"
-ATTACHMENT_UPDATE_COLUMNS: Final = frozenset(
-    {
-        "message_id",
-        "status",
-        "failure_reason",
-        "page_count",
-        "token_estimate",
-        "derived_bytes",
-        "updated_at",
-        "deleted_at",
-    }
-)
-# The column grants an UPDATE of a chat-family table is limited to (migrations 0025,
-# 0027 and 0028), and the UPDATE statements they apply to (normalized SQL).
-_UPDATE_GRANTS: Final[dict[str, frozenset[str]]] = {
-    "chats": CHAT_UPDATE_COLUMNS,
-    "attachments": ATTACHMENT_UPDATE_COLUMNS,
+# GH-190 (migration 0030): the column 0030 adds, the attachments table with it (column
+# order: ALTER TABLE ... ADD COLUMN appends it after derived_bytes), and the name of
+# the action catalog CHECK 0030 replaces.
+ATTACHMENT_ACTIVE_COLUMN: Final = "active"
+_ATTACHMENT_TYPES_0030: Final[dict[str, str]] = {
+    **_CHAT_TYPES["attachments"],
+    ATTACHMENT_ACTIVE_COLUMN: "bool",
 }
+_ATTACHMENT_COLUMNS_0030: Final = frozenset(_ATTACHMENT_TYPES_0030)
+AUDIT_ACTION_CHECK: Final = "audit_events_action_check"
+# The UPDATE statements a column grant applies to (normalized SQL): chats (migration
+# 0025's CHAT_UPDATE_COLUMNS) and attachments (the shipped GRANTs, ``_update_grant``).
 _GRANTED_UPDATE_RE: Final = re.compile(r"update (?:only )?(?:public\.)?(chats|attachments)\b")
 # The BIGINT columns the fake models: sum() of one is NUMERIC (a Decimal from asyncpg).
 _BIGINT_COLUMNS: Final = frozenset({"size_bytes", "derived_bytes", "seq", "storage_quota_bytes"})
@@ -1174,7 +1222,8 @@ _AUDIT_REWRITE_RE: Final = re.compile(
     r"(?<![\w.])(?:delete from|update|truncate(?: table)?)(?: only)? (?:public\.)?audit_events\b"
 )
 # GH-187: audit_events_action_check as migration 0027 leaves it (0021's catalog plus
-# file.upload).
+# file.upload). GH-190: the fake enforces the catalog of the shipped migrations
+# (``shipped_schema().audit_actions``), which is this one until 0030 ships.
 AUDIT_ACTIONS: Final = frozenset(
     {
         "login.success",
@@ -1261,6 +1310,152 @@ _ADD_METADATA_CHECK_RE: Final = re.compile(
     rf'add constraint (?:"?public"?\.)?"?{AUDIT_METADATA_CHECK}"?\b'
 )
 _SQL_COMMENT_RE: Final = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+# ---------------------------------------------------------------------------
+# GH-190: the schema the shipped migrations leave in place, for what migration
+# 0030 changes (attachments.active and its UPDATE grant, the max_context_messages
+# CHECK, the audit action catalog). Read from the migrations next to the imported
+# ``admino.database``, comments removed, whitespace collapsed, lowercased.
+# ---------------------------------------------------------------------------
+
+_ADD_ACTIVE_RE: Final = re.compile(
+    r'(?<![\w.])alter table (?:if exists )?(?:only )?(?:"?public"?\.)?"?attachments"?'
+    r' add (?:column )?(?:if not exists )?"?active"?(?![\w"])'
+)
+_ATTACHMENT_PRIVILEGE_RE: Final = re.compile(
+    r"(?<![\w.])(?P<verb>grant|revoke) (?P<privileges>[^;]*?) on (?:table )?"
+    r'(?:"?public"?\.)?"?attachments"? (?:to|from) (?P<grantees>[^;]*)'
+)
+_UPDATE_PRIVILEGE_RE: Final = re.compile(r"(?<![\w.])update ?\(([^()]*)\)")
+_CONTEXT_MESSAGES_BETWEEN_RE: Final = re.compile(
+    r"check ?\( ?\(?max_context_messages between (\d+) and (\d+)\)? ?\)"
+)
+_ACTION_CATALOG_RE: Final = re.compile(
+    rf'constraint "?{AUDIT_ACTION_CHECK}"? check ?\( ?\(?action\)? in ?\(([^()]*)\)'
+)
+
+
+@dataclass(frozen=True)
+class ShippedSchema:
+    """What a migrations directory leaves in place for the parts 0030 changes (GH-190).
+
+    ``attachments_active``: a migration adds ``attachments.active`` (``ALTER
+    TABLE attachments ADD COLUMN active ...``; the fake then models it as
+    BOOLEAN NOT NULL DEFAULT true, contract C10). ``attachment_update_columns``:
+    the columns admino_app may UPDATE on attachments (every column-level ``GRANT
+    UPDATE (...) ON attachments TO admino_app``, minus the REVOKEs, in order).
+    ``max_context_messages_bounds``: the BETWEEN bounds of the last CHECK on
+    ``platform_settings.max_context_messages`` (0013's inline one, then any
+    re-added one, e.g. 0030's ``platform_settings_max_context_messages_check``).
+    ``audit_actions``: the IN list of the last ``AUDIT_ACTION_CHECK`` a
+    migration adds (0005's inline one, then each replacement).
+    """
+
+    attachments_active: bool
+    attachment_update_columns: frozenset[str]
+    max_context_messages_bounds: tuple[int, int]
+    audit_actions: frozenset[str]
+
+
+def read_shipped_schema(directory: Path) -> ShippedSchema:
+    """The ``ShippedSchema`` of the migrations in ``directory`` (``NNNN_*.sql``, in name order).
+
+    Tests point it at a tmp copy of the migrations (with or without a 0030
+    file) and monkeypatch ``shipped_schema`` to return the result.
+    """
+    active = False
+    update_columns: set[str] = set()
+    bounds: tuple[int, int] | None = None
+    actions: frozenset[str] | None = None
+    for path in sorted(directory.glob("*.sql")):
+        if re.match(r"\d{4}_", path.name) is None:
+            continue
+        sql = _SQL_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8"))
+        text = re.sub(r"\s+", " ", sql).lower()
+        active = active or _ADD_ACTIVE_RE.search(text) is not None
+        for match in _ATTACHMENT_PRIVILEGE_RE.finditer(text):
+            if "admino_app" not in re.findall(r"\w+", match.group("grantees")):
+                continue
+            columns = {
+                column.strip().strip('"')
+                for listed in _UPDATE_PRIVILEGE_RE.findall(match.group("privileges"))
+                for column in listed.split(",")
+            }
+            if match.group("verb") == "grant":
+                update_columns |= columns
+            else:
+                update_columns -= columns
+        for match in _CONTEXT_MESSAGES_BETWEEN_RE.finditer(text):
+            bounds = (int(match.group(1)), int(match.group(2)))
+        for match in _ACTION_CATALOG_RE.finditer(text):
+            actions = frozenset(re.findall(r"'([^']*)'", match.group(1)))
+    assert bounds is not None, f"no max_context_messages CHECK in {directory}"
+    assert actions is not None, f"no {AUDIT_ACTION_CHECK} in {directory}"
+    return ShippedSchema(
+        attachments_active=active,
+        attachment_update_columns=frozenset(update_columns),
+        max_context_messages_bounds=bounds,
+        audit_actions=actions,
+    )
+
+
+@functools.cache
+def _shipped_schema_of_the_tree() -> ShippedSchema:
+    """``read_shipped_schema`` of the migrations next to the imported ``admino.database``."""
+    from admino import database
+
+    return read_shipped_schema(Path(database.__file__).parent / "migrations")
+
+
+def shipped_schema() -> ShippedSchema:
+    """The schema the fake models for what migration 0030 changes (GH-190).
+
+    The shipped migrations decide: until one adds ``attachments.active`` the
+    column doesn't exist (any statement naming it is UndefinedColumnError,
+    ``add_attachment(active=False)`` too), until one re-adds the
+    max_context_messages CHECK with ``BETWEEN 0 AND 200`` a 0 is refused, and
+    until one adds file.exclude / file.include to the action catalog those
+    actions are refused. Every reader site calls this function at run time, so
+    a test switches the schema with ``monkeypatch.setattr(db_fakes,
+    "shipped_schema", lambda: schema)``.
+    """
+    return _shipped_schema_of_the_tree()
+
+
+# The attachments columns admino_app may UPDATE after every shipped migration (the
+# value when the fake was imported; the reader checks ``shipped_schema()`` itself).
+ATTACHMENT_UPDATE_COLUMNS: Final = shipped_schema().attachment_update_columns
+
+
+def _chat_types(table: str) -> dict[str, str]:
+    """A chat-family table's column types in column order, as the shipped schema has them.
+
+    GH-190: attachments gains ``active`` (bool, after derived_bytes) once a
+    shipped migration adds it.
+    """
+    if table == "attachments" and shipped_schema().attachments_active:
+        return _ATTACHMENT_TYPES_0030
+    return _CHAT_TYPES[table]
+
+
+def _table_columns(table: str) -> frozenset[str]:
+    """The columns of a table the reader models, as the shipped schema has them (GH-190)."""
+    if table == "attachments" and shipped_schema().attachments_active:
+        return _ATTACHMENT_COLUMNS_0030
+    return _COLUMNS[table]
+
+
+def _update_grant(table: str) -> frozenset[str]:
+    """The columns admino_app may SET in an UPDATE of chats (0025) or attachments (GRANTs)."""
+    if table == "chats":
+        return CHAT_UPDATE_COLUMNS
+    return shipped_schema().attachment_update_columns
+
+
+def _limit_bounds() -> dict[str, tuple[int, int]]:
+    """The platform limits' CHECK bounds (0013's), max_context_messages as shipped (GH-190)."""
+    return {**LIMIT_BOUNDS, "max_context_messages": shipped_schema().max_context_messages_bounds}
 
 
 # GH-166: migration 0021's users_timezone_check (the shape; the app checks the zone exists).
@@ -2075,8 +2270,9 @@ class FakeDb:
         created_at: datetime | None = None,
         updated_at: datetime | None = None,
         deleted_at: datetime | None = None,
+        active: Any = True,
     ) -> uuid.UUID:
-        """Store an attachments row (GH-187) as migrations 0027 and 0028 allow it; return its id.
+        """Store an attachments row (GH-187) as the shipped migrations allow it; return its id.
 
         ``org_id`` and ``owner_user_id`` are the chat's (a chat that doesn't
         exist is a ForeignKeyViolationError on ``ATTACHMENT_CHAT_FKEY``).
@@ -2085,6 +2281,12 @@ class FakeDb:
         (DataError, CharacterNotInRepertoireError, NotNull, the CHECKs, the
         primary key, the foreign keys: ``message_id`` must name a stored
         chat_messages row). Returns a plain uuid.UUID.
+
+        GH-190: ``active`` (default True, the column's default) is stored once a
+        shipped migration adds the column (a non-bool: DataError, None:
+        NotNullViolationError); before that the row has no ``active`` key and
+        any other value than True is UndefinedColumnError, as an INSERT naming
+        the column would be.
         """
         chat = (
             self.chats.get(uuid.UUID(int=chat_id.int)) if isinstance(chat_id, uuid.UUID) else None
@@ -2118,6 +2320,8 @@ class FakeDb:
             "token_estimate": token_estimate,
             "derived_bytes": derived_bytes,
         }
+        if active is not True or shipped_schema().attachments_active:
+            given[ATTACHMENT_ACTIVE_COLUMN] = active
         row = self.build_chat_row("attachments", given, now)
         self.store_chat_row("attachments", row)
         return uuid.UUID(int=row["id"].int)
@@ -2318,6 +2522,7 @@ class FakeDb:
         if _CHAT_TABLE_RE.search(_masked_literals(n)):
             # GH-176: every statement naming chats or chat_messages runs on the reader,
             # after the checks asyncpg and PostgreSQL make before it runs.
+            _refuse_missing_active(n)
             _check_chat_binds(n, args)
             return self._run_statement(method, n, args)
         if method == "fetch" and _LAST_ADMIN_GUARD_RE.fullmatch(n):
@@ -2557,7 +2762,8 @@ class FakeDb:
                 for column in MODEL_COLUMNS
             )
             rules.extend(
-                (column, low <= row[column] <= high) for column, (low, high) in LIMIT_BOUNDS.items()
+                (column, low <= row[column] <= high)
+                for column, (low, high) in _limit_bounds().items()
             )
             rules.extend(
                 (column, low <= row[column] <= high)
@@ -2781,7 +2987,7 @@ class FakeDb:
                 column="seq",
             )
         stored = self.normalized(table, given)
-        row: dict[str, Any] = dict.fromkeys(_CHAT_TYPES[table])
+        row: dict[str, Any] = dict.fromkeys(_chat_types(table))
         if table == "chats":
             row.update(
                 id=uuid.uuid4(),
@@ -2794,6 +3000,9 @@ class FakeDb:
         elif table == "attachments":
             # GH-187 (migration 0027): no id default (the app names the file with it).
             row.update(status="uploaded", created_at=now, updated_at=now)
+            if ATTACHMENT_ACTIVE_COLUMN in row:
+                # GH-190 (migration 0030): BOOLEAN NOT NULL DEFAULT true.
+                row[ATTACHMENT_ACTIVE_COLUMN] = True
         else:
             self.chat_seq += 1
             row.update(id=uuid.uuid4(), seq=self.chat_seq, status="complete", created_at=now)
@@ -2852,7 +3061,7 @@ class FakeDb:
             and row.get("external_content") is False
         ):
             raise asyncpg.exceptions.CheckViolationError(CHAT_EXTERNAL_CONTENT_RESET)
-        for column in _CHAT_TYPES[table]:
+        for column in _chat_types(table):
             if row.get(column) is None and column not in _CHAT_NULLABLE[table]:
                 raise _pg_error(
                     asyncpg.exceptions.NotNullViolationError,
@@ -3375,8 +3584,9 @@ class FakeDb:
         row["ip"] = None if row["ip"] is None else str(row["ip"])
         if self.fail_audit_when is not None and self.fail_audit_when(row):
             raise AuditWriteError("the audit write was refused")
-        if row.get("action") not in AUDIT_ACTIONS:
-            # GH-187: audit_events_action_check (migration 0027), before the foreign key.
+        if row.get("action") not in shipped_schema().audit_actions:
+            # GH-187: audit_events_action_check (migration 0027; GH-190: the shipped
+            # catalog, 0030's once it ships), before the foreign key.
             raise _audit_check_violation("audit_events_action_check", row)
         if not _audit_metadata_valid(metadata_text, amended=audit_metadata_check_amended()):
             # GH-189: audit_events_metadata_check (0005, or as a later migration
@@ -4371,7 +4581,7 @@ def _failing_row(table: str, row: dict[str, Any]) -> str:
     """PostgreSQL's "Failing row contains (...)" detail: every column, each value
     cut to 64 bytes. Like the real driver's, it carries the row's content."""
     fields = []
-    for column in _CHAT_TYPES[table]:
+    for column in _chat_types(table):
         text = _pg_text(row.get(column))
         encoded = text.encode("utf-8", "replace")
         if len(encoded) > _FAILING_ROW_FIELD_MAX:
@@ -4524,7 +4734,7 @@ def _chat_stored(table: str, values: dict[str, Any]) -> dict[str, Any]:
     First asyncpg's encoders for every value (DataError), then the server's
     input functions: TEXT refuses U+0000, JSONB parses (see ``_jsonb_text``).
     """
-    types = _CHAT_TYPES[table]
+    types = _chat_types(table)
     stored: dict[str, Any] = {}
     for column, value in values.items():
         if column not in types:
@@ -4579,9 +4789,9 @@ def _chat_param_types(n: str) -> dict[int, str]:
     """
     masked = _masked_literals(n)
     columns: dict[str, str] = {}
-    for table, types in _CHAT_TYPES.items():
+    for table in _CHAT_TYPES:
         if re.search(rf"\b{table}\b", masked):
-            columns.update(types)
+            columns.update(_chat_types(table))
     found: dict[int, str] = {}
 
     def note(
@@ -4609,10 +4819,18 @@ def _chat_param_types(n: str) -> dict[int, str]:
                 column = re.fullmatch(r"(?:\w+\.)?(\w+)", column_text)
                 if param is not None and column is not None:
                     note(param.group(1), column.group(1))
+    # GH-190 (A11): ``coalesce($n, col)`` / ``coalesce(col, $n)`` types $n as the
+    # column (coalesce's arguments resolve to one common type, the column's).
+    for match in re.finditer(
+        r"(?<![\w.])coalesce ?\( ?\$(\d+)(?: ?:: ?\w+)? ?, ?(?:\w+\.)?(\w+) ?\)", masked
+    ):
+        note(match.group(1), match.group(2))
+    for match in re.finditer(r"(?<![\w.])coalesce ?\( ?(?:\w+\.)?(\w+) ?, ?\$(\d+) ?\)", masked):
+        note(match.group(2), match.group(1))
     if limit := re.search(r"\blimit \$(\d+)", masked):
         found.setdefault(int(limit.group(1)), "int")
     if head := re.match(r"insert into (\w+) ?\(([^)]*)\)", masked):
-        table_types = _CHAT_TYPES.get(head.group(1), {})
+        table_types = _chat_types(head.group(1)) if head.group(1) in _CHAT_TYPES else {}
         targets = [column.strip().strip('"') for column in head.group(2).split(",")]
         clauses = _clauses(n, ("insert into", "values", "select", "on conflict", "returning"))
         exprs: list[str] = []
@@ -4625,6 +4843,22 @@ def _chat_param_types(n: str) -> dict[int, str]:
             if param is not None and column in table_types:
                 found.setdefault(int(param.group(1)), table_types[column])
     return found
+
+
+def _refuse_missing_active(n: str) -> None:
+    """GH-190: before a shipped migration adds ``attachments.active``, a statement on
+    attachments that names ``active`` (outside literals) is UndefinedColumnError.
+
+    PostgreSQL refuses it when the statement is parsed, before any argument is
+    encoded and whatever rows the tables hold (the reader alone would only fail
+    once it evaluates the column, so an empty table would answer).
+    """
+    if shipped_schema().attachments_active:
+        return
+    masked = _masked_literals(n)
+    if re.search(r"\battachments\b", masked) and re.search(r"\bactive\b", masked):
+        msg = f'column "{ATTACHMENT_ACTIVE_COLUMN}" does not exist'
+        raise _pg_error(asyncpg.exceptions.UndefinedColumnError, msg, table="attachments")
 
 
 def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
@@ -4689,7 +4923,7 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
                 target = re.match(r"(?:\w+\.)?(\w+) ?=", piece)
                 columns = [target.group(1)] if target is not None else []
             for column in columns:
-                if column in _CHAT_TYPES[table] and column not in _UPDATE_GRANTS[table]:
+                if column in _chat_types(table) and column not in _update_grant(table):
                     msg = f"permission denied for table {table}"
                     raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
 
@@ -4984,7 +5218,7 @@ class _Statement:
 
     def columns_of(self, table: str) -> frozenset[str]:
         """The columns of a modelled table, or of a sub-select in FROM (GH-244)."""
-        return self.derived[table] if table in self.derived else _COLUMNS[table]
+        return self.derived[table] if table in self.derived else _table_columns(table)
 
     def subquery(self, query: str, ctx: _Context) -> list[dict[str, Any]]:
         """The rows of a sub-select run for the enclosing row context ``ctx``.
@@ -5390,7 +5624,7 @@ class _Statement:
         if len(set(columns)) != len(columns):
             msg = "a column is specified more than once"
             raise asyncpg.exceptions.DuplicateColumnError(msg)
-        unknown = set(columns) - _COLUMNS[table]
+        unknown = set(columns) - _table_columns(table)
         if unknown:
             msg = f'column "{sorted(unknown)[0]}" of relation "{table}" does not exist'
             raise asyncpg.exceptions.UndefinedColumnError(msg)
@@ -5536,7 +5770,7 @@ class _Statement:
         for piece in _top_split(clauses["set"], ","):
             match = re.fullmatch(r"(?:\w+\.)?(\w+) ?= ?(.+)", piece)
             assert match is not None, f"the fake can't read SET {piece}"
-            if match.group(1) not in _COLUMNS[table]:
+            if match.group(1) not in _table_columns(table):
                 msg = f'column "{match.group(1)}" of relation "{table}" does not exist'
                 raise asyncpg.exceptions.UndefinedColumnError(msg)
             assignments.append(match.groups())

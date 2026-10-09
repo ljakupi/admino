@@ -19,7 +19,8 @@ What is pinned here (``admino.models``):
 - ``AttachmentContent``: ``id``, ``filename`` (1 to 255), ``kind`` (the nine
   ``AttachmentKind`` values), ``page_count`` (``None`` or >= 0) and ``parts`` (a tuple
   of content parts), frozen and ``extra="forbid"``; ``has_images`` is true when a part
-  is an ``ImageContent``.
+  is an ``ImageContent``. GH-190 adds ``token_estimate`` (default 0, pinned in
+  tests/test_context_models.py).
 - ``AgentConfig.image_input`` defaults to ``True`` and accepts ``False``.
 
 The new names are looked up at test time, so this file collects before GH-189 and
@@ -413,6 +414,7 @@ class TestAttachmentContent:
             "kind",
             "page_count",
             "parts",
+            "token_estimate",
         }
 
     def test_multimodal_models_attachment_content_parses_parts_into_a_tuple_in_order(

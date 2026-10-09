@@ -13,8 +13,9 @@ and ``admino.audit_events`` run; ``server._processing`` is replaced (after
 
 What these tests pin down:
 - Upload success, for each of the nine kinds: 201 with exactly an
-  ``AttachmentSummary`` (status ``uploaded``, ``token_estimate`` null (GH-188), the
-  kind detected from the bytes,
+  ``AttachmentSummary`` (status ``uploaded``, ``token_estimate`` null (GH-188),
+  ``active`` true and ``context_report`` null (GH-190), the kind detected from the
+  bytes,
   never from the lying ``Content-Type`` sent, the sanitized filename: path
   traversal, NFD, zero-width, CR/LF and bidi overrides in the header), the row
   of the caller's org and owner, the file at ``<root>/<org_id>/<id>`` (bytes
@@ -51,7 +52,8 @@ What these tests pin down:
   ``/api/attachments/content/get`` (2.0, 30); the routes declare their response
   models.
 - Metadata and download: the owner's live attachment only (GH-188: a ready row
-  answers its ``token_estimate``, a failed one null); another org's, a
+  answers its ``token_estimate``, a failed one null; GH-190: ``active`` true and, for
+  a file not refused for the context, ``context_report`` null); another org's, a
   colleague's (an Org Admin included), a trashed and an unknown attachment, and
   a row whose file is gone (or is a directory, not a regular file: regression
   guard), are one 404 ``attachment_not_found``; a non-UUID id
@@ -200,6 +202,10 @@ _SUMMARY_KEYS: Final = frozenset(
         "failure_reason",
         "page_count",
         "token_estimate",
+        # GH-190: whether the file is in later turns' slot, and the report of a file
+        # refused for the context (null otherwise).
+        "active",
+        "context_report",
         "created_at",
     }
 )
@@ -567,6 +573,8 @@ def _assert_stored_upload(
         "failure_reason": None,
         "page_count": None,
         "token_estimate": None,
+        "active": True,
+        "context_report": None,
     }
     row = env.world.db.attachment_row(attachment_id)
     assert row is not None
@@ -1525,6 +1533,8 @@ class TestAttachmentsRead:
                 "failure_reason": row["failure_reason"],
                 "page_count": row["page_count"],
                 "token_estimate": row["token_estimate"],
+                "active": True,
+                "context_report": None,
                 "created_at": body["created_at"],
             }
             assert _ts(body["created_at"]) == row["created_at"]

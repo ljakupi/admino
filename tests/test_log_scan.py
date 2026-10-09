@@ -562,6 +562,11 @@ def _config() -> MagicMock:
     config.server.trusted_proxies = []
     config.llm.provider = "infomaniak"
     config.llm.active_model_name = "test-model"
+    # GH-190 (contract C11): the chat routes' context budget reads these; config.yaml's defaults.
+    config.llm.max_response_tokens = 4096
+    config.context.safety_margin_percent = 10
+    config.context.max_attachment_mb_per_turn = 64
+    config.context.max_tool_result_tokens = 8000
     return config
 
 

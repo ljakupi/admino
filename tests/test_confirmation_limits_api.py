@@ -508,9 +508,16 @@ def _assert_limited(
     *,
     session_id: str | None = None,
 ) -> None:
-    """The documented 200 of a run whose confirmation was refused (never a 429)."""
+    """The documented 200 of a run whose confirmation was refused (never a 429).
+
+    GH-190 (Decisions 3 and 4): the body also carries ``context_notice`` (None: the
+    run dropped no turn) and ``context_usage`` (its three counts; their values are
+    tests/test_chat_context_budget_api.py's).
+    """
     assert response.status_code == 200, response.text
-    assert response.json() == {
+    body = response.json()
+    usage = body.pop("context_usage", None)
+    assert body == {
         "chat_id": str(chat_id),
         "session_id": session_id,
         "response": _limit_reply(call),
@@ -518,7 +525,9 @@ def _assert_limited(
         "status": "error",
         "pending_confirmation": None,
         "error_code": "rate_limit",
+        "context_notice": None,
     }
+    assert (sorted(usage) if isinstance(usage, dict) else usage) == ["max", "percent", "used"]
 
 
 def _limited_once(
@@ -1019,6 +1028,8 @@ def test_confirmation_limits_rate_limit_is_a_chat_response_code_only() -> None:
             "response": "Refused.",
             "status": "error",
             "error_code": "rate_limit",
+            # GH-190 (Decision 4): every ChatResponse carries the chat's context usage.
+            "context_usage": {"used": 2400, "max": 9000, "percent": 26},
         }
     )
 

@@ -43,9 +43,10 @@ What is pinned:
 - Frames per outcome (C5.3): ``run_started {chat_id}`` first and ``done {}``
   last; deltas word by word (``DisplayDeltas``: flushed before every
   ``tool_call`` and at the end of the run); ``tool_call`` = the record's JSON;
-  then ``confirm``, ``message_saved {message_id, status}``, ``error {code,
-  message}``, in that order: final, tool turn, kept confirmation (no delta of
-  the "requires user confirmation" text), GH-24's pending-limit refusal,
+  then ``confirm``, ``context_usage`` (GH-190, Decision 4: the chat as its next
+  turn starts, tests/context_frames.py), ``message_saved {message_id, status}``,
+  ``error {code, message}``, in that order: final, tool turn, kept confirmation (no
+  delta of the "requires user confirmation" text), GH-24's pending-limit refusal,
   coded and uncoded errors, ``residency_blocked``, ``limit_reached`` (one
   delta of the limit reply), ``stopped``, an agent that raised (``internal_error``,
   nothing stored) and a chat trashed during the run (``chat_not_found``,
@@ -82,8 +83,8 @@ What is pinned:
   confirmation, a streamed approval runs and ends, both before the title call
   is released.
 - Confirm with SSE: an approval streams the resumed run (no ``title``); a
-  denial is exactly ``run_started``, the denial ``delta``,
-  ``message_saved{complete}``, ``done``, and is stored like the JSON denial.
+  denial is exactly ``run_started``, the denial ``delta``, ``context_usage``
+  (GH-190), ``message_saved{complete}``, ``done``, and is stored like the JSON denial.
 - Titles (C5.6): an untitled chat's first streamed exchange sends ``title``
   (the stored title) between ``message_saved`` and ``done``; an ``error`` or
   ``stopped`` first exchange the fallback title with no title call; a chat
@@ -130,6 +131,7 @@ from admino.models import (
     sanitize_display_text,
 )
 from tests.conftest import default_test_platform_settings
+from tests.context_frames import fix_instructions, usage_frame
 from tests.credential_keys import (
     GITHUB_FINE_GRAINED,
     anthropic_api03_key,
@@ -551,6 +553,13 @@ def world(monkeypatch: pytest.MonkeyPatch) -> World:
     return built
 
 
+@pytest.fixture(autouse=True)
+def _fixed_instructions(monkeypatch: pytest.MonkeyPatch) -> None:
+    """GH-190: the instructions count a constant (tests/context_frames.py), so every
+    ``context_usage`` frame is deterministic."""
+    fix_instructions(monkeypatch)
+
+
 @pytest.fixture()
 def script() -> _Script:
     return _Script()
@@ -766,6 +775,12 @@ def _saved(db: FakeDb, chat_id: uuid.UUID, status: str) -> Frame:
     """``message_saved`` naming the chat's last stored message (read now) with ``status``."""
     last = db.messages_of(chat_id)[-1]
     return ("message_saved", {"message_id": str(plain(last["id"])), "status": status})
+
+
+def _usage(db: FakeDb, chat_id: uuid.UUID) -> Frame:
+    """GH-190 (Decision 4): the ``context_usage`` frame right before ``message_saved``: the
+    chat as its next turn starts, read now (tests/context_frames.py)."""
+    return usage_frame(db, chat_id)
 
 
 def _error(code: str, message: str) -> Frame:
@@ -1229,6 +1244,7 @@ def test_chat_stream_final_turn_streams_its_text_word_by_word(
         _delta("world. How "),
         _delta("are "),
         _delta("you?"),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]
@@ -1255,6 +1271,7 @@ def test_chat_stream_tool_turn_interleaves_deltas_and_tool_calls(
         _delta("Here "),
         _delta("it "),
         _delta("is."),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]
@@ -1291,6 +1308,7 @@ def test_chat_stream_kept_confirmation_sends_confirm_before_message_saved(
                 "expires_at": _EXPIRES_AT_JSON,
             },
         ),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "awaiting_confirmation"),
         _DONE,
     ]
@@ -1317,6 +1335,7 @@ def test_chat_stream_pending_limit_refusal_sends_error_rate_limit(
     assert frames == [
         _started(chat_id),
         _tool_call(_record(_PENDING_CALL, "confirm", success=False)),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "error"),
         _error("rate_limit", _PENDING_LIMIT_REPLY),
         _DONE,
@@ -1351,6 +1370,7 @@ def test_chat_stream_failed_run_sends_message_saved_then_error(
     assert frames == [
         _started(chat_id),
         *(_delta(step) for step in steps),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "error"),
         _error(code or "internal_error", failure),
         _DONE,
@@ -1375,6 +1395,7 @@ def test_chat_stream_limit_reached_sends_the_limit_reply_as_one_delta(
         _delta("Looking "),
         _tool_call(_record(_CALL_A)),
         _delta(_LIMIT_REPLY),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "limit_reached"),
         _DONE,
     ]
@@ -1395,6 +1416,7 @@ def test_chat_stream_stopped_run_is_saved_as_stopped(
         _started(chat_id),
         _delta("Partial "),
         _delta("answer "),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "stopped"),
         _DONE,
     ]
@@ -1555,6 +1577,7 @@ def test_chat_stream_held_text_is_flushed_before_a_tool_call(
         _tool_call(_record(_CALL_A)),
         _delta("Found "),
         _delta("it."),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]
@@ -1628,6 +1651,7 @@ def test_chat_stream_stopped_run_inside_a_key_streams_and_stores_no_part_of_it(
     assert frames == [
         _started(chat_id),
         _delta(_KEPT),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "stopped"),
         _DONE,
     ]
@@ -1663,7 +1687,11 @@ def test_chat_stream_failed_run_after_a_cut_key_streams_no_part_of_it(
 
     frames = _stream(response)
     if outcome == "error":
-        ending = [_saved(db, chat_id, "error"), _error("provider_unavailable", failure)]
+        ending = [
+            _usage(db, chat_id),
+            _saved(db, chat_id, "error"),
+            _error("provider_unavailable", failure),
+        ]
     elif outcome == "exception":
         ending = [_error("internal_error", "Internal error")]
     else:
@@ -1739,6 +1767,7 @@ def test_chat_stream_stopped_run_sends_the_word_before_a_tool_call_and_cuts_only
         _delta("up"),
         _tool_call(_record(_CALL_A)),
         _delta("Found it and "),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "stopped"),
         _DONE,
     ]
@@ -1776,6 +1805,7 @@ def test_chat_stream_frame_injection_in_deltas_and_tool_arguments_stays_in_its_f
         "delta",
         "tool_call",
         "delta",
+        "context_usage",
         "message_saved",
         "done",
     ]
@@ -1915,6 +1945,7 @@ async def test_chat_stream_approval_sent_during_a_turn_waits_then_streams(
         "delta",
         "tool_call",
         "confirm",
+        "context_usage",
         "message_saved",
         "done",
     ]
@@ -1923,6 +1954,7 @@ async def test_chat_stream_approval_sent_during_a_turn_waits_then_streams(
         _tool_call(_record(_PENDING_CALL, "confirm")),
         _delta("Stored "),
         _delta("it."),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]
@@ -2051,12 +2083,13 @@ async def test_chat_stream_approval_runs_while_the_first_exchanges_title_call_is
         _tool_call(_record(_PENDING_CALL, "confirm")),
         _delta("Stored "),
         _delta("it."),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]
     assert title_still_parked
     assert script.runs[1].arguments["pending_confirmation"].tool_call == _PENDING_CALL
-    assert _names(frames)[-4:] == ["confirm", "message_saved", "title", "done"]
+    assert _names(frames)[-5:] == ["confirm", "context_usage", "message_saved", "title", "done"]
     assert _of(frames, "title") == [{"title": _TITLE}]
 
 
@@ -2069,7 +2102,8 @@ def test_chat_stream_approval_streams_the_resumed_run_without_a_title(
     world: World, client: TestClient, script: _Script
 ) -> None:
     """An approval streams like a turn: ``run_started``, the approved call's
-    ``tool_call``, the reply's deltas, ``message_saved{complete}``, ``done``, and no
+    ``tool_call``, the reply's deltas, ``context_usage`` (GH-190),
+    ``message_saved{complete}``, ``done``, and no
     ``title`` even for an untitled chat."""
     editor = world.a["editor"]
     db = world.db
@@ -2087,6 +2121,7 @@ def test_chat_stream_approval_streams_the_resumed_run_without_a_title(
         _delta("Saved "),
         _delta("your "),
         _delta("plan."),
+        _usage(db, chat_id),
         _saved(db, chat_id, "complete"),
         _DONE,
     ]
@@ -2096,7 +2131,8 @@ def test_chat_stream_denial_streams_exactly_the_denial(
     world: World, client: TestClient, agent: MagicMock, script: _Script
 ) -> None:
     """A streamed denial: exactly ``run_started``, one ``delta`` "Action memory.store was
-    denied.", ``message_saved{complete}`` naming the stored denial, ``done``; no run; the
+    denied.", ``context_usage`` (GH-190), ``message_saved{complete}`` naming the stored
+    denial, ``done``; no run; the
     denial is stored like the JSON denial and the chat shows no confirmation."""
     editor = world.a["editor"]
     chat_id = _chat(world.db, editor)
@@ -2108,6 +2144,7 @@ def test_chat_stream_denial_streams_exactly_the_denial(
     assert frames == [
         _started(chat_id),
         _delta("Action memory.store was denied."),
+        _usage(world.db, chat_id),
         _saved(world.db, chat_id, "complete"),
         _DONE,
     ]

@@ -689,7 +689,8 @@ describe('platformDefaultsStore save validation', () => {
     [
       'an emptied number field (NaN)',
       (d) => (d.limits.max_context_messages = Number.NaN),
-      { 'limits.max_context_messages': ['platform.defaults.error.range', { min: 1, max: 200 }] },
+      // GH-190 (Decision 15): the range is 0 (no cap) to 200.
+      { 'limits.max_context_messages': ['platform.defaults.error.range', { min: 0, max: 200 }] },
     ],
     [
       'audit retention above 84 months',

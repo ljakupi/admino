@@ -33,11 +33,13 @@ What these tests pin down:
   None), ``ChatMessageView`` (id, role user/assistant/tool, content <= 65536
   sanitized exactly like ``ChatResponse.response``, tool_call_id, tool_calls
   as ``ToolCallRecord`` with sanitized args (<= 50), status a MessageStatus,
-  created_at), ``ChatContext`` (message_count >= 0, max_context_messages within
-  the platform limit's 1 to 200, truncated) and ``ChatDetailResponse`` (a
-  ChatSummary plus messages <= 100, next_cursor, pending_confirmation as a
-  ``PendingConfirmationSummary``, confirmation_status none/pending/expired,
-  context). The JSON keys of each response model are exactly the contract's.
+  created_at, and since GH-190 attachment_ids), ``ContextUsage`` (GH-190,
+  replacing the interim ``ChatContext``: used >= 0, max >= 1, percent >= 0 and
+  above 100 allowed) and ``ChatDetailResponse`` (a ChatSummary plus messages
+  <= 100, next_cursor, pending_confirmation as a ``PendingConfirmationSummary``,
+  confirmation_status none/pending/expired, and context_usage, which replaces
+  GH-176's ``context``). The JSON keys of each response model are exactly the
+  contract's.
 - No chat API model has a ``tool_use_blocks`` field or schema entry: the raw
   tool inputs are never exposed.
 
@@ -65,7 +67,6 @@ from admino.models import (
     ChatRequest,
     ChatResponse,
     PendingConfirmationSummary,
-    PlatformLimits,
     ToolCallRecord,
 )
 
@@ -86,16 +87,25 @@ _CHAT_API_MODELS = (
     "ChatSummary",
     "ChatListResponse",
     "ChatMessageView",
-    "ChatContext",
+    "ContextUsage",
     "ChatDetailResponse",
 )
 _SUMMARY_KEYS = frozenset({"id", "title", "title_source", "created_at", "last_activity_at"})
 _MESSAGE_KEYS = frozenset(
-    {"id", "role", "content", "tool_call_id", "tool_calls", "status", "created_at"}
+    {
+        "id",
+        "role",
+        "content",
+        "tool_call_id",
+        "tool_calls",
+        "status",
+        "created_at",
+        "attachment_ids",
+    }
 )
-_CONTEXT_KEYS = frozenset({"message_count", "max_context_messages", "truncated"})
+_USAGE_KEYS = frozenset({"used", "max", "percent"})
 _DETAIL_KEYS = _SUMMARY_KEYS | frozenset(
-    {"messages", "next_cursor", "pending_confirmation", "confirmation_status", "context"}
+    {"messages", "next_cursor", "pending_confirmation", "confirmation_status", "context_usage"}
 )
 
 # Characters built with chr() so they survive editing tools verbatim.
@@ -231,8 +241,8 @@ def _message_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def _context_payload(**overrides: Any) -> dict[str, Any]:
-    payload: dict[str, Any] = {"message_count": 3, "max_context_messages": 40, "truncated": False}
+def _usage_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {"used": 5200, "max": 180_000, "percent": 2}
     payload.update(overrides)
     return payload
 
@@ -254,7 +264,7 @@ def _detail_payload(**overrides: Any) -> dict[str, Any]:
         **_summary_payload(),
         "messages": [_message_payload()],
         "confirmation_status": "none",
-        "context": _context_payload(),
+        "context_usage": _usage_payload(),
     }
     payload.update(overrides)
     return payload
@@ -262,16 +272,16 @@ def _detail_payload(**overrides: Any) -> dict[str, Any]:
 
 def _sanitized_like_chat_response(text: str) -> str:
     """What ChatResponse.response keeps of a text (the live chat's sanitizer)."""
-    response = ChatResponse.model_validate({"chat_id": _UUID, "session_id": "s1", "response": text})
+    response = ChatResponse.model_validate(
+        {
+            "chat_id": _UUID,
+            "session_id": "s1",
+            "response": text,
+            # GH-190: every ChatResponse carries the chat's context usage.
+            "context_usage": _usage_payload(),
+        }
+    )
     return response.response
-
-
-def _platform_context_bounds() -> tuple[int, int]:
-    """PlatformLimits.max_context_messages' (ge, le): the stored platform limit's range."""
-    metadata = PlatformLimits.model_fields["max_context_messages"].metadata
-    low = next(item.ge for item in metadata if hasattr(item, "ge"))
-    high = next(item.le for item in metadata if hasattr(item, "le"))
-    return int(low), int(high)
 
 
 # ---------------------------------------------------------------------------
@@ -707,42 +717,40 @@ class TestChatMessageView:
 
 
 # ---------------------------------------------------------------------------
-# 7. ChatContext
+# 7. ContextUsage (GH-190: replaces the interim ChatContext)
 # ---------------------------------------------------------------------------
 
 
-class TestChatContext:
-    """The interim context field (until #190): how much of the chat the model sees."""
+class TestChatContextUsage:
+    """How full the chat's context is as its next turn starts: {used, max, percent}."""
 
     def test_chat_models_context_json_keys_are_exactly_the_contract(self) -> None:
-        context = _model("ChatContext").model_validate(_context_payload())
+        usage = _model("ContextUsage").model_validate(_usage_payload())
 
-        assert _dumped_keys(context) == _CONTEXT_KEYS
+        assert _dumped_keys(usage) == _USAGE_KEYS
+        assert not hasattr(models_module, "ChatContext")
 
-    def test_chat_models_context_message_count_is_never_negative(self) -> None:
-        model = _model("ChatContext")
+    def test_chat_models_context_usage_used_is_never_negative(self) -> None:
+        model = _model("ContextUsage")
 
-        assert _accepts(model, _context_payload(message_count=0))
-        assert _locs(_rejects(model, _context_payload(message_count=-1))) == [("message_count",)]
+        assert _accepts(model, _usage_payload(used=0))
+        assert _locs(_rejects(model, _usage_payload(used=-1))) == [("used",)]
 
-    def test_chat_models_context_max_messages_is_the_platform_limit_range(self) -> None:
-        """1 to 200, the range of the stored platform limits.max_context_messages."""
-        model = _model("ChatContext")
-        low, high = _platform_context_bounds()
+    def test_chat_models_context_usage_max_is_at_least_one(self) -> None:
+        """max is the budget: never 0, so percent is always defined."""
+        model = _model("ContextUsage")
 
-        assert (low, high) == (1, 200)
-        assert _accepts(model, _context_payload(max_context_messages=low))
-        assert _accepts(model, _context_payload(max_context_messages=high))
-        for value in (low - 1, high + 1):
-            exc = _rejects(model, _context_payload(max_context_messages=value))
-            assert _locs(exc) == [("max_context_messages",)], value
+        assert _accepts(model, _usage_payload(max=1))
+        assert _locs(_rejects(model, _usage_payload(max=0))) == [("max",)]
 
-    def test_chat_models_context_truncated_is_a_bool(self) -> None:
-        context = _model("ChatContext").model_validate(
-            _context_payload(message_count=41, max_context_messages=40, truncated=True)
+    def test_chat_models_context_usage_percent_may_exceed_100(self) -> None:
+        """Above 100 only when the attachments alone don't fit (Decision 4)."""
+        usage = _model("ContextUsage").model_validate(
+            _usage_payload(used=252_000, max=180_000, percent=140)
         )
 
-        assert context.truncated is True  # type: ignore[attr-defined]
+        assert usage.percent == 140  # type: ignore[attr-defined]
+        assert _locs(_rejects(_model("ContextUsage"), _usage_payload(percent=-1))) == [("percent",)]
 
 
 # ---------------------------------------------------------------------------
@@ -811,10 +819,13 @@ class TestChatDetailResponse:
         assert _dumped_keys(summary) == frozenset(PendingConfirmationSummary.model_fields)
         assert "session_id" not in _dumped_keys(summary)
 
-    def test_chat_models_detail_context_is_a_chat_context(self) -> None:
-        detail = _model("ChatDetailResponse").model_validate(_detail_payload())
+    def test_chat_models_detail_context_usage_is_a_context_usage(self) -> None:
+        """GH-190: context_usage replaces GH-176's interim context field."""
+        model = _model("ChatDetailResponse")
+        detail = model.model_validate(_detail_payload())
 
-        assert isinstance(detail.context, _model("ChatContext"))  # type: ignore[attr-defined]
+        assert isinstance(detail.context_usage, _model("ContextUsage"))  # type: ignore[attr-defined]
+        assert "context" not in model.model_fields
 
 
 # ---------------------------------------------------------------------------

@@ -48,9 +48,10 @@ What is pinned (contract section 1):
   migration 0028 adds token_estimate to the UPDATE grant; the cumulative set after
   every shipped migration is pinned in tests/test_migration_0028.py.)
 - ``audit_events_action_check`` is dropped (no CASCADE), then added again with
-  migration 0021's list plus ``file.upload`` (50 actions, each once), equal to the
-  live ``AuditAction`` (the exact sync moved here from tests/test_migration_0021.py,
-  which keeps a subset check).
+  migration 0021's list plus ``file.upload`` (50 actions, each once), every one of them
+  a live ``AuditAction`` (GH-190: migration 0030 adds file.exclude and file.include,
+  so the exact sync moved on to tests/test_migration_0030.py; this file keeps a subset
+  check).
 - Nothing else: every statement is one of the above; no DO block, function,
   trigger, role, data write, REVOKE, TRUNCATE or DROP TABLE (nested ones included).
 - tests/db_fakes.py mirrors 0027: its action catalog, its update grant on 0027's
@@ -944,11 +945,12 @@ class TestMigration0027ActionCatalog:
         assert len(listed) == len(set(listed)) == _ACTION_CATALOG_SIZE
 
     def test_migration_0027_action_check_matches_audit_action(self) -> None:
-        """The live catalog sync (moved here from test_migration_0021.py): the SQL action
-        list equals AuditAction's values exactly."""
+        """Every action 0027 allows is still an AuditAction (none was dropped). GH-190: the
+        exact catalog sync moved on to tests/test_migration_0030.py, whose list adds
+        file.exclude and file.include."""
         from admino.audit_events import AuditAction
 
-        assert set(_added_actions(_MIGRATION_NAME)) == {action.value for action in AuditAction}
+        assert set(_added_actions(_MIGRATION_NAME)) <= {action.value for action in AuditAction}
 
     def test_migration_0027_action_check_is_dropped_then_added(self) -> None:
         """One DROP (without CASCADE), then one ADD, of the constraint on audit_events."""

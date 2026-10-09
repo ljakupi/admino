@@ -14,7 +14,9 @@ What these tests pin down:
 - ``read_content(root, org_id, attachment)`` (synchronous) reads
   ``<root>/<org_id>/<attachment.id>.d`` and returns an ``AttachmentContent`` whose
   ``id``, ``filename``, ``kind`` and ``page_count`` are the ``ActiveAttachment``'s
-  (the row's page count wins over the manifest's) and whose ``parts`` follow the
+  (the row's page count wins over the manifest's), whose ``token_estimate`` is the
+  row's (GH-190, contract C2/C5: the manifest's never replaces it; NULL is 0) and
+  whose ``parts`` follow the
   manifest's order, not the part files' numbering: a text part is
   ``TextContent(text)``; an image part is ``TextContent(label)`` (only when the label
   isn't None) then ``ImageContent(media_type, <standard base64 of the exact bytes>)``;
@@ -286,9 +288,15 @@ def _active(
     filename: str = "report.pdf",
     page_count: int | None = None,
     attachment_id: uuid.UUID | None = None,
+    **stored: Any,
 ) -> Any:
+    """An ActiveAttachment; ``stored`` passes GH-190's token_estimate / derived_bytes."""
     return m.active(
-        id=attachment_id or uuid.uuid4(), filename=filename, kind=kind, page_count=page_count
+        id=attachment_id or uuid.uuid4(),
+        filename=filename,
+        kind=kind,
+        page_count=page_count,
+        **stored,
     )
 
 
@@ -500,6 +508,33 @@ class TestReadContent:
             "pdf",
             4,
         )
+
+    @pytest.mark.parametrize(
+        ("stored", "expected"),
+        [(4195, 4195), (0, 0), (None, 0)],
+        ids=["estimate", "zero", "null"],
+    )
+    def test_attachment_context_token_estimate_is_the_rows_null_as_zero(
+        self,
+        ac: ModuleType,
+        m: _Names,
+        root: Path,
+        org_dir: Path,
+        stored: int | None,
+        expected: int,
+    ) -> None:
+        """GH-190 (contract C2/C5): the content carries the row's stored estimate (the
+        manifest's, 3 here, never replaces it); a NULL estimate is 0."""
+        attachment = _active(
+            m, kind="pdf", page_count=3, token_estimate=stored, derived_bytes=stored
+        )
+        manifest, files = _baseline()
+        _write_derived(org_dir, attachment.id, manifest, files)
+
+        content = ac.read_content(root, ORG_ID, attachment)
+
+        assert (content.token_estimate, type(content.token_estimate)) == (expected, int)
+        assert manifest["token_estimate"] == 3
 
 
 # ---------------------------------------------------------------------------

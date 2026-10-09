@@ -15,7 +15,8 @@
  *   (`[a-zA-Z0-9][a-zA-Z0-9_.:/-]{0,199}`, full match, strings only);
  * - `DEFAULTS_BOUNDS`: every numeric default's bounds, exactly the backend's
  *   (`src/admino/models.py`: `SettingsPatchLLM`, `Platform*Patch`, the audit
- *   retention and session bounds);
+ *   retention and session bounds); GH-190 (Decision 15, contract C13):
+ *   `limits.max_context_messages` is 0 (no cap) to 200, so the form accepts 0;
  * - `draftFrom`: a deep copy of exactly the editable fields (never the counts,
  *   the key flags or the available model lists);
  * - `validateDraft`: a range error for every numeric field that isn't an
@@ -210,7 +211,8 @@ const BOUNDS: Array<[string, number, number]> = [
   ['limits.max_pending_confirmations', 1, 50],
   ['limits.confirmation_timeout_s', 10, 3600],
   ['limits.max_message_length', 1, 100000],
-  ['limits.max_context_messages', 1, 200],
+  // GH-190 (Decision 15): 0 means no cap (the token budget alone decides).
+  ['limits.max_context_messages', 0, 200],
   ['files.max_file_size_mb', 1, 500],
   ['files.max_files_per_message', 1, 50],
   ['files.max_pages_per_file', 1, 1000],
@@ -455,9 +457,30 @@ describe('validateDraft', () => {
   });
 
   it.each(
-    wrap(['20', null, undefined, true]).map(([value]): [string, unknown] => ['limits.max_context_messages', value]),
+    // GH-190: with 0 in range, values that coerce to 0 (null, false, '', '0') stay errors.
+    wrap(['20', null, undefined, true, false, '', '0']).map(([value]): [string, unknown] => [
+      'limits.max_context_messages',
+      value,
+    ]),
   )('%s set to the non-number %j is the range error', (path, value) => {
-    expect(validateDraft(draftWith({ [path]: value }), STORED)).toStrictEqual({ [path]: rangeError(1, 200) });
+    expect(validateDraft(draftWith({ [path]: value }), STORED)).toStrictEqual({ [path]: rangeError(0, 200) });
+  });
+
+  it('GH-190: limits.max_context_messages 0 (no cap) is valid; -1 and 201 are still the range error', () => {
+    const path = 'limits.max_context_messages';
+    const errorsFor = (value: number): Record<string, string> => validateDraft(draftWith({ [path]: value }), STORED);
+
+    expect({
+      bounds: DEFAULTS_BOUNDS[path],
+      zero: errorsFor(0),
+      minusOne: errorsFor(-1),
+      above: errorsFor(201),
+    }).toStrictEqual({
+      bounds: { min: 0, max: 200 },
+      zero: {},
+      minusOne: { [path]: rangeError(0, 200) },
+      above: { [path]: rangeError(0, 200) },
+    });
   });
 
   it.each(['infomaniak', 'vllm', 'anthropic', 'openai'])('the provider %s is valid', (provider) => {

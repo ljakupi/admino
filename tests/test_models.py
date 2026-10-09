@@ -12,6 +12,10 @@ Covers every model in models.py:
 - GH-160: AgentConfig's bounds widen so every stored platform limit fits
   (max_tool_calls 1-100, confirmation_timeout_s 1.0-3600.0; max_context_messages
   unchanged at 1-200)
+- GH-190: ChatResponse requires ``context_usage`` (its JSON gains
+  ``context_usage`` and ``context_notice``), and AgentConfig.max_context_messages
+  accepts 0 (no cap): 0 to 200. The other new context fields are pinned in
+  tests/test_context_models.py.
 - GH-176: ChatResponse gains a required ``chat_id`` (UUID) and its ``session_id``
   becomes optional (None; the pattern and the credential validator still apply
   when set). ConfirmRequest takes ``chat_id`` (UUID) or the legacy
@@ -56,6 +60,8 @@ _NOW: datetime = datetime.now(UTC)
 _EXPIRES: datetime = _NOW + timedelta(days=1)
 # GH-176: every ChatResponse names its persisted chat.
 _CHAT_ID = uuid.UUID("3d9f6a52-8c1e-4b7a-9e20-5f4c3b2a1d0e")
+# GH-190: every ChatResponse carries the chat's context usage.
+_USAGE: dict[str, int] = {"used": 5200, "max": 180_000, "percent": 2}
 
 
 def _error_types(exc: ValidationError) -> list[tuple[tuple[int | str, ...], str]]:
@@ -210,60 +216,78 @@ class TestChatResponse:
     """Tests for the ChatResponse API model."""
 
     def test_valid_construction(self) -> None:
-        resp = ChatResponse(chat_id=_CHAT_ID, session_id="s1", response="ok")
+        resp = ChatResponse(chat_id=_CHAT_ID, context_usage=_USAGE, session_id="s1", response="ok")
         assert resp.session_id == "s1"
         assert resp.response == "ok"
         assert resp.tool_calls == []
 
     def test_with_tool_calls(self) -> None:
         rec = ToolCallRecord(tool="gmail", action="read", permission="allow", success=True)
-        resp = ChatResponse(chat_id=_CHAT_ID, session_id="s1", response="done", tool_calls=[rec])
+        resp = ChatResponse(
+            chat_id=_CHAT_ID,
+            context_usage=_USAGE,
+            session_id="s1",
+            response="done",
+            tool_calls=[rec],
+        )
         assert len(resp.tool_calls) == 1
         assert resp.tool_calls[0].tool == "gmail"
 
     def test_response_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
-            ChatResponse(chat_id=_CHAT_ID, session_id="s1", response="x" * 65537)
+            ChatResponse(
+                chat_id=_CHAT_ID, context_usage=_USAGE, session_id="s1", response="x" * 65537
+            )
 
     def test_session_id_empty_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            ChatResponse(chat_id=_CHAT_ID, session_id="", response="ok")
+            ChatResponse(chat_id=_CHAT_ID, context_usage=_USAGE, session_id="", response="ok")
 
     def test_session_id_max_length_exceeded(self) -> None:
         with pytest.raises(ValidationError):
-            ChatResponse(chat_id=_CHAT_ID, session_id="s" * 65, response="ok")
+            ChatResponse(chat_id=_CHAT_ID, context_usage=_USAGE, session_id="s" * 65, response="ok")
 
     def test_session_id_rejects_special_chars(self) -> None:
         """session_id with spaces is rejected by pattern constraint."""
         with pytest.raises(ValidationError):
-            ChatResponse(chat_id=_CHAT_ID, session_id="has space", response="ok")
+            ChatResponse(
+                chat_id=_CHAT_ID, context_usage=_USAGE, session_id="has space", response="ok"
+            )
 
     def test_session_id_rejects_newline(self) -> None:
         """session_id with embedded newline is rejected by pattern constraint."""
         with pytest.raises(ValidationError):
-            ChatResponse(chat_id=_CHAT_ID, session_id="inj\nected", response="ok")
+            ChatResponse(
+                chat_id=_CHAT_ID, context_usage=_USAGE, session_id="inj\nected", response="ok"
+            )
 
     def test_session_id_accepts_valid(self) -> None:
         """session_id with alphanumeric, hyphens, underscores is accepted."""
-        resp = ChatResponse(chat_id=_CHAT_ID, session_id="abc-123_def", response="ok")
+        resp = ChatResponse(
+            chat_id=_CHAT_ID, context_usage=_USAGE, session_id="abc-123_def", response="ok"
+        )
         assert resp.session_id == "abc-123_def"
 
     def test_session_id_credential_redacted(self) -> None:
         """session_id containing a GitHub token pattern should have it redacted."""
         token = "ghp_" + "A" * 36
-        resp = ChatResponse(chat_id=_CHAT_ID, session_id=token, response="ok")
+        resp = ChatResponse(chat_id=_CHAT_ID, context_usage=_USAGE, session_id=token, response="ok")
         assert "ghp_" not in resp.session_id
         assert "[CREDENTIAL_REDACTED]" in resp.session_id
 
     def test_chat_response_chat_id_is_required(self) -> None:
         """GH-176: every reply names its persisted chat."""
         with pytest.raises(ValidationError) as exc_info:
-            ChatResponse.model_validate({"session_id": "s1", "response": "ok"})
+            ChatResponse.model_validate(
+                {"session_id": "s1", "response": "ok", "context_usage": _USAGE}
+            )
 
         assert [loc for loc, _ in _error_types(exc_info.value)] == [("chat_id",)]
 
     def test_chat_response_chat_id_is_a_uuid(self) -> None:
-        resp = ChatResponse.model_validate({"chat_id": str(_CHAT_ID), "response": "ok"})
+        resp = ChatResponse.model_validate(
+            {"chat_id": str(_CHAT_ID), "context_usage": _USAGE, "response": "ok"}
+        )
 
         assert isinstance(resp.chat_id, uuid.UUID)
         assert resp.chat_id == _CHAT_ID
@@ -272,15 +296,24 @@ class TestChatResponse:
     @pytest.mark.parametrize("chat_id", ["chat-1", "", "3d9f6a52"])
     def test_chat_response_chat_id_refuses_a_non_uuid(self, chat_id: str) -> None:
         with pytest.raises(ValidationError) as exc_info:
-            ChatResponse.model_validate({"chat_id": chat_id, "session_id": "s1", "response": "ok"})
+            ChatResponse.model_validate(
+                {"chat_id": chat_id, "session_id": "s1", "response": "ok", "context_usage": _USAGE}
+            )
 
         assert [loc for loc, _ in _error_types(exc_info.value)] == [("chat_id",)]
 
     def test_chat_response_session_id_is_optional(self) -> None:
         """The chat route leaves session_id unset (None); only the legacy route echoes one."""
-        absent = ChatResponse.model_validate({"chat_id": str(_CHAT_ID), "response": "ok"})
+        absent = ChatResponse.model_validate(
+            {"chat_id": str(_CHAT_ID), "context_usage": _USAGE, "response": "ok"}
+        )
         explicit = ChatResponse.model_validate(
-            {"chat_id": str(_CHAT_ID), "session_id": None, "response": "ok"}
+            {
+                "chat_id": str(_CHAT_ID),
+                "session_id": None,
+                "response": "ok",
+                "context_usage": _USAGE,
+            }
         )
 
         assert absent.session_id is None
@@ -289,7 +322,9 @@ class TestChatResponse:
 
     def test_chat_response_json_keys(self) -> None:
         """chat_id joins the reply; session_id stays in it (null on the chat route)."""
-        resp = ChatResponse.model_validate({"chat_id": str(_CHAT_ID), "response": "ok"})
+        resp = ChatResponse.model_validate(
+            {"chat_id": str(_CHAT_ID), "context_usage": _USAGE, "response": "ok"}
+        )
 
         assert set(json.loads(resp.model_dump_json())) == {
             "chat_id",
@@ -299,6 +334,8 @@ class TestChatResponse:
             "status",
             "pending_confirmation",
             "error_code",
+            "context_usage",
+            "context_notice",
         }
 
 
@@ -563,10 +600,11 @@ class TestAgentConfig:
             AgentConfig(max_tool_calls=val)
 
     def test_max_context_messages_boundaries(self) -> None:
-        assert AgentConfig(max_context_messages=1).max_context_messages == 1
+        """GH-190: 0 means no cap (the budget alone decides)."""
+        assert AgentConfig(max_context_messages=0).max_context_messages == 0
         assert AgentConfig(max_context_messages=200).max_context_messages == 200
 
-    @pytest.mark.parametrize("val", [0, -1, 201, 500])
+    @pytest.mark.parametrize("val", [-1, 201, 500])
     def test_max_context_messages_out_of_range(self, val: int) -> None:
         with pytest.raises(ValidationError):
             AgentConfig(max_context_messages=val)
@@ -737,7 +775,9 @@ class TestJsonRoundTrip:
 
     def test_chat_response(self) -> None:
         rec = ToolCallRecord(tool="t", action="a", permission="allow", success=True)
-        original = ChatResponse(chat_id=_CHAT_ID, session_id="s", response="ok", tool_calls=[rec])
+        original = ChatResponse(
+            chat_id=_CHAT_ID, context_usage=_USAGE, session_id="s", response="ok", tool_calls=[rec]
+        )
         raw = original.model_dump_json()
         restored = ChatResponse.model_validate_json(raw)
         assert restored == original
@@ -862,7 +902,7 @@ _REDACTION_MARKER = "[CREDENTIAL_REDACTED]"
 
 def _chat_response(text: str) -> ChatResponse:
     """A ChatResponse carrying ``text`` as the assistant response."""
-    return ChatResponse(chat_id=_CHAT_ID, session_id="s1", response=text)
+    return ChatResponse(chat_id=_CHAT_ID, context_usage=_USAGE, session_id="s1", response=text)
 
 
 def _record_args(args: dict[str, object]) -> dict[str, object]:

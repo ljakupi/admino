@@ -142,6 +142,9 @@ _RESPONSE_KEYS: Final = frozenset(
         "status",
         "pending_confirmation",
         "error_code",
+        # GH-190 (Decisions 3 and 4): every turn's response carries both.
+        "context_usage",
+        "context_notice",
     }
 )
 

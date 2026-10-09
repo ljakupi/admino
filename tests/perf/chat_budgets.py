@@ -34,7 +34,8 @@ What it does, in order:
    messages (excluded from the results) and ``PERF_SENDS`` measured ones to
    ``POST /api/chats/{chat_id}/messages``, alternating JSON and SSE (each
    stream read to ``done``), all in that one chat (each turn loads the latest
-   ``max_context_messages`` messages). Every send must produce exactly one
+   ``max_context_messages`` messages, the latest 200 when it is 0: GH-190's
+   default, no cap). Every send must produce exactly one
    ``chat timings`` line on the ``admino.request_timing`` logger (GH-244
    contract C1.3), captured by a logging handler and parsed here.
 6. Fills the user's chats up to 500 (owner SQL, varied ``last_activity_at``),
