@@ -620,7 +620,9 @@ routes. Editors, Viewers and the Super Admin get `403`.
   can't belong to any account on the platform yet, in any capitalization. When the address
   changes, admino emails the old address a short notice (without either address), and a
   password reset link the user already got stops working. A new role applies from the
-  user's next request. A Viewer keeps their chats, connections and notes, unused.
+  user's next request: once they're made a Viewer, an approval of theirs still waiting in
+  a chat is refused too (`403`). A Viewer keeps their chats, connections and notes,
+  unused.
 - `POST /api/org/users/{id}/deactivate` ends every session of the user at once (an
   approval of theirs still waiting in a chat is refused too) and emails them that their
   account was deactivated. Their chats, connections, notes and settings are kept.
@@ -875,8 +877,9 @@ Viewer's chats from before a role change stay stored, unused.
   [permissions](permissions.md#per-organization) as they are when the approval runs.
   An approval or a denial that waited behind a reply still running in the chat is refused
   like any later request when, meanwhile, your account was deactivated or deleted or your
-  organization deactivated (`401`), or you were made a Viewer (`403`): nothing runs, and
-  the confirmation stays pending until it expires.
+  organization deactivated (`401`), or you were made a Viewer (`403`). Nothing runs. The
+  confirmation stays pending until it expires, unless your account was deleted: its
+  confirmations and chats go with it.
 - **At most 3 pending confirmations per user.** You can have up to
   `max_pending_confirmations` (a [platform default](#platform-defaults), 3 by default)
   confirmations waiting at once, across your chats. When you're at the limit, a message
@@ -1679,7 +1682,8 @@ log, without names or email addresses.
   included, and the storage used is what the quota counts: the original files plus
   their converted parts. A size and a count, never a file name.
 - `POST /api/platform/orgs/{id}/users/{user_id}/deactivate` ends every session of the user
-  at once and emails them; their chats, connections, notes and settings are kept.
+  at once (an approval of theirs still waiting in a chat is refused too) and emails them;
+  their chats, connections, notes and settings are kept.
   `.../reactivate` needs a free seat and emails the user a link to log in; it's refused
   while the organization's deletion is pending. An organization always keeps at least one
   active Org Admin, for the Super Admin too: deactivating the last one answers `409` with
