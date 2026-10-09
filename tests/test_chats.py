@@ -222,6 +222,7 @@ _SIGNATURES: Final[dict[str, tuple[int, set[str]]]] = {
     "rename_chat": (4, set()),
     "trash_chat": (3, {"ip"}),
     # GH-189 (contract C4): the answers' included attachment ids and the sticky flag.
+    # GH-245 (contract C2): the failed turn a retry replaces.
     "append_messages": (
         4,
         {
@@ -230,9 +231,11 @@ _SIGNATURES: Final[dict[str, tuple[int, set[str]]]] = {
             "attachment_ids",
             "included_attachment_ids",
             "external_content",
+            "replace_through",
         },
     ),
-    "load_turn": (3, {"limit"}),
+    # GH-245 (contract C2): a retry's window ends before the retried message.
+    "load_turn": (3, {"limit", "before_seq"}),
     "read_chat_detail": (3, {"limit", "cursor"}),
     "append_org_notice": (3, set()),
     "count_org_chats": (2, set()),

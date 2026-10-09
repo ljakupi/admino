@@ -72,8 +72,9 @@ Routes:
   first (``limit``, ``cursor``).
 - GET  /api/chats/{chat_id} — The chat's summary, one page of its messages
   (the latest first, ``cursor`` to earlier ones; each with its attachments'
-  ids, GH-190), its confirmation state and ``context_usage`` (GH-190: how full
-  the chat's context is as its next turn starts).
+  ids, GH-190), its confirmation state, ``context_usage`` (GH-190: how full
+  the chat's context is as its next turn starts) and ``retryable`` (GH-245:
+  its latest message ended as ``error`` or ``stopped``).
 - PATCH /api/chats/{chat_id} — Renames the chat.
 - DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
 - POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
@@ -98,6 +99,11 @@ Routes:
   ``context_usage`` and ``context_notice`` (JSON fields, SSE events).
 - POST /api/chats/{chat_id}/stop — Stops the chat's streamed run
   (``{"stopped": bool}``, GH-8).
+- POST /api/chats/{chat_id}/retry — Runs the chat's failed last turn again
+  and replaces it (GH-245): its latest user message, when the latest message
+  ended as ``error`` or ``stopped`` (else the 409 ``not_retryable``); no
+  request body. Answers like a turn (ChatResponse, or the event stream), with
+  a send's refusals, bucket and title rule.
 - POST /api/chats/{chat_id}/attachments — Stores one file (the raw request
   body, its name in ``X-Attachment-Name``) in a chat of the caller (201
   AttachmentSummary, GH-187); audited.
@@ -247,11 +253,11 @@ Security notes:
   the stored automatic title as ``title`` before ``done``. No audit event;
   titles aren't logged.
 - Streamed turns (GH-8, ``admino.event_stream``, ``admino.streaming``): the
-  turn route and the confirm route answer server-sent events when the
-  ``Accept`` header lists ``text/event-stream`` with a ``q`` above 0 (the
-  legacy POST /api/message never does). Every check before the run (401,
-  CSRF 403, 403, 404, 409, 422, 429, 503) is the usual JSON error; the
-  stream starts once the run holds its chat. The run executes in a detached
+  turn route, the retry route (GH-245) and the confirm route answer
+  server-sent events when the ``Accept`` header lists ``text/event-stream``
+  with a ``q`` above 0 (the legacy POST /api/message never does). Every
+  check before the run (401, CSRF 403, 403, 404, 409, 422, 429, 503) is the
+  usual JSON error; the stream starts once the run holds its chat. The run executes in a detached
   task (kept referenced until it ends) that stores the turn, frees the chat,
   and only then sends ``confirm`` / ``message_saved`` / ``error``, the title
   and ``done``; an agent that raised is ``error{internal_error}`` and a chat
@@ -281,8 +287,8 @@ Security notes:
   and waits for them (at most ``_DRAIN_TIMEOUT_S``; the count of runs still
   going is logged) before it stops the background jobs and closes the pool,
   so a run whose client left still audits its tool call and stores its turn.
-- One run per chat (GH-8): a message takes its chat with
-  ``ChatRuntime.hold(wait=False)``: while a run of the chat is going it is
+- One run per chat (GH-8): a message (and a retry, GH-245) takes its chat
+  with ``ChatRuntime.hold(wait=False)``: while a run of the chat is going it is
   the 409 ``{"detail": "A message is already running in this chat.",
   "reason": "run_active"}`` (after the rate limit, the 422 checks and the
   404), with nothing run or stored and the chat's pending confirmation
@@ -297,6 +303,18 @@ Security notes:
   (every tool call still is, as ``tool.call``); at most an INFO line names
   the chat id. No message, delta, title, tool argument or legacy session id
   is ever logged.
+- Retry (GH-245): ``POST /api/chats/{chat_id}/retry`` is a turn: ``chat.send``,
+  the CSRF check, the ``/api/message`` bucket shared with sends, the owner
+  check (the same 404), the chat's hold and a send's refusals, then the
+  chat's failed last turn (``chats.read_retry_target``: its latest message
+  ended ``error`` or ``stopped``, else the 409 ``not_retryable``) runs again
+  with the history before it and no pending confirmation, so every tool call
+  meets the permission engine again. The new turn replaces the failed one in
+  one transaction through migration 0031's owner-run ``delete_failed_turn``:
+  ``chat_messages`` stays append-only for the runtime role, and the failed
+  message's files move to its copy, never deleted. No audit event (a retry
+  is a turn; its tool calls are ``tool.call`` rows); the log line names the
+  chat id only.
 - Attachments (GH-187, ``admino.attachments``, ``admino.attachment_types``):
   the upload needs ``Capability.FILE_UPLOAD`` (Org Admin, Editor; 403 for a
   Viewer or a Super Admin before any database work or bucket), the reads
@@ -1613,6 +1631,11 @@ _USER_CHATS_BUSY_BODY: Final = {
 _RUN_ACTIVE_BODY: Final = {
     "detail": "A message is already running in this chat.",
     "reason": "run_active",
+}
+# GH-245: a retry of a chat whose latest message didn't end as error or stopped.
+_NOT_RETRYABLE_BODY: Final = {
+    "detail": "The last answer can't be retried.",
+    "reason": "not_retryable",
 }
 # GH-187: the documented error bodies of the attachment routes and of a message's files.
 _ATTACHMENT_NOT_FOUND_BODY: Final = {
@@ -4079,7 +4102,11 @@ async def get_chat_detail(
     org's tool policy) and the turn read (``chats.load_turn``: the latest
     messages as a turn loads them, ``max_context_messages`` or 200 without a
     cap, and the active attachments' stored estimates; no derived file is
-    read). Reading changes nothing.
+    read). GH-245 (Decision 6): ``retryable`` is true exactly when the latest
+    status is ``error`` or ``stopped`` (``chats.RETRYABLE_STATUSES``, the rule
+    of POST /api/chats/{chat_id}/retry's 409 ``not_retryable``), whatever page
+    is read; it comes from the latest status already read, no other
+    statement. Reading changes nothing.
 
     Args:
         principal: The logged-in principal (needs ``chat.send``).
@@ -4092,7 +4119,8 @@ async def get_chat_detail(
         ChatDetailResponse: the summary, the page's messages in chronological
         order (sanitized content, tool-call summaries and attachment ids, never
         the raw tool inputs), the cursor of earlier messages, the confirmation
-        state and the context usage (token counts only).
+        state, the context usage (token counts only) and whether the last
+        answer can be retried.
 
     Raises:
         HTTPException: 429 when rate-limited. Another org's, a colleague's,
@@ -4139,6 +4167,7 @@ async def get_chat_detail(
         pending_confirmation=None if pending is None else _summarise_pending(pending),
         confirmation_status=confirmation_status,
         context_usage=usage,
+        retryable=detail.latest_status in chats.RETRYABLE_STATUSES,
     )
 
 
@@ -4249,6 +4278,9 @@ class _HeldRun:
     attachment_ids: tuple[UUID, ...] = ()
     # Slot 4 of the run (GH-189): the chat's active attachments, read under the hold.
     slot: tuple[AttachmentContent, ...] = ()
+    # A retry's failed turn (GH-245): the seq of its last message, which the stored turn
+    # replaces in the same transaction; None (a send, an approval) replaces nothing.
+    replace_through: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -4298,10 +4330,14 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
     messages and the ones stored (the pending-limit closures included,
     ``_chat_usage``), and the run's ``context_notice``.
 
+    GH-245: a retry's run (``run.replace_through``) replaces the chat's failed
+    last turn in the append's transaction (``chats.append_messages``); a
+    refusal there stores nothing and keeps no confirmation either.
+
     Args:
         run: The held run (the pool, the caller's org scope, the chat, the
-            loaded messages, the platform settings read for the request and
-            the run's slot).
+            loaded messages, the platform settings read for the request, the
+            run's slot and, for a retry, the failed turn it replaces).
         result: The run's result.
 
     Returns:
@@ -4361,6 +4397,7 @@ async def _finish_run(run: _HeldRun, result: AgentResult) -> _StoredRun:
             attachment_ids=run.attachment_ids,
             included_attachment_ids=[content.id for content in run.slot],
             external_content=bool(run.slot) or result.external_content,
+            replace_through=run.replace_through,
         )
     except BaseException:
         # Whatever stopped the store (a chat trashed meanwhile, a database error, a
@@ -4696,6 +4733,70 @@ _SEND_CONFLICT_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         },
     }
 }
+# The OpenAPI entry of the retry route (GH-245, Decision 5): every code it answers, each
+# example the body it sends. Documenting a 422 or a 429 replaces FastAPI's generated one,
+# so their descriptions name the app-wide validation list and bucket body too.
+_RETRY_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    **_EVENT_STREAM_RESPONSES,
+    404: {
+        "description": (
+            "chat_not_found: not a live chat of the caller's (unknown, another org's, a "
+            "colleague's or trashed)."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {"chat_not_found": {"value": _CHAT_NOT_FOUND_BODY}},
+            }
+        },
+    },
+    409: {
+        "description": (
+            "run_active: a run of the chat is going; or not_retryable: the chat's latest "
+            "message didn't end as error or stopped (nothing to retry)."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "run_active": {"value": _RUN_ACTIVE_BODY},
+                    "not_retryable": {"value": _NOT_RETRYABLE_BODY},
+                }
+            }
+        },
+    },
+    422: {
+        "description": (
+            "Validation Error (the usual list: a chat id that isn't a UUID); "
+            + _CONTEXT_REFUSALS_DESCRIPTION
+            + " under report: attachments (attachment_id, token_estimate, derived_bytes "
+            "per file), attachment_tokens, available_tokens, attachment_bytes and "
+            "max_bytes; or image_input_unsupported: an attachment of the chat holds an "
+            "image and the current model takes none."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "context_overflow": {"value": _CONTEXT_OVERFLOW_EXAMPLE},
+                    "attachment_bytes_exceeded": {"value": _ATTACHMENT_BYTES_EXAMPLE},
+                    "image_input_unsupported": {"value": _IMAGE_INPUT_UNSUPPORTED_BODY},
+                }
+            }
+        },
+    },
+    429: {
+        "description": (
+            "Rate limit exceeded (no reason): the caller's per-user /api/message bucket, "
+            "shared with sends, is spent; or rate_limit: too many of the caller's chats "
+            "are active."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {"rate_limit": {"value": _USER_CHATS_BUSY_BODY}},
+            }
+        },
+    },
+    # A send's: the same runtime and the same slot refusals.
+    503: _MESSAGE_RESPONSES[503],
+}
 
 
 def _wants_event_stream(request: Request) -> bool:
@@ -4921,6 +5022,101 @@ def _start_stream(
     return EventStreamResponse(frames.relay(), stop=stop)
 
 
+def _first_exchange(chat: chats.ChatRecord, loaded: list[LLMMessage]) -> bool:
+    """Whether a turn is its chat's first exchange, which titles the chat (GH-179).
+
+    Only an untitled chat (as read under the hold: ``title_source`` "auto"
+    and an empty title) whose loaded history holds no ``assistant`` message:
+    a stored reply means it had one (a GH-66 notice is a user message and
+    doesn't count). A send and a retry (GH-245) apply the same rule.
+    """
+    return (
+        chat.title_source == "auto"
+        and chat.title == ""
+        and not any(stored.role == "assistant" for stored in loaded)
+    )
+
+
+async def _run_turn(
+    held: contextlib.AsyncExitStack,
+    agent: Agent,
+    principal: Principal,
+    run: _HeldRun,
+    message: str,
+    *,
+    session_id: str | None,
+    streamed: bool,
+    background_tasks: BackgroundTasks,
+) -> ChatResponse | EventStreamResponse:
+    """Run a user message in its held chat and answer the turn (a send or a retry).
+
+    Called under the chat's hold (``held``) once every refusal is behind it.
+    The agent runs ``message`` on the run's loaded history (a dangling
+    ``tool_use`` closed by its synthetic cancelled result) with
+    ``str(chat.id)`` as its session id, the caller's principal, tool policy
+    and prompt context, the stored limits and budget (``_run_config``), the
+    chat's sticky ``external_content`` flag as read under the hold (GH-243)
+    and, only when the run has one, slot 4 as ``attachments`` (GH-189: a chat
+    without attachments runs exactly as before). It never gets a pending
+    confirmation (only an approval resumes one), so no tool call runs
+    pre-approved: a ``confirm`` action asks for a new approval.
+
+    A streamed run (GH-8) is handed with the hold to a detached task, which
+    stores, reports and titles it (``_start_stream``). A JSON run is stored
+    (``_finish_run``), and a first exchange's title (``_title_call``) is a
+    background task that runs after the response is sent, once the hold is
+    gone.
+
+    Args:
+        held: The chat's hold (a streamed run's task takes it over).
+        agent: The configured agent.
+        principal: The caller (``chat.send`` checked).
+        run: The held run: what the turn is stored against.
+        message: The user message to run.
+        session_id: The legacy session id the JSON answer echoes; None for a
+            chat id's turn.
+        streamed: Answer with the run's event stream instead of the JSON
+            ChatResponse.
+        background_tasks: The request's background tasks (a JSON turn's title).
+
+    Returns:
+        The stored turn's ChatResponse, or the streamed run's EventStreamResponse.
+
+    Raises:
+        HTTPException: 500 when a JSON run's agent fails (nothing stored).
+        chats.ChatNotFoundError: The chat was trashed during a JSON run (404
+            ``chat_not_found``, nothing stored).
+    """
+    chat = run.chat
+    start = functools.partial(
+        agent.run,
+        user_message=message,
+        session_id=str(chat.id),
+        history=_close_dangling_tool_use(run.loaded),
+        principal=principal,
+        tool_policy=run.policy,
+        agent_config=_run_config(run.platform),
+        prompt_context=run.prompt_context,
+        earlier_external_content=chat.external_content,
+    )
+    if run.slot:
+        start = functools.partial(start, attachments=run.slot)
+    if streamed:
+        return _start_stream(held, run, start)
+    try:
+        result = await start()
+    except (MemoryError, RecursionError):
+        raise
+    except Exception:
+        logger.error("Agent run failed for chat %s", safe_log(chat.id))
+        raise HTTPException(status_code=500, detail="Internal error") from None
+    stored = await _finish_run(run, result)
+    title = _title_call(run, result, stored)
+    if title is not None:
+        background_tasks.add_task(title)
+    return _chat_response(chat.id, session_id, result, stored)
+
+
 async def _chat_turn(
     principal: Principal,
     message: str,
@@ -5010,15 +5206,16 @@ async def _chat_turn(
     caller's stored ``max_pending_confirmations``, else refused with
     ``rate_limit``, GH-24).
 
-    A JSON turn runs here and its chat's first exchange (the chat as read
-    under the hold is untitled with ``title_source`` "auto", and the loaded
-    history holds no ``assistant`` message; a GH-66 notice is a user message)
-    is titled after the response is sent (``_title_call``, a background
-    task). A streamed turn (GH-8) runs in a detached task that stores it,
-    frees the chat, reports it and titles a first exchange before ``done``
-    (``_start_stream``). A chat trashed during the run titles nothing. Either
-    way the title call comes after the request's timing line (GH-244) and
-    never counts in it.
+    The run and its answer are ``_run_turn``'s (shared with a retry,
+    GH-245). A JSON turn runs in the request and its chat's first exchange
+    (``_first_exchange``: the chat as read under the hold is untitled with
+    ``title_source`` "auto", and the loaded history holds no ``assistant``
+    message; a GH-66 notice is a user message) is titled after the response
+    is sent (``_title_call``, a background task). A streamed turn (GH-8)
+    runs in a detached task that stores it, frees the chat, reports it and
+    titles a first exchange before ``done`` (``_start_stream``). A chat
+    trashed during the run titles nothing. Either way the title call comes
+    after the request's timing line (GH-244) and never counts in it.
 
     Args:
         principal: The logged-in principal (``chat.send`` checked).
@@ -5140,13 +5337,6 @@ async def _chat_turn(
                 safe_log(chat.id),
             )
         logger.info("Processing message for chat %s", safe_log(chat.id))
-        # Only an untitled chat's first exchange is titled: a stored reply means it had
-        # one (a GH-66 notice is a user message and doesn't count).
-        first_exchange = (
-            chat.title_source == "auto"
-            and chat.title == ""
-            and not any(stored.role == "assistant" for stored in loaded)
-        )
         run = _HeldRun(
             pool=pool,
             tenant=tenant,
@@ -5155,39 +5345,21 @@ async def _chat_turn(
             platform=platform,
             policy=policy,
             prompt_context=prompt_context,
-            title_message=message if first_exchange else None,
+            title_message=message if _first_exchange(chat, loaded) else None,
             attachment_ids=tuple(attachment_ids),
             slot=slot,
         )
-        start = functools.partial(
-            _agent.run,
-            user_message=message,
-            session_id=str(chat.id),
-            history=_close_dangling_tool_use(loaded),
-            principal=principal,
-            tool_policy=policy,
-            agent_config=_run_config(platform),
-            prompt_context=prompt_context,
-            earlier_external_content=chat.external_content,
+        answer = await _run_turn(
+            held,
+            _agent,
+            principal,
+            run,
+            message,
+            session_id=session_id,
+            streamed=streamed,
+            background_tasks=background_tasks,
         )
-        if slot:
-            # Only with a slot: a chat without attachments runs exactly as before.
-            start = functools.partial(start, attachments=slot)
-        if streamed:
-            return _start_stream(held, run, start)
-        try:
-            result = await start()
-        except (MemoryError, RecursionError):
-            raise
-        except Exception:
-            logger.error("Agent run failed for chat %s", safe_log(chat.id))
-            raise HTTPException(status_code=500, detail="Internal error") from None
-        stored = await _finish_run(run, result)
-    # Runs after the response, without the chat's hold.
-    title = _title_call(run, result, stored)
-    if title is not None:
-        background_tasks.add_task(title)
-    return _chat_response(chat.id, session_id, result, stored)
+    return answer
 
 
 async def post_chat_message(
@@ -5373,6 +5545,138 @@ async def post_chat_stop(principal: _ChatSenderDep, chat_id: UUID) -> ChatStopRe
     if stopped:
         logger.info("Stop requested for chat %s", safe_log(chat.id))
     return ChatStopResponse(stopped=stopped)
+
+
+async def post_chat_retry(
+    request: Request,
+    principal: _ChatSenderDep,
+    chat_id: UUID,
+    background_tasks: BackgroundTasks,
+) -> ChatResponse | EventStreamResponse | JSONResponse:
+    """Handle POST /api/chats/{chat_id}/retry — run a chat's failed last turn again (GH-245).
+
+    Decision 1: a chat can be retried when its latest message (highest seq,
+    any role) ended as ``error`` or ``stopped`` (a Stop, or a streamed client
+    that left; a stop before any output stores ``stopped`` on the user
+    message itself). Anything else (``complete``, ``awaiting_confirmation``,
+    ``limit_reached``, an empty chat, a failed answer followed by an org
+    notice) is the 409 ``not_retryable``. No request body is read.
+
+    Decision 2: the retried message is the chat's latest user message, and the
+    failed turn is that message through the latest one (the answer, its tool
+    calls and results). The new turn replaces it in the store's transaction
+    (``_finish_run`` with ``replace_through``, migration 0031's
+    ``delete_failed_turn``): the user message is stored again with its text
+    and files (moved to the new row, never deleted), then the new answer. V1
+    keeps no versions (#182). A run that stores nothing (an agent that
+    raised: the 500 or the stream's ``internal_error``; a chat trashed
+    meanwhile: the 404 or ``chat_not_found``) leaves the failed turn as it was.
+
+    Decision 3: a fresh run (``_run_turn``, a send's): the messages before the
+    retried one in a send's window (``chats.load_turn`` with ``before_seq``:
+    the latest ``max_context_messages``, 200 without a cap), the chat's
+    active attachments (``_read_slot``, with a send's refusals), the caller's
+    current tool policy and prompt context, the chat's sticky
+    ``external_content`` flag, and no pending confirmation: every tool call
+    goes through the permission engine again, a ``confirm`` action asks for a
+    new approval, no tool result or approval of the failed turn reaches the
+    model, and a tool call of the failed turn runs again if the model calls
+    it again.
+
+    Decision 4: like a send in everything else, in this order: the per-user
+    ``/api/message`` bucket (shared with sends: a retry is an LLM run) before
+    any statement; expired confirmations reaped and the org's due promotions
+    completed; the owner check (``turn_setup.load_turn_setup``: another org's,
+    a colleague's, a trashed and an unknown chat are the 404
+    ``chat_not_found``) before the hold; the chat's hold (``wait=False``: 409
+    ``run_active``, 429 ``rate_limit``, 503 ``chats_busy``); under it the
+    retry target (``chats.read_retry_target``: 409 ``not_retryable``, or the
+    404 for a chat trashed meanwhile), the history, then slot 4. Every
+    refusal is JSON (a streamed request's too) with nothing run or stored and
+    the pending confirmations untouched. The stored ``max_message_length``
+    isn't checked again (the message was accepted when it was sent). With
+    ``Accept: text/event-stream`` the answer is the run's event stream,
+    stoppable like a send's; an untitled chat's first exchange is titled as
+    a send's. No audit event (a retry is a turn; its tool calls write their
+    ``tool.call`` rows); the one log line names the chat id, never content.
+
+    Args:
+        request: The incoming request (its ``Accept`` header).
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+        background_tasks: The request's background tasks (the title task).
+
+    Returns:
+        The new turn's ChatResponse (``session_id`` None), with the run's
+        status and error code like a send's (Decision 5: a run's own failure
+        is the 200 answer's ``error_code``); or the streamed run's
+        EventStreamResponse; or the JSON 409 ``not_retryable``, 422
+        ``context_overflow``, ``attachment_bytes_exceeded`` or
+        ``image_input_unsupported``, or 503 ``storage_unavailable``.
+
+    Raises:
+        HTTPException: 429 when rate-limited; 500 when a JSON retry's agent
+            fails (nothing stored). Another org's, a colleague's, a trashed
+            and an unknown chat are the 404 ``chat_not_found`` (also one
+            trashed during the run); a chat whose run is going the 409
+            ``run_active``; the caller at their chat-runtime bound the 429
+            ``rate_limit``; a full chat runtime the 503 ``chats_busy``.
+    """
+    _check_rate_limit("/api/message", _user_caller(principal))
+    if _agent is None:
+        raise HTTPException(status_code=500, detail="Server not configured")
+    _reap_expired_confirmations()
+
+    from admino.database import get_pool
+
+    pool = get_pool()
+    await _resolve_due_promotions(pool, principal)
+    platform = await _platform_run_settings()
+    tenant = TenantContext.from_principal(principal)
+    # The owner check before the hold, as a send's: a chat the caller can't reach takes
+    # no runtime entry.
+    setup = await turn_setup.load_turn_setup(pool, tenant, chat_id)
+    if not setup.chat_found:
+        raise chats.ChatNotFoundError
+    async with contextlib.AsyncExitStack() as held:
+        await held.enter_async_context(_chat_runtime.hold(chat_id, tenant.user_id, wait=False))
+        # Under the hold: a run of the chat that ended meanwhile decides what is retried.
+        target = await chats.read_retry_target(pool, tenant, chat_id)
+        if target is None:
+            return JSONResponse(status_code=409, content=_NOT_RETRYABLE_BODY)
+        turn = await chats.load_turn(
+            pool, tenant, chat_id, limit=_history_limit(platform), before_seq=target.user_seq
+        )
+        slot = await _read_slot(tenant, platform, turn.attachments)
+        if isinstance(slot, JSONResponse):
+            return slot
+        chat, loaded = turn.chat, turn.history
+        logger.info("Retrying the last message of chat %s", safe_log(chat.id))
+        run = _HeldRun(
+            pool=pool,
+            tenant=tenant,
+            chat=chat,
+            loaded=loaded,
+            platform=platform,
+            policy=setup.policy,
+            prompt_context=setup.prompt_context,
+            title_message=target.message if _first_exchange(chat, loaded) else None,
+            # The failed message's files: unlinked with the failed turn, linked to its copy.
+            attachment_ids=target.attachment_ids,
+            slot=slot,
+            replace_through=target.through_seq,
+        )
+        answer = await _run_turn(
+            held,
+            _agent,
+            principal,
+            run,
+            target.message,
+            session_id=None,
+            streamed=_wants_event_stream(request),
+            background_tasks=background_tasks,
+        )
+    return answer
 
 
 async def post_confirm(
@@ -7780,6 +8084,9 @@ def create_app(
         responses={**_EVENT_STREAM_RESPONSES, **_SEND_CONFLICT_RESPONSES, **_MESSAGE_RESPONSES},
     )(post_chat_message)
     app.post("/api/chats/{chat_id}/stop", response_model=ChatStopResponse)(post_chat_stop)
+    app.post("/api/chats/{chat_id}/retry", response_model=ChatResponse, responses=_RETRY_RESPONSES)(
+        post_chat_retry
+    )
     app.post("/api/chats/{chat_id}/attachments", status_code=201, response_model=AttachmentSummary)(
         post_chat_attachment
     )

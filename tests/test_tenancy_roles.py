@@ -28,7 +28,13 @@ and B have a storage quota. The Super Admin's requests name org A's Org
 Admin's chat and attachment. GH-190: the exclusion (``PATCH
 /api/attachments/{attachment_id}`` with ``{"active": false}``) and the list of
 a chat's files (``GET /api/chats/{chat_id}/attachments``) act on an attachment
-and a chat of the caller's own (a Viewer's too).
+and a chat of the caller's own (a Viewer's too). GH-245: the retry (``POST
+/api/chats/{chat_id}/retry``, no body) acts on a chat of the caller's own whose one
+turn failed (the answer stored ``error``; a Viewer owns one from before a demotion):
+an Org Admin's and an Editor's re-run it with the stub agent (200, the deterministic
+success: the failed turn is retryable, the stub answers a final reply); the Viewer and
+the Super Admin (pointed at org A's Org Admin's failed chat) get 403 and nothing runs
+or changes.
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -99,6 +105,7 @@ from tests.tenancy_world import (
     route_id,
     seed_attachment,
     seed_chat,
+    seed_failed_chat,
     seed_pending_confirmation,
     stub_agent,
     upload_headers,
@@ -348,6 +355,21 @@ def _own_chat(
     return prepare
 
 
+def _own_failed_chat(world: World, caller: Account) -> _Request:
+    """GH-245: retry (no body) a chat of the caller's own whose one turn failed (the
+    answer stored ``error``). A Viewer owns one from before a demotion; the Super Admin's
+    request names org A's Org Admin's. No pending confirmation: a chat whose latest
+    message failed has none."""
+    chat_id = seed_failed_chat(
+        world.db,
+        _chat_owner(world, caller),
+        title="Rollen Chat 245",
+        question="Rollen Frage 245",
+        answer="Rollen Fehler 245",
+    )
+    return _Request("POST", f"/api/chats/{chat_id}/retry")
+
+
 def _upload_attachment(world: World, caller: Account) -> _Request:
     """GH-187: a short text file into a chat of the caller's own (a Viewer owns one from
     before a demotion; the Super Admin's request names org A's Org Admin's chat)."""
@@ -545,6 +567,8 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     ),
     # GH-8: stop the caller's own idle chat (no streamed run: 200 {"stopped": false}).
     ("POST", "/api/chats/{chat_id}/stop"): _Setup(_own_chat("POST", "/stop"), 200),
+    # GH-245: re-run the caller's own failed turn (the stub agent answers: 200).
+    ("POST", "/api/chats/{chat_id}/retry"): _Setup(_own_failed_chat, 200),
     # GH-187: upload into the caller's own chat (201, status "uploaded"); its metadata and
     # download (200).
     ("POST", "/api/chats/{chat_id}/attachments"): _Setup(_upload_attachment, 201),

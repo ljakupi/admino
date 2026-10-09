@@ -84,7 +84,7 @@ The app doesn't connect to PostgreSQL as a superuser. Two roles split the work:
 | Role | Used by | What it can do |
 | --- | --- | --- |
 | `admino` (owner) | The one-shot `migrate` service, or `make migrate` in local dev, with `PG_PASSWORD` | The superuser the postgres image creates. Owns every table and function and applies the migrations. |
-| `admino_app` (runtime) | The running app and the admin CLI, with `PG_APP_PASSWORD` | Not a superuser: no `CREATEDB`, `CREATEROLE`, `REPLICATION` or `BYPASSRLS`, and it owns nothing. Per-table rights for the queries the app runs, plus `EXECUTE` on the two audit purge functions. |
+| `admino_app` (runtime) | The running app and the admin CLI, with `PG_APP_PASSWORD` | Not a superuser: no `CREATEDB`, `CREATEROLE`, `REPLICATION` or `BYPASSRLS`, and it owns nothing. Per-table rights for the queries the app runs, plus `EXECUTE` on the two audit purge functions and on `delete_failed_turn`, which removes a chat's failed last turn for a retry. |
 
 **Why.** The audit log, `audit_events`, is append-only. A superuser session could still
 switch its append-only trigger off (`SET session_replication_role = replica`), drop the
@@ -103,8 +103,9 @@ How it's enforced:
 
 - **The purges run as the owner.** The retention purge (`purge_audit_events`) and the
   organization purge (`purge_org_audit_events`) are `SECURITY DEFINER` functions with a
-  pinned `search_path`, and the only functions `admino_app` may execute. The append-only
-  trigger stays as a second layer: it still lets a delete through only from one of them.
+  pinned `search_path`. With `delete_failed_turn` (below), they are the only functions
+  `admino_app` may execute. The append-only trigger stays as a second layer: it still lets
+  an audit delete through only from one of the two purges.
 - **No quiet erasure through an organization purge.** The organization purge deletes the
   organization itself in the same call as its audit events, and `admino_app` can't delete
   organizations any other way. A database trigger keeps every scheduled deletion open for
@@ -130,6 +131,29 @@ How it's enforced:
   key) and refuses any write of a chat whose owner belongs to another organization,
   including the app's writes as `admino_app`. Only the `admino` owner role could remove
   the key.
+- **Chat messages stay append-only.** On `chat_messages`, `admino_app` has `SELECT` and
+  `INSERT` only: it can't change or delete a stored message directly. Retrying a failed
+  answer (`POST /api/chats/{id}/retry`) removes the failed turn only through
+  `delete_failed_turn` (migration 0031), which runs as the owner (`SECURITY DEFINER` with a
+  pinned `search_path`) and is bound to the chat's organization and owner. It deletes only
+  a live chat's failed last turn: a message that ended as `error` or `stopped` with no
+  assistant or tool message after it, and the messages back to the latest user message at
+  or before it. It also checks the turn's shape, because `admino_app` can insert rows (and
+  take a chat out of the trash): every message between that user message and the failed
+  one must be a tool call or its result (each `complete` or `awaiting_confirmation`), or an
+  assistant message with status `error`. A completed answer stays `complete`, and
+  `admino_app` can't change it, so an `error` row forged after it is refused. The text a
+  streamed reply showed before it timed out is stored as `error` with the failed answer,
+  and migration 0031 backfills the ones stored earlier as `complete` to `error`. Residual
+  risk: a compromised runtime role can still delete a turn that ends in a pending or
+  expired confirmation, a last turn that already failed, rows it inserted itself, and the
+  organization notices after the chat's last answer (they're stored as user messages).
+  Only if it was already compromised before migration 0031 ran and planted rows then, the
+  backfill can set completed answers to `error`, and the role can delete those too. It
+  can't delete a completed turn otherwise. The function unlinks that user message's files first, so
+  they're kept, and refuses anything else with one fixed error that names no row. The
+  deletion and the new turn are stored in one transaction, so a refused or failed retry
+  leaves the failed turn as it was.
 - **New tables get explicit grants.** A migration that creates a table grants
   `admino_app` exactly what the app needs on it, in the same file; a unit test fails
   otherwise. New functions get no `EXECUTE` for anyone by default.

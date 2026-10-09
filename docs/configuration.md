@@ -104,8 +104,9 @@ aren't.
 ### LLM errors and retries
 
 A chat reply that fails has `status: "error"`, and the `POST /api/chats/{id}/messages`,
-`POST /api/message` and `POST /api/confirm/{id}` responses carry its `error_code` (a
-[streamed reply](#streaming-replies) sends it as the `error` event's `code`):
+`POST /api/message`, `POST /api/confirm/{id}` and `POST /api/chats/{id}/retry` responses
+carry its `error_code` (a [streamed reply](#streaming-replies) sends it as the `error`
+event's `code`):
 
 | `error_code` | What happened |
 | --- | --- |
@@ -705,11 +706,12 @@ Viewer's chats from before a role change stay stored, unused.
 | --- | --- |
 | `POST /api/chats` | Starts a chat. The body is `{}` or `{"title": "..."}`. Answers `201` with the chat: `id`, `title`, `title_source`, `created_at` and `last_activity_at`. Without a title, `title` is `""` and `title_source` is `"auto"` until the first exchange titles it (see below); with one, `"user"`. |
 | `GET /api/chats?cursor=&limit=` | Lists your chats, the most recently active first: `{"chats": [...], "next_cursor": ...}`. `limit` is 1–100, 50 by default. Chats in the trash aren't listed. |
-| `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. Each message carries its `attachment_ids`. It also carries `pending_confirmation` and `confirmation_status` (see below), and `context_usage` (see [Context budget](#context-budget)). |
+| `GET /api/chats/{id}?cursor=&limit=` | One chat with a page of its messages, oldest first: the latest 100 by default (`limit` 1–100). `next_cursor` gets the earlier ones. Each message carries its `attachment_ids`. It also carries `pending_confirmation` and `confirmation_status` (see below), `context_usage` (see [Context budget](#context-budget)), and `retryable`: `true` exactly when the chat's latest message ended as `error` or `stopped`, so that a [retry](#retrying-a-failed-reply) would run, whatever page you read. |
 | `PATCH /api/chats/{id}` | Renames the chat: `{"title": "..."}`. `title_source` becomes `"user"`. Sending the same title again changes nothing. |
 | `DELETE /api/chats/{id}` | Moves the chat to the trash, with its [attachments](#attachments), and answers `204`. A pending confirmation of the chat is dropped. It's recorded in the audit log as `chat.delete`, with the chat's ID only. |
 | `POST /api/chats/{id}/messages` | Sends a message: `{"message": "..."}`, optionally with the files you uploaded into the chat, `"attachment_ids": [...]` (see [Attachments](#attachments)). Answers like `POST /api/message`: the reply, its tool calls, the `status`, a `pending_confirmation` when an action waits for your approval, the `error_code`, the `context_usage` and `context_notice` (see [Context budget](#context-budget)), and the `chat_id`. With `Accept: text/event-stream`, the reply streams instead (see [Streaming replies](#streaming-replies)). |
 | `POST /api/chats/{id}/stop` | Stops the chat's streamed message. It needs no body and answers `{"stopped": true}`, or `{"stopped": false}` when the chat has no streamed message running (see [Stopping a reply](#stopping-a-reply)). |
+| `POST /api/chats/{id}/retry` | Runs the chat's latest message again when its last answer ended as `error` or `stopped`, and replaces the failed turn with the new one. It needs no body. Answers like `POST /api/chats/{id}/messages`: JSON, or streamed with `Accept: text/event-stream`. When the last answer didn't fail, it answers `409` `not_retryable` (see [Retrying a failed reply](#retrying-a-failed-reply)). |
 
 - **Titles** have 1 to 200 characters, spaces at either end removed. Control and
   formatting characters are refused with `422`. Creating, renaming and sending messages
@@ -745,7 +747,11 @@ Viewer's chats from before a role change stay stored, unused.
   message without files and for every assistant and tool message. The last
   message of a turn carries the turn's outcome (`complete`, `error`,
   `awaiting_confirmation`, `limit_reached` or `stopped`, see
-  [Stopping a reply](#stopping-a-reply)) and its tool calls; the others are `complete`.
+  [Stopping a reply](#stopping-a-reply)) and its tool calls; the others are `complete`,
+  except in a turn that ended as `error`: there every earlier assistant message stored
+  without tool-call blocks is `error` too. In practice that's the text a streamed reply
+  showed before it timed out (see [Streaming replies](#streaming-replies)), and a tool
+  call the provider sent without call ids.
   Invisible characters (control and formatting characters such as zero-width
   spaces, soft hyphens, word joiners and direction marks; tabs and line breaks stay) and
   credential-like text are stripped from the content, like in a live reply and in
@@ -847,15 +853,18 @@ Viewer's chats from before a role change stay stored, unused.
   Try again shortly.", "reason": "rate_limit"}` when your 16 chats in the server's memory
   are all running or waiting for a confirmation (see below), and `503` with `"reason":
   "chats_busy"` when the server is already running as many chats at once as it can hold.
-  Only these two message routes answer this `409`, `429` or `503`. In each case your
-  message doesn't run and isn't stored; try again shortly. A new `session_id` on
+  Only these two message routes and `POST /api/chats/{id}/retry` (see
+  [Retrying a failed reply](#retrying-a-failed-reply)) answer this `409`, `429` or
+  `503`. In each case your message doesn't run and isn't stored; try again shortly. A
+  new `session_id` on
   `POST /api/message` gets its chat only once its first message runs, so a refused
   message leaves no empty chat behind. One thing still happens first: the notes of
   [promoted permissions](permissions.md#promoting-a-critical-permission) that just took
   effect are added to your organization's chats (see below).
-- **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages` and
-  `POST /api/message` share one limit, so switching between them doesn't double your
-  rate. `POST /api/chats/{id}/stop` has its own.
+- **Rate limits** apply per user on every chat route. `POST /api/chats/{id}/messages`,
+  `POST /api/message` and `POST /api/chats/{id}/retry` share one limit (a
+  [retry](#retrying-a-failed-reply) runs the model like a message), so switching between
+  them doesn't double your rate. `POST /api/chats/{id}/stop` has its own.
 - **Confirmations.** When an action needs your approval, the reply has
   `status: "awaiting_confirmation"` and a `pending_confirmation`. Approve or deny it with
   `POST /api/confirm/{confirmation_id}` and
@@ -945,11 +954,12 @@ Viewer's chats from before a role change stay stored, unused.
 
 ### Streaming replies
 
-`POST /api/chats/{id}/messages` and `POST /api/confirm/{id}` stream the reply while it's
-written when the request's `Accept` header lists `text/event-stream` (in any position and
-any case, but not with `q=0`). Any other `Accept` header, or none (`*/*`,
-`application/json`), gets the JSON answer described above. The stream is the body of the
-`POST` response, so it uses your session cookie like any other request. The legacy
+`POST /api/chats/{id}/messages`, `POST /api/chats/{id}/retry` (see
+[Retrying a failed reply](#retrying-a-failed-reply)) and `POST /api/confirm/{id}` stream
+the reply while it's written when the request's `Accept` header lists `text/event-stream`
+(in any position and any case, but not with `q=0`). Any other `Accept` header, or none
+(`*/*`, `application/json`), gets the JSON answer described above. The stream is the
+body of the `POST` response, so it uses your session cookie like any other request. The legacy
 `POST /api/message` always answers JSON.
 
 Everything that's checked before the message runs is refused with the usual JSON error
@@ -1011,7 +1021,8 @@ chat is free again: you can send the next message, or confirm, as soon as you se
   turn's last message is the error reply, with `status: "error"`. The text that already
   arrived isn't stored, except after a `timeout`: then that text, up to its last complete
   word, is stored as a message of its own just before the error reply (none when no word
-  was complete yet), and the `delta` events end at that same word. The stream ends with
+  was complete yet), also with `status: "error"` as part of the failed reply, and the
+  `delta` events end at that same word. The stream ends with
   `message_saved` (naming the error reply), `error` and `done`. A failed model call is
   [retried](#llm-errors-and-retries) only until the model's first piece of text has
   arrived.
@@ -1056,6 +1067,90 @@ turn is still stored and titled as described below, even with nobody reading.
   `{"detail": "Rate limit exceeded"}`.
 - A stop isn't recorded in the audit log, like sending a message. Every action that ran
   stays recorded as `tool.call`.
+
+### Retrying a failed reply
+
+`POST /api/chats/{id}/retry` runs your latest message of the chat again when its reply
+failed, and the new turn takes the failed one's place. It needs no body. This is a new run
+that you ask for, not one of the automatic [retries of a model call](#llm-errors-and-retries)
+within a reply.
+
+- **What can be retried.** A chat whose latest message ended as `error` or `stopped`: the
+  reply failed (with an `error_code` or without one), you [stopped](#stopping-a-reply) it,
+  or its stream was closed before it ended (a disconnect stops it the same way). A stop
+  before the reply had any output leaves no reply: your message itself has
+  `status: "stopped"`, and it can be retried too. `GET /api/chats/{id}` tells you in
+  `retryable`, `true` exactly then, whatever page you read; each message's `status` tells
+  an error from a stop. Nothing else can be retried, and the route answers `409`
+  `not_retryable` (see Errors below): a chat whose latest message is `complete`, waits
+  for your approval or holds an expired confirmation (`awaiting_confirmation`), or reached
+  its tool-call limit (`limit_reached`), an empty chat, and a failed reply that a later
+  message follows, such as the note of a
+  [promoted permission](permissions.md#promoting-a-critical-permission) (like a message,
+  a retry first adds the notes that just took effect).
+- **What's replaced.** The failed turn: your latest message and everything stored after
+  it, the reply with its actions and their results (and what an approval added to it,
+  or the text a reply showed before it timed out).
+  Once the new run is stored, the new turn replaces the failed one in one transaction:
+  your message is stored again with the same text and the same files (excluded ones
+  included), then the new reply follows. Your re-stored message is a new message, with a
+  new `id`; its files move to it (their `message_id` is its ID) and are never deleted.
+  Nothing of the failed reply is kept: this release keeps no versions of a reply
+  ([#182](https://github.com/ljakupi/admino/issues/182) adds them). A retry that fails
+  again replaces the first failure and can be retried in turn. A run that stores nothing
+  leaves the failed turn as it was: one that failed for an unexpected reason (`500`, or a
+  stream's `internal_error` without `message_saved`), and one whose chat was moved to the
+  trash meanwhile (`404` `chat_not_found`, or the stream's `chat_not_found` error).
+- **A fresh run.** The model gets the chat's messages from before your message (the same
+  window as a send, see [Context budget](#context-budget)), the chat's active
+  [files](#attachments) and your message, and nothing of the failed reply. The run uses
+  your organization's [permissions](permissions.md#per-organization) and the
+  [assistant's instructions](#how-the-assistants-instructions-are-layered) as they are
+  now. Every action goes through the permission engine again: one that needs your
+  approval asks again, with a new `confirmation_id`, even when you approved it in the
+  failed reply. No approval or action result of the failed reply is reused. An action
+  that ran in the failed reply isn't undone, and it runs again if the model asks for it
+  again, so check what the failed reply did before you retry. Once a reply of the chat
+  read external content, such as an email (a failed reply included), actions that change
+  something keep asking first in that chat, and a retry doesn't reset that (see
+  [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
+- **Like a send in everything else.** Org Admins and Editors retry their own chats;
+  Viewers and the Super Admin get `403`. Your message isn't checked against the message
+  length limit again: it was accepted when you sent it. The answer is a send's: the JSON
+  reply with its `status`, `tool_calls`, `pending_confirmation`, `error_code`,
+  `context_usage`, `context_notice` and `chat_id`, or with `Accept: text/event-stream` the
+  [stream](#streaming-replies) with the same events. `POST /api/chats/{id}/stop` stops a
+  streamed retry like a streamed message, and a stopped retry can be retried again. A
+  chat that's still untitled (`title` `""`, `title_source` `"auto"`) and holds no earlier
+  reply gets its [automatic title](#chats) after the retried reply, like after a first
+  exchange; a chat that the failed first exchange already titled with your first message,
+  or that you renamed, keeps its title. A retry counts against the limit you share with
+  sending (see **Rate limits** under [Chats](#chats)) and refuses cross-site requests,
+  like every route that changes something. It isn't recorded in the audit log, like
+  sending a message; every action it runs is recorded as `tool.call`, and those of the
+  failed reply stay recorded.
+- **Errors** are checked in this order. Each refusal is JSON, also with
+  `Accept: text/event-stream`, runs nothing and leaves the failed turn as it was:
+  - your per-user rate limit, `429` `{"detail": "Rate limit exceeded"}` (a refused retry
+    still counts against it);
+  - `404` `{"detail": "Chat not found", "reason": "chat_not_found"}` for a chat that
+    doesn't exist, is in the trash, or is another user's or another organization's;
+  - `409` `{"detail": "A message is already running in this chat.", "reason":
+    "run_active"}` while a message of the chat runs (a send, an approved action or
+    another retry), `429` `{"detail": "Too many of your chats are active. Try again
+    shortly.", "reason": "rate_limit"}` and `503` with `"reason": "chats_busy"` as for a
+    message (see Errors under [Chats](#chats));
+  - `409` `{"detail": "The last answer can't be retried.", "reason": "not_retryable"}`
+    when the chat's latest message didn't end as `error` or `stopped` (see above);
+  - the chat's files, as for a send (see [Attachments](#attachments)): `422`
+    `context_overflow` or `attachment_bytes_exceeded`, `503` `storage_unavailable`, `422`
+    `image_input_unsupported`. [Exclude](#excluding-a-file) the file at fault, then retry.
+
+  A chat ID that isn't a UUID answers `422` with the usual validation list. When the run
+  itself fails, the answer is `200` with `status: "error"` and the reply's `error_code`
+  (see [LLM errors and retries](#llm-errors-and-retries)), and that reply can be retried
+  again. `401` without a session, `403` for a cross-site request or a role without chat
+  access, and `500` keep the bodies they have on every route.
 
 ### Attachments
 
@@ -2088,9 +2183,17 @@ attachments' files live on a Docker volume.
   and with its owner (see [Chats](#chats)). They hold your messages, the assistant's
   replies and the tool results. The assistant's instructions (the platform's rules, the
   organization's and your personal instructions) are never stored. The app can add
-  messages but can't edit or delete a single one. Deleting a user deletes their chats, and
-  purging an organization deletes all of its chats. A chat in the trash stays stored, only
-  marked with `deleted_at`; restoring and purging the trash come with
+  messages but can't edit or delete a single one. A [retry](#retrying-a-failed-reply)
+  removes the failed turn only through `delete_failed_turn` (migration 0031), a function
+  that runs as the owner and refuses anything but the failed last turn of a chat that
+  isn't in the trash, shaped like a real failed turn, so `admino_app` itself still can't
+  delete a message directly (what a compromised runtime role could still remove is in
+  [Security Model → Database roles](SECURITY.md#database-roles)). Migration 0031 also
+  marks as `error` the text a reply showed before it timed out that was stored
+  `complete` before this release, so those turns can be retried. Deleting a
+  user deletes their chats, and purging an organization deletes all of its chats. A chat
+  in the trash stays stored, only marked with `deleted_at`; restoring and purging the
+  trash come with
   [#194](https://github.com/ljakupi/admino/issues/194).
 - **Attachments** (see [Attachments](#attachments)). The `attachments` table holds each
   file's chat, owner, the message that carried it, its cleaned original name, type,

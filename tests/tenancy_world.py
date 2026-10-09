@@ -73,6 +73,13 @@ owner reaches them: anything but the caller's own live attachment is
 ``CHAT_NOT_FOUND``. ``seed_attachment`` passes ``active=False`` (an excluded
 file, migration 0030) through to ``db.add_attachment`` with the other fields.
 
+GH-245 (retry a failed answer): ``POST /api/chats/{chat_id}/retry`` (no body) is a
+member row gated by ``chat.send``: only the chat's owner re-runs its failed last
+turn, so another org's, a colleague's and an unknown chat answer
+``CHAT_NOT_FOUND``. ``seed_failed_chat`` stores a chat whose one turn failed (the
+question, then the answer stored ``error`` or ``stopped``, as the server stores a
+failed run's last message): the state a retry acts on.
+
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
 - The expected role matrix is spelled out here on purpose: deriving it from
@@ -245,6 +252,29 @@ def seed_chat(
     )
     for role, content in messages:
         db.add_chat_message(chat_id, role, content)
+    return chat_id
+
+
+def seed_failed_chat(
+    db: FakeDb,
+    owner: Account | uuid.UUID,
+    *,
+    title: str,
+    question: str,
+    answer: str,
+    status: str = "error",
+) -> uuid.UUID:
+    """GH-245: store a live, titled chat of ``owner`` whose one turn failed; its id.
+
+    ``question`` is the user message (``complete``), ``answer`` the assistant reply
+    stored with ``status`` (``error`` or ``stopped``), the way the server stores a
+    failed run's last message. The chat's latest message is the failed answer, so a
+    retry by the owner passes the status check. A title (``title_source`` "user")
+    keeps the first-exchange title rule out of the request.
+    """
+    chat_id = seed_chat(db, owner, title=title)
+    db.add_chat_message(chat_id, "user", question)
+    db.add_chat_message(chat_id, "assistant", answer, status=status)
     return chat_id
 
 
@@ -728,6 +758,8 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     RouteSpec("POST", "/api/chats/{chat_id}/messages", "member", Capability.CHAT_SEND, "path_id"),
     # GH-8: stop the chat's streamed run.
     RouteSpec("POST", "/api/chats/{chat_id}/stop", "member", Capability.CHAT_SEND, "path_id"),
+    # GH-245: re-run the chat's failed last turn (the owner only, like a send).
+    RouteSpec("POST", "/api/chats/{chat_id}/retry", "member", Capability.CHAT_SEND, "path_id"),
     # GH-187: upload a file into a chat of the caller's own; read an attachment's metadata
     # and download it (the chat's owner only).
     RouteSpec(
