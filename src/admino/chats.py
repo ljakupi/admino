@@ -143,11 +143,19 @@ Security notes:
   role too, which can INSERT a forged ``error`` row and un-trash a chat: a
   completed answer stays ``complete`` (no UPDATE), so a forged row after it
   is refused. The documented residual: such a role can still remove a turn
-  whose tail is a still-awaiting confirmation, an already failed turn and
-  rows it inserted itself. A GH-25 D9 partial (the text a streamed run showed
-  before it timed out) is part of the failed answer: an ``error`` run stores
-  it ``error`` (migration 0031 backfills the older ones). The function unlinks
-  the turn's files first: a file is never deleted with its message.
+  whose tail is a still-awaiting confirmation (pending or expired), an
+  already failed last turn, rows it inserted itself, the org notices after
+  the chat's last answer (they are ``user`` rows) and, only if it was
+  already compromised before migration 0031 ran and planted rows then, the
+  completed answers 0031's backfill set to ``error``; it can't remove a
+  completed turn otherwise. Fail-closed: a stopped or approval turn whose
+  tool-call message came without call ids (no tool_use blocks) can't be
+  replaced (the function refuses it; the retry answers 500, a stream
+  ``internal_error``, and leaves the turn). A GH-25 D9 partial (the text a
+  streamed run showed before it timed out) is part of the failed answer: an
+  ``error`` run stores it ``error`` (migration 0031 backfills the older
+  ones). The function unlinks the turn's files first: a file is never
+  deleted with its message.
 - System prompts and instructions are never stored: a ``system`` message is
   refused before any statement, and so is a message whose content is a list
   of content parts (GH-189: attachment content and images live only in one

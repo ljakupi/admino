@@ -22,8 +22,12 @@
 --   tool_use blocks (or a limit_reached notice), stored complete, which
 --   admino_app can't update: a forged row after it is refused.
 -- Residual (documented): a compromised runtime role can still remove a turn
--- whose tail is a still-awaiting confirmation, an already failed turn, and
--- rows it inserted itself.
+-- whose tail is a still-awaiting confirmation (pending or expired), an
+-- already failed last turn, rows it inserted itself, and the org notices
+-- after the chat's last answer (they are user rows). Only if it was already
+-- compromised before this migration ran and planted rows then, the backfill
+-- below can set completed answers to error, which it can then remove too.
+-- A completed turn can't be removed otherwise.
 -- The turn's files are unlinked from its user row first (message_id = NULL,
 -- the app's own A9 link puts them on the re-stored row in the same
 -- transaction), so the delete never cascades to an attachment. Then the

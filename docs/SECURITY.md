@@ -146,8 +146,11 @@ How it's enforced:
   streamed reply showed before it timed out is stored as `error` with the failed answer,
   and migration 0031 backfills the ones stored earlier as `complete` to `error`. Residual
   risk: a compromised runtime role can still delete a turn that ends in a pending or
-  expired confirmation, a turn that already failed, and rows it inserted itself; it can't
-  delete a completed turn. The function unlinks that user message's files first, so
+  expired confirmation, a last turn that already failed, rows it inserted itself, and the
+  organization notices after the chat's last answer (they're stored as user messages).
+  Only if it was already compromised before migration 0031 ran and planted rows then, the
+  backfill can set completed answers to `error`, and the role can delete those too. It
+  can't delete a completed turn otherwise. The function unlinks that user message's files first, so
   they're kept, and refuses anything else with one fixed error that names no row. The
   deletion and the new turn are stored in one transaction, so a refused or failed retry
   leaves the failed turn as it was.

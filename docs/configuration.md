@@ -748,8 +748,10 @@ Viewer's chats from before a role change stay stored, unused.
   message of a turn carries the turn's outcome (`complete`, `error`,
   `awaiting_confirmation`, `limit_reached` or `stopped`, see
   [Stopping a reply](#stopping-a-reply)) and its tool calls; the others are `complete`,
-  except the text a streamed reply showed before it timed out, stored as `error` like
-  the error reply after it (see [Streaming replies](#streaming-replies)).
+  except in a turn that ended as `error`: there every earlier assistant message stored
+  without tool-call blocks is `error` too. In practice that's the text a streamed reply
+  showed before it timed out (see [Streaming replies](#streaming-replies)), and a tool
+  call the provider sent without call ids.
   Invisible characters (control and formatting characters such as zero-width
   spaces, soft hyphens, word joiners and direction marks; tabs and line breaks stay) and
   credential-like text are stripped from the content, like in a live reply and in
