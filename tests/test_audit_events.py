@@ -1,5 +1,5 @@
 """Tests for admino.audit_events — the content-free audit event store (GH-146, GH-152, GH-153,
-GH-161, GH-164, GH-166, GH-187, GH-190).
+GH-161, GH-164, GH-166, GH-187, GH-190, GH-194).
 
 Every security-relevant action (logins, lockouts, password resets, invitations,
 role changes, activations, sharing changes, deletions and restores, exports,
@@ -68,6 +68,12 @@ What these tests pin down:
 - GH-190: two more org-scoped actions, ``file.exclude`` and ``file.include``
   (52 in all): a member excluded one of their attachments from later turns, or
   included it again. The target is the file; there is no metadata.
+- GH-194: two more org-scoped actions, ``chat.purge`` and ``file.purge`` (54 in
+  all): a chat or a file removed from the trash for good, by its owner (delete
+  forever, empty trash, retention 0) or by the system (the retention purge).
+  The target is the chat or the file; ``chat.purge`` carries ``{"file_count":
+  int}`` (the files removed with it), ``file.purge`` no metadata. A title or a
+  file name in the metadata is refused like any other content.
 
 All asyncpg calls are mocked. No real PostgreSQL connections are made.
 
@@ -226,6 +232,10 @@ _ORG_SCOPED: frozenset[str] = frozenset(
         # GH-190: a member excludes an attachment from later turns, or includes it again.
         "file.exclude",
         "file.include",
+        # GH-194: a chat or a file removed from the trash for good (by its owner or by
+        # the retention purge).
+        "chat.purge",
+        "file.purge",
     }
 )
 _PLATFORM_SCOPED: frozenset[str] = frozenset(
@@ -284,6 +294,7 @@ _ISSUE_CATEGORIES: list[Any] = [
         id="deletions",
     ),
     pytest.param({"project.restore", "chat.restore", "file.restore"}, id="restores"),
+    pytest.param({"chat.purge", "file.purge"}, id="purges"),
     pytest.param({"file.upload"}, id="file-uploads"),
     pytest.param({"file.exclude", "file.include"}, id="file-exclusions"),
     pytest.param({"export.create"}, id="exports"),
@@ -688,13 +699,14 @@ class TestActionCatalog:
         assert issubclass(AuditAction, StrEnum)
 
     def test_audit_events_action_catalog_is_exactly_the_spec(self) -> None:
-        """The catalog has exactly the 52 actions of the spec (GH-146's 39, GH-152's
+        """The catalog has exactly the 54 actions of the spec (GH-146's 39, GH-152's
         session.revoke and session.force_logout, GH-153's invitation.resend and
         invitation.refuse, GH-161's four org.permission_* actions, GH-164's
         user.profile_change, GH-166's password.change, GH-187's file.upload, GH-190's
-        file.exclude and file.include): nothing missing, nothing extra."""
+        file.exclude and file.include, GH-194's chat.purge and file.purge): nothing
+        missing, nothing extra."""
         assert {action.value for action in AuditAction} == _CATALOG
-        assert len(AuditAction) == 52
+        assert len(AuditAction) == 54
 
     @pytest.mark.parametrize("value", sorted(_CATALOG))
     def test_audit_events_action_member_name_is_upper_snake_of_value(self, value: str) -> None:
@@ -1612,6 +1624,128 @@ class TestFileEvents:
         assert json.loads(row["target_ids"]) == [str(_FILE)]
         assert json.loads(row["metadata"]) == {"orphan": True}
         assert json.loads(row["metadata"])["orphan"] is True
+
+
+class TestTrashPurgeEvents:
+    """GH-194 (Decision 9): a chat or a file removed from the trash for good is a
+    chat.purge / file.purge on the item, by its owner (with the client IP) or by the
+    system's retention purge (no user, no IP); chat.purge counts the files removed with
+    the chat. Never a title or a file name."""
+
+    async def test_audit_events_record_chat_purge_by_a_member_with_its_file_count(
+        self, conn: MagicMock
+    ) -> None:
+        """chat.purge by the member, on the chat, from the client IP, with
+        {"file_count": 3}: one row with exactly those values."""
+        await _record(
+            conn,
+            action=AuditAction("chat.purge"),
+            actor_kind="member",
+            actor_user_id=_USER,
+            org_id=_ORG,
+            target_type=TargetType.CHAT,
+            target_ids=[_MARKER],
+            ip=_IP,
+            metadata={"file_count": 3},
+        )
+
+        row = _inserted_row(conn)
+        assert (row["action"], row["actor_kind"], row["actor_user_id"], row["org_id"]) == (
+            "chat.purge",
+            "member",
+            _USER,
+            _ORG,
+        )
+        assert (row["target_type"], json.loads(row["target_ids"])) == ("chat", [str(_MARKER)])
+        assert str(row["ip"]) == _IP
+        assert json.loads(row["metadata"]) == {"file_count": 3}
+
+    async def test_audit_events_record_chat_purge_by_the_system_job(self, conn: MagicMock) -> None:
+        """The retention purge's chat.purge: the system (no user), no IP, in the chat's
+        org, with {"file_count": 0} for a chat without files."""
+        await _record(
+            conn,
+            action=AuditAction("chat.purge"),
+            actor_kind="system",
+            actor_user_id=None,
+            org_id=_ORG,
+            target_type=TargetType.CHAT,
+            target_ids=[_MARKER],
+            ip=None,
+            metadata={"file_count": 0},
+        )
+
+        row = _inserted_row(conn)
+        assert (row["actor_kind"], row["actor_user_id"], row["org_id"], row["ip"]) == (
+            "system",
+            None,
+            _ORG,
+            None,
+        )
+        assert json.loads(row["metadata"]) == {"file_count": 0}
+
+    @pytest.mark.parametrize(
+        ("actor_kind", "actor_user_id", "ip"),
+        [("member", _USER, _IP), ("system", None, None)],
+        ids=["member", "system"],
+    )
+    async def test_audit_events_record_file_purge_on_the_file_without_metadata(
+        self, conn: MagicMock, actor_kind: str, actor_user_id: UUID | None, ip: str | None
+    ) -> None:
+        """file.purge by the member (delete forever, empty trash, retention 0) or by the
+        system (the retention purge), on the file, with no metadata."""
+        await _record(
+            conn,
+            action=AuditAction("file.purge"),
+            actor_kind=actor_kind,
+            actor_user_id=actor_user_id,
+            org_id=_ORG,
+            target_type=TargetType.FILE,
+            target_ids=[_FILE],
+            ip=ip,
+            metadata={},
+        )
+
+        row = _inserted_row(conn)
+        assert (row["action"], row["actor_kind"], row["actor_user_id"], row["org_id"]) == (
+            "file.purge",
+            actor_kind,
+            actor_user_id,
+            _ORG,
+        )
+        assert (row["target_type"], json.loads(row["target_ids"])) == ("file", [str(_FILE)])
+        assert json.loads(row["metadata"]) == {}
+
+    @pytest.mark.parametrize(
+        ("value", "target_type", "metadata"),
+        [
+            ("chat.purge", TargetType.CHAT, {"file_count": 2, "title": "Merger plan"}),
+            ("chat.purge", TargetType.CHAT, {"file_count": "Merger plan"}),
+            ("file.purge", TargetType.FILE, {"filename": "salaries-2026.xlsx"}),
+        ],
+        ids=["chat-title", "chat-title-as-count", "file-name"],
+    )
+    async def test_audit_events_purge_with_a_title_or_file_name_is_refused(
+        self, conn: MagicMock, value: str, target_type: TargetType, metadata: dict[str, Any]
+    ) -> None:
+        """A chat title or a file name in a purge's metadata is content: record() raises
+        AuditRecordError and writes nothing."""
+        action = AuditAction(value)
+
+        with pytest.raises(AuditRecordError):
+            await _record(
+                conn,
+                action=action,
+                actor_kind="member",
+                actor_user_id=_USER,
+                org_id=_ORG,
+                target_type=target_type,
+                target_ids=[_MARKER],
+                ip=_IP,
+                metadata=metadata,
+            )
+
+        conn.execute.assert_not_awaited()
 
 
 class TestRecordSignature:

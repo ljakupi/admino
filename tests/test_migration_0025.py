@@ -31,8 +31,9 @@ What is pinned:
   ``ROW(...)``, a sub-select, ``WHERE false``, any case and spacing); a reset of
   external_content is CheckViolationError ("chats.external_content
   can't be reset") and the statement changes no row; false -> true, true -> true and
-  other columns of a flagged chat pass; the fake's columns and message equal the
-  shipped ones.
+  other columns of a flagged chat pass (GH-194: trashing one sets its trash group with
+  deleted_at, as migration 0031's CHECK requires); the fake's columns (less those a
+  later migration grants, GH-194's trash_group_id) and message equal the shipped ones.
 
 Security notes:
 - Without the column grant, a bug or injected SQL running as admino_app could move a
@@ -210,6 +211,27 @@ def _effective_acl() -> tuple[list[int], dict[tuple[str, str], frozenset[str]]]:
         for statement in _executed(_normalize(migration.sql)):
             _apply(acl, statement)
     return versions, {key: frozenset(value) for key, value in acl.items()}
+
+
+def _chat_update_columns(up_to: int | None) -> set[str]:
+    """The chats columns admino_app may UPDATE after every shipped migration (up to a
+    version)."""
+    acl: dict[tuple[str, str], set[str]] = {}
+    for migration in _load_migrations(db_mod._MIGRATIONS_DIR):
+        if up_to is None or migration.version <= up_to:
+            for statement in _executed(_normalize(migration.sql)):
+                _apply(acl, statement)
+    return {
+        match.group(1)
+        for entry in acl.get((_CHATS, _ROLE), set())
+        if (match := re.fullmatch(r"update\((\w+)\)", entry))
+    }
+
+
+def _chat_update_columns_granted_later() -> frozenset[str]:
+    """The chats columns admino_app may UPDATE after every shipped migration but not
+    after 0025 (GH-194: 0031's trash_group_id)."""
+    return frozenset(_chat_update_columns(None) - _chat_update_columns(_VERSION))
 
 
 def _held(table: str, grantee: str) -> frozenset[str]:
@@ -571,6 +593,8 @@ _NEW_VALUES: dict[str, Any] = {
     "external_content": True,
     "deleted_at": datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC),
 }
+# When the chat whose deleted_at is rewritten went to the trash (GH-194).
+_TRASHED_AT = datetime(2026, 1, 1, 3, 4, 5, tzinfo=UTC)
 # One literal statement per column (no SQL built from strings).
 _SET_ONE: dict[str, str] = {
     "id": "UPDATE chats SET id = $1 WHERE id = $2",
@@ -802,7 +826,10 @@ class TestMigration0025FakeDb:
         other = db.add_account(email="other@example.test")
         outcomes: dict[str, str] = {}
         for column, sql in _SET_ONE.items():
-            chat = db.add_chat(owner, title="Plan")
+            # GH-194: a new deleted_at goes on a chat already in the trash (and so in its
+            # trash group): migration 0031's CHECK refuses a deleted_at without a group.
+            trashed = _TRASHED_AT if column == "deleted_at" else None
+            chat = db.add_chat(owner, title="Plan", deleted_at=trashed)
             value = other if column == "owner_user_id" else _NEW_VALUES[column]
             outcome = await _outcome(db, chat, sql, value, chat)
             row = db.chat_row(chat) or db.chat_row(_NEW_VALUES["id"])
@@ -910,7 +937,10 @@ class TestMigration0025FakeDb:
             "false -> true": (False, "UPDATE chats SET external_content = true WHERE id = $1"),
             "false -> false": (False, "UPDATE chats SET external_content = false WHERE id = $1"),
             "flagged, title": (True, "UPDATE chats SET title = 'x' WHERE id = $1"),
-            "flagged, trash": (True, "UPDATE chats SET deleted_at = now() WHERE id = $1"),
+            "flagged, trash": (
+                True,
+                "UPDATE chats SET deleted_at = now(), trash_group_id = id WHERE id = $1",
+            ),
             "flagged, activity": (
                 True,
                 "UPDATE chats SET last_activity_at = now(), external_content = true WHERE id = $1",
@@ -964,7 +994,9 @@ class TestMigration0025FakeDb:
         assert (db.chat_row(plain), db.chat_row(flagged)) == before
 
     async def test_migration_0025_fake_mirrors_the_shipped_grant_and_message(self) -> None:
-        """The fake's updatable columns and refusal message are the shipped ones."""
+        """The fake's updatable columns and refusal message are the shipped ones (GH-194:
+        less the columns a later migration grants, such as 0031's trash_group_id, which
+        that migration's tests pin)."""
         (grant,) = _file_grants()
         shipped_columns = frozenset(
             entry.removeprefix("update(").removesuffix(")") for entry in grant.entries
@@ -973,6 +1005,6 @@ class TestMigration0025FakeDb:
         shipped_message = _raise_message(statement)
 
         assert (shipped_columns, shipped_message) == (
-            db_fakes.CHAT_UPDATE_COLUMNS,
+            frozenset(db_fakes.CHAT_UPDATE_COLUMNS) - _chat_update_columns_granted_later(),
             db_fakes.CHAT_EXTERNAL_CONTENT_RESET,
         )

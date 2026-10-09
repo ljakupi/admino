@@ -1032,6 +1032,8 @@ _UPDATE_VALUES: Final[dict[str, Any]] = {
     "updated_at": datetime(2026, 1, 2, tzinfo=UTC),
     "deleted_at": datetime(2026, 1, 3, tzinfo=UTC),
 }
+# When the file whose deleted_at is rewritten went to the trash (GH-194).
+_TRASHED_AT: Final = datetime(2026, 1, 2, 12, tzinfo=UTC)
 _SET_HEAD: Final = "UPDATE attachments SET "
 _SET_TAIL: Final = " = $1 WHERE id = $2"
 _INSERT_SQL: Final = (
@@ -1075,13 +1077,20 @@ class TestMigration0027FakeDb:
 
     async def test_migration_0027_fake_updates_only_the_granted_columns(self) -> None:
         """An UPDATE naming a column outside the shipped grant is 'permission denied for
-        table attachments' and changes nothing; a granted column is updated."""
+        table attachments' and changes nothing; a granted column is updated. (GH-194: a
+        new deleted_at goes on a file already in the trash, and so in its trash group:
+        migration 0031's CHECK refuses a deleted_at without a group.)"""
         granted = _shipped_update_columns()
         outcomes: dict[str, str] = {}
         for column in _COLUMNS:
             db = FakeDb()
             member = db.add_account(org_id=ORG_ID)
-            attachment = db.add_attachment(db.add_chat(member), filename="a.txt", kind="txt")
+            attachment = db.add_attachment(
+                db.add_chat(member),
+                filename="a.txt",
+                kind="txt",
+                deleted_at=_TRASHED_AT if column == "deleted_at" else None,
+            )
             before = db.attachment_row(attachment)
             try:
                 await db.pool.execute(

@@ -28,7 +28,13 @@ and B have a storage quota. The Super Admin's requests name org A's Org
 Admin's chat and attachment. GH-190: the exclusion (``PATCH
 /api/attachments/{attachment_id}`` with ``{"active": false}``) and the list of
 a chat's files (``GET /api/chats/{chat_id}/attachments``) act on an attachment
-and a chat of the caller's own (a Viewer's too).
+and a chat of the caller's own (a Viewer's too). GH-194: the trash routes act
+on the caller's own items (a Viewer's too: items trashed before a demotion
+stay in its trash, so its 403 is the role's): ``DELETE
+/api/attachments/{attachment_id}`` on a live file, ``GET`` and ``DELETE
+/api/trash`` on a trash holding a trashed chat, restore and delete forever on
+a trashed chat (with a message and a file in its group) and on a file trashed
+on its own; the Super Admin's requests name org A's Org Admin's items.
 
 Outputs (the expectations):
 - a role outside ``allowed_roles(spec)`` (the spelled-out ``ROLE_MATRIX``)
@@ -44,7 +50,8 @@ Outputs (the expectations):
   just by its roles (``file.upload`` and ``chat.send`` have the same roles):
   with ``access.can`` refusing only the row's capability, the Editor's valid
   request is a 403 that changes nothing. GH-190's two attachment rows
-  (``chat.send``) are checked the same way.
+  (``chat.send``) are checked the same way, and so are GH-194's seven trash
+  rows (``chat.send``, never ``file.upload``).
 
 Completeness: a new non-public ``ROUTES`` row fails
 ``test_tenancy_roles_every_non_public_route_has_a_setup`` until it gets a
@@ -100,6 +107,8 @@ from tests.tenancy_world import (
     seed_attachment,
     seed_chat,
     seed_pending_confirmation,
+    seed_trashed_attachment,
+    seed_trashed_chat,
     stub_agent,
     upload_headers,
     use_attachment_storage,
@@ -386,6 +395,59 @@ def _list_own_chat_attachments(world: World, caller: Account) -> _Request:
     return _Request("GET", f"/api/chats/{chat_id}/attachments")
 
 
+def _delete_own_attachment(world: World, caller: Account) -> _Request:
+    """GH-194: move a live attachment of a chat of the caller's own to the trash."""
+    chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 194")
+    attachment_id = seed_attachment(world.db, chat_id, filename="rollen-194.txt")
+    return _Request("DELETE", f"/api/attachments/{attachment_id}")
+
+
+def _seed_own_trashed_chat(world: World, caller: Account) -> Any:
+    """A trashed chat of the caller's own (the Super Admin: org A's Org Admin's) with a
+    message and a file trashed with it; its id."""
+    return seed_trashed_chat(
+        world.db,
+        _chat_owner(world, caller),
+        title="Rollen Papierkorb 194",
+        messages=(("user", "Rollen Frage 194"),),
+        filenames=("rollen-papierkorb-194.txt",),
+    )
+
+
+def _own_trash(method: str) -> Callable[[World, Account], _Request]:
+    """GH-194: list (GET) or empty (DELETE) the caller's own trash (it holds a chat)."""
+
+    def prepare(world: World, caller: Account) -> _Request:
+        _seed_own_trashed_chat(world, caller)
+        return _Request(method, "/api/trash")
+
+    return prepare
+
+
+def _own_trashed_chat(method: str, suffix: str) -> Callable[[World, Account], _Request]:
+    """GH-194: restore (POST "/restore") or delete forever (DELETE "") a trashed chat of
+    the caller's own."""
+
+    def prepare(world: World, caller: Account) -> _Request:
+        return _Request(method, f"/api/trash/chats/{_seed_own_trashed_chat(world, caller)}{suffix}")
+
+    return prepare
+
+
+def _own_trashed_attachment(method: str, suffix: str) -> Callable[[World, Account], _Request]:
+    """GH-194: restore (POST "/restore") or delete forever (DELETE "") a file the caller
+    deleted on its own from a live chat of its own."""
+
+    def prepare(world: World, caller: Account) -> _Request:
+        chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Rollen Chat 194")
+        attachment_id = seed_trashed_attachment(
+            world.db, chat_id, filename="rollen-papierkorb-194.txt"
+        )
+        return _Request(method, f"/api/trash/attachments/{attachment_id}{suffix}")
+
+    return prepare
+
+
 def _oauth_disconnect(provider: str) -> Callable[[World, Account], _Request]:
     """Disconnect the caller's own connection (seeded for a member; the Super Admin has none)."""
 
@@ -554,6 +616,21 @@ _SETUPS: Final[dict[tuple[str, str], _Setup]] = {
     # chat's attachments (200).
     ("PATCH", "/api/attachments/{attachment_id}"): _Setup(_exclude_own_attachment, 200),
     ("GET", "/api/chats/{chat_id}/attachments"): _Setup(_list_own_chat_attachments, 200),
+    # GH-194: move a live file to the trash (204); list (200) and empty (200) the trash;
+    # restore (200 with the summary) and delete forever (204) a chat and a file.
+    ("DELETE", "/api/attachments/{attachment_id}"): _Setup(_delete_own_attachment, 204),
+    ("GET", "/api/trash"): _Setup(_own_trash("GET"), 200),
+    ("DELETE", "/api/trash"): _Setup(_own_trash("DELETE"), 200),
+    ("POST", "/api/trash/chats/{chat_id}/restore"): _Setup(
+        _own_trashed_chat("POST", "/restore"), 200
+    ),
+    ("POST", "/api/trash/attachments/{attachment_id}/restore"): _Setup(
+        _own_trashed_attachment("POST", "/restore"), 200
+    ),
+    ("DELETE", "/api/trash/chats/{chat_id}"): _Setup(_own_trashed_chat("DELETE", ""), 204),
+    ("DELETE", "/api/trash/attachments/{attachment_id}"): _Setup(
+        _own_trashed_attachment("DELETE", ""), 204
+    ),
     # --- own Google/Microsoft connections ---
     ("GET", "/api/oauth/google/authorize"): _Setup(
         _plain("GET", "/api/oauth/google/authorize"), 200
@@ -781,6 +858,14 @@ _ATTACHMENT_ROUTES: Final[tuple[tuple[str, str], ...]] = (
     # GH-190
     ("PATCH", "/api/attachments/{attachment_id}"),
     ("GET", "/api/chats/{chat_id}/attachments"),
+    # GH-194: the single-file delete and the trash (chat.send, never file.upload).
+    ("DELETE", "/api/attachments/{attachment_id}"),
+    ("GET", "/api/trash"),
+    ("DELETE", "/api/trash"),
+    ("POST", "/api/trash/chats/{chat_id}/restore"),
+    ("POST", "/api/trash/attachments/{attachment_id}/restore"),
+    ("DELETE", "/api/trash/chats/{chat_id}"),
+    ("DELETE", "/api/trash/attachments/{attachment_id}"),
 )
 
 
@@ -811,7 +896,8 @@ class TestAttachmentRouteCapabilities:
         self, world: World, monkeypatch: pytest.MonkeyPatch, route: tuple[str, str]
     ) -> None:
         """With ``can`` refusing only the row's capability (``file.upload`` for the upload,
-        ``chat.send`` for the reads and GH-190's exclusion and list), org A's Editor's valid
+        ``chat.send`` for the reads, GH-190's exclusion and list and GH-194's single-file
+        delete and trash routes), org A's Editor's valid
         request (its JSON body and query included) is 403 Forbidden and
         changes nothing (no table, audit row or file). Control: before the refusal, the
         same request succeeds with the route's documented status."""

@@ -29,11 +29,12 @@ What these tests pin down:
   message", which the server's own dangling-tool_use turn would break).
 - No ``attachment_ids`` (left out, ``()``, ``[]``): exactly today's statements,
   none naming attachments.
-- ``trash_chat`` (A10): the chat's live attachments get ``deleted_at`` in the
-  trash's transaction, on its connection, after the chat's UPDATE and before
-  the ``chat.delete`` audit INSERT, with exactly the contract's A10 form bound
-  to (the chat, the caller's org). Attachments trashed earlier keep their
-  ``deleted_at``; the caller's other chats', colleagues' and other orgs'
+- ``trash_chat`` (A10, GH-194's A10'): the chat's live attachments get
+  ``deleted_at`` and the chat's id as their ``trash_group_id`` in the trash's
+  transaction, on its connection, after the chat's UPDATE and before the
+  ``chat.delete`` audit INSERT, with exactly GH-194's A10' form bound to (the
+  chat, the caller's org). Attachments trashed earlier keep their
+  ``deleted_at`` and their own trash group; the caller's other chats', colleagues' and other orgs'
   attachments are untouched; the files on disk stay (trash is ``deleted_at``,
   #194 purges). A failed audit write rolls the attachments back with the chat;
   a chat that isn't the caller's (or is trashed already) is ``ChatNotFoundError``
@@ -84,8 +85,9 @@ _A9: Final = norm(
     " WHERE id = ANY($2::uuid[]) AND chat_id = $3 AND org_id = $4 AND owner_user_id = $5"
     " AND message_id IS NULL AND deleted_at IS NULL"
 )
+# GH-194 (contract section 5, A10'): the files join the chat's trash group.
 _A10: Final = norm(
-    "UPDATE attachments SET deleted_at = now()"
+    "UPDATE attachments SET deleted_at = now(), trash_group_id = $1"
     " WHERE chat_id = $1 AND org_id = $2 AND deleted_at IS NULL"
 )
 
@@ -550,11 +552,35 @@ class TestTrashChatTrashesAttachments:
         )
         assert {path: path.read_bytes() for path in files} == files
 
+    async def test_chats_attachments_trash_puts_the_live_files_in_the_chats_group(
+        self, chats: ModuleType, db: FakeDb
+    ) -> None:
+        """GH-194 (S6' + A10'): the chat is its own trash group and its live files (sent
+        or not) carry the chat's id; the file trashed earlier keeps its own group."""
+        world = _world(db)
+        earlier = db.attachment_row(world.trashed)
+
+        await chats.trash_chat(db.pool, world.alice.tenant, world.chat, ip=_IP)
+
+        chat = db.chat_row(world.chat)
+        assert chat is not None
+        assert plain(chat["trash_group_id"]) == world.chat
+        groups = {}
+        for attachment_id in (world.fresh, world.second, world.sent):
+            row = db.attachment_row(attachment_id)
+            assert row is not None
+            groups[attachment_id] = plain(row["trash_group_id"])
+        assert groups == dict.fromkeys((world.fresh, world.second, world.sent), world.chat)
+        assert db.attachment_row(world.trashed) == earlier
+        assert earlier is not None
+        assert plain(earlier["trash_group_id"]) == world.trashed
+
     async def test_chats_attachments_trash_runs_a10_between_the_chat_update_and_the_audit(
         self, chats: ModuleType, db: FakeDb
     ) -> None:
-        """Exactly the contract's A10, bound to (the chat, ORG_ID), after the chat's UPDATE
-        and before the chat.delete INSERT, on one connection in the committed transaction."""
+        """Exactly the contract's A10' (GH-194), bound to (the chat, ORG_ID), after the
+        chat's UPDATE and before the chat.delete INSERT, on one connection in the committed
+        transaction."""
         world = _world(db)
         db.calls.clear()
 
