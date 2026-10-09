@@ -25,7 +25,10 @@ Startup sequence:
    These checks only log: a missing key, model or product ID never stops startup
    — chat replies report the setup problem by error code (GH-242).
 7. Import tool modules to trigger @register_tool decorators, then freeze the registry.
-8. Build the AgentConfig from the validated limits.
+8. Build the AgentConfig from the validated limits and (GH-190) the context
+   budget: the model's ``max_input_tokens``, the reserved output
+   (``llm.max_response_tokens``), the safety margin and the tool-result cap
+   (the ``context`` section); ``max_context_messages`` 0 means no cap.
 9. Instantiate the Agent with all dependencies, including the tool-call
    recorder that writes one ``tool.call`` audit event per dispatch. The agent
    holds no permission state: the server loads the requesting org's tool
@@ -502,10 +505,16 @@ def main(
     # ------------------------------------------------------------------
     # 8. Build AgentConfig from the validated application config
     # ------------------------------------------------------------------
+    # GH-190: the context budget too (the server's per-run config replaces the model's
+    # max_input_tokens and the cap with the stored platform values).
     agent_config = AgentConfig(
         max_tool_calls=config.limits.max_tool_calls_per_message,
         max_context_messages=config.limits.max_context_messages,
         confirmation_timeout_s=float(config.limits.confirmation_timeout_s),
+        max_input_tokens=config.llm.max_input_tokens,
+        reserved_output_tokens=config.llm.max_response_tokens,
+        context_margin_percent=config.context.safety_margin_percent,
+        max_tool_result_tokens=config.context.max_tool_result_tokens,
     )
 
     # ------------------------------------------------------------------
