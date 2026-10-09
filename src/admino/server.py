@@ -4579,18 +4579,15 @@ _MESSAGE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
             "Validation Error (the usual list); message_empty: the message is blank "
             "(nothing but whitespace) and sends no files; "
             + _CONTEXT_REFUSALS_DESCRIPTION
-            + "; or image_input_unsupported: an attachment of the chat holds an image "
-            "and the current model takes none."
+            + " under report: attachments (attachment_id, token_estimate, derived_bytes "
+            "per file), attachment_tokens, available_tokens, attachment_bytes and "
+            "max_bytes; or image_input_unsupported: an attachment of the chat holds an "
+            "image and the current model takes none."
         ),
         "content": {
-            "application/json": {
-                "examples": {
-                    "message_empty": {"value": _MESSAGE_EMPTY_BODY},
-                    "context_overflow": {"value": _CONTEXT_OVERFLOW_EXAMPLE},
-                    "attachment_bytes_exceeded": {"value": _ATTACHMENT_BYTES_EXAMPLE},
-                    "image_input_unsupported": {"value": _IMAGE_INPUT_UNSUPPORTED_BODY},
-                }
-            }
+            # GH-286 pins the blank-message body as the example, and OpenAPI forbids
+            # example beside examples, so the other codes are described in words.
+            "application/json": {"example": _MESSAGE_EMPTY_BODY}
         },
     },
     503: {
