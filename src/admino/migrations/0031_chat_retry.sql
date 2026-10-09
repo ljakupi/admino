@@ -11,12 +11,30 @@
 -- failed last turn of a live chat of the given owner and org:
 -- - the row at through_seq ended as error or stopped;
 -- - no assistant or tool row comes after it (an org notice, a user row, may);
--- - the turn starts at the chat's latest user row at or before through_seq.
+-- - the turn starts at the chat's latest user row at or before through_seq;
+-- - the turn's shape (security audit M-1): a compromised admino_app can
+--   insert rows (and un-trash a chat), so a forged error row would satisfy
+--   the checks above. The function accepts only what a real failed turn
+--   holds between its user row and its last row: tool calls (assistant rows
+--   with tool_use blocks) and their results, complete or awaiting
+--   confirmation, and assistant error rows (a timed-out reply's partial
+--   text, see the backfill). A completed turn ends with an answer without
+--   tool_use blocks (or a limit_reached notice), stored complete, which
+--   admino_app can't update: a forged row after it is refused.
+-- Residual (documented): a compromised runtime role can still remove a turn
+-- whose tail is a still-awaiting confirmation, an already failed turn, and
+-- rows it inserted itself.
 -- The turn's files are unlinked from its user row first (message_id = NULL,
 -- the app's own A9 link puts them on the re-stored row in the same
 -- transaction), so the delete never cascades to an attachment. Then the
 -- turn's rows, its user row through through_seq, are deleted. Anything else
 -- is refused with insufficient_privilege and a fixed text (no row data).
+--
+-- The last statement is a one-off backfill (GH-25 D9): a streamed reply that
+-- timed out after showing text stores that text right before its error
+-- reply, now as error; one stored before (complete, no tool_use blocks, its
+-- chat's next row an assistant error row) is set to error here, so its turn
+-- can be retried. It is the migration's only data write.
 --
 -- Grants: EXECUTE on the function to admino_app only (none to PUBLIC). No
 -- table privilege changes; no table, column or index change.
@@ -62,6 +80,17 @@ BEGIN
         RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
             USING ERRCODE = 'insufficient_privilege';
     END IF;
+    PERFORM 1 FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org
+        AND seq > turn_seq AND seq < through_seq
+        AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                AND (role = 'tool'
+                    OR (role = 'assistant' AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+            OR (role = 'assistant' AND status = 'error'));
+    IF FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
     UPDATE attachments SET message_id = NULL, updated_at = now()
     WHERE message_id = turn_id AND chat_id = target_chat AND org_id = target_org;
     DELETE FROM chat_messages
@@ -74,3 +103,16 @@ $$;
 
 REVOKE ALL ON FUNCTION delete_failed_turn(uuid, uuid, uuid, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app;
+
+UPDATE chat_messages m SET status = 'error'
+WHERE m.role = 'assistant' AND m.status = 'complete'
+    AND coalesce(jsonb_array_length(m.tool_use_blocks), 0) = 0
+    AND EXISTS (
+        SELECT 1 FROM chat_messages n
+        WHERE n.chat_id = m.chat_id AND n.org_id = m.org_id
+            AND n.seq = (
+                SELECT min(x.seq) FROM chat_messages x
+                WHERE x.chat_id = m.chat_id AND x.org_id = m.org_id AND x.seq > m.seq
+            )
+            AND n.role = 'assistant' AND n.status = 'error'
+    );

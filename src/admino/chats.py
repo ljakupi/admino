@@ -135,9 +135,19 @@ Security notes:
 - ``chat_messages`` is append-only for the runtime role (SELECT, INSERT; no
   UPDATE or DELETE). The one delete is GH-245's ``delete_failed_turn``
   (migration 0031, until #182's versions), which runs as the owner and checks
-  the chat's org, owner and liveness and the turn's failed status itself, so
-  it removes at most the caller's chat's failed last turn. It unlinks the
-  turn's files first: a file is never deleted with its message.
+  the chat's org, owner and liveness, the turn's failed status and the turn's
+  shape itself: between its user row and its last row only tool calls, their
+  results (complete or awaiting confirmation) and assistant ``error`` rows. An
+  app bug removes at most the caller's chat's failed last turn. The shape
+  check (security audit M-1) keeps the bound against a compromised runtime
+  role too, which can INSERT a forged ``error`` row and un-trash a chat: a
+  completed answer stays ``complete`` (no UPDATE), so a forged row after it
+  is refused. The documented residual: such a role can still remove a turn
+  whose tail is a still-awaiting confirmation, an already failed turn and
+  rows it inserted itself. A GH-25 D9 partial (the text a streamed run showed
+  before it timed out) is part of the failed answer: an ``error`` run stores
+  it ``error`` (migration 0031 backfills the older ones). The function unlinks
+  the turn's files first: a file is never deleted with its message.
 - System prompts and instructions are never stored: a ``system`` message is
   refused before any statement, and so is a message whose content is a list
   of content parts (GH-189: attachment content and images live only in one
@@ -987,12 +997,16 @@ async def append_messages(
 
     Every message is stored ``complete`` without tool calls except the last,
     which gets ``final_status`` and the run's tool calls (NULL when there are
-    none). The chat's ``last_activity_at`` is bumped, and ``external_content``
-    is set (for good) when an appended ``tool`` message holds wrapped external
-    content or the caller says the run received some (GH-189: a run whose
-    slot 4 held attachments). U+0000 is removed from the content and the
-    JSON values; in the JSON values (a model's tool input or the tool-call
-    arguments) each lone
+    none). In an ``error`` run (GH-245), every earlier ``assistant`` message
+    without tool_use blocks is stored ``error`` too: it is the text a
+    streamed call showed before it timed out (GH-25 D9), part of the failed
+    answer, and ``delete_failed_turn``'s shape check admits only that status
+    for such a message inside a turn. The chat's ``last_activity_at`` is
+    bumped, and ``external_content`` is set (for good) when an appended
+    ``tool`` message holds wrapped external content or the caller says the
+    run received some (GH-189: a run whose slot 4 held attachments). U+0000
+    is removed from the content and the JSON values; in the JSON values (a
+    model's tool input or the tool-call arguments) each lone
     surrogate is stored as U+FFFD and each non-finite number (NaN, an
     infinity, an overflowing literal as parsed) as null, at any depth.
 
@@ -1012,7 +1026,8 @@ async def append_messages(
     its latest user message through that seq, is deleted right after the
     touch and before the first insert, on the same connection, by migration
     0031's ``delete_failed_turn`` (R2), which runs as the owner and refuses
-    anything but a failed last turn of the caller's live chat. It unlinks the
+    anything but a failed last turn of the caller's live chat (its rows
+    shaped like one, see the module's security notes). It unlinks the
     turn's files first, so the given ``attachment_ids`` (the failed message's)
     are unsent again and A9 links them to the re-stored user message. A
     refusal rolls the whole transaction back: nothing is deleted or stored.
@@ -1023,7 +1038,9 @@ async def append_messages(
         chat_id: The chat.
         messages: The new user, assistant and tool messages, in order; an
             empty sequence without attachments runs no statement.
-        final_status: The stored status of the run's last message.
+        final_status: The stored status of the run's last message (and, for
+            ``"error"``, of its earlier assistant messages without tool_use
+            blocks).
         tool_calls: The run's tool-call summaries, stored on the last message.
         attachment_ids: The attachments the user message carried (checked by
             the caller with ``attachments.check_sendable``); empty, the
@@ -1076,6 +1093,17 @@ async def append_messages(
         msg = "Content parts are never stored."
         raise ValueError(msg)
     last = len(messages) - 1
+    # The rows stored with final_status: the last one and, in an error run (GH-245 C1'b),
+    # every assistant message without tool_use blocks before it: the text a streamed call
+    # showed before it timed out (GH-25 D9) belongs to the failed answer, and
+    # delete_failed_turn's shape check tells it from a completed answer by that status.
+    with_final = {last}
+    if final_status == "error":
+        with_final.update(
+            index
+            for index, message in enumerate(messages)
+            if message.role == "assistant" and not message.tool_use_blocks
+        )
     # Python mode: the JSON mode mangles a lone surrogate in a key (or raises for a nested
     # one) before _json_text could replace it. Every ToolCallRecord field is JSON-native.
     calls = [record.model_dump() for record in tool_calls or ()]
@@ -1086,7 +1114,7 @@ async def append_messages(
             _json_text(message.tool_use_blocks),
             message.tool_call_id,
             _json_text(calls) if index == last and calls else None,
-            final_status if index == last else "complete",
+            final_status if index in with_final else "complete",
         )
         for index, (message, text) in enumerate(zip(messages, texts, strict=True))
     ]
