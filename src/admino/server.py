@@ -75,7 +75,9 @@ Routes:
   ids, GH-190), its confirmation state and ``context_usage`` (GH-190: how full
   the chat's context is as its next turn starts).
 - PATCH /api/chats/{chat_id} — Renames the chat.
-- DELETE /api/chats/{chat_id} — Moves the chat to the trash (204); audited.
+- DELETE /api/chats/{chat_id} — Moves the chat and its live files to the trash
+  (204; GH-194: purged in the same request when the org's trash retention is
+  0); audited.
 - POST /api/chats/{chat_id}/messages — Runs a turn in the chat; returns
   ChatResponse (with the run's LLM error code, GH-242, or ``rate_limit`` when
   the caller's pending-confirmation limit refused its confirmation, GH-24),
@@ -107,11 +109,28 @@ Routes:
 - PATCH /api/attachments/{attachment_id} — Excludes (``{"active": false}``) or
   includes again (``{"active": true}``) an attachment of the caller's in the
   chat's later turns (GH-190); audited (``file.exclude``, ``file.include``).
+- DELETE /api/attachments/{attachment_id} — Moves a file of the caller to the
+  trash (204, GH-194; purged in the same request when the org's trash
+  retention is 0); audited.
 - GET  /api/chats/{chat_id}/attachments — One page of the caller's files of
   their chat, oldest first (``limit``, ``cursor``, ``status`` and ``active``
   filters; GH-190).
 - GET  /api/attachments/{attachment_id}/content — Downloads the stored
   original (the chat's owner only).
+- GET  /api/trash         — One page of the caller's own trash, latest deletion
+  first (``item_type``, ``cursor``, ``limit``), with the org's effective
+  ``retention_days`` (GH-194).
+- POST /api/trash/chats/{chat_id}/restore — Restores a chat of the caller with
+  the files its deletion moved (200 ChatSummary; 409 ``restore_conflict``);
+  audited.
+- POST /api/trash/attachments/{attachment_id}/restore — Restores a file of the
+  caller deleted on its own (200 AttachmentSummary; 409 ``chat_in_trash``);
+  audited.
+- DELETE /api/trash/chats/{chat_id}, /api/trash/attachments/{attachment_id} —
+  Deletes a trash item of the caller forever: its rows, then its files on
+  disk (204); audited.
+- DELETE /api/trash       — Empties the caller's trash, one item per
+  transaction (200 with the purged chat and attachment counts); audited.
 - POST /api/message       — Legacy: a turn in the caller's chat of a client
   ``session_id`` (created by its first run, until #177: a refused first
   message creates none); returns ChatResponse, always JSON. Titles the chat,
@@ -210,7 +229,8 @@ Security notes:
   results and the assistant's denial), so the history stays well-formed. The
   agent's ``session_id`` is ``str(chat.id)``, so ``tool.call`` rows target
   the chat. Trashing records
-  ``chat.delete`` in the same transaction. The legacy ``session_id`` names
+  ``chat.delete`` in the same transaction (GH-194: with a trash retention of
+  0 the purge follows in the same request). The legacy ``session_id`` names
   the caller's own chat (``chats.legacy_session_id``): another user's
   session id is a chat of the caller's own, and a confirmation never creates
   one. Log lines name chat ids only: never a title, message text or legacy
@@ -395,6 +415,23 @@ Security notes:
   inclusion records ``file.exclude`` / ``file.include`` in its transaction
   (ids only); the same value again records nothing. No log line, error body
   or audit row names a file or holds its content.
+- Trash (GH-194, ``admino.trash``): the trash routes and ``DELETE
+  /api/attachments/{attachment_id}`` need ``chat.send`` (403 for a Viewer or
+  a Super Admin before any database work), the CSRF check on a state change
+  and a per-user bucket each, spent first. The trash is the caller's own
+  (V1): every statement binds the session's org and user, so another org's,
+  a colleague's (an Org Admin's request included) and an unknown item answer
+  the same 404 ``chat_not_found`` / ``attachment_not_found`` with nothing
+  changed. An item expires once its org's effective retention (the org's
+  value clamped into the platform's bounds, read on each request) has passed
+  since its deletion: it is no longer listed or restorable (404), while
+  delete forever and emptying still remove it. Every delete, restore and purge records its
+  content-free event in its transaction (ids, ``file_count`` and the client
+  IP only); a purge removes the item's files from disk (original, partial
+  upload, derived text and page images) only after its commit. A
+  ``restore_conflict`` or ``chat_in_trash`` refusal changes nothing. No log
+  line, error body or audit row names a title or a file; the hourly purge
+  job (lifespan) removes expired items of every org.
 - Session management: ``/api/me/sessions`` needs ``Capability.ACCOUNT_MANAGE``
   and only ever reads or deletes the caller's own sessions; a forced logout
   needs ``Capability.ORG_USERS_MANAGE`` and only reaches users of the Org
@@ -778,6 +815,7 @@ from admino import (
     scoped_settings,
     session_management,
     sessions,
+    trash,
     turn_setup,
     untrusted,
 )
@@ -864,6 +902,10 @@ from admino.models import (
     SettingsLLM,
     SSEEvent,
     TitlePayload,
+    TrashEmptyResponse,
+    TrashItem,
+    TrashItemType,
+    TrashListResponse,
     UserSettingsPatch,
     UserSettingsResponse,
 )
@@ -1271,6 +1313,15 @@ _RATE_LIMITS: dict[str, tuple[float, int]] = {
     # GH-190: excluding or including an attachment, and listing a chat's files, per user.
     "/api/attachments/patch": (0.5, 5),
     "/api/chats/attachments/list": (1.0, 10),
+    # GH-194: deleting one attachment, and the caller's trash, per user. Emptying the
+    # trash purges every item in one request, so its bucket is the tightest.
+    "/api/attachments/delete": (0.5, 5),
+    "/api/trash/list": (1.0, 10),
+    "/api/trash/chats/restore": (0.5, 5),
+    "/api/trash/attachments/restore": (0.5, 5),
+    "/api/trash/chats/delete": (0.5, 5),
+    "/api/trash/attachments/delete": (0.5, 5),
+    "/api/trash/empty": (0.2, 2),
     # GH-159: the settings scopes, per user.
     "/api/me/settings/get": (1.0, 10),
     "/api/me/settings/patch": (0.5, 5),
@@ -1631,6 +1682,16 @@ _TOO_MANY_FILES_BODY: Final = {
 _ATTACHMENT_NOT_READY_BODY: Final = {
     "detail": "Attachment is not ready",
     "reason": "attachment_not_ready",
+}
+# GH-194: the trash restores' conflicts. A file whose chat is in the trash comes back with
+# its chat; a legacy chat's session may have a live chat again since it was trashed.
+_CHAT_IN_TRASH_BODY: Final = {
+    "detail": "The file's chat is in the trash",
+    "reason": "chat_in_trash",
+}
+_RESTORE_CONFLICT_BODY: Final = {
+    "detail": "A live chat already uses this chat's session",
+    "reason": "restore_conflict",
 }
 # GH-189: an active attachment's derived files can't be read (the upload's 503 text).
 _STORAGE_UNAVAILABLE_BODY: Final = {
@@ -4173,12 +4234,17 @@ async def patch_chat(
 async def delete_chat(request: Request, principal: _ChatSenderDep, chat_id: UUID) -> Response:
     """Handle DELETE /api/chats/{chat_id} — move a chat of the caller to the trash.
 
-    Sets ``deleted_at`` (the messages stay until the purge, #194) and records
-    ``chat.delete`` in the same transaction (a failed audit write is a 500
-    with nothing changed). The chat's pending confirmation is dropped.
+    ``trash.delete_chat`` (GH-194): the chat and its live files go to the
+    trash as one group (the messages stay) with ``chat.delete`` in the same
+    transaction (a failed audit write is a 500 with nothing changed). With
+    an effective trash retention of 0 the chat is then purged in the same
+    request (``chat.purge``): its rows and files are gone when the 204 is
+    sent; a failing purge step still answers 204 and leaves the chat in the
+    trash for the purge job. Either way the chat's pending confirmation is
+    dropped.
 
     Args:
-        request: The incoming request (the client IP for the audit event).
+        request: The incoming request (the client IP for the audit events).
         principal: The logged-in principal (needs ``chat.send``).
         chat_id: The chat (a UUID; anything else is a 422).
 
@@ -4195,10 +4261,11 @@ async def delete_chat(request: Request, principal: _ChatSenderDep, chat_id: UUID
     from admino.database import get_pool
 
     tenant = TenantContext.from_principal(principal)
-    await chats.trash_chat(
+    await trash.delete_chat(
         get_pool(),
         tenant,
         chat_id,
+        root=attachments.attachments_root(),
         ip=request.client.host if request.client is not None else None,
     )
     _chat_runtime.pop_pending(chat_id)
@@ -5943,6 +6010,48 @@ async def patch_attachment(
     return _attachment_summary(record)
 
 
+async def delete_attachment(
+    request: Request, principal: _ChatSenderDep, attachment_id: UUID
+) -> Response:
+    """Handle DELETE /api/attachments/{attachment_id} — move a file of the caller to the trash.
+
+    GH-194 (Decision 3): ``trash.delete_attachment`` trashes the caller's own
+    live attachment (sent or not, any status) as an item of its own with
+    ``file.delete`` in the same transaction; its files stay on disk. A
+    trashed file is no longer read, listed or sent. With an effective trash
+    retention of 0 it is then purged in the same request (``file.purge``):
+    its row and files are gone when the 204 is sent; a failing purge step
+    still answers 204 and leaves the file in the trash for the purge job.
+    Nothing is logged on success.
+
+    Args:
+        request: The incoming request (the client IP for the audit events).
+        principal: The logged-in principal (needs ``chat.send``).
+        attachment_id: The attachment (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            live attachment (another org's, a colleague's, an Org Admin's
+            request on an Editor's file included, a trashed or an unknown
+            one) is the 404 ``attachment_not_found`` with nothing changed.
+    """
+    _check_rate_limit("/api/attachments/delete", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    await trash.delete_attachment(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        attachment_id,
+        root=attachments.attachments_root(),
+        ip=request.client.host if request.client is not None else None,
+    )
+    return Response(status_code=204)
+
+
 async def get_chat_attachments(
     principal: _ChatSenderDep,
     chat_id: UUID,
@@ -6106,6 +6215,260 @@ async def get_attachment_content(
     )
     refused = _refused_range(request, response, file_stat.st_size)
     return response if refused is None else refused
+
+
+# ---------------------------------------------------------------------------
+# The caller's trash (GH-194): list, restore, delete forever, empty
+# ---------------------------------------------------------------------------
+
+# The OpenAPI 409 of each restore route, one example per code.
+_TRASH_CHAT_RESTORE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    409: {
+        "description": "restore_conflict: a live chat already uses this chat's session.",
+        "content": {
+            "application/json": {
+                "examples": {"restore_conflict": {"value": _RESTORE_CONFLICT_BODY}}
+            }
+        },
+    }
+}
+_TRASH_ATTACHMENT_RESTORE_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    409: {
+        "description": "chat_in_trash: the file's chat is in the trash (restore the chat first).",
+        "content": {
+            "application/json": {"examples": {"chat_in_trash": {"value": _CHAT_IN_TRASH_BODY}}}
+        },
+    }
+}
+
+
+async def get_trash(
+    principal: _ChatSenderDep,
+    item_type: TrashItemType | None = None,
+    cursor: Annotated[str | None, Query(max_length=200)] = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> TrashListResponse:
+    """Handle GET /api/trash — one page of the caller's own trash.
+
+    Spends the per-user ``/api/trash/list`` bucket, then ``trash.list_trash``:
+    the caller's trash items (a chat, or a file deleted on its own; a file
+    that went with its chat comes back with it and isn't an item) that
+    haven't expired under the org's effective retention, newest deletion
+    first, keyset-paged on ``(deleted_at, id)``. Metadata only. Listing
+    records nothing and logs nothing.
+
+    Args:
+        principal: The logged-in principal (needs ``chat.send``).
+        item_type: Only chats or only attachments; none: both.
+        cursor: The previous page's ``next_cursor``; none for the first page.
+        limit: The page size, 1 to 100 (default 50).
+
+    Returns:
+        TrashListResponse: the page's items (``expires_at`` is ``deleted_at``
+        plus the retention), the next page's cursor (None on the last page)
+        and the effective ``retention_days`` (0: a delete purges at once, so
+        no undo).
+
+    Raises:
+        HTTPException: 429 when rate-limited. A cursor that doesn't decode is
+            the 422 ``invalid_cursor`` (never echoed).
+    """
+    _check_rate_limit("/api/trash/list", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    page = await trash.list_trash(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        limit=limit,
+        cursor=cursor,
+        item_type=item_type,
+    )
+    return TrashListResponse(
+        items=[TrashItem.model_validate(item, from_attributes=True) for item in page.items],
+        next_cursor=page.next_cursor,
+        retention_days=page.retention_days,
+    )
+
+
+async def post_trash_chat_restore(
+    request: Request, principal: _ChatSenderDep, chat_id: UUID
+) -> ChatSummary:
+    """Handle POST /api/trash/chats/{chat_id}/restore — bring a chat back from the trash.
+
+    ``trash.restore_chat``: the chat and the files its deletion moved come
+    back with ``chat.restore`` in the same transaction; a file deleted on its
+    own before stays in the trash. Every other column is kept. The caller's
+    live chat answers its summary with nothing recorded (idempotent).
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+
+    Returns:
+        The chat's ChatSummary.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            unexpired trashed or live chat is the 404 ``chat_not_found``; a
+            legacy chat whose session has a live chat again is the 409
+            ``restore_conflict``; nothing changed either way.
+    """
+    _check_rate_limit("/api/trash/chats/restore", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    record = await trash.restore_chat(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        chat_id,
+        ip=request.client.host if request.client is not None else None,
+    )
+    return _chat_summary(record)
+
+
+async def post_trash_attachment_restore(
+    request: Request, principal: _ChatSenderDep, attachment_id: UUID
+) -> AttachmentSummary:
+    """Handle POST /api/trash/attachments/{attachment_id}/restore — bring a file back.
+
+    ``trash.restore_attachment``: a file deleted on its own comes back into
+    its live chat with ``file.restore`` in the same transaction, keeping its
+    message link and ``active`` flag. The caller's live file answers its
+    summary with nothing recorded (idempotent).
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (needs ``chat.send``).
+        attachment_id: The attachment (a UUID; anything else is a 422).
+
+    Returns:
+        The attachment's AttachmentSummary (``context_report`` null).
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            unexpired trash item or live file (a file that went with its
+            chat included) is the 404 ``attachment_not_found``; a file whose
+            chat is in the trash is the 409 ``chat_in_trash``; nothing
+            changed either way.
+    """
+    _check_rate_limit("/api/trash/attachments/restore", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    record = await trash.restore_attachment(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        attachment_id,
+        ip=request.client.host if request.client is not None else None,
+    )
+    return _attachment_summary(record)
+
+
+async def delete_trash_chat(request: Request, principal: _ChatSenderDep, chat_id: UUID) -> Response:
+    """Handle DELETE /api/trash/chats/{chat_id} — delete a trashed chat forever.
+
+    ``trash.purge_chat``: the chat's rows go (its messages and every file of
+    the chat by cascade) with ``chat.purge`` (``file_count``) in the same
+    transaction, expired or not; after the commit the files go from disk
+    (originals, partial uploads, derived text and page images).
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (needs ``chat.send``).
+        chat_id: The chat (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            trashed chat (a live one included) is the 404 ``chat_not_found``
+            with nothing changed.
+    """
+    _check_rate_limit("/api/trash/chats/delete", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    await trash.purge_chat(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        chat_id,
+        root=attachments.attachments_root(),
+        ip=request.client.host if request.client is not None else None,
+    )
+    return Response(status_code=204)
+
+
+async def delete_trash_attachment(
+    request: Request, principal: _ChatSenderDep, attachment_id: UUID
+) -> Response:
+    """Handle DELETE /api/trash/attachments/{attachment_id} — delete a trashed file forever.
+
+    ``trash.purge_attachment``: the row goes with ``file.purge`` in the same
+    transaction, expired or not; after the commit its files go from disk.
+
+    Args:
+        request: The incoming request (the client IP for the audit event).
+        principal: The logged-in principal (needs ``chat.send``).
+        attachment_id: The attachment (a UUID; anything else is a 422).
+
+    Returns:
+        An empty 204 response.
+
+    Raises:
+        HTTPException: 429 when rate-limited. Anything but the caller's own
+            trash item (a live file and a file that went with its chat
+            included) is the 404 ``attachment_not_found`` with nothing
+            changed.
+    """
+    _check_rate_limit("/api/trash/attachments/delete", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    await trash.purge_attachment(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        attachment_id,
+        root=attachments.attachments_root(),
+        ip=request.client.host if request.client is not None else None,
+    )
+    return Response(status_code=204)
+
+
+async def delete_trash(request: Request, principal: _ChatSenderDep) -> TrashEmptyResponse:
+    """Handle DELETE /api/trash — empty the caller's trash.
+
+    ``trash.empty_trash``: every trashed chat of the caller, then every file
+    deleted on its own, each purged in its own transaction with its
+    ``chat.purge`` / ``file.purge`` event, expired or not. An item restored
+    or purged meanwhile is skipped. A colleague's and another org's trash
+    are never touched.
+
+    Args:
+        request: The incoming request (the client IP for the audit events).
+        principal: The logged-in principal (needs ``chat.send``).
+
+    Returns:
+        TrashEmptyResponse: how many chats and attachments were purged (a
+        file that went with a purged chat counts in that chat's
+        ``file_count``, not here).
+
+    Raises:
+        HTTPException: 429 when rate-limited.
+    """
+    _check_rate_limit("/api/trash/empty", _user_caller(principal))
+
+    from admino.database import get_pool
+
+    emptied = await trash.empty_trash(
+        get_pool(),
+        TenantContext.from_principal(principal),
+        root=attachments.attachments_root(),
+        ip=request.client.host if request.client is not None else None,
+    )
+    return TrashEmptyResponse(chats=emptied.chats, attachments=emptied.attachments)
 
 
 # ---------------------------------------------------------------------------
@@ -7408,6 +7771,24 @@ async def _attachment_not_ready_handler(request: Request, exc: Exception) -> JSO
     return JSONResponse(status_code=409, content=_ATTACHMENT_NOT_READY_BODY)
 
 
+async def _chat_in_trash_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``trash.ChatInTrashError``: the 409 ``chat_in_trash`` (GH-194).
+
+    Restoring a file whose chat is in the trash; nothing changed. The chat's
+    restore brings the file back with it.
+    """
+    return JSONResponse(status_code=409, content=_CHAT_IN_TRASH_BODY)
+
+
+async def _restore_conflict_handler(request: Request, exc: Exception) -> JSONResponse:
+    """``trash.RestoreConflictError``: the 409 ``restore_conflict`` (GH-194).
+
+    Restoring a legacy chat whose session already has a live chat; nothing
+    changed.
+    """
+    return JSONResponse(status_code=409, content=_RESTORE_CONFLICT_BODY)
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -7433,11 +7814,12 @@ async def _recover_attachments() -> None:
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application lifespan — init DB pool, the audit retention job, the
     expired-session purge, the organization purge, the expired login-throttle
-    purge, the expired-confirmation reaper, the attachment orphan GC and the
-    one-shot attachment recovery and, when SMTP is configured, the email
-    outbox sender on startup; on shutdown, stop the detached streamed runs and
-    wait for them (at most ``_DRAIN_TIMEOUT_S``, GH-8), then stop the
-    background tasks and the attachment processing pool, then close the pool.
+    purge, the expired-confirmation reaper, the attachment orphan GC, the trash
+    retention purge (GH-194) and the one-shot attachment recovery and, when SMTP
+    is configured, the email outbox sender on startup; on shutdown, stop the
+    detached streamed runs and wait for them (at most ``_DRAIN_TIMEOUT_S``,
+    GH-8), then stop the background tasks and the attachment processing pool,
+    then close the pool.
 
     The pool must be created here (on uvicorn's event loop), not in main(),
     because asyncio.run() closes its event loop on return, which would
@@ -7508,6 +7890,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # once (the startup doesn't wait for it). Looked up at call time, like the
     # session purge; cancelled before the pool closes.
     attachment_gc_task = asyncio.create_task(attachment_gc.run_gc_job(get_pool()))
+    # GH-194: trash items past their org's retention are purged now and then hourly
+    # (rows, then their files). Looked up at call time, like the GC; cancelled
+    # before the pool closes.
+    trash_purge_task = asyncio.create_task(trash.run_purge_job(get_pool()))
     attachment_recovery_task = asyncio.create_task(_recover_attachments())
 
     # GH-161: no tools gate or promoted permissions are loaded into the agent:
@@ -7521,14 +7907,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     unfinished = await event_stream.drain(_DRAIN_TIMEOUT_S)
     if unfinished:
         logger.warning("Shutdown: %d streamed chat runs still running", unfinished)
-    # GH-187: no recovery, GC pass or processing job outlives the pool. The recovery
-    # stops first, so it queues nothing into the closed processing pool.
+    # GH-187: no recovery, GC pass, trash purge (GH-194) or processing job outlives
+    # the pool. The recovery stops first, so it queues nothing into the closed
+    # processing pool.
     attachment_recovery_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await attachment_recovery_task
     attachment_gc_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await attachment_gc_task
+    trash_purge_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await trash_purge_task
     await _processing.close()
     confirmation_reaper_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
@@ -7668,6 +8058,9 @@ def create_app(
         attachments.AttachmentAlreadySentError, _attachment_already_sent_handler
     )
     app.add_exception_handler(attachments.AttachmentNotReadyError, _attachment_not_ready_handler)
+    # GH-194: the trash restores' conflicts.
+    app.add_exception_handler(trash.ChatInTrashError, _chat_in_trash_handler)
+    app.add_exception_handler(trash.RestoreConflictError, _restore_conflict_handler)
 
     # --- Routes ---
     # Public: health check, login, password reset, the invitation link routes
@@ -7789,6 +8182,9 @@ def create_app(
     app.patch("/api/attachments/{attachment_id}", response_model=AttachmentSummary)(
         patch_attachment
     )
+    app.delete("/api/attachments/{attachment_id}", status_code=204, response_model=None)(
+        delete_attachment
+    )
     app.get("/api/chats/{chat_id}/attachments", response_model=AttachmentListResponse)(
         get_chat_attachments
     )
@@ -7797,6 +8193,24 @@ def create_app(
         response_model=None,
         responses=_ATTACHMENT_CONTENT_RESPONSES,
     )(get_attachment_content)
+    app.get("/api/trash", response_model=TrashListResponse)(get_trash)
+    app.delete("/api/trash", response_model=TrashEmptyResponse)(delete_trash)
+    app.post(
+        "/api/trash/chats/{chat_id}/restore",
+        response_model=ChatSummary,
+        responses=_TRASH_CHAT_RESTORE_RESPONSES,
+    )(post_trash_chat_restore)
+    app.post(
+        "/api/trash/attachments/{attachment_id}/restore",
+        response_model=AttachmentSummary,
+        responses=_TRASH_ATTACHMENT_RESTORE_RESPONSES,
+    )(post_trash_attachment_restore)
+    app.delete("/api/trash/chats/{chat_id}", status_code=204, response_model=None)(
+        delete_trash_chat
+    )
+    app.delete("/api/trash/attachments/{attachment_id}", status_code=204, response_model=None)(
+        delete_trash_attachment
+    )
     app.post("/api/message", response_model=ChatResponse, responses=_MESSAGE_RESPONSES)(
         post_message
     )
