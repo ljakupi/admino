@@ -122,8 +122,11 @@ How it's enforced:
   refuses to start while any are pending.
 - **A chat keeps its owner and its mark.** On `chats`, `admino_app` may update only the
   title and its source, the last activity time, the external-content mark and the trash
-  time: it can't change a chat's ID, organization, owner, creation time or legacy session
-  ID. A database trigger refuses clearing the external-content mark, so a chat that once
+  time and group: it can't change a chat's ID, organization, owner, creation time or
+  legacy session ID. It may delete a chat (deleting it for good from the trash): its
+  messages and files go with it through the foreign keys' cascade, which runs as the
+  tables' owner, so the app still can't delete or edit a single message. A database
+  trigger refuses clearing the external-content mark, so a chat that once
   held external content keeps asking before actions that change something (see
   [Permissions → External content](permissions.md#external-content-makes-side-effects-ask-first)).
   The database also ties a chat's owner to the chat's organization (a composite foreign
@@ -216,13 +219,20 @@ account or the address is locked for 15 minutes, and the lockout is audit-logged
   route. A tool call's `tool.call` audit row names the chat's ID as its target, never its
   title or a message.
 - **Attachments are private to their chat's owner** too. The data layer
-  (`attachments.py`) reads an attachment only within the caller's organization and as
-  its owner, and `chats.py` links one to a message or trashes it only with its own chat.
-  Another user's, another organization's, a trashed chat's and an unknown attachment all
-  answer the same `404` `{"detail": "Attachment not found", "reason":
-  "attachment_not_found"}`, on the reads and on an exclusion alike; a chat's attachment
-  list answers the chat's `404` for any chat that isn't the caller's own. Viewers and the
-  Super Admin get `403`. See [Attachments](#attachments).
+  (`attachments.py`) reads or trashes an attachment only within the caller's
+  organization and as its owner, and `chats.py` links one to a message or trashes it only
+  with its own chat. Another user's, another organization's, a trashed chat's and an
+  unknown attachment all answer the same `404` `{"detail": "Attachment not found",
+  "reason": "attachment_not_found"}`, on the reads, an exclusion and a delete alike; a
+  chat's attachment list answers the chat's `404` for any chat that isn't the caller's
+  own. Viewers and the Super Admin get `403`. See [Attachments](#attachments).
+- **The trash is its owner's.** The data layer (`trash.py`) lists, restores and deletes
+  for good only the caller's own chats and files, within the caller's organization:
+  another user's item (an Org Admin's request on an Editor's item included), another
+  organization's and an unknown one answer the same `404` as above, with nothing
+  changed. The hourly purge job works per organization, each with its own retention.
+  Every delete, restore and purge writes its audit event (IDs, a file count and the
+  client IP only) in the transaction that changes the rows.
 - **Operator blindness.** The Super Admin reaches only the platform routes and their own
   account. Platform responses carry metadata and counts, never content, titles or file
   names. Of an organization's chats, the Super Admin sees only how many aren't in the
@@ -543,6 +553,13 @@ conversion in `attachment_processing.py` and `converters/`:
   [Configuration → Data & storage](configuration.md#data--storage)). The converted parts
   are removed with the original, when the conversion fails, and when the attachment was
   deleted during its conversion.
+- **Deleted for good means off the disk.** A file in the trash keeps its files until it's
+  deleted for good (from the trash, by the hourly purge once its organization's
+  retention has passed, or at once with a retention of 0). Then its row goes first, with
+  its audit event in the same transaction, and only after the commit its original, a
+  partial upload and its converted parts. A purge that rolls back (a failed audit write)
+  removes no file; a file a failed removal leaves behind is removed by the hourly cleanup
+  once it's 24 hours old.
 - **Converted parts are capped and counted.** A small file can convert into far more
   bytes than it holds (a crafted 28 KB PDF of 100 pages renders to more than a gigabyte
   of page images), and the volume is shared by every organization and, at Docker's
