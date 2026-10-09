@@ -4,9 +4,9 @@ The repository behind the chat routes and the agent turns: a member creates,
 lists, renames and trashes their own chats and reads one with a page of its
 messages (``read_chat_detail``); every turn appends the run's new messages
 (``append_messages``) and the next run loads the latest ones back
-(``load_recent_history``; GH-244's send path reads the chat and them in one
-statement, S16, with ``load_turn``). The legacy ``session_id`` API keeps one
-chat per (user, session id) through ``chats.legacy_session_id`` until #177
+(GH-244's send path reads the chat and them in one statement, S16, with
+``load_turn``). The legacy ``session_id`` API keeps one chat per (user,
+session id) through ``chats.legacy_session_id`` until #177
 (``find_legacy_chat``, ``get_or_create_legacy_chat``). GH-66's promotion
 notice reaches every live chat of the org (``append_org_notice``), and the
 Super Admin's org metadata counts the org's chats (``count_org_chats``).
@@ -18,8 +18,13 @@ chat's active attachments (``ActiveAttachment``: sent with one of its
 messages, live, ``ready``, in the order they were sent), and a run whose
 slot 4 held them stores the slot's ids on each of its assistant messages
 (S8', migration 0029) and sets the chat's sticky ``external_content`` flag.
-The upload, reads and files are ``admino.attachments``, which imports this
-module (never the reverse); their derived files are read by
+GH-190: the turn read (T2'') leaves out excluded files (``attachments.active``
+false, migration 0030) and carries each active file's stored
+``token_estimate`` and ``derived_bytes`` for the context budget and the byte
+cap; each message of the chat detail carries the ids of its live attachments,
+excluded ones too (S9' / S11'), and the detail no longer counts the messages
+(Decision 13). The upload, reads and files are ``admino.attachments``, which
+imports this module (never the reverse); their derived files are read by
 ``admino.attachment_context``.
 
 Inputs: an executor (an asyncpg pool or connection) or, for the three
@@ -30,10 +35,10 @@ transactional writes (``trash_chat``, ``append_messages`` and
 carries and the slot's ids its answers included) and whether the run
 received external content; page sizes and opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
-``MessagePage``, its message count and latest message status), ``ChatTurn``
-(the chat, its history and its active ``ActiveAttachment``s),
-``LLMMessage`` lists, counts, whether an automatic title was stored and the
-id of a turn's last appended message.
+``MessagePage`` whose messages carry their ``attachment_ids``, and its latest
+message status), ``ChatTurn`` (the chat, its history and its active
+``ActiveAttachment``s with their estimates), counts, whether an automatic
+title was stored and the id of a turn's last appended message.
 Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
 ``system`` message or a message of content parts to store, attachments
 without a ``user`` message to carry them), ``audit_events.AuditRecordError``
@@ -44,13 +49,15 @@ Behaviour:
   messages by ``seq`` descending (returned chronologically). A page fetches
   one row more than asked to know whether ``next_cursor`` is needed.
 - Cursors are base64url JSON tagged with their kind, at most 200 characters:
-  a chat-list cursor never decodes as a message cursor, and anything that
-  doesn't decode is ``InvalidCursorError``, so is one whose position can't be
-  bound (a seq beyond BIGINT, a timestamp without a UTC equivalent). A cursor
-  carries a position only, never a scope: the caller's tenant still filters
-  every row.
-- ``read_chat_detail`` runs the owner check once, first; the page, the count
-  and the latest status (its ``status`` column only) follow it.
+  a chat-list cursor never decodes as a message cursor (nor as
+  ``admino.attachments``' list cursor, which shares ``encode_cursor`` /
+  ``decode_cursor`` and ``CursorStamp``), and anything that doesn't decode is
+  ``InvalidCursorError``, so is one whose position can't be bound (a seq
+  beyond BIGINT, a timestamp without a UTC equivalent). A cursor carries a
+  position only, never a scope: the caller's tenant still filters every row.
+- ``read_chat_detail`` runs the owner check once, first; the page (with each
+  message's attachment ids) and the latest status (its ``status`` column
+  only) follow it.
 - JSONB values travel as JSON text (``$n::jsonb``) and come back as text,
   decoded here. PostgreSQL's TEXT and JSONB refuse U+0000, so it is removed
   from message content and from every string (keys included) inside the JSON
@@ -92,9 +99,11 @@ Security notes:
 - Attachments are linked only when they are the caller's, in this chat, in
   the caller's org, unsent and live (A9 states all five), and trashed only
   with their chat after its owner check (A10 binds the trashed chat and the
-  caller's org). The turn read (T2') returns only the attachments of the
+  caller's org). The turn read (T2'') returns only the attachments of the
   caller's chat whose org and owner are the chat's, sent with one of its
-  messages, live and ``ready``. None of them reads, writes or names a file.
+  messages, live, ``ready`` and active; the detail page's attachment ids are
+  those of the page's messages (the checked chat's) in the caller's org.
+  None of them reads, writes or names a file.
 - An automatic title never overwrites a user's: ``set_auto_title`` is a
   compare-and-set on ``title_source = 'auto' AND title = ''`` (plus the
   owner, org and ``deleted_at IS NULL`` filters) and returns False instead of
@@ -267,24 +276,35 @@ _LINK_ATTACHMENTS_SQL: Final = """
     WHERE id = ANY($2::uuid[]) AND chat_id = $3 AND org_id = $4 AND owner_user_id = $5
         AND message_id IS NULL AND deleted_at IS NULL
 """
-# S9: a chat's latest messages (newest first) ...
+# S9' (GH-190, Decision 12): a chat's latest messages (newest first), each with the ids of
+# the live attachments linked to it (excluded ones too, as they stay listed) ...
 _LATEST_MESSAGES_SQL: Final = """
-    SELECT id, seq, role, content, tool_use_blocks, tool_call_id, tool_calls, status, created_at
-    FROM chat_messages
-    WHERE chat_id = $1 AND org_id = $2
-    ORDER BY seq DESC
+    SELECT m.id, m.seq, m.role, m.content, m.tool_use_blocks, m.tool_call_id, m.tool_calls,
+           m.status, m.created_at,
+           ARRAY(
+               SELECT a.id FROM attachments a
+               WHERE a.message_id = m.id AND a.org_id = m.org_id AND a.deleted_at IS NULL
+               ORDER BY a.created_at, a.id
+           ) AS attachment_ids
+    FROM chat_messages m
+    WHERE m.chat_id = $1 AND m.org_id = $2
+    ORDER BY m.seq DESC
     LIMIT $3
 """
-# ... and those before a cursor's seq.
+# ... and S11', those before a cursor's seq.
 _MESSAGES_BEFORE_SQL: Final = """
-    SELECT id, seq, role, content, tool_use_blocks, tool_call_id, tool_calls, status, created_at
-    FROM chat_messages
-    WHERE chat_id = $1 AND org_id = $2 AND seq < $3
-    ORDER BY seq DESC
+    SELECT m.id, m.seq, m.role, m.content, m.tool_use_blocks, m.tool_call_id, m.tool_calls,
+           m.status, m.created_at,
+           ARRAY(
+               SELECT a.id FROM attachments a
+               WHERE a.message_id = m.id AND a.org_id = m.org_id AND a.deleted_at IS NULL
+               ORDER BY a.created_at, a.id
+           ) AS attachment_ids
+    FROM chat_messages m
+    WHERE m.chat_id = $1 AND m.org_id = $2 AND m.seq < $3
+    ORDER BY m.seq DESC
     LIMIT $4
 """
-# S10
-_COUNT_MESSAGES_SQL: Final = "SELECT count(*) FROM chat_messages WHERE chat_id = $1 AND org_id = $2"
 # S15: the status of a chat's latest message, without the rest of its row.
 _LATEST_STATUS_SQL: Final = """
     SELECT status FROM chat_messages
@@ -328,24 +348,29 @@ _SET_AUTO_TITLE_SQL: Final = """
 """
 # S16 (GH-244): the caller's live chat with its latest messages (newest first) in ONE
 # statement, because the send path may make at most 3 statements before its LLM call; it
-# stands in for get_chat (S2) plus load_recent_history (S2 again, then S9). The window is
-# counted per chat (LATERAL) and the owner filters sit on the chat, so no row means not
-# found, and a chat without messages gives one row with NULL message columns.
+# stands in for get_chat (S2) plus a message read. The window is counted per chat
+# (LATERAL) and the owner filters sit on the chat, so no row means not found, and a chat
+# without messages gives one row with NULL message columns.
 # T2' (GH-189, Decision 13): the same statement also returns the chat's active
 # attachments (sent with one of its messages, live, ready) on every row, as text arrays
-# [id, filename, kind, page_count] in the order they were sent (Decision 3: the carrying
-# message's seq, then upload order). They don't depend on the message window, and the
-# attachment filters repeat the chat's org and owner.
+# in the order they were sent (Decision 3: the carrying message's seq, then upload
+# order). They don't depend on the message window, and the attachment filters repeat
+# the chat's org and owner.
+# T2'' (GH-190, Decisions 10 and 14): an excluded file (active false, migration 0030) is
+# not active, and each array also carries the stored token_estimate and derived_bytes
+# ([id, filename, kind, page_count, token_estimate, derived_bytes]), so the send path
+# checks the budget and the byte cap without another statement.
 _TURN_SQL: Final = """
     SELECT c.id, c.org_id, c.owner_user_id, c.title, c.title_source, c.external_content,
            c.created_at, c.last_activity_at,
            ARRAY(
-               SELECT ARRAY[a.id::text, a.filename, a.kind, a.page_count::text]
+               SELECT ARRAY[a.id::text, a.filename, a.kind, a.page_count::text,
+                            a.token_estimate::text, a.derived_bytes::text]
                FROM attachments a
                JOIN chat_messages am ON am.id = a.message_id AND am.org_id = a.org_id
                WHERE a.chat_id = c.id AND a.org_id = c.org_id
                  AND a.owner_user_id = c.owner_user_id
-                 AND a.status = 'ready' AND a.deleted_at IS NULL
+                 AND a.status = 'ready' AND a.active AND a.deleted_at IS NULL
                ORDER BY am.seq, a.created_at, a.id
            ) AS attachment_rows,
            m.role, m.content, m.tool_use_blocks, m.tool_call_id
@@ -423,6 +448,9 @@ class MessageRecord(SealedModel):
     tool_calls: list[dict[str, Any]] | None
     status: MessageStatus
     created_at: datetime
+    # GH-190 (Decision 12): the live attachments linked to the message, active or not, by
+    # created_at then id (S9' / S11').
+    attachment_ids: list[PlainUUID] = Field(default_factory=list)
 
 
 class ChatPage(SealedModel):
@@ -440,11 +468,10 @@ class MessagePage(SealedModel):
 
 
 class ChatDetail(SealedModel):
-    """A chat of the caller with one page of its messages, its count and latest status."""
+    """A chat of the caller with one page of its messages and its latest status."""
 
     chat: ChatRecord
     page: MessagePage
-    message_count: int
     # None for a chat without messages.
     latest_status: MessageStatus | None
 
@@ -454,7 +481,8 @@ class ActiveAttachment(SealedModel):
 
     ``filename`` is the stored name (``prompt_assembly.prompt_filename``
     makes the prompt name of it); ``page_count`` is None for a kind without
-    pages.
+    pages. GH-190: ``token_estimate`` and ``derived_bytes`` are the stored
+    values the budget and the byte cap are checked with (None for NULL).
     """
 
     # The stored name is user content: a validation error never repeats it.
@@ -464,15 +492,18 @@ class ActiveAttachment(SealedModel):
     filename: str
     kind: AttachmentKind
     page_count: int | None
+    token_estimate: int | None = None
+    derived_bytes: int | None = None
 
 
 @dataclass(frozen=True)
 class ChatTurn:
     """A chat of the caller, the agent's history of it and its active attachments.
 
-    Read by one statement (S16, T2' since GH-189). ``attachments`` are the
-    chat's sent, live, ``ready`` files in the order they were sent: by the
-    carrying message (oldest first), then ``created_at``, then ``id``.
+    Read by one statement (S16, T2' since GH-189, T2'' since GH-190).
+    ``attachments`` are the chat's sent, live, ``ready``, active files in the
+    order they were sent: by the carrying message (oldest first), then
+    ``created_at``, then ``id``.
     """
 
     chat: ChatRecord
@@ -495,11 +526,15 @@ def _utc_representable(value: datetime) -> datetime:
     return value
 
 
+# A cursor's timestamp: aware and with a UTC equivalent, so asyncpg can bind it.
+CursorStamp = Annotated[AwareDatetime, AfterValidator(_utc_representable)]
+
+
 class _ChatCursor(SealedModel):
     """The position after the last chat of a list page."""
 
     kind: Literal["chats"] = "chats"
-    last_activity_at: Annotated[AwareDatetime, AfterValidator(_utc_representable)]
+    last_activity_at: CursorStamp
     id: UUID
 
 
@@ -510,13 +545,18 @@ class _MessageCursor(SealedModel):
     seq: StrictInt = Field(ge=1, le=_MAX_SEQ)
 
 
-def _encode_cursor(cursor: _ChatCursor | _MessageCursor) -> str:
-    """The opaque cursor string: unpadded base64url of the cursor's JSON."""
+def encode_cursor(cursor: SealedModel) -> str:
+    """The opaque cursor string: unpadded base64url of the cursor's JSON.
+
+    Shared with ``admino.attachments``' list cursor; each cursor model is
+    tagged with its own ``kind``, so one list's cursor never decodes as
+    another's.
+    """
     return base64.urlsafe_b64encode(cursor.model_dump_json().encode()).rstrip(b"=").decode()
 
 
-def _decode_cursor[C: (_ChatCursor, _MessageCursor)](cursor: str, kind: type[C]) -> C:
-    """Decode a cursor of one kind.
+def decode_cursor[C: SealedModel](cursor: str, kind: type[C]) -> C:
+    """Decode a cursor of one kind (at most 200 base64url characters).
 
     Raises:
         InvalidCursorError: If it isn't base64url JSON of that kind of cursor.
@@ -578,6 +618,11 @@ def _message_record(row: Any) -> MessageRecord:
             "tool_calls": _from_json(row["tool_calls"]),
         }
     )
+
+
+def _int_or_none(text: str | None) -> int | None:
+    """A T2'' array's number column (text there) as an int, None for NULL."""
+    return None if text is None else int(text)
 
 
 # Any: asyncpg returns untyped Records.
@@ -721,7 +766,7 @@ async def list_chats(
     if cursor is None:
         rows = await executor.fetch(_LIST_SQL, tenant.org_id, tenant.user_id, limit + 1)
     else:
-        after = _decode_cursor(cursor, _ChatCursor)
+        after = decode_cursor(cursor, _ChatCursor)
         rows = await executor.fetch(
             _LIST_AFTER_SQL,
             tenant.org_id,
@@ -734,9 +779,7 @@ async def list_chats(
     next_cursor = None
     if len(rows) > limit:
         last = chats[-1]
-        next_cursor = _encode_cursor(
-            _ChatCursor(last_activity_at=last.last_activity_at, id=last.id)
-        )
+        next_cursor = encode_cursor(_ChatCursor(last_activity_at=last.last_activity_at, id=last.id))
     return ChatPage(chats=chats, next_cursor=next_cursor)
 
 
@@ -952,37 +995,13 @@ async def append_messages(
     return message_id
 
 
-async def load_recent_history(
-    executor: Executor, tenant: TenantContext, chat_id: UUID, *, limit: int
-) -> list[LLMMessage]:
-    """Return the latest messages of the caller's chat as the agent's history.
-
-    Args:
-        executor: The pool or a connection.
-        tenant: The caller's org scope.
-        chat_id: The chat.
-        limit: How many of the latest messages to load (the context window).
-
-    Returns:
-        The messages in chronological order, without the leading ``tool``
-        results whose assistant turn fell outside the window.
-
-    Raises:
-        ChatNotFoundError: Unless the chat is the caller's and not trashed.
-    """
-    await get_chat(executor, tenant, chat_id)
-    rows = await executor.fetch(_LATEST_MESSAGES_SQL, chat_id, tenant.org_id, limit)
-    return _history(rows)
-
-
 async def load_turn(
     executor: Executor, tenant: TenantContext, chat_id: UUID, *, limit: int
 ) -> ChatTurn:
     """Return the caller's live chat and its latest messages as the agent's history (S16).
 
-    One statement, where ``get_chat`` plus ``load_recent_history`` take three:
-    the send path runs it under the chat's run lock as its last statement
-    before the LLM call (GH-244).
+    One statement (T2''): the send path runs it under the chat's run lock as
+    its last statement before the LLM call (GH-244).
 
     Args:
         executor: The pool or a connection.
@@ -991,12 +1010,13 @@ async def load_turn(
         limit: How many of the latest messages to load (the context window).
 
     Returns:
-        The ``ChatTurn``: the chat as ``get_chat`` returns it, the history
-        as ``load_recent_history`` returns it (chronological, without the
+        The ``ChatTurn``: the chat as ``get_chat`` returns it, the latest
+        ``limit`` messages as the agent's history (chronological, without the
         leading ``tool`` results whose assistant turn fell outside the
-        window) and the chat's active attachments (GH-189, T2': sent with one
-        of its messages, live, ``ready``, in the order they were sent,
-        whatever the window; ``()`` for none).
+        window) and the chat's active attachments (GH-189, T2'': sent with one
+        of its messages, live, ``ready``, not excluded, in the order they were
+        sent, whatever the window, with their stored ``token_estimate`` and
+        ``derived_bytes``; ``()`` for none).
 
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed.
@@ -1007,15 +1027,24 @@ async def load_turn(
     chat = _chat_record({column: rows[0][column] for column in ChatRecord.model_fields})
     # A chat without messages gives one row whose message columns are NULL (role is NOT NULL).
     messages = [row for row in rows if row["role"] is not None]
-    # Every row carries the same array; its page count is text (NULL for no pages).
+    # Every row carries the same array; its numbers are text (NULL for none).
     attachments = tuple(
         ActiveAttachment(
             id=UUID(attachment_id),
             filename=filename,
             kind=kind,
-            page_count=None if page_count is None else int(page_count),
+            page_count=_int_or_none(page_count),
+            token_estimate=_int_or_none(token_estimate),
+            derived_bytes=_int_or_none(derived_bytes),
         )
-        for attachment_id, filename, kind, page_count in rows[0]["attachment_rows"]
+        for (
+            attachment_id,
+            filename,
+            kind,
+            page_count,
+            token_estimate,
+            derived_bytes,
+        ) in rows[0]["attachment_rows"]
     )
     return ChatTurn(chat=chat, history=_history(messages), attachments=attachments)
 
@@ -1023,12 +1052,13 @@ async def load_turn(
 async def read_chat_detail(
     executor: Executor, tenant: TenantContext, chat_id: UUID, *, limit: int, cursor: str | None
 ) -> ChatDetail:
-    """Return the caller's chat with one page of its messages, its count and latest status.
+    """Return the caller's chat with one page of its messages and its latest status.
 
     The owner check (S2) runs once and first: a chat the caller can't reach
-    runs nothing else, and the cursor is decoded only after it. The page,
-    the count and the latest status (its ``status`` column only) bind the
-    checked chat and the caller's org.
+    runs nothing else, and the cursor is decoded only after it. The page
+    (S9' or S11', each message with its ``attachment_ids``) and the latest
+    status (S15, its ``status`` column only) bind the checked chat and the
+    caller's org. GH-190 (Decision 13): the messages are no longer counted.
 
     Args:
         executor: The pool or a connection.
@@ -1039,9 +1069,10 @@ async def read_chat_detail(
 
     Returns:
         The chat; up to ``limit`` messages before the cursor, in
-        chronological order, with the cursor of the earlier messages (None
-        at the beginning); the chat's message count; the status of its
-        latest message (highest seq; None without messages).
+        chronological order, each with the ids of its live attachments
+        (excluded ones too), with the cursor of the earlier messages (None
+        at the beginning); the status of its latest message (highest seq;
+        None without messages).
 
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed.
@@ -1051,22 +1082,20 @@ async def read_chat_detail(
     if cursor is None:
         rows = await executor.fetch(_LATEST_MESSAGES_SQL, chat_id, tenant.org_id, limit + 1)
     else:
-        before = _decode_cursor(cursor, _MessageCursor)
+        before = decode_cursor(cursor, _MessageCursor)
         rows = await executor.fetch(
             _MESSAGES_BEFORE_SQL, chat_id, tenant.org_id, before.seq, limit + 1
         )
     messages = [_message_record(row) for row in reversed(rows[:limit])]
     next_cursor = None
     if len(rows) > limit:
-        next_cursor = _encode_cursor(_MessageCursor(seq=messages[0].seq))
-    message_count = int(await executor.fetchval(_COUNT_MESSAGES_SQL, chat_id, tenant.org_id))
+        next_cursor = encode_cursor(_MessageCursor(seq=messages[0].seq))
     latest_status: MessageStatus | None = await executor.fetchval(
         _LATEST_STATUS_SQL, chat_id, tenant.org_id
     )
     return ChatDetail(
         chat=chat,
         page=MessagePage(messages=messages, next_cursor=next_cursor),
-        message_count=message_count,
         latest_status=latest_status,
     )
 

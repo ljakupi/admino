@@ -7,19 +7,29 @@ attachments volume as ``<root>/<org_id>/<attachment_id>`` and described by an
 (``attachment_processing``), whose conversion writes the derived artifacts
 into ``<root>/<org_id>/<attachment_id>.d/`` (``derived_path``, GH-188) and
 stores the file's token estimate and derived bytes (migration 0028). The
-org's storage quota counts the originals and their derived files.
+org's storage quota counts the originals and their derived files. GH-190
+(migration 0030): a member excludes a file from the context or includes it
+again (``set_active``, the ``active`` flag; an excluded file stays linked to
+its message and listed), lists their chat's files (``list_chat_attachments``)
+and the context budget counts the chat's ready, active files
+(``ready_active_attachments``).
 
 Inputs: the pool or an executor, the caller's ``TenantContext``, a chat id,
-the already sanitized file name, the declared ``Content-Length``, the request
-body as an async iterator of chunks, the attachments root, the platform's
-maximum file size and the client IP (for the audit event).
-Outputs: ``AttachmentRecord``s, ``(file_count, used_bytes)`` of an org, its
+an attachment id, the already sanitized file name, the declared
+``Content-Length``, the request body as an async iterator of chunks, the
+attachments root, the platform's maximum file size, the new ``active`` flag,
+a page size, an opaque cursor and the list filters (status, flag), and the
+client IP (for the audit events).
+Outputs: ``AttachmentRecord``s, an ``AttachmentPage`` (oldest first, with
+the next page's cursor), ``(file_count, used_bytes)`` of an org, its
 ``(quota_bytes, used_bytes)`` under its row lock (``lock_org_storage``, for
 the upload's commit check and the processing step's ready outcome), the
 number of disk entries removed (``remove_files``; ``remove_derived`` removes
-one attachment's ``<id>.d`` only), and the files a message may send as
-``chats.ActiveAttachment``s (``check_sendable``, GH-189). Errors:
-``AttachmentRefusedError`` (with a reason code), ``chats.ChatNotFoundError``,
+one attachment's ``<id>.d`` only), the active files a message may send as
+``chats.ActiveAttachment``s (``check_sendable``, GH-189; GH-190: with their
+stored estimate and derived bytes) and the chat's ready, active files
+(``ready_active_attachments``). Errors: ``AttachmentRefusedError`` (with a
+reason code), ``chats.ChatNotFoundError``, ``chats.InvalidCursorError``,
 ``AttachmentNotFoundError``, ``AttachmentAlreadySentError``,
 ``AttachmentNotReadyError``, ``audit_events.AuditRecordError`` and the
 driver's errors.
@@ -45,7 +55,18 @@ Security notes:
   data, their user id); another org's, a colleague's, a trashed and an
   unknown attachment raise the same ``AttachmentNotFoundError`` with a fixed
   text. The composite foreign key of migration 0027 makes an attachment of
-  someone else's chat impossible in the database too.
+  someone else's chat impossible in the database too. The chat list runs the
+  chat's owner check first (``chats.ChatNotFoundError`` for any chat but the
+  caller's live one) and decodes its cursor only then; a cursor carries a
+  position (``created_at``, ``id``), never a scope.
+- Exclusion (GH-190): ``set_active`` locks the caller's live attachment
+  (``FOR UPDATE``) and changes only its ``active`` column (migration 0030
+  grants the runtime role UPDATE on it), and records ``file.exclude`` or
+  ``file.include`` (ids only, no metadata) in the same transaction, so the
+  change never happens unaudited; the same value again writes and records
+  nothing. ``check_sendable`` refuses over every id, excluded ones included,
+  and returns the active ones only, so an excluded file never reaches the
+  slot.
 - The file is named by its id only; the original name lives in the row.
   Directories are created 0700 (a missing root too; an existing root's
   mode is left alone), files 0600; the partial file is created
@@ -69,9 +90,11 @@ Security notes:
   ZIP directory parse grows with the file) is bounded across uploads.
 - No content in logs: nothing here logs a file name, a path or file bytes;
   ``remove_files`` and ``remove_derived`` log ids and an exception's class
-  name only.
-- Parameterized SQL only (the contract's forms A1-A7 and GH-189's A8'),
-  every value a bind parameter. Imports nothing from the server, agent, LLM or tools layers.
+  name only. No audit event carries a file name.
+- Parameterized SQL only (the contract's forms A1-A4', A5'/A6', A7', A8'',
+  A10a/A10b, A11/A11' and A12), every value a bind parameter (the list
+  filters bind NULL for "any"). Imports nothing from the server, agent, LLM
+  or tools layers.
 """
 
 from __future__ import annotations
@@ -85,7 +108,8 @@ import shutil
 import stat
 import uuid
 from datetime import datetime  # noqa: TC003 — Pydantic resolves field annotations at runtime
-from typing import TYPE_CHECKING, Any, BinaryIO, Final
+from typing import TYPE_CHECKING, Any, BinaryIO, Final, Literal
+from uuid import UUID
 
 import asyncpg
 
@@ -102,7 +126,6 @@ from admino.models import (  # noqa: TC001 — Pydantic resolves field annotatio
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterable, Iterator, Sequence
     from pathlib import Path
-    from uuid import UUID
 
     from admino.chats import Executor
     from admino.tenancy import TenantContext
@@ -159,17 +182,17 @@ _USED_SQL: Final = (
     "SELECT coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0)"
     " FROM attachments WHERE org_id = $1"
 )
-# A5: the new row (status, reason, page count, estimate and timestamps by default).
+# A5': the new row (status, reason, page count, estimate, flag and timestamps by default).
 _INSERT_SQL: Final = """
     INSERT INTO attachments (id, org_id, chat_id, owner_user_id, filename, kind, size_bytes)
     VALUES ($1, $2, $3, $4, $5, $6, $7)
     RETURNING id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
-              page_count, token_estimate, created_at
+              page_count, token_estimate, active, created_at
 """
-# A6: the caller's live attachment.
+# A6': the caller's live attachment.
 _GET_SQL: Final = """
     SELECT id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
-           page_count, token_estimate, created_at
+           page_count, token_estimate, active, created_at
     FROM attachments
     WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
 """
@@ -180,12 +203,55 @@ _STORAGE_SQL: Final = """
            coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0) AS used_bytes
     FROM attachments WHERE org_id = $1
 """
-# A8' (GH-189): which of the given ids are the caller's live attachments of the chat,
-# with what the send rules and slot 4 need, in upload order.
+# A8'' (GH-189, GH-190): which of the given ids are the caller's live attachments of the
+# chat, with what the send rules, the budget and slot 4 need, in upload order. Excluded
+# files are read too: the refusals hold for every id, the slot takes the active ones only.
 _SENDABLE_SQL: Final = """
-    SELECT id, message_id, status, filename, kind, page_count FROM attachments
+    SELECT id, message_id, status, filename, kind, page_count, token_estimate, derived_bytes, active
+    FROM attachments
     WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4
       AND deleted_at IS NULL
+    ORDER BY created_at, id
+"""
+# A10a (GH-190): the caller's live attachment, locked for the flag's compare-and-set ...
+_LOCK_SQL: Final = """
+    SELECT id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
+           page_count, token_estimate, active, created_at
+    FROM attachments
+    WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
+    FOR UPDATE
+"""
+# ... and A10b, its new flag (the row A10a locked: the owner was checked there).
+_SET_ACTIVE_SQL: Final = "UPDATE attachments SET active = $3 WHERE id = $1 AND org_id = $2"
+# A11 (GH-190, Decision 11): the caller's live attachments of the chat, oldest first, with
+# the optional status and active filters (NULL: any): the first page ...
+_LIST_SQL: Final = """
+    SELECT id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
+           page_count, token_estimate, active, created_at
+    FROM attachments
+    WHERE chat_id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
+      AND status = coalesce($4, status) AND active = coalesce($5, active)
+    ORDER BY created_at, id
+    LIMIT $6
+"""
+# ... and A11', the page after a cursor's position.
+_LIST_AFTER_SQL: Final = """
+    SELECT id, chat_id, message_id, filename, kind, size_bytes, status, failure_reason,
+           page_count, token_estimate, active, created_at
+    FROM attachments
+    WHERE chat_id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
+      AND status = coalesce($4, status) AND active = coalesce($5, active)
+      AND (created_at, id) > ($6, $7)
+    ORDER BY created_at, id
+    LIMIT $8
+"""
+# A12 (GH-190, Decision 7): the chat's live, ready, active files (sent or not) with their
+# stored estimate and derived bytes, in upload order: what the context report counts.
+_READY_ACTIVE_SQL: Final = """
+    SELECT id, filename, kind, page_count, token_estimate, derived_bytes
+    FROM attachments
+    WHERE chat_id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
+      AND status = 'ready' AND active
     ORDER BY created_at, id
 """
 
@@ -211,7 +277,24 @@ class AttachmentRecord(SealedModel):
     failure_reason: str | None
     page_count: int | None
     token_estimate: int | None
+    # GH-190 (migration 0030): False for a file the user excluded from the context.
+    active: bool
     created_at: datetime
+
+
+class AttachmentPage(SealedModel):
+    """One page of a chat's attachments, oldest first; ``next_cursor`` None on the last page."""
+
+    attachments: list[AttachmentRecord]
+    next_cursor: str | None
+
+
+class _AttachmentCursor(SealedModel):
+    """The position after the last attachment of a list page."""
+
+    kind: Literal["attachments"] = "attachments"
+    created_at: chats.CursorStamp
+    id: UUID
 
 
 class AttachmentNotFoundError(LookupError):
@@ -558,12 +641,15 @@ async def check_sendable(
 ) -> list[chats.ActiveAttachment]:
     """Check that every id is the caller's live, unsent, ``ready`` attachment of the chat.
 
-    One statement (A8'); none for no ids. The refusals come in this order,
-    each for any of the files: not found, already sent, not ready.
+    One statement (A8''); none for no ids. The refusals come in this order,
+    each for any of the files, excluded ones included: not found, already
+    sent, not ready.
 
     Returns:
-        The files as slot 4 needs them, in upload order (``created_at``, then
-        ``id``); ``[]`` for no ids.
+        The active files (GH-190: an excluded one is sent, linked, but never
+        in the slot) as slot 4 and the budget need them, with their stored
+        estimate and derived bytes, in upload order (``created_at``, then
+        ``id``); ``[]`` for no ids or only excluded ones.
 
     Raises:
         AttachmentNotFoundError: An id that isn't the caller's live
@@ -584,12 +670,134 @@ async def check_sendable(
         raise AttachmentAlreadySentError
     if any(row["status"] != "ready" for row in rows):
         raise AttachmentNotReadyError
-    return [
-        chats.ActiveAttachment(
-            id=row["id"], filename=row["filename"], kind=row["kind"], page_count=row["page_count"]
+    return [_active_attachment(row) for row in rows if row["active"]]
+
+
+# Any: asyncpg returns untyped Records.
+def _active_attachment(row: Any) -> chats.ActiveAttachment:
+    """The ActiveAttachment of an A8'' or A12 row."""
+    return chats.ActiveAttachment(
+        id=row["id"],
+        filename=row["filename"],
+        kind=row["kind"],
+        page_count=row["page_count"],
+        token_estimate=row["token_estimate"],
+        derived_bytes=row["derived_bytes"],
+    )
+
+
+async def set_active(
+    pool: asyncpg.Pool, tenant: TenantContext, attachment_id: UUID, active: bool, *, ip: str | None
+) -> AttachmentRecord:
+    """Include the caller's attachment in the context or exclude it, and audit the change.
+
+    One transaction: the caller's live attachment is locked (A10a), whatever
+    its status and whether it was sent; the same value again returns it with
+    nothing written and nothing recorded (idempotent). Otherwise the flag is
+    set (A10b) and ``file.exclude`` or ``file.include`` is recorded on the
+    same connection (the member, the file as the target, no metadata), so a
+    failed audit write rolls the change back. An excluded file stays linked
+    to its message and listed.
+
+    Args:
+        pool: The database pool.
+        tenant: The caller's org scope; the caller owns the file.
+        attachment_id: The attachment.
+        active: True to include it, False to exclude it.
+        ip: The client IP, for the audit event.
+
+    Returns:
+        The attachment with its flag as it now is.
+
+    Raises:
+        AttachmentNotFoundError: Unless the attachment is the caller's (their
+            org, their own) and not trashed; nothing is written.
+        AuditRecordError: If the event can't be recorded; the flag is rolled
+            back.
+    """
+    async with pool.acquire() as conn, conn.transaction():
+        row = await conn.fetchrow(_LOCK_SQL, attachment_id, tenant.org_id, tenant.user_id)
+        if row is None:
+            raise AttachmentNotFoundError
+        if row["active"] == active:
+            return _record(row)
+        await conn.execute(_SET_ACTIVE_SQL, attachment_id, tenant.org_id, active)
+        await audit_events.record(
+            conn,
+            action=AuditAction.FILE_INCLUDE if active else AuditAction.FILE_EXCLUDE,
+            actor_kind="member",
+            actor_user_id=tenant.user_id,
+            org_id=tenant.org_id,
+            target_type=TargetType.FILE,
+            target_ids=(attachment_id,),
+            ip=ip,
         )
-        for row in rows
-    ]
+    return _record({**dict(row), "active": active})
+
+
+async def list_chat_attachments(
+    executor: Executor,
+    tenant: TenantContext,
+    chat_id: UUID,
+    *,
+    limit: int,
+    cursor: str | None,
+    status: AttachmentStatus | None,
+    active: bool | None,
+) -> AttachmentPage:
+    """Return one page of the caller's live attachments of their chat, oldest first.
+
+    The chat's owner check (S2) runs first: a chat the caller can't reach
+    runs nothing else, and the cursor is decoded only after it (A11, or A11'
+    after a cursor). Trashed files are never listed; excluded ones are.
+
+    Args:
+        executor: The pool or a connection.
+        tenant: The caller's org scope; the caller owns the chat.
+        chat_id: The chat.
+        limit: The page size (at least 1).
+        cursor: The previous page's ``next_cursor``, or None for the first page.
+        status: Only files with this status, or None for any.
+        active: Only included (True) or excluded (False) files, or None for both.
+
+    Returns:
+        The attachments by ``created_at`` then ``id``, and the cursor of the
+        next page (None on the last one).
+
+    Raises:
+        chats.ChatNotFoundError: Unless the chat is the caller's and not trashed.
+        chats.InvalidCursorError: If the cursor isn't an attachment-list cursor.
+    """
+    await chats.get_chat(executor, tenant, chat_id)
+    scope = (chat_id, tenant.org_id, tenant.user_id, status, active)
+    if cursor is None:
+        rows = await executor.fetch(_LIST_SQL, *scope, limit + 1)
+    else:
+        after = chats.decode_cursor(cursor, _AttachmentCursor)
+        rows = await executor.fetch(_LIST_AFTER_SQL, *scope, after.created_at, after.id, limit + 1)
+    records = [_record(row) for row in rows[:limit]]
+    next_cursor = None
+    if len(rows) > limit:
+        last = records[-1]
+        next_cursor = chats.encode_cursor(_AttachmentCursor(created_at=last.created_at, id=last.id))
+    return AttachmentPage(attachments=records, next_cursor=next_cursor)
+
+
+async def ready_active_attachments(
+    executor: Executor, tenant: TenantContext, chat_id: UUID
+) -> list[chats.ActiveAttachment]:
+    """Return the chat's live, ``ready``, active attachments, sent or not (A12).
+
+    What the upload rejection's context report counts (Decision 7). A
+    colleague's or another org's chat gives ``[]`` (every row binds the
+    caller's org and the caller).
+
+    Returns:
+        The files with their stored estimate and derived bytes (None for
+        NULL), in upload order (``created_at``, then ``id``).
+    """
+    rows = await executor.fetch(_READY_ACTIVE_SQL, chat_id, tenant.org_id, tenant.user_id)
+    return [_active_attachment(row) for row in rows]
 
 
 def _remove_entry(path: Path, attachment_id: UUID) -> bool:

@@ -9,10 +9,12 @@ once per active attachment, to build the ``AttachmentContent`` that
 Inputs: the attachments root (``attachments.attachments_root()``), the
 caller's org id and the chat's active attachments (``chats.ActiveAttachment``,
 read from the caller's own rows).
-Outputs: ``AttachmentContent``: the row's id, stored name, kind and page
-count, and the parts in manifest order (a text part as ``TextContent``; an
-image part as ``TextContent(label)`` when it has a label, then
-``ImageContent`` with the image's standard base64).
+Outputs: ``AttachmentContent``: the row's id, stored name, kind, page count
+and token estimate (GH-190: the row's, NULL as 0; the manifest's never
+replaces it, so the budget counts what the send rule checked), and the parts
+in manifest order (a text part as ``TextContent``; an image part as
+``TextContent(label)`` when it has a label, then ``ImageContent`` with the
+image's standard base64).
 Errors: ``AttachmentUnavailableError``, one error with a fixed text for every
 failure: a missing or unreadable file, a symlink, an invalid manifest, a
 manifest kind other than the row's, a text part that isn't strict UTF-8, or
@@ -135,8 +137,8 @@ def read_content(root: Path, org_id: UUID, attachment: ActiveAttachment) -> Atta
         attachment: One of the chat's active attachments.
 
     Returns:
-        Its content: the row's id, name, kind and page count, and the parts
-        in manifest order.
+        Its content: the row's id, name, kind, page count and token estimate
+        (NULL as 0), and the parts in manifest order.
 
     Raises:
         AttachmentUnavailableError: On any failure (see the module docstring);
@@ -155,6 +157,7 @@ def read_content(root: Path, org_id: UUID, attachment: ActiveAttachment) -> Atta
             kind=attachment.kind,
             page_count=attachment.page_count,
             parts=tuple(parts),
+            token_estimate=attachment.token_estimate or 0,
         )
     except (OSError, ValueError) as exc:
         # The class name only: an OSError's message holds the path, a
