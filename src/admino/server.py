@@ -124,7 +124,9 @@ Routes:
   resumed run's LLM error code), or streams like a turn (GH-8). An approval
   resumes with the chat's active attachments (GH-189; the 503 and the 422s
   above leave the confirmation pending). Both answers carry ``context_usage``
-  (GH-190), an approval also ``context_notice``.
+  (GH-190), an approval also ``context_notice``. The platform settings are
+  read under the chat's hold, and an approval whose chat was trashed while it
+  waited removes its confirmation before the 404 (GH-294).
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -137,7 +139,9 @@ Routes:
   model capabilities, the retry limit and the number of residency orgs),
   limits, files, retention and security (Super Admin); audited. A switch to a
   non-Swiss provider needs the residency-org count confirmed (409
-  ``residency_confirmation`` otherwise).
+  ``residency_confirmation`` otherwise). A ``llm.max_input_tokens`` that leaves
+  no room for the reserved output and the safety margin is the 422
+  ``max_input_tokens_too_small`` before any database work (GH-294).
 - GET/PATCH /api/org/permissions — The Org Admin's own org's tool permission
   matrix; a change is audited.
 - GET  /api/org/critical-permissions — The org's four promotable (tier-2)
@@ -343,7 +347,8 @@ Security notes:
 - Attachment injection (GH-189, ``admino.attachment_context``,
   ``admino.prompt_assembly``): a chat's active attachments (its sent, live,
   ``ready`` files, read with the chat in ``chats.load_turn``, then the
-  message's own files) are slot 4 of every run of the chat: a turn, a legacy
+  message's own files not among them, so each file appears once, GH-294) are
+  slot 4 of every run of the chat: a turn, a legacy
   turn and an approved confirmation. Under the chat's hold, before a pending
   confirmation is cancelled or consumed, their derived files are read from
   ``<root>/<org_id>/<id>.d`` (the caller's org and rows only, no symlink
@@ -1632,6 +1637,15 @@ _STORAGE_UNAVAILABLE_BODY: Final = {
 _IMAGE_INPUT_UNSUPPORTED_BODY: Final = {
     "detail": "The current model does not accept image input",
     "reason": "image_input_unsupported",
+}
+# GH-294 (Decisions 1 and 3): a platform patch whose llm.max_input_tokens leaves no input
+# token beside the reserved output and the safety margin; every turn would be refused at
+# runtime. Fixed text, never the value patched or the config's.
+_MAX_INPUT_TOKENS_TOO_SMALL_BODY: Final = {
+    "detail": (
+        "The model's max input tokens leave no room for the reserved output and the safety margin"
+    ),
+    "reason": "max_input_tokens_too_small",
 }
 # GH-190 (Decision 5): a turn whose attachments alone don't fit, tokens checked before
 # bytes. The 422 body adds the per-file report (ids and stored sizes, never a name).
@@ -4641,6 +4655,24 @@ _CONFIRM_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
         },
     },
 }
+# The OpenAPI 422 of PATCH /api/platform/settings (GH-294, Decision 3). Documenting a 422
+# replaces FastAPI's generated one, so the description names the validation list too.
+_PLATFORM_PATCH_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
+    422: {
+        "description": (
+            "Validation Error (the usual list); or max_input_tokens_too_small: the "
+            "patch's llm.max_input_tokens leaves no room for the reserved output "
+            "(llm.max_response_tokens) and the safety margin (nothing written)."
+        ),
+        "content": {
+            "application/json": {
+                "examples": {
+                    "max_input_tokens_too_small": {"value": _MAX_INPUT_TOKENS_TOO_SMALL_BODY},
+                }
+            }
+        },
+    },
+}
 # The OpenAPI 409 of the chat message route (GH-8, GH-187, GH-189).
 _SEND_CONFLICT_RESPONSES: Final[dict[int | str, dict[str, object]]] = {
     409: {
@@ -4926,7 +4958,11 @@ async def _chat_turn(
     before a pending confirmation is cancelled, slot 4 is built
     (``_read_slot``): the chat's active attachments (``turn.attachments``,
     the files of earlier messages in send order) followed by the message's
-    own files. A file whose derived files can't be read is the 503
+    own files that aren't among them (GH-294, Decision 5: compared by id, so
+    a file a concurrent send of the chat linked meanwhile appears once, in
+    its earlier position, in the checks, the slot, the stored
+    ``included_attachment_ids`` and the ``tool.call`` rows'
+    ``attachment_ids``). A file whose derived files can't be read is the 503
     ``storage_unavailable``, an image part without the stored
     ``llm.image_input`` the 422 ``image_input_unsupported``; either is JSON
     (a streamed request's too) with nothing run or stored and the pending
@@ -5086,8 +5122,12 @@ async def _chat_turn(
         # external_content (GH-243), which must escalate this run (audit M-1).
         turn = await chats.load_turn(pool, tenant, chat_id, limit=_history_limit(platform))
         chat, loaded = turn.chat, turn.history
+        # One file once per turn (GH-294, Decision 5): a concurrent send of this chat may
+        # have linked one of this message's files already, so turn.attachments holds it.
+        linked = {attachment.id for attachment in turn.attachments}
+        own = [attachment for attachment in sent if attachment.id not in linked]
         # Before the pending confirmation is cancelled: a refused message keeps it.
-        slot = await _read_slot(tenant, platform, [*turn.attachments, *sent])
+        slot = await _read_slot(tenant, platform, [*turn.attachments, *own])
         if isinstance(slot, JSONResponse):
             return slot
         if _chat_runtime.pop_pending(chat.id) is not None:
@@ -5376,8 +5416,9 @@ async def post_confirm(
     it), with the caller's principal, the chat's ``external_content`` flag
     (read again under the hold, so a turn that ran in front of the approval
     counts), the stored platform limits and LLM retry limit (read on every
-    request, GH-160, GH-242) and their org's tool policy as it is now (loaded
-    again, after completing the org's due promotions; GH-161), then stores the
+    request, under the hold: GH-160, GH-242, GH-294) and their org's tool
+    policy as it is now (loaded again, after completing the org's due
+    promotions; GH-161), then stores the
     run like a turn (a confirmation it asks for counts against the caller's
     stored ``max_pending_confirmations`` in their other chats, the consumed
     one not included; GH-24). An approved resume also loads the caller's
@@ -5387,6 +5428,16 @@ async def post_confirm(
     whose LLM provider has meanwhile become non-Swiss ends with
     ``residency_blocked`` before the approved tool is dispatched (the agent's
     guard). Another user's pending confirmation is never found (404).
+
+    GH-294 (Decision 6): the stored platform settings are read once, under
+    the chat's hold and after the confirmation checks (a 404 or 400 reads
+    nothing more), for an approval and a denial alike: a change made while
+    the request waited for the hold (``image_input``, the limits, the retry
+    limit, ``max_input_tokens``) applies to the approved run and to the
+    denial's ``context_usage``. Decision 7: an approval whose chat was
+    trashed while it waited answers the 404 ``chat_not_found`` with its
+    pending confirmation removed first, so nothing is left for the reaper
+    and nothing is run, stored or audited.
 
     GH-8: with an ``Accept`` header listing ``text/event-stream`` an approval
     streams the resumed run like a turn (no title), and a denial streams
@@ -5413,8 +5464,10 @@ async def post_confirm(
     Raises:
         HTTPException: 404 if no confirmation is pending for the chat, it has
             expired or the id doesn't match, 400 if the IDs mismatch, 500
-            when a JSON approval's agent fails. A chat trashed meanwhile is
-            the 404 ``chat_not_found``.
+            when a JSON approval's agent fails.
+        chats.ChatNotFoundError: The chat was trashed meanwhile (404
+            ``chat_not_found``; an approval removes its pending confirmation
+            first, GH-294 Decision 7).
     """
     if _agent is None or _config is None:
         raise HTTPException(status_code=500, detail="Server not configured")
@@ -5426,7 +5479,6 @@ async def post_confirm(
 
     pool = get_pool()
     await _resolve_due_promotions(pool, principal)
-    platform = await _platform_run_settings()
     tenant = TenantContext.from_principal(principal)
     policy = await org_permissions.load_tool_policy(pool, tenant)
 
@@ -5469,6 +5521,10 @@ async def post_confirm(
         if _utc_now() >= pending.expires_at:
             _chat_runtime.pop_pending(chat.id)
             raise HTTPException(status_code=404, detail=_NO_PENDING_DETAIL)
+
+        # Read under the hold, once (GH-294, Decision 6): a change made while this request
+        # waited behind a running turn (image_input, the limits) applies to its run.
+        platform = await _platform_run_settings()
 
         if not body.approved:
             # A denial is consumed at once and reads no attachment (GH-189): the turn read
@@ -5526,7 +5582,13 @@ async def post_confirm(
         # set it; security audit M-1), the chat's active attachments (GH-189) and the
         # prompt context as it is now (GH-170: a change made while the confirmation was
         # pending applies to the resumed run).
-        turn = await chats.load_turn(pool, tenant, chat.id, limit=_history_limit(platform))
+        try:
+            turn = await chats.load_turn(pool, tenant, chat.id, limit=_history_limit(platform))
+        except chats.ChatNotFoundError:
+            # Trashed while this approval waited for the hold (GH-294, Decision 7): the
+            # confirmation goes now, not with the reaper, and the 404 propagates.
+            _chat_runtime.pop_pending(chat.id)
+            raise
         # Before the confirmation is consumed: a refused approval leaves it pending.
         slot = await _read_slot(tenant, platform, turn.attachments)
         if isinstance(slot, JSONResponse):
@@ -6349,15 +6411,28 @@ async def patch_platform_settings(
     stored limits and retry limit apply to the next chat request (no
     restart).
 
+    GH-294 (Decisions 1 and 3): a patch that gives ``llm.max_input_tokens``
+    is checked against the running config first, after the rate limit and the
+    capability check and before any statement: when the reserved output
+    (``llm.max_response_tokens``) isn't below
+    ``context_budget.budget_limit(value, context.safety_margin_percent)``, no
+    input token would be left, so every turn would be refused at runtime. The
+    answer is the 422 ``max_input_tokens_too_small`` with nothing written or
+    audited, no client built and the residency confirmation not consulted. A
+    patch without the value isn't checked.
+
     Args:
         request: The incoming request (the client IP for the audit event).
         principal: The logged-in principal (401 without a session).
         body: Validated PlatformSettingsPatch (422 without echo otherwise).
 
     Returns:
-        PlatformSettingsResponse: the platform settings after the change, or
-        the 409 ``{"detail", "reason": "residency_confirmation",
-        "residency_orgs"}`` of an unconfirmed switch to a non-Swiss provider.
+        PlatformSettingsResponse: the platform settings after the change; the
+        422 ``{"detail", "reason": "max_input_tokens_too_small"}`` of a
+        ``llm.max_input_tokens`` that leaves no room for the reserved output
+        and the safety margin; or the 409 ``{"detail", "reason":
+        "residency_confirmation", "residency_orgs"}`` of an unconfirmed switch
+        to a non-Swiss provider.
 
     Raises:
         HTTPException: 429 when rate-limited, 403 without
@@ -6371,6 +6446,14 @@ async def patch_platform_settings(
         raise HTTPException(status_code=500, detail="Server not configured")
     _check_rate_limit("/api/platform/settings/patch", _user_caller(principal))
     _require_capability(principal, Capability.PLATFORM_DEFAULTS_MANAGE)
+    # GH-294 (Decisions 1 and 3): from the running config alone, before any statement, so a
+    # refused patch writes, audits and builds nothing. Only a given value is checked: the
+    # stored one already passed the start check or an earlier patch.
+    if body.llm is not None and body.llm.max_input_tokens is not None:
+        budget = _budget_settings()
+        limit = context_budget.budget_limit(body.llm.max_input_tokens, budget.safety_margin_percent)
+        if budget.reserved_output_tokens >= limit:
+            return JSONResponse(status_code=422, content=_MAX_INPUT_TOKENS_TOO_SMALL_BODY)
 
     from admino.database import get_pool
 
@@ -7683,9 +7766,11 @@ def create_app(
     app.get("/api/platform/settings", response_model=PlatformSettingsResponse)(
         get_platform_settings
     )
-    app.patch("/api/platform/settings", response_model=PlatformSettingsResponse)(
-        patch_platform_settings
-    )
+    app.patch(
+        "/api/platform/settings",
+        response_model=PlatformSettingsResponse,
+        responses=_PLATFORM_PATCH_RESPONSES,
+    )(patch_platform_settings)
     app.get("/api/org/permissions", response_model=PermissionsResponse)(get_org_permission_matrix)
     app.patch("/api/org/permissions", response_model=PermissionsResponse)(
         patch_org_permission_matrix

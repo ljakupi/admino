@@ -16,7 +16,8 @@ in manifest order (a text part as ``TextContent``; an image part as
 ``TextContent(label)`` when it has a label, then ``ImageContent`` with the
 image's standard base64).
 Errors: ``AttachmentUnavailableError``, one error with a fixed text for every
-failure: a missing or unreadable file, a symlink, an invalid manifest, a
+failure: a missing or unreadable file, a symlink, a file that isn't a
+regular one (a directory or a FIFO), an invalid manifest, a
 manifest kind other than the row's, a text part that isn't strict UTF-8, or
 more than ``converters.common.MAX_DERIVED_BYTES`` bytes for one attachment.
 
@@ -25,7 +26,14 @@ Security notes:
   O_NOFOLLOW`` and every file inside it relative to that directory's
   descriptor with ``O_NOFOLLOW``, so a link planted at the directory, the
   manifest or a part (to another org's files, say) is refused. A file must be
-  a regular one (``O_NONBLOCK`` keeps a planted FIFO from blocking the open).
+  a regular one (``O_NONBLOCK`` keeps a planted FIFO from blocking the open):
+  its type is checked on the raw descriptor before any read, so a directory
+  or a FIFO at the manifest's or a part's name is refused unread (GH-294,
+  Decision 10).
+- No descriptor leaks: every descriptor opened here (``<id>.d`` and each file
+  in it) is closed on every path, a refusal included (GH-294, Decision 12),
+  so repeated reads of a planted attachment can't exhaust the process's
+  descriptors.
 - Part names come from the validated manifest (``part-NNNN.<ext>``, never a
   path), so a manifest can't name a file outside ``<id>.d``.
 - Tenancy: the path is built from the caller's org id and the id of a row the
@@ -78,16 +86,29 @@ class AttachmentUnavailableError(Exception):
 def _read_file(directory: int, name: str, budget: int) -> bytes:
     """Read the regular file ``name`` of the open directory, at most ``budget`` bytes.
 
+    The type is checked on the raw descriptor, before any file object exists
+    and before any read, so a directory or a FIFO planted at ``name`` is
+    refused unread (GH-294, Decision 10). The descriptor ``os.open`` returned
+    is closed on every path, a refusal included (Decision 12): a file object
+    made on a directory's descriptor raises without closing it, which leaked
+    one descriptor per read.
+
     Raises:
         OSError: The file is missing, a symlink or can't be read.
         ValueError: It isn't a regular file or holds more than ``budget`` bytes.
     """
-    with os.fdopen(os.open(name, _FILE_FLAGS, dir_fd=directory), "rb") as file:
-        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+    fd = os.open(name, _FILE_FLAGS, dir_fd=directory)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
             msg = "Not a regular file."
             raise ValueError(msg)
-        # One byte more than the budget tells a file that doesn't fit.
-        data = file.read(budget + 1)
+        # closefd=False: the finally below is the descriptor's only close, so a
+        # file object that fails half-made can neither leak it nor close it twice.
+        with os.fdopen(fd, "rb", closefd=False) as file:
+            # One byte more than the budget tells a file that doesn't fit.
+            data = file.read(budget + 1)
+    finally:
+        os.close(fd)
     if len(data) > budget:
         msg = "Derived files too large."
         raise ValueError(msg)
