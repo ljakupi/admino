@@ -46,6 +46,9 @@ section 6 pins the upload's cross-site refusal (403, nothing stored). GH-190
 adds ``PATCH /api/attachments/{attachment_id}`` (``{"active": false}`` on an
 attachment of the caller's own chat: a JSON body) and ``GET
 /api/chats/{chat_id}/attachments`` (the files of a chat of the caller's own).
+GH-245 adds ``POST /api/chats/{chat_id}/retry`` (no body; a request on a chat of the
+caller's own whose one turn failed, so the stub agent re-runs it: 200). Its section 7
+pins the retry's cross-site refusal (403, nothing run or changed).
 
 Adding a route (each later issue): give it a ``RouteSpec`` row in
 ``ROUTES`` (tests/tenancy_world.py), a well-formed request in ``_REQUESTS``
@@ -110,6 +113,7 @@ from tests.tenancy_world import (
     route_id,
     seed_attachment,
     seed_chat,
+    seed_failed_chat,
     seed_pending_confirmation,
     stub_agent,
     upload_headers,
@@ -345,6 +349,19 @@ def _own_chat(
     return build
 
 
+def _own_failed_chat(world: World, caller: Account, _client: TestClient) -> _Request:
+    """GH-245: retry (no body) a chat of the caller's own whose one turn failed (the
+    answer stored ``error``): the stub agent re-runs it and the route answers 200."""
+    chat_id = seed_failed_chat(
+        world.db,
+        _chat_owner(world, caller),
+        title="Tenancy chat 245",
+        question="Tenancy question 245",
+        answer="Tenancy failed answer 245",
+    )
+    return _Request("POST", f"/api/chats/{chat_id}/retry")
+
+
 def _own_chat_upload(world: World, caller: Account, _client: TestClient) -> _Request:
     """GH-187: upload a short text file into a chat of the caller's own."""
     chat_id = seed_chat(world.db, _chat_owner(world, caller), title="Tenancy chat 187")
@@ -521,6 +538,8 @@ _REQUESTS: Final[dict[tuple[str, str], _Builder]] = {
     ),
     # GH-8: no request body; the caller's own idle chat answers 200 {"stopped": false}.
     ("POST", "/api/chats/{chat_id}/stop"): _own_chat("POST", "/stop"),
+    # GH-245: no request body; the caller's own chat with a failed turn (200, re-run).
+    ("POST", "/api/chats/{chat_id}/retry"): _own_failed_chat,
     # GH-187: a raw-body upload (no JSON body) and the two attachment reads.
     ("POST", "/api/chats/{chat_id}/attachments"): _own_chat_upload,
     ("GET", "/api/attachments/{attachment_id}"): _own_attachment(""),
@@ -1266,3 +1285,44 @@ class TestAttachmentUploadCsrf:
         assert stored_after_refusal == (0, 0, {})
         assert accepted.status_code == 201, accepted.text
         agent.run.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# 7. The retry refuses a cross-site request (GH-245, #139 §5 CSRF)
+# ---------------------------------------------------------------------------
+
+
+class TestChatRetryCsrf:
+    """POST /api/chats/{chat_id}/retry runs the agent and replaces the failed turn: a
+    cross-site request is refused before anything runs (Decision 4: a send's CSRF check)."""
+
+    def test_tenancy_chat_retry_refuses_a_cross_site_request_and_runs_nothing(
+        self, world: World, client: TestClient, agent: MagicMock
+    ) -> None:
+        """A cross-site retry (``Sec-Fetch-Site: cross-site``) by the chat's owner is 403
+        ``Cross-origin request refused``: no run, no write statement, the chat and its
+        failed turn as they were. Control: the same request from the same origin re-runs
+        the turn (200, one run)."""
+        caller = world.a["editor"]
+        request = _own_failed_chat(world, caller, client)
+        chat_id = uuid.UUID(request.url.split("/")[3])
+        chat_before = world.db.chat_row(chat_id)
+        messages_before = world.db.messages_of(chat_id)
+        mark = len(world.db.calls)
+
+        refused = _send(client, request, {**caller.cookie, "Sec-Fetch-Site": "cross-site"})
+        after_refusal = (
+            world.db.chat_row(chat_id),
+            world.db.messages_of(chat_id),
+            _writes_since(world.db, mark),
+            agent.run.await_count,
+        )
+        accepted = _send(client, request, {**caller.cookie, "Sec-Fetch-Site": "same-origin"})
+
+        assert (refused.status_code, refused.json()) == (
+            403,
+            {"detail": "Cross-origin request refused"},
+        )
+        assert after_refusal == (chat_before, messages_before, [], 0)
+        assert accepted.status_code == 200, accepted.text
+        assert agent.run.await_count == 1

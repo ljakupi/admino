@@ -252,8 +252,10 @@ def test_chats_load_turn_result_is_a_frozen_dataclass_of_chat_history_and_attach
 def test_chats_load_turn_limit_is_keyword_only(chats: ModuleType) -> None:
     parameters = inspect.signature(chats.load_turn).parameters
 
-    assert list(parameters) == ["executor", "tenant", "chat_id", "limit"]
+    # GH-245 (contract C2): a retry's window ends before the retried message (before_seq).
+    assert list(parameters) == ["executor", "tenant", "chat_id", "limit", "before_seq"]
     assert parameters["limit"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["before_seq"].kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # ---------------------------------------------------------------------------

@@ -136,6 +136,8 @@ _DETAIL_KEYS: Final = _SUMMARY_KEYS | {
     "pending_confirmation",
     "confirmation_status",
     "context_usage",
+    # GH-245 (Decision 6): whether the chat's latest message failed (retry offered).
+    "retryable",
 }
 # GH-190: every message carries its ``attachment_ids`` (Decision 12).
 _MESSAGE_KEYS: Final = frozenset(

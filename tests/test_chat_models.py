@@ -38,7 +38,8 @@ What these tests pin down:
   above 100 allowed) and ``ChatDetailResponse`` (a ChatSummary plus messages
   <= 100, next_cursor, pending_confirmation as a ``PendingConfirmationSummary``,
   confirmation_status none/pending/expired, and context_usage, which replaces
-  GH-176's ``context``). The JSON keys of each response model are exactly the
+  GH-176's ``context``; GH-245 adds the required ``retryable: bool``, no default,
+  a non-bool refused). The JSON keys of each response model are exactly the
   contract's.
 - No chat API model has a ``tool_use_blocks`` field or schema entry: the raw
   tool inputs are never exposed.
@@ -105,7 +106,15 @@ _MESSAGE_KEYS = frozenset(
 )
 _USAGE_KEYS = frozenset({"used", "max", "percent"})
 _DETAIL_KEYS = _SUMMARY_KEYS | frozenset(
-    {"messages", "next_cursor", "pending_confirmation", "confirmation_status", "context_usage"}
+    {
+        "messages",
+        "next_cursor",
+        "pending_confirmation",
+        "confirmation_status",
+        "context_usage",
+        # GH-245 (Decision 6).
+        "retryable",
+    }
 )
 
 # Characters built with chr() so they survive editing tools verbatim.
@@ -181,6 +190,15 @@ def _rejects(model: type[BaseModel], payload: dict[str, Any]) -> ValidationError
     with pytest.raises(ValidationError) as exc_info:
         model.model_validate(payload)
     return exc_info.value
+
+
+def _validation_error(model: type[BaseModel], retryable: Any) -> ValidationError | None:
+    """The error of a detail payload with ``retryable`` set to the value; None if valid."""
+    try:
+        model.model_validate(_detail_payload(retryable=retryable))
+    except ValidationError as exc:
+        return exc
+    return None
 
 
 def _accepts(model: type[BaseModel], payload: dict[str, Any]) -> bool:
@@ -265,6 +283,8 @@ def _detail_payload(**overrides: Any) -> dict[str, Any]:
         "messages": [_message_payload()],
         "confirmation_status": "none",
         "context_usage": _usage_payload(),
+        # GH-245: required.
+        "retryable": False,
     }
     payload.update(overrides)
     return payload
@@ -826,6 +846,45 @@ class TestChatDetailResponse:
 
         assert isinstance(detail.context_usage, _model("ContextUsage"))  # type: ignore[attr-defined]
         assert "context" not in model.model_fields
+
+    def test_chat_models_detail_retryable_is_a_required_bool(self) -> None:
+        """GH-245 (contract C3): ``retryable: bool``, required, no default."""
+        field = _model("ChatDetailResponse").model_fields.get("retryable")
+
+        assert field is not None, "ChatDetailResponse.retryable does not exist (GH-245)"
+        assert (field.annotation, field.is_required()) == (bool, True)
+
+    def test_chat_models_detail_without_retryable_is_refused(self) -> None:
+        payload = _detail_payload()
+        del payload["retryable"]
+
+        exc = _rejects(_model("ChatDetailResponse"), payload)
+
+        assert [
+            (tuple(error["loc"]), error["type"]) for error in exc.errors(include_url=False)
+        ] == [(("retryable",), "missing")]
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_chat_models_detail_retryable_is_dumped_as_a_json_bool(self, value: bool) -> None:
+        detail = _model("ChatDetailResponse").model_validate(_detail_payload(retryable=value))
+
+        assert json.loads(detail.model_dump_json())["retryable"] is value
+
+    def test_chat_models_detail_retryable_refuses_a_non_bool(self) -> None:
+        """Under the model's (lax) config a value that isn't a bool is refused at its loc:
+        null, a word, 2 and a list."""
+        model = _model("ChatDetailResponse")
+        outcomes = {
+            repr(value): _locs(exc) if (exc := _validation_error(model, value)) else "accepted"
+            for value in (None, "maybe", 2, [True])
+        }
+
+        assert outcomes == {
+            "None": [("retryable",)],
+            "'maybe'": [("retryable",)],
+            "2": [("retryable",)],
+            "[True]": [("retryable",)],
+        }
 
 
 # ---------------------------------------------------------------------------
