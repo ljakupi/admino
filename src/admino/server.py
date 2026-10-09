@@ -126,7 +126,10 @@ Routes:
   above leave the confirmation pending). Both answers carry ``context_usage``
   (GH-190), an approval also ``context_notice``. The platform settings are
   read under the chat's hold, and an approval whose chat was trashed while it
-  waited removes its confirmation before the 404 (GH-294).
+  waited removes its confirmation before the 404 (GH-294). The caller's
+  account is read again first under the hold: deactivated, removed or an org
+  deactivated meanwhile is the 401, demoted to Viewer the 403, with nothing
+  run or stored and the confirmation left pending (GH-298).
 - GET/PATCH /api/me/settings — The caller's own theme and notifications (every
   role).
 - POST /api/me/settings/reset — Revert the caller's own settings to the
@@ -5445,7 +5448,28 @@ async def post_confirm(
     trashed while it waited has read the platform settings, the promotions
     and the policy, then answers the 404 ``chat_not_found`` with its pending
     confirmation removed first, so nothing is left for the reaper and
-    nothing is run, stored or audited.
+    nothing of the approval is run, stored or audited (completing a due
+    promotion does store its pair and notices).
+
+    GH-298 (Decisions 1 to 4): the first step under the chat's hold, before
+    the confirmation checks and the reads above, re-reads the caller's
+    account once (``sessions.recheck_principal``), for an approval and a
+    denial alike. A change made while the request waited refuses it as it
+    refuses a request sent after the change: a user deactivated, deleted or
+    removed from the org, or whose org was deactivated or scheduled for
+    deletion, is the 401 ``Unauthorized`` (as is any account row that fails
+    the session lookup's account rules, fail closed), a role without
+    ``chat.send`` (demoted to Viewer) the 403 ``Forbidden``, JSON even for a
+    streamed confirm, and the per-IP budget of unresolved session cookies is
+    not spent. Nothing more is read, run or stored: no settings, promotions
+    or policy, no agent run, no ``tool.call`` row, no message, and the
+    confirmation stays pending until it expires (a removed user's goes with
+    the account, ``ChatRuntime.forget_user``). An account that passes goes
+    on with the principal and tenant the request arrived with (same user and
+    org; a run never reads the role). A session that ends while the request
+    waits without a change to the account (logout, forced logout, password
+    change, expiry) is out of scope: the request was authenticated when it
+    arrived, like a reply already running.
 
     GH-8: with an ``Accept`` header listing ``text/event-stream`` an approval
     streams the resumed run like a turn (no title), and a denial streams
@@ -5470,9 +5494,11 @@ async def post_confirm(
         ``image_input_unsupported``.
 
     Raises:
-        HTTPException: 404 if no confirmation is pending for the chat, it has
-            expired or the id doesn't match, 400 if the IDs mismatch, 500
-            when a JSON approval's agent fails.
+        HTTPException: 401 ``Unauthorized`` when the caller's account no
+            longer passes under the hold, 403 ``Forbidden`` when its role lost
+            ``chat.send`` meanwhile (GH-298); 404 if no confirmation is
+            pending for the chat, it has expired or the id doesn't match, 400
+            if the IDs mismatch, 500 when a JSON approval's agent fails.
         chats.ChatNotFoundError: The chat was trashed meanwhile (404
             ``chat_not_found``; an approval removes its pending confirmation
             first, GH-294 Decision 7).
@@ -5511,6 +5537,15 @@ async def post_confirm(
     # The chat's hold serialises with its runs; a streamed approval's task takes it over.
     async with contextlib.AsyncExitStack() as held:
         await held.enter_async_context(_chat_runtime.hold(chat.id, tenant.user_id))
+        # First under the hold (GH-298, Decisions 1 to 4): the caller's account is read
+        # again, so a change made while this request waited refuses it as a request sent
+        # after the change is refused, with nothing more read, run or stored. Only the
+        # answer counts: the request goes on with the principal it arrived with.
+        current = await sessions.recheck_principal(pool, principal)
+        if current is None:
+            raise HTTPException(status_code=401, detail=_UNAUTHORIZED_DETAIL)
+        if not can(current, Capability.CHAT_SEND):
+            raise HTTPException(status_code=403, detail="Forbidden")
         pending = _chat_runtime.get_pending(chat.id)
 
         if pending is None:

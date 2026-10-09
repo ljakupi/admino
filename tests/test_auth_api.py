@@ -238,6 +238,11 @@ class _FakeDb:
       legacy chats of POST /api/message and POST /api/confirm).
       Every account added here is also stored, with the same id, in the shared
       database's users table (the chats' owner foreign key).
+    - GH-298: a users fetchrow whose binds hold no str and no bytes (a lookup by
+      id: POST /api/confirm's re-read of the caller's account under the chat's
+      hold) also runs on the shared database, where the account is mirrored; the
+      email lookup can't serve it. The mirror keeps the defaults for status,
+      deleted_at and the org's status (active).
     """
 
     def __init__(self) -> None:
@@ -316,6 +321,13 @@ class _FakeDb:
         self.calls.append((method, sql, args))
         normalized = _norm(sql)
         if _is_throttle_sql(normalized) or _is_chat_sql(normalized):
+            return self.shared.handle(method, sql, args, "pool", None)
+        if (
+            method == "fetchrow"
+            and re.search(r"\busers\b", normalized)
+            and args
+            and not any(isinstance(arg, str | bytes) for arg in args)
+        ):
             return self.shared.handle(method, sql, args, "pool", None)
         if re.search(r"\brevoked_at\b", normalized):
             # Migration 0009 dropped the column: revoking deletes the row.
