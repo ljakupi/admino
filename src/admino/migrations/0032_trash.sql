@@ -1,4 +1,4 @@
--- 0031_trash.sql
+-- 0032_trash.sql
 -- The trash: restore, delete forever and the retention purge (GH-194).
 --
 -- 0024 and 0027 made the trash a timestamp (deleted_at) on chats and

@@ -30,7 +30,8 @@ What is pinned:
   the member (``chat.purge`` with ``file_count``); a chat's pending confirmation
   is dropped too. A purge step that fails (its audit write refused) still
   answers 204, leaves the item trashed with its files, and logs a content-free
-  warning.
+  warning. An org retention of 1 (the smallest above 0) only trashes, like any
+  retention above 0 (review round 1, Suggestion 1).
 - 404 ``attachment_not_found`` / ``chat_not_found`` (exact) for another org's, a
   colleague's (an Org Admin's request on an Editor's item included), an unknown,
   an already trashed item and a file of a trashed chat, nothing changed (rows,
@@ -473,6 +474,52 @@ class TestDeleteAtRetentionZero:
         assert [event[0] for event in _events(db)] == [
             f"{'chat' if kind == 'chat' else 'file'}.delete"
         ]
+
+    def test_trash_delete_at_retention_one_only_trashes_the_chat_and_the_file(
+        self,
+        world: World,
+        root: Path,
+        client: TestClient,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Review round 1, Suggestion 1: an org retention of 1 (the smallest above 0,
+        inside the bounds 0 to 90) is not 0. Deleting a chat and then a file of another
+        chat answers 204 each; both are trashed (the chat with its live file as its
+        group, the file as its own), every file stays on disk, only the two deletes are
+        audited (no purge); ``GET /api/trash`` lists both with ``retention_days`` 1, and
+        each restore brings its item back."""
+        db, editor = world.db, world.a["editor"]
+        _set_bounds(monkeypatch, db, low=0, high=90)
+        _set_retention(db, 1)
+        chat_id = _chat(db, editor)
+        grouped = _file(db, chat_id)
+        file_id = _file(db, _chat(db, editor))
+
+        deleted = [_delete_chat(client, editor, chat_id), _delete_file(client, editor, file_id)]
+        listed = client.get("/api/trash", headers=editor.cookie)
+
+        assert [_deleted(response) for response in deleted] == [(204, b"")] * 2
+        assert [
+            _trash_columns(db.chat_row(chat_id)),
+            _trash_columns(db.attachment_row(grouped)),
+            _trash_columns(db.attachment_row(file_id)),
+        ] == [(True, str(chat_id)), (True, str(chat_id)), (True, str(file_id))]
+        assert [_on_disk(root, ORG_ID, item) for item in (grouped, file_id)] == [_KEPT] * 2
+        assert _events(db) == [
+            _event("chat.delete", editor, chat_id),
+            _event("file.delete", editor, file_id),
+        ]
+        assert (sorted(_ids(listed)), listed.json()["retention_days"]) == (
+            sorted([str(chat_id), str(file_id)]),
+            1,
+        )
+        restored = [_restore_chat(client, editor, chat_id), _restore_file(client, editor, file_id)]
+        assert [response.status_code for response in restored] == [200, 200]
+        assert [
+            _trash_columns(db.chat_row(chat_id)),
+            _trash_columns(db.attachment_row(grouped)),
+            _trash_columns(db.attachment_row(file_id)),
+        ] == [(False, None)] * 3
 
     @pytest.mark.parametrize("kind", ["chat", "attachment"])
     def test_trash_delete_at_retention_zero_with_a_failing_purge_still_answers_204(

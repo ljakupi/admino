@@ -1,6 +1,6 @@
 """The member's trash: list, restore, delete forever, empty, and the retention purge (GH-194).
 
-Migration 0031 gives chats and attachments a ``trash_group_id`` next to
+Migration 0032 gives chats and attachments a ``trash_group_id`` next to
 ``deleted_at``: a trashed chat is its own group, the live files its deletion
 moved carry the chat's id, and a file deleted on its own is its own group.
 An item of the trash is a row whose group is its own id. Restoring a chat

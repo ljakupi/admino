@@ -14,7 +14,7 @@ org.permission_change, org.permission_promote, org.permission_promote_cancel
 and org.permission_demote, by migration 0020 for GH-164's user.profile_change,
 by migration 0021 for GH-166's password.change, by migration 0027 for
 GH-187's file.upload, by migration 0030 for GH-190's file.exclude and
-file.include and by migration 0031 for GH-194's chat.purge and file.purge;
+file.include and by migration 0032 for GH-194's chat.purge and file.purge;
 the metadata CHECK is replaced by migration 0029 for GH-189's attachment
 ids).
 

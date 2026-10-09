@@ -32,7 +32,7 @@ What is pinned:
   external_content is CheckViolationError ("chats.external_content
   can't be reset") and the statement changes no row; false -> true, true -> true and
   other columns of a flagged chat pass (GH-194: trashing one sets its trash group with
-  deleted_at, as migration 0031's CHECK requires); the fake's columns (less those a
+  deleted_at, as migration 0032's CHECK requires); the fake's columns (less those a
   later migration grants, GH-194's trash_group_id) and message equal the shipped ones.
 
 Security notes:
@@ -230,7 +230,7 @@ def _chat_update_columns(up_to: int | None) -> set[str]:
 
 def _chat_update_columns_granted_later() -> frozenset[str]:
     """The chats columns admino_app may UPDATE after every shipped migration but not
-    after 0025 (GH-194: 0031's trash_group_id)."""
+    after 0025 (GH-194: 0032's trash_group_id)."""
     return frozenset(_chat_update_columns(None) - _chat_update_columns(_VERSION))
 
 
@@ -827,7 +827,7 @@ class TestMigration0025FakeDb:
         outcomes: dict[str, str] = {}
         for column, sql in _SET_ONE.items():
             # GH-194: a new deleted_at goes on a chat already in the trash (and so in its
-            # trash group): migration 0031's CHECK refuses a deleted_at without a group.
+            # trash group): migration 0032's CHECK refuses a deleted_at without a group.
             trashed = _TRASHED_AT if column == "deleted_at" else None
             chat = db.add_chat(owner, title="Plan", deleted_at=trashed)
             value = other if column == "owner_user_id" else _NEW_VALUES[column]
@@ -995,7 +995,7 @@ class TestMigration0025FakeDb:
 
     async def test_migration_0025_fake_mirrors_the_shipped_grant_and_message(self) -> None:
         """The fake's updatable columns and refusal message are the shipped ones (GH-194:
-        less the columns a later migration grants, such as 0031's trash_group_id, which
+        less the columns a later migration grants, such as 0032's trash_group_id, which
         that migration's tests pin)."""
         (grant,) = _file_grants()
         shipped_columns = frozenset(

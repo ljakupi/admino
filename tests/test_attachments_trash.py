@@ -20,7 +20,7 @@ What these tests pin down:
   later delete leaves it in its own group (A10' only takes live files).
 
 Harness: the real ``admino.attachments`` and ``admino.chats`` over
-tests/db_fakes.py's FakeDb (migration 0031's schema once it ships) and a
+tests/db_fakes.py's FakeDb (migration 0032's schema once it ships) and a
 ``tmp_path`` attachments root.
 
 Security notes: owner-only (Decision 1), the isolation lives in A13's

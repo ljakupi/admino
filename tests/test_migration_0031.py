@@ -1,281 +1,275 @@
-"""Tests for migration 0031_trash.sql (GH-194, contract section 1, issue Decisions 2, 9
-and 10): the trash groups on chats and attachments, their backfill and CHECKs, the trash
-indexes, DELETE on chats and UPDATE of the groups for the runtime role, and
-``chat.purge`` / ``file.purge`` in the audit action catalog.
+"""Tests for migration 0031_chat_retry.sql (GH-245, contract C1, issue Decision 7): the
+owner-run ``delete_failed_turn`` function a retry uses to replace a chat's failed last
+turn, while chat_messages stays append-only for admino_app.
 
 There is no real PostgreSQL in the suite, so the shipped SQL file is the spec (the
-pipeline ran the contract's SQL on a throwaway postgres:16 as admino_app: the backfill,
-both CHECKs, the cascade of a chat DELETE and the refused writes). The SQL is read with
-tests/test_migration_0018.py's lexer (comments blanked, '...' literals and
+pipeline ran the contract's SQL on a throwaway postgres:16 as admino_app). The SQL is
+read with tests/test_migration_0018.py's lexer (comments blanked, '...' literals and
 dollar-quoted bodies kept whole, nested DO / function bodies and EXECUTE literals
-searched too), the added columns with tests/test_migration_0024.py's column parser,
-the indexes with tests/test_migration_0027.py's reader, the action list with
-tests/test_migration_0021.py's IN-list reader, and the GRANT / REVOKE statements of
-every shipped migration are replayed into the privileges each role ends up with
-(tests/test_migration_0027.py's replay). The two backfill UPDATEs are read into their
-target, assignments (a CASE and an EXISTS sub-select included) and WHERE conditions,
-with every column reference resolved to its table (alias or not).
+searched too) and tests/test_migration_0019.py's CREATE FUNCTION reader; the GRANT /
+REVOKE statements of every shipped migration are replayed into the privileges each role
+ends up with, on the tables (tests/test_migration_0027.py's replay) and on the functions
+(this file: PUBLIC's default EXECUTE on a new function, 0018's REVOKE ON ALL FUNCTIONS
+and ALTER DEFAULT PRIVILEGES, every GRANT / REVOKE ON FUNCTION).
 
 What is pinned:
-- ``0031_trash.sql`` ships as the only version 31, right after the versions 1 to 30;
-  run_migrations applies and records it after 0030, and not again once applied. It
-  opens with a header comment naming trash_group_id, the two new actions and what is
-  granted.
-- ``trash_group_id`` is added to chats and to attachments, each a UUID, nullable,
-  without a default, CHECK, key or reference (existing rows read NULL until the
-  backfill; the application sets it).
-- The backfill: ``UPDATE chats SET trash_group_id = id WHERE deleted_at IS NOT
-  NULL`` (every trashed chat is its own group); ``UPDATE attachments SET
-  trash_group_id = CASE WHEN EXISTS (a chat with the file's chat_id and org_id whose
-  deleted_at IS NOT NULL) THEN chat_id ELSE id END WHERE deleted_at IS NOT NULL`` (a
-  file trashed with its chat joins the chat's group, any other trashed file is its
-  own); live rows are untouched. They are the only data writes.
-- ``chats_trash_group_check`` and ``attachments_trash_group_check``, each exactly
-  ``CHECK ((deleted_at IS NULL) = (trash_group_id IS NULL))`` (validated: nothing
-  after the expression), added after the backfill of their table.
-- ``chats_trash_idx`` / ``attachments_trash_idx``: plain btree, non-unique, not
-  CONCURRENTLY, on (org_id, owner_user_id, deleted_at, id) WHERE deleted_at IS NOT
-  NULL.
-- Grants: ``DELETE`` on chats and ``UPDATE (trash_group_id)`` on chats and on
-  attachments, to admino_app only, without grant option, after the columns exist;
-  no REVOKE. Every (table, grantee) holds after 0031 what it held after 0030, except
-  admino_app on chats (``delete``, ``update(trash_group_id)``) and on attachments
-  (``update(trash_group_id)``). After every shipped migration admino_app holds on
-  chats SELECT, INSERT, DELETE and UPDATE on exactly title, title_source,
-  last_activity_at, external_content, deleted_at and trash_group_id; on attachments
-  SELECT, INSERT, DELETE and UPDATE on exactly message_id, status, failure_reason,
-  page_count, token_estimate, derived_bytes, active, updated_at, deleted_at and
-  trash_group_id; on chat_messages SELECT and INSERT only (append-only: a chat's
-  DELETE cascades to its messages as the table owner); PUBLIC nothing. (The
-  cumulative pin moved here from tests/test_migration_0030.py.) The runtime-role
-  grant guards of tests/test_migration_0018.py still hold, and they read 0031's
-  grants.
-- ``audit_events_action_check`` is dropped (no IF EXISTS, no CASCADE) and re-added
-  with 0030's list plus ``'chat.purge'`` right after ``'chat.restore'`` and
-  ``'file.purge'`` right after ``'file.restore'``, nothing else added or removed,
-  each listed once; the list equals ``AuditAction`` (the exact sync moved here from
-  tests/test_migration_0030.py), which has ``CHAT_PURGE = "chat.purge"`` and
-  ``FILE_PURGE = "file.purge"``. The FakeDb's catalog (``db_fakes.shipped_schema()``)
-  is that list.
-- Nothing else: every statement (top level and DO blocks) is one of the above; no DO
-  block, function, trigger, role, INSERT / DELETE / TRUNCATE / COPY / MERGE, REVOKE,
-  CREATE TABLE, DROP TABLE / INDEX / COLUMN, SECURITY DEFINER, owner change or default
-  privileges, also not nested in a body or an EXECUTE literal.
+- ``0031_chat_retry.sql`` ships as the only version 31, right after the versions 1 to
+  30; run_migrations applies it after 0030 (once). It opens with a header comment that
+  names delete_failed_turn, says chat_messages stays append-only for admino_app (no
+  UPDATE or DELETE), that the function is SECURITY DEFINER with a pinned search_path,
+  that the turn's files are unlinked first, that #182 replaces it, and the grants; since
+  the audit fixes it also names the turn's ``shape`` check (C1'), its ``residual`` and
+  the ``backfill`` of GH-25 D9's timeout partials (C1'b).
+- Exactly four top-level statements, in this order: ``CREATE FUNCTION
+  delete_failed_turn(target_chat uuid, target_org uuid, target_owner uuid, through_seq
+  bigint) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = public,
+  pg_temp`` (not OR REPLACE, no other option); ``REVOKE ALL ON FUNCTION
+  delete_failed_turn(uuid, uuid, uuid, bigint) FROM PUBLIC``; ``GRANT EXECUTE ON FUNCTION
+  delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app`` (no grant option); the
+  C1'b backfill ``UPDATE chat_messages m SET status = 'error' WHERE ...`` exactly as the
+  contract states it (normalized like the body): every ``assistant`` row stored
+  ``complete`` without tool_use blocks whose next row in its chat by seq is an
+  ``assistant`` ``error`` row (a D9 partial stored before C1'b) becomes ``error``.
+- The function body equals the contract's statement for statement (comments blanked,
+  whitespace collapsed, keywords case-insensitive, '...' literals byte for byte),
+  including C1' (security audit M-1): after the turn's user row is found and before the
+  unlink, the turn's shape is checked (every row strictly between that user row and
+  through_seq is a ``tool`` row or an ``assistant`` row with at least one tool_use
+  block, ``complete`` or ``awaiting_confirmation``, or, C1'b, an ``assistant`` row with
+  status ``error``: GH-25 D9's partial reply before the error reply). Five RAISEs, every
+  RAISE ``RAISE EXCEPTION 'only a failed turn of a live chat can be deleted' USING
+  ERRCODE = 'insufficient_privilege'`` (a plain literal: no row data), and the body runs
+  static SQL only (no EXECUTE, format() or quoting helpers).
+- Nothing else: no table, column, index, trigger, rule, policy, role or schema change,
+  no table GRANT or REVOKE, no DO block, no data write outside the function body but
+  the one backfill UPDATE on chat_messages, no default privileges, no OWNER TO, no SET
+  ROLE, also not nested in a body or a literal.
+- After every shipped migration: admino_app holds exactly SELECT, INSERT on
+  chat_messages (never UPDATE or DELETE), PUBLIC nothing; every table's privileges are
+  what they were after 0030. admino_app may EXECUTE exactly purge_audit_events(integer),
+  purge_org_audit_events(uuid) and delete_failed_turn(uuid, uuid, uuid, bigint), PUBLIC
+  no function; 0031 adds EXECUTE on delete_failed_turn for admino_app and changes no
+  other function's privileges. Every grant guard of tests/test_migration_0018.py passes
+  with 0031 shipped.
+- tests/db_fakes.py mirrors the refusal (contract C5): the fake's
+  ``SELECT delete_failed_turn($1, $2, $3, $4)`` for an unknown chat raises
+  InsufficientPrivilegeError with exactly the SQL's RAISE text.
 
 Security notes:
-- DELETE on chats is the one new table-level privilege: delete forever and the
-  retention purge need it. The cascade to chat_messages and attachments runs as their
-  owner, so the app still can't delete a message on its own; no other table gains
-  DELETE, no table gains a table-wide UPDATE, and no grant reaches PUBLIC.
-- The new columns hold ids only; the catalog grows by two content-free actions.
-- A CHECK added before the backfill would refuse every existing trashed row (the
-  migration would fail); one with NOT VALID would let a row hold a deletion time
-  without a group.
+- The runtime role still can't UPDATE or DELETE a chat message: the only delete path is
+  the owner-run function, which checks the chat's org, owner and liveness, the turn's
+  failed status and the turn's shape itself, so a bug or injected SQL running as
+  admino_app can delete at most the caller-named chat's failed last turn, never another
+  org's or a colleague's rows. admino_app can INSERT rows and un-trash a chat, so the
+  shape check (C1', security audit M-1) is what keeps a forged ``error`` row after a
+  completed answer, tool turn or ``limit_reached`` notice from erasing that turn; the
+  documented residual is a turn whose tail is a still-awaiting confirmation, an already
+  failed turn and rows the role forged itself. Admitting ``assistant`` ``error`` rows
+  (C1'b) opens nothing: a completed answer stays ``complete`` (admino_app can't UPDATE
+  it), so a forged row after it is still refused; the backfill runs as the migration
+  owner, once, and only turns a D9 partial (followed by its error reply) into ``error``.
+- SECURITY DEFINER with ``search_path = public, pg_temp`` (two names, not one literal):
+  the function can't be hijacked through objects in another schema.
+- The refusal names no chat, org, user or row: the error carries no data.
 """
 
 from __future__ import annotations
 
-import itertools
 import re
-from typing import TYPE_CHECKING, Any, Final
+import uuid
+from typing import TYPE_CHECKING, Final, NamedTuple
 from unittest.mock import AsyncMock
 
+import asyncpg
+import pytest
+
 import admino.database as db_mod
-from tests import db_fakes
+from tests.db_fakes import ORG_ID, FakeDb
 from tests.test_migration_0018 import (
+    _GLOBAL_DEFAULT_REVOKE,
     _GUARDS,
     _executed,
     _fragments,
+    _grantees,
     _load_migrations,
     _masked,
-    _migration_grants,
+    _Migration,
     _normalize,
+    _parse_grants,
+    _privileges,
     _shipped,
+    _signature,
     _split,
+    _target,
 )
-from tests.test_migration_0021 import _added_actions
-from tests.test_migration_0024 import _canonical_default, _Column, _parse_column
-from tests.test_migration_0025 import _GRANT_RE, _acl_keys, _grantees, _privilege_entries
-from tests.test_migration_0027 import (
-    _ALTER_RE,
-    _INDEX_RE,
-    _apply,
-    _conditions,
-    _Index,
-    _names,
-    _targets,
-    _unwrap,
+from tests.test_migration_0019 import (
+    _SET_RE,
+    _canon,
+    _Function,
+    _function_of,
+    _is_security_definer,
+    _language,
+    _settings,
+    _Statement,
+    _statements,
 )
+from tests.test_migration_0027 import _apply
 
 if TYPE_CHECKING:
-    from pathlib import Path
     from unittest.mock import MagicMock
 
-_MIGRATION_NAME: Final = "0031_trash.sql"
+_MIGRATION_NAME: Final = "0031_chat_retry.sql"
 _PREVIOUS_MIGRATION: Final = "0030_context_budget.sql"
 _VERSION: Final = 31
 _ROLE: Final = "admino_app"
-_CHATS: Final = "chats"
-_ATTACHMENTS: Final = "attachments"
+_FUNCTION: Final = "delete_failed_turn"
+_SIGNATURE: Final = "delete_failed_turn(uuid,uuid,uuid,bigint)"
+_ARGUMENTS: Final = (
+    ("target_chat", "uuid"),
+    ("target_org", "uuid"),
+    ("target_owner", "uuid"),
+    ("through_seq", "bigint"),
+)
+_SEARCH_PATH: Final = ("public", "pg_temp")
+_REFUSAL: Final = "only a failed turn of a live chat can be deleted"
+_ERRCODE: Final = "insufficient_privilege"
+_RAISE_COUNT: Final = 5
 _MESSAGES: Final = "chat_messages"
-_AUDIT_TABLE: Final = "audit_events"
-_COLUMN: Final = "trash_group_id"
-_TABLES: Final = (_CHATS, _ATTACHMENTS)
-_TRASH_CHECKS: Final[dict[str, str]] = {
-    _CHATS: "chats_trash_group_check",
-    _ATTACHMENTS: "attachments_trash_group_check",
-}
-_TRASH_INDEXES: Final[dict[str, str]] = {
-    "chats_trash_idx": _CHATS,
-    "attachments_trash_idx": _ATTACHMENTS,
-}
-_INDEX_COLUMNS: Final = ("org_id", "owner_user_id", "deleted_at", "id")
-_ACTION_CHECK: Final = "audit_events_action_check"
-# Each new action and the action it follows in the written list.
-_NEW_ACTIONS: Final[dict[str, str]] = {"chat.purge": "chat.restore", "file.purge": "file.restore"}
+_PURGES: Final = ("purge_audit_events(integer)", "purge_org_audit_events(uuid)")
+_EXECUTABLE: Final = frozenset({*_PURGES, _SIGNATURE})
+_CALL: Final = "SELECT delete_failed_turn($1, $2, $3, $4)"
 
-# admino_app's privileges after every shipped migration.
-_CHAT_UPDATE_COLUMNS: Final = (
-    "title",
-    "title_source",
-    "last_activity_at",
-    "external_content",
-    "deleted_at",
-    "trash_group_id",
-)
-_ATTACHMENT_UPDATE_COLUMNS: Final = (
-    "message_id",
-    "status",
-    "failure_reason",
-    "page_count",
-    "token_estimate",
-    "derived_bytes",
-    "active",
-    "updated_at",
-    "deleted_at",
-    "trash_group_id",
-)
-_EXPECTED_PRIVILEGES: Final[dict[str, frozenset[str]]] = {
-    _CHATS: frozenset(
-        {"select", "insert", "delete", *(f"update({c})" for c in _CHAT_UPDATE_COLUMNS)}
-    ),
-    _ATTACHMENTS: frozenset(
-        {"select", "insert", "delete", *(f"update({c})" for c in _ATTACHMENT_UPDATE_COLUMNS)}
-    ),
-    _MESSAGES: frozenset({"select", "insert"}),
-}
-# What 0031 adds to admino_app's privileges, per table.
-_ADDED_PRIVILEGES: Final[dict[str, frozenset[str]]] = {
-    _CHATS: frozenset({"delete", f"update({_COLUMN})"}),
-    _ATTACHMENTS: frozenset({f"update({_COLUMN})"}),
-}
+# The function body of contract C1, as validated on postgres:16 (between AS $$ and $$).
+_CONTRACT_BODY: Final = """
+DECLARE
+    turn_id uuid;
+    turn_seq bigint;
+    deleted bigint;
+BEGIN
+    PERFORM 1 FROM chats
+    WHERE id = target_chat AND org_id = target_org AND owner_user_id = target_owner
+        AND deleted_at IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM 1 FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org AND seq = through_seq
+        AND status IN ('error', 'stopped');
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM 1 FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org AND seq > through_seq
+        AND role <> 'user';
+    IF FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    SELECT id, seq INTO turn_id, turn_seq FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org AND role = 'user'
+        AND seq <= through_seq
+    ORDER BY seq DESC
+    LIMIT 1;
+    IF turn_id IS NULL THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    PERFORM 1 FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org
+        AND seq > turn_seq AND seq < through_seq
+        AND NOT ((status IN ('complete', 'awaiting_confirmation')
+                AND (role = 'tool'
+                    OR (role = 'assistant'
+                        AND coalesce(jsonb_array_length(tool_use_blocks), 0) > 0)))
+            OR (role = 'assistant' AND status = 'error'));
+    IF FOUND THEN
+        RAISE EXCEPTION 'only a failed turn of a live chat can be deleted'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    UPDATE attachments SET message_id = NULL, updated_at = now()
+    WHERE message_id = turn_id AND chat_id = target_chat AND org_id = target_org;
+    DELETE FROM chat_messages
+    WHERE chat_id = target_chat AND org_id = target_org
+        AND seq >= turn_seq AND seq <= through_seq;
+    GET DIAGNOSTICS deleted = ROW_COUNT;
+    RETURN deleted;
+END;
+"""
 
-_UUID_TYPES: Final = frozenset({"uuid"})
-# ADD [COLUMN] name definition; ADD CONSTRAINT is no column.
-_ADD_COLUMN_RE: Final = re.compile(
-    r'add (?:column )?(?:if not exists )?(?!constraint\b)"?(?P<name>\w+)"? (?P<definition>.+)'
+# C1'b: 0031's fourth statement, the backfill of GH-25 D9 partials stored ``complete``
+# before the append rule (validated on postgres:16: RUN_DIR/audit-fix-0031-validated.sql).
+_CONTRACT_BACKFILL: Final = """
+UPDATE chat_messages m SET status = 'error'
+WHERE m.role = 'assistant' AND m.status = 'complete'
+    AND coalesce(jsonb_array_length(m.tool_use_blocks), 0) = 0
+    AND EXISTS (
+        SELECT 1 FROM chat_messages n
+        WHERE n.chat_id = m.chat_id AND n.org_id = m.org_id
+            AND n.seq = (
+                SELECT min(x.seq) FROM chat_messages x
+                WHERE x.chat_id = m.chat_id AND x.org_id = m.org_id AND x.seq > m.seq
+            )
+            AND n.role = 'assistant' AND n.status = 'error'
+    )
+"""
+
+# Argument / type spellings PostgreSQL treats as one type.
+_TYPE_ALIASES: Final = {"int8": "bigint", "int4": "integer", "int": "integer"}
+_ERRCODE_ALIASES: Final = {"42501": _ERRCODE}
+_FUNCTION_KINDS: Final = frozenset({"function", "procedure", "routine"})
+_BULK_FUNCTION_KINDS: Final = frozenset({"all functions", "all procedures", "all routines"})
+
+_CREATE_FUNCTION_RE: Final = re.compile(
+    r"create (?:or replace )?(?:function|procedure) (?P<name>[\w.\"$]+) ?"
+    r"\((?P<arguments>[^)]*)\)"
 )
-# A plain DROP (no IF EXISTS: a missing constraint fails loudly; no CASCADE).
-_DROP_RE: Final = re.compile(r'drop constraint "?(?P<name>\w+)"?(?P<rest>(?: restrict)?)')
-# ADD CONSTRAINT ... CHECK (...) with nothing after it (no NOT VALID, no NO INHERIT).
-_ADD_CHECK_RE: Final = re.compile(r'add constraint "?(?P<name>\w+)"? check ?\((?P<expression>.*)\)')
-# UPDATE <table> [[AS] alias] SET ... (the alias is never the keyword SET).
-_UPDATE_HEAD_RE: Final = re.compile(
-    r'update (?:only )?(?:"?public"?\.)?"?(?P<table>\w+)"?'
-    r'(?: (?:as )?"?(?P<alias>(?!set\b)\w+)"?)? set (?P<rest>.+)'
+_DROP_FUNCTION_RE: Final = re.compile(
+    r"drop (?:function|procedure|routine) (?:if exists )?(?P<objects>.+?)"
+    r"(?: (?:cascade|restrict))?"
 )
-# SELECT ... FROM <table> [[AS] alias] WHERE ... (an EXISTS sub-select).
-_SUBSELECT_RE: Final = re.compile(
-    r'select (?P<columns>.+?) from (?:only )?(?:"?public"?\.)?"?(?P<table>\w+)"?'
-    r'(?: (?:as )?"?(?P<alias>(?!where\b)\w+)"?)? where (?P<where>.+)'
+_REVOKE_STATEMENT_RE: Final = re.compile(
+    r"revoke (?P<option>grant option for )?(?P<privileges>.+?) on (?P<target>.+?)"
+    r" from (?P<grantees>.+?)(?P<rest>(?: granted by \S+)?(?: (?:cascade|restrict))?)"
 )
-# A column reference: [qualifier.]name, not a function call.
-_REFERENCE_RE: Final = re.compile(
-    r'(?<![\w."])(?:"?(?P<qualifier>\w+)"?\.)?"?(?P<name>\w+)"?(?![\w(])'
+_RAISE_RE: Final = re.compile(
+    r"(?:.*\bthen )?raise (?P<level>\w+) (?P<message>'(?:[^']|'')*')"
+    r" using errcode ?= ?'(?P<code>[^']*)'"
 )
-_COLUMNS_READ: Final = frozenset(
-    {"id", "org_id", "chat_id", "owner_user_id", "message_id", "deleted_at", "trash_group_id"}
+_DYNAMIC_SQL_RE: Final = re.compile(
+    r"\bexecute\b|\bformat ?\(|\bquote_(?:ident|literal|nullable)\b|\bdblink"
 )
-# Fragments 0031 must not start with (top level, DO / function bodies, literals).
+# Patterns never found in any fragment of 0031 (top level, function body, literals).
 _FORBIDDEN: Final[dict[str, str]] = {
-    "do": r"do\b",
-    "revoke": r"revoke\b",
-    "insert": r"insert into\b",
-    "delete": r"delete from\b",
-    "truncate": r"truncate\b",
-    "copy": r"copy\b",
-    "merge": r"merge into\b",
-    "function": r"(?:create|alter|drop) (?:or replace )?(?:function|procedure)\b",
-    "trigger": r"(?:create|alter|drop) (?:or replace )?(?:constraint )?trigger\b",
-    "role": r"(?:create|alter|drop) (?:role|user|group)\b",
-    "drop": r"drop (?:table|view|schema|type|index|column)\b",
-    "default privileges": r"alter default privileges\b",
-    "create": r"create (?:table|view|type|schema)\b",
+    "do block": r"^do\b",
+    "table / index / view / type / schema / sequence": (
+        r"\b(?:create|alter|drop) (?:(?:unique|temp|temporary|unlogged|global|local) )*"
+        r"(?:table|index|view|materialized view|type|schema|sequence|domain|extension)\b"
+    ),
+    "trigger / rule / policy": (
+        r"\b(?:create|alter|drop) (?:or replace )?(?:constraint )?"
+        r"(?:trigger|event trigger|rule|policy)\b"
+    ),
+    "function change": r"\b(?:alter|drop) (?:function|procedure|routine)\b",
+    "role": r"\b(?:create|alter|drop) (?:role|user|group)\b",
+    "set role": r"\bset (?:(?:local|session) )?(?:role|session authorization)\b",
+    "owner": r"\bowner to\b|\bauthorization\b|\breassign owned\b",
+    "default privileges": r"\balter default privileges\b",
+    "insert": r"\binsert into\b",
+    "truncate": r"\btruncate\b",
+    "copy": r"\bcopy\b",
+    "merge": r"\bmerge into\b",
+    "session_replication_role": r"\bsession_replication_role\b",
+    "security invoker": r"\bsecurity invoker\b",
+    "disable": r"\bdisable\b",
 }
-# Fragments 0031 must not contain anywhere.
-_FORBIDDEN_ANYWHERE: Final[dict[str, str]] = {
-    "security definer": r"\bsecurity definer\b",
-    "drop column": r"\bdrop column\b",
-    "owner change": r"\bowner to\b",
-    "trigger switch": r"\b(?:disable|enable) (?:always |replica )?trigger\b",
-    "grant option": r"\bwith grant option\b",
+# Data writes that may only appear inside the function body (C1'b: but the backfill).
+_TOP_LEVEL_WRITES: Final[dict[str, str]] = {
+    "update": r"\bupdate (?:only )?\S+(?: (?:as )?(?!set\b)\w+)? set\b",
+    "delete": r"\bdelete from\b",
+    "select": r"^select\b|\bperform\b",
 }
-_UPDATE_FRAGMENT: Final = r"update (?:only )?\S+ "
-_INDEX_FRAGMENT: Final = r"create (?:unique )?index\b"
-
-# The steps the contract runs (ALTER TABLE actions one by one), as a multiset.
-_CONTRACT_STEPS: Final = (
-    f"column {_CHATS}.{_COLUMN}",
-    f"column {_ATTACHMENTS}.{_COLUMN}",
-    f"backfill {_CHATS}",
-    f"backfill {_ATTACHMENTS}",
-    f"check {_CHATS}.{_TRASH_CHECKS[_CHATS]}",
-    f"check {_ATTACHMENTS}.{_TRASH_CHECKS[_ATTACHMENTS]}",
-    "index chats_trash_idx",
-    "index attachments_trash_idx",
-    f"grant delete on {_CHATS} to {_ROLE}",
-    f"grant update({_COLUMN}) on {_CHATS} to {_ROLE}",
-    f"grant update({_COLUMN}) on {_ATTACHMENTS} to {_ROLE}",
-    f"drop {_AUDIT_TABLE}.{_ACTION_CHECK}",
-    f"check {_AUDIT_TABLE}.{_ACTION_CHECK}",
-)
-
-# A backfill as read: (table, {column: value}, WHERE conditions, anything unexpected).
-_Backfill = tuple[str, dict[str, Any], frozenset[str], tuple[str, ...]]
-
-_CHATS_BACKFILL: Final[_Backfill] = (
-    _CHATS,
-    {_COLUMN: f"{_CHATS}.id"},
-    frozenset({f"{_CHATS}.deleted_at is not null"}),
-    (),
-)
-_ATTACHMENTS_BACKFILL: Final[_Backfill] = (
-    _ATTACHMENTS,
-    {
-        _COLUMN: (
-            "case",
-            (
-                (
-                    (
-                        "exists",
-                        _CHATS,
-                        frozenset(
-                            {
-                                f"{_ATTACHMENTS}.chat_id = {_CHATS}.id",
-                                f"{_ATTACHMENTS}.org_id = {_CHATS}.org_id",
-                                f"{_CHATS}.deleted_at is not null",
-                            }
-                        ),
-                    ),
-                    f"{_ATTACHMENTS}.chat_id",
-                ),
-            ),
-            f"{_ATTACHMENTS}.id",
-        )
-    },
-    frozenset({f"{_ATTACHMENTS}.deleted_at is not null"}),
-    (),
-)
 
 
 # ---------------------------------------------------------------------------
@@ -283,372 +277,16 @@ _ATTACHMENTS_BACKFILL: Final[_Backfill] = (
 # ---------------------------------------------------------------------------
 
 
-def _migration_path() -> Path:
-    return db_mod._MIGRATIONS_DIR / _MIGRATION_NAME
-
-
 def _raw_sql() -> str:
-    path = _migration_path()
+    path = db_mod._MIGRATIONS_DIR / _MIGRATION_NAME
     assert path.is_file(), f"{_MIGRATION_NAME} is not shipped"
     return path.read_text(encoding="utf-8")
 
 
-def _statements() -> list[str]:
-    """The statements 0031 runs (top level and DO blocks), normalized."""
-    return _executed(_normalize(_raw_sql()))
-
-
-def _canon(text: str) -> str:
-    """Whitespace collapsed and dropped around parentheses and commas; one space around
-    a comparison."""
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"\s*([(),])\s*", r"\1", text)
-    return re.sub(r"\s*(>=|<=|<>|!=|=|<|>)\s*", r" \1 ", text).strip()
-
-
-def _closing(masked: str, open_index: int) -> int:
-    """The index of the parenthesis closing the one at ``open_index`` (-1: none)."""
-    depth = 0
-    for index in range(open_index, len(masked)):
-        if masked[index] == "(":
-            depth += 1
-        elif masked[index] == ")":
-            depth -= 1
-            if depth == 0:
-                return index
-    return -1
-
-
-def _top_level(masked: str, words: str) -> list[re.Match[str]]:
-    """The matches of the keyword pattern ``words`` outside parentheses."""
-    found: list[re.Match[str]] = []
-    depth = 0
-    for token in re.finditer(rf"\(|\)|\b(?:{words})\b", masked):
-        if token.group(0) == "(":
-            depth += 1
-        elif token.group(0) == ")":
-            depth -= 1
-        elif depth == 0:
-            found.append(token)
-    return found
-
-
-def _and_parts(expression: str) -> list[str]:
-    """The top-level AND-ed conditions, each unwrapped."""
-    expression = _unwrap(expression)
-    parts: list[str] = []
-    start = 0
-    for token in _top_level(_masked(expression), "and"):
-        parts.append(_unwrap(expression[start : token.start()]))
-        start = token.end()
-    parts.append(_unwrap(expression[start:]))
-    return parts
-
-
-def _resolved(text: str, scope: dict[str, str], default: str) -> str:
-    """``text`` with every column reference written as ``<table>.<column>``.
-
-    A qualifier is looked up in ``scope`` (table names and aliases); a bare column
-    the statements read belongs to ``default`` (the innermost FROM / UPDATE table).
-    An unknown qualifier stays visible as ``?<qualifier>``.
-    """
-
-    def replace(match: re.Match[str]) -> str:
-        qualifier, name = match.group("qualifier"), match.group("name")
-        if qualifier is not None:
-            return f"{scope.get(qualifier, '?' + qualifier)}.{name}"
-        if name in _COLUMNS_READ:
-            return f"{default}.{name}"
-        return match.group(0)
-
-    masked = _masked(text)
-    out: list[str] = []
-    position = 0
-    for match in _REFERENCE_RE.finditer(masked):
-        out.append(text[position : match.start()])
-        out.append(replace(match))
-        position = match.end()
-    out.append(text[position:])
-    return _canon("".join(out))
-
-
-def _condition(text: str, scope: dict[str, str], default: str) -> Any:
-    """One condition, its references resolved; ``a = b`` with its sides sorted; an
-    EXISTS sub-select read as ("exists", table, its WHERE conditions)."""
-    text = _unwrap(text)
-    masked = _masked(text)
-    exists = re.fullmatch(r"exists ?\((?P<body>.*)\)", masked)
-    if exists is not None and _closing(masked, exists.start("body") - 1) == len(masked) - 1:
-        return _subselect(text[exists.start("body") : exists.end("body")], scope)
-    resolved = _resolved(text, scope, default)
-    sides = re.fullmatch(r"(?P<left>[\w.?]+) = (?P<right>[\w.?]+)", resolved)
-    if sides is not None:
-        return " = ".join(sorted((sides.group("left"), sides.group("right"))))
-    return resolved
-
-
-def _subselect(text: str, scope: dict[str, str]) -> Any:
-    """("exists", table, conditions) of ``SELECT ... FROM t [alias] WHERE ...``."""
-    text = _unwrap(text)
-    match = _SUBSELECT_RE.fullmatch(_masked(text))
-    if match is None:
-        return ("unreadable sub-select", _canon(text))
-    table = match.group("table")
-    inner = {**scope, table: table}
-    if match.group("alias"):
-        inner[match.group("alias")] = table
-    where = text[match.start("where") : match.end("where")]
-    return ("exists", table, frozenset(_condition(p, inner, table) for p in _and_parts(where)))
-
-
-def _value(text: str, scope: dict[str, str], default: str) -> Any:
-    """An assigned value: a CASE as ("case", ((condition, value), ...), else), else the
-    resolved expression."""
-    text = _unwrap(text)
-    masked = _masked(text)
-    if not (masked.startswith("case ") and masked.endswith(" end")):
-        return _resolved(text, scope, default)
-    keywords = _top_level(masked, "case|when|then|else|end")
-    words = [token.group(0) for token in keywords]
-    branch_count = (len(words) - 3) // 2
-    if branch_count < 1 or words != ["case", *["when", "then"] * branch_count, "else", "end"]:
-        return ("unreadable case", _canon(text))
-    pieces = [
-        text[token.end() : following.start()].strip()
-        for token, following in itertools.pairwise(keywords)
-    ]
-    if pieces[0]:  # CASE <operand> WHEN ...: not the contract's searched CASE
-        return ("unreadable case", _canon(text))
-    branches = tuple(
-        (
-            _condition(pieces[1 + 2 * branch], scope, default),
-            _value(pieces[2 + 2 * branch], scope, default),
-        )
-        for branch in range(branch_count)
-    )
-    return ("case", branches, _value(pieces[-1], scope, default))
-
-
-def _backfill(statement: str) -> _Backfill:
-    """(table, {column: value}, WHERE conditions, unexpected clauses) of an UPDATE."""
-    masked = _masked(statement)
-    head = _UPDATE_HEAD_RE.fullmatch(masked)
-    assert head is not None, f"the test can't read the UPDATE {statement!r}"
-    table = head.group("table")
-    scope = {table: table}
-    if head.group("alias"):
-        scope[head.group("alias")] = table
-    rest = statement[head.start("rest") :]
-    clauses = _top_level(_masked(rest), "where|from|returning")
-    unexpected = tuple(token.group(0) for token in clauses if token.group(0) != "where")
-    wheres = [token for token in clauses if token.group(0) == "where"]
-    set_end = clauses[0].start() if clauses else len(rest)
-    where = ""
-    if len(wheres) == 1:
-        later = [token.start() for token in clauses if token.start() > wheres[0].start()]
-        where = rest[wheres[0].end() : later[0] if later else len(rest)]
-    assignments: dict[str, Any] = {}
-    for item in _split(rest[:set_end], ","):
-        match = re.fullmatch(r'"?(\w+)"? ?= ?(.+)', item.strip())
-        assert match is not None, f"the test can't read the assignment {item!r}"
-        assignments[match.group(1)] = _value(match.group(2), scope, table)
-    conditions = (
-        frozenset(_condition(p, scope, table) for p in _and_parts(where)) if where else frozenset()
-    )
-    return table, assignments, conditions, unexpected
-
-
-def _backfills() -> list[_Backfill]:
-    """Every UPDATE 0031 runs (top level and DO blocks), read."""
-    return [_backfill(s) for s in _statements() if re.match(r"update\b", _masked(s))]
-
-
-def _alter_actions() -> list[tuple[str, str]]:
-    """(table, action) for every action of every ALTER TABLE 0031 runs, in order."""
-    found: list[tuple[str, str]] = []
-    for statement in _statements():
-        match = _ALTER_RE.fullmatch(_masked(statement))
-        if match is None:
-            continue
-        for action in _split(statement[match.start("actions") :], ","):
-            found.append((match.group("table"), action))
-    return found
-
-
-def _action_step(table: str, action: str) -> str:
-    """One ALTER TABLE action as a step: a column added, a constraint dropped (plainly)
-    or a CHECK added (validated), else the action itself."""
-    masked = _masked(action)
-    if (column := _ADD_COLUMN_RE.fullmatch(masked)) is not None:
-        return f"column {table}.{column.group('name')}"
-    if (drop := _DROP_RE.fullmatch(masked)) is not None:
-        return f"drop {table}.{drop.group('name')}"
-    if (added := _ADD_CHECK_RE.fullmatch(masked)) is not None:
-        return f"check {table}.{added.group('name')}"
-    return f"other: alter table {table} {action}"
-
-
-def _grant_steps(statement: str) -> list[str] | None:
-    """One step per (privilege, table, grantee) of a GRANT; None if it isn't one."""
-    match = _GRANT_RE.fullmatch(_masked(statement))
-    if match is None:
-        return None
-    suffix = " with grant option" if match.group("option") else ""
-    return [
-        f"grant {key} on {table} to {grantee}{suffix}"
-        for name, columns in _privilege_entries(match.group("privileges"))
-        for key in _acl_keys(name, columns)
-        for table in _targets(match.group("target"))
-        for grantee in sorted(_grantees(match.group("grantees")))
-    ]
-
-
-def _steps() -> list[str]:
-    """What 0031 does, in order: ALTER TABLE actions one by one, the backfills, the
-    indexes, one step per granted privilege; anything else as ``other: ...``."""
-    steps: list[str] = []
-    for statement in _statements():
-        masked = _masked(statement)
-        if (alter := _ALTER_RE.fullmatch(masked)) is not None:
-            for action in _split(statement[alter.start("actions") :], ","):
-                steps.append(_action_step(alter.group("table"), action))
-        elif (update := _UPDATE_HEAD_RE.fullmatch(masked)) is not None:
-            steps.append(f"backfill {update.group('table')}")
-        elif (index := _INDEX_RE.fullmatch(masked)) is not None:
-            steps.append(f"index {index.group('name')}")
-        elif (grants := _grant_steps(statement)) is not None:
-            steps.extend(grants)
-        else:
-            steps.append(f"other: {statement}")
-    return steps
-
-
-def _added_column(table: str) -> _Column:
-    """The parsed definition of ``<table>.trash_group_id`` as 0031 adds it (exactly once)."""
-    found = []
-    for action_table, action in _alter_actions():
-        match = _ADD_COLUMN_RE.fullmatch(_masked(action))
-        if match is not None and (action_table, match.group("name")) == (table, _COLUMN):
-            definition = action[match.start("definition") :]
-            found.append(_parse_column(_COLUMN, definition))
-    assert len(found) == 1, f"{_MIGRATION_NAME} must add {table}.{_COLUMN} exactly once"
-    return found[0]
-
-
-def _added_check(table: str, name: str) -> str:
-    """The expression 0031 adds the CHECK ``name`` on ``table`` with (exactly once)."""
-    found = []
-    for action_table, action in _alter_actions():
-        match = _ADD_CHECK_RE.fullmatch(_masked(action))
-        if match is not None and (action_table, match.group("name")) == (table, name):
-            found.append(action[match.start("expression") : match.end("expression")])
-    assert len(found) == 1, f"{_MIGRATION_NAME} must add {name} on {table} exactly once"
-    return found[0]
-
-
-def _equality(expression: str) -> Any:
-    """The two sides of a top-level ``a = b`` (unwrapped, canonical, as a set: the order
-    of the sides doesn't matter), else the canonical expression."""
-    expression = _unwrap(expression)
-    masked = _masked(expression)
-    operators = []
-    depth = 0
-    for index, char in enumerate(masked):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth -= 1
-        elif depth == 0 and char == "=" and masked[index - 1 : index] not in ("<", ">", "!"):
-            operators.append(index)
-    if len(operators) != 1:
-        return _canon(expression)
-    left, right = expression[: operators[0]], expression[operators[0] + 1 :]
-    return frozenset({_canon(_unwrap(left)), _canon(_unwrap(right))})
-
-
-def _indexes() -> dict[str, _Index]:
-    """Every CREATE INDEX 0031 runs, by name."""
-    found: dict[str, _Index] = {}
-    for statement in _statements():
-        masked = _masked(statement)
-        match = _INDEX_RE.fullmatch(masked)
-        if match is None:
-            assert not re.match(r"create (?:unique )?index\b", masked), (
-                f"the test can't read the index statement {statement!r}"
-            )
-            continue
-        columns = tuple(
-            re.sub(r" asc$", "", column.strip().strip('"'))
-            for column in _split(match.group("columns"), ",")
-        )
-        assert match.group("name") not in found, f"index {match.group('name')} created twice"
-        found[match.group("name")] = _Index(
-            table=match.group("table"),
-            unique=match.group("unique") is not None,
-            concurrently=match.group("concurrently") is not None,
-            btree=match.group("method") in (None, "btree"),
-            columns=columns,
-            include=_names(match.group("include")) if match.group("include") else (),
-            where=(
-                _conditions(statement[match.start("where") : match.end("where")])
-                if match.group("where")
-                else frozenset()
-            ),
-        )
-    return found
-
-
-def _listed_actions() -> list[str]:
-    """The literals of 0031's ``audit_events_action_check``, in written order."""
+def _top_statements() -> list[_Statement]:
+    """0031's top-level statements (comments blanked; raw, normalized and masked)."""
     _raw_sql()
-    return _added_actions(_MIGRATION_NAME)
-
-
-def _expected_actions() -> list[str]:
-    """0030's list with each purge right after its restore (contract section 1)."""
-    expected = list(_added_actions(_PREVIOUS_MIGRATION))
-    for action, after in _NEW_ACTIONS.items():
-        expected.insert(expected.index(after) + 1, action)
-    return expected
-
-
-def _acl(up_to: int | None = None) -> dict[tuple[str, str], frozenset[str]]:
-    """(table, grantee) -> ACL entries after every shipped migration (up to a version).
-
-    Fails the calling test when version 31 isn't shipped."""
-    shipped = _load_migrations(db_mod._MIGRATIONS_DIR)
-    assert _VERSION in [m.version for m in shipped], f"{_MIGRATION_NAME} is not shipped"
-    acl: dict[tuple[str, str], set[str]] = {}
-    for migration in shipped:
-        if up_to is not None and migration.version > up_to:
-            continue
-        for statement in _executed(_normalize(migration.sql)):
-            _apply(acl, statement)
-    return {key: frozenset(value) for key, value in acl.items() if value}
-
-
-def _file_grants() -> list[tuple[frozenset[str], tuple[str, ...], frozenset[str], bool]]:
-    """(ACL entries, tables, grantees, grant option) of every GRANT in 0031, nested DO /
-    function bodies and EXECUTE literals included."""
-    grants = []
-    for fragment in _fragments(_normalize(_raw_sql())):
-        match = _GRANT_RE.fullmatch(_masked(fragment))
-        if match is None:
-            continue
-        entries = frozenset(
-            key
-            for name, columns in _privilege_entries(match.group("privileges"))
-            for key in _acl_keys(name, columns)
-        )
-        grants.append(
-            (
-                entries,
-                _targets(match.group("target")),
-                _grantees(match.group("grantees")),
-                bool(match.group("option")),
-            )
-        )
-    return grants
+    return _statements(_MIGRATION_NAME)
 
 
 def _header_lines() -> list[str]:
@@ -661,6 +299,245 @@ def _header_lines() -> list[str]:
         elif stripped:
             break
     return [line for line in lines if line]
+
+
+def _alias_types(signature: str) -> str:
+    """A ``name(type,...)`` signature with PostgreSQL's type aliases folded."""
+    name, paren, rest = signature.partition("(")
+    if not paren:
+        return signature
+    types = [_TYPE_ALIASES.get(item, item) for item in rest.removesuffix(")").split(",") if item]
+    return f"{name}({','.join(types)})"
+
+
+def _function() -> _Function:
+    """The one CREATE FUNCTION of 0031 (tests/test_migration_0019.py's reader)."""
+    found = [
+        function
+        for statement in _top_statements()
+        if (function := _function_of(statement.raw)) is not None
+    ]
+    assert len(found) == 1, f"{_MIGRATION_NAME} must create exactly one function"
+    return found[0]
+
+
+def _arguments(text: str) -> tuple[tuple[str, str], ...]:
+    """(name, type) per argument of a normalized argument list (an IN mode dropped)."""
+    result: list[tuple[str, str]] = []
+    for item in _split(text, ","):
+        tokens = item.split()
+        if tokens and tokens[0] == "in":
+            tokens = tokens[1:]
+        name = tokens[0] if tokens else ""
+        type_name = " ".join(tokens[1:])
+        result.append((name, _TYPE_ALIASES.get(type_name, type_name)))
+    return tuple(result)
+
+
+def _other_options(options: str) -> str:
+    """The function's options without LANGUAGE plpgsql, SECURITY DEFINER, the SET
+    clauses and VOLATILE (the default): whatever else 0031 declares."""
+    rest = _SET_RE.sub(" ", options)
+    rest = re.sub(r"\blanguage '?plpgsql'?", " ", rest)
+    rest = re.sub(r"\b(?:external )?security definer\b", " ", rest)
+    rest = re.sub(r"\bvolatile\b", " ", rest)
+    return re.sub(r"\s+", " ", rest).strip()
+
+
+def _body_statements(body: str) -> list[str]:
+    """A PL/pgSQL body as its ``;``-separated pieces, comments blanked, whitespace
+    collapsed (and dropped around punctuation), lowercased outside literals."""
+    return [_canon(piece) for piece in _split(_normalize(body), ";")]
+
+
+def _shipped_body() -> str:
+    return _function().body
+
+
+def _raises() -> list[tuple[str, str, str]]:
+    """(level, message, errcode) of every RAISE in the shipped body, in order; an
+    unreadable RAISE is reported whole."""
+    found: list[tuple[str, str, str]] = []
+    for piece in _split(_normalize(_shipped_body()), ";"):
+        if re.search(r"\braise\b", _masked(piece)) is None:
+            continue
+        match = _RAISE_RE.fullmatch(piece)
+        if match is None:
+            found.append(("unreadable", piece, ""))
+            continue
+        message = match.group("message")[1:-1].replace("''", "'")
+        code = _ERRCODE_ALIASES.get(match.group("code").lower(), match.group("code").lower())
+        found.append((match.group("level"), message, code))
+    return found
+
+
+def _kind(statement: _Statement) -> str:
+    """create function / revoke / grant / update, else the statement itself."""
+    if _function_of(statement.raw) is not None:
+        return "create function"
+    if re.match(r"revoke\b", statement.masked):
+        return "revoke"
+    if re.match(r"grant\b", statement.masked):
+        return "grant"
+    if re.match(r"update\b", statement.masked):
+        return "update"
+    return statement.norm
+
+
+class _Revoke(NamedTuple):
+    privileges: frozenset[str]
+    kind: str
+    objects: tuple[str, ...]
+    grantees: frozenset[str]
+    option_only: bool
+    rest: str
+
+
+def _function_privileges(kind: str, privileges: frozenset[str]) -> frozenset[str]:
+    """ALL on a function is EXECUTE (its only privilege)."""
+    if kind in _FUNCTION_KINDS and "all" in privileges:
+        return (privileges - {"all"}) | {"execute"}
+    return privileges
+
+
+_FileGrant = tuple[frozenset[str], str, tuple[str, ...], frozenset[str], bool]
+
+
+def _file_grants() -> tuple[list[_FileGrant], int]:
+    """(privileges, kind, objects, grantees, grant option) of every GRANT in 0031, nested
+    bodies and literals included, and how many role memberships it grants."""
+    grants, memberships = _parse_grants(_fragments(_normalize(_raw_sql())))
+    return [
+        (
+            _function_privileges(grant.kind, grant.privileges),
+            grant.kind,
+            tuple(_alias_types(item) for item in grant.objects),
+            grant.grantees,
+            grant.grant_option,
+        )
+        for grant in grants
+    ], len(memberships)
+
+
+def _file_revokes() -> list[_Revoke]:
+    """Every REVOKE in 0031, nested bodies and literals included."""
+    revokes: list[_Revoke] = []
+    for fragment in _fragments(_normalize(_raw_sql())):
+        masked = _masked(fragment)
+        if re.match(r"revoke\b", masked) is None:
+            continue
+        match = _REVOKE_STATEMENT_RE.fullmatch(masked)
+        assert match is not None, f"the test can't read the REVOKE {fragment!r}"
+        kind, objects = _target(match.group("target"))
+        revokes.append(
+            _Revoke(
+                _function_privileges(kind, _privileges(match.group("privileges"))),
+                kind,
+                tuple(_alias_types(item) for item in objects),
+                _grantees(match.group("grantees")),
+                match.group("option") is not None,
+                match.group("rest").strip(),
+            )
+        )
+    return revokes
+
+
+# ---------------------------------------------------------------------------
+# Helpers: privileges after every shipped migration
+# ---------------------------------------------------------------------------
+
+
+def _shipped_migrations() -> list[_Migration]:
+    """The shipped migrations; fails the calling test while version 31 isn't shipped."""
+    shipped = _load_migrations(db_mod._MIGRATIONS_DIR)
+    assert _VERSION in [m.version for m in shipped], f"{_MIGRATION_NAME} is not shipped"
+    return shipped
+
+
+def _table_acl(up_to: int | None = None) -> dict[tuple[str, str], frozenset[str]]:
+    """(table, grantee) -> ACL entries after every shipped migration (up to a version)."""
+    acl: dict[tuple[str, str], set[str]] = {}
+    for migration in _shipped_migrations():
+        if up_to is not None and migration.version > up_to:
+            continue
+        for statement in _executed(_normalize(migration.sql)):
+            _apply(acl, statement)
+    return {key: frozenset(value) for key, value in acl.items() if value}
+
+
+def _covers_execute(privileges: frozenset[str]) -> bool:
+    return bool(privileges & {"execute", "all"})
+
+
+def _function_targets(acl: dict[str, set[str]], kind: str, objects: tuple[str, ...]) -> list[str]:
+    """The known functions a GRANT / REVOKE target names (a bare name: every overload)."""
+    if kind in _BULK_FUNCTION_KINDS:
+        return list(acl) if "public" in objects else []
+    if kind not in _FUNCTION_KINDS:
+        return []
+    targets: list[str] = []
+    for item in objects:
+        if "(" in item:
+            targets.append(_alias_types(item))
+        else:
+            targets.extend(signature for signature in acl if signature.split("(")[0] == item)
+    return targets
+
+
+def _apply_to_functions(acl: dict[str, set[str]], statement: str, public_default: bool) -> bool:
+    """Apply one statement to the functions' ACL (grantee, ``grantee*`` for a grant
+    option; the owner left out) as PostgreSQL does; returns whether a function created
+    from now on gives PUBLIC EXECUTE (PostgreSQL's default until 0018's global ALTER
+    DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC)."""
+    masked = _masked(statement)
+    if (created := _CREATE_FUNCTION_RE.match(masked)) is not None:
+        raw = f"{created.group('name')}({created.group('arguments')})"
+        acl.setdefault(_alias_types(_signature(raw)), {"public"} if public_default else set())
+        return public_default
+    if (dropped := _DROP_FUNCTION_RE.fullmatch(masked)) is not None:
+        objects = tuple(_signature(item) for item in _split(dropped.group("objects"), ","))
+        for signature in _function_targets(acl, "function", objects):
+            acl.pop(signature, None)
+        return public_default
+    if _GLOBAL_DEFAULT_REVOKE.fullmatch(masked):
+        return False
+    if re.match(r"grant\b", masked):
+        for grant in _parse_grants([statement])[0]:
+            if not _covers_execute(grant.privileges):
+                continue
+            for signature in _function_targets(acl, grant.kind, grant.objects):
+                held = acl.setdefault(signature, set())
+                held.update(grant.grantees)
+                if grant.grant_option:
+                    held.update(f"{grantee}*" for grantee in grant.grantees)
+        return public_default
+    if (revoke := _REVOKE_STATEMENT_RE.fullmatch(masked)) is not None:
+        if not _covers_execute(_privileges(revoke.group("privileges"))):
+            return public_default
+        kind, objects = _target(revoke.group("target"))
+        for signature in _function_targets(acl, kind, objects):
+            held = acl.setdefault(signature, set())
+            for grantee in _grantees(revoke.group("grantees")):
+                held.discard(f"{grantee}*")
+                if revoke.group("option") is None:
+                    held.discard(grantee)
+    return public_default
+
+
+def _function_acl(up_to: int | None = None) -> dict[str, frozenset[str]]:
+    """signature -> who may EXECUTE it after every shipped migration (up to a version)."""
+    acl: dict[str, set[str]] = {}
+    public_default = True
+    for migration in _shipped_migrations():
+        if up_to is not None and migration.version > up_to:
+            continue
+        for statement in _executed(_normalize(migration.sql)):
+            public_default = _apply_to_functions(acl, statement, public_default)
+    return {signature: frozenset(held) for signature, held in acl.items()}
+
+
+def _executable_by(grantee: str) -> frozenset[str]:
+    return frozenset(signature for signature, held in _function_acl().items() if grantee in held)
 
 
 # ---------------------------------------------------------------------------
@@ -702,7 +579,6 @@ class TestMigration0031File:
         assert (_VERSION, _MIGRATION_NAME) in recorded
 
     async def test_migration_0031_runs_after_0030(self, mock_pool: MagicMock) -> None:
-        """With 0001 to 0029 applied, 0030 runs before 0031."""
         conn = mock_pool._mock_conn
         conn.fetch = AsyncMock(return_value=[{"version": v} for v in range(1, _VERSION - 1)])
         previous = (db_mod._MIGRATIONS_DIR / _PREVIOUS_MIGRATION).read_text(encoding="utf-8")
@@ -718,7 +594,6 @@ class TestMigration0031File:
     async def test_migration_0031_already_applied_is_not_run_again(
         self, mock_pool: MagicMock
     ) -> None:
-        """With 0001 to 0031 applied, the file isn't executed."""
         conn = mock_pool._mock_conn
         conn.fetch = AsyncMock(return_value=[{"version": v} for v in range(1, _VERSION + 1)])
         shipped = _raw_sql()
@@ -727,370 +602,288 @@ class TestMigration0031File:
 
         assert not any(c.args and c.args[0] == shipped for c in conn.execute.call_args_list)
 
-    def test_migration_0031_opens_with_a_header_comment_naming_what_it_changes(self) -> None:
-        """What, why and grants, before any statement: the group column, the two new
-        actions and the DELETE granted to the runtime role."""
+    def test_migration_0031_opens_with_a_header_comment_naming_what_it_adds(self) -> None:
+        """What, why and grants, before any statement: the function, chat_messages staying
+        append-only for admino_app (no UPDATE or DELETE), SECURITY DEFINER with a pinned
+        search_path, the files unlinked first, #182, and what is granted; and the audit
+        fixes: the turn's ``shape`` check (C1'), its ``residual`` (what a compromised
+        runtime role can still remove) and the ``backfill`` of the GH-25 D9 partials
+        stored before (C1'b)."""
         lines = _header_lines()
         header = " ".join(lines)
 
-        assert len(lines) >= 3
-        assert {
-            "names the column": re.search(rf"\b{_COLUMN}\b", header) is not None,
-            "names chat.purge": "chat.purge" in header,
-            "names file.purge": "file.purge" in header,
+        checks = {
+            "names the function": _FUNCTION in header,
+            "names chat_messages": _MESSAGES in header,
+            "says append-only": re.search(r"append[- ]only", header, re.IGNORECASE) is not None,
+            "names admino_app": _ROLE in header,
+            "says no UPDATE": re.search(r"\bupdate\b", header, re.IGNORECASE) is not None,
+            "says no DELETE": re.search(r"\bdelete\b", header, re.IGNORECASE) is not None,
+            "says SECURITY DEFINER": re.search(r"security definer", header, re.IGNORECASE)
+            is not None,
+            "says search_path": "search_path" in header,
+            "says the files are unlinked": re.search(r"\bunlink", header, re.IGNORECASE)
+            is not None,
+            "names #182": "#182" in header,
             "says what is granted": re.search(r"\bgrant", header, re.IGNORECASE) is not None,
-            "names the delete": re.search(r"\bdelete\b", header, re.IGNORECASE) is not None,
-        } == dict.fromkeys(
-            (
-                "names the column",
-                "names chat.purge",
-                "names file.purge",
-                "says what is granted",
-                "names the delete",
-            ),
-            True,
-        )
-
-
-# ---------------------------------------------------------------------------
-# 2. The trash_group_id columns (Decision 2)
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0031Columns:
-    """ALTER TABLE chats / attachments ADD COLUMN trash_group_id UUID."""
-
-    def test_migration_0031_adds_only_the_two_trash_group_columns(self) -> None:
-        """One ADD COLUMN per table, trash_group_id on chats and on attachments, and no
-        other column anywhere."""
-        added = sorted(
-            (table, match.group("name"))
-            for table, action in _alter_actions()
-            if (match := _ADD_COLUMN_RE.fullmatch(_masked(action))) is not None
-        )
-
-        assert added == sorted((table, _COLUMN) for table in _TABLES)
-
-    def test_migration_0031_trash_group_ids_are_nullable_uuids_without_default(self) -> None:
-        """UUID, nullable (a live row has no group), no default (the application sets it
-        with deleted_at), nothing else on the column: no CHECK (the table CHECK pairs it
-        with deleted_at), key, reference or identity."""
-        columns = {table: _added_column(table) for table in _TABLES}
-
-        assert {
-            table: {
-                "uuid": column.type_name in _UUID_TYPES,
-                "not null": column.not_null,
-                "primary key": column.primary_key,
-                "identity": column.identity,
-                "default": _canonical_default(column),
-                "checks": column.checks,
-                "uniques": column.uniques,
-                "references": column.references,
-                "unexpected": column.unexpected,
-            }
-            for table, column in columns.items()
-        } == {
-            table: {
-                "uuid": True,
-                "not null": False,
-                "primary key": False,
-                "identity": None,
-                "default": None,
-                "checks": [],
-                "uniques": [],
-                "references": [],
-                "unexpected": [],
-            }
-            for table in _TABLES
+            "says the turn's shape is checked": re.search(r"\bshape\b", header, re.IGNORECASE)
+            is not None,
+            "names the residual": re.search(r"\bresidual\b", header, re.IGNORECASE) is not None,
+            "says the D9 partials are backfilled": re.search(r"\bbackfill", header, re.IGNORECASE)
+            is not None,
         }
 
+        assert len(lines) >= 3
+        assert checks == dict.fromkeys(checks, True)
+
 
 # ---------------------------------------------------------------------------
-# 3. The backfill of the existing trash (Decision 2)
+# 2. The statements, in order
 # ---------------------------------------------------------------------------
 
 
-class TestMigration0031Backfill:
-    """Existing trashed rows get their group; live rows keep NULL."""
+class TestMigration0031Statements:
+    """CREATE FUNCTION, REVOKE ALL FROM PUBLIC, GRANT EXECUTE TO admino_app, the D9
+    backfill UPDATE; nothing else."""
 
-    def test_migration_0031_backfills_every_trashed_chat_as_its_own_group(self) -> None:
-        """UPDATE chats SET trash_group_id = id WHERE deleted_at IS NOT NULL: nothing
-        else is set, no other filter, no FROM or RETURNING."""
-        by_table = {backfill[0]: backfill for backfill in _backfills()}
-
-        assert by_table.get(_CHATS) == _CHATS_BACKFILL
-
-    def test_migration_0031_backfills_trashed_files_into_their_trashed_chat_or_their_own(
+    def test_migration_0031_runs_exactly_the_four_statements_in_the_contract_order(
         self,
     ) -> None:
-        """UPDATE attachments SET trash_group_id = CASE WHEN EXISTS (a chat with the
-        file's chat_id and org_id that is trashed) THEN chat_id ELSE id END WHERE
-        deleted_at IS NOT NULL: a file trashed with its chat joins the chat's group,
-        any other trashed file (deleted on its own) is its own group, a live file keeps
-        NULL. Nothing else is set; no FROM or RETURNING."""
-        by_table = {backfill[0]: backfill for backfill in _backfills()}
-
-        assert by_table.get(_ATTACHMENTS) == _ATTACHMENTS_BACKFILL
-
-    def test_migration_0031_the_two_backfills_are_its_only_data_writes(self) -> None:
-        """Exactly one UPDATE per table, and no other UPDATE fragment anywhere (nested
-        bodies and literals included)."""
-        fragments = _fragments(_normalize(_raw_sql()))
-        updates = [f for f in fragments if re.match(_UPDATE_FRAGMENT, _masked(f))]
-
-        assert sorted(backfill[0] for backfill in _backfills()) == sorted(_TABLES)
-        assert len(updates) == len(_TABLES)
-
-
-# ---------------------------------------------------------------------------
-# 4. The CHECKs pairing the group with deleted_at (Decision 2)
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0031Checks:
-    """A row has both deleted_at and trash_group_id, or neither."""
-
-    def test_migration_0031_checks_pair_deleted_at_with_trash_group_id(self) -> None:
-        """chats_trash_group_check and attachments_trash_group_check are each exactly
-        (deleted_at IS NULL) = (trash_group_id IS NULL), validated (nothing after the
-        expression: no NOT VALID)."""
-        expressions = {
-            name: _equality(_added_check(table, name)) for table, name in _TRASH_CHECKS.items()
-        }
-
-        assert expressions == dict.fromkeys(
-            _TRASH_CHECKS.values(), frozenset({"deleted_at is null", f"{_COLUMN} is null"})
-        )
-
-    def test_migration_0031_steps_run_in_an_order_postgresql_accepts(self) -> None:
-        """Each column exists before its backfill and its UPDATE grant; each CHECK comes
-        after its table's backfill (before it, every trashed row would fail it); the
-        action CHECK is dropped before it is added again."""
-        steps = _steps()
-
-        def position(step: str) -> int:
-            assert step in steps, f"{_MIGRATION_NAME} has no step {step!r}: {steps}"
-            return steps.index(step)
-
-        orders = {
-            f"{table}: column, backfill, check, grant": (
-                position(f"column {table}.{_COLUMN}")
-                < position(f"backfill {table}")
-                < position(f"check {table}.{_TRASH_CHECKS[table]}")
-                and position(f"column {table}.{_COLUMN}")
-                < position(f"grant update({_COLUMN}) on {table} to {_ROLE}")
-            )
-            for table in _TABLES
-        }
-        orders["action check: drop, add"] = position(
-            f"drop {_AUDIT_TABLE}.{_ACTION_CHECK}"
-        ) < position(f"check {_AUDIT_TABLE}.{_ACTION_CHECK}")
-
-        assert orders == dict.fromkeys(orders, True)
-
-
-# ---------------------------------------------------------------------------
-# 5. The trash indexes
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0031Indexes:
-    """The owner's trash and the purge read an org's trashed rows by deletion time."""
-
-    def test_migration_0031_creates_exactly_the_two_partial_trash_indexes(self) -> None:
-        """Plain btree, non-unique, not CONCURRENTLY (migrations run in a transaction), on
-        (org_id, owner_user_id, deleted_at, id) WHERE deleted_at IS NOT NULL: they hold
-        only the trash."""
-        expected = {
-            name: _Index(
-                table=table,
-                unique=False,
-                concurrently=False,
-                btree=True,
-                columns=_INDEX_COLUMNS,
-                include=(),
-                where=frozenset({"deleted_at is not null"}),
-            )
-            for name, table in _TRASH_INDEXES.items()
-        }
-
-        assert _indexes() == expected
-
-
-# ---------------------------------------------------------------------------
-# 6. Privileges (Decision 10)
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0031Privileges:
-    """admino_app may delete chats and write the groups; nothing else changes."""
-
-    def test_migration_0031_grants_delete_on_chats_and_update_of_the_groups_only(
-        self,
-    ) -> None:
-        """Every GRANT of the file (nested ones included), together: DELETE on chats,
-        UPDATE (trash_group_id) on chats and on attachments; to admino_app alone (never
-        PUBLIC), without grant option."""
-        grants = _file_grants()
-
-        assert {
-            (table, entry)
-            for entries, tables, _, _ in grants
-            for table in tables
-            for entry in entries
-        } == {(table, entry) for table, held in _ADDED_PRIVILEGES.items() for entry in held}
-        assert {grantee for _, _, grantees, _ in grants for grantee in grantees} == {_ROLE}
-        assert [option for *_, option in grants if option] == []
-
-    def test_migration_0031_adds_exactly_the_contract_privileges(self) -> None:
-        """Every (table, grantee) holds after 0031 what it held after 0030, except
-        admino_app on chats (delete, update(trash_group_id)) and on attachments
-        (update(trash_group_id)): no other table gains DELETE, nothing is revoked."""
-        before = _acl(_VERSION - 1)
-        expected = dict(before)
-        for table, added in _ADDED_PRIVILEGES.items():
-            expected[(table, _ROLE)] = before.get((table, _ROLE), frozenset()) | added
-
-        assert _acl(_VERSION) == expected
-
-    def test_migration_0031_runtime_role_privileges_after_every_migration(self) -> None:
-        """After every shipped migration: chats SELECT, INSERT, DELETE and UPDATE on six
-        columns (never id, org_id, owner_user_id, created_at or legacy_session_id);
-        attachments SELECT, INSERT, DELETE and UPDATE on ten columns (never id, org_id,
-        chat_id, owner_user_id, filename, kind, size_bytes or created_at); chat_messages
-        SELECT, INSERT only (append-only: a chat's DELETE cascades as the owner); no
-        table-wide UPDATE, no grant option; PUBLIC nothing on any of them."""
-        acl = _acl()
-
-        assert {
-            (table, grantee): acl.get((table, grantee), frozenset())
-            for table in _EXPECTED_PRIVILEGES
-            for grantee in (_ROLE, "public")
-        } == {
-            **{(table, _ROLE): held for table, held in _EXPECTED_PRIVILEGES.items()},
-            **{(table, "public"): frozenset() for table in _EXPECTED_PRIVILEGES},
-        }
-
-    def test_migration_0031_passes_the_runtime_role_grant_guards(self) -> None:
-        """tests/test_migration_0018.py's guards hold over every shipped migration with
-        0031 in place, and their parser reads 0031's table grants (DELETE and UPDATE on
-        chats, UPDATE on attachments, to admino_app) and no role membership."""
-        shipped = _shipped()
-        ours = [migration for migration in shipped if migration.version == _VERSION]
-        assert [migration.name for migration in ours] == [_MIGRATION_NAME]
-        grants, memberships = _migration_grants(ours[0])
-
-        assert {
-            (table, privilege, grantee)
-            for grant in grants
-            if grant.kind == "table"
-            for table in grant.objects
-            for privilege in grant.privileges
-            for grantee in grant.grantees
-        } == {
-            (_CHATS, "delete", _ROLE),
-            (_CHATS, "update", _ROLE),
-            (_ATTACHMENTS, "update", _ROLE),
-        }
-        assert memberships == []
-        assert {guard_id: guard(shipped) for guard_id, guard in _GUARDS} == {
-            guard_id: [] for guard_id, _ in _GUARDS
-        }
-
-
-# ---------------------------------------------------------------------------
-# 7. The audit action catalog (Decision 9)
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0031ActionCatalog:
-    """audit_events_action_check is replaced with 0030's catalog plus the two purges."""
-
-    def test_migration_0031_action_check_is_dropped_then_re_added_under_its_name(
-        self,
-    ) -> None:
-        """A plain DROP (no IF EXISTS, no CASCADE), then one ADD of the same name on
-        audit_events, with nothing after the expression."""
-        steps = [
-            _action_step(table, action)
-            for table, action in _alter_actions()
-            if table == _AUDIT_TABLE
+        """The function first (a privilege on a missing function fails), then the REVOKE
+        from PUBLIC, then the GRANT, then C1'b's backfill UPDATE: no other top-level
+        statement (so no other data write, DO block or table change outside the function
+        body)."""
+        assert [_kind(statement) for statement in _top_statements()] == [
+            "create function",
+            "revoke",
+            "grant",
+            "update",
         ]
 
-        assert steps == [
-            f"drop {_AUDIT_TABLE}.{_ACTION_CHECK}",
-            f"check {_AUDIT_TABLE}.{_ACTION_CHECK}",
+    def test_migration_0031_backfill_is_the_contract_update_statement(self) -> None:
+        """C1'b: the fourth statement is the contract's UPDATE, statement for statement
+        (comments, layout and keyword case aside, '...' literals byte for byte): an
+        ``assistant`` row stored ``complete`` without tool_use blocks (NULL or ``[]``)
+        becomes ``error`` only when its chat's next row by seq (same chat and org) is an
+        ``assistant`` ``error`` row, so a D9 partial stored before C1'b joins its failed
+        answer and a completed answer followed by a user row (or by nothing) is kept."""
+        statements = _top_statements()
+
+        assert len(statements) == 4, [_kind(statement) for statement in statements]
+        assert _body_statements(statements[3].raw) == _body_statements(_CONTRACT_BACKFILL)
+
+    def test_migration_0031_revokes_all_on_the_function_from_public_only(self) -> None:
+        """The file's only REVOKE (nested ones included): ALL (EXECUTE, a function's only
+        privilege) ON FUNCTION delete_failed_turn(uuid, uuid, uuid, bigint) FROM PUBLIC."""
+        assert _file_revokes() == [
+            _Revoke(
+                frozenset({"execute"}),
+                "function",
+                (_SIGNATURE,),
+                frozenset({"public"}),
+                False,
+                "",
+            )
         ]
 
-    def test_migration_0031_action_list_is_0030s_with_each_purge_after_its_restore(
-        self,
-    ) -> None:
-        """0030's 52 actions in their order, with 'chat.purge' right after
-        'chat.restore' and 'file.purge' right after 'file.restore': nothing else added
-        or removed, each listed once."""
-        listed = _listed_actions()
+    def test_migration_0031_grants_execute_on_the_function_to_admino_app_only(self) -> None:
+        """The file's only GRANT (nested ones included): EXECUTE ON FUNCTION
+        delete_failed_turn(uuid, uuid, uuid, bigint) TO admino_app, without grant option;
+        no role membership."""
+        assert _file_grants() == (
+            [(frozenset({"execute"}), "function", (_SIGNATURE,), frozenset({_ROLE}), False)],
+            0,
+        )
 
-        assert listed == _expected_actions()
-        assert len(listed) == len(set(listed)) == 54
-
-    def test_migration_0031_action_check_matches_audit_action(self) -> None:
-        """The live catalog sync (moved here from test_migration_0030.py): the SQL action
-        list equals AuditAction's values exactly."""
-        from admino.audit_events import AuditAction
-
-        assert set(_listed_actions()) == {action.value for action in AuditAction}
-
-    def test_migration_0031_audit_action_has_the_two_purge_members(self) -> None:
-        """AuditAction.CHAT_PURGE / FILE_PURGE are 'chat.purge' / 'file.purge'."""
-        from admino import audit_events
-
-        assert {
-            name: getattr(getattr(audit_events.AuditAction, name, None), "value", None)
-            for name in ("CHAT_PURGE", "FILE_PURGE")
-        } == {"CHAT_PURGE": "chat.purge", "FILE_PURGE": "file.purge"}
-
-    def test_migration_0031_fake_catalog_is_the_shipped_one(self) -> None:
-        """tests/db_fakes.py reads its action catalog from the shipped migrations: after
-        0031 it is 0031's list (moved here from test_migration_0030.py's mirror)."""
-        assert db_fakes.shipped_schema().audit_actions == frozenset(_listed_actions())
-
-
-# ---------------------------------------------------------------------------
-# 8. Nothing else
-# ---------------------------------------------------------------------------
-
-
-class TestMigration0031Scope:
-    """Only the columns, the backfill, the CHECKs, the indexes, the grants and the
-    catalog."""
-
-    def test_migration_0031_runs_exactly_the_contract_steps(self) -> None:
-        """Every statement at the top level or in a DO block, ALTER TABLE actions and
-        granted privileges one by one: two columns, two backfills, three CHECKs, one
-        DROP, two indexes, three grants; nothing else, nothing twice."""
-        assert sorted(_steps()) == sorted(_CONTRACT_STEPS)
-
-    def test_migration_0031_runs_no_code_revoke_or_other_write(self) -> None:
-        """No DO block, function, trigger, role, INSERT / DELETE / TRUNCATE / COPY /
-        MERGE, REVOKE, CREATE TABLE, DROP TABLE / INDEX / COLUMN, SECURITY DEFINER,
-        owner change, trigger switch, grant option or default privileges, also not
-        nested in a body or an EXECUTE literal; the two indexes are the only CREATE
-        INDEX fragments."""
+    def test_migration_0031_changes_nothing_else(self) -> None:
+        """No DO block, table / index / view / type / schema / trigger / rule / policy /
+        role change, no other function altered or dropped, no default privileges, OWNER TO,
+        SET ROLE, INSERT, TRUNCATE, COPY or MERGE, also not nested in the function body or
+        a literal."""
         fragments = _fragments(_normalize(_raw_sql()))
         offenders = [
             (kind, fragment)
             for fragment in fragments
             for kind, pattern in _FORBIDDEN.items()
-            if re.match(pattern, _masked(fragment))
-        ] + [
-            (kind, fragment)
-            for fragment in fragments
-            for kind, pattern in _FORBIDDEN_ANYWHERE.items()
             if re.search(pattern, _masked(fragment))
         ]
-        indexes = [f for f in fragments if re.match(_INDEX_FRAGMENT, _masked(f))]
 
         assert fragments, f"{_MIGRATION_NAME} runs nothing"
         assert offenders == []
-        assert len(indexes) == len(_TRASH_INDEXES)
+
+    def test_migration_0031_writes_no_data_outside_the_function_body_but_the_backfill(
+        self,
+    ) -> None:
+        """At the top level exactly one UPDATE, DELETE, SELECT or PERFORM: C1'b's backfill
+        UPDATE on chat_messages (the body's DML runs only when admino_app calls the
+        function); no other data write, no DELETE, no other table updated."""
+        writes = [
+            (kind, _body_statements(statement.raw))
+            for statement in _top_statements()
+            for kind, pattern in _TOP_LEVEL_WRITES.items()
+            if re.search(pattern, statement.masked)
+        ]
+
+        assert writes == [("update", _body_statements(_CONTRACT_BACKFILL))]
+
+
+# ---------------------------------------------------------------------------
+# 3. The function's declaration
+# ---------------------------------------------------------------------------
+
+
+class TestMigration0031FunctionDeclaration:
+    """delete_failed_turn(target_chat uuid, target_org uuid, target_owner uuid,
+    through_seq bigint) RETURNS bigint, plpgsql, SECURITY DEFINER, search_path pinned."""
+
+    def test_migration_0031_creates_delete_failed_turn_with_the_contract_signature(
+        self,
+    ) -> None:
+        """A plain CREATE FUNCTION (not OR REPLACE: a function already there fails the
+        migration instead of keeping its owner and grants), the four named arguments in
+        order, RETURNS bigint (the deleted row count), LANGUAGE plpgsql."""
+        function = _function()
+
+        assert {
+            "name": function.name,
+            "or replace": function.or_replace,
+            "arguments": _arguments(function.arguments),
+            "returns": _TYPE_ALIASES.get(function.returns, function.returns),
+            "language": _language(function),
+        } == {
+            "name": _FUNCTION,
+            "or replace": False,
+            "arguments": _ARGUMENTS,
+            "returns": "bigint",
+            "language": "plpgsql",
+        }
+
+    def test_migration_0031_function_is_security_definer(self) -> None:
+        """It runs as the owner, so admino_app needs no DELETE or UPDATE on
+        chat_messages; never SECURITY INVOKER."""
+        function = _function()
+
+        assert _is_security_definer(function), function.options
+        assert re.search(r"\bsecurity invoker\b", function.options) is None
+
+    def test_migration_0031_function_pins_its_search_path(self) -> None:
+        """SET search_path = public, pg_temp, as two names (not one 'public, pg_temp'
+        literal, which PostgreSQL reads as a single schema) and as its only setting."""
+        assert _settings(_function().options) == {"search_path": _SEARCH_PATH}
+
+    def test_migration_0031_function_declares_no_other_option(self) -> None:
+        """Only LANGUAGE plpgsql, SECURITY DEFINER and the SET clause (VOLATILE, the
+        default, tolerated): no STRICT (a NULL argument would return NULL instead of the
+        refusal), STABLE / IMMUTABLE, LEAKPROOF, PARALLEL, COST or ROWS."""
+        assert _other_options(_function().options) == ""
+
+
+# ---------------------------------------------------------------------------
+# 4. The function's body
+# ---------------------------------------------------------------------------
+
+
+class TestMigration0031FunctionBody:
+    """The validated body: the checks, the refusals, the unlink, the delete, the count."""
+
+    def test_migration_0031_body_is_the_contract_body_statement_for_statement(self) -> None:
+        """The live, owned chat; the row at through_seq ended as error or stopped; no
+        assistant or tool row after it; the turn's start (the latest user message at or
+        before it); the turn's shape (C1', security audit M-1: only tool rows and
+        assistant rows with tool_use blocks, complete or awaiting_confirmation, or (C1'b)
+        assistant rows with status error, GH-25 D9's partial, strictly between that user
+        message and through_seq); the files unlinked; the turn
+        deleted; the deleted count returned. Comments, layout and keyword case aside,
+        statement for statement."""
+        assert _body_statements(_shipped_body()) == _body_statements(_CONTRACT_BODY)
+
+    def test_migration_0031_every_raise_is_the_plain_refusal_with_insufficient_privilege(
+        self,
+    ) -> None:
+        """Five RAISE EXCEPTION 'only a failed turn of a live chat can be deleted' USING
+        ERRCODE = 'insufficient_privilege' (42501): a plain literal, so the error carries
+        no chat, org, user or row data; no other RAISE (NOTICE, a format placeholder)."""
+        assert _raises() == [("exception", _REFUSAL, _ERRCODE)] * _RAISE_COUNT
+
+    def test_migration_0031_body_runs_static_sql_only(self) -> None:
+        """No EXECUTE, format(), quote_ident / quote_literal / quote_nullable or dblink:
+        the ids reach the statements as typed arguments, never as SQL text."""
+        body = _masked(_normalize(_shipped_body()))
+
+        assert body.strip(), "the function has an empty body"
+        assert _DYNAMIC_SQL_RE.search(body) is None, body
+
+
+# ---------------------------------------------------------------------------
+# 5. Privileges after every shipped migration
+# ---------------------------------------------------------------------------
+
+
+class TestMigration0031Privileges:
+    """chat_messages stays append-only for admino_app; it may execute the new function."""
+
+    def test_migration_0031_admino_app_holds_select_insert_on_chat_messages_only(
+        self,
+    ) -> None:
+        """After every shipped migration: SELECT, INSERT (never UPDATE or DELETE, no grant
+        option) for admino_app on chat_messages; PUBLIC nothing."""
+        acl = _table_acl()
+
+        assert {
+            _ROLE: acl.get((_MESSAGES, _ROLE), frozenset()),
+            "public": acl.get((_MESSAGES, "public"), frozenset()),
+        } == {_ROLE: frozenset({"select", "insert"}), "public": frozenset()}
+
+    def test_migration_0031_changes_no_table_privilege(self) -> None:
+        """Every (table, grantee) holds after 0031 exactly what it held after 0030."""
+        assert _table_acl(_VERSION) == _table_acl(_VERSION - 1)
+
+    def test_migration_0031_admino_app_may_execute_exactly_the_purges_and_the_new_function(
+        self,
+    ) -> None:
+        """After every shipped migration: purge_audit_events(integer),
+        purge_org_audit_events(uuid) and delete_failed_turn(uuid, uuid, uuid, bigint);
+        no trigger function or anything else."""
+        assert _executable_by(_ROLE) == _EXECUTABLE
+
+    def test_migration_0031_public_may_execute_no_function(self) -> None:
+        """After every shipped migration PUBLIC (every role) may execute no function, the
+        new one included."""
+        assert _executable_by("public") == frozenset()
+
+    def test_migration_0031_adds_execute_on_the_new_function_and_nothing_else(self) -> None:
+        """Every function's privileges after 0031 are those after 0030, plus
+        delete_failed_turn executable by admino_app alone (no grant option)."""
+        before = _function_acl(_VERSION - 1)
+
+        assert _function_acl(_VERSION) == {**before, _SIGNATURE: frozenset({_ROLE})}
+
+    def test_migration_0031_passes_the_0018_grant_guards(self) -> None:
+        """With 0031 shipped, every grant guard of tests/test_migration_0018.py
+        (section 7) still passes over all shipped migrations."""
+        migrations = _shipped()
+        violations = {guard_id: guard(migrations) for guard_id, guard in _GUARDS}
+
+        assert _MIGRATION_NAME in [migration.name for migration in migrations]
+        assert violations == {guard_id: [] for guard_id, _ in _GUARDS}
+
+
+# ---------------------------------------------------------------------------
+# 6. tests/db_fakes.py mirrors the refusal
+# ---------------------------------------------------------------------------
+
+
+class TestMigration0031FakeDb:
+    """The FakeDb's delete_failed_turn refuses with the SQL's own text (contract C5)."""
+
+    async def test_migration_0031_fake_refusal_is_the_sql_raise_text(self) -> None:
+        """An unknown chat: InsufficientPrivilegeError with exactly the shipped RAISE
+        literal, as PostgreSQL would answer."""
+        literals = {message for _, message, _ in _raises()}
+        db = FakeDb()
+
+        with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
+            await db.pool.fetchval(_CALL, uuid.uuid4(), ORG_ID, uuid.uuid4(), 1)
+
+        assert literals == {_REFUSAL}
+        assert str(refused.value) == _REFUSAL

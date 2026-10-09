@@ -1,4 +1,4 @@
-"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-194).
+"""Shared in-memory database for the service and HTTP tests (GH-151 to GH-245).
 
 ``FakeDb`` stands in for the users, organizations, invitations, sessions,
 password_reset_tokens, email_outbox, audit_events, login_throttle,
@@ -177,7 +177,7 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   whose type the SQL implies (a cast, ``col <op> $n``, a row comparison, an
   INSERT position, ``LIMIT $n``) through its encoder; every str argument's
   U+0000 (used or not); and migration 0024's grants: admino_app may not
-  DELETE chats (GH-194: until a shipped migration, 0031, grants it) nor UPDATE
+  DELETE chats (GH-194: until a shipped migration, 0032, grants it) nor UPDATE
   or DELETE chat_messages (InsufficientPrivilegeError; the cascades still run).
   JSONB values travel as JSON text (``$n::jsonb``, no codec, like
   ``oauth_tokens.scopes``): parsed on write, stored and
@@ -186,7 +186,7 @@ Chats (GH-176, migration 0024; GH-266, migration 0025; GH-271, migration 0026):
   is a DataError.
 - Migration 0025 (GH-266): an UPDATE of chats may SET only title,
   title_source, last_activity_at, external_content and deleted_at
-  (``CHAT_UPDATE_COLUMNS``; GH-194: the shipped GRANTs decide, 0031 adds
+  (``CHAT_UPDATE_COLUMNS``; GH-194: the shipped GRANTs decide, 0032 adds
   trash_group_id); naming id, org_id, owner_user_id, created_at or
   legacy_session_id is InsufficientPrivilegeError "permission denied for table
   chats", raised before the statement runs (nothing changes), in a ``col =``
@@ -345,7 +345,7 @@ Attachments (GH-187, migration 0027; GH-188, migration 0028):
   UPDATE may SET only the shipped column grant (``ATTACHMENT_UPDATE_COLUMNS``,
   GH-190: read from the migrations' GRANTs; through 0029: message_id, status,
   failure_reason, page_count, token_estimate and derived_bytes (0028),
-  updated_at, deleted_at; 0030 adds active, GH-194's 0031 trash_group_id).
+  updated_at, deleted_at; 0030 adds active, GH-194's 0032 trash_group_id).
   Naming id, org_id, chat_id, owner_user_id, filename, kind, size_bytes or
   created_at (also in a row-constructor piece) is InsufficientPrivilegeError
   "permission denied for table attachments", raised before the statement runs
@@ -482,7 +482,7 @@ C6, C7, C10):
   ``attachments_of(chat_id)`` read the flag back (no key before 0030).
 
 The trash: restore, delete forever and the retention purge (GH-194, migration
-0031; contract §1, §2, §5):
+0032; contract §1, §2, §5):
 - Gated on the shipped migrations like 0030 (``ShippedSchema.trash_group_tables``,
   ``trash_group_checks``, ``chat_update_columns``, ``delete_tables``; the
   defaults are 0030's schema). Until a shipped migration adds them there is no
@@ -491,8 +491,10 @@ The trash: restore, delete forever and the retention purge (GH-194, migration
   arguments are encoded, whatever rows exist), ``add_chat`` /
   ``add_attachment(trash_group_id=...)`` refuse it the same way, admino_app
   may not DELETE chats (InsufficientPrivilegeError) and chat.purge /
-  file.purge are refused by ``audit_events_action_check``. Once a
-  ``0031_*.sql`` ships the contract's statements:
+  file.purge are refused by ``audit_events_action_check``. The gate reads the
+  statements, never a version number: GH-245's ``0031_chat_retry.sql`` adds
+  none of them, so it leaves the trash schema off. Once a shipped migration
+  (``0032_trash.sql``) runs the contract's statements:
   - ``chats.trash_group_id`` and ``attachments.trash_group_id`` (UUID, NULL;
     ALTER TABLE ... ADD COLUMN, so each is its table's last column, after
     attachments.active, and last in the "Failing row contains" detail): the
@@ -527,9 +529,81 @@ The trash: restore, delete forever and the retention purge (GH-194, migration
   the rows come back reversed).
 - Helpers: ``add_chat(..., deleted_at=X)`` gives the chat ``trash_group_id`` =
   its id; ``add_attachment(..., deleted_at=X)`` its chat's id when that chat is
-  trashed, else its own id (0031's backfill); a live row gets NULL; both take
+  trashed, else its own id (0032's backfill); a live row gets NULL; both take
   an explicit ``trash_group_id=`` (None included) checked like an INSERT.
   ``chat_row`` / ``attachment_row`` / ``attachments_of`` read the column back.
+
+Retrying a failed answer (GH-245, migration 0031; contract C1, C2, C5):
+- The SQL forms run on the reader as PostgreSQL answers them, with no new
+  reader feature. R1 (``chats.read_retry_target``: the caller's live chat with
+  two LEFT JOIN LATERAL sub-selects, ``latest`` (the latest message's seq and
+  status) and ``turn`` (the latest user message's id, seq and content), and a
+  correlated ``ARRAY(SELECT a.id ... ORDER BY a.created_at, a.id)`` of the
+  turn row's live files, excluded ones included): one row per live chat of
+  the caller (``fetchrow``), NULL ``through_seq`` / ``status`` / ``user_seq`` /
+  ``content`` and ``[]`` for a chat without messages, a list of asyncpg UUIDs
+  otherwise, no row for another org's, another owner's, a trashed or an
+  unknown chat. T2b (``load_turn(..., before_seq=...)``: T2'' with ``AND seq <
+  $5`` in the lateral's WHERE, the bound typed as the bigint seq) loads the
+  latest ``limit`` messages before the bound; T2'' is unchanged.
+- ``SELECT delete_failed_turn($1, $2, $3, $4)`` (optionally ``public.``,
+  ``$n::uuid`` / ``$n::bigint`` casts and an ``AS`` alias; any other statement
+  naming the function fails the test) emulates C1's plpgsql body, through
+  ``fetchval`` (the deleted count, an int), ``fetchrow`` / ``fetch`` (a row
+  ``{"delete_failed_turn": n}``) and ``execute`` ("SELECT 1"), on the pool or
+  a connection; inside ``conn.transaction()`` it is undone with the
+  transaction. In PostgreSQL's order: until a shipped migration creates the
+  function (``shipped_functions()``, below) it is UndefinedFunctionError
+  (also for another arity or a ``$n::text`` argument), raised before the
+  arguments are checked; then the binds like a chat statement (argument count:
+  InterfaceError; a ``$n`` gap: IndeterminateDatatypeError; a non-UUID chat,
+  org or owner and a non-int or out-of-int64 through_seq: DataError); then
+  admino_app's EXECUTE (``permission denied for function
+  delete_failed_turn``, InsufficientPrivilegeError, when the migrations don't
+  grant it); then C1's checks in C1's order, each refusal an
+  InsufficientPrivilegeError ``DELETE_FAILED_TURN_REFUSAL`` ("only a failed
+  turn of a live chat can be deleted", no row data) with nothing changed: the
+  chat is live and of that org and owner; the row at through_seq (of that
+  chat and org) is ``error`` or ``stopped`` (``FAILED_TURN_STATUSES``); no
+  assistant or tool row of the chat follows it (user rows, e.g. an org notice,
+  may); a user row at or before it exists (the turn starts at the latest
+  one); every row strictly between that user row and through_seq is what a
+  real failed turn holds there (C1', security audit M-1, with C1'b): a
+  ``tool`` row or an ``assistant`` row with at least one tool_use block
+  (``coalesce(jsonb_array_length(tool_use_blocks), 0) > 0``: NULL and ``[]``
+  are none), with status ``complete`` or ``awaiting_confirmation``
+  (``FAILED_TURN_BODY_STATUSES``), or an ``assistant`` row with status
+  ``error`` (C1'b: GH-25 D9's partial reply of a streamed run that timed out
+  after text, stored ``error`` as part of the failed answer; 0031 backfills
+  the ones stored ``complete`` before). So a forged ``error`` row after a
+  completed answer (stored ``complete``; admino_app can't UPDATE it), a
+  completed tool turn or a ``limit_reached`` notice is refused (a forged row
+  after a still-awaiting tool call is not: the documented residual). NULL
+  arguments are refused the same way (the function isn't STRICT).
+  Then every attachment of the turn user row in that chat and org (trashed and
+  excluded ones too) gets ``message_id`` NULL and ``updated_at`` now, and the
+  chat's rows from the turn's seq to through_seq are deleted (the ON DELETE
+  CASCADE of ``attachments.message_id`` still runs, but reaches no unlinked
+  file); the count is returned. A function the migrations don't make SECURITY
+  DEFINER runs as admino_app and fails at its DELETE ("permission denied for
+  table chat_messages", nothing changed).
+- admino_app still may not DELETE or UPDATE chat_messages directly
+  (InsufficientPrivilegeError "permission denied for table chat_messages", as
+  before).
+- ``shipped_functions()`` is the ``ShippedFunctions`` that
+  ``read_shipped_functions`` reads from the migrations next to the imported
+  ``admino.database`` (comments removed): ``created``, ``executable`` (by
+  admino_app: PUBLIC's default EXECUTE until 0018's ``ALTER DEFAULT
+  PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC``, then the GRANTs and
+  REVOKEs of EXECUTE) and ``security_definer``. The fake reads the migrations
+  of the tree it imports ``admino`` from, so a prototype tree run with
+  ``PYTHONPATH=<tree>/src`` that holds ``0031_chat_retry.sql`` in
+  ``<tree>/src/admino/migrations/`` runs the function with no patch. On a tree
+  without 0031 a test switches with ``monkeypatch.setattr(db_fakes,
+  "shipped_functions", lambda: db_fakes.read_shipped_functions(<a tmp copy of
+  the migrations plus the contract's 0031>))`` (tests/test_fakedb_retry.py
+  builds 0030's and 0031's that way), before it calls the function. 0031
+  changes nothing ``shipped_schema()`` reads.
 
 The login throttle (GH-157):
 - ``throttle`` holds the login_throttle rows of migration 0012 (scope,
@@ -1140,7 +1214,7 @@ _CHAT_TYPES: Final[dict[str, dict[str, str]]] = {
     },
 }
 _CHAT_NULLABLE: Final[dict[str, frozenset[str]]] = {
-    # GH-194: trash_group_id (migration 0031) is nullable; it exists once 0031 ships.
+    # GH-194: trash_group_id (migration 0032) is nullable; it exists once 0032 ships.
     "chats": frozenset({"legacy_session_id", "deleted_at", "trash_group_id"}),
     "chat_messages": frozenset(
         {"tool_use_blocks", "tool_call_id", "tool_calls", "included_attachment_ids"}
@@ -1205,7 +1279,7 @@ ATTACHMENT_CHAT_FKEY: Final = "attachments_chat_fkey"
 # the action catalog CHECK 0030 replaces.
 ATTACHMENT_ACTIVE_COLUMN: Final = "active"
 AUDIT_ACTION_CHECK: Final = "audit_events_action_check"
-# GH-194 (migration 0031): the trash group column chats and attachments gain (ALTER
+# GH-194 (migration 0032): the trash group column chats and attachments gain (ALTER
 # TABLE ... ADD COLUMN appends it last), the CHECK that ties it to deleted_at on each
 # table, and the partial unique index a restored chat's legacy session id can hit.
 TRASH_GROUP_COLUMN: Final = "trash_group_id"
@@ -1214,7 +1288,7 @@ TRASH_GROUP_CHECKS: Final[dict[str, str]] = {
     "attachments": "attachments_trash_group_check",
 }
 CHAT_LEGACY_SESSION_KEY: Final = "chats_legacy_session_key"
-# The chat-family tables admino_app may DELETE from before 0031 (0027's attachments;
+# The chat-family tables admino_app may DELETE from before 0032 (0027's attachments;
 # 0024 grants no DELETE on chats or chat_messages).
 _DELETE_TABLES_0030: Final = frozenset({"attachments"})
 # The UPDATE statements a column grant applies to (normalized SQL): chats and
@@ -1376,7 +1450,7 @@ _SQL_COMMENT_RE: Final = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
 # ---------------------------------------------------------------------------
 # GH-190: the schema the shipped migrations leave in place, for what migration
 # 0030 changes (attachments.active and its UPDATE grant, the max_context_messages
-# CHECK, the audit action catalog). GH-194: and for what migration 0031 changes
+# CHECK, the audit action catalog). GH-194: and for what migration 0032 changes
 # (trash_group_id on chats and attachments, their CHECKs, admino_app's DELETE on
 # chats and UPDATE of the new columns, the catalog). Read from the migrations next
 # to the imported ``admino.database``, comments removed, whitespace collapsed,
@@ -1425,7 +1499,7 @@ _ACTION_CATALOG_RE: Final = re.compile(
 @dataclass(frozen=True)
 class ShippedSchema:
     """What a migrations directory leaves in place for the parts 0030 (GH-190) and
-    0031 (GH-194) change.
+    0032 (GH-194) change.
 
     ``attachments_active``: a migration adds ``attachments.active`` (``ALTER
     TABLE attachments ADD COLUMN active ...``; the fake then models it as
@@ -1438,7 +1512,7 @@ class ShippedSchema:
     ``audit_actions``: the IN list of the last ``AUDIT_ACTION_CHECK`` a
     migration adds (0005's inline one, then each replacement).
 
-    GH-194 (the defaults are what 0001 to 0030 leave in place):
+    GH-194 (the defaults are what 0001 to 0031 leave in place):
     ``trash_group_tables``: the tables a migration gives ``trash_group_id``
     (``ALTER TABLE chats|attachments ADD COLUMN trash_group_id ...``; the fake
     models it as a nullable UUID, the table's last column).
@@ -1515,7 +1589,7 @@ def read_shipped_schema(directory: Path) -> ShippedSchema:
     """The ``ShippedSchema`` of the migrations in ``directory`` (``NNNN_*.sql``, in name order).
 
     Tests point it at a tmp copy of the migrations (with or without a 0030 or a
-    0031 file) and monkeypatch ``shipped_schema`` to return the result.
+    0032 file) and monkeypatch ``shipped_schema`` to return the result.
     """
     active = False
     trash_tables: set[str] = set()
@@ -1573,7 +1647,7 @@ def _shipped_schema_of_the_tree() -> ShippedSchema:
 
 
 def shipped_schema() -> ShippedSchema:
-    """The schema the fake models for what migrations 0030 (GH-190) and 0031 (GH-194) change.
+    """The schema the fake models for what migrations 0030 (GH-190) and 0032 (GH-194) change.
 
     The shipped migrations decide: until one adds ``attachments.active`` the
     column doesn't exist (any statement naming it is UndefinedColumnError,
@@ -1594,7 +1668,7 @@ def shipped_schema() -> ShippedSchema:
 @functools.cache
 def _chat_types_of(table: str, active: bool, trash_group: bool) -> dict[str, str]:
     """A chat-family table's column types in column order: the base columns, then the
-    columns later migrations append (0030's ``active``, then 0031's ``trash_group_id``)."""
+    columns later migrations append (0030's ``active``, then 0032's ``trash_group_id``)."""
     types = dict(_CHAT_TYPES[table])
     if active:
         types[ATTACHMENT_ACTIVE_COLUMN] = "bool"
@@ -1643,7 +1717,7 @@ def _table_columns(table: str) -> frozenset[str]:
 
 def _update_grant(table: str) -> frozenset[str]:
     """The columns admino_app may SET in an UPDATE of chats or attachments (the shipped
-    GRANTs; GH-194: chats' too, 0025's ``CHAT_UPDATE_COLUMNS`` until 0031 ships)."""
+    GRANTs; GH-194: chats' too, 0025's ``CHAT_UPDATE_COLUMNS`` until 0032 ships)."""
     if table == "chats":
         return shipped_schema().chat_update_columns
     return shipped_schema().attachment_update_columns
@@ -1652,6 +1726,195 @@ def _update_grant(table: str) -> frozenset[str]:
 def _limit_bounds() -> dict[str, tuple[int, int]]:
     """The platform limits' CHECK bounds (0013's), max_context_messages as shipped (GH-190)."""
     return {**LIMIT_BOUNDS, "max_context_messages": shipped_schema().max_context_messages_bounds}
+
+
+# ---------------------------------------------------------------------------
+# GH-245: the database functions the shipped migrations leave in place, for
+# migration 0031's ``delete_failed_turn`` (contract C1, C5). Read like
+# ``shipped_schema``: comments removed, whitespace collapsed, lowercased.
+# ---------------------------------------------------------------------------
+
+DELETE_FAILED_TURN: Final = "delete_failed_turn"
+# The text of every refusal of the function (SQLSTATE 42501, no row data).
+DELETE_FAILED_TURN_REFUSAL: Final = "only a failed turn of a live chat can be deleted"
+# The statuses the row at through_seq must have (the function's IN list).
+FAILED_TURN_STATUSES: Final = frozenset({"error", "stopped"})
+# C1' (security audit M-1): the statuses a tool row or a tool_use assistant row
+# strictly between the turn's user row and through_seq must have (the shape
+# check's IN list; C1'b admits any assistant row with status 'error' besides).
+FAILED_TURN_BODY_STATUSES: Final = frozenset({"complete", "awaiting_confirmation"})
+# The function's parameters in order, as asyncpg encodes them (uuid x 3, bigint).
+_DELETE_FAILED_TURN_KINDS: Final = ("uuid", "uuid", "uuid", "int8")
+_FUNCTION_NAME: Final = r'(?:"?public"?\.)?"?(\w+)"?'
+_CREATE_FUNCTION_RE: Final = re.compile(
+    rf"(?<![\w.])create (?:or replace )?function {_FUNCTION_NAME} ?\("
+)
+_DROP_FUNCTION_RE: Final = re.compile(rf"(?<![\w.])drop function (?:if exists )?{_FUNCTION_NAME}")
+_ALTER_FUNCTION_RE: Final = re.compile(
+    rf"(?<![\w.])alter function {_FUNCTION_NAME} ?\([^()]*\)(?P<rest>[^;]*)"
+)
+_FUNCTION_PRIVILEGE_RE: Final = re.compile(
+    r"(?<![\w.])(?P<verb>grant|revoke) (?P<privileges>[^;]*?) on "
+    r'(?P<target>all functions in schema "?public"?|function [^;]*?) (?:to|from) '
+    r"(?P<grantees>[^;]*)"
+)
+_DEFAULT_FUNCTION_REVOKE_RE: Final = re.compile(
+    r"(?<![\w.])alter default privileges [^;]*?revoke (?:execute|all(?: privileges)?)"
+    r" on functions from public\b"
+)
+_DOLLAR_QUOTE_RE: Final = re.compile(r"\$(\w*)\$")
+# The one form the app calls the function with (normalized SQL).
+_DELETE_FAILED_TURN_RE: Final = re.compile(
+    rf"select (?:public\.)?{DELETE_FAILED_TURN} ?\((?P<args>[^()]*)\)(?: as (?P<alias>\w+))?;?"
+)
+
+
+def _failed_turn_body_row(row: Mapping[str, Any]) -> bool:
+    """Whether a stored chat_messages row may sit strictly between a failed turn's user
+    row and through_seq (C1', security audit M-1, amended by C1'b): what the shape
+    check's ``NOT (...)`` admits, ``(status IN ('complete', 'awaiting_confirmation') AND
+    (role = 'tool' OR (role = 'assistant' AND
+    coalesce(jsonb_array_length(tool_use_blocks), 0) > 0))) OR (role = 'assistant' AND
+    status = 'error')``. The second branch is GH-25 D9's partial reply (a streamed run
+    that timed out after text), stored ``error`` with the failed answer since C1'b.
+    status and role are NOT NULL; ``tool_use_blocks`` is NULL or a JSON array (its CHECK),
+    so a NULL or ``[]`` column counts no tool_use block."""
+    if row["role"] == "assistant" and row["status"] == "error":
+        return True
+    if row["status"] not in FAILED_TURN_BODY_STATUSES:
+        return False
+    if row["role"] == "tool":
+        return True
+    if row["role"] != "assistant" or row["tool_use_blocks"] is None:
+        return False
+    blocks = json.loads(row["tool_use_blocks"])
+    assert isinstance(blocks, list), "chat_messages_tool_use_blocks_check keeps an array"
+    return len(blocks) > 0
+
+
+@dataclass(frozen=True)
+class ShippedFunctions:
+    """The functions a migrations directory leaves in place (GH-245).
+
+    ``created``: every function a migration creates (``CREATE [OR REPLACE]
+    FUNCTION``) and none drops. ``executable``: those of them admino_app may
+    EXECUTE: PUBLIC's EXECUTE on a new function until a migration runs
+    ``ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`` (0018),
+    then each ``GRANT`` / ``REVOKE`` of EXECUTE (or ALL) ``ON FUNCTION ...`` or
+    ``ON ALL FUNCTIONS IN SCHEMA public`` to or from ``admino_app`` or PUBLIC, in
+    file order. ``security_definer``: those that run as their owner (SECURITY
+    DEFINER in the CREATE or a later ALTER FUNCTION; a CREATE OR REPLACE without
+    it runs as the caller again, as in PostgreSQL). Overloads aren't told apart
+    (the migrations have none).
+    """
+
+    created: frozenset[str]
+    executable: frozenset[str]
+    security_definer: frozenset[str]
+
+
+def _function_attributes(text: str, start: int) -> str:
+    """A CREATE FUNCTION's attributes: its text from ``start`` to the body's opening
+    dollar quote, plus what follows the closing one up to the ``;``."""
+    opening = _DOLLAR_QUOTE_RE.search(text, start)
+    if opening is None:
+        end = text.find(";", start)
+        return text[start : end if end >= 0 else len(text)]
+    closing = text.find(opening.group(0), opening.end())
+    if closing < 0:
+        return text[start : opening.start()]
+    tail = closing + len(opening.group(0))
+    end = text.find(";", tail)
+    return text[start : opening.start()] + " " + text[tail : end if end >= 0 else len(text)]
+
+
+def read_shipped_functions(directory: Path) -> ShippedFunctions:
+    """The ``ShippedFunctions`` of the migrations in ``directory`` (``NNNN_*.sql``, in name order).
+
+    Tests point it at a tmp copy of the migrations (with or without a 0031
+    file) and monkeypatch ``shipped_functions`` to return the result.
+    """
+    created: set[str] = set()
+    public: set[str] = set()
+    app: set[str] = set()
+    definer: set[str] = set()
+    public_by_default = True
+    for path in sorted(directory.glob("*.sql")):
+        if re.match(r"\d{4}_", path.name) is None:
+            continue
+        sql = _SQL_COMMENT_RE.sub(" ", path.read_text(encoding="utf-8"))
+        text = re.sub(r"\s+", " ", sql).lower()
+        events: list[tuple[int, str, re.Match[str]]] = [
+            (match.start(), kind, match)
+            for kind, pattern in (
+                ("create", _CREATE_FUNCTION_RE),
+                ("drop", _DROP_FUNCTION_RE),
+                ("alter", _ALTER_FUNCTION_RE),
+                ("privilege", _FUNCTION_PRIVILEGE_RE),
+                ("default", _DEFAULT_FUNCTION_REVOKE_RE),
+            )
+            for match in pattern.finditer(text)
+        ]
+        for _, kind, match in sorted(events, key=lambda event: event[0]):
+            if kind == "default":
+                public_by_default = False
+            elif kind == "create":
+                name = match.group(1)
+                if name not in created:
+                    created.add(name)
+                    app.discard(name)
+                    (public.add if public_by_default else public.discard)(name)
+                attributes = _function_attributes(text, match.end())
+                is_definer = re.search(r"\bsecurity definer\b", attributes) is not None
+                (definer.add if is_definer else definer.discard)(name)
+            elif kind == "drop":
+                for found in (created, public, app, definer):
+                    found.discard(match.group(1))
+            elif kind == "alter":
+                rest = match.group("rest")
+                if re.search(r"\bsecurity definer\b", rest):
+                    definer.add(match.group(1))
+                elif re.search(r"\bsecurity invoker\b", rest):
+                    definer.discard(match.group(1))
+            elif re.search(r"\b(?:execute|all)\b", match.group("privileges")):
+                target = match.group("target")
+                if target.startswith("all functions"):
+                    names = set(created)
+                else:
+                    listed = re.sub(r"\([^()]*\)", "()", target[len("function ") :])
+                    names = set(re.findall(rf"{_FUNCTION_NAME} ?\(", listed))
+                grantees = set(re.findall(r"\w+", match.group("grantees")))
+                for grantee, found in (("public", public), ("admino_app", app)):
+                    if grantee in grantees:
+                        if match.group("verb") == "grant":
+                            found.update(names & created)
+                        else:
+                            found.difference_update(names)
+    return ShippedFunctions(
+        created=frozenset(created),
+        executable=frozenset(name for name in created if name in public or name in app),
+        security_definer=frozenset(definer & created),
+    )
+
+
+@functools.cache
+def _shipped_functions_of_the_tree() -> ShippedFunctions:
+    """``read_shipped_functions`` of the migrations next to the imported ``admino.database``."""
+    from admino import database
+
+    return read_shipped_functions(Path(database.__file__).parent / "migrations")
+
+
+def shipped_functions() -> ShippedFunctions:
+    """The database functions the fake models as shipped (GH-245).
+
+    The shipped migrations decide: until one creates ``delete_failed_turn``
+    (0031) the call is UndefinedFunctionError, as on PostgreSQL. The emulation
+    calls this function at run time, so a test switches with
+    ``monkeypatch.setattr(db_fakes, "shipped_functions", lambda:
+    db_fakes.read_shipped_functions(<a tmp copy of the migrations>))``.
+    """
+    return _shipped_functions_of_the_tree()
 
 
 # GH-166: migration 0021's users_timezone_check (the shape; the app checks the zone exists).
@@ -1769,12 +2032,12 @@ def _bound(args: tuple[Any, ...], pattern: str, text: str) -> Any:
 
 
 # GH-194: the default of ``add_chat`` / ``add_attachment``'s ``trash_group_id`` (derived
-# from ``deleted_at`` as 0031's backfill does; an explicit None is a value).
+# from ``deleted_at`` as 0032's backfill does; an explicit None is a value).
 _DERIVED: Final = object()
 
 
 def _refuse_trash_group_seed(table: str, value: Any) -> None:
-    """GH-194: before 0031 ships, seeding ``trash_group_id`` is UndefinedColumnError."""
+    """GH-194: before 0032 ships, seeding ``trash_group_id`` is UndefinedColumnError."""
     if value is not _DERIVED:
         msg = f'column "{TRASH_GROUP_COLUMN}" of relation "{table}" does not exist'
         raise _pg_error(asyncpg.exceptions.UndefinedColumnError, msg, table=table)
@@ -2337,9 +2600,9 @@ class FakeDb:
         CharacterNotInRepertoireError, NotNull, the CHECKs, the partial unique
         legacy session key, the foreign keys). Returns a plain uuid.UUID.
 
-        GH-194: once a shipped migration adds ``trash_group_id`` (0031), a
+        GH-194: once a shipped migration adds ``trash_group_id`` (0032), a
         trashed chat (``deleted_at`` set) is its own trash group by default
-        (``trash_group_id`` = its id, what 0031's backfill gives an existing
+        (``trash_group_id`` = its id, what 0032's backfill gives an existing
         trashed chat) and a live one has none; an explicit ``trash_group_id=``
         is stored as given (checked like an INSERT, the trash group CHECK
         included). Before that, any ``trash_group_id=`` is UndefinedColumnError,
@@ -2378,7 +2641,7 @@ class FakeDb:
         elif trash_group_id is not _DERIVED:
             given[TRASH_GROUP_COLUMN] = trash_group_id
         elif deleted_at is not None:
-            # GH-194: 0031's backfill makes every trashed chat its own trash group.
+            # GH-194: 0032's backfill makes every trashed chat its own trash group.
             chat_id = chat_id if chat_id is not None else uuid.uuid4()
             given[TRASH_GROUP_COLUMN] = chat_id
         if chat_id is not None:
@@ -2514,8 +2777,8 @@ class FakeDb:
         any other value than True is UndefinedColumnError, as an INSERT naming
         the column would be.
 
-        GH-194: once a shipped migration adds ``trash_group_id`` (0031), a
-        trashed file (``deleted_at`` set) defaults to the trash group 0031's
+        GH-194: once a shipped migration adds ``trash_group_id`` (0032), a
+        trashed file (``deleted_at`` set) defaults to the trash group 0032's
         backfill gives it: its chat's id when that chat is trashed (the chat's
         deletion moved it), else its own id (deleted on its own); a live file
         has none. An explicit ``trash_group_id=`` is stored as given (checked
@@ -2561,7 +2824,7 @@ class FakeDb:
         elif trash_group_id is not _DERIVED:
             given[TRASH_GROUP_COLUMN] = trash_group_id
         elif deleted_at is not None:
-            # GH-194: 0031's backfill: the chat's group when the chat is trashed, else
+            # GH-194: 0032's backfill: the chat's group when the chat is trashed, else
             # the file's own.
             trashed_chat = chat["deleted_at"] is not None
             given[TRASH_GROUP_COLUMN] = chat["id"] if trashed_chat else given["id"]
@@ -2762,6 +3025,9 @@ class FakeDb:
         assert not n.startswith("truncate"), f"the fake doesn't truncate: {n}"
         if purge := _PURGE_ORG_AUDIT_RE.fullmatch(n):
             return self._purge_org_audit_events(method, purge, args)
+        if re.search(rf"\b{DELETE_FAILED_TURN}\b", _masked_literals(n)):
+            # GH-245 (migration 0031): the owner-run delete of a chat's failed last turn.
+            return self._delete_failed_turn(method, n, args)
         if _CHAT_TABLE_RE.search(_masked_literals(n)):
             # GH-176: every statement naming chats or chat_messages runs on the reader,
             # after the checks asyncpg and PostgreSQL make before it runs.
@@ -3503,7 +3769,7 @@ class FakeDb:
 
     @staticmethod
     def _trash_group_rules(table: str, row: dict[str, Any]) -> list[tuple[str, bool]]:
-        """GH-194 (migration 0031): ``<table>_trash_group_check``, ``(deleted_at IS NULL) =
+        """GH-194 (migration 0032): ``<table>_trash_group_check``, ``(deleted_at IS NULL) =
         (trash_group_id IS NULL)``, once a shipped migration adds it. Its name sorts
         after every other CHECK of chats and attachments, so it runs last."""
         constraint = TRASH_GROUP_CHECKS[table]
@@ -3897,6 +4163,123 @@ class FakeDb:
             return {key: purged}
         if method == "fetch":
             return [{key: purged}]
+        return "SELECT 1"
+
+    def _delete_failed_turn(self, method: str, n: str, args: tuple[Any, ...]) -> Any:
+        """``SELECT delete_failed_turn($1, $2, $3, $4)`` (GH-245, migration 0031, contract C1).
+
+        In PostgreSQL's order: the call is resolved when the statement is
+        prepared (UndefinedFunctionError until a shipped migration creates the
+        function, or for another arity or argument type), then asyncpg's
+        argument checks (count, ``$n`` gaps, the uuid and bigint encoders:
+        InterfaceError / IndeterminateDatatypeError / DataError), then the
+        EXECUTE privilege, then the body exactly as C1 states it, each refusal
+        an InsufficientPrivilegeError ``DELETE_FAILED_TURN_REFUSAL`` with
+        nothing changed: the live chat of that org and owner; the row at
+        through_seq ended ``error`` or ``stopped``; no assistant or tool row
+        after it; the latest user row at or before it (the turn); then (C1',
+        security audit M-1) the turn's shape: every row strictly between that
+        user row and through_seq is a ``tool`` row or an ``assistant`` row with
+        at least one tool_use block, ``complete`` or ``awaiting_confirmation``
+        (what a real failed turn holds there: tool calls, their results, an
+        approval's awaiting row), or (C1'b) an ``assistant`` row with status
+        ``error`` (GH-25 D9's partial reply before the error reply), so a row
+        admino_app forged after a completed answer, tool turn or
+        ``limit_reached`` notice deletes nothing. Then the
+        turn user row's attachments are unlinked (``message_id`` NULL,
+        ``updated_at`` now; trashed and excluded ones too) and the rows from
+        the turn's seq to through_seq are deleted (their cascade reaches no
+        unlinked file). Returns how many rows it deleted (an int; a row
+        ``{"delete_failed_turn": n}`` for fetchrow / fetch, "SELECT 1" for
+        execute). A function that doesn't run as its owner (no SECURITY
+        DEFINER) fails at the DELETE: admino_app may not delete chat_messages.
+        """
+        form = (
+            f"the fake runs {DELETE_FAILED_TURN} only as SELECT {DELETE_FAILED_TURN}($a, ...): {n}"
+        )
+        match = _DELETE_FAILED_TURN_RE.fullmatch(n)
+        assert match is not None, form
+        pieces = _top_split(match.group("args"), ",")
+        params = [re.fullmatch(r"\$(\d+)(?: ?:: ?(\w+))?", piece) for piece in pieces]
+        found = [param for param in params if param is not None]
+        assert len(found) == len(params) or pieces == [""], form
+        found = found if pieces != [""] else []
+        casts = [param.group(2) for param in found]
+        wanted = [kind if kind == "uuid" else "int" for kind in _DELETE_FAILED_TURN_KINDS]
+        functions = shipped_functions()
+        if (
+            DELETE_FAILED_TURN not in functions.created
+            or len(found) != len(_DELETE_FAILED_TURN_KINDS)
+            or any(
+                cast is not None and _CAST_TYPES.get(cast) != kind
+                for cast, kind in zip(casts, wanted, strict=True)
+            )
+        ):
+            shown = ", ".join(cast or "unknown" for cast in casts)
+            msg = f"function {DELETE_FAILED_TURN}({shown}) does not exist"
+            raise asyncpg.exceptions.UndefinedFunctionError(msg)
+        _check_chat_binds(n, args)
+        values = [
+            _encode_chat_value(kind, f"${param.group(1)}", args[int(param.group(1)) - 1])
+            for kind, param in zip(_DELETE_FAILED_TURN_KINDS, found, strict=True)
+        ]
+        if DELETE_FAILED_TURN not in functions.executable:
+            msg = f"permission denied for function {DELETE_FAILED_TURN}"
+            raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+        chat_id, org_id, owner_id, through_seq = values
+        refusal = asyncpg.exceptions.InsufficientPrivilegeError(DELETE_FAILED_TURN_REFUSAL)
+        chat = self.chats.get(chat_id) if chat_id is not None else None
+        if (
+            chat is None
+            or org_id is None
+            or owner_id is None
+            or chat["org_id"] != org_id
+            or chat["owner_user_id"] != owner_id
+            or chat["deleted_at"] is not None
+        ):
+            raise refusal
+        rows = [
+            row
+            for row in self.chat_messages.values()
+            if row["chat_id"] == chat_id and row["org_id"] == org_id
+        ]
+        if through_seq is None or not any(
+            row["seq"] == through_seq and row["status"] in FAILED_TURN_STATUSES for row in rows
+        ):
+            raise refusal
+        if any(row["seq"] > through_seq and row["role"] != "user" for row in rows):
+            raise refusal
+        users = [row for row in rows if row["role"] == "user" and row["seq"] <= through_seq]
+        if not users:
+            raise refusal
+        turn = max(users, key=lambda row: row["seq"])
+        if any(
+            turn["seq"] < row["seq"] < through_seq and not _failed_turn_body_row(row)
+            for row in rows
+        ):
+            raise refusal
+        if DELETE_FAILED_TURN not in functions.security_definer:
+            # Run as admino_app, the body's DELETE is refused and the statement undone.
+            msg = "permission denied for table chat_messages"
+            raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
+        now = datetime.now(UTC)
+        for key, attachment in list(self.attachments.items()):
+            if (
+                attachment["message_id"] == turn["id"]
+                and attachment["chat_id"] == chat_id
+                and attachment["org_id"] == org_id
+            ):
+                self.attachments[key] = {**attachment, "message_id": None, "updated_at": now}
+        doomed = {row["id"] for row in rows if turn["seq"] <= row["seq"] <= through_seq}
+        self.drop_messages(doomed)
+        deleted = len(doomed)
+        key = match.group("alias") or DELETE_FAILED_TURN
+        if method == "fetchval":
+            return deleted
+        if method == "fetchrow":
+            return {key: deleted}
+        if method == "fetch":
+            return [{key: deleted}]
         return "SELECT 1"
 
     def _enqueue(self, args: tuple[Any, ...]) -> Any:
@@ -5142,10 +5525,10 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     asyncpg's encoder (DataError); every str argument through the server's text
     input (U+0000: CharacterNotInRepertoireError), used or not; then the
     grants of migration 0024: admino_app may not DELETE chats (GH-194: until a
-    shipped GRANT, 0031's, allows it; ``ShippedSchema.delete_tables``) and may
+    shipped GRANT, 0032's, allows it; ``ShippedSchema.delete_tables``) and may
     not UPDATE or DELETE chat_messages (InsufficientPrivilegeError); and those of
     migration 0025 (GH-266): an UPDATE of chats may SET only the shipped
-    column grant (``CHAT_UPDATE_COLUMNS`` until 0031 adds trash_group_id; another
+    column grant (``CHAT_UPDATE_COLUMNS`` until 0032 adds trash_group_id; another
     existing column: InsufficientPrivilegeError;
     a column chats doesn't have is left to the reader's UndefinedColumnError,
     which PostgreSQL raises first). GH-271: every column of a row-constructor
@@ -5184,7 +5567,7 @@ def _check_chat_binds(n: str, args: tuple[Any, ...]) -> None:
     if denied is not None and (
         denied.group(2) is not None or denied.group(1) not in shipped_schema().delete_tables
     ):
-        # GH-194: DELETE follows the shipped GRANTs (0027's attachments; 0031 adds chats).
+        # GH-194: DELETE follows the shipped GRANTs (0027's attachments; 0032 adds chats).
         msg = f"permission denied for table {denied.group(1) or denied.group(2)}"
         raise asyncpg.exceptions.InsufficientPrivilegeError(msg)
     if (granted := _GRANTED_UPDATE_RE.match(n)) is not None:

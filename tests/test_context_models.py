@@ -170,6 +170,8 @@ def _detail(**overrides: Any) -> dict[str, Any]:
         "messages": [_message_view()],
         "confirmation_status": "none",
         "context_usage": dict(_USAGE),
+        # GH-245: ChatDetailResponse requires retryable.
+        "retryable": False,
     }
     payload.update(overrides)
     return payload

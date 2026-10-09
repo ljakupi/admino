@@ -27,8 +27,8 @@ What is pinned:
   admino_app holds on attachments SELECT, INSERT, DELETE and UPDATE on exactly
   message_id, status, failure_reason, page_count, token_estimate, derived_bytes,
   active, updated_at and deleted_at (no table-wide UPDATE, no grant option); PUBLIC
-  nothing. (GH-194: migration 0031 adds ``update(trash_group_id)``; the cumulative
-  set after every shipped migration is pinned in tests/test_migration_0031.py.)
+  nothing. (GH-194: migration 0032 adds ``update(trash_group_id)``; the cumulative
+  set after every shipped migration is pinned in tests/test_migration_0032.py.)
 - ``platform_settings_max_context_messages_check`` (0013's inline CHECK, PostgreSQL's
   name for it) is dropped (no IF EXISTS, no CASCADE) and re-added under the same name
   as ``CHECK (max_context_messages BETWEEN 0 AND 200)``, validated (nothing after the
@@ -39,8 +39,8 @@ What is pinned:
   0027's list plus ``'file.exclude', 'file.include'`` right after ``'file.restore'``,
   nothing else added or removed, each listed once; every one of them is a live
   ``AuditAction``, which has ``FILE_EXCLUDE = "file.exclude"`` and ``FILE_INCLUDE =
-  "file.include"`` (GH-194: migration 0031 adds chat.purge and file.purge, so the
-  exact sync moved on to tests/test_migration_0031.py; this file keeps a subset check).
+  "file.include"`` (GH-194: migration 0032 adds chat.purge and file.purge, so the
+  exact sync moved on to tests/test_migration_0032.py; this file keeps a subset check).
 - Statement order: the column's ALTER, the GRANT, the platform CHECK's DROP and ADD,
   the action CHECK's DROP and ADD. Nothing else: no DO block, function, trigger, role,
   INSERT / UPDATE / DELETE / TRUNCATE / COPY / MERGE, REVOKE, CREATE, DROP TABLE /
@@ -48,8 +48,8 @@ What is pinned:
 - tests/db_fakes.py mirrors 0030: ``db_fakes.shipped_schema()`` of the tree holds what
   the file says (the column, the cumulative UPDATE grant, 0 to 200, every action of
   0030's catalog; GH-194: the fake's catalog after every shipped migration is pinned
-  in tests/test_migration_0031.py); the fake's attachments row has ``active`` (true)
-  right after ``derived_bytes`` (GH-194: 0031's trash_group_id follows it);
+  in tests/test_migration_0032.py); the fake's attachments row has ``active`` (true)
+  right after ``derived_bytes`` (GH-194: 0032's trash_group_id follows it);
   admino_app may UPDATE it; 0 and 200 are stored for max_context_messages, -1 and 201
   are CheckViolationError; ``file.exclude`` and ``file.include`` rows are recorded.
 
@@ -577,9 +577,9 @@ class TestMigration0030Privileges:
         """After every migration up to 0030: SELECT, INSERT, DELETE and UPDATE on exactly
         the nine columns the application writes (active included; no table-wide UPDATE,
         so never id, org_id, chat_id, owner_user_id, filename, kind, size_bytes or
-        created_at; no grant option); PUBLIC nothing. (GH-194: migration 0031 adds
+        created_at; no grant option); PUBLIC nothing. (GH-194: migration 0032 adds
         update(trash_group_id); the set after every shipped migration is pinned in
-        tests/test_migration_0031.py.)"""
+        tests/test_migration_0032.py.)"""
         acl = _acl(_VERSION)
 
         assert {
@@ -674,7 +674,7 @@ class TestMigration0030ActionCatalog:
 
     def test_migration_0030_action_check_matches_audit_action(self) -> None:
         """Every action 0030 allows is still an AuditAction (none was dropped). GH-194: the
-        exact catalog sync moved on to tests/test_migration_0031.py, whose list adds
+        exact catalog sync moved on to tests/test_migration_0032.py, whose list adds
         chat.purge and file.purge."""
         from admino.audit_events import AuditAction
 
@@ -755,7 +755,7 @@ class TestMigration0030FakeDb:
         """db_fakes.shipped_schema() of the tree: the column, the cumulative UPDATE grant,
         the CHECK's bounds, as this file's parsers read them, and every action of 0030's
         catalog. (GH-194: a later migration adds actions and schema fields; the fake's
-        catalog after every shipped migration is pinned in tests/test_migration_0031.py.)"""
+        catalog after every shipped migration is pinned in tests/test_migration_0032.py.)"""
         schema = db_fakes.shipped_schema()
 
         assert (
@@ -769,7 +769,7 @@ class TestMigration0030FakeDb:
         self,
     ) -> None:
         """ADD COLUMN appends: in the fake's attachments row derived_bytes is followed by
-        active, true by default (GH-194: 0031's trash_group_id comes after them)."""
+        active, true by default (GH-194: 0032's trash_group_id comes after them)."""
         db = FakeDb()
         row = db.attachment_row(_attachment(db))
         assert row is not None

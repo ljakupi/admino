@@ -1,7 +1,7 @@
 """Tests for admino.trash: the member's trash service (GH-194, contract sections 2, 4, 5, 7).
 
 Issue #194 (Decisions 1 to 7, 9 and 10) and its contract pin a new module
-``admino.trash`` over migration 0031's trash groups. These tests cover the
+``admino.trash`` over migration 0032's trash groups. These tests cover the
 member-facing functions (the retention purge job is tests/test_trash_purge_job.py):
 
 - ``list_trash``: the caller's own items only (chats, and files of their own:
@@ -42,7 +42,7 @@ member-facing functions (the retention purge job is tests/test_trash_purge_job.p
   content-free warning; a failing retention read changes nothing.
 - Logs: no title, file name or path in any record (canary values).
 
-Harness: the real service over tests/db_fakes.py's FakeDb (migration 0031's
+Harness: the real service over tests/db_fakes.py's FakeDb (migration 0032's
 schema once it ships: the trash group column, CHECKs and grants, every
 contract form, the chat DELETE cascade) and a ``tmp_path`` attachments root.
 Time is injected (``now=``) and rows carry fixed ``deleted_at`` stamps.
@@ -241,7 +241,7 @@ def _file(
     attachment_id: uuid.UUID | None = None,
     **fields: Any,
 ) -> uuid.UUID:
-    """A file of the chat. Trashed: with its chat's group by default (0031's backfill),
+    """A file of the chat. Trashed: with its chat's group by default (0032's backfill),
     or as its own item (``own_group``: deleted on its own)."""
     attachment_id = attachment_id or uuid.uuid4()
     extra: dict[str, Any] = {}

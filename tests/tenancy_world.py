@@ -90,9 +90,16 @@ inside the default 30-day retention, with its messages and the files its
 deletion moved) and ``seed_trashed_attachment`` (a file deleted on its own in
 a live chat, or with its trashed chat), both through ``FakeDb.add_chat`` /
 ``add_attachment`` with ``deleted_at`` (the FakeDb gives the trash group of
-migration 0031's backfill once 0031 ships); each trashed file has its
+migration 0032's backfill once 0032 ships); each trashed file has its
 original and a derived text file ``<id>.d/text.txt`` under the attachments
 root, so ``attachment_files`` sees what a purge would remove.
+
+GH-245 (retry a failed answer): ``POST /api/chats/{chat_id}/retry`` (no body) is a
+member row gated by ``chat.send``: only the chat's owner re-runs its failed last
+turn, so another org's, a colleague's and an unknown chat answer
+``CHAT_NOT_FOUND``. ``seed_failed_chat`` stores a chat whose one turn failed (the
+question, then the answer stored ``error`` or ``stopped``, as the server stores a
+failed run's last message): the state a retry acts on.
 
 Security notes:
 - Passwords, tokens and emails here are fixed fake values, never secrets.
@@ -269,6 +276,29 @@ def seed_chat(
     return chat_id
 
 
+def seed_failed_chat(
+    db: FakeDb,
+    owner: Account | uuid.UUID,
+    *,
+    title: str,
+    question: str,
+    answer: str,
+    status: str = "error",
+) -> uuid.UUID:
+    """GH-245: store a live, titled chat of ``owner`` whose one turn failed; its id.
+
+    ``question`` is the user message (``complete``), ``answer`` the assistant reply
+    stored with ``status`` (``error`` or ``stopped``), the way the server stores a
+    failed run's last message. The chat's latest message is the failed answer, so a
+    retry by the owner passes the status check. A title (``title_source`` "user")
+    keeps the first-exchange title rule out of the request.
+    """
+    chat_id = seed_chat(db, owner, title=title)
+    db.add_chat_message(chat_id, "user", question)
+    db.add_chat_message(chat_id, "assistant", answer, status=status)
+    return chat_id
+
+
 def seed_pending_confirmation(
     owner: Account | uuid.UUID, chat_id: uuid.UUID, confirmation_id: str
 ) -> PendingConfirmation:
@@ -377,7 +407,7 @@ def seed_trashed_attachment(
     ``<ATTACHMENTS_ROOT>/<org_id>/<attachment_id>.d/text.txt``; return its id.
 
     In a live chat the file was deleted on its own (its own trash group once
-    migration 0031 ships: a trash item); in a trashed chat it went with the
+    migration 0032 ships: a trash item); in a trashed chat it went with the
     chat (the chat's group: not an item of its own). Call
     ``use_attachment_storage`` first.
     """
@@ -407,7 +437,7 @@ def seed_trashed_chat(
     ``filenames`` trashed with it (same ``deleted_at``; ``seed_trashed_attachment``);
     return the chat's id.
 
-    The chat is its own trash group once migration 0031 ships (a trash item); its
+    The chat is its own trash group once migration 0032 ships (a trash item); its
     files carry the chat's group (they come back with it). A title makes
     ``title_source`` "user".
     """
@@ -815,6 +845,8 @@ ROUTES: Final[tuple[RouteSpec, ...]] = (
     RouteSpec("POST", "/api/chats/{chat_id}/messages", "member", Capability.CHAT_SEND, "path_id"),
     # GH-8: stop the chat's streamed run.
     RouteSpec("POST", "/api/chats/{chat_id}/stop", "member", Capability.CHAT_SEND, "path_id"),
+    # GH-245: re-run the chat's failed last turn (the owner only, like a send).
+    RouteSpec("POST", "/api/chats/{chat_id}/retry", "member", Capability.CHAT_SEND, "path_id"),
     # GH-187: upload a file into a chat of the caller's own; read an attachment's metadata
     # and download it (the chat's owner only).
     RouteSpec(

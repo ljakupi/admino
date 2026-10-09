@@ -48,6 +48,13 @@ Viewer, plus a Super Admin):
   row stays live). ``GET /api/trash`` lists only the caller's own items and
   ``DELETE /api/trash`` purges only the caller's own (``own_user``); a
   colleague's trash and the role refusals are in tests/test_trash_isolation.py.
+- GH-245: ``POST /api/chats/{chat_id}/retry`` (no body) on org B's chat, a
+  colleague's (an Org Admin's, an Editor's, a Viewer's; for an Org Admin too) or an
+  unknown id is the chat routes' ``chat_not_found`` 404, also when that chat's
+  last turn failed and its owner could retry it: nothing runs, the failed turn
+  stays (its messages and their statuses), no statement deletes it. The control
+  is a chat of the caller's own whose turn failed: the stub agent re-runs it (200),
+  and org B's owner still retries its own after A's refusal.
 - ``own_org`` routes: org B is seeded differently from org A; org A's caller
   reads and changes only org A (settings, tool permissions, critical
   promotions, the permission summary, invitations, the user list and its
@@ -127,6 +134,7 @@ from tests.tenancy_world import (
     make_client,
     seed_attachment,
     seed_chat,
+    seed_failed_chat,
     seed_pending_confirmation,
     seed_trashed_attachment,
     seed_trashed_chat,
@@ -605,6 +613,32 @@ def _stop_chat(client: TestClient, caller: Account, ident: str) -> httpx.Respons
     return client.post(f"/api/chats/{ident}/stop", headers=caller.cookie)
 
 
+def _retry_chat(client: TestClient, caller: Account, ident: str) -> httpx.Response:
+    """GH-245: POST /api/chats/{chat_id}/retry, no body (re-run the failed last turn)."""
+    return client.post(f"/api/chats/{ident}/retry", headers=caller.cookie)
+
+
+# GH-245: a chat whose one turn failed carries the marker in its title and messages.
+def _failed_marked_chat(world: World, owner: Account, marker: str) -> uuid.UUID:
+    """A titled chat of ``owner`` whose one turn failed (the question, then the answer
+    stored ``error``), all carrying ``marker``: its owner's retry re-runs it."""
+    return seed_failed_chat(
+        world.db,
+        owner,
+        title=f"{marker} Vertragsentwurf",
+        question=f"{marker} question",
+        answer=f"{marker} failed answer",
+    )
+
+
+def _b_failed_chat(world: World, _client: TestClient) -> str:
+    return str(_failed_marked_chat(world, world.b["editor"], _B_MARKER))
+
+
+def _a_failed_chat(world: World, _client: TestClient) -> str:
+    return str(_failed_marked_chat(world, world.a["editor"], _A_MARKER))
+
+
 def _upload_attachment(client: TestClient, caller: Account, ident: str) -> httpx.Response:
     """GH-187: upload a short text file (raw body, name in X-Attachment-Name) into a chat."""
     return client.post(
@@ -922,6 +956,18 @@ _PATH_ID_CASES: Final[dict[Route, _PathIdCase]] = {
     ("POST", "/api/chats/{chat_id}/messages"): _chat_case(200, _send_chat_message),
     # GH-8: stopping the chat's streamed run (none here: own chat answers 200 stopped false).
     ("POST", "/api/chats/{chat_id}/stop"): _chat_case(200, _stop_chat),
+    # GH-245: the retry of a failed turn. B's and A's chats are retryable for their owners
+    # (the answer failed), so the 404 is the boundary, not a 409; own chat: 200, re-run.
+    ("POST", "/api/chats/{chat_id}/retry"): _PathIdCase(
+        caller="editor",
+        detail="Chat not found",
+        own_status=200,
+        seed_foreign=_b_failed_chat,
+        seed_own=_a_failed_chat,
+        send=_retry_chat,
+        unknown_id=_uuid_id,
+        reason="chat_not_found",
+    ),
     # GH-187: only the chat's owner uploads (201 into the own chat); only the owner reads.
     ("POST", "/api/chats/{chat_id}/attachments"): _chat_case(201, _upload_attachment),
     ("GET", "/api/attachments/{attachment_id}"): _attachment_case(_get_attachment),
@@ -947,7 +993,7 @@ _PATH_ID_PARAMS: Final = [
 ]
 
 # The chat routes of GH-176 (and GH-8's stop route, GH-187's upload, GH-190's list of a
-# chat's attachments) that name a chat in the path.
+# chat's attachments, GH-245's retry) that name a chat in the path.
 _CHAT_ROUTES: Final[tuple[Route, ...]] = (
     ("GET", "/api/chats/{chat_id}"),
     ("PATCH", "/api/chats/{chat_id}"),
@@ -957,6 +1003,8 @@ _CHAT_ROUTES: Final[tuple[Route, ...]] = (
     ("POST", "/api/chats/{chat_id}/attachments"),
     # GH-190: the list of a chat's attachments.
     ("GET", "/api/chats/{chat_id}/attachments"),
+    # GH-245: the retry (on these complete chats it would be a 409 for their owner).
+    ("POST", "/api/chats/{chat_id}/retry"),
 )
 # Space-free ids, so the RED record (gates.sh cuts node ids at a space) names each case.
 _CHAT_ROUTE_PARAMS: Final = [
@@ -1441,6 +1489,84 @@ class TestChatPathRoutes:
         assert colleague.headers.get("content-type") == unknown.headers.get("content-type")
         assert _state(world.db) == before
         assert "A-colleague-176" not in colleague.text
+        assert str(chat_id) not in colleague.text
+        agent.run.assert_not_awaited()
+
+
+class TestChatRetryPathRoute:
+    """GH-245: only the chat's owner retries; another org's or a colleague's failed turn
+    is chat_not_found and stays as it was, though its owner could retry it."""
+
+    @covers(("POST", "/api/chats/{chat_id}/retry"))
+    @pytest.mark.parametrize("status", ["error", "stopped"])
+    def test_cross_org_chat_retry_on_the_other_orgs_failed_turn_is_404_and_keeps_it(
+        self, world: World, client: TestClient, agent: MagicMock, status: str
+    ) -> None:
+        """Org B's chat whose answer ended ``error`` / ``stopped``: org A's Editor gets the
+        chat_not_found 404 (no echo of B's title or content); B's chat row and messages
+        (the failed status included) stay, no statement calls ``delete_failed_turn`` or
+        inserts a message, and the agent never runs. Control: B's Editor then retries it
+        (200, one run)."""
+        owner = world.b["editor"]
+        chat_id = seed_failed_chat(
+            world.db,
+            owner,
+            title=f"{_B_MARKER} Vertragsentwurf",
+            question=f"{_B_MARKER} question",
+            answer=f"{_B_MARKER} answer",
+            status=status,
+        )
+        row_before = world.db.chat_row(chat_id)
+        messages_before = world.db.messages_of(chat_id)
+        mark = len(world.db.calls)
+
+        response = _retry_chat(client, world.a["editor"], str(chat_id))
+        refused = (
+            world.db.chat_row(chat_id),
+            world.db.messages_of(chat_id),
+            [
+                call.normalized
+                for call in world.db.calls[mark:]
+                if "delete_failed_turn" in call.normalized
+                or "insert into chat_messages" in call.normalized
+            ],
+            agent.run.await_count,
+        )
+        owners = _retry_chat(client, owner, str(chat_id))
+
+        assert (response.status_code, response.json()) == (404, CHAT_NOT_FOUND)
+        assert _B_MARKER not in response.text
+        assert refused == (row_before, messages_before, [], 0)
+        assert [message["status"] for message in messages_before] == ["complete", status]
+        assert owners.status_code == 200, owners.text
+        assert agent.run.await_count == 1
+
+    @covers(("POST", "/api/chats/{chat_id}/retry"))
+    @pytest.mark.parametrize(("caller_role", "owner_role"), _COLLEAGUE_PAIRS)
+    def test_cross_org_chat_retry_on_a_colleagues_failed_turn_is_404_like_an_unknown_id(
+        self,
+        world: World,
+        client: TestClient,
+        agent: MagicMock,
+        caller_role: MemberRole,
+        owner_role: MemberRole,
+    ) -> None:
+        """A colleague's chat in the caller's own org whose answer failed (an Org Admin's,
+        an Editor's, a Viewer's; an Org Admin calling too): the same 404 as an unknown
+        id, nothing changes (tables, chat runtime, files), no run, and the owner's
+        title, content and chat id never appear."""
+        chat_id = _failed_marked_chat(world, world.a[owner_role], "A-colleague-245")
+        caller = world.a[caller_role]
+        before = _state(world.db)
+
+        colleague = _retry_chat(client, caller, str(chat_id))
+        unknown = _retry_chat(client, caller, _uuid_id())
+
+        assert (colleague.status_code, colleague.json()) == (404, CHAT_NOT_FOUND)
+        assert (unknown.status_code, unknown.json()) == (404, CHAT_NOT_FOUND)
+        assert colleague.headers.get("content-type") == unknown.headers.get("content-type")
+        assert _state(world.db) == before
+        assert "A-colleague-245" not in colleague.text
         assert str(chat_id) not in colleague.text
         agent.run.assert_not_awaited()
 
@@ -2668,6 +2794,7 @@ _CASE_CLASSES: Final = (
     TestPathIdRoutes,
     TestPathIdSideEffects,
     TestChatPathRoutes,
+    TestChatRetryPathRoute,
     TestAttachmentPathRoutes,
     TestTrashPathRoutes,
     TestOwnOrgRoutes,

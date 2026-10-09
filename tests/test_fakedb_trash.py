@@ -1,32 +1,35 @@
-"""The FakeDb's own spec for migration 0031 and GH-194's SQL forms (tests/db_fakes.py).
+"""The FakeDb's own spec for migration 0032 and GH-194's SQL forms (tests/db_fakes.py).
 
 Issue #194 (Decisions 2, 5, 8, 10) and its contract (§1 migration, §2 audit
 catalog, §5 SQL forms). The fake models the schema the shipped migrations leave
 in place (``db_fakes.shipped_schema()``, read from the migrations next to
 ``admino.database``): until a shipped migration adds ``trash_group_id`` it is
-0030's schema; once ``0031_*.sql`` does, it is 0031's. These tests switch it with
-a tmp copy of the tree's migrations 0001 to 0030, with or without a 0031: the
-tree's own ``0031_*.sql`` when it exists, else ``MIGRATION_0031`` below (the
-statements of the contract's migration that the schema reader reads).
+0031's schema (0030's for what the reader reads: GH-245's ``0031_chat_retry.sql``
+changes none of it); once ``0032_trash.sql`` does, it is 0032's. These tests
+switch it with a tmp copy of the tree's migrations 0001 to 0031, with or without
+a 0032: the tree's own ``0032_trash.sql`` when it exists, else ``MIGRATION_0032``
+below (the statements of the contract's migration that the schema reader reads).
 
 What these tests pin down:
-- The schema reader: through 0030 there is no trash group column, no CHECK,
-  no DELETE on chats and 0025's chats UPDATE grant; with 0031 both tables have
+- The schema reader: through 0031 there is no trash group column, no CHECK,
+  no DELETE on chats and 0025's chats UPDATE grant; with 0032 both tables have
   the column and the CHECK, admino_app may DELETE chats and UPDATE
-  trash_group_id on both, and chat.purge / file.purge join the catalog. A 0031
+  trash_group_id on both, and chat.purge / file.purge join the catalog. A 0032
   whose statements are only in comments changes nothing; a later REVOKE or
   DROP CONSTRAINT takes its part back (a table-level REVOKE takes the column
-  grants with it). The tree's own migrations give 0031's schema (RED until
-  0031 ships).
-- Before 0031: no ``trash_group_id`` key in seeded rows, ``trash_group_id=`` on
+  grants with it). The tree's own migrations give 0032's schema (RED until
+  0032 ships). The reader keys on the statements, never on a version number
+  (review round 1, B1): GH-245's 0031_chat_retry.sql leaves the trash schema
+  off, adding 0032_trash.sql switches it on.
+- Before 0032: no ``trash_group_id`` key in seeded rows, ``trash_group_id=`` on
   ``add_chat`` / ``add_attachment`` and every form naming the column are
   UndefinedColumnError (also on empty tables), ``DELETE FROM chats`` is
   InsufficientPrivilegeError, chat.purge / file.purge are refused.
-- After 0031: the column is each table's last (after attachments.active), NULL
+- After 0032: the column is each table's last (after attachments.active), NULL
   for an INSERT without it; the seed helpers derive it like the backfill (a
   trashed chat: its own id; a trashed file: its trashed chat's id, else its
   own); both CHECKs refuse either column without the other on every INSERT and
-  UPDATE path (the pre-0031 S6 / A10 forms included) with the constraint name
+  UPDATE path (the pre-0032 S6 / A10 forms included) with the constraint name
   and the "Failing row contains" detail, after the table's other CHECKs; the
   grants; the catalog.
 - The forms of contract §5 answer as PostgreSQL did (pg-verify, 2026-10-09):
@@ -61,11 +64,11 @@ import pytest
 from tests import db_fakes
 from tests.db_fakes import ORG_ID, OTHER_ORG_ID, FakeDb, ShippedSchema, plain
 
-# Contract §1: the statements of migration 0031 that the schema reader reads (the
+# Contract §1: the statements of migration 0032 that the schema reader reads (the
 # backfill and the indexes change nothing it models). Used when the tree has no
-# 0031 yet; otherwise the tree's file is the 0031 under test.
-MIGRATION_0031: Final = """
--- 0031_trash.sql (GH-194): ALTER TABLE chats ADD COLUMN trash_group_id (comment only).
+# 0032 yet; otherwise the tree's file is the 0032 under test.
+MIGRATION_0032: Final = """
+-- 0032_trash.sql (GH-194): ALTER TABLE chats ADD COLUMN trash_group_id (comment only).
 ALTER TABLE chats ADD COLUMN trash_group_id UUID;
 ALTER TABLE attachments ADD COLUMN trash_group_id UUID;
 ALTER TABLE chats ADD CONSTRAINT chats_trash_group_check
@@ -97,7 +100,7 @@ ALTER TABLE audit_events ADD CONSTRAINT audit_events_action_check CHECK (action 
     'org.permission_demote'
 ));
 """
-# A 0031 that only describes its statements in comments.
+# A 0032 that only describes its statements in comments.
 MIGRATION_COMMENTS_ONLY: Final = """
 -- ALTER TABLE chats ADD COLUMN trash_group_id UUID;
 -- ALTER TABLE attachments ADD COLUMN trash_group_id UUID;
@@ -115,6 +118,9 @@ ALTER TABLE chats ADD CONSTRAINT chats_trash_group_check
     CHECK ((deleted_at IS NULL) = (trash_group_id IS NULL));
 """
 
+# GH-194's migration (version 32: GH-245's 0031_chat_retry.sql took 31) and GH-245's.
+TRASH_MIGRATION: Final = "0032_trash.sql"
+CHAT_RETRY_MIGRATION: Final = "0031_chat_retry.sql"
 GROUP: Final = "trash_group_id"
 PURGE_ACTIONS: Final = frozenset({"chat.purge", "file.purge"})
 CHECKS: Final = frozenset({"chats_trash_group_check", "attachments_trash_group_check"})
@@ -242,7 +248,7 @@ J5: Final = """
     WHERE id = $1 AND org_id = $2 AND trash_group_id = id AND deleted_at <= $3
     RETURNING id
 """
-# The pre-0031 trash forms (chats.trash_chat's S6 and A10 as shipped before GH-194).
+# The pre-0032 trash forms (chats.trash_chat's S6 and A10 as shipped before GH-194).
 S6_OLD: Final = """
     UPDATE chats SET deleted_at = now()
     WHERE id = $1 AND org_id = $2 AND owner_user_id = $3 AND deleted_at IS NULL
@@ -311,34 +317,35 @@ def _tree_migrations() -> Path:
     return Path(database.__file__).parent / "migrations"
 
 
-def _contract_0031() -> str:
-    """The tree's own 0031 when it ships one, else the contract's statements."""
-    shipped = sorted(_tree_migrations().glob("0031_*.sql"))
-    return shipped[0].read_text(encoding="utf-8") if shipped else MIGRATION_0031
+def _contract_0032() -> str:
+    """The tree's own 0032_trash.sql when it ships, else the contract's statements."""
+    shipped = _tree_migrations() / TRASH_MIGRATION
+    return shipped.read_text(encoding="utf-8") if shipped.is_file() else MIGRATION_0032
 
 
-def _migrations_copy(target: Path, extra: str | None) -> Path:
-    """0001 to 0030 of the tree's migrations in ``target``, plus ``extra`` as 0031."""
+def _migrations_copy(target: Path, extra: str | None, *, through: int = 31) -> Path:
+    """0001 to ``through`` (0031) of the tree's migrations in ``target``, plus ``extra``
+    as 0032."""
     target.mkdir()
     for path in sorted(_tree_migrations().glob("*.sql")):
         match = re.match(r"(\d{4})_", path.name)
-        if match is not None and int(match.group(1)) <= 30:
+        if match is not None and int(match.group(1)) <= through:
             shutil.copyfile(path, target / path.name)
     if extra is not None:
-        (target / "0031_trash.sql").write_text(extra, encoding="utf-8")
+        (target / TRASH_MIGRATION).write_text(extra, encoding="utf-8")
     return target
 
 
 @pytest.fixture()
-def read_0030(tmp_path: Path) -> ShippedSchema:
-    """What 0001 to 0030 leave in place (unpatched)."""
-    return db_fakes.read_shipped_schema(_migrations_copy(tmp_path / "m0030", None))
+def read_0031(tmp_path: Path) -> ShippedSchema:
+    """What 0001 to 0031 leave in place (unpatched)."""
+    return db_fakes.read_shipped_schema(_migrations_copy(tmp_path / "m0031", None))
 
 
 @pytest.fixture()
-def read_0031(tmp_path: Path) -> ShippedSchema:
-    """What 0001 to 0030 plus the 0031 under test leave in place (unpatched)."""
-    return db_fakes.read_shipped_schema(_migrations_copy(tmp_path / "m0031", _contract_0031()))
+def read_0032(tmp_path: Path) -> ShippedSchema:
+    """What 0001 to 0031 plus the 0032 under test leave in place (unpatched)."""
+    return db_fakes.read_shipped_schema(_migrations_copy(tmp_path / "m0032", _contract_0032()))
 
 
 def _use(monkeypatch: pytest.MonkeyPatch, schema: ShippedSchema) -> ShippedSchema:
@@ -347,15 +354,15 @@ def _use(monkeypatch: pytest.MonkeyPatch, schema: ShippedSchema) -> ShippedSchem
 
 
 @pytest.fixture()
-def schema_0030(monkeypatch: pytest.MonkeyPatch, read_0030: ShippedSchema) -> ShippedSchema:
-    """The fake runs 0030's schema."""
-    return _use(monkeypatch, read_0030)
-
-
-@pytest.fixture()
 def schema_0031(monkeypatch: pytest.MonkeyPatch, read_0031: ShippedSchema) -> ShippedSchema:
     """The fake runs 0031's schema."""
     return _use(monkeypatch, read_0031)
+
+
+@pytest.fixture()
+def schema_0032(monkeypatch: pytest.MonkeyPatch, read_0032: ShippedSchema) -> ShippedSchema:
+    """The fake runs 0032's schema."""
+    return _use(monkeypatch, read_0032)
 
 
 @dataclass(frozen=True)
@@ -368,7 +375,7 @@ class _World:
 
 def _world() -> _World:
     """The owner's live and trashed chats and files, a colleague's, another org's, and
-    two orgs for J1 (built on 0031's schema: the seeds derive their trash groups)."""
+    two orgs for J1 (built on 0032's schema: the seeds derive their trash groups)."""
     db = FakeDb()
     owner = db.add_account(org_id=ORG_ID)
     colleague = db.add_account(org_id=ORG_ID)
@@ -392,7 +399,7 @@ def _world() -> _World:
     db.add_attachment(LIVE_CHAT, attachment_id=OLD_FILE, filename="old.pdf", deleted_at=D40)
     db.add_attachment(TRASHED_CHAT, attachment_id=GROUP_FILE_A, filename="a.pdf", deleted_at=D1)
     db.add_attachment(TRASHED_CHAT, attachment_id=GROUP_FILE_B, filename="b.pdf", deleted_at=D1)
-    # Deleted on its own before its chat: its own group (0031's backfill can't tell,
+    # Deleted on its own before its chat: its own group (0032's backfill can't tell,
     # so the seed names it).
     db.add_attachment(
         TRASHED_CHAT,
@@ -446,19 +453,19 @@ async def _outcome(call: Any) -> str:
 
 
 class TestShippedSchemaReader:
-    """``read_shipped_schema`` reads what 0031 leaves in place."""
+    """``read_shipped_schema`` reads what 0032 leaves in place."""
 
-    def test_fakedb_trash_schema_through_0030_has_no_trash_parts(
-        self, read_0030: ShippedSchema
+    def test_fakedb_trash_schema_through_0031_has_no_trash_parts(
+        self, read_0031: ShippedSchema
     ) -> None:
         """No column, no CHECK, 0025's chats UPDATE grant, DELETE on attachments only,
         no purge action."""
         assert (
-            read_0030.trash_group_tables,
-            read_0030.trash_group_checks,
-            read_0030.chat_update_columns,
-            read_0030.delete_tables,
-            read_0030.audit_actions & PURGE_ACTIONS,
+            read_0031.trash_group_tables,
+            read_0031.trash_group_checks,
+            read_0031.chat_update_columns,
+            read_0031.delete_tables,
+            read_0031.audit_actions & PURGE_ACTIONS,
         ) == (
             frozenset(),
             frozenset(),
@@ -467,15 +474,15 @@ class TestShippedSchemaReader:
             frozenset(),
         )
 
-    def test_fakedb_trash_schema_with_0031_adds_the_trash_parts(
-        self, read_0030: ShippedSchema, read_0031: ShippedSchema
+    def test_fakedb_trash_schema_with_0032_adds_the_trash_parts(
+        self, read_0031: ShippedSchema, read_0032: ShippedSchema
     ) -> None:
         """Both columns and CHECKs, DELETE on chats, UPDATE (trash_group_id) on both
         tables, the two purge actions; nothing else changes."""
-        assert read_0031 == dataclasses.replace(
-            read_0030,
-            attachment_update_columns=read_0030.attachment_update_columns | {GROUP},
-            audit_actions=read_0030.audit_actions | PURGE_ACTIONS,
+        assert read_0032 == dataclasses.replace(
+            read_0031,
+            attachment_update_columns=read_0031.attachment_update_columns | {GROUP},
+            audit_actions=read_0031.audit_actions | PURGE_ACTIONS,
             trash_group_tables=frozenset({"chats", "attachments"}),
             trash_group_checks=CHECKS,
             chat_update_columns=db_fakes.CHAT_UPDATE_COLUMNS | {GROUP},
@@ -483,21 +490,21 @@ class TestShippedSchemaReader:
         )
 
     def test_fakedb_trash_schema_ignores_statements_in_comments(
-        self, tmp_path: Path, read_0030: ShippedSchema
+        self, tmp_path: Path, read_0031: ShippedSchema
     ) -> None:
-        """A 0031 that only describes its statements in comments changes nothing."""
+        """A 0032 that only describes its statements in comments changes nothing."""
         directory = _migrations_copy(tmp_path / "comments", MIGRATION_COMMENTS_ONLY)
 
-        assert db_fakes.read_shipped_schema(directory) == read_0030
+        assert db_fakes.read_shipped_schema(directory) == read_0031
 
     def test_fakedb_trash_schema_reads_each_table_on_its_own(
-        self, tmp_path: Path, read_0030: ShippedSchema
+        self, tmp_path: Path, read_0031: ShippedSchema
     ) -> None:
         """A migration giving chats alone the column and its CHECK changes chats only."""
         directory = _migrations_copy(tmp_path / "chats-only", MIGRATION_CHATS_ONLY)
 
         assert db_fakes.read_shipped_schema(directory) == dataclasses.replace(
-            read_0030,
+            read_0031,
             trash_group_tables=frozenset({"chats"}),
             trash_group_checks=frozenset({"chats_trash_group_check"}),
         )
@@ -526,36 +533,64 @@ class TestShippedSchemaReader:
         ids=["revoke-delete", "revoke-column", "revoke-table-update", "drop-check", "other-role"],
     )
     def test_fakedb_trash_schema_later_statements_take_their_part_back(
-        self, tmp_path: Path, read_0031: ShippedSchema, later: str, changes: dict[str, Any]
+        self, tmp_path: Path, read_0032: ShippedSchema, later: str, changes: dict[str, Any]
     ) -> None:
         """A later REVOKE / DROP CONSTRAINT takes back exactly its part (a table-level
         REVOKE UPDATE takes every column grant of that privilege with it); a grant to
         another role changes nothing."""
-        directory = _migrations_copy(tmp_path / "later", _contract_0031() + "\n" + later + "\n")
+        directory = _migrations_copy(tmp_path / "later", _contract_0032() + "\n" + later + "\n")
 
-        assert db_fakes.read_shipped_schema(directory) == dataclasses.replace(read_0031, **changes)
+        assert db_fakes.read_shipped_schema(directory) == dataclasses.replace(read_0032, **changes)
 
-    def test_fakedb_trash_shipped_migrations_give_the_0031_schema(
-        self, read_0031: ShippedSchema
+    def test_fakedb_trash_shipped_migrations_give_the_0032_schema(
+        self, read_0032: ShippedSchema
     ) -> None:
-        """The tree's own migrations (what the fake uses unpatched) leave 0031's schema,
-        and the import-time attachments UPDATE grant is that one (RED until 0031 ships)."""
+        """The tree's own migrations (what the fake uses unpatched) leave 0032's schema,
+        and the import-time attachments UPDATE grant is that one (RED until 0032 ships)."""
         assert (db_fakes.shipped_schema(), db_fakes.ATTACHMENT_UPDATE_COLUMNS) == (
-            read_0031,
-            read_0031.attachment_update_columns,
+            read_0032,
+            read_0032.attachment_update_columns,
         )
 
+    def test_fakedb_trash_schema_is_keyed_on_the_trash_migration_not_version_31(
+        self, tmp_path: Path, read_0032: ShippedSchema
+    ) -> None:
+        """Review round 1, B1: the tree's migrations through GH-245's
+        ``0031_chat_retry.sql`` (version 31, no trash statement) leave exactly 0030's
+        schema, so version 31 alone never switches the trash on; adding our
+        ``0032_trash.sql`` gives both columns and CHECKs and DELETE on chats."""
+        through_0030 = _migrations_copy(tmp_path / "through-0030", None, through=30)
+        through_0031 = _migrations_copy(tmp_path / "through-0031", None)
+        with_0032 = _migrations_copy(tmp_path / "with-0032", _contract_0032())
+
+        assert (
+            sorted(path.name for path in through_0031.glob("0031_*.sql")),
+            db_fakes.read_shipped_schema(through_0031),
+            sorted(path.name for path in with_0032.glob("003[12]_*.sql")),
+            db_fakes.read_shipped_schema(with_0032),
+        ) == (
+            [CHAT_RETRY_MIGRATION],
+            db_fakes.read_shipped_schema(through_0030),
+            [CHAT_RETRY_MIGRATION, TRASH_MIGRATION],
+            read_0032,
+        )
+        assert (
+            read_0032.trash_group_tables,
+            read_0032.trash_group_checks,
+            "chats" in read_0032.delete_tables,
+        ) == (frozenset({"chats", "attachments"}), CHECKS, True)
+
 
 # ---------------------------------------------------------------------------
-# 2. Before 0031
+# 2. Before 0032
 # ---------------------------------------------------------------------------
 
 
-class TestBefore0031:
-    """0030's schema: no trash group column, no DELETE on chats."""
+class TestBefore0032:
+    """0031's schema: no trash group column, no DELETE on chats."""
 
-    async def test_fakedb_before_0031_seeds_have_no_trash_group(
-        self, schema_0030: ShippedSchema
+    async def test_fakedb_before_0032_seeds_have_no_trash_group(
+        self, schema_0031: ShippedSchema
     ) -> None:
         """Trashed seeds store no ``trash_group_id`` key; seeding one is refused
         (UndefinedColumnError, None included) and stores nothing."""
@@ -589,8 +624,8 @@ class TestBefore0031:
         )
         assert (len(db.chats_of(owner)), len(db.attachments_of(chat))) == (1, 1)
 
-    async def test_fakedb_before_0031_every_form_naming_the_group_is_undefined(
-        self, schema_0030: ShippedSchema
+    async def test_fakedb_before_0032_every_form_naming_the_group_is_undefined(
+        self, schema_0031: ShippedSchema
     ) -> None:
         """Even on empty tables (refused when parsed, as PostgreSQL does)."""
         db = FakeDb()
@@ -618,8 +653,8 @@ class TestBefore0031:
 
         assert outcomes == dict.fromkeys(calls, "UndefinedColumnError")
 
-    async def test_fakedb_before_0031_admino_app_may_not_delete_chats(
-        self, schema_0030: ShippedSchema
+    async def test_fakedb_before_0032_admino_app_may_not_delete_chats(
+        self, schema_0031: ShippedSchema
     ) -> None:
         """T9 is InsufficientPrivilegeError and deletes nothing (no cascade either)."""
         db = FakeDb()
@@ -634,15 +669,15 @@ class TestBefore0031:
 
 
 # ---------------------------------------------------------------------------
-# 3. The columns, seeds, CHECKs, grants and catalog after 0031
+# 3. The columns, seeds, CHECKs, grants and catalog after 0032
 # ---------------------------------------------------------------------------
 
 
 class TestTrashGroupColumns:
-    """0031's ``trash_group_id`` on chats and attachments."""
+    """0032's ``trash_group_id`` on chats and attachments."""
 
     async def test_fakedb_trash_group_is_the_last_column_and_null_by_default(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """ADD COLUMN appends it (after attachments.active); an INSERT without it and a
         live seed store NULL."""
@@ -670,7 +705,7 @@ class TestTrashGroupColumns:
         ]
 
     async def test_fakedb_trash_group_seeds_follow_the_backfill(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """A trashed chat is its own group; a trashed file joins its trashed chat's
         group, else is its own; an explicit group is stored as given."""
@@ -706,7 +741,7 @@ class TestTrashGroupChecks:
 
     @pytest.mark.parametrize("table", ["chats", "attachments"])
     async def test_fakedb_trash_group_check_refuses_either_column_alone_on_seeds(
-        self, schema_0031: ShippedSchema, table: str
+        self, schema_0032: ShippedSchema, table: str
     ) -> None:
         """Trashed without a group and a group without the trash: CheckViolationError
         on the table's constraint; nothing stored."""
@@ -744,9 +779,9 @@ class TestTrashGroupChecks:
         ids=["chat-old-s6", "chat-group-only", "file-old-a10", "file-group-only"],
     )
     async def test_fakedb_trash_group_check_refuses_updates_with_the_row_detail(
-        self, schema_0031: ShippedSchema, table: str, sql: str, tail: str
+        self, schema_0032: ShippedSchema, table: str, sql: str, tail: str
     ) -> None:
-        """The pre-0031 trash forms (deleted_at without a group) and a group without
+        """The pre-0032 trash forms (deleted_at without a group) and a group without
         the trash fail on the table's CHECK, the group last in the "Failing row
         contains" detail (after deleted_at for a chat, after active for a file); the
         statement changes nothing."""
@@ -768,7 +803,7 @@ class TestTrashGroupChecks:
         ) == (f"{table}_trash_group_check", expected, True)
 
     async def test_fakedb_trash_group_check_runs_after_the_other_checks(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """A row breaking chats_title_check too reports that one first (name order)."""
         db = FakeDb()
@@ -781,20 +816,20 @@ class TestTrashGroupChecks:
 
 
 class TestTrashGrants:
-    """0031's grants: DELETE on chats, UPDATE (trash_group_id) on chats and attachments."""
+    """0032's grants: DELETE on chats, UPDATE (trash_group_id) on chats and attachments."""
 
     @pytest.mark.parametrize("granted", [True, False], ids=["granted", "revoked"])
     async def test_fakedb_trash_group_privileges_follow_the_shipped_grants(
-        self, monkeypatch: pytest.MonkeyPatch, read_0031: ShippedSchema, granted: bool
+        self, monkeypatch: pytest.MonkeyPatch, read_0032: ShippedSchema, granted: bool
     ) -> None:
-        """With 0031's grants S6', A13 and T9 run; without them each is
+        """With 0032's grants S6', A13 and T9 run; without them each is
         InsufficientPrivilegeError and changes nothing."""
-        schema = read_0031
+        schema = read_0032
         if not granted:
             schema = dataclasses.replace(
-                read_0031,
+                read_0032,
                 chat_update_columns=db_fakes.CHAT_UPDATE_COLUMNS,
-                attachment_update_columns=read_0031.attachment_update_columns - {GROUP},
+                attachment_update_columns=read_0032.attachment_update_columns - {GROUP},
                 delete_tables=frozenset({"attachments"}),
             )
         _use(monkeypatch, schema)
@@ -817,9 +852,9 @@ class TestTrashGrants:
         )
 
     async def test_fakedb_trash_grants_change_no_other_privilege(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
-        """After 0031: DELETE chat_messages, UPDATE chats.owner_user_id /
+        """After 0032: DELETE chat_messages, UPDATE chats.owner_user_id /
         legacy_session_id and UPDATE attachments.chat_id stay refused (pg-verify)."""
         db = FakeDb()
         owner = db.add_account(org_id=ORG_ID)
@@ -839,20 +874,20 @@ class TestTrashGrants:
 
     @pytest.mark.parametrize(
         ("schema", "recorded"),
-        [("0030", ["chat.delete"]), ("0031", ["chat.delete", "chat.purge", "file.purge"])],
-        ids=["0030", "0031"],
+        [("0031", ["chat.delete"]), ("0032", ["chat.delete", "chat.purge", "file.purge"])],
+        ids=["0031", "0032"],
     )
     async def test_fakedb_trash_purge_actions_follow_the_shipped_catalog(
         self,
         monkeypatch: pytest.MonkeyPatch,
-        read_0030: ShippedSchema,
         read_0031: ShippedSchema,
+        read_0032: ShippedSchema,
         schema: str,
         recorded: list[str],
     ) -> None:
         """chat.purge (with its file_count) and file.purge are refused by
-        audit_events_action_check until 0031; chat.purged never."""
-        _use(monkeypatch, read_0030 if schema == "0030" else read_0031)
+        audit_events_action_check until 0032; chat.purged never."""
+        _use(monkeypatch, read_0031 if schema == "0031" else read_0032)
         db = FakeDb()
         actor = db.add_account(org_id=ORG_ID)
         refused = []
@@ -885,7 +920,7 @@ class TestTrashGrants:
 
 
 # ---------------------------------------------------------------------------
-# 4. The SQL forms of contract §5 (0031's schema)
+# 4. The SQL forms of contract §5 (0032's schema)
 # ---------------------------------------------------------------------------
 
 
@@ -893,7 +928,7 @@ class TestTrashForms:
     """R1, S6' + A10', A13 (contract §4: the retention read and the two deletes)."""
 
     async def test_fakedb_r1_reads_the_retention_or_no_row(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """The org's stored value; an org without a row: None."""
         world = _world()
@@ -904,7 +939,7 @@ class TestTrashForms:
         ]
 
     async def test_fakedb_s6_and_a10_trash_a_chat_with_its_live_files_as_one_group(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """The chat becomes its own group, its live files join it; files trashed before
         keep their group and stamp; a colleague's binding trashes nothing."""
@@ -924,7 +959,7 @@ class TestTrashForms:
         assert db.attachment_row(OWN_FILE) == own_before
 
     async def test_fakedb_a13_trashes_one_live_file_as_its_own_group(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """Returns the id once; a trashed file or a colleague's binding: no row."""
         world = _world()
@@ -950,7 +985,7 @@ class TestTrashListForms:
     """T1c, T1c', T1a, T1a' (contract §4 list_trash)."""
 
     async def test_fakedb_t1c_lists_own_trashed_chats_newest_first_with_ties_by_id(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """deleted_at > cutoff, own group, the owner's only; the keyset pages concatenate
         to the full list across the D1 tie; LIMIT applies."""
@@ -969,7 +1004,7 @@ class TestTrashListForms:
             ["id", "title", "deleted_at"],
         )
 
-    async def test_fakedb_t1c_cutoff_is_strict(self, schema_0031: ShippedSchema) -> None:
+    async def test_fakedb_t1c_cutoff_is_strict(self, schema_0032: ShippedSchema) -> None:
         """A chat deleted exactly at the cutoff is expired (not listed)."""
         world = _world()
 
@@ -977,7 +1012,7 @@ class TestTrashListForms:
 
         assert _ids(rows) == [TIE_CHAT, TRASHED_CHAT]
 
-    async def test_fakedb_t1a_lists_own_group_files_only(self, schema_0031: ShippedSchema) -> None:
+    async def test_fakedb_t1a_lists_own_group_files_only(self, schema_0032: ShippedSchema) -> None:
         """Files deleted on their own (even in a trashed chat), not the files of a
         chat's group, not expired ones, not a colleague's; the keyset continues."""
         world = _world()
@@ -1005,7 +1040,7 @@ class TestTrashListForms:
         ids=["t1c-naive", "t1c-after-str", "t2-naive", "j2-str"],
     )
     async def test_fakedb_trash_timestamp_parameters_must_be_aware_datetimes(
-        self, schema_0031: ShippedSchema, sql: str, args: tuple[Any, ...]
+        self, schema_0032: ShippedSchema, sql: str, args: tuple[Any, ...]
     ) -> None:
         """A naive datetime or a str for a cutoff / cursor stamp is a DataError."""
         world = _world()
@@ -1018,7 +1053,7 @@ class TestTrashRestoreForms:
     """T2, T3, T4, T6 (contract §4 restore_chat, restore_attachment)."""
 
     async def test_fakedb_t2_and_t3_restore_a_chat_and_exactly_its_group(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """T2 returns the chat record and clears both columns; T3 brings back the two
         files of its group, not the file deleted on its own before it."""
@@ -1047,7 +1082,7 @@ class TestTrashRestoreForms:
         }
 
     async def test_fakedb_t2_finds_no_expired_live_or_foreign_chat(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """Expired (cutoff after deleted_at), live, a colleague's binding: no row,
         nothing changed; a longer retention restores the old chat."""
@@ -1066,7 +1101,7 @@ class TestTrashRestoreForms:
         assert (misses, unchanged, longer is not None) == ([None] * 4, True, True)
 
     async def test_fakedb_t2_of_a_legacy_chat_whose_session_is_live_is_a_unique_violation(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """chats_legacy_session_key (the owner's live chat with the same session):
         UniqueViolationError with the constraint name; nothing changed. A colleague's
@@ -1092,7 +1127,7 @@ class TestTrashRestoreForms:
         )
 
     async def test_fakedb_t4_and_t6_restore_an_own_group_file_only(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """T4 gives its chat; T6 clears both columns and returns the AR record. A
         file of a chat's group, an expired file and a colleague's binding: no row."""
@@ -1125,7 +1160,7 @@ class TestTrashPurgeForms:
     """T7, T8, T9, T10, E1, E2 (contract §4 purge_chat, purge_attachment, empty_trash)."""
 
     async def test_fakedb_t7_locks_the_owners_trashed_chat_only(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """FOR UPDATE is recorded; a trashed chat of the owner: its id (expired too);
         a live chat, a colleague's binding: no row."""
@@ -1151,7 +1186,7 @@ class TestTrashPurgeForms:
         assert len(world.db.matching(r"deleted_at is not null for update$")) == 4
 
     async def test_fakedb_t8_lists_every_attachment_row_of_the_chat(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """Any state (the chat's group and a file trashed on its own); another org's
         binding: none."""
@@ -1166,7 +1201,7 @@ class TestTrashPurgeForms:
         )
 
     async def test_fakedb_t9_deletes_the_chat_with_its_messages_and_files(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """ "DELETE 1"; the chat's messages and every attachment row go with it; every
         other chat's rows stay; another org's binding deletes nothing."""
@@ -1193,7 +1228,7 @@ class TestTrashPurgeForms:
         } == others
 
     async def test_fakedb_t9_rolls_back_with_its_transaction(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """A failure after T9 in the same transaction restores the chat, its messages
         and its files."""
@@ -1209,7 +1244,7 @@ class TestTrashPurgeForms:
         assert db.snapshot() == before
 
     async def test_fakedb_t10_deletes_an_own_group_trashed_file_only(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """Returns the id (an expired one too); a file of a chat's group, a live file
         and a colleague's binding: no row, still stored."""
@@ -1232,7 +1267,7 @@ class TestTrashPurgeForms:
         ) == sorted([GROUP_FILE_A, LIVE_FILE])
 
     async def test_fakedb_e1_and_e2_list_every_trashed_item_by_id(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """Expired ones included; E2 only files of their own group; the owner's only."""
         world = _world()
@@ -1251,7 +1286,7 @@ class TestTrashJobForms:
     """J1 to J5 (contract §4 purge_expired)."""
 
     async def test_fakedb_j1_is_the_distinct_ordered_union_of_orgs_with_trash(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """Orgs with a trashed chat or file (a file alone counts), each once, by id;
         an org with live rows only: absent."""
@@ -1265,7 +1300,7 @@ class TestTrashJobForms:
         )
 
     async def test_fakedb_j2_and_j3_find_expired_chats_with_an_inclusive_cutoff(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """J2: the org's chats with deleted_at <= cutoff (any owner) by deleted_at then
         id; J3: one of them, locked; a chat deleted exactly at the cutoff is
@@ -1294,7 +1329,7 @@ class TestTrashJobForms:
         assert len(world.db.matching(r"deleted_at <= \$3 for update$")) == 4
 
     async def test_fakedb_j4_and_j5_find_and_delete_expired_own_group_files(
-        self, schema_0031: ShippedSchema
+        self, schema_0032: ShippedSchema
     ) -> None:
         """J4: the org's own-group files with deleted_at <= cutoff (any owner); a
         chat's group file is not one. J5 deletes one and returns its id; a group file

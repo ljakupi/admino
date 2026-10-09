@@ -17,7 +17,7 @@ tests/tenancy_world.py (orgs A and B with an Org Admin, an Editor and a Viewer
 each, plus a Super Admin, real session cookies), with the attachments root
 under ``tmp_path``. Trashed rows are seeded with ``FakeDb.add_chat`` /
 ``add_attachment(deleted_at=...)`` (the fake derives ``trash_group_id`` as
-migration 0031's backfill does once it ships) at fixed offsets from now, so
+migration 0032's backfill does once it ships) at fixed offsets from now, so
 expiry never waits; every seeded file has its original ``<id>``, a partial
 ``<id>.part`` and a derived ``<id>.d/`` tree on disk. The org's retention is
 its ``org_settings`` row; the platform's trash bounds are the settings cache

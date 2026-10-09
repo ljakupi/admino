@@ -45,8 +45,8 @@ What these tests pin down (contract section 1):
   chat_messages`` to admino_app (no DELETE: trash is ``deleted_at``;
   chat_messages is append-only), no grant option, no other grantee. Migration
   0025 (GH-266, tests/test_migration_0025.py) narrows the UPDATE on chats to
-  the five columns the application writes; migration 0031 (GH-194,
-  tests/test_migration_0031.py) grants DELETE on chats for the trash purge.
+  the five columns the application writes; migration 0032 (GH-194,
+  tests/test_migration_0032.py) grants DELETE on chats for the trash purge.
 - The SQL bounds equal the Python ones (contract section 6): the title bound
   is ``ChatSummary.title``'s, the content bound ``ChatMessageView.content``'s
   and ``LLMMessage.content``'s, the tool_calls bound ``ChatMessageView.tool_calls``'s,
@@ -65,7 +65,7 @@ Security notes:
   chats and their messages (tests/test_schema_foreign_keys.py).
 - 0024 gives the runtime role no DELETE on chats and no UPDATE / DELETE on
   messages: the stored conversation can only grow, and trash is a timestamp
-  (GH-194: 0031's DELETE on chats removes a chat's messages only by the cascade,
+  (GH-194: 0032's DELETE on chats removes a chat's messages only by the cascade,
   which runs as the table owner).
 - No ``system`` role: system prompts and org/personal instructions are never
   persisted.
@@ -1201,8 +1201,8 @@ class TestMigration0024Grants:
         assert "delete" not in granted
 
     def test_migration_0024_chats_are_never_deleted_by_the_app(self) -> None:
-        """Trash is deleted_at: 0024 grants no DELETE on chats. (GH-194: migration 0031
-        grants it for delete forever and the retention purge; tests/test_migration_0031.py
+        """Trash is deleted_at: 0024 grants no DELETE on chats. (GH-194: migration 0032
+        grants it for delete forever and the retention purge; tests/test_migration_0032.py
         pins the privileges after every shipped migration.)"""
         granted = _granted(_CHATS)
 
@@ -1357,9 +1357,9 @@ class TestMigration0024MatchesPython:
 
     def test_migration_0024_the_fake_database_has_the_shipped_columns(self) -> None:
         """0024's columns, in order. A column a later migration appends (GH-189: 0029's
-        chat_messages.included_attachment_ids; GH-194: 0031's chats.trash_group_id) is
+        chat_messages.included_attachment_ids; GH-194: 0032's chats.trash_group_id) is
         pinned, after these, by its own migration's test (tests/test_migration_0029.py,
-        tests/test_migration_0031.py and tests/test_fakedb_trash.py)."""
+        tests/test_migration_0032.py and tests/test_fakedb_trash.py)."""
         later = {_MESSAGES: ("included_attachment_ids",), _CHATS: ("trash_group_id",)}
         shipped = {table: [name for name, _ in _table(table).columns] for table in _TABLES}
 

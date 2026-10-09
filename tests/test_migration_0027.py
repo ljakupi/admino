@@ -1079,7 +1079,7 @@ class TestMigration0027FakeDb:
         """An UPDATE naming a column outside the shipped grant is 'permission denied for
         table attachments' and changes nothing; a granted column is updated. (GH-194: a
         new deleted_at goes on a file already in the trash, and so in its trash group:
-        migration 0031's CHECK refuses a deleted_at without a group.)"""
+        migration 0032's CHECK refuses a deleted_at without a group.)"""
         granted = _shipped_update_columns()
         outcomes: dict[str, str] = {}
         for column in _COLUMNS:

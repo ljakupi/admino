@@ -41,7 +41,7 @@ What these tests pin down:
 
 Harness: the module is imported lazily (fixture ``trash``), so this file collects before
 it exists and every test fails on its own. ``FakeDb`` (tests/db_fakes.py) models
-migration 0031 once ``0031_*.sql`` ships. Time is injected (``now=``) and every seeded
+migration 0032 once ``0032_*.sql`` ships. Time is injected (``now=``) and every seeded
 row carries a fixed ``deleted_at``; disk entries live under ``tmp_path``; the job's
 sleeps are recorders and every job run is bounded by ``asyncio.wait_for``.
 
@@ -504,7 +504,7 @@ class TestCascade:
     async def test_trash_purge_job_group_file_is_not_purged_on_its_own(
         self, trash: ModuleType, world: _World, root: Path
     ) -> None:
-        """A file of a trashed chat's group whose own stamp is expired (0031's backfill can
+        """A file of a trashed chat's group whose own stamp is expired (0032's backfill can
         give one) stays with its chat while the chat isn't expired: J4 selects only a file
         that is its own group."""
         db = world.db

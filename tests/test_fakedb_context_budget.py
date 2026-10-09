@@ -558,7 +558,7 @@ class TestShippedSchemaReader:
         """The tree's own migrations through 0030 (what the fake uses unpatched, later
         migrations on top) leave 0030's schema, and the fake's import-time UPDATE grant
         is the shipped one, 0030's included (RED until 0030 ships). GH-194: read
-        through 0030, as 0031 adds its own parts (tests/test_fakedb_trash.py)."""
+        through 0030, as 0032 adds its own parts (tests/test_fakedb_trash.py)."""
         tree = db_fakes.read_shipped_schema(_migrations_copy(tmp_path / "tree", None, through=30))
         grant = db_fakes.ATTACHMENT_UPDATE_COLUMNS
 

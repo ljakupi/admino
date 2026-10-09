@@ -12,7 +12,7 @@ org's storage quota counts the originals and their derived files. GH-190
 again (``set_active``, the ``active`` flag; an excluded file stays linked to
 its message and listed), lists their chat's files (``list_chat_attachments``)
 and the context budget counts the chat's ready, active files
-(``ready_active_attachments``). GH-194 (migration 0031): a member moves one
+(``ready_active_attachments``). GH-194 (migration 0032): a member moves one
 of their live files to the trash on its own (``trash_attachment``: the file
 is its own trash group, its files stay on disk); listing, restoring and
 purging the trash are ``admino.trash``, which imports this module.
@@ -71,7 +71,7 @@ Security notes:
   and returns the active ones only, so an excluded file never reaches the
   slot.
 - Trash (GH-194): ``trash_attachment`` sets only ``deleted_at`` and
-  ``trash_group_id`` (migration 0031 grants the runtime role UPDATE on the
+  ``trash_group_id`` (migration 0032 grants the runtime role UPDATE on the
   group) of the caller's live file and records ``file.delete`` (the file's
   id, no metadata) in the same transaction, so a failed audit write rolls it
   back.
