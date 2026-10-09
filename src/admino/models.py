@@ -3670,7 +3670,10 @@ class ChatDetailResponse(ChatSummary):
     ``pending`` with a live pending confirmation, ``expired`` when the latest
     message awaits a confirmation that is gone (expired or lost in a restart).
     ``context_usage`` is how full the chat's context is as its next turn
-    starts (GH-190).
+    starts (GH-190). ``retryable`` (GH-245) is true exactly when the chat's
+    latest message ended as ``error`` or ``stopped``, whatever page is read:
+    then POST /api/chats/{chat_id}/retry passes its status check instead of
+    answering ``409`` ``not_retryable``.
     """
 
     messages: list[ChatMessageView] = Field(max_length=100)
@@ -3678,6 +3681,7 @@ class ChatDetailResponse(ChatSummary):
     pending_confirmation: PendingConfirmationSummary | None = None
     confirmation_status: Literal["none", "pending", "expired"]
     context_usage: ContextUsage
+    retryable: bool
 
 
 # ---------------------------------------------------------------------------

@@ -26,6 +26,13 @@ excluded ones too (S9' / S11'), and the detail no longer counts the messages
 (Decision 13). The upload, reads and files are ``admino.attachments``, which
 imports this module (never the reverse); their derived files are read by
 ``admino.attachment_context``.
+GH-245 retries a failed answer: ``read_retry_target`` (R1) reads the chat's
+failed last turn (its latest message ended ``error`` or ``stopped``,
+``RETRYABLE_STATUSES``) as a ``RetryTarget``, ``load_turn(before_seq=...)``
+(T2b) loads the history before the retried user message, and
+``append_messages(replace_through=...)`` deletes the failed turn through
+migration 0031's ``delete_failed_turn`` (R2) in the transaction that stores
+the new one.
 
 Inputs: an executor (an asyncpg pool or connection) or, for the three
 transactional writes (``trash_chat``, ``append_messages`` and
@@ -33,16 +40,18 @@ transactional writes (``trash_chat``, ``append_messages`` and
 (the server-generated id of a legacy chat to create); titles,
 ``LLMMessage``s, ``ToolCallRecord``s, attachment ids (the files a message
 carries and the slot's ids its answers included) and whether the run
-received external content; page sizes and opaque cursors.
+received external content; page sizes and opaque cursors; the seq bounds of
+a retry (the retried user message, the failed turn's last message).
 Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
 ``MessagePage`` whose messages carry their ``attachment_ids``, and its latest
 message status), ``ChatTurn`` (the chat, its history and its active
-``ActiveAttachment``s with their estimates), counts, whether an automatic
-title was stored and the id of a turn's last appended message.
+``ActiveAttachment``s with their estimates), ``RetryTarget``, counts, whether
+an automatic title was stored and the id of a turn's last appended message.
 Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
 ``system`` message or a message of content parts to store, attachments
-without a ``user`` message to carry them), ``audit_events.AuditRecordError``
-and the driver's errors.
+without a ``user`` message to carry them, a replaced turn without its
+``user`` message), ``audit_events.AuditRecordError`` and the driver's errors
+(``asyncpg.InsufficientPrivilegeError`` when ``delete_failed_turn`` refuses).
 
 Behaviour:
 - Lists are keyset-paginated: chats by ``(last_activity_at, id)`` descending,
@@ -82,6 +91,10 @@ Behaviour:
   selects the winner's chat (whose id differs from the one given). Only that
   key's violation is the race (GH-271): any other unique violation (the given
   id already taken) propagates as the driver raised it.
+- A retry's ``append_messages`` (GH-245) runs ``delete_failed_turn`` right
+  after the touch and before the first insert, on the same connection: a
+  refusal rolls the whole turn back, and the re-stored user message takes the
+  failed one's files through the usual A9 link (the function unlinked them).
 - ``append_org_notice`` (GH-66) skips every chat whose latest message (highest
   seq, any role) is ``awaiting_confirmation``: a user message after the
   pending call's ``tool_use`` would separate it from its result and break the
@@ -119,6 +132,12 @@ Security notes:
   (migration 0025), and only ``message_id``, ``updated_at`` and
   ``deleted_at`` (among others) of an attachment (migration 0027): every
   UPDATE here stays within them.
+- ``chat_messages`` is append-only for the runtime role (SELECT, INSERT; no
+  UPDATE or DELETE). The one delete is GH-245's ``delete_failed_turn``
+  (migration 0031, until #182's versions), which runs as the owner and checks
+  the chat's org, owner and liveness and the turn's failed status itself, so
+  it removes at most the caller's chat's failed last turn. It unlinks the
+  turn's files first: a file is never deleted with its message.
 - System prompts and instructions are never stored: a ``system`` message is
   refused before any statement, and so is a message whose content is a list
   of content parts (GH-189: attachment content and images live only in one
@@ -171,6 +190,10 @@ _MAX_SEQ: Final = 2**63 - 1
 _CURSOR_RE: Final = re.compile(r"[A-Za-z0-9_-]{1,200}")
 # The partial unique key (migration 0024) a concurrent first legacy message loses on.
 _LEGACY_SESSION_KEY: Final = "chats_legacy_session_key"
+# GH-245 (Decision 1): the statuses of a chat's latest message that make it retryable: an
+# error, or a stop (the Stop route or a streamed client that disconnected). Migration
+# 0031's delete_failed_turn checks the same two.
+RETRYABLE_STATUSES: Final[frozenset[MessageStatus]] = frozenset({"error", "stopped"})
 
 # S1: a new chat of the caller (a legacy session id only for the legacy route).
 _CREATE_SQL: Final = """
@@ -385,6 +408,68 @@ _TURN_SQL: Final = """
     WHERE c.id = $1 AND c.org_id = $2 AND c.owner_user_id = $3 AND c.deleted_at IS NULL
     ORDER BY m.seq DESC
 """
+# T2b (GH-245, Decision 3): T2'' with the message window ending before the retried user
+# message ($5), so a retry's history is what a send of that message had. The attachment
+# array doesn't depend on the window: the active files are the chat's, the retried
+# message's included.
+_TURN_BEFORE_SQL: Final = """
+    SELECT c.id, c.org_id, c.owner_user_id, c.title, c.title_source, c.external_content,
+           c.created_at, c.last_activity_at,
+           ARRAY(
+               SELECT ARRAY[a.id::text, a.filename, a.kind, a.page_count::text,
+                            a.token_estimate::text, a.derived_bytes::text]
+               FROM attachments a
+               JOIN chat_messages am ON am.id = a.message_id AND am.org_id = a.org_id
+               WHERE a.chat_id = c.id AND a.org_id = c.org_id
+                 AND a.owner_user_id = c.owner_user_id
+                 AND a.status = 'ready' AND a.active AND a.deleted_at IS NULL
+               ORDER BY am.seq, a.created_at, a.id
+           ) AS attachment_rows,
+           m.role, m.content, m.tool_use_blocks, m.tool_call_id
+    FROM chats c
+    LEFT JOIN LATERAL (
+        SELECT seq, role, content, tool_use_blocks, tool_call_id
+        FROM chat_messages
+        WHERE chat_id = c.id AND org_id = c.org_id AND seq < $5
+        ORDER BY seq DESC
+        LIMIT $4
+    ) m ON true
+    WHERE c.id = $1 AND c.org_id = $2 AND c.owner_user_id = $3 AND c.deleted_at IS NULL
+    ORDER BY m.seq DESC
+"""
+# R1 (GH-245, Decisions 1 and 2): the caller's live chat with its latest message (any
+# role: an org notice after a failed answer makes it not retryable) and its latest user
+# message (the retried one) with that message's live files, excluded ones too, in the
+# order they were uploaded. No row means not found; NULL message columns mean no message
+# (or no user message) to retry.
+_RETRY_TARGET_SQL: Final = """
+    SELECT c.id,
+           latest.seq AS through_seq, latest.status,
+           turn.seq AS user_seq, turn.content,
+           ARRAY(
+               SELECT a.id FROM attachments a
+               WHERE a.message_id = turn.id AND a.chat_id = c.id AND a.org_id = c.org_id
+                 AND a.owner_user_id = c.owner_user_id AND a.deleted_at IS NULL
+               ORDER BY a.created_at, a.id
+           ) AS attachment_ids
+    FROM chats c
+    LEFT JOIN LATERAL (
+        SELECT seq, status FROM chat_messages
+        WHERE chat_id = c.id AND org_id = c.org_id
+        ORDER BY seq DESC
+        LIMIT 1
+    ) latest ON true
+    LEFT JOIN LATERAL (
+        SELECT id, seq, content FROM chat_messages
+        WHERE chat_id = c.id AND org_id = c.org_id AND role = 'user'
+        ORDER BY seq DESC
+        LIMIT 1
+    ) turn ON true
+    WHERE c.id = $1 AND c.org_id = $2 AND c.owner_user_id = $3 AND c.deleted_at IS NULL
+"""
+# R2 (GH-245, migration 0031): the runtime role can't DELETE a chat message, so the failed
+# turn is deleted by the owner-run function, which re-checks the chat and the turn itself.
+_DELETE_FAILED_TURN_SQL: Final = "SELECT delete_failed_turn($1, $2, $3, $4)"
 
 
 class ChatNotFoundError(LookupError):
@@ -509,6 +594,28 @@ class ChatTurn:
     chat: ChatRecord
     history: list[LLMMessage]
     attachments: tuple[ActiveAttachment, ...]
+
+
+@dataclass(frozen=True)
+class RetryTarget:
+    """The failed last turn of a chat that a retry re-runs and replaces (GH-245).
+
+    The turn runs from the chat's latest user message (``user_seq``) through
+    its latest message (``through_seq``), which ended ``error`` or
+    ``stopped``; both are the same row when a stop came before any output.
+    """
+
+    # The seq of the chat's latest message, the failed turn's last.
+    through_seq: int
+    # Its stored status, one of RETRYABLE_STATUSES.
+    status: MessageStatus
+    # The seq of the chat's latest user message: the retried one.
+    user_seq: int
+    # That message's stored text, which the retry sends again.
+    message: str
+    # Its live linked files (excluded ones too) by created_at then id: the re-stored user
+    # message carries them again.
+    attachment_ids: tuple[UUID, ...]
 
 
 def _utc_representable(value: datetime) -> datetime:
@@ -874,6 +981,7 @@ async def append_messages(
     attachment_ids: Sequence[UUID] = (),
     included_attachment_ids: Sequence[UUID] = (),
     external_content: bool = False,
+    replace_through: int | None = None,
 ) -> UUID | None:
     """Append a run's new messages to the caller's chat, in one transaction.
 
@@ -900,6 +1008,15 @@ async def append_messages(
     ``assistant`` message is stored with those ids, in the given order (S8');
     every other message keeps NULL.
 
+    With ``replace_through`` (GH-245, a retry), the chat's failed last turn,
+    its latest user message through that seq, is deleted right after the
+    touch and before the first insert, on the same connection, by migration
+    0031's ``delete_failed_turn`` (R2), which runs as the owner and refuses
+    anything but a failed last turn of the caller's live chat. It unlinks the
+    turn's files first, so the given ``attachment_ids`` (the failed message's)
+    are unsent again and A9 links them to the re-stored user message. A
+    refusal rolls the whole transaction back: nothing is deleted or stored.
+
     Args:
         pool: The database pool.
         tenant: The caller's org scope.
@@ -916,6 +1033,9 @@ async def append_messages(
         external_content: True when the run received external content its
             tool results don't show (its slot 4 held attachments): the chat's
             sticky flag is set like for a wrapped tool result.
+        replace_through: The seq of the failed turn's last message, which the
+            new turn replaces; None, the default, deletes nothing and runs
+            the statements as before.
 
     Returns:
         The id of the last appended message (GH-8: a streamed turn's
@@ -923,11 +1043,18 @@ async def append_messages(
 
     Raises:
         ValueError: If a ``system`` message is passed, a message whose
-            content is a list of content parts (never stored), or attachments
-            without a ``user`` message to carry them; nothing is written.
+            content is a list of content parts (never stored), attachments
+            without a ``user`` message to carry them, or ``replace_through``
+            without a ``user`` message (a replaced turn always stores its user
+            message again); nothing is written.
         ChatNotFoundError: Unless the chat is the caller's and not trashed;
             nothing is written.
+        asyncpg.InsufficientPrivilegeError: If ``delete_failed_turn`` refuses
+            (the seq isn't the chat's failed last turn); nothing is written.
     """
+    if replace_through is not None and not any(message.role == "user" for message in messages):
+        msg = "A replaced turn needs its user message."
+        raise ValueError(msg)
     # The index of the message the attachments go with; None links nothing.
     carrier: int | None = None
     if attachment_ids:
@@ -976,6 +1103,11 @@ async def append_messages(
         )
         if touched is None:
             raise ChatNotFoundError
+        if replace_through is not None:
+            # After the touch: a trashed chat is ChatNotFoundError before the function runs.
+            await conn.fetchval(
+                _DELETE_FAILED_TURN_SQL, chat_id, tenant.org_id, tenant.user_id, replace_through
+            )
         message_id: UUID | None = None
         for index, (role, content, blocks, call_id, stored_calls, status) in enumerate(rows):
             values = (chat_id, tenant.org_id, role, content, blocks, call_id, stored_calls, status)
@@ -996,32 +1128,47 @@ async def append_messages(
 
 
 async def load_turn(
-    executor: Executor, tenant: TenantContext, chat_id: UUID, *, limit: int
+    executor: Executor,
+    tenant: TenantContext,
+    chat_id: UUID,
+    *,
+    limit: int,
+    before_seq: int | None = None,
 ) -> ChatTurn:
     """Return the caller's live chat and its latest messages as the agent's history (S16).
 
     One statement (T2''): the send path runs it under the chat's run lock as
-    its last statement before the LLM call (GH-244).
+    its last statement before the LLM call (GH-244). A retry (GH-245) passes
+    ``before_seq``, the retried user message's seq, and T2b loads the latest
+    messages before it instead: the failed turn never reaches the model.
 
     Args:
         executor: The pool or a connection.
         tenant: The caller's org scope.
         chat_id: The chat.
         limit: How many of the latest messages to load (the context window).
+        before_seq: Load only messages with a lower seq (T2b); None, the
+            default, loads the latest ones (T2'').
 
     Returns:
         The ``ChatTurn``: the chat as ``get_chat`` returns it, the latest
-        ``limit`` messages as the agent's history (chronological, without the
-        leading ``tool`` results whose assistant turn fell outside the
-        window) and the chat's active attachments (GH-189, T2'': sent with one
-        of its messages, live, ``ready``, not excluded, in the order they were
-        sent, whatever the window, with their stored ``token_estimate`` and
+        ``limit`` messages (before ``before_seq`` when given) as the agent's
+        history (chronological, without the leading ``tool`` results whose
+        assistant turn fell outside the window) and the chat's active
+        attachments (GH-189, T2'': sent with one of its messages, live,
+        ``ready``, not excluded, in the order they were sent, whatever the
+        window or ``before_seq``, with their stored ``token_estimate`` and
         ``derived_bytes``; ``()`` for none).
 
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed.
     """
-    rows = await executor.fetch(_TURN_SQL, chat_id, tenant.org_id, tenant.user_id, limit)
+    if before_seq is None:
+        rows = await executor.fetch(_TURN_SQL, chat_id, tenant.org_id, tenant.user_id, limit)
+    else:
+        rows = await executor.fetch(
+            _TURN_BEFORE_SQL, chat_id, tenant.org_id, tenant.user_id, limit, before_seq
+        )
     if not rows:
         raise ChatNotFoundError
     chat = _chat_record({column: rows[0][column] for column in ChatRecord.model_fields})
@@ -1047,6 +1194,47 @@ async def load_turn(
         ) in rows[0]["attachment_rows"]
     )
     return ChatTurn(chat=chat, history=_history(messages), attachments=attachments)
+
+
+async def read_retry_target(
+    executor: Executor, tenant: TenantContext, chat_id: UUID
+) -> RetryTarget | None:
+    """Return the caller's chat's failed last turn, which a retry replaces (GH-245).
+
+    One statement (R1), which writes nothing. A chat can be retried when its
+    latest message (highest seq, any role) ended ``error`` or ``stopped``
+    (Decision 1); the retried message is its latest user message, which may
+    be that latest message itself (a stop before any output).
+
+    Args:
+        executor: The pool or a connection.
+        tenant: The caller's org scope.
+        chat_id: The chat.
+
+    Returns:
+        The ``RetryTarget``; None when the chat can't be retried (no message,
+        a latest message with another status, or no user message).
+
+    Raises:
+        ChatNotFoundError: Unless the chat is the caller's and not trashed.
+    """
+    row = await executor.fetchrow(_RETRY_TARGET_SQL, chat_id, tenant.org_id, tenant.user_id)
+    if row is None:
+        raise ChatNotFoundError
+    if (
+        row["through_seq"] is None
+        or row["status"] not in RETRYABLE_STATUSES
+        or row["user_seq"] is None
+    ):
+        return None
+    return RetryTarget(
+        through_seq=row["through_seq"],
+        status=row["status"],
+        user_seq=row["user_seq"],
+        message=row["content"],
+        # asyncpg's UUID subclass: plain UUIDs for the callers and their sealed models.
+        attachment_ids=tuple(UUID(int=file_id.int) for file_id in row["attachment_ids"]),
+    )
 
 
 async def read_chat_detail(
