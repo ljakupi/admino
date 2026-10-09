@@ -13,22 +13,31 @@ Super Admin's org metadata counts the org's chats (``count_org_chats``).
 GH-179's background task stores the automatic title (``set_auto_title``).
 GH-187's attachments follow their chat: a turn links the files its user
 message carried (``append_messages``), and the trash takes them along
-(``trash_chat``). The upload, reads and files are ``admino.attachments``,
-which imports this module (never the reverse).
+(``trash_chat``). GH-189: the turn read (``load_turn``, T2') also returns the
+chat's active attachments (``ActiveAttachment``: sent with one of its
+messages, live, ``ready``, in the order they were sent), and a run whose
+slot 4 held them stores the slot's ids on each of its assistant messages
+(S8', migration 0029) and sets the chat's sticky ``external_content`` flag.
+The upload, reads and files are ``admino.attachments``, which imports this
+module (never the reverse); their derived files are read by
+``admino.attachment_context``.
 
 Inputs: an executor (an asyncpg pool or connection) or, for the three
 transactional writes (``trash_chat``, ``append_messages`` and
 ``append_org_notice``), the pool; the caller's ``TenantContext``; a chat id
 (the server-generated id of a legacy chat to create); titles,
-``LLMMessage``s, ``ToolCallRecord``s and attachment ids; page sizes and
-opaque cursors.
+``LLMMessage``s, ``ToolCallRecord``s, attachment ids (the files a message
+carries and the slot's ids its answers included) and whether the run
+received external content; page sizes and opaque cursors.
 Outputs: ``ChatRecord``, ``ChatPage``, ``ChatDetail`` (the chat, a
 ``MessagePage``, its message count and latest message status), ``ChatTurn``
-(the chat and its history), ``LLMMessage`` lists, counts, whether an
-automatic title was stored and the id of a turn's last appended message.
+(the chat, its history and its active ``ActiveAttachment``s),
+``LLMMessage`` lists, counts, whether an automatic title was stored and the
+id of a turn's last appended message.
 Errors: ``ChatNotFoundError``, ``InvalidCursorError``, ``ValueError`` (a
-``system`` message to store, attachments without a ``user`` message to
-carry them), ``audit_events.AuditRecordError`` and the driver's errors.
+``system`` message or a message of content parts to store, attachments
+without a ``user`` message to carry them), ``audit_events.AuditRecordError``
+and the driver's errors.
 
 Behaviour:
 - Lists are keyset-paginated: chats by ``(last_activity_at, id)`` descending,
@@ -83,25 +92,30 @@ Security notes:
 - Attachments are linked only when they are the caller's, in this chat, in
   the caller's org, unsent and live (A9 states all five), and trashed only
   with their chat after its owner check (A10 binds the trashed chat and the
-  caller's org). Neither reads, writes or names a file.
+  caller's org). The turn read (T2') returns only the attachments of the
+  caller's chat whose org and owner are the chat's, sent with one of its
+  messages, live and ``ready``. None of them reads, writes or names a file.
 - An automatic title never overwrites a user's: ``set_auto_title`` is a
   compare-and-set on ``title_source = 'auto' AND title = ''`` (plus the
   owner, org and ``deleted_at IS NULL`` filters) and returns False instead of
   raising, so a rename that lands while the title is generated always wins.
 - The sticky ``external_content`` flag (GH-243) is set only when an appended
   ``tool`` message holds wrapped external content
-  (``untrusted.contains_wrapped``): a user or the model typing a marker can't
-  set it, and nothing here ever clears it (migration 0025's trigger refuses
-  a reset in the database too).
+  (``untrusted.contains_wrapped``) or the trusted caller says the run
+  received some (``external_content=True``: GH-189's attachments): a user or
+  the model typing a marker can't set it, and nothing here ever clears it
+  (migration 0025's trigger refuses a reset in the database too).
 - The runtime role may update only ``title``, ``title_source``,
   ``last_activity_at``, ``external_content`` and ``deleted_at`` of a chat
   (migration 0025), and only ``message_id``, ``updated_at`` and
   ``deleted_at`` (among others) of an attachment (migration 0027): every
   UPDATE here stays within them.
 - System prompts and instructions are never stored: a ``system`` message is
-  refused before any statement.
+  refused before any statement, and so is a message whose content is a list
+  of content parts (GH-189: attachment content and images live only in one
+  LLM call's context; the stored content is the user's text).
 - No content in logs or errors: nothing is logged here, and no error carries
-  a title, message, session id or chat id. The driver's errors (which quote
+  a title, message, file name, session id or chat id. The driver's errors (which quote
   the failing row) propagate untouched and must never be logged by text.
 - Parameterized SQL only: every statement is a constant, every value a bind
   parameter. Imports nothing from the server, agent, LLM, tools or OAuth
@@ -118,15 +132,15 @@ import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, Protocol
-from uuid import UUID  # noqa: TC003 — Pydantic resolves field annotations at runtime
+from uuid import UUID
 
 import asyncpg
-from pydantic import AfterValidator, AwareDatetime, Field, StrictInt
+from pydantic import AfterValidator, AwareDatetime, ConfigDict, Field, StrictInt
 
 from admino import audit_events, untrusted
 from admino.access import PlainUUID, SealedModel
 from admino.audit_events import AuditAction, TargetType
-from admino.models import LLMMessage
+from admino.models import AttachmentKind, LLMMessage
 from admino.models import MessageStatus as MessageStatus
 from admino.models import TitleSource as TitleSource
 
@@ -235,6 +249,15 @@ _INSERT_MESSAGE_SQL: Final = """
     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8)
     RETURNING id
 """
+# S8' (GH-189, migration 0029): an assistant message of a run whose slot 4 held
+# attachments, with the slot's ids (Decision 11).
+_INSERT_INCLUDED_SQL: Final = """
+    INSERT INTO chat_messages
+        (chat_id, org_id, role, content, tool_use_blocks, tool_call_id, tool_calls, status,
+         included_attachment_ids)
+    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::jsonb, $8, $9::uuid[])
+    RETURNING id
+"""
 # A9 (GH-187): the caller's unsent, live attachments of this chat go with the user message
 # that carried them. An id that no longer matches (another chat's, another owner's or org's,
 # trashed, already sent, unknown) is simply not linked: the send route checked them (A8)
@@ -308,9 +331,23 @@ _SET_AUTO_TITLE_SQL: Final = """
 # stands in for get_chat (S2) plus load_recent_history (S2 again, then S9). The window is
 # counted per chat (LATERAL) and the owner filters sit on the chat, so no row means not
 # found, and a chat without messages gives one row with NULL message columns.
+# T2' (GH-189, Decision 13): the same statement also returns the chat's active
+# attachments (sent with one of its messages, live, ready) on every row, as text arrays
+# [id, filename, kind, page_count] in the order they were sent (Decision 3: the carrying
+# message's seq, then upload order). They don't depend on the message window, and the
+# attachment filters repeat the chat's org and owner.
 _TURN_SQL: Final = """
     SELECT c.id, c.org_id, c.owner_user_id, c.title, c.title_source, c.external_content,
            c.created_at, c.last_activity_at,
+           ARRAY(
+               SELECT ARRAY[a.id::text, a.filename, a.kind, a.page_count::text]
+               FROM attachments a
+               JOIN chat_messages am ON am.id = a.message_id AND am.org_id = a.org_id
+               WHERE a.chat_id = c.id AND a.org_id = c.org_id
+                 AND a.owner_user_id = c.owner_user_id
+                 AND a.status = 'ready' AND a.deleted_at IS NULL
+               ORDER BY am.seq, a.created_at, a.id
+           ) AS attachment_rows,
            m.role, m.content, m.tool_use_blocks, m.tool_call_id
     FROM chats c
     LEFT JOIN LATERAL (
@@ -412,12 +449,35 @@ class ChatDetail(SealedModel):
     latest_status: MessageStatus | None
 
 
+class ActiveAttachment(SealedModel):
+    """An active attachment of a chat: what slot 4 needs from its row (GH-189).
+
+    ``filename`` is the stored name (``prompt_assembly.prompt_filename``
+    makes the prompt name of it); ``page_count`` is None for a kind without
+    pages.
+    """
+
+    # The stored name is user content: a validation error never repeats it.
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    id: PlainUUID
+    filename: str
+    kind: AttachmentKind
+    page_count: int | None
+
+
 @dataclass(frozen=True)
 class ChatTurn:
-    """A chat of the caller and the agent's history of it, read by one statement (S16)."""
+    """A chat of the caller, the agent's history of it and its active attachments.
+
+    Read by one statement (S16, T2' since GH-189). ``attachments`` are the
+    chat's sent, live, ``ready`` files in the order they were sent: by the
+    carrying message (oldest first), then ``created_at``, then ``id``.
+    """
 
     chat: ChatRecord
     history: list[LLMMessage]
+    attachments: tuple[ActiveAttachment, ...]
 
 
 def _utc_representable(value: datetime) -> datetime:
@@ -769,6 +829,8 @@ async def append_messages(
     final_status: MessageStatus = "complete",
     tool_calls: Sequence[ToolCallRecord] | None = None,
     attachment_ids: Sequence[UUID] = (),
+    included_attachment_ids: Sequence[UUID] = (),
+    external_content: bool = False,
 ) -> UUID | None:
     """Append a run's new messages to the caller's chat, in one transaction.
 
@@ -776,8 +838,10 @@ async def append_messages(
     which gets ``final_status`` and the run's tool calls (NULL when there are
     none). The chat's ``last_activity_at`` is bumped, and ``external_content``
     is set (for good) when an appended ``tool`` message holds wrapped external
-    content. U+0000 is removed from the content and the JSON values; in the
-    JSON values (a model's tool input or the tool-call arguments) each lone
+    content or the caller says the run received some (GH-189: a run whose
+    slot 4 held attachments). U+0000 is removed from the content and the
+    JSON values; in the JSON values (a model's tool input or the tool-call
+    arguments) each lone
     surrogate is stored as U+FFFD and each non-finite number (NaN, an
     infinity, an overflowing literal as parsed) as null, at any depth.
 
@@ -788,6 +852,10 @@ async def append_messages(
     stores its synthetic cancelled result before it. An id that no longer
     matches (deleted, trashed or sent meanwhile, another chat's, owner's or
     org's) is left as it is, without an error.
+
+    With ``included_attachment_ids`` (GH-189, Decision 11), every
+    ``assistant`` message is stored with those ids, in the given order (S8');
+    every other message keeps NULL.
 
     Args:
         pool: The database pool.
@@ -800,14 +868,20 @@ async def append_messages(
         attachment_ids: The attachments the user message carried (checked by
             the caller with ``attachments.check_sendable``); empty, the
             default, adds no statement.
+        included_attachment_ids: The ids of the run's slot 4, in slot order;
+            empty, the default, stores every message as before (S8).
+        external_content: True when the run received external content its
+            tool results don't show (its slot 4 held attachments): the chat's
+            sticky flag is set like for a wrapped tool result.
 
     Returns:
         The id of the last appended message (GH-8: a streamed turn's
         ``message_saved`` names it); None for an empty sequence.
 
     Raises:
-        ValueError: If a ``system`` message is passed, or attachments without
-            a ``user`` message to carry them; nothing is written.
+        ValueError: If a ``system`` message is passed, a message whose
+            content is a list of content parts (never stored), or attachments
+            without a ``user`` message to carry them; nothing is written.
         ChatNotFoundError: Unless the chat is the caller's and not trashed;
             nothing is written.
     """
@@ -825,6 +899,12 @@ async def append_messages(
     if any(message.role == "system" for message in messages):
         msg = "System messages are never stored."
         raise ValueError(msg)
+    # Content parts exist only in one LLM call's context (Decision 1): the stored
+    # content is the user's text.
+    texts = [message.content for message in messages if isinstance(message.content, str)]
+    if len(texts) != len(messages):
+        msg = "Content parts are never stored."
+        raise ValueError(msg)
     last = len(messages) - 1
     # Python mode: the JSON mode mangles a lone surrogate in a key (or raises for a nested
     # one) before _json_text could replace it. Every ToolCallRecord field is JSON-native.
@@ -832,15 +912,18 @@ async def append_messages(
     rows = [
         (
             message.role,
-            message.content.replace(_NUL, ""),
+            text.replace(_NUL, ""),
             _json_text(message.tool_use_blocks),
             message.tool_call_id,
             _json_text(calls) if index == last and calls else None,
             final_status if index == last else "complete",
         )
-        for index, message in enumerate(messages)
+        for index, (message, text) in enumerate(zip(messages, texts, strict=True))
     ]
-    external = any(role == "tool" and untrusted.contains_wrapped(text) for role, text, *_ in rows)
+    external = external_content or any(
+        role == "tool" and untrusted.contains_wrapped(text) for role, text, *_ in rows
+    )
+    included = list(included_attachment_ids)
     async with pool.acquire() as conn, conn.transaction():
         touched = await conn.fetchval(
             _TOUCH_EXTERNAL_SQL if external else _TOUCH_SQL,
@@ -852,17 +935,11 @@ async def append_messages(
             raise ChatNotFoundError
         message_id: UUID | None = None
         for index, (role, content, blocks, call_id, stored_calls, status) in enumerate(rows):
-            message_id = await conn.fetchval(
-                _INSERT_MESSAGE_SQL,
-                chat_id,
-                tenant.org_id,
-                role,
-                content,
-                blocks,
-                call_id,
-                stored_calls,
-                status,
-            )
+            values = (chat_id, tenant.org_id, role, content, blocks, call_id, stored_calls, status)
+            if included and role == "assistant":
+                message_id = await conn.fetchval(_INSERT_INCLUDED_SQL, *values, included)
+            else:
+                message_id = await conn.fetchval(_INSERT_MESSAGE_SQL, *values)
             if index == carrier:
                 await conn.execute(
                     _LINK_ATTACHMENTS_SQL,
@@ -914,9 +991,12 @@ async def load_turn(
         limit: How many of the latest messages to load (the context window).
 
     Returns:
-        The ``ChatTurn``: the chat as ``get_chat`` returns it and the history
+        The ``ChatTurn``: the chat as ``get_chat`` returns it, the history
         as ``load_recent_history`` returns it (chronological, without the
-        leading ``tool`` results whose assistant turn fell outside the window).
+        leading ``tool`` results whose assistant turn fell outside the
+        window) and the chat's active attachments (GH-189, T2': sent with one
+        of its messages, live, ``ready``, in the order they were sent,
+        whatever the window; ``()`` for none).
 
     Raises:
         ChatNotFoundError: Unless the chat is the caller's and not trashed.
@@ -927,7 +1007,17 @@ async def load_turn(
     chat = _chat_record({column: rows[0][column] for column in ChatRecord.model_fields})
     # A chat without messages gives one row whose message columns are NULL (role is NOT NULL).
     messages = [row for row in rows if row["role"] is not None]
-    return ChatTurn(chat=chat, history=_history(messages))
+    # Every row carries the same array; its page count is text (NULL for no pages).
+    attachments = tuple(
+        ActiveAttachment(
+            id=UUID(attachment_id),
+            filename=filename,
+            kind=kind,
+            page_count=None if page_count is None else int(page_count),
+        )
+        for attachment_id, filename, kind, page_count in rows[0]["attachment_rows"]
+    )
+    return ChatTurn(chat=chat, history=_history(messages), attachments=attachments)
 
 
 async def read_chat_detail(

@@ -122,7 +122,7 @@ from admino.llm import (
     validate_tools_payload,
 )
 from admino.logs import safe_log
-from admino.models import LLMMessage, ToolCall
+from admino.models import LLMMessage, TextContent, ToolCall
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
@@ -131,6 +131,7 @@ if TYPE_CHECKING:
     from openai.types.chat import ChatCompletionChunk
 
     from admino.config import LLMConfig
+    from admino.models import ContentPart
 
 logger = logging.getLogger(__name__)
 
@@ -146,17 +147,26 @@ def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, An
     Tool-role messages require a ``tool_call_id`` linking them to the
     originating tool call, and that call must appear in the preceding assistant
     message's ``tool_calls``: the agent stores it in ``tool_use_blocks``, which
-    is replayed here as OpenAI ``tool_calls`` (JSON-string arguments).
+    is replayed here as OpenAI ``tool_calls`` (JSON-string arguments). A
+    user message's content list (GH-189) becomes text and ``image_url`` parts
+    in order, each image a ``data:`` URL of its own media type; a str stays a
+    str.
 
     Args:
-        messages: Conversation messages.
+        messages: Conversation messages (never changed).
 
     Returns:
         Messages in OpenAI format.
     """
     api_messages: list[dict[str, Any]] = []
     for msg in messages:
-        entry: dict[str, Any] = {"role": msg.role, "content": msg.content}
+        content = msg.content
+        entry: dict[str, Any] = {
+            "role": msg.role,
+            "content": content
+            if isinstance(content, str)
+            else [_content_part_to_openai(part) for part in content],
+        }
         # OpenAI requires tool_call_id on tool-role messages
         if msg.role == "tool" and msg.tool_call_id:
             entry["tool_call_id"] = msg.tool_call_id
@@ -166,6 +176,13 @@ def _convert_messages_to_openai(messages: list[LLMMessage]) -> list[dict[str, An
                 entry["tool_calls"] = tool_calls
         api_messages.append(entry)
     return api_messages
+
+
+def _content_part_to_openai(part: ContentPart) -> dict[str, Any]:
+    """Return one content part as an OpenAI ``text`` or ``image_url`` part."""
+    if isinstance(part, TextContent):
+        return {"type": "text", "text": part.text}
+    return {"type": "image_url", "image_url": {"url": f"data:{part.media_type};base64,{part.data}"}}
 
 
 def _tool_use_blocks_to_openai(blocks: list[dict[str, Any]]) -> list[dict[str, Any]]:

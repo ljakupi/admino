@@ -2301,14 +2301,15 @@ class TestToolCallRecorderContract:
 
     def test_agent_tool_call_recorder_takes_eight_keyword_only_arguments(self) -> None:
         """The protocol's __call__ takes exactly the eight keywords (incl. principal and
-        the GH-243 escalated flag)."""
+        the GH-243 escalated flag), plus GH-189's optional ``attachment_ids`` (Decision
+        10: passed only for a run with attachments, so calls keep the eight)."""
         recorder_type = getattr(agent_module, "ToolCallRecorder", None)
         assert recorder_type is not None
 
         params = dict(inspect.signature(recorder_type.__call__).parameters)
         params.pop("self", None)
 
-        assert set(params) == _RECORDER_KWARGS
+        assert set(params) == _RECORDER_KWARGS | {"attachment_ids"}
         assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params.values())
 
     def test_agent_init_takes_keyword_only_tool_call_recorder(self) -> None:

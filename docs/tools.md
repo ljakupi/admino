@@ -77,6 +77,11 @@ should point out instructions it finds there instead of following them.
 Not wrapped: the `send` and `create` results (they repeat the agent's own arguments), the
 `memory.store` confirmation, error messages and "nothing found" messages.
 
+The files you send with a message aren't tool results, but they're wrapped the same way:
+`kind="attachment"`, the file's name as the label, in your message (never in the
+agent's instructions) and in full, without the 20,000-character cap. See
+[Configuration → Attachments](configuration.md#attachments).
+
 Before it is wrapped, the text is cleaned: control characters and invisible formatting
 characters (bidirectional overrides, zero-width characters) are removed, the exact marker
 name inside the text is defused (also when split by one of those removed characters) so
@@ -115,8 +120,8 @@ These are planned and **not** in this release — don't expect them to work yet:
 - **Drive and OneDrive downloads into attachments**
   ([#192](https://github.com/ljakupi/admino/issues/192)) — `download` saves the file as an
   attachment of the current chat. You can already upload attachments yourself (see
-  [Configuration → Attachments](configuration.md#attachments)); no tool reads them, and
-  their content reaches the model with [#189](https://github.com/ljakupi/admino/issues/189).
+  [Configuration → Attachments](configuration.md#attachments)); no tool reads them, but
+  once you send one with a message, its content reaches the model as data.
 - **`documents`** — a document store (store / classify / search / query).
 - **`search`** — web search.
 

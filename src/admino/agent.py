@@ -28,7 +28,14 @@ Architecture & boundaries:
   the run's advertised tools and the run's clock reading (read once per
   run), so every call of a run carries the same system message: the base
   prompt ending with the run's tools line, the instruction sections, then
-  the date line. There is no startup-built prompt.
+  the date line. There is no startup-built prompt. Slot 4 (GH-189), the
+  chat's active attachments the caller passes as ``attachments``, is not in
+  the system message: on every LLM call of the run (the first, the tool loop,
+  the streamed path and a resumed confirmation) ``assemble`` puts it at the
+  start of the context's current user message as content parts, so attached
+  files never get system-message authority. Those parts exist only in the
+  call's context: the returned history keeps the user's text as the str it
+  was given.
 - The agent holds no permission state and there is no module-level mutable
   state (GH-161). Every run gets the requesting org's
   :class:`admino.models.ToolPolicy` (its permissions, promoted tier-2 pairs
@@ -47,7 +54,10 @@ Security notes:
   principal (the logged-in user, which the agent passes through unread), the
   session id, the tool/action names the LLM asked for, the final permission
   decision, the success flag, the dispatch duration and whether the dispatch
-  was escalated — never argument values, tool output or error text.
+  was escalated — never argument values, tool output or error text. A run
+  with attachments (GH-189) also passes ``attachment_ids``, the ids in slot
+  order, on every recorder call; a run without them passes exactly the eight
+  keywords above. No file name, kind, size or content is passed.
   Conversation content is not audited.
 - Untrusted content (GH-243): the whole run executes inside
   ``untrusted.run_boundary()``, so the tool handlers wrap third-party content
@@ -56,11 +66,15 @@ Security notes:
   whole of it, not just the LLM's context window; this covers a resumed
   confirmation and later turns) holds a wrapped ``tool`` message, the caller
   passes ``earlier_external_content=True`` (GH-176: a persisted chat loads
-  only its latest messages, and its sticky flag covers the older ones), or a
-  dispatch returns a wrapped result. From then on every dispatch, the resume
+  only its latest messages, and its sticky flag covers the older ones), the
+  run has attachments (GH-189: slot 4's blocks are wrapped with the run's
+  boundary, so the files count from the first dispatch), or a dispatch
+  returns a wrapped result. From then on every dispatch, the resume
   pre-dispatch included, passes ``escalate_side_effects=True`` and the
-  registry turns an allowed side effect into ``confirm``. The flag only
-  tightens a decision and never reaches the permission engine. No content,
+  registry turns an allowed side effect into ``confirm``; a hardcoded denial
+  such as ``gmail.send`` stays denied. The flag only tightens a decision and
+  never reaches the permission engine. The attachment ids and the flag are
+  locals of the run, never stored on the agent. No content, file name,
   label or boundary is logged.
 - A run is never anonymous: ``run`` takes the caller's ``principal`` as a
   required keyword (GH-149); the agent makes no access decision with it.
@@ -87,7 +101,10 @@ Security notes:
   LLM call goes through ``llm_policy.chat`` with the run's residency flag and
   ``llm_max_retries``, so a transient failure is retried on the same client
   with the same context; the agent never passes a user/org id, email or name
-  to the client.
+  to the client. Every call also passes the run config's ``image_input``
+  (GH-189, defence in depth behind the server's refusal): with it off, a
+  context holding an image part is refused before the client is called, and
+  the run ends with the generic error reply and no ``error_code``.
 - Streamed runs and stop (GH-8): with a ``stream`` (an
   ``admino.streaming.RunStream``) every LLM call goes through
   ``llm_policy.chat_stream`` instead: each answer text piece is forwarded to
@@ -187,11 +204,12 @@ from admino.tenancy import NoTenantContextError, TenantContext
 from admino.tools.registry import ToolCallResult, dispatch_tool_call, get_registered_tools
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
+    from uuid import UUID
 
     from admino.access import Principal
     from admino.llm import LLMClient, LLMStreamDelta
-    from admino.models import LLMErrorCode, ToolPolicy
+    from admino.models import AttachmentContent, LLMErrorCode, ToolPolicy
     from admino.permissions import PermissionState
     from admino.streaming import RunStream
     from admino.tools.registry import ToolDescription
@@ -251,6 +269,7 @@ class ToolCallRecorder(Protocol):
         success: bool,
         duration_ms: int,
         escalated: bool,
+        attachment_ids: tuple[UUID, ...] = (),
     ) -> None:
         """Record one dispatch outcome.
 
@@ -264,6 +283,8 @@ class ToolCallRecorder(Protocol):
             duration_ms: Wall-clock duration of the dispatch, milliseconds.
             escalated: Whether dispatch tightened an ``allow`` to ``confirm``
                 because the run holds external content (GH-243).
+            attachment_ids: The ids of the run's attachments in slot order
+                (GH-189). The agent passes it only for a run with attachments.
         """
 
 
@@ -333,6 +354,7 @@ class Agent:
         prompt_context: PromptContext | None = None,
         earlier_external_content: bool = False,
         stream: RunStream | None = None,
+        attachments: Sequence[AttachmentContent] = (),
     ) -> AgentResult:
         """Run the agent loop for a single user message.
 
@@ -343,7 +365,8 @@ class Agent:
         (``prompt_assembly.system_prompt`` over ``prompt_context``, the run's
         advertised tools and the run's clock reading: the same on every call
         of the run) and a trimmed window of the history in which the current
-        user message is always kept.
+        user message is always kept; with ``attachments``, slot 4 opens that
+        message (``prompt_assembly.assemble``).
 
         Args:
             user_message: The user's message text. Must already be validated
@@ -385,6 +408,13 @@ class Agent:
                 records are reported to it as they happen, and setting its
                 ``stop`` ends the run with status "stopped" (see the module
                 docstring). None: the JSON path, unchanged and not stoppable.
+            attachments: The chat's active attachments in slot order (GH-189),
+                built by the caller from its own rows and derived files. Non-empty:
+                every LLM call carries them as slot 4 of the current user
+                message, the run escalates allowed side effects from its first
+                dispatch (the resume pre-dispatch included), and every recorder
+                call gets their ids. Empty: the run is exactly a run without
+                attachments. Applies to this run only.
 
         Returns:
             :class:`AgentResult` with the terminal status, the updated
@@ -406,6 +436,7 @@ class Agent:
                 prompt_context=prompt_context,
                 earlier_external_content=earlier_external_content,
                 stream=stream,
+                attachments=attachments,
             )
 
     # ------------------------------------------------------------------
@@ -425,6 +456,7 @@ class Agent:
         prompt_context: PromptContext | None,
         earlier_external_content: bool,
         stream: RunStream | None,
+        attachments: Sequence[AttachmentContent],
     ) -> AgentResult:
         """Run the agent loop inside the run's untrusted-content boundary (see ``run``)."""
         config = self._config if agent_config is None else agent_config
@@ -446,10 +478,17 @@ class Agent:
         # asked for the confirmation being resumed), every side effect the
         # policy allows needs the user's confirmation for the rest of the run.
         # GH-176: a persisted chat passes only its latest messages, so the
-        # caller's flag covers external content older than that tail. It is a
-        # local of this run, never stored on the agent, so concurrent and later
-        # runs keep their own.
-        received_untrusted = earlier_external_content or _holds_untrusted_content(working_history)
+        # caller's flag covers external content older than that tail. GH-189:
+        # attached files are external content too, from the first dispatch on.
+        # The flag and the ids are locals of this run, never stored on the
+        # agent, so concurrent and later runs keep their own.
+        holds_attachments = bool(attachments)
+        attachment_ids = tuple(attachment.id for attachment in attachments)
+        received_untrusted = (
+            holds_attachments
+            or earlier_external_content
+            or _holds_untrusted_content(working_history)
+        )
         # Index of this turn's user message, pinned into every context window.
         # On resume there is no new user message, so the request being resumed
         # (the most recent user message) is pinned instead. None only when the
@@ -540,6 +579,7 @@ class Agent:
                 working_history=working_history,
                 tool_records=tool_records,
                 escalate_side_effects=received_untrusted,
+                attachment_ids=attachment_ids,
                 stream=stream,
             )
             if pre_result is not None:
@@ -548,8 +588,10 @@ class Agent:
                 # terminal error. Return it before any LLM call.
                 return pre_result
             # The resumed call's result is now the last history message.
-            received_untrusted = earlier_external_content or _holds_untrusted_content(
-                working_history
+            received_untrusted = (
+                holds_attachments
+                or earlier_external_content
+                or _holds_untrusted_content(working_history)
             )
             tool_calls_used += 1
             carry_confirmation = None  # consumed on pre-dispatch
@@ -570,6 +612,9 @@ class Agent:
                     current_idx=current_idx,
                     max_messages=config.max_context_messages,
                 ),
+                # GH-189: slot 4 opens the context's current user message on
+                # every call; the history itself keeps the user's text.
+                attachments=attachments,
             )
             # The text this call forwards to the stream (a streamed call only), kept
             # so a timeout can store it (GH-25, D9).
@@ -586,6 +631,7 @@ class Agent:
                             tools_payload,
                             data_residency=tool_policy.data_residency,
                             max_retries=config.llm_max_retries,
+                            image_input=config.image_input,
                         )
                         request_timing.llm_first_byte()
                     else:
@@ -596,6 +642,7 @@ class Agent:
                             forwarded=forwarded,
                             data_residency=tool_policy.data_residency,
                             max_retries=config.llm_max_retries,
+                            image_input=config.image_input,
                         )
             except (MemoryError, RecursionError):
                 raise
@@ -700,6 +747,7 @@ class Agent:
                     session_id=session_id,
                     pending_confirmation=carry_confirmation,
                     escalate_side_effects=received_untrusted,
+                    attachment_ids=attachment_ids,
                 )
                 if dispatched is None:
                     # H-1: the dispatch could not be recorded — abort before
@@ -795,6 +843,7 @@ class Agent:
         forwarded: list[str],
         data_residency: bool,
         max_retries: int,
+        image_input: bool,
     ) -> LLMResponse | str:
         """Make one LLM call through ``llm_policy.chat_stream``, reporting its text to ``stream``.
 
@@ -819,6 +868,7 @@ class Agent:
             tools_payload,
             data_residency=data_residency,
             max_retries=max_retries,
+            image_input=image_input,
         )
         stopped = asyncio.ensure_future(stream.stop.wait())
         read: asyncio.Future[LLMStreamDelta | LLMResponse] | None = None
@@ -860,6 +910,7 @@ class Agent:
         session_id: str,
         pending_confirmation: PendingConfirmation | None,
         escalate_side_effects: bool,
+        attachment_ids: tuple[UUID, ...],
     ) -> tuple[ToolCallResult, int] | None:
         """Dispatch a single tool call via the registry, then record it.
 
@@ -872,8 +923,9 @@ class Agent:
         that times a dispatch and awaits the recorder, so no call site can
         dispatch without recording. The recorder gets the run's
         principal, the raw tool/action names the LLM asked for, the final
-        decision, the success flag, the duration and the escalated flag —
-        never arguments, output or error text.
+        decision, the success flag, the duration and the escalated flag, plus
+        the run's ``attachment_ids`` when it has any (GH-189); never
+        arguments, output or error text.
 
         Returns:
             ``(result, duration_ms)`` once the outcome is recorded, or
@@ -902,6 +954,8 @@ class Agent:
                     escalate_side_effects=escalate_side_effects,
                 )
         duration_ms = int((time.monotonic() - start) * 1000)
+        # GH-189: a run without attachments records exactly today's keywords.
+        attachments_kwarg = {"attachment_ids": attachment_ids} if attachment_ids else {}
         try:
             await self._record_tool_call(
                 principal=principal,
@@ -912,6 +966,7 @@ class Agent:
                 success=result.success,
                 duration_ms=duration_ms,
                 escalated=result.escalated,
+                **attachments_kwarg,
             )
         except (MemoryError, RecursionError):
             raise
@@ -931,6 +986,7 @@ class Agent:
         working_history: list[LLMMessage],
         tool_records: list[ToolCallRecord],
         escalate_side_effects: bool,
+        attachment_ids: tuple[UUID, ...],
         stream: RunStream | None,
     ) -> AgentResult | None:
         """Resume an approved pending confirmation by dispatching the tool call.
@@ -939,7 +995,8 @@ class Agent:
         tool call stored inside ``pending_confirmation`` through the registry
         (which verifies tool/action/args identity and expiry one more time),
         with the run's ``escalate_side_effects`` (GH-243: an escalated call
-        stays an escalated ``confirm``), appends the resulting
+        stays an escalated ``confirm``) and ``attachment_ids`` (GH-189, for
+        the recorder), appends the resulting
         ``tool_result`` to ``working_history``, and records the call in
         ``tool_records`` (reported to ``stream`` when the run is streamed).
 
@@ -959,6 +1016,7 @@ class Agent:
             session_id=session_id,
             pending_confirmation=pending_confirmation,
             escalate_side_effects=escalate_side_effects,
+            attachment_ids=attachment_ids,
         )
         if dispatched is None:
             return _audit_unavailable(working_history, tool_records)
@@ -1058,7 +1116,9 @@ def _holds_untrusted_content(history: list[LLMMessage]) -> bool:
     that has scrolled out of the context may still have shaped the turn.
     """
     return any(
-        message.role == "tool" and untrusted.contains_wrapped(message.content)
+        message.role == "tool"
+        and isinstance(message.content, str)
+        and untrusted.contains_wrapped(message.content)
         for message in history
     )
 

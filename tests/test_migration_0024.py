@@ -1351,6 +1351,13 @@ class TestMigration0024MatchesPython:
         )
 
     def test_migration_0024_the_fake_database_has_the_shipped_columns(self) -> None:
+        """0024's columns, in order. A column a later migration appends (GH-189: 0029's
+        chat_messages.included_attachment_ids) is pinned, after these, by its own
+        migration's test (tests/test_migration_0029.py)."""
+        later = {_MESSAGES: ("included_attachment_ids",)}
         shipped = {table: [name for name, _ in _table(table).columns] for table in _TABLES}
 
-        assert shipped == {table: list(db_fakes._CHAT_TYPES[table]) for table in _TABLES}
+        assert shipped == {
+            table: [c for c in db_fakes._CHAT_TYPES[table] if c not in later.get(table, ())]
+            for table in _TABLES
+        }

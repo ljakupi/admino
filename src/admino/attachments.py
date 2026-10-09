@@ -17,9 +17,11 @@ Outputs: ``AttachmentRecord``s, ``(file_count, used_bytes)`` of an org, its
 ``(quota_bytes, used_bytes)`` under its row lock (``lock_org_storage``, for
 the upload's commit check and the processing step's ready outcome), the
 number of disk entries removed (``remove_files``; ``remove_derived`` removes
-one attachment's ``<id>.d`` only). Errors: ``AttachmentRefusedError`` (with a
-reason code), ``chats.ChatNotFoundError``, ``AttachmentNotFoundError``,
-``AttachmentAlreadySentError``, ``audit_events.AuditRecordError`` and the
+one attachment's ``<id>.d`` only), and the files a message may send as
+``chats.ActiveAttachment``s (``check_sendable``, GH-189). Errors:
+``AttachmentRefusedError`` (with a reason code), ``chats.ChatNotFoundError``,
+``AttachmentNotFoundError``, ``AttachmentAlreadySentError``,
+``AttachmentNotReadyError``, ``audit_events.AuditRecordError`` and the
 driver's errors.
 
 Upload order (``upload_attachment``): the size checks, the chat's owner
@@ -68,8 +70,8 @@ Security notes:
 - No content in logs: nothing here logs a file name, a path or file bytes;
   ``remove_files`` and ``remove_derived`` log ids and an exception's class
   name only.
-- Parameterized SQL only (the contract's forms A1-A8), every value a bind
-  parameter. Imports nothing from the server, agent, LLM or tools layers.
+- Parameterized SQL only (the contract's forms A1-A7 and GH-189's A8'),
+  every value a bind parameter. Imports nothing from the server, agent, LLM or tools layers.
 """
 
 from __future__ import annotations
@@ -178,11 +180,13 @@ _STORAGE_SQL: Final = """
            coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), 0) AS used_bytes
     FROM attachments WHERE org_id = $1
 """
-# A8: which of the given ids are the caller's live attachments of the chat.
+# A8' (GH-189): which of the given ids are the caller's live attachments of the chat,
+# with what the send rules and slot 4 need, in upload order.
 _SENDABLE_SQL: Final = """
-    SELECT id, message_id FROM attachments
+    SELECT id, message_id, status, filename, kind, page_count FROM attachments
     WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4
       AND deleted_at IS NULL
+    ORDER BY created_at, id
 """
 
 
@@ -222,6 +226,13 @@ class AttachmentAlreadySentError(Exception):
 
     def __init__(self) -> None:
         super().__init__("Attachment already sent.")
+
+
+class AttachmentNotReadyError(Exception):
+    """The attachment isn't ``ready`` yet (``uploaded``, ``processing``) or failed."""
+
+    def __init__(self) -> None:
+        super().__init__("Attachment not ready.")
 
 
 def attachments_root() -> Path:
@@ -544,27 +555,41 @@ async def org_storage(executor: Executor, org_id: UUID) -> tuple[int, int]:
 
 async def check_sendable(
     executor: Executor, tenant: TenantContext, chat_id: UUID, attachment_ids: Sequence[UUID]
-) -> None:
-    """Check that every id is the caller's live, unsent attachment of the chat.
+) -> list[chats.ActiveAttachment]:
+    """Check that every id is the caller's live, unsent, ``ready`` attachment of the chat.
 
-    No statement runs for no ids.
+    One statement (A8'); none for no ids. The refusals come in this order,
+    each for any of the files: not found, already sent, not ready.
+
+    Returns:
+        The files as slot 4 needs them, in upload order (``created_at``, then
+        ``id``); ``[]`` for no ids.
 
     Raises:
         AttachmentNotFoundError: An id that isn't the caller's live
-            attachment of this chat (checked first).
+            attachment of this chat.
         AttachmentAlreadySentError: An attachment another message carried.
+        AttachmentNotReadyError: An attachment whose status isn't ``ready``.
     """
     if not attachment_ids:
-        return
+        return []
     rows = await executor.fetch(
         _SENDABLE_SQL, list(attachment_ids), chat_id, tenant.org_id, tenant.user_id
     )
     # Compared by value: asyncpg returns its own UUID subclass.
-    message_ids = {row["id"].int: row["message_id"] for row in rows}
-    if any(attachment_id.int not in message_ids for attachment_id in attachment_ids):
+    found = {row["id"].int for row in rows}
+    if any(attachment_id.int not in found for attachment_id in attachment_ids):
         raise AttachmentNotFoundError
-    if any(message_id is not None for message_id in message_ids.values()):
+    if any(row["message_id"] is not None for row in rows):
         raise AttachmentAlreadySentError
+    if any(row["status"] != "ready" for row in rows):
+        raise AttachmentNotReadyError
+    return [
+        chats.ActiveAttachment(
+            id=row["id"], filename=row["filename"], kind=row["kind"], page_count=row["page_count"]
+        )
+        for row in rows
+    ]
 
 
 def _remove_entry(path: Path, attachment_id: UUID) -> bool:

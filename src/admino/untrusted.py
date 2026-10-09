@@ -1,8 +1,9 @@
-"""Untrusted-content boundary: third-party text in tool results is wrapped as data (GH-243).
+"""Untrusted-content boundary: third-party text is wrapped as data (GH-243, GH-189).
 
 Tool results carry third-party content (emails, files, calendar events,
-recalled memory notes). Before such text reaches the model it is wrapped
-between a begin and an end marker that carry a random boundary::
+recalled memory notes), and so do the files the user attaches (GH-189). Before
+such text reaches the model it is wrapped between a begin and an end marker
+that carry a random boundary::
 
     <untrusted_content_{B} kind="{kind}" label="{label}">
     {text}
@@ -11,12 +12,17 @@ between a begin and an end marker that carry a random boundary::
 The base prompt (``prompt_assembly``) tells the model that wrapped content is
 data, never instructions; the agent uses ``contains_wrapped`` to notice that a
 run has received such content and then escalates its side-effecting actions to
-confirmation (``tools.registry.dispatch_tool_call``).
+confirmation (``tools.registry.dispatch_tool_call``). Slot 4 of the prompt
+(``prompt_assembly.attachment_slot``) builds one block per attachment from the
+same pieces, line by line, as its images are content parts of their own:
+``markers`` gives the begin and end lines and ``sanitize_text`` sanitizes each
+line between them.
 
 Inputs: a kind (one of ``UNTRUSTED_KINDS``), a short label (e.g. ``gmail
-message 18c2f``) and the formatted tool output.
-Outputs: the wrapped string (``wrap``), whether a text holds a begin marker
-(``contains_wrapped``), and the run's boundary (``run_boundary``).
+message 18c2f``) and the formatted tool output or a line of a file.
+Outputs: the wrapped string (``wrap``), the begin and end markers
+(``markers``), the sanitized text (``sanitize_text``), whether a text holds a
+begin marker (``contains_wrapped``), and the run's boundary (``run_boundary``).
 
 The boundary ``B`` is 16 lowercase hex characters from ``secrets``. Inside a
 ``run_boundary()`` block every ``wrap`` uses the block's boundary (one per
@@ -33,8 +39,9 @@ Security notes:
   characters, BOM, tag characters) and lone surrogates are removed; then
   every case-insensitive ``untrusted_content`` becomes ``untrusted-content``.
   So the exact marker name doesn't survive inside the text, also when a copy
-  is split by one of the removed characters, as those go first. The text is
-  capped at ``MAX_CHARS`` characters, the label at ``MAX_LABEL_CHARS`` on one
+  is split by one of the removed characters, as those go first. ``wrap`` caps
+  the text at ``MAX_CHARS`` characters; ``sanitize_text`` doesn't cap
+  (attachments go in full). The label is capped at ``MAX_LABEL_CHARS`` on one
   line without quotes or angle brackets, so it can't leave its attribute.
 - Limits: look-alike markers survive sanitization. These are homoglyphs
   (such as Cyrillic letters), a space or hyphen for the underscore,
@@ -105,8 +112,19 @@ def run_boundary() -> Iterator[str]:
         _RUN_BOUNDARY.reset(token)
 
 
-def _sanitize(text: str) -> str:
-    """Normalise line breaks, drop unsafe characters and neutralize the marker token."""
+def sanitize_text(text: str) -> str:
+    """Return ``text`` sanitized as ``wrap`` sanitizes its body, without the cap.
+
+    Line breaks become ``"\\n"``; control characters but tab and newline,
+    format (``Cf``) characters and lone surrogates are removed; every
+    case-insensitive ``untrusted_content`` becomes ``untrusted-content``.
+
+    Args:
+        text: Third-party content, such as a line of an attached file.
+
+    Returns:
+        The sanitized text, at any length.
+    """
     text = _LINE_BREAK_RE.sub("\n", text)
     text = "".join(
         char
@@ -119,9 +137,36 @@ def _sanitize(text: str) -> str:
 
 def _sanitize_label(label: str) -> str:
     """One stripped line without quotes or angle brackets, capped; ``-`` when empty."""
-    label = _WHITESPACE_RE.sub(" ", _sanitize(label))
+    label = _WHITESPACE_RE.sub(" ", sanitize_text(label))
     label = _LABEL_REMOVED_RE.sub("", label).strip()[:MAX_LABEL_CHARS]
     return label or "-"
+
+
+def markers(kind: UntrustedKind, label: str) -> tuple[str, str]:
+    """Return the begin and end marker of one block, with one boundary.
+
+    The boundary is the run's inside a ``run_boundary()`` block, else a fresh
+    one for this pair.
+
+    Args:
+        kind: What the content is (one of ``UNTRUSTED_KINDS``).
+        label: A short description such as a file name; sanitized to one line
+            of at most ``MAX_LABEL_CHARS`` characters.
+
+    Returns:
+        ``(begin, end)``, each one line without a newline.
+
+    Raises:
+        ValueError: ``kind`` is not a known kind (the value is not echoed).
+    """
+    if kind not in UNTRUSTED_KINDS:
+        msg = "Unknown untrusted content kind."
+        raise ValueError(msg)
+    boundary = _RUN_BOUNDARY.get() or secrets.token_hex(8)
+    return (
+        f'<untrusted_content_{boundary} kind="{kind}" label="{_sanitize_label(label)}">',
+        f"</untrusted_content_{boundary}>",
+    )
 
 
 def wrap(kind: UntrustedKind, label: str, text: str) -> str:
@@ -141,17 +186,11 @@ def wrap(kind: UntrustedKind, label: str, text: str) -> str:
     Raises:
         ValueError: ``kind`` is not a known kind (the value is not echoed).
     """
-    if kind not in UNTRUSTED_KINDS:
-        msg = "Unknown untrusted content kind."
-        raise ValueError(msg)
-    boundary = _RUN_BOUNDARY.get() or secrets.token_hex(8)
-    body = _sanitize(text)
+    begin, end = markers(kind, label)
+    body = sanitize_text(text)
     if len(body) > MAX_CHARS:
         body = f"{body[:MAX_CHARS]}\n{TRUNCATION_MARKER}"
-    return (
-        f'<untrusted_content_{boundary} kind="{kind}" label="{_sanitize_label(label)}">\n'
-        f"{body}\n</untrusted_content_{boundary}>"
-    )
+    return f"{begin}\n{body}\n{end}"
 
 
 def contains_wrapped(text: str) -> bool:

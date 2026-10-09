@@ -2812,10 +2812,11 @@ class TestRecordToolCall:
         assert (row["org_id"], row["actor_user_id"]) == (_ORG, _USER)
 
     def test_signature_is_keyword_only_after_the_executor(self) -> None:
+        """GH-189 (Decision 10): plus the optional attachment_ids."""
         params = list(inspect.signature(_record_tool_call()).parameters.values())
 
         assert params[0].name == "executor"
-        assert {p.name for p in params[1:]} == set(_tool_call_kwargs())
+        assert {p.name for p in params[1:]} == set(_tool_call_kwargs()) | {"attachment_ids"}
         assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in params[1:])
 
 

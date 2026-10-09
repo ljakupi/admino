@@ -52,11 +52,14 @@ What these tests pin down:
   org (trashed included, colleagues' too), no other org's; ``(0, 0)`` for none.
   GH-188 (contract 12.4): A7' = used_bytes counts the originals plus the derived bytes
   (NULL derived bytes count 0).
-- ``check_sendable`` (A8): no statement for no ids; None when every id is the
-  caller's live, unsent attachment of this chat; any id that isn't (another chat,
-  another org, a colleague's, trashed, unknown) is ``AttachmentNotFoundError``,
-  which wins over an already-sent one; an already-sent id is
-  ``AttachmentAlreadySentError``.
+- ``check_sendable`` (A8; GH-189 Decision 7 and contract C5: A8', which also
+  reads status, filename, kind and page count in ``created_at, id`` order): no
+  statement and ``[]`` for no ids; the files as a list when every id is the
+  caller's live, unsent, ready attachment of this chat; any id that isn't
+  (another chat, another org, a colleague's, trashed, unknown) is
+  ``AttachmentNotFoundError``, which wins over an already-sent one; an
+  already-sent id is ``AttachmentAlreadySentError``. The not-ready refusal and
+  the full error order are tests/test_attachments_sendable.py's.
 - ``remove_files`` removes ``<id>``, ``<id>.part`` and the ``<id>.d`` tree of each id
   under ``root/<org>`` and counts the removed entries; another org's directory and
   other ids stay; a symlink is unlinked, never followed (its target survives);
@@ -130,8 +133,10 @@ _FORMS: Final[dict[str, str]] = {
     "A6": _SELECT + _R + _A6_TAIL,
     "A7": "SELECT count(*) AS file_count, coalesce(sum(size_bytes + coalesce(derived_bytes, 0)), "
     "0) AS used_bytes FROM attachments WHERE org_id = $1",
-    "A8": "SELECT id, message_id FROM attachments WHERE id = ANY($1::uuid[]) AND chat_id = $2 "
-    "AND org_id = $3 AND owner_user_id = $4 AND deleted_at IS NULL",
+    # GH-189 (contract C5): A8' reads what the slot needs, in upload order.
+    "A8": "SELECT id, message_id, status, filename, kind, page_count FROM attachments "
+    "WHERE id = ANY($1::uuid[]) AND chat_id = $2 AND org_id = $3 AND owner_user_id = $4 "
+    "AND deleted_at IS NULL ORDER BY created_at, id",
 }
 
 _PNG_SIGNATURE: Final = b"\x89PNG\r\n\x1a\n"
@@ -1093,17 +1098,22 @@ class TestAttachmentsCheckSendable:
     ) -> None:
         result = await att.check_sendable(world.db.pool, world.tenant, world.chat, [])
 
-        assert (result, world.db.calls) == (None, [])
+        # GH-189 (contract C5): no files is an empty list, still without a statement.
+        assert (result, world.db.calls) == ([], [])
 
     async def test_attachments_check_sendable_accepts_the_callers_unsent_files(
         self, att: ModuleType, world: _World
     ) -> None:
+        """GH-189 (Decision 7): only ready files are sendable, and they come back."""
         db = world.db
-        ids = [db.add_attachment(world.chat), db.add_attachment(world.chat)]
+        ids = [
+            db.add_attachment(world.chat, status="ready"),
+            db.add_attachment(world.chat, status="ready"),
+        ]
 
         result = await att.check_sendable(db.pool, world.tenant, world.chat, ids)
 
-        assert result is None
+        assert {item.id for item in result} == set(ids)
         assert [_label(call) for call in db.calls] == ["A8"]
         assert set(db.calls[0].args[0]) == set(ids)
         assert db.calls[0].args[1:] == (world.chat, ORG_ID, world.member)

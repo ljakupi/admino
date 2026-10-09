@@ -8,14 +8,19 @@ binds every call to ``Agent.run``'s signature, records it, plays one delta into
 a ``RunStream`` when it gets one, awaits a one-shot ``during`` hook and answers
 a final ``AgentResult`` whose history is the history it received plus the
 user message plus one assistant reply. Attachment rows are seeded with
-``FakeDb.add_attachment``; no file is read or written here.
+``FakeDb.add_attachment``. GH-189 (Decision 7): only a ``ready`` file is sent, and
+its derived files are read under the chat's hold, so the sendable files (``_files``)
+are seeded ready with their derived files (tests/attachment_derived.py) under a
+``tmp_path`` attachments root; the stub's signature has ``Agent.run``'s
+``attachments`` keyword (C11).
 
 What is pinned (``POST /api/chats/{chat_id}/messages`` with ``attachment_ids``):
 - Success, JSON and SSE: the run happens once, and every listed attachment's
   ``message_id`` is the stored user message's id (not the reply's); a file of
   the chat that isn't listed stays unsent. The send runs exactly one lookup
-  (A8) and one link (A9) naming attachments, the link in the transaction of
-  the turn's message INSERTs. A message sent while a ``tool_use`` was dangling
+  (A8'), the turn read (T2', which reads the chat's sent files since GH-189's
+  Decision 13) and one link (A9) naming attachments, the link in the
+  transaction of the turn's message INSERTs. A message sent while a ``tool_use`` was dangling
   (the turn stores the synthetic cancelled result first) links the user
   message too. A file trashed during the run isn't linked and the turn is
   stored; a chat trashed during the run is the 404 ``chat_not_found`` with
@@ -38,7 +43,8 @@ What is pinned (``POST /api/chats/{chat_id}/messages`` with ``attachment_ids``):
   error, ``uuid_parsing`` at the index), never echoing the input, with no run
   and no attachment statement.
 - No ``attachment_ids`` (left out or ``[]``): the same statements as a send
-  without the key, none naming attachments (GH-244's budget untouched).
+  without the key, the turn read (T2') the only one naming attachments, and as
+  many as before GH-189 (GH-244's budget untouched).
 - The legacy ``POST /api/message`` refuses ``attachment_ids`` (422
   ``extra_forbidden``) while the chat route takes them.
 
@@ -62,8 +68,9 @@ from typing import TYPE_CHECKING, Any, Final
 
 import pytest
 
-from admino import scoped_settings, server
+from admino import attachments, scoped_settings, server
 from admino.models import AgentConfig, AgentResult, LLMMessage, PendingConfirmation
+from tests.attachment_derived import write_derived
 from tests.conftest import default_test_platform_settings
 from tests.db_fakes import FakeDb, plain
 from tests.tenancy_world import (
@@ -72,13 +79,15 @@ from tests.tenancy_world import (
     make_app,
     make_client,
     stub_agent,
+    use_attachment_storage,
     use_fake_database,
     use_fast_passwords,
     use_roomy_rate_limits,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
+    from pathlib import Path
     from unittest.mock import MagicMock
 
     import httpx
@@ -104,6 +113,10 @@ _PAST: Final = datetime(2026, 9, 1, 8, 0, tzinfo=UTC)
 _ATTACHMENTS_SQL: Final = re.compile(r"\battachments\b")
 _LINK_SQL: Final = re.compile(r"^update attachments set message_id\b")
 _MESSAGE_INSERT_SQL: Final = re.compile(r"^insert into chat_messages\b")
+# GH-189 (Decision 13): the turn read (T2', chats.load_turn) names attachments too.
+_TURN_SQL: Final = re.compile(r"\bfrom chats c left join lateral\b")
+# Today's statements of a send without files in a chat without sent files (GH-244).
+_STATEMENTS_WITHOUT_FILES: Final = 6
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +136,10 @@ def _run_signature(
     prompt_context: Any = None,
     earlier_external_content: bool = False,
     stream: Any = None,
+    attachments: Sequence[Any] = (),
 ) -> None:
-    """``Agent.run``'s signature; every stub call is bound to it."""
+    """``Agent.run``'s signature (GH-189: with ``attachments``); every stub call is bound
+    to it."""
 
 
 class _Script:
@@ -164,13 +179,15 @@ class _Script:
 
 
 @pytest.fixture()
-def world(monkeypatch: pytest.MonkeyPatch) -> World:
-    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database."""
+def world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> World:
+    """Orgs A and B (OA/ED/VI each) and a Super Admin, behind the fake database; the
+    attachments root is under ``tmp_path`` (GH-189: a sent file's derived files)."""
     db = FakeDb()
     built = build_world(db)
     use_fake_database(monkeypatch, db)
     use_fast_passwords(monkeypatch)
     use_roomy_rate_limits(monkeypatch)
+    use_attachment_storage(monkeypatch, built, tmp_path / "attachments")
     return built
 
 
@@ -204,8 +221,26 @@ def _chat(db: FakeDb, account: Account, **fields: Any) -> uuid.UUID:
 
 
 def _files(db: FakeDb, chat_id: uuid.UUID, count: int) -> list[uuid.UUID]:
-    """``count`` unsent, live attachments of the chat."""
-    return [db.add_attachment(chat_id, created_at=_PAST) for _ in range(count)]
+    """``count`` unsent, live, ready attachments of the chat (one-page PDFs), each with
+    its derived files under ``attachments.attachments_root()`` (GH-189, Decision 7:
+    only a ready file is sent, and its derived files must be readable)."""
+    chat = db.chat_row(chat_id)
+    assert chat is not None
+    root = attachments.attachments_root()
+    ids: list[uuid.UUID] = []
+    for index in range(count):
+        file_id = db.add_attachment(
+            chat_id,
+            created_at=_PAST,
+            status="ready",
+            page_count=1,
+            token_estimate=8,
+            derived_bytes=64,
+        )
+        parts = [("text", f"Page one of file {index}", 1)]
+        write_derived(root, plain(chat["org_id"]), file_id, kind="pdf", parts=parts, page_count=1)
+        ids.append(file_id)
+    return ids
 
 
 def _send(
@@ -302,8 +337,8 @@ def test_chat_attachments_api_send_links_the_files_to_the_stored_user_message(
     world: World, client: TestClient, script: _Script, sse: bool
 ) -> None:
     """The run happens; both listed files carry the user message's id, the unlisted one
-    stays unsent; one lookup and one link name attachments, the link in the transaction
-    of the turn's message INSERTs."""
+    stays unsent; one lookup, the turn read (T2', GH-189 Decision 13) and one link name
+    attachments, the link in the transaction of the turn's message INSERTs."""
     db = world.db
     editor = world.a["editor"]
     chat_id = _chat(db, editor)
@@ -328,7 +363,10 @@ def test_chat_attachments_api_send_links_the_files_to_the_stored_user_message(
         None,
     ]
     statements = _calls_since(db, since, _ATTACHMENTS_SQL)
-    assert [call.normalized.split(" ", 1)[0] for call in statements] == ["select", "update"]
+    assert [
+        "turn" if _TURN_SQL.search(call.normalized) else call.normalized.split(" ", 1)[0]
+        for call in statements
+    ] == ["select", "turn", "update"]
     (link,) = _calls_since(db, since, _LINK_SQL)
     inserts = _calls_since(db, since, _MESSAGE_INSERT_SQL)
     assert link.tx is not None
@@ -632,8 +670,9 @@ def test_chat_attachments_api_invalid_attachment_ids_get_422_without_echo(
 def test_chat_attachments_api_send_without_files_issues_todays_statements(
     world: World, client: TestClient, script: _Script
 ) -> None:
-    """The key left out and ``[]``: both turns run with the same statements, none naming
-    attachments; the chats' unsent files stay unsent."""
+    """The key left out and ``[]``: both turns run with the same statements, as many as
+    before GH-189, the turn read (T2', Decision 13) the only one naming attachments; the
+    chats' unsent files stay unsent."""
     db = world.db
     editor = world.a["editor"]
     without, empty = _chat(db, editor), _chat(db, editor)
@@ -646,7 +685,10 @@ def test_chat_attachments_api_send_without_files_issues_todays_statements(
         statements.append([call.normalized for call in db.calls[since:]])
 
     assert statements[0] == statements[1]
-    assert not any(_ATTACHMENTS_SQL.search(sql) for sql in statements[0])
+    assert len(statements[0]) == _STATEMENTS_WITHOUT_FILES
+    assert [
+        bool(_TURN_SQL.search(sql)) for sql in statements[0] if _ATTACHMENTS_SQL.search(sql)
+    ] == [True]
     assert [_linked_to(db, file_id) for file_id in files] == [None, None]
     assert len(script.runs) == 2
 
