@@ -88,6 +88,10 @@ Security notes:
   estimate and derived bytes, never by name. ``AttachmentUpdateRequest``
   takes a strict bool and nothing else and hides its input from validation
   errors. ``ChatMessageView.attachment_ids`` are ids only.
+- Trash (GH-194): ``TrashItem`` carries an item's type, id, name (the chat
+  title or the file name a client already showed), chat id and times only,
+  never an org, an owner, a trash group or a path; ``TrashListResponse`` and
+  ``TrashEmptyResponse`` are response models (no request body is added).
 - Blank messages (GH-286): ``ChatMessageCreate.message`` and
   ``ChatRequest.message`` take at most 32768 characters and accept an empty
   or whitespace-only text, unstripped; the message routes refuse a blank one
@@ -3633,6 +3637,43 @@ class ChatListResponse(BaseModel):
 
     chats: list[ChatSummary] = Field(max_length=100)
     next_cursor: str | None = Field(default=None, max_length=_CURSOR_MAX_LENGTH)
+
+
+TrashItemType = Literal["chat", "attachment"]
+"""The kind of a trash item (GH-194): V1's trash holds chats and attachments."""
+
+
+class TrashItem(BaseModel):
+    """One item of the caller's trash: metadata only.
+
+    ``name`` is the chat's title (an untitled chat's is empty) or the file's
+    name; ``chat_id`` is the file's chat and None for a chat. ``expires_at``
+    is ``deleted_at`` plus the org's effective retention.
+    """
+
+    item_type: TrashItemType
+    id: UUID
+    # Bounded like a file name (migration 0027); a chat title is shorter still.
+    name: str = Field(max_length=_ATTACHMENT_FILENAME_MAX_LENGTH)
+    chat_id: UUID | None
+    deleted_at: datetime
+    expires_at: datetime
+
+
+class TrashListResponse(BaseModel):
+    """GET /api/trash response: one page of the caller's trash, latest deletion first."""
+
+    items: list[TrashItem] = Field(max_length=100)
+    next_cursor: str | None = Field(default=None, max_length=_CURSOR_MAX_LENGTH)
+    # The org setting's range: 0 purges a deleted item at once.
+    retention_days: int = Field(ge=0, le=90)
+
+
+class TrashEmptyResponse(BaseModel):
+    """DELETE /api/trash response: how many items were purged."""
+
+    chats: int = Field(ge=0)
+    attachments: int = Field(ge=0)
 
 
 class ChatMessageView(BaseModel):

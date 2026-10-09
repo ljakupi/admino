@@ -3,9 +3,9 @@
 Every security-relevant action (logins and lockouts, password resets and
 changes, session revocations and forced logouts, invitations, role and profile
 changes, activations, sharing changes, file uploads, deletions, restores,
-exclusions and inclusions, exports, Org Admin access to other users' projects,
-org and platform settings, org tool permissions, Super Admin actions, residency
-policy, break-glass sessions, agent tool calls) is written through
+purges, exclusions and inclusions, exports, Org Admin access to other users'
+projects, org and platform settings, org tool permissions, Super Admin actions,
+residency policy, break-glass sessions, agent tool calls) is written through
 ``record()`` as one row of the ``audit_events`` table (migration 0005; the
 action catalog CHECK is replaced by migration 0009 for GH-152's session
 actions, by migration 0010 for GH-153's invitation.resend and
@@ -13,9 +13,10 @@ invitation.refuse, by migration 0016 for GH-161's
 org.permission_change, org.permission_promote, org.permission_promote_cancel
 and org.permission_demote, by migration 0020 for GH-164's user.profile_change,
 by migration 0021 for GH-166's password.change, by migration 0027 for
-GH-187's file.upload and by migration 0030 for GH-190's file.exclude and
-file.include; the metadata CHECK is replaced by migration 0029 for GH-189's
-attachment ids).
+GH-187's file.upload, by migration 0030 for GH-190's file.exclude and
+file.include and by migration 0031 for GH-194's chat.purge and file.purge;
+the metadata CHECK is replaced by migration 0029 for GH-189's attachment
+ids).
 
 Inputs: ``record()`` takes a database executor (the caller's connection, or
 the pool) plus the event: an ``AuditAction``, the actor, the org scope,
@@ -134,6 +135,10 @@ class AuditAction(StrEnum):
     PROJECT_RESTORE = "project.restore"
     CHAT_DELETE = "chat.delete"
     CHAT_RESTORE = "chat.restore"
+    # A trashed chat removed for good, by its owner (delete forever, empty
+    # trash, retention 0) or by the system's retention purge (GH-194); the
+    # target is the chat, the metadata the number of files removed with it
+    CHAT_PURGE = "chat.purge"
     # A member's upload of a chat attachment (GH-187); the orphan GC's removal
     # is a system file.delete
     FILE_UPLOAD = "file.upload"
@@ -143,6 +148,9 @@ class AuditAction(StrEnum):
     # it again (GH-190); the target is the file, there is no metadata
     FILE_EXCLUDE = "file.exclude"
     FILE_INCLUDE = "file.include"
+    # A trashed file removed for good, by its owner or by the retention purge
+    # (GH-194); the target is the file, there is no metadata
+    FILE_PURGE = "file.purge"
     # Org Admin access to other users' projects
     PROJECT_ADMIN_ACCESS = "project.admin_access"
     # Exports
@@ -220,11 +228,13 @@ ACTION_SCOPES: Final[Mapping[AuditAction, ActionScope]] = MappingProxyType(
         AuditAction.PROJECT_RESTORE: "org",
         AuditAction.CHAT_DELETE: "org",
         AuditAction.CHAT_RESTORE: "org",
+        AuditAction.CHAT_PURGE: "org",
         AuditAction.FILE_UPLOAD: "org",
         AuditAction.FILE_DELETE: "org",
         AuditAction.FILE_RESTORE: "org",
         AuditAction.FILE_EXCLUDE: "org",
         AuditAction.FILE_INCLUDE: "org",
+        AuditAction.FILE_PURGE: "org",
         AuditAction.PROJECT_ADMIN_ACCESS: "org",
         AuditAction.EXPORT_CREATE: "org",
         AuditAction.ORG_SETTINGS_CHANGE: "org",
