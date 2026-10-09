@@ -132,13 +132,23 @@ How it's enforced:
   including the app's writes as `admino_app`. Only the `admino` owner role could remove
   the key.
 - **Chat messages stay append-only.** On `chat_messages`, `admino_app` has `SELECT` and
-  `INSERT` only: it can't change or delete a stored message. Retrying a failed answer
-  (`POST /api/chats/{id}/retry`) removes the failed turn only through `delete_failed_turn`
-  (migration 0031), which runs as the owner (`SECURITY DEFINER` with a pinned
-  `search_path`) and is bound to the chat's organization and owner. It deletes only a live chat's failed last turn: a message that ended as
-  `error` or `stopped` with no assistant or tool message after it, and the messages back
-  to the latest user message at or before it. It unlinks that user message's files first,
-  so they're kept, and refuses anything else with one fixed error that names no row. The
+  `INSERT` only: it can't change or delete a stored message directly. Retrying a failed
+  answer (`POST /api/chats/{id}/retry`) removes the failed turn only through
+  `delete_failed_turn` (migration 0031), which runs as the owner (`SECURITY DEFINER` with a
+  pinned `search_path`) and is bound to the chat's organization and owner. It deletes only
+  a live chat's failed last turn: a message that ended as `error` or `stopped` with no
+  assistant or tool message after it, and the messages back to the latest user message at
+  or before it. It also checks the turn's shape, because `admino_app` can insert rows (and
+  take a chat out of the trash): every message between that user message and the failed
+  one must be a tool call or its result (each `complete` or `awaiting_confirmation`), or an
+  assistant message with status `error`. A completed answer stays `complete`, and
+  `admino_app` can't change it, so an `error` row forged after it is refused. The text a
+  streamed reply showed before it timed out is stored as `error` with the failed answer,
+  and migration 0031 backfills the ones stored earlier as `complete` to `error`. Residual
+  risk: a compromised runtime role can still delete a turn that ends in a pending or
+  expired confirmation, a turn that already failed, and rows it inserted itself; it can't
+  delete a completed turn. The function unlinks that user message's files first, so
+  they're kept, and refuses anything else with one fixed error that names no row. The
   deletion and the new turn are stored in one transaction, so a refused or failed retry
   leaves the failed turn as it was.
 - **New tables get explicit grants.** A migration that creates a table grants

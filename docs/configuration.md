@@ -747,7 +747,9 @@ Viewer's chats from before a role change stay stored, unused.
   message without files and for every assistant and tool message. The last
   message of a turn carries the turn's outcome (`complete`, `error`,
   `awaiting_confirmation`, `limit_reached` or `stopped`, see
-  [Stopping a reply](#stopping-a-reply)) and its tool calls; the others are `complete`.
+  [Stopping a reply](#stopping-a-reply)) and its tool calls; the others are `complete`,
+  except the text a streamed reply showed before it timed out, stored as `error` like
+  the error reply after it (see [Streaming replies](#streaming-replies)).
   Invisible characters (control and formatting characters such as zero-width
   spaces, soft hyphens, word joiners and direction marks; tabs and line breaks stay) and
   credential-like text are stripped from the content, like in a live reply and in
@@ -1017,7 +1019,8 @@ chat is free again: you can send the next message, or confirm, as soon as you se
   turn's last message is the error reply, with `status: "error"`. The text that already
   arrived isn't stored, except after a `timeout`: then that text, up to its last complete
   word, is stored as a message of its own just before the error reply (none when no word
-  was complete yet), and the `delta` events end at that same word. The stream ends with
+  was complete yet), also with `status: "error"` as part of the failed reply, and the
+  `delta` events end at that same word. The stream ends with
   `message_saved` (naming the error reply), `error` and `done`. A failed model call is
   [retried](#llm-errors-and-retries) only until the model's first piece of text has
   arrived.
@@ -1084,7 +1087,8 @@ within a reply.
   [promoted permission](permissions.md#promoting-a-critical-permission) (like a message,
   a retry first adds the notes that just took effect).
 - **What's replaced.** The failed turn: your latest message and everything stored after
-  it, the reply with its actions and their results (and what an approval added to it).
+  it, the reply with its actions and their results (and what an approval added to it,
+  or the text a reply showed before it timed out).
   Once the new run is stored, the new turn replaces the failed one in one transaction:
   your message is stored again with the same text and the same files (excluded ones
   included), then the new reply follows. Your re-stored message is a new message, with a
@@ -2180,7 +2184,11 @@ attachments' files live on a Docker volume.
   messages but can't edit or delete a single one. A [retry](#retrying-a-failed-reply)
   removes the failed turn only through `delete_failed_turn` (migration 0031), a function
   that runs as the owner and refuses anything but the failed last turn of a chat that
-  isn't in the trash, so `admino_app` itself still can't delete a message. Deleting a
+  isn't in the trash, shaped like a real failed turn, so `admino_app` itself still can't
+  delete a message directly (what a compromised runtime role could still remove is in
+  [Security Model → Database roles](SECURITY.md#database-roles)). Migration 0031 also
+  marks as `error` the text a reply showed before it timed out that was stored
+  `complete` before this release, so those turns can be retried. Deleting a
   user deletes their chats, and purging an organization deletes all of its chats. A chat
   in the trash stays stored, only marked with `deleted_at`; restoring and purging the
   trash come with
