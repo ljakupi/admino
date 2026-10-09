@@ -49,6 +49,16 @@ computed from ``admino.tokens.estimate_text_tokens`` and the contract's formulas
   closing, so the "closing doesn't fit" fallback is unreachable); the audit's probes
   (a look-alike close tag, a forged truncation note and an injected line before the
   cut, at the default cap of 8000; three blocks cut inside the second).
+- Amendment A6 (A5 re-audit L-1, L-2): ``MAX_TOOL_RESULT_CHARS == 65_536`` (the registry's
+  slice and ``LLMMessage.content``'s limit); a text comes back unchanged only when it fits
+  the cap, is at most 65 536 characters and leaves no block open; otherwise every "longest
+  prefix" also keeps ``len(prefix + suffix) <= 65_536``. The re-audit's probe (a
+  65 536-character emoji/ASCII mix, its last block open after the registry's slice or
+  closed, at caps 16 384, 20 000 and 100 000) never exceeds the length; the kept prefix is
+  the longest within BOTH bounds (one more character breaks the binding one); a fitting
+  text with only closed blocks is unchanged; a fitting text ending inside a block (the
+  registry's slice, a short wrap cut before its end marker) comes back closed; a sweep
+  over caps 256 to 100 000 never ends with a block open.
 - ``context_report`` (sums, order kept) and ``overflow_reason`` (tokens before
   bytes; exactly at a limit is not over).
 - ``BudgetSettings.from_config``: reserved = ``llm.max_response_tokens``, the
@@ -1252,6 +1262,267 @@ def test_context_budget_truncate_tool_result_three_wrapped_emails_keep_every_kep
         result.endswith("\n" + end + _MARKER),
         estimate_text_tokens(result) <= cap,
     ) == (2, 2, True, True)
+
+
+# ---------------------------------------------------------------------------
+# 11c. The cut also respects the message length and closes a registry-cut block
+#      (amendment A6, A5 re-audit L-1 and L-2)
+# ---------------------------------------------------------------------------
+
+_MAX_CHARS: Final = 65_536
+_HIGH_CAPS: Final = (16_384, 20_000, 100_000)
+# Just above the 20 000 cap: an emoji tail then costs about one token per dropped
+# character, so the closing (81 characters) or the marker (43) would make the cut
+# longer than its 65 536-character input (L-1).
+_JUST_OVER: Final = 20_005
+
+
+def _a6_longest(text: str, suffix: str, max_tokens: int) -> int:
+    """The most characters of ``text`` whose estimate with ``suffix`` fits AND whose length
+    with ``suffix`` is at most 65 536 (0 when none)."""
+    room = max(0, min(len(text), _MAX_CHARS - len(suffix)))
+    fitting = bisect.bisect_right(
+        range(room + 1),
+        max_tokens,
+        key=lambda length: estimate_text_tokens(text[:length] + suffix),
+    )
+    return max(fitting - 1, 0)
+
+
+def _a6_cut(text: str, max_tokens: int) -> str:
+    """Amendment A6's rule, written out from the contract."""
+    if (
+        estimate_text_tokens(text) <= max_tokens
+        and len(text) <= _MAX_CHARS
+        and _open_end(text) is None
+    ):
+        return text
+    kept = text[: _a6_longest(text, _MARKER, max_tokens)]
+    end = _open_end(kept)
+    if end is None:
+        return kept + _MARKER
+    closing = "\n" + end + _MARKER
+    return text[: _a6_longest(text, closing, max_tokens)] + closing
+
+
+def _registry_cut_mails(*, ascii_only: bool = False, target: int = _JUST_OVER) -> str:
+    """The re-audit's probe: four wrapped emails of one run (ASCII bodies, the last one
+    ending in emoji), sliced to 65 536 characters as the registry does, so the last block
+    is open. The last body's ASCII head is sized so the slice's estimate is ``target``
+    (or one more); ``ascii_only`` gives L-2's all-ASCII shape (estimate about 16 400)."""
+
+    def build(ascii_head: int) -> str:
+        mails = [untrusted.wrap("email", f"gmail message {n}", "a" * 20_000) for n in (1, 2, 3)]
+        tail = "a" * ascii_head + _EMOJI * (20_000 - ascii_head)
+        mails.append(untrusted.wrap("email", "gmail message 4", tail))
+        return ("Found 4 messages:\n" + "\n".join(mails))[:_MAX_CHARS]
+
+    with untrusted.run_boundary():
+        if ascii_only:
+            return build(20_000)
+        # The slice's estimate never grows with the ASCII head: the longest head that
+        # keeps it at ``target`` or above.
+        fitting = bisect.bisect_right(
+            range(20_001), -target, key=lambda head: -estimate_text_tokens(build(head))
+        )
+        return build(fitting - 1)
+
+
+def _closed_mix(target: int = _JUST_OVER) -> str:
+    """A 65 536-character result with no open block: a closed wrapped email, then the
+    tool's own text, ASCII then emoji, sized so the estimate is ``target`` (or one more)."""
+    with untrusted.run_boundary():
+        mail = untrusted.wrap("email", "gmail message 1", "a" * 20_000) + "\n"
+    rest = _MAX_CHARS - len(mail)
+
+    def build(ascii_head: int) -> str:
+        return mail + "a" * ascii_head + _EMOJI * (rest - ascii_head)
+
+    fitting = bisect.bisect_right(
+        range(rest + 1), -target, key=lambda head: -estimate_text_tokens(build(head))
+    )
+    return build(fitting - 1)
+
+
+def _short_cut_before_end() -> tuple[str, str]:
+    """A short wrapped email cut right before its end marker, and that end marker."""
+    with untrusted.run_boundary() as boundary:
+        mail = untrusted.wrap("email", "probe message", "Short mail body, invoice 2026-10-09.")
+    end = f"</untrusted_content_{boundary}>"
+    return mail[: -len("\n" + end)], end
+
+
+def test_context_budget_max_tool_result_chars_is_the_message_and_registry_limit(
+    cb: ModuleType,
+) -> None:
+    """One bound for the cut, the registry's slice and ``LLMMessage.content``."""
+    LLMMessage(role="tool", content="a" * _MAX_CHARS)
+    with pytest.raises(ValueError, match="content"):
+        LLMMessage(role="tool", content="a" * (_MAX_CHARS + 1))
+
+    assert (cb.MAX_TOOL_RESULT_CHARS, registry._MAX_RESULT_LENGTH) == (_MAX_CHARS, _MAX_CHARS)
+
+
+@pytest.mark.parametrize("shape", ["open-block", "closed-block"])
+def test_context_budget_truncate_tool_result_registry_cut_probe_stays_within_the_length(
+    cb: ModuleType, shape: str
+) -> None:
+    """L-1's probe: a 65 536-character emoji/ASCII mix, with its last block open (the
+    registry's slice) or closed, at the high caps 16 384, 20 000 and 100 000: never longer
+    than 65 536 characters, never over the cap, no block left open, A6's rule exactly."""
+    text = _registry_cut_mails() if shape == "open-block" else _closed_mix()
+    # Non-vacuity: the probe's shape (the slice length, the open or closed block, the
+    # estimate just above 20 000).
+    assert (
+        len(text),
+        _open_end(text) is None,
+        _JUST_OVER <= estimate_text_tokens(text) <= _JUST_OVER + 1,
+    ) == (_MAX_CHARS, shape == "closed-block", True)
+
+    outcomes = {}
+    for cap in _HIGH_CAPS:
+        result = cb.truncate_tool_result(text, cap)
+        outcomes[cap] = (
+            len(result) <= _MAX_CHARS,
+            estimate_text_tokens(result) <= cap,
+            untrusted.open_block_end(result) is None,
+            result == _a6_cut(text, cap),
+        )
+
+    assert outcomes == dict.fromkeys(_HIGH_CAPS, (True, True, True, True))
+
+
+@pytest.mark.parametrize("case", ["closed-block", "open-block"])
+def test_context_budget_truncate_tool_result_keeps_the_longest_prefix_within_both_bounds(
+    cb: ModuleType, case: str
+) -> None:
+    """The kept prefix is the longest whose estimate AND length with the suffix fit: one
+    more character breaks the binding bound, the length at 20 000 (the slice's estimate
+    is just above it) and the tokens at 16 384 (the length would still hold)."""
+    text = _registry_cut_mails() if case == "open-block" else _closed_mix()
+    end = _open_end(text)
+    suffix = _MARKER if end is None else "\n" + end + _MARKER
+    outcomes = {}
+
+    for cap in (20_000, 16_384):
+        kept = _a6_longest(text, suffix, cap)
+        result = cb.truncate_tool_result(text, cap)
+        one_more = text[: kept + 1] + suffix
+        outcomes[cap] = (
+            result == text[:kept] + suffix,
+            len(result) <= _MAX_CHARS,
+            estimate_text_tokens(result) <= cap,
+            "length" if len(one_more) > _MAX_CHARS else "-",
+            "tokens" if estimate_text_tokens(one_more) > cap else "-",
+        )
+
+    assert outcomes == {
+        20_000: (True, True, True, "length", "-"),
+        16_384: (True, True, True, "-", "tokens"),
+    }
+
+
+def test_context_budget_truncate_tool_result_over_the_length_within_the_cap_is_cut_to_the_length(
+    cb: ModuleType,
+) -> None:
+    """A text longer than 65 536 characters is cut even when its estimate fits: the
+    longest prefix whose length with the marker is 65 536, then the marker."""
+    text = "Summary line of the run. " * 3000
+    assert (len(text) > _MAX_CHARS, estimate_text_tokens(text) <= 20_000) == (True, True)
+
+    result = cb.truncate_tool_result(text, 20_000)
+
+    assert result == text[: _MAX_CHARS - len(_MARKER)] + _MARKER
+
+
+def test_context_budget_truncate_tool_result_fitting_text_of_closed_blocks_is_unchanged(
+    cb: ModuleType,
+) -> None:
+    """Regression guard: within the cap and the length (65 536 exactly is within), with
+    only closed blocks or none, the text comes back as it is."""
+    at_length = _closed_mix()
+    mails = _three_mails(one_run=True)
+    plain = "a" * cb.MAX_TOOL_RESULT_CHARS
+    cases = {
+        "65536-closed-mix": (at_length, 100_000),
+        "65536-ascii": (plain, 16_384),
+        "three-mails-at-cap": (mails, estimate_text_tokens(mails)),
+    }
+
+    outcomes = {label: cb.truncate_tool_result(text, cap) for label, (text, cap) in cases.items()}
+
+    assert outcomes == {label: text for label, (text, _) in cases.items()}
+
+
+@pytest.mark.parametrize(
+    ("case", "cap"),
+    [
+        ("registry-slice-ascii", 20_000),
+        ("registry-slice-ascii", 100_000),
+        ("registry-slice-emoji", 100_000),
+        ("short-cut-before-end", 256),
+    ],
+    ids=["ascii-20000", "ascii-100000", "emoji-100000", "short-256"],
+)
+def test_context_budget_truncate_tool_result_fitting_text_inside_an_open_block_is_closed(
+    cb: ModuleType, case: str, cap: int
+) -> None:
+    """L-2: the text fits the cap but ends inside a block (the registry's slice, a short
+    wrap cut before its end marker): it comes back closed with ``"\\n" + end + marker``,
+    the closing within both bounds and the kept prefix the longest that allows it."""
+    if case == "short-cut-before-end":
+        text, end = _short_cut_before_end()
+    else:
+        text = _registry_cut_mails(ascii_only=case == "registry-slice-ascii")
+        end = str(_open_end(text))
+    closing = "\n" + end + _MARKER
+    # Non-vacuity: the text fits the cap and the length, and its last block is open.
+    assert (
+        estimate_text_tokens(text) <= cap,
+        len(text) <= _MAX_CHARS,
+        untrusted.open_block_end(text),
+    ) == (True, True, end)
+
+    result = cb.truncate_tool_result(text, cap)
+
+    expected_kept = len(text) if case == "short-cut-before-end" else _MAX_CHARS - len(closing)
+    assert result == text[:expected_kept] + closing
+    assert (
+        len(result) <= _MAX_CHARS,
+        estimate_text_tokens(result) <= cap,
+        untrusted.open_block_end(result),
+    ) == (True, True, None)
+
+
+@pytest.mark.parametrize(
+    "case", ["registry-slice-emoji", "registry-slice-ascii", "short-cut-before-end"]
+)
+def test_context_budget_truncate_tool_result_never_ends_with_a_block_open_from_256_to_100000(
+    cb: ModuleType, case: str
+) -> None:
+    """A sweep over the configurable caps (256 to 100 000, densely around the text's own
+    estimate): A6's rule exactly, no block left open, within the cap and the length."""
+    if case == "short-cut-before-end":
+        text, _ = _short_cut_before_end()
+    else:
+        text = _registry_cut_mails(ascii_only=case == "registry-slice-ascii")
+    own = estimate_text_tokens(text)
+    near = range(max(256, own - 60), own + 61, 3)
+    caps = sorted({*range(256, 100_001, 2999), *near, 100_000})
+    violations: dict[str, list[int]] = {"open": [], "long": [], "over": [], "rule": []}
+
+    for cap in caps:
+        result = cb.truncate_tool_result(text, cap)
+        for name, broken in (
+            ("open", untrusted.open_block_end(result) is not None),
+            ("long", len(result) > _MAX_CHARS),
+            ("over", estimate_text_tokens(result) > cap),
+            ("rule", result != _a6_cut(text, cap)),
+        ):
+            if broken:
+                violations[name].append(cap)
+
+    assert violations == {"open": [], "long": [], "over": [], "rule": []}
 
 
 # ---------------------------------------------------------------------------

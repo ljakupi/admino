@@ -40,6 +40,11 @@ What is pinned here, from the issue's Decisions 1, 2, 3, 8 and 9:
   ending with ``"\\n" + <the block's end marker> + TOOL_RESULT_MARKER`` (the audit's probe
   shape: the real end marker follows the injected line), within the cap, in the loop and
   in the resume pre-dispatch; escalation and ``external_content`` are unchanged.
+- Amendment A6 (A5 re-audit L-1, L-2): with ``max_tool_result_tokens=20_000`` a handler
+  result of four wrapped emails over 65 536 characters (the registry slices it inside the
+  last block, the slice just over the cap) doesn't abort the run: the stored and sent tool
+  message is ``truncate_tool_result`` of the slice, at most 65 536 characters, its last
+  block closed, within the cap, and the next side effect still escalates (loop and resume).
 - Amendment A1: ``AgentResult.external_content`` is True when the run received external
   content (attachments, ``earlier_external_content``, a wrapped tool message in its
   history, a dispatch whose full result was wrapped, even when the cut removed the marker),
@@ -66,6 +71,7 @@ Security notes: every text is fixed fake data; the canaries only prove what isn'
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
 import re
@@ -1353,6 +1359,139 @@ class TestToolResultCutClosesTheBlock:
             [content.endswith(closing) for _, content in stored],
             [estimate_text_tokens(content) <= 256 for _, content in stored],
         ) == (["c-1"], True, [True], [True])
+        assert second.status == "awaiting_confirmation"
+        assert second.pending_confirmation is not None
+        assert second.pending_confirmation.tool_call == again
+        assert second_recorder.outcomes() == [
+            ("probe", "ask", "confirm", True, False),
+            ("probe", "act", "confirm", False, True),
+        ]
+
+
+# ===========================================================================
+# 7c. A registry-cut result at a high cap stays a valid, closed message
+#     (amendment A6, A5 re-audit L-1 and L-2)
+# ===========================================================================
+
+_MAX_CHARS: Final = 65_536
+_HIGH_CAP: Final = 20_000
+# Just above the cap: the closing (81 characters) then replaces fewer emoji than its own
+# length, so A5's cut alone would exceed LLMMessage.content's 65 536 characters (L-1).
+_JUST_OVER: Final = 20_005
+
+
+def _over_long_mails() -> Callable[[], str]:
+    """The re-audit's probe through a handler: four wrapped emails of the run's boundary
+    (ASCII bodies, the last ending in emoji), more than 65 536 characters, so the registry
+    slices it inside the last block. The last body's ASCII head is sized so the slice's
+    estimate is just above the 20 000 cap."""
+
+    def make() -> str:
+        from admino import untrusted
+
+        def build(ascii_head: int) -> str:
+            mails = [untrusted.wrap("email", f"gmail message {n}", "a" * 20_000) for n in (1, 2, 3)]
+            tail = "a" * ascii_head + _EMOJI * (20_000 - ascii_head)
+            mails.append(untrusted.wrap("email", "gmail message 4", tail))
+            return "Found 4 messages:\n" + "\n".join(mails)
+
+        # The slice's estimate never grows with the ASCII head: the longest head that
+        # keeps it at _JUST_OVER or above.
+        fitting = bisect.bisect_right(
+            range(20_001),
+            -_JUST_OVER,
+            key=lambda head: -estimate_text_tokens(build(head)[:_MAX_CHARS]),
+        )
+        return build(fitting - 1)
+
+    return make
+
+
+def _registry_slice(full: str) -> str:
+    """What the registry hands the agent: the handler's result sliced to 65 536 characters."""
+    return full[:_MAX_CHARS]
+
+
+def _closed_at_the_length(content: object, full: str) -> tuple[object, ...]:
+    """(at most 65 536, last block closed, ends with the closing, within the cap)."""
+    from admino import untrusted
+
+    text = str(content)
+    # Every wrap of the run shares its boundary: the open block's end marker is that one.
+    closing = f"\n</untrusted_content_{_BEGIN_ID_RE.findall(full)[-1]}>{_MARKER}"
+    return (
+        len(text) <= _MAX_CHARS,
+        untrusted.open_block_end(text),
+        text.endswith(closing),
+        estimate_text_tokens(text) <= _HIGH_CAP,
+    )
+
+
+class TestRegistryCutResultAtAHighCap:
+    """With max_tool_result_tokens 20 000 an over-long wrapped result no longer aborts."""
+
+    async def test_agent_context_budget_registry_cut_result_at_a_high_cap_is_a_closed_message(
+        self, probe: _Probe, recorder: _Recorder
+    ) -> None:
+        probe.results["fetch:mail"] = _over_long_mails()
+        llm = _ScriptedLLM(
+            _tools(_call("fetch", "mail", "c-1")),
+            _tools(_call("act", "1", "c-2")),
+            _text("never sent"),
+        )
+
+        result = await _run(
+            _agent(llm, recorder),
+            "current-message",
+            config=_limits(tool_cap=_HIGH_CAP, max_input_tokens=100_000),
+        )
+
+        full = probe.returned[0]
+        sliced = _registry_slice(full)
+        # Non-vacuity: the handler's result is over the length, its slice just over the cap.
+        assert (len(full) > _MAX_CHARS, estimate_text_tokens(sliced)) == (True, _JUST_OVER)
+        stored = [m.content for m in result.history if m.role == "tool"]
+        sent = [m.content for m in llm.received[1] if m.role == "tool"]
+        assert (result.status, sent == stored, stored) == (
+            "awaiting_confirmation",
+            True,
+            [_cut(sliced, _HIGH_CAP)],
+        )
+        assert _closed_at_the_length(stored[0], full) == (True, None, True, True)
+        # Escalation is still judged on the full result: the next side effect asks.
+        assert recorder.outcomes() == [
+            ("probe", "fetch", "allow", True, False),
+            ("probe", "act", "confirm", False, True),
+        ]
+
+    async def test_agent_context_budget_resumed_registry_cut_result_at_a_high_cap_is_closed(
+        self, probe: _Probe
+    ) -> None:
+        config = _limits(tool_cap=_HIGH_CAP, max_input_tokens=100_000)
+        first = await _run(
+            _agent(_ScriptedLLM(_tools(_call("ask", "mail", "c-1"))), _Recorder()),
+            "current-message please ask",
+            config=config,
+        )
+        assert first.pending_confirmation is not None
+        probe.results["ask:mail"] = _over_long_mails()
+        again = _call("act", "1", "c-2")
+        llm = _ScriptedLLM(_tools(again), _text("never sent"))
+        second_recorder = _Recorder()
+
+        second = await _run(
+            _agent(llm, second_recorder),
+            "",
+            config=config,
+            history=first.history,
+            pending=first.pending_confirmation,
+        )
+
+        full = probe.returned[0]
+        stored = [m.content for m in second.history if m.role == "tool"]
+        sent = [m.content for m in llm.received[0] if m.role == "tool"]
+        assert (sent == stored, stored) == (True, [_cut(_registry_slice(full), _HIGH_CAP)])
+        assert _closed_at_the_length(stored[0], full) == (True, None, True, True)
         assert second.status == "awaiting_confirmation"
         assert second.pending_confirmation is not None
         assert second.pending_confirmation.tool_call == again
