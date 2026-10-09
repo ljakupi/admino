@@ -270,8 +270,11 @@ the dispatch layer in `tools/registry.py`):
   `context.max_tool_result_tokens` (8,000 tokens by default) is cut to its longest
   beginning that fits, followed by the marker `[tool result truncated to fit the
   context]`, and the cut result is what the model gets and the chat stores (see
-  [Configuration → Context budget](configuration.md#context-budget)). The cut can drop a
-  block's end marker, or its begin marker when the block starts past the cut. So the
+  [Configuration → Context budget](configuration.md#context-budget)). A cut inside a
+  block never leaves it open: the kept part ends with the block's own end marker on a
+  line of its own, then the cut marker, all within the cap, so a look-alike close tag or
+  a forged truncation note before the cut point still sits inside the block. A block
+  that starts past the cut is dropped whole, its begin marker included. So the
   escalation is decided on the full result, before the cut, and a run that received
   wrapped content reports it to the server, which sets the chat's sticky
   `external_content` mark (later turns escalate too, and an untitled chat gets its

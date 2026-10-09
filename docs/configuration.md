@@ -1478,7 +1478,9 @@ instructions + attachments + history + reserved output ≤ budget
 - **Long tool results are cut.** A tool result whose estimate is above
   `context.max_tool_result_tokens` (8,000 tokens by default) is cut to its longest
   beginning that fits with the marker, and the line `[tool result truncated to fit the
-  context]` follows it. The model gets the cut result, and the chat stores it (see
+  context]` follows it. A cut inside wrapped third-party content closes that block
+  first, with its end marker on its own line before the marker, within the same cap.
+  The model gets the cut result, and the chat stores it (see
   [Tools → Long results are cut](tools.md#long-results-are-cut)).
 - **Estimates.** The estimator is rough and errs high for German and French text. A
   provider that still refuses a context as too long answers `context_too_long` too.

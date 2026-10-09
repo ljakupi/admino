@@ -118,9 +118,11 @@ An action added without a declaration counts as a side effect.
 A tool result that would take more of the model's context than
 `context.max_tool_result_tokens` allows (`config.yaml`, 8,000 tokens by default, from 256
 to 100,000) is cut: it keeps its longest beginning that fits, and the marker
-`[tool result truncated to fit the context]` follows on its own line. The model gets the
-cut result, and the chat stores it. Ask for less (a narrower search, fewer emails) when
-you need what was cut.
+`[tool result truncated to fit the context]` follows on its own line. When the cut falls
+inside wrapped content, the wrapped block is closed first: its end marker follows the kept
+part on its own line, before the marker, within the same cap. The model gets the cut
+result, and the chat stores it. Ask for less (a narrower search, fewer emails) when you
+need what was cut.
 
 Wrapped content still counts in full: whether a later side effect asks first is decided on
 the whole result, before the cut, so a cut that removes the wrapped part, its markers

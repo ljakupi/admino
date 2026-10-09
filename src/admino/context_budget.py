@@ -27,7 +27,12 @@ and a message are counted alike:
 Security notes: constants and pure functions only: no I/O, no logging and no
 clock (the caller passes ``now``). Never imports the agent, the server, the
 database, the chat or attachment repositories or an LLM module. A report names
-files by id, never by name, and nothing here sees a file's content.
+files by id, never by name, and nothing here sees a file's content. A cut
+never leaves an untrusted block open: a cut inside a wrapped block closes it
+with the block's own end marker (``untrusted.open_block_end``) before the
+marker, so a forged close tag or truncation note before the cut point stays
+inside the block. The cut is for the context only: the agent decides
+escalation and ``external_content`` on the full result.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
-from admino import prompt_assembly
+from admino import prompt_assembly, untrusted
 from admino.models import ContextReport, ContextUsage, TextContent
 from admino.tokens import estimate_text_tokens
 from admino.tools import registry
@@ -299,28 +304,43 @@ def truncate_tool_result(text: str, max_tokens: int) -> str:
     """Cut a tool result whose estimate is above ``max_tokens``, ending it with the marker.
 
     The kept part is the longest prefix, in characters, whose estimate plus
-    the marker's fits; below the marker's own estimate that prefix is empty
-    and the marker stays.
+    the marker's fits. When that prefix ends inside a wrapped block (its begin
+    marker kept, its end marker cut), the block is closed: the kept part is
+    then the longest prefix that fits with a newline, the block's end marker
+    and the marker. Below the closing's (or the marker's) own estimate the
+    kept part is empty and the closing (or the marker) stays.
 
     Args:
         text: The tool result.
         max_tokens: The cap (``context.max_tool_result_tokens``).
 
     Returns:
-        ``text`` itself when it fits, else ``prefix + TOOL_RESULT_MARKER``.
+        ``text`` itself when it fits, else ``prefix + TOOL_RESULT_MARKER`` or,
+        for a cut inside a block, ``prefix + "\n" + end marker +
+        TOOL_RESULT_MARKER``.
     """
     if estimate_text_tokens(text) <= max_tokens:
         return text
+    kept = text[: _longest_prefix(text, TOOL_RESULT_MARKER, max_tokens)]
+    end = untrusted.open_block_end(kept)
+    if end is None:
+        return kept + TOOL_RESULT_MARKER
+    closing = "\n" + end + TOOL_RESULT_MARKER
+    return text[: _longest_prefix(text, closing, max_tokens)] + closing
+
+
+def _longest_prefix(text: str, suffix: str, max_tokens: int) -> int:
+    """Return the most characters of ``text`` whose estimate with ``suffix`` fits (0: none)."""
     # The estimate never shrinks as the prefix grows, so a binary search finds
     # the longest prefix that fits.
     low, high = 0, len(text)
     while low < high:
         middle = (low + high + 1) // 2
-        if estimate_text_tokens(text[:middle] + TOOL_RESULT_MARKER) <= max_tokens:
+        if estimate_text_tokens(text[:middle] + suffix) <= max_tokens:
             low = middle
         else:
             high = middle - 1
-    return text[:low] + TOOL_RESULT_MARKER
+    return low
 
 
 def context_report(
